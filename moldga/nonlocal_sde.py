@@ -412,7 +412,11 @@ def calculate_self_energy_q(
         )
 
     delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_local.cut_niv(config.box.niv_core)
-    mu_history = [config.sys.mu]
+    mu_history = (
+        [config.sys.mu]
+        if starting_iter == 0
+        else [float(np.load(os.path.join(config.self_consistency.previous_sc_path, "mu_history.npy"))[-1])]
+    )
 
     theta = 0
 
@@ -422,11 +426,9 @@ def calculate_self_energy_q(
         logger.log_info("----------------------------------------")
 
         giwk_full = GreensFunction.get_g_full(
-            sigma_old.rotate_orbitals(theta=-theta), config.sys.mu, config.lattice.hamiltonian.get_ek()
+            sigma_old.rotate_orbitals(theta=-theta), mu_history[-1], config.lattice.hamiltonian.get_ek()
         ).rotate_orbitals(theta=theta)
 
-        # giwk_full = GreensFunction.get_g_full(sigma_old, config.sys.mu, config.lattice.hamiltonian.get_ek())
-        # giwk_full.mat = giwk_full.mat[..., 0, 0, :][..., None, None, :]
         giwk_full.save(output_dir=config.output.output_path, name="g_dga")
 
         logger.log_memory_usage("giwk", giwk_full, comm.size)
@@ -491,11 +493,11 @@ def calculate_self_energy_q(
         sigma_new += delta_sigma
         sigma_new = sigma_new.concatenate_self_energies(sigma_dmft).rotate_orbitals(theta=-theta)
 
-        old_mu = config.sys.mu
+        old_mu = mu_history[-1]
         if comm.rank == 0:
             config.sys.mu = update_mu(
-                config.sys.mu, config.sys.n, giwk_full.ek, sigma_new.mat, config.sys.beta, sigma_dmft.fit_smom()[0]
-            )  # maybe sigma_new.fit_smom()[0]
+                config.sys.mu, config.sys.n, giwk_full.ek, sigma_new.mat, config.sys.beta, sigma_new.fit_smom()[0]
+            )
 
         config.sys.mu = comm.bcast(config.sys.mu)
         mu_history.append(config.sys.mu)
