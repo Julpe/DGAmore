@@ -496,7 +496,7 @@ def calculate_self_energy_q(
         old_mu = mu_history[-1]
         if comm.rank == 0:
             config.sys.mu = update_mu(
-                config.sys.mu, config.sys.n, giwk_full.ek, sigma_new.mat, config.sys.beta, sigma_new.fit_smom()[0]
+                old_mu, config.sys.n, giwk_full.ek, sigma_new.mat, config.sys.beta, sigma_new.fit_smom()[0]
             )
 
         config.sys.mu = comm.bcast(config.sys.mu)
