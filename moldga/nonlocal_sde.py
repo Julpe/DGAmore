@@ -498,6 +498,10 @@ def calculate_self_energy_q(
             config.sys.mu = update_mu(
                 old_mu, config.sys.n, giwk_full.ek, sigma_new.mat, config.sys.beta, sigma_new.fit_smom()[0]
             )
+            # linear mixing of mu to ensure more stable mu convergence
+            config.sys.mu = (
+                config.self_consistency.mixing * config.sys.mu + (1 - config.self_consistency.mixing) * old_mu
+            )
 
         config.sys.mu = comm.bcast(config.sys.mu)
         mu_history.append(config.sys.mu)
