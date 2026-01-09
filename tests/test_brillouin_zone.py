@@ -37,7 +37,19 @@ def test_raises_error_for_insufficient_dimensions_on_inv_sym():
 def test_applies_x_y_symmetry_to_square_matrix():
     mat = np.random.rand(4, 4, 6)
     bz.x_y_sym(mat)
-    assert np.allclose(mat, np.minimum(mat, np.transpose(mat, axes=(1, 0, 2))))
+    assert np.allclose(mat, np.minimum(mat, mat.swapaxes(0, 1)))
+
+
+def test_applies_x_z_symmetry_to_square_matrix():
+    mat = np.random.rand(4, 6, 4)
+    bz.x_z_sym(mat)
+    assert np.allclose(mat, np.minimum(mat, mat.swapaxes(0, 2)))
+
+
+def test_applies_y_z_symmetry_to_square_matrix():
+    mat = np.random.rand(6, 4, 4)
+    bz.y_z_sym(mat)
+    assert np.allclose(mat, np.minimum(mat, mat.swapaxes(1, 2)))
 
 
 def test_does_nothing_for_non_square_matrix():
@@ -51,6 +63,18 @@ def test_raises_error_for_insufficient_dimensions_on_x_y_sym():
     mat = np.random.rand(4, 4)
     with pytest.raises(AssertionError, match="dim\(mat\) = 2 but must be at least 3 dimensional"):
         bz.x_y_sym(mat)
+
+
+def test_raises_error_for_insufficient_dimensions_on_x_z_sym():
+    mat = np.random.rand(4, 4)
+    with pytest.raises(AssertionError, match="dim\(mat\) = 2 but must be at least 3 dimensional"):
+        bz.x_z_sym(mat)
+
+
+def test_raises_error_for_insufficient_dimensions_on_y_z_sym():
+    mat = np.random.rand(4, 4)
+    with pytest.raises(AssertionError, match="dim\(mat\) = 2 but must be at least 3 dimensional"):
+        bz.y_z_sym(mat)
 
 
 def test_applies_simultaneous_inversion_in_x_and_y_directions():
@@ -93,6 +117,20 @@ def test_applies_x_y_symmetry_correctly_with_mock():
         mock_x_y_sym.assert_called_once_with(mat)
 
 
+def test_applies_x_z_symmetry_correctly_with_mock():
+    mat = np.random.rand(4, 6, 4)
+    with patch("moldga.brillouin_zone.x_z_sym") as mock_x_z_sym:
+        bz.apply_symmetry(mat, bz.KnownSymmetries.X_Z_SYM)
+        mock_x_z_sym.assert_called_once_with(mat)
+
+
+def test_applies_y_z_symmetry_correctly_with_mock():
+    mat = np.random.rand(6, 4, 4)
+    with patch("moldga.brillouin_zone.y_z_sym") as mock_y_z_sym:
+        bz.apply_symmetry(mat, bz.KnownSymmetries.Y_Z_SYM)
+        mock_y_z_sym.assert_called_once_with(mat)
+
+
 def test_applies_x_y_inversion_symmetry_correctly_with_mock():
     mat = np.random.rand(6, 6, 4)
     with patch("moldga.brillouin_zone.x_y_inv") as mock_x_y_inv:
@@ -111,10 +149,11 @@ def test_raises_error_for_unknown_symmetry_with_mock():
 def test_applies_multiple_symmetries_in_order():
     mat = np.random.rand(6, 6, 6)
     with patch("moldga.brillouin_zone.apply_symmetry") as mock_apply_symmetry:
-        bz.apply_symmetries(mat, [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV])
+        bz.apply_symmetries(mat, [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV, bz.KnownSymmetries.Z_INV])
         mock_apply_symmetry.assert_any_call(mat, bz.KnownSymmetries.X_INV)
         mock_apply_symmetry.assert_any_call(mat, bz.KnownSymmetries.Y_INV)
-        assert mock_apply_symmetry.call_count == 2
+        mock_apply_symmetry.assert_any_call(mat, bz.KnownSymmetries.Z_INV)
+        assert mock_apply_symmetry.call_count == 3
 
 
 def test_does_nothing_when_no_symmetries_provided():
@@ -133,6 +172,11 @@ def test_raises_error_for_insufficient_dimensions_on_apply_symmetries():
 def test_returns_correct_symmetries_for_two_dimensional_square():
     result = bz.get_lattice_symmetries_from_string("two_dimensional_square")
     assert result == bz.two_dimensional_square_symmetries()
+
+
+def test_returns_correct_symmetries_for_three_dimensional_cubic():
+    result = bz.get_lattice_symmetries_from_string("three_dimensional_cubic")
+    assert result == bz.three_dimensional_cubic_symmetries()
 
 
 def test_returns_correct_symmetries_for_quasi_one_dimensional_square():

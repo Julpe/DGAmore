@@ -79,28 +79,6 @@ def create_full_vertex_q_r(
     return f_q_r
 
 
-def create_full_vertex_q_r2(channel: SpinChannel, niv_pp: int, mpi_distributor: MpiDistributor, i, j) -> FourPoint:
-    r"""
-    Alternative way that calculates the full vertex function in either the density or magnetic channel using
-    :math:`F^q_r = F^\omega_r [ 1- \chi_0^{nl,q} F^\omega_r]^{-1}`, see Eq. (3.106a) and Eq. (3.106b) in my thesis for
-    the case of :math:`V^q=0`.
-    """
-    f_r_loc = LocalFourPoint.load(
-        os.path.join(config.output.output_path, f"f_{channel.value}_loc.npy"), channel=channel
-    )
-    gchi0_loc = LocalFourPoint.load(os.path.join(config.output.output_path, "gchi0_loc.npy"), num_vn_dimensions=1)
-    gchi0_q = FourPoint.load(
-        os.path.join(config.output.output_path, f"gchi0_q_rank_{mpi_distributor.comm.rank}.npy"), num_vn_dimensions=1
-    )
-
-    f_q_r = config.sys.beta**i * (
-        f_r_loc
-        @ (FourPoint.identity_like(gchi0_q) - config.sys.beta**j * (gchi0_q - gchi0_loc) @ f_r_loc).invert(False)
-    ).cut_niv(config.box.niv_core)
-    del f_r_loc, gchi0_q, gchi0_loc
-    return transform_vertex_q_ph_to_pp_w0(f_q_r, niv_pp)
-
-
 def transform_vertex_q_ph_to_pp_w0(f_q_r: FourPoint, niv_pp: int) -> FourPoint:
     """
     Transforms the vertex function from particle-hole notation to particle-particle notation based on Motoharu Kitatani's
@@ -311,8 +289,8 @@ def create_local_reducible_r_pp_diagrams_w0(
     gamma_r_loc = (
         f_r_loc
         @ (
-            LocalFourPoint.identity_like(f_r_loc).permute_orbitals("abcd->acbd")
-            - 0.5 * gchi0_pp_loc @ f_r_loc.permute_orbitals("abcd->acbd")
+            LocalFourPoint.identity_like(f_r_loc)
+            - 0.5 * (gchi0_pp_loc.permute_orbitals("abcd->acbd") @ f_r_loc.permute_orbitals("abcd->acbd"))
         ).invert()
     )
     logger.log_info(f"Constructed local {channel.value}let irreducible vertex.")

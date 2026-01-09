@@ -19,6 +19,8 @@ class KnownSymmetries(Enum):
     Y_INV = "y-inv"
     Z_INV = "z-inv"
     X_Y_SYM = "x-y-sym"
+    X_Z_SYM = "x-z-sym"
+    Y_Z_SYM = "y-z-sym"
     X_Y_INV = "x-y-inv"
 
 
@@ -57,6 +59,20 @@ def two_dimensional_square_symmetries() -> list[KnownSymmetries]:
     Two-dimensional square lattice symmetries.
     """
     return [KnownSymmetries.X_INV, KnownSymmetries.Y_INV, KnownSymmetries.X_Y_SYM]
+
+
+def three_dimensional_cubic_symmetries() -> list[KnownSymmetries]:
+    """
+    Three-dimensional cubic lattice symmetries.
+    """
+    return [
+        KnownSymmetries.X_INV,
+        KnownSymmetries.Y_INV,
+        KnownSymmetries.Z_INV,
+        KnownSymmetries.X_Y_SYM,
+        KnownSymmetries.X_Z_SYM,
+        KnownSymmetries.Y_Z_SYM,
+    ]
 
 
 def two_dimensional_nematic_symmetries() -> list[KnownSymmetries]:
@@ -108,11 +124,33 @@ def x_y_sym(mat: np.ndarray) -> None:
     """
     In-place x-y symmetry applied to matrix.
     """
+    _pairwise_sym(mat, 0, 1)
+
+
+def x_z_sym(mat: np.ndarray) -> None:
+    """
+    In-place x-z symmetry applied to matrix.
+    """
+    _pairwise_sym(mat, 0, 2)
+
+
+def y_z_sym(mat: np.ndarray) -> None:
+    """
+    In-place y-z symmetry applied to matrix.
+    """
+    _pairwise_sym(mat, 1, 2)
+
+
+def _pairwise_sym(mat: np.ndarray, axis_a: int, axis_b: int) -> None:
+    """
+    In-place symmetry swapping axis_a and axis_b applied to matrix.
+    """
+    assert axis_a in [0, 1, 2] and axis_b in [0, 1, 2], f"axes = {(axis_a, axis_b)} must be in [0,1,2]"
     assert len(np.shape(mat)) >= 3, f"dim(mat) = {len(np.shape(mat))} but must be at least 3 dimensional"
-    if mat.shape[0] == mat.shape[1]:
-        mat[:, :, :, ...] = np.minimum(mat, np.transpose(mat, axes=(1, 0, 2, *range(3, mat.ndim))))
+    if mat.shape[axis_a] == mat.shape[axis_b]:
+        mat[...] = np.minimum(mat, mat.swapaxes(axis_a, axis_b))
     else:
-        warnings.warn("Matrix not square. Doing nothing.")
+        warnings.warn(f"Matrix not compatible for symmetry between axes {axis_a} and {axis_b}. Doing nothing.")
 
 
 def x_y_inv(mat: np.ndarray) -> None:
@@ -138,6 +176,10 @@ def apply_symmetry(mat: np.ndarray, sym: KnownSymmetries) -> None:
         inv_sym(mat, 2)
     if sym == KnownSymmetries.X_Y_SYM:
         x_y_sym(mat)
+    if sym == KnownSymmetries.X_Z_SYM:
+        x_z_sym(mat)
+    if sym == KnownSymmetries.Y_Z_SYM:
+        y_z_sym(mat)
     if sym == KnownSymmetries.X_Y_INV:
         x_y_inv(mat)
 
@@ -159,6 +201,8 @@ def get_lattice_symmetries_from_string(symmetry_string: str) -> list[KnownSymmet
     """
     if symmetry_string == "two_dimensional_square":
         return two_dimensional_square_symmetries()
+    elif symmetry_string == "three_dimensional_cubic":
+        return three_dimensional_cubic_symmetries()
     elif symmetry_string == "quasi_one_dimensional_square":
         return quasi_one_dimensional_square_symmetries()
     elif symmetry_string == "simultaneous_x_y_inversion":

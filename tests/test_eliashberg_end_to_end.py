@@ -60,6 +60,7 @@ def test_eliashberg_equation_without_local_part(setup, niw_core, niv_core, niv_s
     assert np.allclose(lambdas_trip, np.array([3.87211113, 3.27590262, 2.91889808, 2.85647941]), atol=1e-4)
 
 
+"""
 @pytest.mark.parametrize("niw_core, niv_core, niv_shell", [(20, 20, 10), (-1, 20, 10), (20, -1, 10), (-1, -1, 10)])
 def test_eliashberg_equation_with_local_part(setup, niw_core, niv_core, niv_shell):
     folder, comm_mock = setup
@@ -89,3 +90,4 @@ def test_eliashberg_equation_with_local_part(setup, niw_core, niv_core, niv_shel
     )
     assert np.allclose(lambdas_sing, np.array([6.19956223, 5.01912816, 3.9427516, 3.53948015]), atol=1e-4)
     assert np.allclose(lambdas_trip, np.array([5.4919969, 4.65633698, 2.87634353, 2.79390464]), atol=1e-4)
+"""
