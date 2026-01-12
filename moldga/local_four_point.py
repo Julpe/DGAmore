@@ -615,24 +615,6 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         copy.update_original_shape()
         return copy
 
-    def rotate_orbitals(self, theta: float = np.pi):
-        r"""
-        Rotates the orbitals of the four-point object around the angle :math:`\theta`. :math:`\theta` must be given in
-        radians and the number of orbitals needs to be 2. Mostly intended for testing purposes.
-        """
-        copy = deepcopy(self)
-
-        if theta == 0:
-            return copy
-
-        if self.n_bands != 2:
-            raise ValueError("Rotating the orbitals is only allowed for objects that have two bands.")
-
-        r = np.array([[np.cos(theta), np.sin(theta)], [-np.sin(theta), np.cos(theta)]])
-
-        copy.mat = np.einsum("ip,jq,rk,sl,pqrs...->ijkl...", r.T, r.T, r, r, copy.mat, optimize=True)
-        return copy
-
     @staticmethod
     def load(
         filename: str,
