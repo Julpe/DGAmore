@@ -200,25 +200,6 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
 
         return SelfEnergy(poly_mat, copy.nq, copy.full_niv_range, copy.has_compressed_q_dimension, False)
 
-    def rotate_orbitals(self, theta: float = np.pi):
-        r"""
-        Rotates the orbitals of the four-point object around the angle :math:`\theta`. :math:`\theta` must be given in
-        radians and the number of orbitals needs to be 2.
-        """
-        copy = deepcopy(self)
-
-        if theta == 0:
-            return copy
-
-        if self.n_bands != 2:
-            raise ValueError("Rotating the orbitals is only allowed for objects that have two bands.")
-
-        r = np.array([[np.cos(theta), np.sin(theta)], [-np.sin(theta), np.cos(theta)]])
-
-        einsum_str = "ip,qj,xpq...->xij..." if self.has_compressed_q_dimension else "ip,qj,xyzpq...->xyzij..."
-        copy.mat = np.einsum(einsum_str, r.T, r, copy.mat, optimize=True)
-        return copy
-
     def _estimate_niv_core(self, err: float = 1e-5):
         """
         Check when the real and the imaginary part are within an error margin of the asymptotic.

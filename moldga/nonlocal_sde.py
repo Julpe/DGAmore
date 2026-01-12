@@ -37,15 +37,6 @@ def get_hartree_fock(
     hartree = 2 * (u_loc + v_q0).times("qabcd,dc->ab", config.sys.occ)
     fock = -1.0 / nq_tot * (u_loc + v_nonloc).compress_q_dimension().times("qadcb,qkdc->kab", occ_qk)
     hartree, fock = hartree[None, ..., None], fock[..., None]  # [k,o1,o2,v]
-
-    theta = 0
-
-    if theta == 0:
-        return hartree, fock
-
-    r = np.array([[np.cos(theta), np.sin(theta)], [-np.sin(theta), np.cos(theta)]])
-    hartree = np.einsum("ip,qj,xpqv->xijv", r.T, r, hartree, optimize=True)
-    fock = np.einsum("ip,qj,xpqv->xijv", r.T, r, fock, optimize=True)
     return hartree, fock
 
 
@@ -418,17 +409,12 @@ def calculate_self_energy_q(
         else [float(np.load(os.path.join(config.self_consistency.previous_sc_path, "mu_history.npy"))[-1])]
     )
 
-    theta = 0
-
     for current_iter in range(starting_iter + 1, starting_iter + config.self_consistency.max_iter + 1):
         logger.log_info("----------------------------------------")
         logger.log_info(f"Starting iteration {current_iter}.")
         logger.log_info("----------------------------------------")
 
-        giwk_full = GreensFunction.get_g_full(
-            sigma_old.rotate_orbitals(theta=-theta), mu_history[-1], config.lattice.hamiltonian.get_ek()
-        ).rotate_orbitals(theta=theta)
-
+        giwk_full = GreensFunction.get_g_full(sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek())
         giwk_full.save(output_dir=config.output.output_path, name="g_dga")
 
         logger.log_memory_usage("giwk", giwk_full, comm.size)
@@ -491,7 +477,7 @@ def calculate_self_energy_q(
         # This is done to minimize noise. We remove some fluctuations from dmft that are included in the local self-energy
         # calculated in this code and add the smooth dmft self-energy
         sigma_new += delta_sigma
-        sigma_new = sigma_new.concatenate_self_energies(sigma_dmft).rotate_orbitals(theta=-theta)
+        sigma_new = sigma_new.concatenate_self_energies(sigma_dmft)
 
         old_mu = mu_history[-1]
         if comm.rank == 0:

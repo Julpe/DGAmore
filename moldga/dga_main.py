@@ -65,9 +65,6 @@ def execute_dga_routine():
     g_dmft = comm.bcast(g_dmft, root=0)
     sigma_dmft = comm.bcast(sigma_dmft, root=0)
 
-    theta = 0
-    g_dmft = g_dmft.rotate_orbitals(theta=theta)
-
     logger.log_memory_usage("giwk & siwk", g_dmft, 2 * comm.size)
     logger.log_memory_usage("g2_dens & g2_magn", g2_dens, 2 * comm.size)
 
@@ -83,18 +80,16 @@ def execute_dga_routine():
         logger.log_info("Plotted g2 (dens) and g2 (magn).")
 
     ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
-    g_loc = GreensFunction.create_g_loc(sigma_dmft.create_with_asympt_up_to_core(), ek).rotate_orbitals(theta=theta)
-    sigma_dmft = sigma_dmft.rotate_orbitals(theta=theta)
+    g_loc = GreensFunction.create_g_loc(sigma_dmft.create_with_asympt_up_to_core(), ek)
+    sigma_dmft = sigma_dmft
     g_loc.save(output_dir=config.output.output_path, name="g_loc")
-    u_loc = config.lattice.hamiltonian.get_local_u().rotate_orbitals(theta=theta)
-    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid).rotate_orbitals(theta=theta)
+    u_loc = config.lattice.hamiltonian.get_local_u()
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
 
     logger.log_info("Preprocessing done.")
     logger.log_info("Starting local Schwinger-Dyson equation (SDE).")
 
     if comm.rank == 0:
-        g2_dens = g2_dens.rotate_orbitals(theta=theta)
-        g2_magn = g2_magn.rotate_orbitals(theta=theta)
         (gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc) = (
             local_sde.perform_local_schwinger_dyson(g_loc, g2_dens, g2_magn, u_loc)
         )

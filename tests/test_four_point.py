@@ -263,31 +263,6 @@ def test_identity_shapes_and_like(rng):
     assert I2.num_vn_dimensions == target.num_vn_dimensions
 
 
-def test_rotate_orbitals_theta_zero_is_noop(small_fourpoint_compressed):
-    fp = small_fourpoint_compressed
-    out = fp.rotate_orbitals(theta=0.0)
-    assert np.allclose(out.mat, fp.mat)
-
-
-def test_rotate_orbitals_raises_if_not_two_bands(rng):
-    nq = (1, 1, 1)
-    o = 3
-    niw = 2
-    niv = 2
-    mat = rng.standard_normal((1, o, o, o, o, 2 * niw + 1, 2 * niv, 2 * niv)) + 1j * rng.standard_normal(
-        (1, o, o, o, o, 2 * niw + 1, 2 * niv, 2 * niv)
-    )
-    fp = FourPoint(
-        mat=mat,
-        nq=nq,
-        num_wn_dimensions=1,
-        num_vn_dimensions=2,
-        has_compressed_q_dimension=True,
-    )
-    with pytest.raises(ValueError):
-        _ = fp.rotate_orbitals(theta=np.pi / 4)
-
-
 def test_add_with_localinteraction_and_interaction(rng):
     nq = (4, 4, 1)
     qtot = 4
