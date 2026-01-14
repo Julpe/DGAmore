@@ -58,30 +58,21 @@ class BubbleGenerator:
         )
 
     @staticmethod
-    def create_generalized_chi0_pp(g_loc: GreensFunction, niw_pp: int, niv_pp: int) -> LocalFourPoint:
+    def create_generalized_chi0_pp_w0(g_loc: GreensFunction, niv_pp: int) -> LocalFourPoint:
         r"""
         Returns the particle-particle bare bubble susceptibility from the Green's function. Returns the object with :math:`\omega = 0`.
-        We have :math:`\chi_{0;abcd}^{\vec{k}\nu} = G_{ad}^k * G_{cb}^{\omega-k}`. Attention:
-        no factor of :math:`\beta` is included here.
+        We have :math:`\chi_{0;abcd}^{\vec{k}\nu} = G_{ad}^k * G_{cb}^{\omega-k}`.
         """
         g = g_loc.cut_niv(niv_pp)
-        eye_bands = np.eye(g.current_shape[0])
-        wn = MFHelper.wn(niw_pp, return_only_positive=True)
-        vn = MFHelper.vn(niv_pp)
-        g_left_mat = (
-            g_loc.mat[:, None, None, :, None, g_loc.niv - niv_pp : g_loc.niv + niv_pp]
-            * eye_bands[None, :, :, None, None, None]
-        )
-        g_right_mat = (
-            g_loc.transpose_orbitals().mat[None, :, :, None, g_loc.niv + wn[:, None] - vn[None, :]]
-            * eye_bands[:, None, None, :, None, None]
+        eye_bands = np.eye(config.sys.n_bands)
+        gchi0_q = (g.mat[:, None, None, :, :] * eye_bands[None, :, :, None, None]) * (
+            np.conj(g.mat)[None, :, :, None, :] * eye_bands[:, None, None, :, None]
         )
         return LocalFourPoint(
-            -g_left_mat * g_right_mat,
+            -config.sys.beta * gchi0_q[..., None, :],
             SpinChannel.NONE,
             1,
             1,
-            full_niw_range=False,
             frequency_notation=FrequencyNotation.PP,
         )
 
@@ -97,4 +88,12 @@ class BubbleGenerator:
         gchi0_q = (g.mat[:, :, None, None, :, :] * eye_bands[None, None, :, :, None, None]) * (
             np.conj(g.mat)[:, None, :, :, None, :] * eye_bands[None, :, None, None, :, None]
         )
-        return FourPoint(gchi0_q, SpinChannel.NONE, config.lattice.nq, 0, 1, has_compressed_q_dimension=True)
+        return FourPoint(
+            gchi0_q,
+            SpinChannel.NONE,
+            config.lattice.nq,
+            0,
+            1,
+            has_compressed_q_dimension=True,
+            frequency_notation=FrequencyNotation.PP,
+        )

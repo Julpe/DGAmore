@@ -185,6 +185,13 @@ class IHaveChannel(ABC):
             raise ValueError("Channel must be of type SpinChannel.")
         self._channel = value
 
+    def set_channel(self, channel: SpinChannel):
+        """
+        Sets the spin channel of the object. For a set of available channels, see the enum `SpinChannel`.
+        """
+        self.channel = channel
+        return self
+
     @property
     def frequency_notation(self) -> FrequencyNotation:
         """
@@ -202,6 +209,14 @@ class IHaveChannel(ABC):
         if not isinstance(value, FrequencyNotation):
             raise ValueError("Frequency notation must be of type FrequencyNotation.")
         self._frequency_notation = value
+
+    def set_frequency_notation(self, value: FrequencyNotation):
+        """
+        Sets the frequency notation of the object. For a set of available frequency notations,
+        see the enum `FrequencyNotation`.
+        """
+        self.frequency_notation = value
+        return self
 
 
 class IAmNonLocal(IHaveMat, ABC):

@@ -593,9 +593,8 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
         iw_pp, iv_pp, ivp_pp = MFHelper.get_frequencies_for_ph_to_pp_channel_conversion(copy.niw, copy.niv)
         copy.mat = copy.mat[..., iw_pp, iv_pp, ivp_pp]
-        copy.frequency_notation = FrequencyNotation.PP
         copy.update_original_shape()
-        return copy.to_half_niw_range()
+        return copy.set_frequency_notation(FrequencyNotation.PP).to_half_niw_range()
 
     def pad_with_u(self, u: LocalInteraction, niv_pad: int):
         """

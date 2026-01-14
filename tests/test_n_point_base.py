@@ -173,24 +173,32 @@ def test_updates_channel_to_valid_value():
     obj = IHaveChannel()
     obj.channel = SpinChannel.MAGN
     assert obj.channel == SpinChannel.MAGN
+    obj.set_channel(SpinChannel.DENS)
+    assert obj.channel == SpinChannel.DENS
 
 
 def test_raises_error_when_setting_invalid_channel():
     obj = IHaveChannel()
     with pytest.raises(ValueError):
         obj.channel = "invalid_channel"
+    with pytest.raises(ValueError):
+        obj.set_channel("invalid_channel")
 
 
 def test_updates_frequency_notation_to_valid_value():
     obj = IHaveChannel()
     obj.frequency_notation = FrequencyNotation.PP
     assert obj.frequency_notation == FrequencyNotation.PP
+    obj.set_frequency_notation(FrequencyNotation.PH)
+    assert obj.frequency_notation == FrequencyNotation.PH
 
 
 def test_raises_error_when_setting_invalid_frequency_notation():
     obj = IHaveChannel()
     with pytest.raises(ValueError):
         obj.frequency_notation = "invalid_notation"
+    with pytest.raises(ValueError):
+        obj.set_frequency_notation("invalid_notation")
 
 
 # ----- Tests for IAmNonLocal -----
