@@ -251,37 +251,29 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
     return lambdas, gaps
 
 
-def transform_vertex_ph_to_pp_w0(f_r_loc: LocalFourPoint) -> LocalFourPoint:
-    r"""
-    Creates the local full vertex in PP notation and for :math:`\omega=0` for either singlet or triplet channel.
-    """
-    f_r_loc_pp_w0 = f_r_loc.change_frequency_notation_ph_to_pp()
-    f_r_loc_pp_w0.mat = f_r_loc_pp_w0.mat[..., 0, :, :][..., None, :, :]  # we need w=0,v,v'
-    f_r_loc_pp_w0.update_original_shape()
-    return f_r_loc_pp_w0
+def transform_vertex_ud_loc_pp_w0(name: str) -> LocalFourPoint:
+    v_dens_loc = LocalFourPoint.load(
+        os.path.join(config.output.output_path, f"{name}_dens_loc.npy"), SpinChannel.DENS
+    ).cut_niv(config.box.niv_core)
+    v_magn_loc = LocalFourPoint.load(
+        os.path.join(config.output.output_path, f"{name}_magn_loc.npy"), SpinChannel.MAGN
+    ).cut_niv(config.box.niv_core)
+
+    v_ud_loc = 0.5 * (v_dens_loc - v_magn_loc).set_channel(SpinChannel.UD)
+    v_ud_loc_pp_w0 = v_ud_loc.change_frequency_notation_ph_to_pp_w0()
+    v_ud_loc_pp_w0.mat = v_ud_loc_pp_w0.mat[..., 0, :, :][..., None, :, :]  # we need w=0,v,v'
+    v_ud_loc_pp_w0.update_original_shape()
+    del v_dens_loc, v_magn_loc, v_ud_loc
+    return v_ud_loc_pp_w0
 
 
-def create_local_ud_diagrams_pp_w0(g_loc: GreensFunction) -> Tuple[LocalFourPoint, LocalFourPoint]:
+def create_local_ud_diagrams_pp_w0(g_loc: GreensFunction) -> Tuple[LocalFourPoint, LocalFourPoint, LocalFourPoint]:
     r"""
     Creates the local particle-particle reducible diagrams for :math:`\omega=0`. Uses equation B.26 in Rohringer's
     thesis. NOTE: This is not fully tested yet and still in development. Please consider setting
     `include_local_part` in the Eliashberg configuration to False.
     """
-
-    def get_ud_loc_pp_w0_vertex(name: str) -> LocalFourPoint:
-        v_dens_loc = LocalFourPoint.load(
-            os.path.join(config.output.output_path, f"{name}_dens_loc.npy"), SpinChannel.DENS
-        )
-        v_magn_loc = LocalFourPoint.load(
-            os.path.join(config.output.output_path, f"{name}_magn_loc.npy"), SpinChannel.MAGN
-        )
-
-        v_ud_loc = 0.5 * (v_dens_loc - v_magn_loc).set_channel(SpinChannel.UD)
-        v_ud_loc_pp_w0 = transform_vertex_ph_to_pp_w0(v_ud_loc)
-        del v_dens_loc, v_magn_loc, v_ud_loc
-        return v_ud_loc_pp_w0
-
-    gchi_ud_loc_pp_w0 = get_ud_loc_pp_w0_vertex("gchi")
+    gchi_ud_loc_pp_w0 = transform_vertex_ud_loc_pp_w0("gchi")
 
     gchi0_loc_pp_w0 = BubbleGenerator.create_generalized_chi0_pp_w0(g_loc, gchi_ud_loc_pp_w0.niv)
 
@@ -289,7 +281,10 @@ def create_local_ud_diagrams_pp_w0(g_loc: GreensFunction) -> Tuple[LocalFourPoin
         (gchi_ud_loc_pp_w0.flip_frequency_axis(-1) - gchi0_loc_pp_w0).invert() + gchi0_loc_pp_w0.invert()
     ).flip_frequency_axis(-1)
 
-    f_ud_loc_pp_w0 = get_ud_loc_pp_w0_vertex("f")
+    if config.output.save_quantities:
+        gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
+
+    f_ud_loc_pp_w0 = transform_vertex_ud_loc_pp_w0("f")
 
     phi_ud_loc_pp_w0 = f_ud_loc_pp_w0 - gamma_ud_loc_pp_w0
     phi_ud_loc_pp_w0.mat = phi_ud_loc_pp_w0.mat[..., 0, :, :]
@@ -300,7 +295,7 @@ def create_local_ud_diagrams_pp_w0(g_loc: GreensFunction) -> Tuple[LocalFourPoin
     f_ud_loc_pp_w0.update_original_shape()
     f_ud_loc_pp_w0._num_wn_dimensions = 0
 
-    return f_ud_loc_pp_w0, phi_ud_loc_pp_w0
+    return f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0
 
 
 def solve(
@@ -324,8 +319,6 @@ def solve(
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
 
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
-    if config.eliashberg.include_local_part:
-        niv_pp = min(config.box.niw_core // 3, config.box.niv_full // 3, niv_pp)
 
     f_dens_pp = create_full_vertex_q_r_pp_w0(u_loc, v_nonloc, gamma_dens, niv_pp, mpi_dist_irrk)
     f_magn_pp = create_full_vertex_q_r_pp_w0(u_loc, v_nonloc, gamma_magn, niv_pp, mpi_dist_irrk)
@@ -353,11 +346,17 @@ def solve(
         logger.log_info("Created the bare bubble susceptibility in pp notation.")
 
         if config.eliashberg.include_local_part:
-            f_ud_loc_pp_w0, phi_ud_loc_pp_w0 = create_local_ud_diagrams_pp_w0(g_loc)
+            f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0 = create_local_ud_diagrams_pp_w0(g_loc)
+
+            if config.output.save_quantities:
+                f_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="f_ud_loc_pp_w0")
+                phi_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="phi_ud_loc_pp_w0")
+                gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
+                logger.log_info("Saved local ud diagrams in pp notation to file.")
 
             gamma_sing_pp -= f_ud_loc_pp_w0 + phi_ud_loc_pp_w0
             gamma_trip_pp -= f_ud_loc_pp_w0 + phi_ud_loc_pp_w0
-            del f_ud_loc_pp_w0, phi_ud_loc_pp_w0
+            del f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0
 
         if config.eliashberg.save_pairing_vertex:
             gamma_sing_pp.save(

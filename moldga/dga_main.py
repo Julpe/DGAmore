@@ -105,10 +105,6 @@ def execute_dga_routine():
 
     logger.log_info("Local Schwinger-Dyson equation (SDE) done.")
 
-    if comm.rank == 0:
-        (2 * f_m).save(name="f_dc_loc", output_dir=config.output.output_path)
-        logger.log_info(f"Saved F_dc = 2*F_m to file.")
-
     if (config.lambda_correction.perform_lambda_correction or config.output.save_quantities) and comm.rank == 0:
         chi_d.save(name="chi_dens_loc", output_dir=config.output.output_path)
         chi_m.save(name="chi_magn_loc", output_dir=config.output.output_path)

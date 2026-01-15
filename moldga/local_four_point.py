@@ -573,7 +573,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         copy.mat = np.einsum(permutation, copy.mat, optimize=True)
         return copy
 
-    def change_frequency_notation_ph_to_pp(self) -> "LocalFourPoint":
+    def change_frequency_notation_ph_to_pp_w0(self):
         r"""
         Changes the frequency notation of the object from ph to pp and returns a copy in half the niw range.
         The frequency shifts are :math:`(w,v_1,v_2) -> (w',v_1',v_2') = (v_1 + v_2 - w, v_1, v_2)`.
@@ -591,10 +591,10 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         if copy.num_vn_dimensions == 1:
             copy = copy.extend_vn_to_diagonal()
 
-        iw_pp, iv_pp, ivp_pp = MFHelper.get_frequencies_for_ph_to_pp_channel_conversion(copy.niw, copy.niv)
-        copy.mat = copy.mat[..., iw_pp, iv_pp, ivp_pp]
+        iw_pp, iv_pp, ivp_pp = MFHelper.get_frequencies_for_ph_to_pp_w0_channel_conversion(copy.niw, copy.niv)
+        copy.mat = copy.mat[..., iw_pp, iv_pp, ivp_pp][..., None, :, :]
         copy.update_original_shape()
-        return copy.set_frequency_notation(FrequencyNotation.PP).to_half_niw_range()
+        return copy.set_frequency_notation(FrequencyNotation.PP)
 
     def pad_with_u(self, u: LocalInteraction, niv_pad: int):
         """

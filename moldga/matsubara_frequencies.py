@@ -56,33 +56,19 @@ class MFHelper:
         return np.pi / beta * (2 * MFHelper.vn(niv, shift, return_only_positive) + 1)
 
     @staticmethod
-    def get_frequencies_for_ph_to_pp_channel_conversion(
+    def get_frequencies_for_ph_to_pp_w0_channel_conversion(
         niw: int, niv: int
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         r"""
         Returns the new frequencies :math:`(w', v_1', v_2')` for the conversion of ph to pp notation.
-        :math:`F_{pp}[w,v_1,v_2] = F_{ph}[w',v_1',v_2']` where :math:`(w,v_1,v_2) -> (w',v_1',v_2') = (v_1 + v_2 - w, v_1, v_2)`
+        :math:`F_{pp}[w,v_1,v_2] = F_{ph}[w',v_1',v_2']` where :math:`(w,v_1,v_2) -> (w',v_1',v_2') = (v_1+v_2-w,v_1,v_2)`
         """
-        niw_pp, niv_pp = niw // 3, min(niw // 3, niv // 3)
-        iw, iv, ivp = MFHelper._get_frequencies_for_channel_conversion(niw_pp, niv_pp)
-        return niw + iv + ivp - iw, niv + iv, niv + ivp
+        niv_pp = min(niw // 2, niv)
+        vn = MFHelper.vn(niv_pp)
+        vn_pp, vpn_pp = np.meshgrid(vn, vn, indexing="ij")
 
-    @staticmethod
-    def get_frequencies_for_ph_to_ph_bar_channel_conversion(
-        niw: int, niv: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        r"""
-        Returns the new frequencies :math:`(w', v_1', v_2')` for the conversion of ph to ph_bar notation.
-        :math:`F_ph_bar[...] = F_ph[w',v_1',v_2']` where :math:`(w,v_1,v_2) -> (w',v_1',v_2') = (v_2-v_1, v_2-w, v_2)`
-        """
-        niw_phbar, niv_phbar = niw // 2, min(niw // 2, niv // 2)
-        iw, iv, ivp = MFHelper._get_frequencies_for_channel_conversion(niw_phbar, niv_phbar)
-        return niw + ivp - iv, niv + ivp - iw, niv + ivp
+        wn_pp = niw + 1 + vn_pp + vpn_pp
+        vn_pp += niv
+        vpn_pp += niv
 
-    @staticmethod
-    def _get_frequencies_for_channel_conversion(niw: int, niv: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Helper method which returns three frequency arrays for the conversion of frequency notation.
-        """
-        wn, vn = MFHelper.wn(niw), MFHelper.vn(niv)
-        return wn[:, None, None], vn[None, :, None], vn[None, None, :]
+        return wn_pp, vn_pp, vpn_pp
