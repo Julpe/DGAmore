@@ -61,7 +61,7 @@ class BubbleGenerator:
     def create_generalized_chi0_pp_w0(g_loc: GreensFunction, niv_pp: int) -> LocalFourPoint:
         r"""
         Returns the particle-particle bare bubble susceptibility from the Green's function. Returns the object with :math:`\omega = 0`.
-        We have :math:`\chi_{0;abcd}^{\vec{k}\nu} = G_{ad}^k * G_{cb}^{\omega-k}`.
+        We have :math:`\chi_{0;abcd}^{\vec{k}\nu} = -\beta * G_{ad}^k * G_{cb}^{\omega-k}`.
         """
         g = g_loc.cut_niv(niv_pp)
         eye_bands = np.eye(config.sys.n_bands)

@@ -273,13 +273,21 @@ def create_local_ud_diagrams_pp_w0(g_loc: GreensFunction) -> Tuple[LocalFourPoin
     thesis. NOTE: This is not fully tested yet and still in development. Please consider setting
     `include_local_part` in the Eliashberg configuration to False.
     """
-    gchi_ud_loc_pp_w0 = transform_vertex_ud_loc_pp_w0("gchi")
+    gchi_ud_loc_pp_w0 = transform_vertex_ud_loc_pp_w0("gchi").flip_frequency_axis(-1).swap_fermionic_frequency_axes()
 
-    gchi0_loc_pp_w0 = BubbleGenerator.create_generalized_chi0_pp_w0(g_loc, gchi_ud_loc_pp_w0.niv)
+    gchi0_loc_pp_w0 = (
+        BubbleGenerator.create_generalized_chi0_pp_w0(g_loc, gchi_ud_loc_pp_w0.niv)
+        .extend_vn_to_diagonal()
+        .flip_frequency_axis(-1)
+        .swap_fermionic_frequency_axes()
+    )
 
-    gamma_ud_loc_pp_w0 = config.sys.beta**2 * (
-        (gchi_ud_loc_pp_w0.flip_frequency_axis(-1) - gchi0_loc_pp_w0).invert() + gchi0_loc_pp_w0.invert()
-    ).flip_frequency_axis(-1)
+    gamma_ud_loc_pp_w0 = (
+        config.sys.beta**2
+        * ((gchi_ud_loc_pp_w0 - gchi0_loc_pp_w0).invert() + gchi0_loc_pp_w0.invert())
+        .flip_frequency_axis(-1)
+        .swap_fermionic_frequency_axes()
+    )
 
     if config.output.save_quantities:
         gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")

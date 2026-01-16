@@ -232,6 +232,17 @@ class LocalNPoint(IHaveMat):
         copy.mat = np.flip(copy.mat, axis=axis)
         return copy
 
+    def swap_fermionic_frequency_axes(self):
+        """
+        Swaps two frequency axes of the matrix and returns a copy.
+        """
+        if self.num_vn_dimensions < 2:
+            raise ValueError("Cannot swap axes if there are less than two fermionic frequency dimensions.")
+
+        copy = deepcopy(self)
+        copy.mat = np.swapaxes(copy.mat, -1, -2)
+        return copy
+
     def save(self, output_dir: str = "./", name: str = "please_give_me_a_name") -> None:
         """
         Saves the content of the matrix to a numpy file. Always saves it in half the niw range to save storage space.
