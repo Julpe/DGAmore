@@ -80,7 +80,7 @@ def create_full_vertex_q_r(
     return f_q_r
 
 
-def transform_vertex_q_ph_to_pp_w0(f_q_r: FourPoint, niv_pp: int) -> FourPoint:
+def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp: int) -> np.ndarray:
     """
     Transforms the vertex function from particle-hole notation to particle-particle notation based on Motoharu Kitatani's
     frequency convention (which is the same as Georg Rohringer's). This is done by flipping the last Matsubara
@@ -89,14 +89,27 @@ def transform_vertex_q_ph_to_pp_w0(f_q_r: FourPoint, niv_pp: int) -> FourPoint:
     """
     vn = MFHelper.vn(niv_pp)
     omega = vn[:, None] - vn[None, :]
-    f_q_r = f_q_r.cut_niv(niv_pp).to_full_niw_range().flip_frequency_axis(-1)
-    f_q_r_pp_mat = np.zeros((*f_q_r.current_shape[:-3], 2 * niv_pp, 2 * niv_pp), dtype=f_q_r.mat.dtype)
+    vertex = vertex.cut_niv(niv_pp).to_full_niw_range().flip_frequency_axis(-1)
+    f_q_r_pp_mat = np.zeros((*vertex.current_shape[:-3], 2 * niv_pp, 2 * niv_pp), dtype=vertex.mat.dtype)
     for idx, w in enumerate(MFHelper.wn(config.box.niw_core)):
-        f_q_r_pp_mat[..., omega == w] = -f_q_r[..., idx, omega == w]
+        f_q_r_pp_mat[..., omega == w] = -vertex[..., idx, omega == w]
+    return f_q_r_pp_mat
 
-    return FourPoint(
-        f_q_r_pp_mat, f_q_r.channel, config.lattice.q_grid.nk, 0, 2, True, True, True, FrequencyNotation.PP
-    )
+
+def transform_vertex_loc_frequencies_w0(f_r_loc: LocalFourPoint, niv_pp: int) -> LocalFourPoint:
+    """
+    Transforms the vertex function from particle-hole notation to a modified particle-particle notation.
+    """
+    mat = _transform_vertex_frequencies_w0(f_r_loc, niv_pp)
+    return LocalFourPoint(mat, SpinChannel.UD, 0, 2, True, True, FrequencyNotation.PP)
+
+
+def transform_vertex_q_frequencies_w0(f_q_r: FourPoint, niv_pp: int) -> FourPoint:
+    """
+    Transforms the vertex function from particle-hole notation to a modified particle-particle notation.
+    """
+    mat = _transform_vertex_frequencies_w0(f_q_r, niv_pp)
+    return FourPoint(mat, f_q_r.channel, config.lattice.q_grid.nk, 0, 2, True, True, True, FrequencyNotation.PP)
 
 
 def create_full_vertex_q_r_pp_w0(
@@ -119,7 +132,7 @@ def create_full_vertex_q_r_pp_w0(
     logger.log_info(f"Full ladder-vertex ({f_q_r.channel.value}) calculated.")
     logger.log_memory_usage(f"Full ladder-vertex ({f_q_r.channel.value})", f_q_r, mpi_dist_irrk.comm.size)
 
-    return transform_vertex_q_ph_to_pp_w0(f_q_r, niv_pp)
+    return transform_vertex_q_frequencies_w0(f_q_r, niv_pp)
 
 
 def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
@@ -251,7 +264,7 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
     return lambdas, gaps
 
 
-def transform_vertex_ud_loc_pp_w0(name: str) -> LocalFourPoint:
+def transform_vertex_ud_loc_ph_to_pp_w0(name: str) -> LocalFourPoint:
     v_dens_loc = LocalFourPoint.load(
         os.path.join(config.output.output_path, f"{name}_dens_loc.npy"), SpinChannel.DENS
     ).cut_niv(config.box.niv_core)
@@ -273,7 +286,9 @@ def create_local_ud_diagrams_pp_w0(g_loc: GreensFunction) -> Tuple[LocalFourPoin
     thesis. NOTE: This is not fully tested yet and still in development. Please consider setting
     `include_local_part` in the Eliashberg configuration to False.
     """
-    gchi_ud_loc_pp_w0 = transform_vertex_ud_loc_pp_w0("gchi").flip_frequency_axis(-1).swap_fermionic_frequency_axes()
+    gchi_ud_loc_pp_w0 = (
+        transform_vertex_ud_loc_ph_to_pp_w0("gchi").flip_frequency_axis((-2, -1)).swap_fermionic_frequency_axes()
+    )
 
     gchi0_loc_pp_w0 = (
         BubbleGenerator.create_generalized_chi0_pp_w0(g_loc, gchi_ud_loc_pp_w0.niv)
@@ -285,14 +300,14 @@ def create_local_ud_diagrams_pp_w0(g_loc: GreensFunction) -> Tuple[LocalFourPoin
     gamma_ud_loc_pp_w0 = (
         config.sys.beta**2
         * ((gchi_ud_loc_pp_w0 - gchi0_loc_pp_w0).invert() + gchi0_loc_pp_w0.invert())
-        .flip_frequency_axis(-1)
+        .flip_frequency_axis((-2, -1))
         .swap_fermionic_frequency_axes()
     )
 
     if config.output.save_quantities:
         gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
 
-    f_ud_loc_pp_w0 = transform_vertex_ud_loc_pp_w0("f")
+    f_ud_loc_pp_w0 = transform_vertex_ud_loc_ph_to_pp_w0("f")
 
     phi_ud_loc_pp_w0 = f_ud_loc_pp_w0 - gamma_ud_loc_pp_w0
     phi_ud_loc_pp_w0.mat = phi_ud_loc_pp_w0.mat[..., 0, :, :]
@@ -354,6 +369,21 @@ def solve(
         logger.log_info("Created the bare bubble susceptibility in pp notation.")
 
         if config.eliashberg.include_local_part:
+            f_dens_loc = LocalFourPoint.load(
+                os.path.join(config.output.output_path, "f_dens_loc.npy"), SpinChannel.DENS
+            )
+            f_magn_loc = LocalFourPoint.load(
+                os.path.join(config.output.output_path, "f_magn_loc.npy"), SpinChannel.MAGN
+            )
+            # note, this is not the regular full vertex in pp notation but rather the one with a different v, v'
+            # transformation, see Eq. 4.49 or Eq. 4.50 in my thesis.
+            f_ud_loc_transformed_pp = transform_vertex_loc_frequencies_w0(0.5 * (f_dens_loc - f_magn_loc), niv_pp)
+
+            gamma_sing_pp -= f_ud_loc_transformed_pp
+            gamma_trip_pp -= f_ud_loc_transformed_pp
+
+            del f_dens_loc, f_magn_loc, f_ud_loc_transformed_pp
+
             f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0 = create_local_ud_diagrams_pp_w0(g_loc)
 
             if config.output.save_quantities:
@@ -362,8 +392,8 @@ def solve(
                 gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
                 logger.log_info("Saved local ud diagrams in pp notation to file.")
 
-            gamma_sing_pp -= f_ud_loc_pp_w0 + phi_ud_loc_pp_w0
-            gamma_trip_pp -= f_ud_loc_pp_w0 + phi_ud_loc_pp_w0
+            gamma_sing_pp -= phi_ud_loc_pp_w0
+            gamma_trip_pp -= phi_ud_loc_pp_w0
             del f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0
 
         if config.eliashberg.save_pairing_vertex:
