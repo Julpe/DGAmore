@@ -372,21 +372,6 @@ def solve(
         logger.log_info("Created the bare bubble susceptibility in pp notation.")
 
         if config.eliashberg.include_local_part:
-            f_dens_loc = LocalFourPoint.load(
-                os.path.join(config.output.output_path, "f_dens_loc.npy"), SpinChannel.DENS
-            )
-            f_magn_loc = LocalFourPoint.load(
-                os.path.join(config.output.output_path, "f_magn_loc.npy"), SpinChannel.MAGN
-            )
-            # note, this is not the regular full vertex in pp notation but rather the one with a different v, v'
-            # transformation, see Eq. 4.49 or Eq. 4.50 in my thesis.
-            f_ud_loc_transformed_pp = transform_pp_to_ph_w0(0.5 * (f_dens_loc - f_magn_loc), niv_pp)
-
-            gamma_sing_pp -= f_ud_loc_transformed_pp
-            gamma_trip_pp -= f_ud_loc_transformed_pp
-
-            del f_dens_loc, f_magn_loc, f_ud_loc_transformed_pp
-
             f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0 = create_local_ud_diagrams_pp_w0(g_loc, niv_pp)
 
             if config.output.save_quantities:
@@ -395,8 +380,8 @@ def solve(
                 gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
                 logger.log_info("Saved local ud diagrams in pp notation to file.")
 
-            gamma_sing_pp -= phi_ud_loc_pp_w0
-            gamma_trip_pp -= phi_ud_loc_pp_w0
+            gamma_sing_pp -= f_ud_loc_pp_w0 + phi_ud_loc_pp_w0
+            gamma_trip_pp -= f_ud_loc_pp_w0 + phi_ud_loc_pp_w0
             del f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0
 
         if config.eliashberg.save_pairing_vertex:
