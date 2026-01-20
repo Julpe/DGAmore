@@ -361,6 +361,27 @@ def test_returns_self_when_already_in_half_bosonic_range():
     assert result.mat.shape == mat.shape
 
 
+def test_swaps_two_fermionic_frequency_axes_correctly():
+    mat = np.zeros((2, 2, 2, 2, 5, 4, 4))
+    random_1 = np.random.rand()
+    random_2 = np.random.rand()
+    mat[..., 0, 1] = random_1
+    mat[..., 1, 0] = random_2
+    obj = LocalNPoint(mat, 4, 1, 2)
+    result = obj.swap_fermionic_frequency_axes()
+    assert np.allclose(result.mat[..., 0, 1], random_2)
+    assert np.allclose(result.mat[..., 1, 0], random_1)
+
+
+@pytest.mark.parametrize("num_vn_dimensions", [0, 1])
+def test_raises_error_when_swapping_with_less_than_two_fermionic_dimensions(num_vn_dimensions):
+    shape = (4, 4, 4, 4, 1) + (4,) * num_vn_dimensions
+    mat = np.zeros(shape)
+    obj = LocalNPoint(mat, 4, 1, num_vn_dimensions)
+    with pytest.raises(ValueError):
+        obj.swap_fermionic_frequency_axes()
+
+
 def test_saves_matrix_calls_to_full_niw_range_when_full_range():
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=True)

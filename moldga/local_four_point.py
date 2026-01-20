@@ -573,29 +573,6 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         copy.mat = np.einsum(permutation, copy.mat, optimize=True)
         return copy
 
-    def change_frequency_notation_ph_to_pp_w0(self):
-        r"""
-        Changes the frequency notation of the object from ph to pp and returns a copy in half the niw range.
-        The frequency shifts are :math:`(w,v_1,v_2) -> (w',v_1',v_2') = (v_1 + v_2 - w, v_1, v_2)`.
-        """
-        if self.num_wn_dimensions != 1 or self.num_vn_dimensions not in (1, 2):
-            raise ValueError("Object must have 1 bosonic and 1 or 2 fermionic frequency dimensions.")
-
-        copy = deepcopy(self)
-
-        if copy.frequency_notation == FrequencyNotation.PP:
-            return copy
-
-        copy = copy.to_full_niw_range()
-
-        if copy.num_vn_dimensions == 1:
-            copy = copy.extend_vn_to_diagonal()
-
-        iw_pp, iv_pp, ivp_pp = MFHelper.get_frequencies_for_ph_to_pp_w0_channel_conversion(copy.niw, copy.niv)
-        copy.mat = copy.mat[..., iw_pp, iv_pp, ivp_pp][..., None, :, :]
-        copy.update_original_shape()
-        return copy.set_frequency_notation(FrequencyNotation.PP)
-
     def create_wn_dimension(self):
         """
         Creates a bosonic frequency dimension for the LocalFourPoint object if it does not have one yet.
