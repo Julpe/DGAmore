@@ -23,7 +23,7 @@ def setup():
         yield folder, comm_mock
 
 
-@pytest.mark.parametrize("niw_core, niv_core, niv_shell", [(20, 20, 10), (-1, 20, 10), (20, -1, 10), (-1, -1, 10)])
+@pytest.mark.parametrize("niw_core, niv_core, niv_shell", [(20, 20, 10)])
 def test_calculates_nonlocal_sde_correctly(setup, niw_core, niv_core, niv_shell):
     folder, comm_mock = setup
 

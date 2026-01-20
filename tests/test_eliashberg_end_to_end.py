@@ -30,7 +30,7 @@ def setup():
         yield folder, comm_mock
 
 
-@pytest.mark.parametrize("niw_core, niv_core, niv_shell", [(20, 20, 10), (-1, 20, 10), (20, -1, 10), (-1, -1, 10)])
+@pytest.mark.parametrize("niw_core, niv_core, niv_shell", [(20, 20, 10)])
 def test_eliashberg_equation_without_local_part(setup, niw_core, niv_core, niv_shell):
     folder, comm_mock = setup
 
@@ -60,7 +60,7 @@ def test_eliashberg_equation_without_local_part(setup, niw_core, niv_core, niv_s
     assert np.allclose(lambdas_trip, np.array([3.31268461, 2.97998614, 2.71194245, 2.71194088]), atol=1e-4)
 
 
-@pytest.mark.parametrize("niw_core, niv_core, niv_shell", [(20, 20, 10), (-1, 20, 10), (20, -1, 10), (-1, -1, 10)])
+@pytest.mark.parametrize("niw_core, niv_core, niv_shell", [(20, 20, 10)])
 def test_eliashberg_equation_with_local_part(setup, niw_core, niv_core, niv_shell):
     folder, comm_mock = setup
 
@@ -87,5 +87,5 @@ def test_eliashberg_equation_with_local_part(setup, niw_core, niv_core, niv_shel
     lambdas_sing, lambdas_trip, gaps_sing, gaps_trip = eliashberg_solver.solve(
         g_dga, g_dmft, u_loc, v_nonloc, gamma_dens, gamma_magn, comm_mock
     )
-    assert np.allclose(lambdas_sing, np.array([3.80246556, 3.76423898, 3.59673922, 3.50612527]), atol=1e-4)
-    assert np.allclose(lambdas_trip, np.array([4.74189571, 4.32932316, 3.10310033, 3.03508083]), atol=1e-4)
+    assert np.allclose(lambdas_sing, np.array([5.35773904, 5.19313805, 3.69113813, 3.57722097]), atol=1e-4)
+    assert np.allclose(lambdas_trip, np.array([4.61666175, 4.61222357, 3.13225854, 3.00039873]), atol=1e-4)

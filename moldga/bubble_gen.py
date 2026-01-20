@@ -65,11 +65,11 @@ class BubbleGenerator:
         """
         g = g_loc.cut_niv(niv_pp)
         eye_bands = np.eye(config.sys.n_bands)
-        gchi0_q = (g.mat[:, None, None, :, :] * eye_bands[None, :, :, None, None]) * (
+        gchi0_pp_w0 = (g.mat[:, None, None, :, :] * eye_bands[None, :, :, None, None]) * (
             np.conj(g.mat)[None, :, :, None, :] * eye_bands[:, None, None, :, None]
         )
         return LocalFourPoint(
-            -config.sys.beta * gchi0_q[..., None, :],
+            -config.sys.beta * gchi0_pp_w0[..., None, :],
             SpinChannel.NONE,
             1,
             1,

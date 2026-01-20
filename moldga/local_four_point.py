@@ -596,6 +596,36 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         copy.update_original_shape()
         return copy.set_frequency_notation(FrequencyNotation.PP)
 
+    def create_wn_dimension(self):
+        """
+        Creates a bosonic frequency dimension for the LocalFourPoint object if it does not have one yet.
+        The new bosonic frequency dimension will have niw=0 only.
+        """
+        if self.num_wn_dimensions != 0:
+            raise ValueError("Object already has bosonic frequency dimensions.")
+
+        copy = deepcopy(self)
+        # insert bosonic axis immediately before the last vn axes
+        copy.mat = np.expand_dims(copy.mat, axis=-(copy.num_vn_dimensions + 1))
+        copy._num_wn_dimensions = 1
+        copy.update_original_shape()
+        return copy
+
+    def take_first_wn(self):
+        """
+        Selects the first entry in the wn dimension of the LocalFourPoint object, effectively removing the bosonic
+        frequency dimension.
+        """
+        if self.num_wn_dimensions != 1:
+            raise ValueError("Object must have exactly one bosonic frequency dimension.")
+
+        copy = deepcopy(self)
+        # select first entry of wn
+        copy.mat = np.take(copy.mat, 0, axis=-(copy.num_vn_dimensions + 1))
+        copy._num_wn_dimensions = 0
+        copy.update_original_shape()
+        return copy
+
     def pad_with_u(self, u: LocalInteraction, niv_pad: int):
         """
         Used to pad a LocalFourPoint object with a LocalInteraction object outside the core frequency region.

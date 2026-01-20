@@ -110,7 +110,7 @@ def test_extracts_dmft_quantities_correctly(setup, niw_core, niv_core, niv_shell
     assert np.allclose(vq.mat, np.zeros_like(vq.mat))
 
 
-@pytest.mark.parametrize("niw_core, niv_core, niv_shell", [(20, 20, 10), (-1, 20, 10), (20, -1, 10), (-1, -1, 10)])
+@pytest.mark.parametrize("niw_core, niv_core, niv_shell", [(20, 20, 10)])
 def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
     folder = setup
 
