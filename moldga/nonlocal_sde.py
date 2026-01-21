@@ -265,48 +265,38 @@ def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full
 
 def calculate_sigma_from_kernel_fast(kernel: FourPoint, giwk: GreensFunction, my_full_q_list: np.ndarray) -> SelfEnergy:
     r"""
-    Returns :math:`\Sigma_{ij}^{k} = -1/2 * 1/\beta * 1/N_q \sum_q [ U^q_{r;aibc} * K_{r;cbjd}^{qv} * G_{ad}^{w-v} ]`.
+    Returns :math:`\Sigma_{ij}^{k} = -1/2 * 1/\beta * 1/N_q \sum_q [ U^q_{r;aibc} * K_{r;cbjd}^{qv} * G_{ad}^{q-k} ]`.
     For very large momentum grids, this function is the slowest part compared to the rest of the code due to the
     repeated loops. Potential speed-ups could be achieved by batching the q-points or using numba.
     """
+    nkx, nky, nkz = config.lattice.k_grid.nk
+    niv_core = config.box.niv_core
+    nb = config.sys.n_bands
+    xyz = config.lattice.k_grid.nk_tot
 
-    mat = np.zeros(
-        (*config.lattice.k_grid.nk, config.sys.n_bands, config.sys.n_bands, config.box.niv_core),
-        dtype=kernel.mat.dtype,
-    )
+    mat = np.zeros((nkx, nky, nkz, nb, nb, niv_core), dtype=kernel.mat.dtype)
 
     wn = MFHelper.wn(config.box.niw_core)
-
-    nkx, nky, nkz = config.lattice.k_grid.nk
-    vdim = config.box.niv_core
-    xyz = config.lattice.k_grid.nk_tot
-    nb = config.sys.n_bands
+    freq_slices = [slice(giwk.niv - w, giwk.niv - w + niv_core) for w in wn]
 
     giwk_mat_f = np.asfortranarray(giwk.mat)
-    kernel = np.asfortranarray(kernel.to_full_niw_range().mat)
-    acc_2d = np.empty((xyz, nb**2), dtype=mat.dtype)
+    kernel_mat = np.asfortranarray(kernel.to_full_niw_range().mat)
 
     kxs, kys, kzs = np.arange(nkx), np.arange(nky), np.arange(nkz)
     kx_indices = [((kxs + q[0]) % nkx) for q in my_full_q_list]
     ky_indices = [((kys + q[1]) % nky) for q in my_full_q_list]
     kz_indices = [((kzs + q[2]) % nkz) for q in my_full_q_list]
 
-    for idx_q, q in enumerate(my_full_q_list):
+    for idx_q in range(len(my_full_q_list)):
         g_q_view = giwk_mat_f[
             kx_indices[idx_q][:, None, None], ky_indices[idx_q][None, :, None], kz_indices[idx_q][None, None, :], ...
         ].reshape(xyz, *giwk_mat_f.shape[3:])
 
-        for idx_w, wn_i in enumerate(wn):
-            g = (
-                g_q_view[..., giwk.niv - wn_i : giwk.niv + config.box.niv_core - wn_i]
-                .transpose(0, 2, 1, 3)
-                .reshape(xyz, nb**2, vdim)
-            )
-            k = kernel[idx_q, ..., idx_w, config.box.niv_core :].transpose(0, 3, 1, 2, 4).reshape(nb**2, nb**2, vdim)
-
-            for t in range(vdim):
-                np.matmul(g[:, :, t], k[:, :, t], out=acc_2d)
-                mat[..., t] += acc_2d.reshape(nkx, nky, nkz, nb, nb)
+        for idx_w, fs in enumerate(freq_slices):
+            g = g_q_view[..., fs].transpose(0, 2, 1, 3).reshape(xyz, nb * nb, niv_core)
+            k = kernel_mat[idx_q, ..., idx_w, niv_core:].transpose(0, 3, 1, 2, 4).reshape(nb * nb, nb * nb, niv_core)
+            acc = np.matmul(g.transpose(2, 0, 1), k.transpose(2, 0, 1)).transpose(1, 2, 0)
+            mat += acc.reshape(nkx, nky, nkz, nb, nb, niv_core)
 
     mat *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
     return SelfEnergy(np.ascontiguousarray(mat), config.lattice.nk, False).compress_q_dimension()
@@ -401,6 +391,9 @@ def calculate_self_energy_q(
             f"Using previous calculation and starting the self-consistency loop at iteration {starting_iter+1}."
         )
 
+    sigma_old = sigma_old.cut_niv(config.box.niv_core + config.box.niv_full)
+    sigma_dmft = sigma_dmft.cut_niv(config.box.niv_core + config.box.niv_full)
+
     delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_local.cut_niv(config.box.niv_core)
     mu_history = (
         [config.sys.mu]
@@ -419,7 +412,7 @@ def calculate_self_energy_q(
             giwk_full.save(output_dir=config.output.output_path, name="g_dga")
 
         logger.log_memory_usage("giwk", giwk_full, comm.size)
-        gchi0_q = BubbleGenerator.create_generalized_chi0_q(
+        gchi0_q = BubbleGenerator.create_generalized_chi0_q_fast(
             giwk_full, config.box.niw_core, config.box.niv_full, my_irr_q_list
         )
 
@@ -493,12 +486,6 @@ def calculate_self_energy_q(
         config.sys.mu = comm.bcast(config.sys.mu)
         mu_history.append(config.sys.mu)
         logger.log_info(f"Updated mu from {old_mu} to {config.sys.mu}.")
-
-        if config.self_consistency.use_poly_fit and config.poly_fitting.do_poly_fitting:
-            sigma_new = sigma_new.fit_polynomial(
-                config.poly_fitting.n_fit, config.poly_fitting.o_fit, config.box.niv_core
-            )
-            logger.log_info(f"Fitted polynomial to sigma at iteration {current_iter}.")
 
         logger.log_info("Applying mixing strategy to the self-energy.")
         sigma_new = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter)
