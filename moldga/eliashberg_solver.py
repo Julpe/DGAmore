@@ -54,7 +54,7 @@ def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp:
     return f_q_r_pp_mat
 
 
-def transform_pp_to_ph_w0(f_r_loc: LocalFourPoint, niv_pp: int) -> LocalFourPoint:
+def transform_vertex_loc_frequencies_w0(f_r_loc: LocalFourPoint, niv_pp: int) -> LocalFourPoint:
     """
     Transforms the vertex function from particle-hole notation to a modified particle-particle notation.
     """
@@ -150,7 +150,7 @@ def create_local_ud_diagrams_pp_w0(
     gchi_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"gchi_dens_loc.npy"), SpinChannel.DENS)
     gchi_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"gchi_magn_loc.npy"), SpinChannel.MAGN)
     gchi_ud_loc = 0.5 * (gchi_dens_loc - gchi_magn_loc).set_channel(SpinChannel.UD)
-    gchi_ud_loc_pp_w0 = transform_pp_to_ph_w0(gchi_ud_loc, niv_pp).create_wn_dimension()
+    gchi_ud_loc_pp_w0 = gchi_ud_loc.change_frequency_notation_ph_to_pp_w0()
     del gchi_dens_loc, gchi_magn_loc, gchi_ud_loc
 
     gchi0_loc_pp_w0 = (
@@ -169,7 +169,7 @@ def create_local_ud_diagrams_pp_w0(
     f_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_dens_loc.npy"), SpinChannel.DENS)
     f_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_magn_loc.npy"), SpinChannel.MAGN)
     f_ud_loc = 0.5 * (f_dens_loc - f_magn_loc).set_channel(SpinChannel.UD)
-    f_ud_loc_pp_w0 = transform_pp_to_ph_w0(f_ud_loc, niv_pp).create_wn_dimension()
+    f_ud_loc_pp_w0 = f_ud_loc.change_frequency_notation_ph_to_pp_w0()
     del f_dens_loc, f_magn_loc, f_ud_loc
 
     phi_ud_loc_pp_w0 = f_ud_loc_pp_w0 - gamma_ud_loc_pp_w0
@@ -380,9 +380,23 @@ def solve(
                 gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
                 logger.log_info("Saved local ud diagrams in pp notation to file.")
 
-            gamma_sing_pp -= f_ud_loc_pp_w0 + phi_ud_loc_pp_w0
-            gamma_trip_pp -= f_ud_loc_pp_w0 + phi_ud_loc_pp_w0
-            del f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0
+            del f_ud_loc_pp_w0, gamma_ud_loc_pp_w0
+
+            # special treatment of local full vertex that is subtracted with a different frequency notation and is
+            # different from the regular pp
+            f_dens_loc = LocalFourPoint.load(
+                os.path.join(config.output.output_path, f"f_dens_loc.npy"), SpinChannel.DENS
+            )
+            f_magn_loc = LocalFourPoint.load(
+                os.path.join(config.output.output_path, f"f_magn_loc.npy"), SpinChannel.MAGN
+            )
+            f_ud_loc = 0.5 * (f_dens_loc - f_magn_loc).set_channel(SpinChannel.UD)
+            f_ud_loc_transf_w0 = transform_vertex_loc_frequencies_w0(f_ud_loc, niv_pp)
+            del f_dens_loc, f_magn_loc, f_ud_loc
+
+            gamma_sing_pp -= f_ud_loc_transf_w0 + phi_ud_loc_pp_w0
+            gamma_trip_pp -= f_ud_loc_transf_w0 + phi_ud_loc_pp_w0
+            del phi_ud_loc_pp_w0, f_ud_loc_transf_w0
 
         if config.eliashberg.save_pairing_vertex:
             gamma_sing_pp.save(

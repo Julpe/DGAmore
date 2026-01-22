@@ -422,7 +422,7 @@ def calculate_self_energy_q(
         logger.log_memory_usage("Gchi0_q_full", gchi0_q, comm.size)
         giwk_full = giwk_full.cut_niv(config.box.niw_core + config.box.niv_full)
 
-        f_dc_loc = 2 * LocalFourPoint.load(os.path.join(config.output.output_path, "f_magn_loc.npy")).symmetrize_v_vp()
+        f_dc_loc = 2 * LocalFourPoint.load(os.path.join(config.output.output_path, "f_magn_loc.npy"))
         kernel = -calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc)
         del f_dc_loc
         logger.log_info("Calculated double-counting kernel.")

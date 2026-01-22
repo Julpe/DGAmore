@@ -93,7 +93,7 @@ def test_symmetrizes_random_matrix_correctly():
     mat = np.random.rand(2, 2, 2, 2, 5, 3, 3)
     obj = LocalFourPoint(mat)
     result = obj.symmetrize_v_vp()
-    expected = 0.5 * (mat + np.swapaxes(mat, -1, -2))
+    expected = 0.5 * (mat + mat.swapaxes(0, 2).swapaxes(1, 3).swapaxes(-1, -2))
     assert np.allclose(result.mat, expected, rtol=1e-4)
 
 

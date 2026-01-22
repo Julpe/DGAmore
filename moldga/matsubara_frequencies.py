@@ -54,3 +54,21 @@ class MFHelper:
         frequencies in the interval [\pi/\beta, 2(\mathrm{niv}+1)*\pi/\beta) are returned.
         """
         return np.pi / beta * (2 * MFHelper.vn(niv, shift, return_only_positive) + 1)
+
+    @staticmethod
+    def get_frequencies_for_ph_to_pp_w0_channel_conversion(
+        niw: int, niv: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        r"""
+        Returns the new frequencies :math:`(w', v_1', v_2')` for the conversion of ph to pp notation.
+        :math:`F_{pp}[w,v_1,v_2] = F_{ph}[w',v_1',v_2']` where :math:`(w,v_1,v_2) -> (w',v_1',v_2') = (w+v_1+v_2,v_1,v_2)`
+        """
+        niv_pp = min(niw // 2, niv)
+        vn = MFHelper.vn(niv_pp)
+        vn_pp, vpn_pp = np.meshgrid(vn, vn, indexing="ij")
+
+        wn_pp = niw + vn_pp + vpn_pp + 1
+        vn_pp += niv
+        vpn_pp += niv
+
+        return wn_pp, vn_pp, vpn_pp

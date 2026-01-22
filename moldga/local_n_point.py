@@ -184,7 +184,8 @@ class LocalNPoint(IHaveMat):
     def to_full_niw_range(self):
         """
         Converts the object to the full bosonic frequency range and returns the original object. For details, we refer
-        to Eq. (2.39) and the associated text in Georg Rohringer's PhD thesis.
+        to Eq. (2.39) and the associated text in Georg Rohringer's PhD thesis. This corresponds to time-reversal
+        symmetry.
         """
         if self.num_wn_dimensions == 0 or self.full_niw_range:
             return self

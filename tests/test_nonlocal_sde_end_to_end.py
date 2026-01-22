@@ -52,4 +52,4 @@ def test_calculates_nonlocal_sde_correctly(setup, niw_core, niv_core, niv_shell)
     )
     sigma_dga_ref = np.load(f"{folder}/sigma_dga.npy")
 
-    assert np.allclose(sigma_dga_mat, sigma_dga_ref[..., 50:150], atol=3e-5)
+    assert np.allclose(sigma_dga_mat, sigma_dga_ref, atol=3e-5)
