@@ -482,17 +482,36 @@ class Hamiltonian:
 
     def _convham_2_orbs(self, k_mesh: np.ndarray) -> np.ndarray:
         """
-        Fourier transforms the kinetic Hamiltonian to momentum space.
+        Fourier transforms the kinetic Hamiltonian to momentum space (more memory-friendly).
         """
-        fft_grid = np.exp(1j * np.matmul(self._er_r_grid, k_mesh)) / self._er_r_weights[:, None, None]
-        return np.transpose(np.sum(fft_grid * self._er[..., None], axis=0), axes=(2, 0, 1))
+        n_rp = self._er.shape[0]
+        n_orbs = self._er.shape[1]
+        nk = k_mesh.shape[1]
+
+        result = np.zeros((n_orbs, n_orbs, nk), dtype=np.complex128)
+
+        for r in range(n_rp):
+            phase = np.exp(1j * np.tensordot(self._er_r_grid[r], k_mesh, axes=([2], [0])))
+            phase /= float(self._er_r_weights[r, 0])
+            result += phase * self._er[r, ..., None]
+
+        return np.transpose(result, axes=(2, 0, 1))
 
     def _convham_4_orbs(self, k_mesh: np.ndarray) -> np.ndarray:
         """
-        Fourier transforms the interaction Hamiltonian to momentum space.
+        Fourier transforms the interaction Hamiltonian to momentum space (more memory-friendly).
         """
-        fft_grid = np.exp(1j * np.matmul(self._ur_r_grid, k_mesh)) / self._ur_r_weights[:, None, None, None, None]
-        return np.transpose(np.sum(fft_grid * self._ur_nonlocal[..., None], axis=0), axes=(4, 0, 1, 2, 3))
+        n_rp = self._ur_nonlocal.shape[0]
+        n_orbs = self._ur_nonlocal.shape[1]
+        nk = k_mesh.shape[1]
+        result = np.zeros((n_orbs, n_orbs, n_orbs, n_orbs, nk), dtype=np.complex128)
+
+        for r in range(n_rp):
+            phase = np.exp(1j * np.tensordot(self._ur_r_grid[r], k_mesh, axes=([4], [0])))
+            phase /= float(self._ur_r_weights[r, 0])
+            result += phase * self._ur_nonlocal[r, ..., None]
+
+        return np.transpose(result, axes=(4, 0, 1, 2, 3))
 
     def _parse_elements(self, elements: list, element_type: type) -> list:
         """
