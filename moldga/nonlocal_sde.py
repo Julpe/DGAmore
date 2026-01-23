@@ -287,16 +287,18 @@ def calculate_sigma_from_kernel_fast(kernel: FourPoint, giwk: GreensFunction, my
     ky_indices = [((kys + q[1]) % nky) for q in my_full_q_list]
     kz_indices = [((kzs + q[2]) % nkz) for q in my_full_q_list]
 
+    acc_buf = np.empty((xyz, nb, nb, niv_core), dtype=mat.dtype)
+
     for idx_q in range(len(my_full_q_list)):
         g_q_view = giwk_mat_f[
             kx_indices[idx_q][:, None, None], ky_indices[idx_q][None, :, None], kz_indices[idx_q][None, None, :], ...
         ].reshape(xyz, *giwk_mat_f.shape[3:])
 
         for idx_w, fs in enumerate(freq_slices):
-            g = g_q_view[..., fs].transpose(0, 2, 1, 3).reshape(xyz, nb * nb, niv_core)
-            k = kernel_mat[idx_q, ..., idx_w, niv_core:].transpose(0, 3, 1, 2, 4).reshape(nb * nb, nb * nb, niv_core)
-            acc = np.matmul(g.transpose(2, 0, 1), k.transpose(2, 0, 1)).transpose(1, 2, 0)
-            mat += acc.reshape(nkx, nky, nkz, nb, nb, niv_core)
+            g_slice = g_q_view[..., fs]
+            k_slice = kernel_mat[idx_q, ..., idx_w, niv_core:]
+            np.einsum("aijdv,xadv->xijv", k_slice, g_slice, out=acc_buf, optimize=True)
+            mat += acc_buf.reshape(nkx, nky, nkz, nb, nb, niv_core)
 
     mat *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
     return SelfEnergy(np.ascontiguousarray(mat), config.lattice.nk, False).compress_q_dimension()
