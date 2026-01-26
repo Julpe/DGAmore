@@ -52,31 +52,36 @@ def load_from_w2dyn_file_and_update_config() -> tuple[GreensFunction, SelfEnergy
     if config.sys.n == 0:
         config.sys.n = 2 * np.sum(config.sys.occ_dmft)
 
+    file2 = w2dyn_aux.W2dynG4iwFile(fname=str(os.path.join(config.dmft.input_path, config.dmft.fname_2p)))
+    g2_dens = LocalFourPoint(file2.read_g2_full_multiband(config.sys.n_bands, name="dens"), channel=SpinChannel.DENS)
+    g2_magn = LocalFourPoint(file2.read_g2_full_multiband(config.sys.n_bands, name="magn"), channel=SpinChannel.MAGN)
+    file2.close()
+
+    update_frequency_boxes(g2_dens.niw, g2_dens.niv)
+
     def extend_orbital(arr: np.ndarray) -> np.ndarray:
         return np.einsum("i...,ij->ij...", arr, np.eye(config.sys.n_bands))
 
     giw_spin_mean = np.mean(file.get_giw(), axis=1)  # [band,spin,niv]
+    niv_dmft = giw_spin_mean.shape[-1] // 2
+    niv_cut = config.box.niw_core + config.box.niv_full
+    giw_spin_mean = giw_spin_mean[..., niv_dmft - niv_cut : niv_dmft + niv_cut]
     g_dmft = GreensFunction(extend_orbital(giw_spin_mean))
 
     siw_spin_mean = np.mean(file.get_siw(), axis=1)  # [band,spin,niv]
     siw_spin_mean = extend_orbital(siw_spin_mean)[None, None, None, ...]
     siw_dc_spin_mean = np.mean(file.get_dc(), axis=-1)  # [band,spin]
     siw_dc_spin_mean = extend_orbital(siw_dc_spin_mean)[None, None, None, ..., None]
+    siw_spin_mean = siw_spin_mean[..., niv_dmft - niv_cut : niv_dmft + niv_cut]
     sigma_dmft = SelfEnergy(siw_spin_mean, estimate_niv_core=True) + siw_dc_spin_mean
+
     del giw_spin_mean, siw_spin_mean, siw_dc_spin_mean
 
-    file.close()
-
-    file = w2dyn_aux.W2dynG4iwFile(fname=str(os.path.join(config.dmft.input_path, config.dmft.fname_2p)))
-    g2_dens = LocalFourPoint(file.read_g2_full_multiband(config.sys.n_bands, name="dens"), channel=SpinChannel.DENS)
-    g2_magn = LocalFourPoint(file.read_g2_full_multiband(config.sys.n_bands, name="magn"), channel=SpinChannel.MAGN)
     file.close()
 
     config.lattice.hamiltonian = set_hamiltonian(
         config.lattice.type, config.lattice.er_input, config.lattice.interaction_type, config.lattice.interaction_input
     )
-
-    update_frequency_boxes(g2_dens.niw, g2_dens.niv)
 
     output_format = "LDGA_Nk{}_Nq{}_wc{}_vc{}_vs{}".format(
         config.lattice.k_grid.nk_tot,

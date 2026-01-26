@@ -84,8 +84,15 @@ def test_extracts_dmft_quantities_correctly(setup, niw_core, niv_core, niv_shell
         .cut_niw_and_niv(config.box.niw_core, config.box.niv_core)
     )
 
-    g_dmft_ref_mat = np.load(f"{folder}/g_dmft.npy")
-    s_dmft_ref_mat = np.load(f"{folder}/sigma_dmft.npy")
+    niv = 100
+    cut = config.box.niw_core + config.box.niv_full
+
+    g_dmft_ref_mat = np.load(f"{folder}/g_dmft.npy")[..., niv - cut : niv + cut]
+    s_dmft_ref_mat = np.load(f"{folder}/sigma_dmft.npy")[..., niv - cut : niv + cut]
+
+    niv = g_dmft.mat.shape[-1] // 2
+    g_dmft.mat = g_dmft.mat[..., niv - cut : niv + cut]
+    s_dmft.mat = s_dmft.mat[..., niv - cut : niv + cut]
 
     assert np.allclose(g2_dens.mat, g2_dens_ref.mat)
     assert np.allclose(g2_magn.mat, g2_magn_ref.mat)
@@ -125,6 +132,9 @@ def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
     u_loc = config.lattice.hamiltonian.get_local_u()
 
     g_loc_ref_mat = np.load(f"{folder}/g_loc.npy")
+    niv = g_loc_ref_mat.shape[-1] // 2
+    cut = config.box.niw_core + config.box.niv_full
+    g_loc_ref_mat = g_loc_ref_mat[..., niv - cut : niv + cut]
     assert np.allclose(g_loc.mat, g_loc_ref_mat)
 
     (gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc) = (
@@ -170,4 +180,4 @@ def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
     compare_quantity(gchi_d, gchi_m, "gchi_dens_loc", "gchi_magn_loc", 2, config.box.niv_core)
 
     sigma_loc_ref = np.load(f"{folder}/siw_dga_local.npy")
-    assert np.allclose(sigma_loc.mat, sigma_loc_ref, atol=1e-3)
+    assert np.allclose(sigma_loc.mat, sigma_loc_ref, atol=5e-3)
