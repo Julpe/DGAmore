@@ -174,23 +174,51 @@ class MpiDistributor:
 
     def scatter(self, full_data: np.ndarray = None, root: int = 0) -> np.ndarray:
         """
-        Scatters the numpy array from the root rank to all ranks.
+        Scatter a large NumPy array safely by chunking along axis 0.
         """
-        if full_data is not None:
-            assert isinstance(full_data, np.ndarray), "full_data must be a numpy array"
-            rest_shape = np.shape(full_data)[1:]
-            data_type = full_data.dtype
+        comm = self.comm
+        rank = comm.Get_rank()
+
+        # Broadcast metadata
+        if rank == root:
+            assert isinstance(full_data, np.ndarray)
+            rest_shape = full_data.shape[1:]
+            dtype = full_data.dtype
         else:
             rest_shape = None
-            data_type = None
+            dtype = None
 
-        data_type = self.comm.bcast(data_type, root)
-        rest_shape = self.comm.bcast(rest_shape, root)
+        rest_shape = comm.bcast(rest_shape, root=root)
+        dtype = comm.bcast(dtype, root=root)
+
         rank_shape = (self.my_size,) + rest_shape
-        rank_data = np.empty(rank_shape, dtype=data_type)
-        other_dims = np.prod(rank_data.shape[1:])
-        # displacements = np.insert(np.cumsum(self.sizes[:-1]), 0, 0)
-        self.comm.Scatterv([full_data, self.sizes * other_dims], rank_data, root=root)
+        rank_data = np.empty(rank_shape, dtype=dtype)
+
+        # Compute the chunk size
+        bytes_per_row = np.prod(rest_shape) * dtype.itemsize
+        max_bytes = 2**31 - 1
+        max_rows_per_chunk = max(1, max_bytes // bytes_per_row)
+
+        # Scatter the junks and assemble the full array
+        offset = 0
+        while offset < self.my_size:
+            chunk = min(max_rows_per_chunk, self.my_size - offset)
+            recv_slice = slice(offset, offset + chunk)
+
+            if rank == root:
+                sendbuf = full_data[
+                    np.concatenate(
+                        [
+                            np.arange(sum(self.sizes[:r]) + offset, sum(self.sizes[:r]) + offset + chunk)
+                            for r in range(comm.Get_size())
+                        ]
+                    )
+                ]
+            else:
+                sendbuf = None
+            comm.Scatter(sendbuf, rank_data[recv_slice], root=root)
+            offset += chunk
+
         return rank_data
 
     def bcast(self, data, root=0):
