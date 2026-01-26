@@ -170,57 +170,57 @@ def complete(text, state):
 
 
 if __name__ == "__main__":
-    default_ph_filename = "Vertex.hdf5"
+    default_filename = "Vertex.hdf5"
     default_output_filename = "g4iw_sym.hdf5"
 
-    g4iw_ph_groupstring = "worm-last/ineq-001/g4iw-worm"
+    g4iw_groupstring = "worm-last/ineq-001/g4iw-worm"
 
     readline.parse_and_bind("tab: complete")
     readline.set_completer_delims(" \t\n;")
     readline.set_completer(complete)
 
-    input_ph_filename = input(f"Enter the DMFT vertex file name (default = {default_ph_filename}): ")
+    input_filename = input(f"Enter the DMFT vertex file name (default = {default_filename}): ")
     output_filename = input(f"Enter the output filename (default = {default_output_filename}): ")
 
-    input_ph_filename = input_ph_filename if input_ph_filename else default_ph_filename
-    output_filename = output_filename if output_filename else default_output_filename
+    input_filename = input_filename.strip() if input_filename else default_filename
+    output_filename = output_filename.strip() if output_filename else default_output_filename
 
-    vertex_file_ph = h5py.File(input_ph_filename, "r")
+    vertex_file = h5py.File(input_filename, "r")
     output_file = h5py.File(output_filename, "w")
 
-    n_bands = int(vertex_file_ph[".config"].attrs[f"atoms.1.nd"]) + int(vertex_file_ph[".config"].attrs[f"atoms.1.np"])
+    n_bands = int(vertex_file[".config"].attrs[f"atoms.1.nd"]) + int(vertex_file[".config"].attrs[f"atoms.1.np"])
 
-    indices_ph = None
+    indices = None
     try:
-        indices_ph = list(vertex_file_ph[g4iw_ph_groupstring].keys())
+        indices = list(vertex_file[g4iw_groupstring].keys())
     except KeyError:
-        print("WARNING: No g4iw-worm group found in the PH input file. Aborting.")
+        print("WARNING: No g4iw-worm group found in the input file. Aborting.")
         exit()
 
-    niw_ph, niv_ph = get_niw_niv(vertex_file_ph, g4iw_ph_groupstring, indices_ph)
+    niw, niv = get_niw_niv(vertex_file, g4iw_groupstring, indices)
 
     print("Number of bands:", n_bands)
-    print("Number of fermionic Matsubara frequencies for PH channel:", niv_ph)
-    print("Number of bosonic Matsubara frequencies for PH channel:", niw_ph)
+    print("Number of fermionic Matsubara frequencies:", niv)
+    print("Number of bosonic Matsubara frequencies:", niw)
 
-    print("Extracting G2ph ...")
-    g2_uuuu_ph, g2_dddd_ph, g2_dduu_ph, g2_uudd_ph, g2_uddu_ph, g2_duud_ph = extract_g2_general(
-        g4iw_ph_groupstring, indices_ph, vertex_file_ph, niw_ph, niv_ph
+    print("Extracting G2 ...")
+    g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud = extract_g2_general(
+        g4iw_groupstring, indices, vertex_file, niw, niv
     )
-    print("G2ph extracted. Calculating G2_dens and G2_magn for ph ...")
-    g2_dens_ph = 0.5 * (g2_uuuu_ph + g2_dddd_ph + g2_uudd_ph + g2_dduu_ph)
-    g2_magn_ph = 0.5 * (g2_uddu_ph + g2_duud_ph)
+    print("G2 extracted. Calculating G2_dens and G2_magn ...")
+    g2_dens = 0.5 * (g2_uuuu + g2_dddd + g2_uudd + g2_dduu)
+    g2_magn = 0.5 * (g2_uddu + g2_duud)
 
-    del g2_uuuu_ph, g2_dddd_ph, g2_dduu_ph, g2_uudd_ph, g2_uddu_ph, g2_duud_ph
+    del g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud
     gc.collect()
     print("G2_dens and G2_magn calculated. Writing to file ...")
 
-    save_to_file([g2_dens_ph, g2_magn_ph], ["dens", "magn"], niw_ph, n_bands)
-    del g2_dens_ph, g2_magn_ph
+    save_to_file([g2_dens, g2_magn], ["dens", "magn"], niw, n_bands)
+    del g2_dens, g2_magn
     gc.collect()
     print("G2_dens and G2_magn successfully written to file.")
 
     output_file.close()
-    vertex_file_ph.close()
+    vertex_file.close()
     print("Done!")
     exit()
