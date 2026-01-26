@@ -341,13 +341,14 @@ class IAmNonLocal(IHaveMat, ABC):
 
     def find_q(self, q: tuple[int, int, int] = (0, 0, 0)):
         r"""
-        Finds the matrix element for a single given momentum :math:`\vec{q}`. Makes it possible to use e.g. only the
-        :math:`\vec{q}=0` component of a non-local object
+        Find the matrix element for a single momentum :math:`\vec{q}` and returns a compressed copy.
+        Raises a ValueError if no element is found.
         """
-        result = deepcopy(self).reduce_q(np.array(list(q))[None, ...])
+        q_arr = np.atleast_2d(np.array(q, dtype=int))
+        result = deepcopy(self).reduce_q(q_arr)
         result._nq = (1, 1, 1)
 
-        if result.current_shape == (0,):
+        if getattr(result, "mat", None) is None or result.mat.size == 0 or result.current_shape[0] == 0:
             raise ValueError("No matrix element found for the given momentum.")
 
         return result

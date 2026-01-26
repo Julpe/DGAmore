@@ -30,12 +30,18 @@ def get_hartree_fock(
     :math:`\Sigma_{F}^k = - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}`.
     """
     v_q0 = v_nonloc.find_q((0, 0, 0))
-    occ_qk = np.array([np.roll(config.sys.occ_k, [-i for i in q], axis=(0, 1, 2)) for q in q_list])  # [q,k,o1,o2]
     nq_tot, nk_tot = np.prod(config.lattice.nq), np.prod(config.lattice.nk)
-    occ_qk = occ_qk.reshape(nq_tot, nk_tot, config.sys.n_bands, config.sys.n_bands)
-
     hartree = 2 * (u_loc + v_q0).times("qabcd,dc->ab", config.sys.occ)
-    fock = -1.0 / nq_tot * (u_loc + v_nonloc).times("qadcb,qkdc->kab", occ_qk)
+
+    nb = config.sys.n_bands
+    fock = np.zeros((nk_tot, nb, nb), dtype=hartree.dtype)
+
+    for q in q_list:
+        v_q = v_nonloc.find_q(q)
+        occ_k = np.roll(config.sys.occ_k, [-i for i in q], axis=(0, 1, 2)).reshape(nk_tot, nb, nb)
+        fock += (u_loc + v_q).times("qadcb,kdc->kab", occ_k)
+
+    fock *= -1.0 / nq_tot
     return hartree[None, ..., None], fock[..., None]  # [k,o1,o2,v]
 
 
