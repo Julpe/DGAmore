@@ -173,11 +173,9 @@ class MpiDistributor:
         return tot_result
 
     def scatter(self, full_data: np.ndarray = None, root: int = 0) -> np.ndarray:
-        """
-        Scatter a large NumPy array safely by chunking along axis 0.
-        """
         comm = self.comm
         rank = comm.Get_rank()
+        size = comm.Get_size()
 
         # Broadcast metadata
         if rank == root:
@@ -194,30 +192,30 @@ class MpiDistributor:
         rank_shape = (self.my_size,) + rest_shape
         rank_data = np.empty(rank_shape, dtype=dtype)
 
-        # Compute the chunk size
+        # Compute chunking
         bytes_per_row = np.prod(rest_shape) * dtype.itemsize
         max_bytes = 2**31 - 1
         max_rows_per_chunk = max(1, max_bytes // bytes_per_row)
 
-        # Scatter the junks and assemble the full array
-        offset = 0
-        while offset < self.my_size:
-            chunk = min(max_rows_per_chunk, self.my_size - offset)
-            recv_slice = slice(offset, offset + chunk)
+        # Compute offsets
+        offsets = np.cumsum([0] + list(self.sizes[:-1]))
+
+        # Scatter data in chunks as point-to-point transfers to avoid large buffer allocations
+        for start in range(0, self.my_size, max_rows_per_chunk):
+            chunk = min(max_rows_per_chunk, self.my_size - start)
 
             if rank == root:
-                sendbuf = full_data[
-                    np.concatenate(
-                        [
-                            np.arange(sum(self.sizes[:r]) + offset, sum(self.sizes[:r]) + offset + chunk)
-                            for r in range(comm.Get_size())
-                        ]
-                    )
-                ]
+                for r in range(size):
+                    global_start = offsets[r] + start
+                    global_end = global_start + chunk
+                    buf = full_data[global_start:global_end]
+
+                    if r == root:
+                        rank_data[start : start + chunk] = buf
+                    else:
+                        comm.Send(buf, dest=r, tag=start)
             else:
-                sendbuf = None
-            comm.Scatter(sendbuf, rank_data[recv_slice], root=root)
-            offset += chunk
+                comm.Recv(rank_data[start : start + chunk], source=root, tag=start)
 
         return rank_data
 
