@@ -29,19 +29,16 @@ def get_hartree_fock(
     where the Hartree-term reads :math:`\Sigma_{H} = 2(U_{abcd} + V^{q=0}_{abcd}) n_{dc}` and the Fock-term reads
     :math:`\Sigma_{F}^k = - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}`.
     """
+    occ_qk = np.array([np.roll(config.sys.occ_k, [-i for i in q], axis=(0, 1, 2)) for q in q_list]).reshape(
+        len(q_list), config.lattice.k_grid.nk_tot, config.sys.n_bands, config.sys.n_bands
+    )  # [q,k,o1,o2]
+
     v_q0 = v_nonloc.find_q((0, 0, 0))
-    nq_tot, nk_tot = np.prod(config.lattice.nq), np.prod(config.lattice.nk)
     hartree = 2 * (u_loc + v_q0).times("qabcd,dc->ab", config.sys.occ)
 
-    nb = config.sys.n_bands
-    fock = np.zeros((nk_tot, nb, nb), dtype=hartree.dtype)
+    v_q = v_nonloc.reduce_q(q_list)
+    fock = -1.0 / config.lattice.q_grid.nk_tot * (u_loc + v_q).times("qadcb,qkdc->kab", occ_qk)
 
-    for q in q_list:
-        v_q = v_nonloc.find_q(q)
-        occ_k = np.roll(config.sys.occ_k, [-i for i in q], axis=(0, 1, 2)).reshape(nk_tot, nb, nb)
-        fock += (u_loc + v_q).times("qadcb,kdc->kab", occ_k)
-
-    fock *= -1.0 / nq_tot
     return hartree[None, ..., None], fock[..., None]  # [k,o1,o2,v]
 
 
@@ -385,12 +382,10 @@ def calculate_self_energy_q(
 
     # Hartree- and Fock-terms
     v_nonloc = v_nonloc.compress_q_dimension()
-    if comm.rank == 0:
-        hartree, fock = get_hartree_fock(u_loc, v_nonloc, full_q_list)
-    else:
-        hartree, fock = None, None
-    hartree, fock = comm.bcast((hartree, fock), root=0)
+    hartree, fock = get_hartree_fock(u_loc, v_nonloc, my_full_q_list)
+    fock = mpi_dist_fullbz.allreduce(fock)
     logger.log_info("Calculated Hartree and Fock terms.")
+
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
 
     sigma_old, starting_iter = get_starting_sigma(config.self_consistency.previous_sc_path, sigma_dmft)
@@ -472,6 +467,7 @@ def calculate_self_energy_q(
 
         sigma_new.mat = mpi_dist_irrk.allreduce(sigma_new.mat)
         logger.log_memory_usage("Non-local sigma", sigma_new, comm.size)
+        sigma_new.mat = comm.bcast(sigma_new.mat, root=0)
 
         sigma_new = sigma_new + hartree + fock
         logger.log_info("Full non-local self-energy calculated.")
