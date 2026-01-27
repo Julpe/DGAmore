@@ -172,50 +172,72 @@ class MpiDistributor:
         self.comm.Gatherv(rank_result, [tot_result, self.sizes * other_dims], root=root)
         return tot_result
 
-    def scatter(self, full_data: np.ndarray = None, root: int = 0) -> np.ndarray:
-        comm = self.comm
-        rank = comm.Get_rank()
-        size = comm.Get_size()
+    def scatter(self, full_data: np.ndarray = None, root: int = 0):
+        MAX_MPI_BYTES = 2**31 - 1
 
-        # Broadcast metadata
-        if rank == root:
-            assert isinstance(full_data, np.ndarray)
+        def chunk_bounds(n_items: int, itemsize: int, items_per_element: int):
+            max_elems = max(1, MAX_MPI_BYTES // (itemsize * items_per_element))
+            for i in range(0, n_items, max_elems):
+                yield i, min(n_items, i + max_elems)
+
+        def send_in_chunks(arr: np.ndarray, dest: int, base_tag: int = 0):
+            arr = np.ascontiguousarray(arr)
+            itemsize = arr.dtype.itemsize
+            items_per_element = int(np.prod(arr.shape[1:])) if arr.ndim > 1 else 1
+            for idx, (i, j) in enumerate(chunk_bounds(arr.shape[0], itemsize, items_per_element)):
+                self.comm.Send(arr[i:j], dest=dest, tag=base_tag + idx)
+
+        def recv_in_chunks(shape, dtype, source: int, base_tag: int = 0):
+            out = np.empty(shape, dtype=dtype)
+            itemsize = np.dtype(dtype).itemsize
+            items_per_element = int(np.prod(shape[1:])) if len(shape) > 1 else 1
+            for idx, (i, j) in enumerate(chunk_bounds(shape[0], itemsize, items_per_element)):
+                tmp = np.empty((j - i,) + tuple(shape[1:]), dtype=dtype)
+                self.comm.Recv(tmp, source=source, tag=base_tag + idx)
+                out[i:j] = tmp
+            return out
+
+        if full_data is not None and not isinstance(full_data, np.ndarray):
+            raise TypeError("full_data must be a numpy array or None")
+
+        if full_data is not None:
+            data_len = full_data.shape[0]
             rest_shape = full_data.shape[1:]
-            dtype = full_data.dtype
+            data_type = full_data.dtype
         else:
+            data_len = None
             rest_shape = None
-            dtype = None
+            data_type = None
 
-        rest_shape = comm.bcast(rest_shape, root=root)
-        dtype = comm.bcast(dtype, root=root)
+        data_type = self.comm.bcast(data_type, root)
+        rest_shape = self.comm.bcast(rest_shape, root)
 
-        rank_shape = (self.my_size,) + rest_shape
-        rank_data = np.empty(rank_shape, dtype=dtype)
+        rank_shape = (self._my_size,) + rest_shape if rest_shape else (self._my_size,)
+        rank_data = np.empty(rank_shape, dtype=data_type)
 
-        # Compute chunking
-        bytes_per_row = np.prod(rest_shape) * dtype.itemsize
-        max_bytes = 2**31 - 1
-        max_rows_per_chunk = max(1, max_bytes // bytes_per_row)
+        if self.my_rank == root:
+            if full_data is None:
+                return rank_data
 
-        # Compute offsets
-        offsets = np.cumsum([0] + list(self.sizes[:-1]))
+            full_data = np.asarray(full_data, dtype=data_type)
 
-        # Scatter data in chunks as point-to-point transfers to avoid large buffer allocations
-        for start in range(0, self.my_size, max_rows_per_chunk):
-            chunk = min(max_rows_per_chunk, self.my_size - start)
-
-            if rank == root:
-                for r in range(size):
-                    global_start = offsets[r] + start
-                    global_end = global_start + chunk
-                    buf = full_data[global_start:global_end]
-
+            if data_len == self.ntasks:
+                for r in range(self.mpi_size):
+                    n = self._sizes[r]
+                    if n == 0:
+                        continue
+                    sl = self._slices[r]
                     if r == root:
-                        rank_data[start : start + chunk] = buf
+                        rank_data[...] = full_data[sl]
                     else:
-                        comm.Send(buf, dest=r, tag=start)
+                        send_in_chunks(full_data[sl], dest=r, base_tag=0)
+            elif data_len == self._my_size and self.mpi_size == 1:
+                rank_data[...] = np.ascontiguousarray(full_data)
             else:
-                comm.Recv(rank_data[start : start + chunk], source=root, tag=start)
+                raise ValueError(f"Mismatch in scatter!")
+        else:
+            if self._my_size > 0:
+                rank_data = recv_in_chunks(rank_shape, data_type, source=root, base_tag=0)
 
         return rank_data
 

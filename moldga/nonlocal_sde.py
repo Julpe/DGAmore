@@ -28,18 +28,92 @@ def get_hartree_fock(
     .. math:: \Sigma_{HF}^k = 2(U_{abcd} + V^{q=0}_{abcd}) n_{dc} - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}
     where the Hartree-term reads :math:`\Sigma_{H} = 2(U_{abcd} + V^{q=0}_{abcd}) n_{dc}` and the Fock-term reads
     :math:`\Sigma_{F}^k = - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}`.
+    Processes the Fock-Term in block-diagonal orbital space to save memory, as for high momentum grids,
+    the occ_qk property can become large.
     """
-    occ_qk = np.array([np.roll(config.sys.occ_k, [-i for i in q], axis=(0, 1, 2)) for q in q_list]).reshape(
-        len(q_list), config.lattice.k_grid.nk_tot, config.sys.n_bands, config.sys.n_bands
-    )  # [q,k,o1,o2]
-
     v_q0 = v_nonloc.find_q((0, 0, 0))
     hartree = 2 * (u_loc + v_q0).times("qabcd,dc->ab", config.sys.occ)
 
-    v_q = v_nonloc.reduce_q(q_list)
-    fock = -1.0 / config.lattice.q_grid.nk_tot * (u_loc + v_q).times("qadcb,qkdc->kab", occ_qk)
+    def _find_orbital_blocks(occ_k, tol=1e-12):
+        mat = np.abs(occ_k).sum(axis=(0, 1, 2))
+        adj = (mat > tol) | (mat.T > tol)
+        nb = mat.shape[0]
+        visited = np.zeros(nb, dtype=bool)
+        blocks = []
+        for i in range(nb):
+            if visited[i]:
+                continue
+            stack = [i]
+            comp = []
+            visited[i] = True
+            while stack:
+                u = stack.pop()
+                comp.append(u)
+                neigh = np.nonzero(adj[u])[0]
+                for v in neigh:
+                    if not visited[v]:
+                        visited[v] = True
+                        stack.append(v)
+            blocks.append(sorted(comp))
+        return blocks
 
-    return hartree[None, ..., None], fock[..., None]  # [k,o1,o2,v]
+    v_q = v_nonloc.reduce_q(q_list)
+    uv = u_loc + v_q
+    uv_mat = uv.mat  # expected shape: (nq, a, d, c, b)
+
+    nkx, nky, nkz = config.lattice.k_grid.nk
+    nk_tot = config.lattice.k_grid.nk_tot
+    nb = config.sys.n_bands
+    Nq = config.lattice.q_grid.nk_tot
+
+    # prepare q / k index maps once
+    q_arr = np.asarray(q_list, dtype=int)
+    nq = q_arr.shape[0]
+    kxs = np.arange(nkx, dtype=int)
+    kys = np.arange(nky, dtype=int)
+    kzs = np.arange(nkz, dtype=int)
+
+    kx_idx = (kxs[None, :] + q_arr[:, 0][:, None]) % nkx  # (nq, nkx)
+    ky_idx = (kys[None, :] + q_arr[:, 1][:, None]) % nky  # (nq, nky)
+    kz_idx = (kzs[None, :] + q_arr[:, 2][:, None]) % nkz  # (nq, nkz)
+
+    # expanded views for advanced indexing per block (will broadcast to (nq,nkx,nky,nkz,bs,bs))
+    kx_idx_exp = kx_idx[:, :, None, None, None, None]
+    ky_idx_exp = ky_idx[:, None, :, None, None, None]
+    kz_idx_exp = kz_idx[:, None, None, :, None, None]
+
+    blocks = _find_orbital_blocks(config.sys.occ_k)
+    fock_full = np.zeros((nk_tot, nb, nb), dtype=uv_mat.dtype)
+
+    for block in blocks:
+        idx = np.array(block, dtype=int)
+        bs = len(idx)
+        if bs == 0:
+            continue
+
+        # small index arrays for last two orbital axes -> broadcast into the full grid
+        idx_row = idx[None, None, None, None, :, None]  # shape (1,1,1,1,bs,1)
+        idx_col = idx[None, None, None, None, None, :]  # shape (1,1,1,1,1,bs)
+
+        # Advanced-index occ_k to build only the needed block for all q and k:
+        # result shape -> (nq, nkx, nky, nkz, bs, bs)
+        occ_block_qk_6d = config.sys.occ_k[kx_idx_exp, ky_idx_exp, kz_idx_exp, idx_row, idx_col]
+
+        # reshape to (nq, nk_tot, bs, bs)
+        occ_block = occ_block_qk_6d.reshape(nq, nk_tot, bs, bs)
+
+        # slice interaction to block orbitals for all q; uv_mat axes (q,a,d,c,b)
+        uv_block = uv_mat.take(idx, axis=1).take(idx, axis=2).take(idx, axis=3).take(idx, axis=4)
+        # uv_block shape -> (nq, bs, bs, bs, bs) matching 'qadcb'
+
+        # einsum over q, d, c -> output (k, a, b)
+        contrib = -1.0 / Nq * np.einsum("qadcb,qkdc->kab", uv_block, occ_block, optimize=True)
+
+        # accumulate into full fock; contrib shape is (k, bs, bs)
+        fock_full[:, idx[:, None], idx] += contrib
+
+    fock = fock_full[..., None]  # [k,o1,o2,v]
+    return hartree[None, ..., None], fock
 
 
 def create_auxiliary_chi_r_q(
@@ -394,8 +468,8 @@ def calculate_self_energy_q(
             f"Using previous calculation and starting the self-consistency loop at iteration {starting_iter+1}."
         )
 
-    sigma_old = sigma_old.cut_niv(config.box.niv_core + config.box.niv_full)
-    sigma_dmft = sigma_dmft.cut_niv(config.box.niv_core + config.box.niv_full)
+    sigma_old = sigma_old.cut_niv(config.box.niw_core + config.box.niv_full)
+    sigma_dmft = sigma_dmft.cut_niv(config.box.niw_core + config.box.niv_full)
 
     delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_local.cut_niv(config.box.niv_core)
     mu_history = (
