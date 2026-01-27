@@ -58,15 +58,13 @@ def get_hartree_fock(
         return blocks
 
     v_q = v_nonloc.reduce_q(q_list)
-    uv = u_loc + v_q
-    uv_mat = uv.mat  # expected shape: (nq, a, d, c, b)
+    v_q_mat = (u_loc + v_q).mat
 
     nkx, nky, nkz = config.lattice.k_grid.nk
     nk_tot = config.lattice.k_grid.nk_tot
     nb = config.sys.n_bands
-    Nq = config.lattice.q_grid.nk_tot
+    nq_tot = config.lattice.q_grid.nk_tot
 
-    # prepare q / k index maps once
     q_arr = np.asarray(q_list, dtype=int)
     nq = q_arr.shape[0]
     kxs = np.arange(nkx, dtype=int)
@@ -83,7 +81,7 @@ def get_hartree_fock(
     kz_idx_exp = kz_idx[:, None, None, :, None, None]
 
     blocks = _find_orbital_blocks(config.sys.occ_k)
-    fock_full = np.zeros((nk_tot, nb, nb), dtype=uv_mat.dtype)
+    fock = np.zeros((nk_tot, nb, nb), dtype=v_q_mat.dtype)
 
     for block in blocks:
         idx = np.array(block, dtype=int)
@@ -91,29 +89,15 @@ def get_hartree_fock(
         if bs == 0:
             continue
 
-        # small index arrays for last two orbital axes -> broadcast into the full grid
         idx_row = idx[None, None, None, None, :, None]  # shape (1,1,1,1,bs,1)
         idx_col = idx[None, None, None, None, None, :]  # shape (1,1,1,1,1,bs)
-
-        # Advanced-index occ_k to build only the needed block for all q and k:
-        # result shape -> (nq, nkx, nky, nkz, bs, bs)
         occ_block_qk_6d = config.sys.occ_k[kx_idx_exp, ky_idx_exp, kz_idx_exp, idx_row, idx_col]
+        occ_block_qk = occ_block_qk_6d.reshape(nq, nk_tot, bs, bs)
+        uv_block = v_q_mat.take(idx, axis=1).take(idx, axis=2).take(idx, axis=3).take(idx, axis=4)
+        block_contrib = -1.0 / nq_tot * np.einsum("qadcb,qkdc->kab", uv_block, occ_block_qk, optimize=True)
+        fock[:, idx[:, None], idx] += block_contrib
 
-        # reshape to (nq, nk_tot, bs, bs)
-        occ_block = occ_block_qk_6d.reshape(nq, nk_tot, bs, bs)
-
-        # slice interaction to block orbitals for all q; uv_mat axes (q,a,d,c,b)
-        uv_block = uv_mat.take(idx, axis=1).take(idx, axis=2).take(idx, axis=3).take(idx, axis=4)
-        # uv_block shape -> (nq, bs, bs, bs, bs) matching 'qadcb'
-
-        # einsum over q, d, c -> output (k, a, b)
-        contrib = -1.0 / Nq * np.einsum("qadcb,qkdc->kab", uv_block, occ_block, optimize=True)
-
-        # accumulate into full fock; contrib shape is (k, bs, bs)
-        fock_full[:, idx[:, None], idx] += contrib
-
-    fock = fock_full[..., None]  # [k,o1,o2,v]
-    return hartree[None, ..., None], fock
+    return hartree[None, ..., None], fock[..., None]  # [k,o1,o2,v]
 
 
 def create_auxiliary_chi_r_q(
