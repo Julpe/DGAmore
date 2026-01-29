@@ -26,8 +26,8 @@ def execute_dga_routine():
 
     config_parser = ConfigParser().parse_config(comm)
     logger = config.logger
-    logger.log_info("Starting DGA routine.")
-    logger.log_info(f"Running on {str(comm.size)} {"process" if comm.size == 1 else "processes"}.")
+    logger.info("Starting DGA routine.")
+    logger.info(f"Running on {str(comm.size)} {"process" if comm.size == 1 else "processes"}.")
 
     if comm.rank == 0:
         g_dmft, sigma_dmft, g2_dens, g2_magn = dga_io.load_from_w2dyn_file_and_update_config()
@@ -59,25 +59,25 @@ def execute_dga_routine():
 
     config_parser.save_config_file(path=config.output.output_path, name="dga_config.yaml")
 
-    logger.log_info("Config init and folder setup done.")
-    logger.log_info("Loaded data from w2dyn file.")
+    logger.info("Config init and folder setup done.")
+    logger.info("Loaded data from w2dyn file.")
 
     g_dmft = comm.bcast(g_dmft, root=0)
     sigma_dmft = comm.bcast(sigma_dmft, root=0)
 
     logger.log_memory_usage("giwk & siwk", g_dmft, 2 * comm.size)
-    logger.log_memory_usage("g2_dens & g2_magn", g2_dens, 2 * comm.size)
+    logger.log_memory_usage("g2_dens & g2_magn", g2_dens, 2)
 
     if config.output.save_quantities and comm.rank == 0:
         sigma_dmft.save(name="sigma_dmft", output_dir=config.output.output_path)
         g_dmft.save(name="g_dmft", output_dir=config.output.output_path)
-        logger.log_info("Saved sigma_dmft as numpy file.")
+        logger.info("Saved sigma_dmft as numpy file.")
 
     if config.output.do_plotting and comm.rank == 0:
         for g2, name in [(g2_dens, "G2_dens"), (g2_magn, "G2_magn")]:
             for omega in [0, -10, 10]:
                 plotting.plot_nu_nup(g2, omega=omega, name=name, output_dir=config.output.plotting_path)
-        logger.log_info("Plotted g2 (dens) and g2 (magn).")
+        logger.info("Plotted g2 (dens) and g2 (magn).")
 
     ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
     g_loc = GreensFunction.create_g_loc(sigma_dmft.create_with_asympt_up_to_core(), ek)
@@ -88,8 +88,8 @@ def execute_dga_routine():
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
 
-    logger.log_info("Preprocessing done.")
-    logger.log_info("Starting local Schwinger-Dyson equation (SDE).")
+    logger.info("Preprocessing done.")
+    logger.info("Starting local Schwinger-Dyson equation (SDE).")
 
     if comm.rank == 0:
         (gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc) = (
@@ -103,7 +103,7 @@ def execute_dga_routine():
     gamma_m = comm.bcast(gamma_m, root=0)
     gamma_d = comm.bcast(gamma_d, root=0)
 
-    logger.log_info("Local Schwinger-Dyson equation (SDE) done.")
+    logger.info("Local Schwinger-Dyson equation (SDE) done.")
 
     if comm.rank == 0:
         (2 * f_m).save(name="f_dc_loc", output_dir=config.output.output_path)
@@ -131,26 +131,26 @@ def execute_dga_routine():
         f_d.save(name="f_dens_loc", output_dir=config.output.output_path)
         f_m.save(name="f_magn_loc", output_dir=config.output.output_path)
         del f_d, f_m
-        logger.log_info("Saved all relevant quantities as numpy files.")
+        logger.info("Saved all relevant quantities as numpy files.")
 
     if config.output.do_plotting and comm.rank == 0:
         plotting.plot_nu_nup(gchi_d, omega=0, name=f"Gchi_dens", output_dir=config.output.plotting_path)
         plotting.plot_nu_nup(gchi_m, omega=0, name=f"Gchi_magn", output_dir=config.output.plotting_path)
-        logger.log_info(f"Local generalized susceptibilities dens & magn plotted.")
+        logger.info(f"Local generalized susceptibilities dens & magn plotted.")
         del gchi_m, gchi_d
 
         gamma_dens_plot = gamma_d.cut_niv(min(config.box.niv_core, 2 * int(config.sys.beta)))
         plotting.plot_nu_nup(gamma_dens_plot, omega=0, name="Gamma_dens", output_dir=config.output.plotting_path)
         plotting.plot_nu_nup(gamma_dens_plot, omega=10, name="Gamma_dens", output_dir=config.output.plotting_path)
         plotting.plot_nu_nup(gamma_dens_plot, omega=-10, name="Gamma_dens", output_dir=config.output.plotting_path)
-        logger.log_info("Plotted gamma (dens).")
+        logger.info("Plotted gamma (dens).")
         del gamma_dens_plot
 
         gamma_magn_plot = gamma_m.cut_niv(min(config.box.niv_core, 2 * int(config.sys.beta)))
         plotting.plot_nu_nup(gamma_magn_plot, omega=0, name="Gamma_magn", output_dir=config.output.plotting_path)
         plotting.plot_nu_nup(gamma_magn_plot, omega=10, name="Gamma_magn", output_dir=config.output.plotting_path)
         plotting.plot_nu_nup(gamma_magn_plot, omega=-10, name="Gamma_magn", output_dir=config.output.plotting_path)
-        logger.log_info("Plotted gamma (magn).")
+        logger.info("Plotted gamma (magn).")
         del gamma_magn_plot
 
         plotting.chi_checks(
@@ -162,7 +162,7 @@ def execute_dga_routine():
             output_dir=config.output.plotting_path,
         )
         del chi_d, chi_m
-        logger.log_info("Plotted checks of the susceptibility.")
+        logger.info("Plotted checks of the susceptibility.")
 
         sigma_list = []
         sigma_names = []
@@ -185,15 +185,15 @@ def execute_dga_routine():
             name="DMFT",
             output_dir=config.output.plotting_path,
         )
-        logger.log_info("Plotted local self-energies for comparison.")
-        logger.log_info("Finished plotting.")
+        logger.info("Plotted local self-energies for comparison.")
+        logger.info("Finished plotting.")
 
-    logger.log_info("Local DGA routine finished.")
+    logger.info("Local DGA routine finished.")
 
-    logger.log_info("Starting non-local ladder-DGA routine.")
+    logger.info("Starting non-local ladder-DGA routine.")
     sigma_dga = nonlocal_sde.calculate_self_energy_q(comm, u_loc, v_nonloc, sigma_dmft, sigma_loc, gamma_d, gamma_m)
     del sigma_dmft, sigma_loc
-    logger.log_info("Non-local ladder-DGA routine finished.")
+    logger.info("Non-local ladder-DGA routine finished.")
 
     giwk_dga = GreensFunction.get_g_full(sigma_dga, config.sys.mu, ek).cut_niv(
         config.box.niv_full + config.box.niw_core
@@ -201,10 +201,10 @@ def execute_dga_routine():
 
     if config.output.save_quantities and comm.rank == 0:
         sigma_dga.save(name=f"sigma_dga", output_dir=config.output.output_path)
-        logger.log_info("Saved non-local self-energy as numpy file.")
+        logger.info("Saved non-local self-energy as numpy file.")
 
         giwk_dga.save(name=f"giwk_dga", output_dir=config.output.output_path)
-        logger.log_info("Saved non-local Green's function as numpy file.")
+        logger.info("Saved non-local Green's function as numpy file.")
 
     if (config.poly_fitting.do_poly_fitting and not config.self_consistency.use_poly_fit) and comm.rank == 0:
         sigma_fit = sigma_dga.fit_polynomial(config.poly_fitting.n_fit, config.poly_fitting.o_fit, config.box.niv_core)
@@ -231,7 +231,7 @@ def execute_dga_routine():
             name="Sigma_dga_kz0",
             output_dir=config.output.plotting_path,
         )
-        logger.log_info("Plotted non-local self-energy as a function of kx and ky.")
+        logger.info("Plotted non-local self-energy as a function of kx and ky.")
 
         plotting.plot_two_point_kx_ky(
             giwk_dga,
@@ -249,14 +249,14 @@ def execute_dga_routine():
             name="Giwk_dga_kz0",
             output_dir=config.output.plotting_path,
         )
-        logger.log_info("Plotted non-local Green's function as a function of kx and ky.")
+        logger.info("Plotted non-local Green's function as a function of kx and ky.")
 
-    logger.log_info("DGA routine finished.")
+    logger.info("DGA routine finished.")
 
     if config.eliashberg.perform_eliashberg:
         if not np.allclose(config.lattice.q_grid.nk, config.lattice.k_grid.nk):
             raise ValueError("Eliashberg equation can only be solved when nq = nk.")
-        logger.log_info("Starting with Eliashberg equation.")
+        logger.info("Starting with Eliashberg equation.")
         lambdas_sing, lambdas_trip, gaps_sing, gaps_trip = eliashberg_solver.solve(
             giwk_dga, g_loc, u_loc, v_nonloc, gamma_d, gamma_m, comm
         )
@@ -272,7 +272,7 @@ def execute_dga_routine():
             for i in range(len(gaps_sing)):
                 gaps_sing[i].save(name=f"gap_sing_{i+1}", output_dir=config.output.eliashberg_path)
                 gaps_trip[i].save(name=f"gap_trip_{i+1}", output_dir=config.output.eliashberg_path)
-            logger.log_info("Saved singlet and triplet gap functions to files.")
+            logger.info("Saved singlet and triplet gap functions to files.")
 
         if config.output.do_plotting and comm.rank == 0:
             kx, ky = config.lattice.k_grid.kx_shift_closed, config.lattice.k_grid.ky_shift_closed
@@ -283,9 +283,9 @@ def execute_dga_routine():
                 plotting.plot_gap_function(
                     gaps_trip[i], kx, ky, name=f"gap_trip_{i+1}", output_dir=config.output.eliashberg_path
                 )
-            logger.log_info("Plotted singlet and triplet gap functions.")
+            logger.info("Plotted singlet and triplet gap functions.")
 
-    logger.log_info("Exiting ...")
+    logger.info("Exiting ...")
     MPI.Finalize()
 
 
@@ -304,16 +304,16 @@ def setup_lambda_correction_settings(comm: MPI.Comm) -> None:
 
     if config.self_consistency.use_lambda_correction:
         config.lambda_correction.perform_lambda_correction = True
-        config.logger.log_info("Calculating self-consistency with lambda correction.")
+        config.logger.info("Calculating self-consistency with lambda correction.")
         return
 
     if config.lambda_correction.perform_lambda_correction and not config.self_consistency.use_lambda_correction:
         config.self_consistency.max_iter = 1
         config.self_consistency.mixing = 1.0
-        config.logger.log_info("Performing one-shot DGA with lambda correction.")
+        config.logger.info("Performing one-shot DGA with lambda correction.")
         return
 
-    config.logger.log_info("Calculating self-consistency without lambda correction.")
+    config.logger.info("Calculating self-consistency without lambda correction.")
 
 
 def configure_matplotlib():

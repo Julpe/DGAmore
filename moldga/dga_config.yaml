@@ -27,6 +27,7 @@ self_consistency:
   previous_sc_path: "" # Path to the previous self-consistency folder. If not specified, the code will start a new calculation from scratch. If specified,
   # the code will start from the last iteration of the previous calculation and does max_iter steps on top
   use_lambda_correction: False # If True, the code will perform a lambda correction for each iteration, and it will automatically set perform_lambda_correction in the settings below to True.
+  restrict_chi_phys: False # If True, the physical susceptibilities will be restricted to positive values during the self-consistency cycle.
 
 lambda_correction:
   perform_lambda_correction: False # If True, the code will perform a lambda correction. This is only possible for single-orbital systems!

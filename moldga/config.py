@@ -81,6 +81,7 @@ class SelfConsistencyConfig:
         self.use_poly_fit = False
         self.previous_sc_path: str = "./"
         self.use_lambda_correction: bool = False
+        self.restrict_chi_phys: bool = False
 
 
 class EliashbergConfig:
@@ -158,9 +159,9 @@ class PolyFittingConfig:
 
 class OutputConfig:
     """
-    Class to store the output parameters. The output path is the path where the results are saved, the plotting path
-    is the path where the plots are saved, and the plotting subfolder name is the name of the subfolder in the plotting
-    path where the plots are saved. The Eliashberg path is the absolute path where the Eliashberg results are saved.
+    Class to store the output parameters. The output path is the path where the results are saved, the plotting path is
+    the path where the plots are saved, and the plotting subfolder name is the name of the subfolder in the plotting
+    path where the plots are saved to. The Eliashberg path is the absolute path where the Eliashberg results are saved to.
     """
 
     def __init__(self):
