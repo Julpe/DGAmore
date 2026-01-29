@@ -116,20 +116,20 @@ def update_frequency_boxes(niw: int, niv: int) -> None:
 
     if config.box.niw_core == -1:
         config.box.niw_core = niw
-        logger.log_info(f"Number of bosonic Matsubara frequency is set to '-1'. Using niw = {niw}.")
+        logger.info(f"Number of bosonic Matsubara frequency is set to '-1'. Using niw = {niw}.")
     elif config.box.niw_core > niw:
         config.box.niw_core = niw
-        logger.log_info(
+        logger.info(
             f"Number of bosonic Matsubara frequencies cannot exceed available "
             f"frequencies in the DMFT four-point object. Using niw = {niw}."
         )
 
     if config.box.niv_core == -1:
         config.box.niv_core = niv
-        logger.log_info(f"Number of fermionic Matsubara frequency is set to '-1'. Using niv = {niv}.")
+        logger.info(f"Number of fermionic Matsubara frequency is set to '-1'. Using niv = {niv}.")
     elif config.box.niv_core > niv:
         config.box.niv_core = niv
-        logger.log_info(
+        logger.info(
             f"Number of fermionic Matsubara frequencies cannot exceed available "
             f"frequencies in the DMFT four-point object. Using niv = {niv}."
         )
@@ -145,7 +145,7 @@ def update_g2_from_dmft(g2: LocalFourPoint) -> LocalFourPoint:
     g2 = g2.cut_niw_and_niv(config.box.niw_core, config.box.niv_core)
     if config.dmft.do_sym_v_vp:
         g2 = g2.symmetrize_v_vp()
-        config.logger.log_info(f"Symmetrized G2 ({g2.channel.value}) with respect to v and v'.")
+        config.logger.info(f"Symmetrized G2 ({g2.channel.value}) with respect to v and v'.")
     return g2
 
 
@@ -175,7 +175,7 @@ def set_hamiltonian(er_type: str, er_input: str | list, int_type: str, int_input
         ham, k_points = ham.read_hk_w2k(er_input)
         if config.lattice.nk is None:
             # ATTENTION: This is currently only available for 2D square lattices.
-            config.logger.log_info("Using q- and k-grid from wannier.hk file.")
+            config.logger.info("Using q- and k-grid from wannier.hk file.")
             config.lattice.nk = (int(np.sqrt(k_points[:, 0].size)), int(np.sqrt(k_points[:, 0].size)), 1)
             config.lattice.nq = config.lattice.nk
             config.lattice.k_grid = bz.KGrid(config.lattice.nk, config.lattice.symmetries)

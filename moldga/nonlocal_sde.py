@@ -184,13 +184,13 @@ def calculate_sigma_kernel_r_q(
     logger = config.logger
 
     gchi_aux_q_r = create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_loc, v_nonloc)
-    logger.log_info(f"Non-Local auxiliary susceptibility ({gchi_aux_q_r.channel.value}) calculated.")
+    logger.info(f"Non-Local auxiliary susceptibility ({gchi_aux_q_r.channel.value}) calculated.")
     logger.log_memory_usage(f"Gchi_aux ({gchi_aux_q_r.channel.value})", gchi_aux_q_r, mpi_dist_irrq.comm.size)
 
     gchi_aux_q_r_sum = gchi_aux_q_r.sum_over_vn(config.sys.beta, axis=(-1,))
     del gchi_aux_q_r
     vrg_q_r = create_vrg_r_q(gchi_aux_q_r_sum, gchi0_q_inv)
-    logger.log_info(f"Non-local three-leg vertex gamma^wv ({vrg_q_r.channel.value}) done.")
+    logger.info(f"Non-local three-leg vertex gamma^wv ({vrg_q_r.channel.value}) done.")
     logger.log_memory_usage(f"Three-leg vertex ({vrg_q_r.channel.value})", vrg_q_r, mpi_dist_irrq.comm.size)
 
     if config.eliashberg.perform_eliashberg:
@@ -205,11 +205,16 @@ def calculate_sigma_kernel_r_q(
     chi_phys_q_r = create_generalized_chi_q_with_shell_correction(
         chi_phys_q_r, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc
     )
-    logger.log_info(
-        f"Updated non-local susceptibility chi^q ({chi_phys_q_r.channel.value}) with asymptotic correction."
-    )
+    logger.info(f"Updated non-local susceptibility chi^q ({chi_phys_q_r.channel.value}) with asymptotic correction.")
+
+    if config.self_consistency.restrict_chi_phys:
+        logger.warning("Restricting physical susceptibility to positive values.")
+        chi_phys_q_r = chi_phys_q_r.invert(False)
+        chi_phys_q_r[chi_phys_q_r.mat < 0] = 1e-4
+        chi_phys_q_r = chi_phys_q_r.invert(False)
+
     logger.log_memory_usage(
-        f"Summed auxiliary susceptibility ({chi_phys_q_r.channel.value})", chi_phys_q_r, mpi_dist_irrq.comm.size
+        f"Physical susceptibility ({chi_phys_q_r.channel.value})", chi_phys_q_r, mpi_dist_irrq.comm.size
     )
 
     if config.lambda_correction.perform_lambda_correction or config.output.save_quantities:
@@ -219,7 +224,7 @@ def calculate_sigma_kernel_r_q(
                 chi_phys_q_r = perform_lambda_correction(chi_phys_q_r)
             chi_phys_q_r.save(name=f"chi_phys_q_{chi_phys_q_r.channel.value}", output_dir=config.output.output_path)
         chi_phys_q_r.mat = mpi_dist_irrq.scatter(chi_phys_q_r.mat)
-        logger.log_info(f"Saved physical susceptibility ({chi_phys_q_r.channel.value}) to file.")
+        logger.info(f"Saved physical susceptibility ({chi_phys_q_r.channel.value}) to file.")
 
     if config.eliashberg.perform_eliashberg:
         chi_phys_q_r.save(
@@ -241,10 +246,10 @@ def perform_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
     if config.lambda_correction.type not in ["spch", "sp"]:
         raise ValueError("Lambda correction type must be either 'spch' or 'sp'.")
 
-    logger.log_info(f"Lambda correction type set to '{config.lambda_correction.type}'.")
+    logger.info(f"Lambda correction type set to '{config.lambda_correction.type}'.")
 
     if config.lambda_correction.type == "spch":
-        logger.log_info(f"Performing lambda correction for {chi_phys_q_r.channel.value} channel.")
+        logger.info(f"Performing lambda correction for {chi_phys_q_r.channel.value} channel.")
         chi_r_loc = LocalFourPoint.load(
             os.path.join(config.output.output_path, f"chi_{chi_phys_q_r.channel.value}_loc.npy"),
             chi_phys_q_r.channel,
@@ -254,7 +259,7 @@ def perform_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
             chi_phys_q_r, chi_r_loc.mat.sum() / config.sys.beta
         )
         del chi_r_loc
-        logger.log_info(
+        logger.info(
             f"Lambda correction for the {chi_phys_q_r.channel.value} channel applied with lambda = {lambda_r:.6f}."
         )
 
@@ -268,7 +273,7 @@ def perform_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
     if chi_phys_q_r.channel != SpinChannel.MAGN:
         return chi_phys_q_r
 
-    logger.log_info(f"Performing lambda correction for magn channel.")
+    logger.info(f"Performing lambda correction for magn channel.")
     chi_phys_q_dens = FourPoint.load(
         os.path.join(config.output.output_path, f"chi_phys_q_dens.npy"),
         SpinChannel.DENS,
@@ -288,7 +293,7 @@ def perform_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
         config.lattice.q_grid.irrk_count[:, None, None, None, None, None] * chi_phys_q_dens.mat
     ).sum()
     chi_phys_q_r, lambda_r = lc.perform_single_lambda_correction(chi_phys_q_r, chi_magn_loc_sum / config.sys.beta)
-    logger.log_info(f"Lambda correction 'sp' applied. Lambda for magn channel is: {lambda_r:.6f}.")
+    logger.info(f"Lambda correction 'sp' applied. Lambda for magn channel is: {lambda_r:.6f}.")
 
     if config.output.save_quantities:
         with open(os.path.join(config.output.output_path, f"lambda_{config.lambda_correction.type}.txt"), "a") as f:
@@ -426,8 +431,7 @@ def calculate_self_energy_q(
     """
     logger = config.logger
 
-    logger.log_info("Starting with non-local DGA routine.")
-    logger.log_info("Initializing MPI distributor.")
+    logger.info("Initializing MPI distributor.")
 
     # MPI distributor for the irreducible BZ
     mpi_dist_irrk = MpiDistributor.create_distributor(ntasks=config.lattice.q_grid.nk_irr, comm=comm, name="Q")
@@ -442,13 +446,13 @@ def calculate_self_energy_q(
     v_nonloc = v_nonloc.compress_q_dimension()
     hartree, fock = get_hartree_fock(u_loc, v_nonloc, my_full_q_list)
     fock = mpi_dist_fullbz.allreduce(fock)
-    logger.log_info("Calculated Hartree and Fock terms.")
+    logger.info("Calculated Hartree and Fock terms.")
 
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
 
     sigma_old, starting_iter = get_starting_sigma(config.self_consistency.previous_sc_path, sigma_dmft)
     if starting_iter > 0:
-        logger.log_info(
+        logger.info(
             f"Using previous calculation and starting the self-consistency loop at iteration {starting_iter+1}."
         )
 
@@ -463,9 +467,9 @@ def calculate_self_energy_q(
     )
 
     for current_iter in range(starting_iter + 1, starting_iter + config.self_consistency.max_iter + 1):
-        logger.log_info("----------------------------------------")
-        logger.log_info(f"Starting iteration {current_iter}.")
-        logger.log_info("----------------------------------------")
+        logger.info("----------------------------------------")
+        logger.info(f"Starting iteration {current_iter}.")
+        logger.info("----------------------------------------")
 
         giwk_full = GreensFunction.get_g_full(sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek())
 
@@ -486,7 +490,7 @@ def calculate_self_energy_q(
         f_dc_loc = 2 * LocalFourPoint.load(os.path.join(config.output.output_path, "f_magn_loc.npy"))
         kernel = -calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc)
         del f_dc_loc
-        logger.log_info("Calculated double-counting kernel.")
+        logger.info("Calculated double-counting kernel.")
 
         gchi0_q_full_sum = 1.0 / config.sys.beta * gchi0_q.sum_over_all_vn(config.sys.beta)
         gchi0_q_core = gchi0_q.cut_niv(config.box.niv_core)
@@ -505,30 +509,30 @@ def calculate_self_energy_q(
         kernel += calculate_sigma_kernel_r_q(
             gamma_dens, gchi0_q_core_inv, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc, mpi_dist_irrk
         )
-        logger.log_info("Calculated kernel for density channel.")
+        logger.info("Calculated kernel for density channel.")
 
         kernel += 3 * calculate_sigma_kernel_r_q(
             gamma_magn, gchi0_q_core_inv, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc, mpi_dist_irrk
         )
         del gchi0_q_core_inv, gchi0_q_full_sum, gchi0_q_core_sum
-        logger.log_info("Calculated kernel for magnetic channel.")
+        logger.info("Calculated kernel for magnetic channel.")
 
         kernel.mat = mpi_dist_irrk.gather(kernel.mat)
         if comm.rank == 0:
             kernel = kernel.map_to_full_bz(config.lattice.q_grid.irrk_inv)
         kernel.mat = mpi_dist_fullbz.scatter(kernel.mat)
-        logger.log_info("Kernel mapped to full BZ and scattered across all MPI ranks.")
+        logger.info("Kernel mapped to full BZ and scattered across all MPI ranks.")
 
         sigma_new = calculate_sigma_from_kernel_fast(kernel, giwk_full, my_full_q_list)
         del kernel
-        logger.log_info("Self-energy calculated from kernel.")
+        logger.info("Self-energy calculated from kernel.")
 
         sigma_new.mat = mpi_dist_irrk.allreduce(sigma_new.mat)
         logger.log_memory_usage("Non-local sigma", sigma_new, comm.size)
         sigma_new.mat = comm.bcast(sigma_new.mat, root=0)
 
         sigma_new = sigma_new + hartree + fock
-        logger.log_info("Full non-local self-energy calculated.")
+        logger.info("Full non-local self-energy calculated.")
 
         # This is done to minimize noise. We remove some fluctuations from dmft that are included in the local self-energy
         # calculated in this code and add the smooth dmft self-energy
@@ -547,40 +551,51 @@ def calculate_self_energy_q(
 
         config.sys.mu = comm.bcast(config.sys.mu)
         mu_history.append(config.sys.mu)
-        logger.log_info(f"Updated mu from {old_mu} to {config.sys.mu}.")
+        logger.info(f"Updated mu from {old_mu} to {config.sys.mu}.")
 
-        logger.log_info("Applying mixing strategy to the self-energy.")
+        logger.info("Applying mixing strategy to the self-energy.")
         sigma_new = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter)
 
         if config.self_consistency.save_iter and config.output.save_quantities and comm.rank == 0:
             sigma_new.save(name=f"sigma_dga_iteration_{current_iter}", output_dir=config.output.output_path)
-            logger.log_info(f"Saved sigma for iteration {current_iter} as numpy array.")
+            logger.info(f"Saved sigma for iteration {current_iter} as numpy array.")
 
-        logger.log_info("Checking self-consistency convergence.")
+        logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
             niv_start = sigma_new.niv
             niv_end = niv_start + int(np.ceil(config.box.niv_core / 5))
-            converged = np.allclose(
+
+            sigma_converged = np.allclose(
                 sigma_old[..., niv_start:niv_end],
                 sigma_new[..., niv_start:niv_end],
                 atol=config.self_consistency.epsilon,
             )
+            logger.info(f"Self-energy convergence: {sigma_converged}.")
+
+            mu_converged = abs(mu_history[-1] - mu_history[-2]) < np.pi / (10 * config.sys.beta)
+            logger.info(f"Chemical potential convergence: {mu_converged}.")
+
+            converged = mu_converged and sigma_converged
         else:
             converged = False
         converged = comm.bcast(converged)
 
         sigma_old = sigma_new
         if converged:
-            logger.log_info(f"Self-consistency reached. Sigma converged at iteration {current_iter}.")
-            break
-        logger.log_info("Self-consistency not reached yet.")
+            if config.self_consistency.restrict_chi_phys:
+                logger.info("ATTENTION: Self-consistency with modified susceptibility reached. Disabling restriction.")
+                config.self_consistency.restrict_chi_phys = False
+            else:
+                logger.info(f"Self-consistency of sigma and mu reached at iteration {current_iter}.")
+                break
+        logger.info("Self-consistency not reached.")
 
     mpi_dist_irrk.delete_file()
     mpi_dist_fullbz.delete_file()
 
     if config.output.save_quantities:
         np.save(os.path.join(config.output.output_path, "mu_history.npy"), mu_history)
-        logger.log_info("Saved mu history as numpy array.")
+        logger.info("Saved mu history as numpy array.")
 
     return sigma_old
 
@@ -613,7 +628,7 @@ def apply_mixing_strategy(
         niv_core = config.box.niv_core
         last_proposals = [sigma[..., niv_dmft - niv_core : niv_dmft + niv_core] for sigma in last_proposals]
         last_results = [sigma[..., niv_dmft - niv_core : niv_dmft + niv_core] for sigma in last_results]
-        logger.log_info(f"Loaded last {n_hist} self-energies from files.")
+        logger.info(f"Loaded last {n_hist} self-energies from files.")
 
         shape = last_results[-1].shape
         n_total = int(np.prod(shape))
@@ -650,14 +665,14 @@ def apply_mixing_strategy(
             ..., niv_dmft - niv_core : niv_dmft + niv_core
         ] + update.reshape(shape)
 
-        logger.log_info(
+        logger.info(
             f"Pulay mixing applied with {n_hist} previous iterations and a mixing parameter of {config.self_consistency.mixing}."
         )
 
         return sigma_new
 
     sigma_new = config.self_consistency.mixing * sigma_new + (1 - config.self_consistency.mixing) * sigma_old
-    logger.log_info(
+    logger.info(
         f"Sigma linearly mixed with previous iteration using a mixing parameter of {config.self_consistency.mixing}."
     )
     return sigma_new

@@ -33,7 +33,7 @@ def delete_files(filepath: str, *args) -> None:
             try:
                 os.remove(full_path)
             except OSError:
-                config.logger.log_info(f"Error deleting file: {name}.")
+                config.logger.info(f"Error deleting file: {name}.")
 
 
 # --- Frequency transform helpers (PH -> PP w0) ---
@@ -78,18 +78,18 @@ def create_full_vertex_q_r(
     Calculates the full vertex in the given channel (either density or magnetic).
     """
     logger = config.logger
-    logger.log_info(f"Starting to calculate the full {gamma_r.channel.value} vertex.")
+    logger.info(f"Starting to calculate the full {gamma_r.channel.value} vertex.")
 
     gchi0_q_inv = FourPoint.load(
         os.path.join(config.output.eliashberg_path, f"gchi0_q_inv_rank_{comm.rank}.npy"), num_vn_dimensions=1
     )
-    logger.log_info(f"Loaded gchi0_q_inv from file.")
+    logger.info(f"Loaded gchi0_q_inv from file.")
     f_q_r = nonlocal_sde.create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_loc, v_nonloc)
-    logger.log_info(f"Non-Local auxiliary susceptibility ({gamma_r.channel.value}) calculated.")
+    logger.info(f"Non-Local auxiliary susceptibility ({gamma_r.channel.value}) calculated.")
 
     f_q_r = config.sys.beta**2 * (gchi0_q_inv - gchi0_q_inv @ f_q_r @ gchi0_q_inv)
     del gchi0_q_inv
-    logger.log_info(f"Calculated first part of full {gamma_r.channel.value} vertex.")
+    logger.info(f"Calculated first part of full {gamma_r.channel.value} vertex.")
 
     vrg_q_r = FourPoint.load(
         os.path.join(config.output.eliashberg_path, f"vrg_q_{gamma_r.channel.value}_rank_{comm.rank}.npy"),
@@ -101,12 +101,12 @@ def create_full_vertex_q_r(
         channel=gamma_r.channel,
         num_vn_dimensions=0,
     )
-    logger.log_info(f"Loaded vrg_q_{gamma_r.channel.value} and gchi_aux_q_{gamma_r.channel.value}_sum from files.")
+    logger.info(f"Loaded vrg_q_{gamma_r.channel.value} and gchi_aux_q_{gamma_r.channel.value}_sum from files.")
 
     u = u_loc.as_channel(gamma_r.channel) + v_nonloc.as_channel(gamma_r.channel)
     f_q_r += u @ (vrg_q_r * vrg_q_r) - u @ gchi_aux_q_r_sum @ u @ (vrg_q_r * vrg_q_r)
     del gchi_aux_q_r_sum, vrg_q_r
-    logger.log_info(f"Calculated second part of full {f_q_r.channel.value} vertex.")
+    logger.info(f"Calculated second part of full {f_q_r.channel.value} vertex.")
 
     delete_files(
         config.output.eliashberg_path,
@@ -132,9 +132,9 @@ def create_full_vertex_q_r_pp_w0(
         if mpi_dist_irrk.comm.rank == 0:
             f_q_r.save(output_dir=config.output.output_path, name=f"f_irrq_{f_q_r.channel.value}")
         f_q_r.mat = mpi_dist_irrk.scatter(f_q_r.mat)
-        config.logger.log_info(f"Saved full ladder-vertex ({f_q_r.channel.value}) in the irreducible BZ to file.")
+        config.logger.info(f"Saved full ladder-vertex ({f_q_r.channel.value}) in the irreducible BZ to file.")
 
-    logger.log_info(f"Full ladder-vertex ({f_q_r.channel.value}) calculated.")
+    logger.info(f"Full ladder-vertex ({f_q_r.channel.value}) calculated.")
     logger.log_memory_usage(f"Full ladder-vertex ({f_q_r.channel.value})", f_q_r, mpi_dist_irrk.comm.size)
 
     return transform_vertex_q_frequencies_w0(f_q_r, niv_pp)
@@ -224,7 +224,7 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
     """
     logger = config.logger
 
-    logger.log_info(
+    logger.info(
         f"Starting to solve the Eliashberg equation for the {gamma_q_r_pp.channel.value}let channel.",
         allowed_ranks=(0, 1),
     )
@@ -244,7 +244,7 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
 
     gap0 = get_initial_gap_function(gap_shape, gamma_q_r_pp.channel)
     symmetry_label = config.eliashberg.symmetry if config.eliashberg.symmetry else "random"
-    logger.log_info(
+    logger.info(
         f"Initialized the gap function as {symmetry_label} for the {gamma_q_r_pp.channel.value}let channel.",
         allowed_ranks=(0, 1),
     )
@@ -284,7 +284,7 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
     n_eig = config.eliashberg.n_eig
     eig_label = "" if n_eig > 1 else f" {n_eig}"
     plural = "" if n_eig == 1 else "s"
-    logger.log_info(
+    logger.info(
         f"Starting Lanczos method to retrieve largest{eig_label} eigenvalue{plural} and eigenvector{plural} "
         f"for the {gamma_q_r_pp.channel.value}let channel.",
         allowed_ranks=(0, 1),
@@ -294,7 +294,7 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
         mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0, which="LA", maxiter=10000
     )
 
-    logger.log_info(
+    logger.info(
         f"Finished Lanczos method for the largest{eig_label} eigenvalue{plural} and eigenvector{plural} "
         f"for the {gamma_q_r_pp.channel.value}let channel.",
         allowed_ranks=(0, 1),
@@ -304,7 +304,7 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
     lambdas = lambdas[order]
     gaps = gaps[:, order]
 
-    logger.log_info(
+    logger.info(
         f"Largest{eig_label} eigenvalue{plural} for the {gamma_q_r_pp.channel.value}let "
         f"channel {"is" if n_eig == 1 else "are"}: " + ", ".join(f"{lam:.6f}" for lam in lambdas),
         allowed_ranks=(0, 1),
@@ -315,7 +315,7 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
         for i in range(config.eliashberg.n_eig)
     ]
 
-    logger.log_info(
+    logger.info(
         f"Finished solving the Eliashberg equation for the {gamma_q_r_pp.channel.value}let channel.",
         allowed_ranks=(0, 1),
     )
@@ -356,12 +356,12 @@ def solve(
 
     gamma_sing_pp = 0.5 * f_dens_pp - 1.5 * f_magn_pp
     gamma_sing_pp.channel = SpinChannel.SING
-    logger.log_info("Calculated full ladder-vertex (singlet) in pp notation.")
+    logger.info("Calculated full ladder-vertex (singlet) in pp notation.")
 
     gamma_trip_pp = 0.5 * f_dens_pp + 0.5 * f_magn_pp
     gamma_trip_pp.channel = SpinChannel.TRIP
     del f_dens_pp, f_magn_pp
-    logger.log_info("Calculated full ladder-vertex (triplet) in pp notation.")
+    logger.info("Calculated full ladder-vertex (triplet) in pp notation.")
 
     gamma_sing_pp.mat = mpi_dist_irrk.gather(gamma_sing_pp.mat)
     gamma_trip_pp.mat = mpi_dist_irrk.gather(gamma_trip_pp.mat)
@@ -369,7 +369,7 @@ def solve(
     gchi0_q0_pp = None
     if mpi_dist_irrk.my_rank == 0:
         gchi0_q0_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(giwk_dga, niv_pp)
-        logger.log_info("Created the bare bubble susceptibility in pp notation.")
+        logger.info("Created the bare bubble susceptibility in pp notation.")
 
         if config.eliashberg.include_local_part:
             f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0 = create_local_ud_diagrams_pp_w0(g_loc, niv_pp)
@@ -378,7 +378,7 @@ def solve(
                 f_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="f_ud_loc_pp_w0")
                 phi_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="phi_ud_loc_pp_w0")
                 gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
-                logger.log_info("Saved local ud diagrams in pp notation to file.")
+                logger.info("Saved local ud diagrams in pp notation to file.")
 
             del f_ud_loc_pp_w0, gamma_ud_loc_pp_w0
 
@@ -405,7 +405,7 @@ def solve(
             gamma_trip_pp.save(
                 output_dir=config.output.eliashberg_path, name=f"gamma_irrq_{gamma_trip_pp.channel.value}_pp"
             )
-            config.logger.log_info(
+            config.logger.info(
                 f"Saved singlet and triplet pairing vertices in pp notation in the irreducible BZ to file."
             )
 

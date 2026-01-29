@@ -74,7 +74,7 @@ class ConfigParser:
         conf.niv_core = self._try_parse(box_section, "niv_core", -1)
         conf.niv_shell = self._try_parse(box_section, "niv_shell", 0)
         if conf.niv_shell <= 0:
-            config.logger.log_info(f"'niv_shell' is set to {conf.niv_shell}. No asymptotics will be used.")
+            config.logger.info(f"'niv_shell' is set to {conf.niv_shell}. No asymptotics will be used.")
             conf.niv_shell = 0
         conf.niv_full = conf.niv_core + conf.niv_shell
 
@@ -90,7 +90,7 @@ class ConfigParser:
         conf.nk = self._try_parse(lattice_section, "nk", (16, 16, 1))
 
         if "nq" not in lattice_section:
-            config.logger.log_info("'nq' not set in config. Setting 'nq' = 'nk'.")
+            config.logger.info("'nq' not set in config. Setting 'nq' = 'nk'.")
             conf.nq = conf.nk
         else:
             conf.nq = self._try_parse(lattice_section, "nq", (16, 16, 1))
@@ -142,9 +142,7 @@ class ConfigParser:
         conf.output_path = self._try_parse(output_section, "output_path", "./")
 
         if not conf.output_path or conf.output_path == "":
-            config.logger.log_info(
-                f"'output_path' not set in config. Setting 'output_path' = '{config.dmft.input_path}'."
-            )
+            config.logger.info(f"'output_path' not set in config. Setting 'output_path' = '{config.dmft.input_path}'.")
             conf.output_path = config.dmft.input_path
 
         return conf
@@ -164,6 +162,7 @@ class ConfigParser:
         conf.mixing_history_length = self._try_parse(sc_section, "mixing_history_length", 3)
         conf.previous_sc_path = self._try_parse(sc_section, "previous_sc_path", "./")
         conf.use_lambda_correction = self._try_parse(sc_section, "use_lambda_correction", False)
+        conf.restrict_chi_phys = self._try_parse(sc_section, "restrict_chi_phys", False)
 
         return conf
 
@@ -206,5 +205,5 @@ class ConfigParser:
         try:
             return value_type(config_section[key])
         except ValueError:
-            config.logger.log_info(f"Could not parse value for {key}. Using default value: {default_value}.")
+            config.logger.info(f"Could not parse value for {key}. Using default value: {default_value}.")
             return default_value

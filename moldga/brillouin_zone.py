@@ -54,6 +54,13 @@ class Labels(Enum):
     A = "A"
 
 
+def fmmm_amam_symmetries() -> list[KnownSymmetries]:
+    """
+    Amam/Fmmm lattice symmetries in three dimensions.
+    """
+    return [KnownSymmetries.X_INV, KnownSymmetries.Y_INV, KnownSymmetries.Z_INV]
+
+
 def two_dimensional_square_symmetries() -> list[KnownSymmetries]:
     """
     Two-dimensional square lattice symmetries.
@@ -209,6 +216,8 @@ def get_lattice_symmetries_from_string(symmetry_string: str) -> list[KnownSymmet
         return simultaneous_x_y_inversion()
     elif symmetry_string == "quasi_two_dimensional_square_symmetries":
         return quasi_two_dimensional_square_symmetries()
+    elif symmetry_string.lower() == "fmmm" or symmetry_string.lower() == "amam" or symmetry_string.lower() == "cmcm":
+        return fmmm_amam_symmetries()
     elif not symmetry_string or symmetry_string == "none":
         return []
     elif isinstance(symmetry_string, (tuple, list)):

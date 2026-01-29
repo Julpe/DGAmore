@@ -113,27 +113,27 @@ def create_vertex_functions(
 
     gchi_r = create_generalized_chi(g2_r, g_loc)
     # del g2_r
-    logger.log_info(f"Local generalized susceptibility chi^wvv' ({gchi_r.channel.value}) done.")
+    logger.info(f"Local generalized susceptibility chi^wvv' ({gchi_r.channel.value}) done.")
 
     gamma_r = create_gamma_r_with_shell_correction(gchi_r, gchi0, u_loc)
 
     gchi0 = gchi0.take_vn_diagonal()
-    logger.log_info(f"Local irreducible vertex Gamma^wvv' ({gamma_r.channel.value}) with asymptotic correction done.")
+    logger.info(f"Local irreducible vertex Gamma^wvv' ({gamma_r.channel.value}) with asymptotic correction done.")
 
     f_r = create_full_vertex_from_gamma(gamma_r, gchi0, u_loc)
-    logger.log_info(f"Local full vertex F^wvv' ({f_r.channel.value}) done.")
+    logger.info(f"Local full vertex F^wvv' ({f_r.channel.value}) done.")
 
     gchi_r_aux = create_auxiliary_chi(gamma_r, gchi0_inv_core, u_loc)
-    logger.log_info(f"Local auxiliary susceptibility chi^*wvv' ({gchi_r_aux.channel.value}) done.")
+    logger.info(f"Local auxiliary susceptibility chi^*wvv' ({gchi_r_aux.channel.value}) done.")
 
     vrg_r = create_vrg(gchi_r_aux, gchi0_inv_core)
-    logger.log_info(f"Local three-leg vertex gamma^wv ({vrg_r.channel.value}) done.")
+    logger.info(f"Local three-leg vertex gamma^wv ({vrg_r.channel.value}) done.")
 
     gchi_r_aux_sum = gchi_r_aux.sum_over_all_vn(config.sys.beta)
     del gchi_r_aux
 
     gchi_r_aux_sum = create_generalized_chi_with_shell_correction(gchi_r_aux_sum, gchi0, u_loc)
-    logger.log_info(f"Updated local susceptibility chi^w ({gchi_r_aux_sum.channel.value}) with asymptotic correction.")
+    logger.info(f"Updated local susceptibility chi^w ({gchi_r_aux_sum.channel.value}) with asymptotic correction.")
 
     return gamma_r, gchi_r_aux_sum, vrg_r, f_r, gchi_r
 
@@ -215,14 +215,14 @@ def perform_local_schwinger_dyson_abinitio_dga(
     logger = config.logger
 
     gchi_dens_loc = create_generalized_chi(g2_dens, g_loc)
-    logger.log_info("Generalized susceptibility chi^wvv' (dens) done.")
+    logger.info("Generalized susceptibility chi^wvv' (dens) done.")
     del g2_dens
     gchi_magn_loc = create_generalized_chi(g2_magn, g_loc)
-    logger.log_info("Generalized susceptibility chi^wvv' (magn) done.")
+    logger.info("Generalized susceptibility chi^wvv' (magn) done.")
     del g2_magn
 
     gchi0_loc_full = BubbleGenerator.create_generalized_chi0(g_loc, config.box.niw_core, config.box.niv_full)
-    logger.log_info("Local bare susceptibility chi_0^wv done.")
+    logger.info("Local bare susceptibility chi_0^wv done.")
     gchi0_core = gchi0_loc_full.cut_niv(config.box.niv_core)
 
     # 1 + chi0 * F_r = gchi_r * (chi0)^(-1) = 1 + gamma_r or
@@ -230,9 +230,9 @@ def perform_local_schwinger_dyson_abinitio_dga(
     # gamma_r is NOT the irreducible vertex in channel r but rather the three-point vertex from AbinitioDGA
     gchi0_inv_core = gchi0_core.invert()
     f_dens_loc = -config.sys.beta**2 * (gchi0_inv_core - gchi0_inv_core @ gchi_dens_loc @ gchi0_inv_core)
-    logger.log_info("Local full vertex F^wvv' (dens) done.")
+    logger.info("Local full vertex F^wvv' (dens) done.")
     f_magn_loc = -config.sys.beta**2 * (gchi0_inv_core - gchi0_inv_core @ gchi_magn_loc @ gchi0_inv_core)
-    logger.log_info("Local full vertex F^wvv' (magn) done.")
+    logger.info("Local full vertex F^wvv' (magn) done.")
     del gchi0_inv_core
 
     # f_dens_loc_with_asympt = create_asympt_f(gchi_dens_loc, gchi_magn_loc, gchi_ud_pp_loc_sum, u_loc)
@@ -240,15 +240,15 @@ def perform_local_schwinger_dyson_abinitio_dga(
     # in most equations we need 1 + gamma_r so we add it here
     gamma_dens_loc = 1.0 / config.sys.beta * (gchi0_core @ f_dens_loc).sum_over_vn(config.sys.beta, axis=(-2,))
     one_plus_gamma_dens_loc = LocalFourPoint.identity_like(gamma_dens_loc) + gamma_dens_loc
-    logger.log_info("Local three-leg vertex gamma^wv (dens) done.")
+    logger.info("Local three-leg vertex gamma^wv (dens) done.")
 
     gamma_magn_loc = 1.0 / config.sys.beta * (gchi0_core @ f_magn_loc).sum_over_vn(config.sys.beta, axis=(-2,))
     one_plus_gamma_magn_loc = LocalFourPoint.identity_like(gamma_dens_loc) + gamma_magn_loc
-    logger.log_info("Local three-leg vertex gamma^wv (magn) done.")
+    logger.info("Local three-leg vertex gamma^wv (magn) done.")
     del gchi0_core, gamma_magn_loc
 
     sigma_loc = get_loc_self_energy_gamma_abinitio_dga(gamma_dens_loc, u_loc, g_loc)
-    logger.log_info("Local self-energy done.")
+    logger.info("Local self-energy done.")
     del gamma_dens_loc
 
     return (

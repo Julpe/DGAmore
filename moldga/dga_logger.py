@@ -23,7 +23,7 @@ class DgaLogger:
         # self._logger.addHandler(logging.FileHandler(self._filepath))
 
         self._start_time = datetime.now()
-        self.log_info("       Current-T        |    Elapsed-T    |    Message")
+        self.info("       Current-T        |    Elapsed-T    |    Message")
 
     @property
     def is_root(self) -> bool:
@@ -65,11 +65,17 @@ class DgaLogger:
         """
         self._log("::DEBUG:: " + message, level=logging.DEBUG, allowed_ranks=allowed_ranks)
 
-    def log_info(self, message: str, allowed_ranks: tuple = (0,)):
+    def info(self, message: str, allowed_ranks: tuple = (0,)):
         """
         Logs an informational message. This is intended for general information about the program's execution.
         """
         self._log(message, level=logging.INFO, allowed_ranks=allowed_ranks)
+
+    def warning(self, message: str, allowed_ranks: tuple = (0,)):
+        """
+        Logs a warning message. This is intended for situations that are not errors but may require attention.
+        """
+        self._log("::WARNING:: " + message, level=logging.WARNING, allowed_ranks=allowed_ranks)
 
     def log_memory_usage(self, obj_name: str, obj, n_exists: int = 1, allowed_ranks: tuple = (0,)):
         """
@@ -78,7 +84,7 @@ class DgaLogger:
         """
         if obj is None:
             return
-        self.log_info(
+        self.info(
             f"{obj_name} {"uses" if n_exists <= self._comm.size else "use"} (GB): {obj.memory_usage_in_gb * n_exists:.6f}",
             allowed_ranks=allowed_ranks,
         )
