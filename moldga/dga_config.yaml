@@ -56,6 +56,11 @@ poly_fitting:
   n_fit: -1 # Number of Matsubara frequencies used for fit; default: -1 (niv_core + 40)
   o_fit: 8 # Polynomial order used for the fit; default: 8
 
+self_energy_interpolation:
+  do_interpolation: False # If True, the code will interpolate the self-energy to a different frequency and beta in each iteration
+  target_beta: 1.0 # Target inverse temperature for the interpolation
+  target_niv: 10 # Target number of fermionic frequencies for the interpolation
+
 output:
   output_path: "./" # Path, where the DGA output folders are created. If not specified, the output is created in the input folder directory of the DMFT files
   save_quantities: True # If True, the code will save several quantities into the output folder

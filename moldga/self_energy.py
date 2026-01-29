@@ -2,6 +2,7 @@ import itertools as it
 from copy import deepcopy
 
 import numpy as np
+from scipy.interpolate import interp1d
 
 import moldga.config as config
 from moldga.local_n_point import LocalNPoint
@@ -199,6 +200,33 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
                     poly_mat[k, o1, o2, :] = np.polyval(poly, vn_full)
 
         return SelfEnergy(poly_mat, copy.nq, copy.full_niv_range, copy.has_compressed_q_dimension, False)
+
+    def interpolate(self, beta_source: float, beta_target: float, niv_target: int) -> "SelfEnergy":
+        """
+        Linearly interpolate the self-energy from beta_source to beta_target,
+        using positive Matsubara data and explicit v=0 anchoring.
+        """
+        vn_in = MFHelper.vn(self.niv, float(beta_source), return_only_positive=True)
+        vn_out = MFHelper.vn(niv_target, float(beta_target), return_only_positive=True)
+
+        fit_mat = self.mat[..., self.niv :]
+        sigma_zero = 0.5 * (self.mat[..., self.niv - 1] + self.mat[..., self.niv])
+
+        # Augment grid with v=0
+        vn_aug = np.concatenate(([0.0], vn_in))
+        sigma_aug = np.concatenate((sigma_zero[..., None], fit_mat), axis=-1)
+
+        interp = interp1d(
+            vn_aug,
+            sigma_aug,
+            kind="linear",
+            axis=-1,
+            bounds_error=False,
+            fill_value="extrapolate",
+            assume_sorted=True,
+        )
+
+        return SelfEnergy(interp(vn_out), self.nq, False, self.has_compressed_q_dimension, False)
 
     def _estimate_niv_core(self, err: float = 1e-5):
         """

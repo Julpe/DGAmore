@@ -512,6 +512,15 @@ def calculate_self_energy_q(
             sigma_new.save(name=f"sigma_dga_iteration_{current_iter}", output_dir=config.output.output_path)
             logger.info(f"Saved sigma for iteration {current_iter} as numpy array.")
 
+            if config.self_energy_interpolation.do_interpolation:
+                beta_target = config.self_energy_interpolation.beta_target
+                niv_target = config.self_energy_interpolation.niv_target
+                beta_source = config.sys.beta
+                sigma_new.interpolate(beta_source, beta_target, niv_target).save(
+                    name=f"sigma_dga_interpolated_beta{beta_target}_niv{niv_target}_iteration_{current_iter}",
+                    output_dir=config.output.output_path,
+                )
+
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
             niv_start = sigma_new.niv

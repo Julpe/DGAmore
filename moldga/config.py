@@ -157,6 +157,17 @@ class PolyFittingConfig:
         self.o_fit: int = 3
 
 
+class SelfEnergyInterpolationConfig:
+    """
+    Class to store the interpolation parameters for the self-energy, such as target beta and target niv.
+    """
+
+    def __init__(self):
+        self.do_interpolation: bool = False
+        self.beta_target: float = 0.0
+        self.niv_target: int = 0
+
+
 class OutputConfig:
     """
     Class to store the output parameters. The output path is the path where the results are saved, the plotting path
@@ -181,5 +192,6 @@ dmft: DmftConfig = DmftConfig()
 sys: SystemConfig = SystemConfig()
 output: OutputConfig = OutputConfig()
 poly_fitting: PolyFittingConfig = PolyFittingConfig()
+self_energy_interpolation: SelfEnergyInterpolationConfig = SelfEnergyInterpolationConfig()
 self_consistency: SelfConsistencyConfig = SelfConsistencyConfig()
 eliashberg: EliashbergConfig = EliashbergConfig()
