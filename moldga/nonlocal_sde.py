@@ -329,7 +329,7 @@ def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full
     return SelfEnergy(mat, config.lattice.nk, False).compress_q_dimension()
 
 
-def calculate_sigma_from_kernel_fast(
+def calculate_sigma_from_kernel_cpu(
     kernel: FourPoint,
     giwk: GreensFunction,
     my_full_q_list: np.ndarray,
@@ -372,57 +372,72 @@ def calculate_sigma_from_kernel_fast(
     return SelfEnergy(np.ascontiguousarray(mat), config.lattice.nk, False).compress_q_dimension()
 
 
-"""
-import cupy as cp
-import numpy as np
+def calculate_sigma_from_kernel_gpu(
+    kernel: FourPoint,
+    giwk: GreensFunction,
+    my_full_q_list: np.ndarray,
+) -> SelfEnergy:
+    r"""
+    Returns :math:`\Sigma_{ij}^{k} = -1/2 * 1/\beta * 1/N_q \sum_q [ U^q_{r;aibc} * K_{r;cbjd}^{qv} * G_{ad}^{w-v} ]`.
+    For very large momentum grids, this function is the slowest part compared to the rest of the code due to the
+    repeated loops. This function tries to execute it on the GPU using CuPy.
+    """
+    import cupy as cp
 
-
-def calculate_sigma_from_kernel_fast_gpu(
-    kernel: "FourPoint", giwk: "GreensFunction", my_full_q_list: np.ndarray
-) -> "SelfEnergy":
     nkx, nky, nkz = config.lattice.k_grid.nk
-    niv_core = config.box.niv_core
     nb = config.sys.n_bands
+    niv_core = config.box.niv_core
 
-    # Determine dtype (use complex64 if original is complex64, else complex128)
-    dtype = cp.complex64 if np.issubdtype(kernel.mat.dtype, np.complex64) else cp.complex128
-
-    # Allocate result on GPU
-    mat_gpu = cp.zeros((nkx, nky, nkz, nb, nb, niv_core), dtype=dtype)
-
-    # Frequency slices
+    mat_gpu = cp.zeros((nkx, nky, nkz, nb, nb, niv_core), dtype=kernel.mat.dtype, order="F")
     wn = MFHelper.wn(config.box.niw_core)
-    freq_slices = [slice(giwk.niv - w, giwk.niv - w + niv_core) for w in wn]
 
-    # Move arrays to GPU
-    giwk_gpu = cp.asarray(np.asfortranarray(giwk.mat), dtype=dtype)
-    kernel_gpu = cp.asarray(np.asfortranarray(kernel.to_full_niw_range().mat), dtype=dtype)
+    giwk_mat = cp.asarray(giwk.mat, order="F")
+    kernel_mat = cp.asarray(kernel.to_full_niw_range().mat, order="F")[..., niv_core:]
 
-    # Precompute k indices
     kxs, kys, kzs = cp.arange(nkx), cp.arange(nky), cp.arange(nkz)
     kx_indices = [((kxs + q[0]) % nkx) for q in my_full_q_list]
     ky_indices = [((kys + q[1]) % nky) for q in my_full_q_list]
     kz_indices = [((kzs + q[2]) % nkz) for q in my_full_q_list]
 
-    # Loop over q-points (memory-safe)
-    for idx_q in range(len(my_full_q_list)):
-        # Shifted giwk slice
-        g_q_view = giwk_gpu[
-            kx_indices[idx_q][:, None, None], ky_indices[idx_q][None, :, None], kz_indices[idx_q][None, None, :], ...
+    for iq in range(len(my_full_q_list)):
+        g_q_view = giwk_mat[
+            kx_indices[iq][:, None, None], ky_indices[iq][None, :, None], kz_indices[iq][None, None, :], ...
         ]
 
-        for idx_w, fs in enumerate(freq_slices):
-            g_slice = g_q_view[..., fs]  # shape: (xyz, o1, o2, niv_core)
-            k_slice = kernel_gpu[idx_q, ..., idx_w, niv_core:]  # shape: (o1,o2,o3,o4,v)
-            mat_gpu += cp.einsum("aijdv,xyzadv->xyzijv", k_slice, g_slice, optimize=True)
+        for iw, w in enumerate(wn):
+            g_slice = g_q_view[..., giwk.niv - w : giwk.niv + niv_core - w]
+            k_slice = kernel_mat[iq, ..., iw, :]
+            mat_gpu += cp.einsum("xyzadv,aijdv->xyzijv", g_slice, k_slice, optimize=True)
 
-    # Scale result
     mat_gpu *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
+    return SelfEnergy(np.ascontiguousarray(cp.asnumpy(mat_gpu)), config.lattice.nk, False).compress_q_dimension()
 
-    # Bring back to CPU and wrap as SelfEnergy
-    mat_cpu = cp.asnumpy(mat_gpu)
-    return SelfEnergy(np.ascontiguousarray(mat_cpu), config.lattice.nk, False).compress_q_dimension()
-"""
+
+def calculate_sigma_from_kernel_auto(
+    mpi_distributor: MpiDistributor, kernel: FourPoint, giwk: GreensFunction, my_full_q_list: np.ndarray
+) -> SelfEnergy:
+    """
+    Automatically tries to calculate the self-energy from the kernel on the GPU using CuPy. If CuPy is not installed
+    or no GPU is available, it falls back to the CPU implementation.
+    """
+    logger = config.logger
+
+    try:
+        import cupy as cp
+
+        n_gpus = cp.cuda.runtime.getDeviceCount()
+
+        if cp.cuda.is_available() and n_gpus > 0:
+            logger.info(f"CuPy detected {n_gpus} GPU(s). Using GPU acceleration for self-energy calculation.")
+
+            gpu_id = mpi_distributor.my_rank % n_gpus
+            cp.cuda.Device(gpu_id).use()
+            return calculate_sigma_from_kernel_gpu(kernel, giwk, my_full_q_list)
+    except ImportError:
+        # CuPy not installed
+        pass
+
+    return calculate_sigma_from_kernel_cpu(kernel, giwk, my_full_q_list)
 
 
 def get_starting_sigma(output_path: str, default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
@@ -533,8 +548,8 @@ def calculate_self_energy_q(
             giwk_full.save(output_dir=config.output.output_path, name="g_dga")
 
         logger.log_memory_usage("giwk", giwk_full, comm.size)
-        gchi0_q = BubbleGenerator.create_generalized_chi0_q_fast(
-            giwk_full, config.box.niw_core, config.box.niv_full, my_irr_q_list
+        gchi0_q = BubbleGenerator.create_generalized_chi0_q_auto(
+            mpi_dist_irrk, giwk_full, config.box.niw_core, config.box.niv_full, my_irr_q_list
         )
 
         if config.eliashberg.perform_eliashberg:
@@ -579,7 +594,7 @@ def calculate_self_energy_q(
         kernel.mat = mpi_dist_fullbz.scatter(kernel.mat)
         logger.info("Kernel mapped to full BZ and scattered across all MPI ranks.")
 
-        sigma_new = calculate_sigma_from_kernel_fast(kernel, giwk_full, my_full_q_list)
+        sigma_new = calculate_sigma_from_kernel_auto(mpi_dist_fullbz, kernel, giwk_full, my_full_q_list)
         del kernel
         logger.info("Self-energy calculated from kernel.")
 

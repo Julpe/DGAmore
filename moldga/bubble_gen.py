@@ -58,44 +58,107 @@ class BubbleGenerator:
         )
 
     @staticmethod
-    def create_generalized_chi0_q_fast(giwk: GreensFunction, niw: int, niv: int, q_list: np.ndarray) -> FourPoint:
-        r"""
-        Returns χ₀^{qν}_{abcd} = -β ∑ₖ G^{k}_{ad} G^{k-q}_{cb}
+    def create_generalized_chi0_q_cpu(giwk: GreensFunction, niw: int, niv: int, q_list: np.ndarray) -> FourPoint:
         """
-
+        Returns χ₀^{qν}_{abcd} = -β ∑ₖ G^{k}_{ad} G^{k-q}_{cb}
+        Optimized CPU version with preallocated buffers.
+        """
         wn = MFHelper.wn(niw, return_only_positive=True)
         nb = giwk.n_bands
         nq = len(q_list)
 
-        gchi0_q = np.zeros(
-            (nq, nb, nb, nb, nb, len(wn), 2 * niv),
-            dtype=giwk.mat.dtype,
-        )
+        gchi0_q = np.zeros((nq, nb, nb, nb, nb, len(wn), 2 * niv), dtype=giwk.mat.dtype)
 
         g_left = giwk.cut_niv(niv + niw).mat
         g_right = giwk.transpose_orbitals().cut_niv(niv + niw).mat
-        iv0 = niv + niw
-        g_left = g_left[..., iv0 - niv : iv0 + niv]
+        giwk_niv = g_right.shape[-1] // 2
+
+        g_r_buf = np.empty_like(g_left)
+        g_left = g_left[..., giwk_niv - niv : giwk_niv + niv]
 
         path, _ = np.einsum_path("xyzadv,xyzcbv->abcdv", g_left, g_left, optimize="optimal")
+        kxs, kys, kzs = np.arange(g_right.shape[0]), np.arange(g_right.shape[1]), np.arange(g_right.shape[2])
 
         for iq, q in enumerate(q_list):
-            g_r = g_right
-            g_r = np.take(g_r, np.arange(g_r.shape[0]) - q[0], axis=0, mode="wrap")
-            g_r = np.take(g_r, np.arange(g_r.shape[1]) - q[1], axis=1, mode="wrap")
-            g_r = np.take(g_r, np.arange(g_r.shape[2]) - q[2], axis=2, mode="wrap")
+            g_r_buf[...] = np.take(g_right, (kxs - q[0]) % g_right.shape[0], axis=0)
+            g_r_buf[...] = np.take(g_r_buf, (kys - q[1]) % g_right.shape[1], axis=1)
+            g_r_buf[...] = np.take(g_r_buf, (kzs - q[2]) % g_right.shape[2], axis=2)
 
             for iw, wn_i in enumerate(wn):
-                s = iv0 - niv - wn_i
-                e = iv0 + niv - wn_i
-
-                # Guaranteed: e - s == 2*niv
-                gchi0_q[iq, ..., iw, :] = np.einsum("xyzadv,xyzcbv->abcdv", g_left, g_r[..., s:e], optimize=path)
+                s = giwk_niv - niv - wn_i
+                e = giwk_niv + niv - wn_i
+                gchi0_q[iq, ..., iw, :] = np.einsum("xyzadv,xyzcbv->abcdv", g_left, g_r_buf[..., s:e], optimize=path)
 
         gchi0_q *= -config.sys.beta / config.lattice.q_grid.nk_tot
         return FourPoint(
             gchi0_q, SpinChannel.NONE, config.lattice.nq, 1, 1, full_niw_range=False, has_compressed_q_dimension=True
         )
+
+    @staticmethod
+    def create_generalized_chi0_q_gpu(giwk: GreensFunction, niw: int, niv: int, q_list: np.ndarray) -> FourPoint:
+        """
+        GPU version of χ₀^{qν}_{abcd} with preallocated buffers and fused einsum.
+        """
+        import cupy as cp
+
+        wn = MFHelper.wn(niw, return_only_positive=True)
+        nb = giwk.n_bands
+        nq = len(q_list)
+
+        gchi0_q = cp.zeros((nq, nb, nb, nb, nb, len(wn), 2 * niv), dtype=giwk.mat.dtype, order="F")
+
+        g_left = cp.asarray(giwk.cut_niv(niv + niw).mat, order="F")
+        g_right = cp.asarray(giwk.transpose_orbitals().cut_niv(niv + niw).mat, order="F")
+        giwk_niv = g_right.shape[-1] // 2
+
+        g_r_buf = cp.empty_like(g_left)
+        g_left = g_left[..., giwk_niv - niv : giwk_niv + niv]
+
+        kxs, kys, kzs = cp.arange(g_right.shape[0]), cp.arange(g_right.shape[1]), cp.arange(g_right.shape[2])
+
+        for iq, q in enumerate(q_list):
+            g_r_buf[...] = cp.take(g_right, (kxs - q[0]) % g_right.shape[0], axis=0)
+            g_r_buf[...] = cp.take(g_r_buf, (kys - q[1]) % g_right.shape[1], axis=1)
+            g_r_buf[...] = cp.take(g_r_buf, (kzs - q[2]) % g_right.shape[2], axis=2)
+
+            for iw, wn_i in enumerate(wn):
+                s = giwk_niv - niv - wn_i
+                e = giwk_niv + niv - wn_i
+                gchi0_q[iq, ..., iw, :] += cp.einsum("xyzadv,xyzcbv->abcdv", g_left, g_r_buf[..., s:e], optimize=True)
+
+        gchi0_q *= -config.sys.beta / config.lattice.q_grid.nk_tot
+        return FourPoint(
+            cp.asnumpy(gchi0_q),
+            SpinChannel.NONE,
+            config.lattice.nq,
+            1,
+            1,
+            full_niw_range=False,
+            has_compressed_q_dimension=True,
+        )
+
+    @staticmethod
+    def create_generalized_chi0_q_auto(mpi_distributor, giwk, niw, niv, q_list):
+        """
+        Automatically uses GPU if available, otherwise CPU.
+        """
+        logger = config.logger
+
+        try:
+            import cupy as cp
+
+            n_gpus = cp.cuda.runtime.getDeviceCount()
+
+            if cp.cuda.is_available() and n_gpus > 0:
+                logger.info(f"CuPy detected {n_gpus} GPU(s). Using GPU acceleration for gchi0_q calculation.")
+
+                gpu_id = mpi_distributor.my_rank % n_gpus
+                cp.cuda.Device(gpu_id).use()
+                return BubbleGenerator.create_generalized_chi0_q_gpu(giwk, niw, niv, q_list)
+        except ImportError:
+            pass
+
+        return BubbleGenerator.create_generalized_chi0_q_cpu(giwk, niw, niv, q_list)
 
     @staticmethod
     def create_generalized_chi0_pp_w0(g_loc: GreensFunction, niv_pp: int) -> LocalFourPoint:
