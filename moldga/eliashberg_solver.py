@@ -70,7 +70,7 @@ def transform_vertex_q_frequencies_w0(f_q_r: FourPoint, niv_pp: int) -> FourPoin
 
 # --- Full q-dependent vertex creation and transformation ---
 def create_full_vertex_q_r(
-    u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, comm: MPI.Comm
+    u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, comm: MPI.Comm
 ) -> FourPoint:
     """
     Calculates the full vertex in the given channel (either density or magnetic).
@@ -87,6 +87,10 @@ def create_full_vertex_q_r(
 
     f_q_r = config.sys.beta**2 * (gchi0_q_inv - gchi0_q_inv @ f_q_r @ gchi0_q_inv)
     del gchi0_q_inv
+
+    if not config.eliashberg.save_fq:
+        f_q_r = transform_vertex_q_frequencies_w0(f_q_r, niv_pp)
+
     logger.info(f"Calculated first part of full {gamma_r.channel.value} vertex.")
 
     vrg_q_r = FourPoint.load(
@@ -102,8 +106,14 @@ def create_full_vertex_q_r(
     logger.info(f"Loaded vrg_q_{gamma_r.channel.value} and gchi_aux_q_{gamma_r.channel.value}_sum from files.")
 
     u = u_loc.as_channel(gamma_r.channel) + v_nonloc.as_channel(gamma_r.channel)
-    f_q_r += u @ (vrg_q_r * vrg_q_r) - u @ gchi_aux_q_r_sum @ u @ (vrg_q_r * vrg_q_r)
+    f_q_r_2 = u @ (vrg_q_r * vrg_q_r) - u @ gchi_aux_q_r_sum @ u @ (vrg_q_r * vrg_q_r)
     del gchi_aux_q_r_sum, vrg_q_r
+
+    if not config.eliashberg.save_fq:
+        f_q_r_2 = transform_vertex_q_frequencies_w0(f_q_r_2, niv_pp)
+    f_q_r += f_q_r_2
+    del f_q_r_2
+
     logger.info(f"Calculated second part of full {f_q_r.channel.value} vertex.")
 
     delete_files(
@@ -123,7 +133,7 @@ def create_full_vertex_q_r_pp_w0(
     """
     logger = config.logger
 
-    f_q_r = create_full_vertex_q_r(u_loc, v_nonloc, gamma_r, mpi_dist_irrk.comm)
+    f_q_r = create_full_vertex_q_r(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk.comm)
 
     if config.eliashberg.save_fq:
         f_q_r.mat = mpi_dist_irrk.gather(f_q_r.mat)
@@ -135,7 +145,9 @@ def create_full_vertex_q_r_pp_w0(
     logger.info(f"Full ladder-vertex ({f_q_r.channel.value}) calculated.")
     logger.log_memory_usage(f"Full ladder-vertex ({f_q_r.channel.value})", f_q_r, mpi_dist_irrk.comm.size)
 
-    return transform_vertex_q_frequencies_w0(f_q_r, niv_pp)
+    if config.eliashberg.save_fq:
+        return transform_vertex_q_frequencies_w0(f_q_r, niv_pp)
+    return f_q_r
 
 
 # --- Local particle-particle reducible diagrams (w=0) ---
@@ -246,34 +258,21 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
         allowed_ranks=(0, 1),
     )
 
-    norm = 0.5 / config.lattice.q_grid.nk_tot / config.sys.beta
-    nx, ny, nz, o, _, v = gap_shape
-    xyz = nx * ny * nz
-    o2 = o * o
-    m = o2 * v
+    einsum_str1 = "xyzacbdv,xyzdcv->xyzabv"
+    path1 = np.einsum_path(einsum_str1, gchi0_q0_pp.mat, gap0, optimize=True)[1]
+    einsum_str2 = "xyzacbdvp,xyzdcp->xyzabv"
+    path2 = np.einsum_path(einsum_str2, gamma_x.mat, gap0, optimize=True)[1]
 
-    # reshape gamma to (xyz, m, m)
-    gamma_x_mat_compound = gamma_x.mat.transpose(0, 1, 2, 3, 5, 7, 6, 4, 8).reshape(xyz, m, m)
-    gamma_x_flipped_mat_compound = gamma_x_flipped.mat.transpose(0, 1, 2, 3, 5, 7, 6, 4, 8).reshape(xyz, m, m)
-    gchi0_q0_pp_mat_compound_orbs = gchi0_q0_pp.mat.transpose(0, 1, 2, 7, 3, 5, 4, 6).reshape(xyz * v, o2, o2)
+    norm = 0.5 / config.lattice.q_grid.nk_tot / config.sys.beta
 
     def mv(gap: np.ndarray):
-        gap = gap.reshape(gap_shape)
-        gap_r = gap.transpose(0, 1, 2, 5, 4, 3).reshape(xyz * v, o2)
-        # Perform matrix multiplication and reshape the result
-        gap_gg = np.matmul(gchi0_q0_pp_mat_compound_orbs, gap_r[..., None])[..., 0]
-        gap_gg = gap_gg.reshape(nx, ny, nz, v, o, o).transpose(0, 1, 2, 5, 4, 3)
-        # Apply FFT and flip operations
-        gap_gg_fft = np.fft.fftn(gap_gg, axes=(0, 1, 2))
-        gap_gg_flipped = np.roll(np.flip(gap_gg_fft, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-        # Flatten and prepare for matrix multiplication
-        gap_flat = gap_gg_fft.reshape(xyz, m)
-        gap_flat_flip = gap_gg_flipped.reshape(xyz, m)
-        # Perform matrix multiplications
-        gap_new_flat = np.matmul(gamma_x_mat_compound, gap_flat[..., None])[..., 0]
-        gap_new_flat += sign * np.matmul(gamma_x_flipped_mat_compound, gap_flat_flip[..., None])[..., 0]
-        # Reshape and apply inverse FFT
-        gap_new = gap_new_flat.reshape(nx, ny, nz, o, o, v).transpose(0, 1, 2, 4, 3, 5)
+        gap_gg = np.fft.fftn(
+            np.einsum(einsum_str1, gchi0_q0_pp.mat, gap.reshape(gap_shape), optimize=path1), axes=(0, 1, 2)
+        )
+        gap_gg_flipped = np.roll(np.flip(gap_gg, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+        gap_new = np.einsum(einsum_str2, gamma_x.mat, gap_gg, optimize=path2) + sign * np.einsum(
+            einsum_str2, gamma_x_flipped.mat, gap_gg_flipped, optimize=path2
+        )
         return np.fft.ifftn(norm * gap_new, axes=(0, 1, 2)).flatten()
 
     mat = sp.sparse.linalg.LinearOperator(shape=(np.prod(gap_shape), np.prod(gap_shape)), matvec=mv)

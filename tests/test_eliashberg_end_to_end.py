@@ -30,8 +30,8 @@ def setup():
         yield folder, comm_mock
 
 
-@pytest.mark.parametrize("niw_core, niv_core, niv_shell", [(20, 20, 10)])
-def test_eliashberg_equation_without_local_part(setup, niw_core, niv_core, niv_shell):
+@pytest.mark.parametrize("niw_core, niv_core, niv_shell, save_fq", [(20, 20, 10, True), (20, 20, 10, False)])
+def test_eliashberg_equation_without_local_part(setup, niw_core, niv_core, niv_shell, save_fq):
     folder, comm_mock = setup
 
     config.box.niw_core = niw_core
@@ -44,6 +44,7 @@ def test_eliashberg_equation_without_local_part(setup, niw_core, niv_core, niv_s
     config.output.output_path = folder
     config.output.eliashberg_path = config.output.output_path
     config.eliashberg.include_local_part = False
+    config.eliashberg.save_fq = save_fq
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
@@ -60,8 +61,8 @@ def test_eliashberg_equation_without_local_part(setup, niw_core, niv_core, niv_s
     assert np.allclose(lambdas_trip, np.array([3.34166718, 2.9909934, 2.72114652, 2.72114537]), atol=1e-4)
 
 
-@pytest.mark.parametrize("niw_core, niv_core, niv_shell", [(20, 20, 10)])
-def test_eliashberg_equation_with_local_part(setup, niw_core, niv_core, niv_shell):
+@pytest.mark.parametrize("niw_core, niv_core, niv_shell, save_fq", [(20, 20, 10, True), (20, 20, 10, False)])
+def test_eliashberg_equation_with_local_part(setup, niw_core, niv_core, niv_shell, save_fq):
     folder, comm_mock = setup
 
     config.box.niw_core = niw_core
@@ -74,7 +75,7 @@ def test_eliashberg_equation_with_local_part(setup, niw_core, niv_core, niv_shel
     config.output.output_path = folder
     config.output.eliashberg_path = config.output.output_path
     config.eliashberg.include_local_part = True
-    config.eliashberg.save_fq = True
+    config.eliashberg.save_fq = save_fq
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
