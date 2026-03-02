@@ -129,7 +129,7 @@ request with your changes. Before creating a pull request, please make sure that
 style and that it is well-documented. Also, please make sure that your code does not break any existing functionality 
 and that it is tested. We have set up a continuous integration (CI) pipeline that runs tests on every pull request, so 
 if your code does not pass the tests, it will not be merged. Additionally, we have set up a code coverage tool that 
-checks the coverage of the tests, so please make sure that your code is well-tested and that it has more than 85% 
+checks the coverage of the tests, so please make sure that your code is well-tested and that it has more than 85 % 
 coverage. If you are unsure about any of these points, please feel free to contact me via 
 [E-Mail](mailto:julian.peil@tuwien.ac.at).
 
