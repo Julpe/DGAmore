@@ -286,23 +286,37 @@ def setup_lambda_correction_settings(comm: MPI.Comm) -> None:
     the self-consistency will be set to a single iteration with full mixing. Will raise an error if the user tries to enable
     the lambda correction for multi-band systems.
     """
-    if comm.rank == 0 and config.sys.n_bands != 1 and config.lambda_correction.perform_lambda_correction:
+    if (
+        comm.rank == 0
+        and config.sys.n_bands != 1
+        and (config.lambda_correction.perform_lambda_correction or config.self_consistency.use_lambda_correction)
+    ):
         raise ValueError(
             "Lambda correction is not available for multi-band systems. Please disable it in the config file."
         )
 
-    if config.self_consistency.use_lambda_correction:
+    if config.self_consistency.max_iter > 1 and not config.self_consistency.use_lambda_correction:
+        config.lambda_correction.perform_lambda_correction = False
+        config.logger.info("Calculating self-consistency without lambda correction.")
+        return
+
+    if config.self_consistency.max_iter > 1 and config.self_consistency.use_lambda_correction:
         config.lambda_correction.perform_lambda_correction = True
         config.logger.info("Calculating self-consistency with lambda correction.")
         return
 
-    if config.lambda_correction.perform_lambda_correction and not config.self_consistency.use_lambda_correction:
+    if config.lambda_correction.perform_lambda_correction:
         config.self_consistency.max_iter = 1
         config.self_consistency.mixing = 1.0
         config.logger.info("Performing one-shot DGA with lambda correction.")
         return
+    elif not config.lambda_correction.perform_lambda_correction:
+        config.self_consistency.max_iter = 1
+        config.self_consistency.mixing = 1.0
+        config.logger.info("Performing one-shot DGA without lambda correction.")
+        return
 
-    config.logger.info("Calculating self-consistency without lambda correction.")
+    raise ValueError("Invalid configuration for lambda correction and self-consistency. Please check the config file.")
 
 
 def configure_matplotlib():

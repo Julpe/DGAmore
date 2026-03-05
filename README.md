@@ -39,8 +39,15 @@ To install `conda` or `miniconda`, please follow the instructions on their respe
 - `miniconda`: [Linux](https://www.anaconda.com/docs/getting-started/miniconda/install#linux-2) or
 [macOS](https://www.anaconda.com/docs/getting-started/miniconda/install#macos-2).
 
-Once you have created your virtual environment, you have to clone the repository into any folder of choice. You can do 
-this with the following command:
+Once you have created your virtual environment, make sure that you activate the `conda` or `miniconda` environment 
+after installation, and - for convenience - that you add the `conda` or `miniconda` executable to your `PATH` variable, 
+so that you can use the `conda` command from your terminal. First, you need to install `mpich` and `mpi4py` to be able 
+to run the code with MPI. You can install both into your environment by running the following command:
+```bash
+conda install -c conda-forge mpich mpi4py
+```
+Then, you have to clone the repository into any folder of choice. Please make sure that you have `git` installed on your 
+system. You can clone the repository by running the following command: 
 ```bash
 git clone https://github.com/Julpe/moLDGA.git
 ```
@@ -56,6 +63,9 @@ pip install -e .
 Editable mode is recommended if you want to make changes to the code, as it allows you to edit the code without having 
 to reinstall it every time. Also, if new changes are made to the code, you can simply pull the latest version from the 
 repository, and you will have the latest version of the code without having to reinstall it.
+
+Please make sure that you are not using any (older) cached versions of the required packages, as this might lead to 
+issues with the installation.
 
 ---
 
@@ -86,25 +96,30 @@ As an example, the following shell command runs the code using 8 MPI processes a
 mpiexec -np 8 python dga_main.py -p /configs/ -c my_config.yaml
 ```
 
-The following code snippet shows the content of an exemplary job submit script for a slurm-based cluster.
-In this case, the configuration file is named `my_config.yaml`:
+The following code snippet shows the content of an exemplary job submit script for a slurm-based cluster:
 
 ```bash
 #!/bin/bash
-#SBATCH -N 1
-#SBATCH -J <some_job_name>
-#SBATCH --partition=<some_partition>
-#SBATCH --qos=<some_qos>
-#SBATCH --ntasks-per-node=96
-#SBATCH -t 1:00:00
+#SBATCH -N <n nodes>
+#SBATCH -J <some job name>
+#SBATCH --partition = <some partition>
+#SBATCH --qos = <some qos>
+#SBATCH --ntasks-per-node = <n proc>
+#SBATCH -t <time limit>
 
 # Load the necessary modules, in this case activate the conda environment 
-# with the preinstalled moLDGA package and its dependencies.
+# with the preinstalled moLDGA package and its dependencies
 module purge
-source <path to miniconda>/miniconda3/bin/activate <some_conda_env>
+source <path to miniconda>/miniconda3/bin/activate <your conda env>
 
-# Run the code with MPI, using all available tasks on the node.
-mpiexec -n $SLURM_NTASKS python <path to code>/dga_main.py -p "<path to config>" -c "my_config.yaml"
+# Set the number of OpenMP threads to 1, as we are using MPI for parallelization
+export OMP_NUM_THREADS=1
+
+# Run the code with MPI, in this case with srun, which is the recommended way to run MPI jobs on a slurm-based cluster:
+srun python <path to code>/dga_main.py -p "<path to config>" -c "<name of config>.yaml"
+
+# If you want to use mpirun or mpiexec instead of srun, you can use the following command:
+mpirun/mpiexec -np $SLURM_NTASKS python <path to code>/dga_main.py -p "<path to config>" -c "<name of config>.yaml"
 ```
 
 ---
@@ -118,7 +133,7 @@ information on how to configure the code. Please note that each section in the c
 code will not run if any section is missing. The default values in the configuration file are set to reasonable 
 defaults, so if you are unsure about any of the parameters, you can simply use the default values (except for the file 
 paths to the input). If you are unsure about any of the parameters, please refer to the documentation in the 
-configuration file or contact me via [E-Mail](mailto:julian.peil@tuwien.ac.at).
+configuration file, my [Master's thesis](https://doi.org/10.34726/hss.2025.130528) or contact me via [E-Mail](mailto:julian.peil@tuwien.ac.at).
 
 --- 
 

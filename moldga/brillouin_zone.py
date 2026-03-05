@@ -6,7 +6,6 @@ Only modified the constant arrays and made enums out of them for type hinting.
 import warnings
 from enum import Enum
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 
@@ -29,14 +28,14 @@ class KnownKPoints(Enum):
     Known k-points in the Brillouin zone.
     """
 
-    GAMMA = [0, 0, 0]
-    X = [0.5, 0, 0]  # [np.pi, 0, 0]
-    Y = [0, 0.5, 0]  # [0, np.pi, 0]
-    M = [0.5, 0.5, 0]  # [np.pi, np.pi, 0]
-    M2 = [0.25, 0.25, 0]  # [np.pi/2, np.pi/2, 0]
-    Z = [0.0, 0.0, 0.5]  # [np.pi/2, np.pi/2, 0]
-    R = [0.5, 0.0, 0.5]  # [np.pi/2, np.pi/2, 0]
-    A = [0.5, 0.5, 0.5]  # [np.pi/2, np.pi/2, 0]
+    GAMMA = (0.0, 0.0, 0.0)
+    X = (0.5, 0.0, 0.0)
+    Y = (0.0, 0.5, 0.0)
+    Z = (0.0, 0.0, 0.5)
+    M = (0.5, 0.5, 0.0)
+    M2 = (0.25, 0.25, 0.0)
+    R = (0.5, 0.0, 0.5)
+    A = (0.5, 0.5, 0.5)
 
 
 class Labels(Enum):
@@ -44,14 +43,32 @@ class Labels(Enum):
     Labels for the k-points in the Brillouin zone.
     """
 
-    GAMMA = r"$\Gamma$"
-    X = "X"
-    Y = "Y"
-    M = "M"
-    M2 = "M2"
-    Z = "Z"
-    R = "R"
-    A = "A"
+    GAMMA = ("gamma", r"$\Gamma$")
+    X = ("x", "X")
+    Y = ("y", "Y")
+    Z = ("z", "Z")
+    M = ("m", "M")
+    M2 = ("m2", "M2")
+    R = ("r", "R")
+    A = ("a", "A")
+
+    @property
+    def key(self):
+        return self.value[0]
+
+    @property
+    def latex(self):
+        return self.value[1]
+
+    @staticmethod
+    def from_string(s: str):
+        s = s.strip().lower()
+
+        for label in Labels:
+            if s == label.key:
+                return label
+
+        raise ValueError(f"Unknown label string: {s}")
 
 
 def two_dimensional_square_symmetries() -> list[KnownSymmetries]:
@@ -195,7 +212,7 @@ def apply_symmetries(mat: np.ndarray, symmetries: list[KnownSymmetries]) -> None
         apply_symmetry(mat, sym)
 
 
-def get_lattice_symmetries_from_string(symmetry_string: str) -> list[KnownSymmetries]:
+def get_lattice_symmetries_from_string(symmetry_string: str | tuple | list) -> list[KnownSymmetries]:
     """
     Return the lattice symmetries from a string.
     """
@@ -421,12 +438,15 @@ class KPath:
     @property
     def labels(self):
         """Labels of the k-points for plotting"""
+        label_map = {l.key: l.latex for l in Labels}
+
         count = 0
-        ckps = self.ckps
         labels = []
-        for k_p in ckps:
-            if k_p in [s.value for s in KnownSymmetries]:
-                labels.append(Labels[k_p].value)
+        for k_p in self.ckps:
+            key = k_p.strip().lower()
+
+            if key in label_map:
+                labels.append(label_map[key])
             else:
                 labels.append(f"K{count}")
             count += 1
@@ -455,7 +475,10 @@ class KPath:
 
     @property
     def k_axis(self):
-        return np.linspace(0, 1, np.sum(self.nkp), endpoint=True)
+        k_axis_pos = np.zeros(np.sum(self.nkp))
+        ds = np.linalg.norm(self.kpts[1:] - self.kpts[:-1], ord=2, axis=1)
+        k_axis_pos[1:] = np.cumsum(ds)
+        return k_axis_pos / k_axis_pos[-1]
 
     @property
     def nk_tot(self):
@@ -469,11 +492,16 @@ class KPath:
         return np.array(self.k_val).T
 
     def corner_k_points(self):
-        ckps = self.ckps
-        ckp = np.zeros((np.size(ckps), 3))
-        for i, kps in enumerate(ckps):
-            if kps in [s.value for s in KnownSymmetries]:
-                ckp[i, :] = KnownKPoints[kps].value
+        ckp = np.zeros((len(self.ckps), 3))
+
+        label_values = {l.key for l in Labels}
+        kpoint_map = {k.name.lower(): np.array(k.value) for k in KnownKPoints}
+
+        for i, kps in enumerate(self.ckps):
+            key = kps.strip().lower()
+
+            if key in label_values:
+                ckp[i, :] = kpoint_map[key]
             else:
                 ckp[i, :] = get_k_point_from_string(kps)
 
@@ -496,36 +524,6 @@ class KPath:
                 k_path = np.concatenate((k_path, segment))
         return k_path, nkp
 
-    def plot_kpoints(self, fname=None):
-        plt.figure()
-        plt.plot(self.kpts[:, 0], color="cornflowerblue", label="$k_x$")
-        plt.plot(self.kpts[:, 1], color="firebrick", label="$k_y$")
-        plt.plot(self.kpts[:, 2], color="seagreen", label="$k_z$")
-        plt.legend()
-        plt.xlabel("Path-index")
-        plt.ylabel("k-index")
-        if fname is not None:
-            plt.savefig(fname + "_q_path.png", dpi=300)
-        plt.show()
-
-    def plot_kpath(self, mat, verbose=False, do_save=True, pdir="./", name="k_path", ylabel="Energy [t]"):
-        """
-        mat: [kx,ky,kz]
-        """
-        plt.figure()
-        plt.xticks(self.x_ticks, self.labels)
-        plt.vlines(self.x_ticks, np.min(mat), np.max(mat), ls="-", color="grey", alpha=0.8)
-        plt.hlines(0, self.k_axis[0], self.k_axis[-1], ls="--", color="grey", alpha=0.8)
-        plt.plot(self.k_axis, self.map_to_kpath(mat), "-k")
-        plt.ylabel(ylabel)
-        plt.xlim(self.k_axis[0], self.k_axis[-1])
-        plt.ylim(np.min(mat), np.max(mat))
-        if do_save:
-            plt.savefig(pdir + "/" + name + ".png", dpi=300)
-        if verbose:
-            plt.show()
-        plt.close()
-
     def get_bands(self, ek):
         """Return the bands along the k-path"""
         ek_kpath = self.map_to_kpath(ek)
@@ -537,7 +535,7 @@ class KPath:
 
 
 def kpath_segment(k_start, k_end, nk):
-    nkp = int(np.round(np.linalg.norm(k_start * nk - k_end * nk)))
+    nkp = int(np.round(np.linalg.norm(k_start * nk - k_end * nk, ord=np.inf)))
     k_segment = (
         k_start[None, :] * nk + np.linspace(0, 1, nkp, endpoint=False)[:, None] * ((k_end - k_start) * nk)[None, :]
     )
@@ -552,24 +550,3 @@ def get_k_point_from_string(string):
     scoords = string.split(" ")
     coords = np.array([float(sc) for sc in scoords])
     return coords
-
-
-def get_bz_masks(nk):
-    mask_1q = np.ones((nk, nk), dtype=int)
-    mask_2q = np.ones((nk, nk), dtype=int)
-    mask_3q = np.ones((nk, nk), dtype=int)
-    mask_4q = np.ones((nk, nk), dtype=int)
-    mask_3q[: nk // 2, : nk // 2] = 0
-    mask_1q[nk // 2 :, : nk // 2] = 0
-    mask_2q[nk // 2 :, nk // 2 :] = 0
-    mask_4q[: nk // 2, nk // 2 :] = 0
-    return [mask_1q, mask_2q, mask_3q, mask_4q]
-
-
-def shift_mat_by_ind(mat, ind=(0, 0, 0)):
-    """Structure of mat has to be {kx,ky,kz,...}"""
-    return np.roll(mat, ind, axis=(0, 1, 2))
-
-
-if __name__ == "__main__":
-    pass

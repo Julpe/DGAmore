@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import moldga.brillouin_zone as bz
+from moldga.brillouin_zone import KPath, KnownKPoints, Labels
 from unittest.mock import patch
 
 
@@ -355,3 +356,114 @@ def test_returns_correct_irrq_list_for_valid_input():
     assert np.array_equal(irrq_list[:, 0], kgrid.kmesh_ind[0].flatten()[kgrid.irrk_ind])
     assert np.array_equal(irrq_list[:, 1], kgrid.kmesh_ind[1].flatten()[kgrid.irrk_ind])
     assert np.array_equal(irrq_list[:, 2], kgrid.kmesh_ind[2].flatten()[kgrid.irrk_ind])
+
+
+def test_corner_k_points_and_label_mapping_for_known_labels():
+    kx = np.arange(4)
+    kp = KPath(nk=(4, 4, 4), path="gamma-x", kx=kx, ky=kx, kz=kx)
+
+    assert kp.ckps == ["gamma", "x"]
+
+    ckp = kp.corner_k_points()
+
+    assert np.allclose(ckp[0], np.array(KnownKPoints.GAMMA.value))
+    assert np.allclose(ckp[1], np.array(KnownKPoints.X.value))
+
+    assert kp.labels == [Labels.GAMMA.latex, Labels.X.latex]
+
+
+def test_map_to_kpath_and_get_kpoints_return_expected_values():
+    kx = np.arange(4)
+    kp = KPath(nk=(4, 4, 4), path="gamma-x", kx=kx, ky=kx, kz=kx)
+
+    mat = np.arange(4 * 4 * 4).reshape(4, 4, 4)
+    mapped = kp.map_to_kpath(mat)
+
+    expected = np.array([mat[tuple(kp.kpts[i])] for i in range(kp.kpts.shape[0])])
+    assert np.array_equal(mapped, expected)
+
+    kpoints = kp.get_kpoints()
+    assert kpoints.shape == (kp.kpts.shape[0], 3)
+
+    assert np.array_equal(kpoints[:, 0], kp.kpts[:, 0])
+    assert np.array_equal(kpoints[:, 1], kp.kpts[:, 1])
+    assert np.array_equal(kpoints[:, 2], kp.kpts[:, 2])
+
+
+def test_corner_k_points_accepts_numeric_string_points():
+    kx = np.arange(4)
+    kp = KPath(nk=(4, 4, 4), path="gamma-0.25 0.25 0", kx=kx, ky=kx, kz=kx)
+
+    ckp = kp.corner_k_points()
+    assert np.allclose(ckp[0], np.array(KnownKPoints.GAMMA.value))
+    assert np.allclose(ckp[1], np.array([0.25, 0.25, 0.0]))
+
+
+def test_nk_tot_returns_sum_of_nkp():
+    kp = KPath(nk=(4, 4, 4), path="gamma-x")
+    kp.nkp = [2, 3, 1]
+    assert kp.nk_tot == 6
+
+
+def test_nk_seg_returns_diff_of_cind():
+    kp = KPath(nk=(4, 4, 4), path="gamma-x")
+    kp.nkp = [2, 3, 1]
+    cind = np.concatenate(([0], np.cumsum(kp.nkp) - 1))
+    expected = np.diff(cind)
+    assert np.array_equal(kp.nk_seg, expected)
+
+
+def test_k_axis_normalized_positions_and_length():
+    kp = KPath(nk=(4, 4, 4), path="gamma-x")
+    # create 4 consecutive k-points with equal step lengths of 1
+    kp.kpts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]])
+    kp.nkp = [2, 2]  # total points = 4
+    # distances between consecutive points: [1, 1, 1] -> cumulative [1,2,3]
+    # k_axis_pos = [0,1,2,3] -> normalized by 3 -> [0, 1/3, 2/3, 1]
+    expected = np.array([0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0])
+    assert np.allclose(kp.k_axis, expected, rtol=1e-12, atol=1e-12)
+    assert kp.k_axis.size == kp.nk_tot
+
+
+def test_build_k_path_single_segment_gamma_to_x():
+    """
+    For nk=(4,4,4) and path 'gamma-x' the segment should produce two indices:
+    [[0,0,0], [1,0,0]] and nkp should be [2].
+    """
+    kp = KPath(nk=(4, 4, 4), path="gamma-x")
+    k_path, nkp = kp.build_k_path()
+
+    expected = np.array([[0, 0, 0], [1, 0, 0]])
+    assert isinstance(k_path, np.ndarray)
+    assert np.array_equal(k_path, expected)
+    assert nkp == [2]
+
+
+def test_get_bands_returns_sorted_real_eigenvalues():
+    """
+    Patch KPath.map_to_kpath to return an object that yields 2x2 matrices.
+    Ensure get_bands returns sorted real eigenvalues for each k-point.
+    """
+
+    class MockEKPath:
+        def __init__(self, mats):
+            self.mats = mats
+            # emulate an array with shape (n_kpoints, nbands, nbands)
+            self.current_shape = (len(mats), mats[0].shape[0], mats[0].shape[0])
+
+        def __iter__(self):
+            return iter(self.mats)
+
+    kp = KPath(nk=(4, 4, 4), path="gamma-x")
+    # create two diagonal matrices with known eigenvalues
+    mats = [
+        np.array([[2.0, 0.0], [0.0, 1.0]]),  # eigenvalues [2,1] -> sorted [1,2]
+        np.array([[4.0, 0.0], [0.0, 3.0]]),  # eigenvalues [4,3] -> sorted [3,4]
+    ]
+    mock_ek = MockEKPath(mats)
+
+    with patch.object(KPath, "map_to_kpath", return_value=mock_ek):
+        bands = kp.get_bands(ek=None)
+
+    expected = np.array([[1.0, 2.0], [3.0, 4.0]])
+    assert np.allclose(bands, expected)

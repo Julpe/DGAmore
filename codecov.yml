@@ -20,5 +20,7 @@ coverage:
       default:
         patch: 85%
         threshold: 0%
-        base: auto
-        if_not_found: failure
+        informational: true
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default

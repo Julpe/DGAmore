@@ -37,69 +37,27 @@ def get_hartree_fock(
     v_q0 = v_nonloc.find_q((0, 0, 0))
     hartree = 2 * (u_loc + v_q0).times("qabcd,dc->ab", config.sys.occ)
 
-    def _find_orbital_blocks(occ_k, tol=1e-12):
-        mat = np.abs(occ_k).sum(axis=(0, 1, 2))
-        adj = (mat > tol) | (mat.T > tol)
-        nb = mat.shape[0]
-        visited = np.zeros(nb, dtype=bool)
-        blocks = []
-        for i in range(nb):
-            if visited[i]:
-                continue
-            stack = [i]
-            comp = []
-            visited[i] = True
-            while stack:
-                u = stack.pop()
-                comp.append(u)
-                neigh = np.nonzero(adj[u])[0]
-                for v in neigh:
-                    if not visited[v]:
-                        visited[v] = True
-                        stack.append(v)
-            blocks.append(sorted(comp))
-        return blocks
-
-    v_q = v_nonloc.reduce_q(q_list)
-    v_q_mat = (u_loc + v_q).mat
-
-    nkx, nky, nkz = config.lattice.k_grid.nk
-    nk_tot = config.lattice.k_grid.nk_tot
     nb = config.sys.n_bands
-    nq_tot = config.lattice.q_grid.nk_tot
+    nk_tot = np.prod(config.lattice.nk)
+    nq_tot = np.prod(config.lattice.nq)
 
-    q_arr = np.asarray(q_list, dtype=int)
-    nq = q_arr.shape[0]
-    kxs = np.arange(nkx, dtype=int)
-    kys = np.arange(nky, dtype=int)
-    kzs = np.arange(nkz, dtype=int)
+    occ_k = config.sys.occ_k
+    uq = (u_loc + v_nonloc.reduce_q(q_list)).permute_orbitals("abcd->adcb")  # (nq,a,d,c,b)
 
-    kx_idx = (kxs[None, :] + q_arr[:, 0][:, None]) % nkx  # (nq, nkx)
-    ky_idx = (kys[None, :] + q_arr[:, 1][:, None]) % nky  # (nq, nky)
-    kz_idx = (kzs[None, :] + q_arr[:, 2][:, None]) % nkz  # (nq, nkz)
+    fock = np.zeros((nk_tot, nb, nb), dtype=uq.mat.dtype)
 
-    # expanded views for advanced indexing per block (will broadcast to (nq,nkx,nky,nkz,bs,bs))
-    kx_idx_exp = kx_idx[:, :, None, None, None, None]
-    ky_idx_exp = ky_idx[:, None, :, None, None, None]
-    kz_idx_exp = kz_idx[:, None, None, :, None, None]
+    for d in range(nb):
+        for c in range(nb):
+            u_slice = uq[:, :, d, c, :]
+            if not np.any(u_slice):
+                continue
 
-    blocks = _find_orbital_blocks(config.sys.occ_k)
-    fock = np.zeros((nk_tot, nb, nb), dtype=v_q_mat.dtype)
+            occ_qk_dc = np.array([np.roll(occ_k[..., d, c], [-i for i in q], axis=(0, 1, 2)) for q in q_list])
+            occ_qk_dc = occ_qk_dc.reshape(len(q_list), nk_tot)
+            contribution = u_slice[:, None, :, :] * occ_qk_dc[:, :, None, None]
+            fock += contribution.sum(axis=0)
 
-    for block in blocks:
-        idx = np.array(block, dtype=int)
-        bs = len(idx)
-        if bs == 0:
-            continue
-
-        idx_row = idx[None, None, None, None, :, None]  # shape (1,1,1,1,bs,1)
-        idx_col = idx[None, None, None, None, None, :]  # shape (1,1,1,1,1,bs)
-        occ_block_qk_6d = config.sys.occ_k[kx_idx_exp, ky_idx_exp, kz_idx_exp, idx_row, idx_col]
-        occ_block_qk = occ_block_qk_6d.reshape(nq, nk_tot, bs, bs)
-        uv_block = v_q_mat.take(idx, axis=1).take(idx, axis=2).take(idx, axis=3).take(idx, axis=4)
-        block_contrib = -1.0 / nq_tot * np.einsum("qadcb,qkdc->kab", uv_block, occ_block_qk, optimize=True)
-        fock[:, idx[:, None], idx] += block_contrib
-
+    fock *= -1.0 / nq_tot
     return hartree[None, ..., None], fock[..., None]  # [k,o1,o2,v]
 
 
@@ -371,9 +329,8 @@ def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full
         shifted_mat = np.roll(giwk.mat, [-i for i in q], axis=(0, 1, 2))
         for idx_w, wn_i in enumerate(wn):
             g_qk = shifted_mat[..., giwk.niv - wn_i : giwk.niv + config.box.niv_core - wn_i]
-            mat += np.einsum(
-                "aijdv,xyzadv->xyzijv", kernel[idx_q, ..., idx_w, config.box.niv_core :], g_qk, optimize=path
-            )
+            k_slice = kernel[idx_q, ..., idx_w, config.box.niv_core :]
+            mat += np.einsum("aijdv,xyzadv->xyzijv", k_slice, g_qk, optimize=path)
 
     mat *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
     return SelfEnergy(mat, config.lattice.nk, False).compress_q_dimension()
@@ -404,7 +361,6 @@ def calculate_sigma_from_kernel_cpu(
     ky_indices = [((kys + q[1]) % nky) for q in my_full_q_list]
     kz_indices = [((kzs + q[2]) % nkz) for q in my_full_q_list]
 
-    g_buf = np.empty((nkx, nky, nkz, nb, nb, niv_core), dtype=mat.dtype)
     acc = np.empty((nkx, nky, nkz, nb, nb, niv_core), dtype=mat.dtype)
 
     for iq in range(len(my_full_q_list)):
@@ -413,9 +369,9 @@ def calculate_sigma_from_kernel_cpu(
         ]
 
         for iw, w in enumerate(wn):
-            g_buf[...] = g_q_view[..., giwk.niv - w : giwk.niv + niv_core - w]
+            g_slice = g_q_view[..., giwk.niv - w : giwk.niv + niv_core - w]
             k_slice = kernel_mat[iq, ..., iw, :]
-            np.einsum("xyzadv,aijdv->xyzijv", g_buf, k_slice, out=acc, optimize=True)
+            np.einsum("xyzadv,aijdv->xyzijv", g_slice, k_slice, out=acc, optimize=True)
             np.add(mat, acc, out=mat)
 
     mat *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
