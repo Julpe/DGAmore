@@ -1,6 +1,7 @@
 from copy import deepcopy
 
 import numpy as np
+from numpy.ma.core import swapaxes
 
 from moldga.interaction import Interaction, LocalInteraction
 from moldga.local_four_point import LocalFourPoint
@@ -103,14 +104,22 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         """
         return self.pow(power, FourPoint.identity_like(self))
 
-    def sum_over_vn(self, beta: float, axis: tuple = (-1,)) -> "FourPoint":
+    def sum_over_vn(self, beta: float, axis: tuple = (-1,), copy: bool = True) -> "FourPoint":
         r"""
         Sums over a specific number of fermionic frequency dimensions and multiplies the with the correct prefactor
         :math:`1/\beta^{n_dim}`.
         """
         if len(axis) > self.num_vn_dimensions:
             raise ValueError(f"Cannot sum over more fermionic axes than available in {self.current_shape}.")
+
+        if not copy:
+            self.mat = 1 / beta ** len(axis) * np.sum(self.mat, axis=axis)
+            self._num_vn_dimensions -= len(axis)
+            self.update_original_shape()
+            return self
+
         copy_mat = 1 / beta ** len(axis) * np.sum(self.mat, axis=axis)
+
         self.update_original_shape()
         return FourPoint(
             copy_mat,
@@ -561,6 +570,22 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             self.frequency_notation,
         ).to_full_indices(self.original_shape)
 
+    def invert(self, copy: bool = True):
+        """
+        Inverts the object by transforming it to compound indices. Returns the object always in half of their niw range.
+        """
+
+        if copy:
+            copy = deepcopy(self.to_half_niw_range()).to_compound_indices()
+            for i in range(copy.current_shape[0]):
+                copy.mat[i] = np.linalg.inv(copy.mat[i])
+            return copy.to_full_indices()
+
+        self.to_half_niw_range().to_compound_indices()
+        for i in range(self.current_shape[0]):
+            self.mat[i] = np.linalg.inv(self.mat[i])
+        return self.to_full_indices()
+
     @staticmethod
     def load(
         filename: str,
@@ -604,20 +629,39 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         """
         if num_vn_dimensions not in (1, 2):
             raise ValueError("Invalid number of fermionic frequency dimensions.")
+
         full_shape = (nq_tot,) + (n_bands,) * 4 + (2 * niw + 1,) + (2 * niv,) * num_vn_dimensions
+
+        if num_vn_dimensions == 1:
+            mat = (
+                np.tile(np.eye(n_bands**2)[None, ..., None, None], (nq_tot, 1, 1, 2 * niw + 1, 2 * niv))
+                .reshape(full_shape)
+                .swapaxes(3, 4)
+            )
+            # swapping the last two orbital axes to get [q,o1,o2,o4,o3,w,v] since the matrix is unity in
+            # [o1,o2,o4,o3] (remember last two orbital indices are swapped in the compound index notation)
+            return FourPoint(
+                mat,
+                nq=nq,
+                num_vn_dimensions=num_vn_dimensions,
+                has_compressed_q_dimension=True,
+                frequency_notation=frequency_notation,
+            ).to_half_niw_range()
+
         compound_index_size = 2 * niv * n_bands**2
         mat = np.tile(np.eye(compound_index_size)[None, None, ...], (nq_tot, 2 * niw + 1, 1, 1))
 
-        result = FourPoint(
-            mat,
-            nq=nq,
-            num_vn_dimensions=num_vn_dimensions,
-            has_compressed_q_dimension=True,
-            frequency_notation=frequency_notation,
-        ).to_full_indices(full_shape)
-        if num_vn_dimensions == 1:
-            result = result.take_vn_diagonal()
-        return result.to_half_niw_range()
+        return (
+            FourPoint(
+                mat,
+                nq=nq,
+                num_vn_dimensions=num_vn_dimensions,
+                has_compressed_q_dimension=True,
+                frequency_notation=frequency_notation,
+            )
+            .to_full_indices(full_shape)
+            .to_half_niw_range()
+        )
 
     @staticmethod
     def identity_like(other: "FourPoint") -> "FourPoint":

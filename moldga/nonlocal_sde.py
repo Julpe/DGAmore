@@ -183,12 +183,15 @@ def calculate_sigma_kernel_r_q(
     """
     logger = config.logger
 
-    gchi_aux_q_r = create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_loc, v_nonloc)
-    logger.info(f"Non-Local auxiliary susceptibility ({gchi_aux_q_r.channel.value}) calculated.")
-    logger.log_memory_usage(f"Gchi_aux ({gchi_aux_q_r.channel.value})", gchi_aux_q_r, mpi_dist_irrq.comm.size)
-
-    gchi_aux_q_r_sum = gchi_aux_q_r.sum_over_vn(config.sys.beta, axis=(-1,))
-    del gchi_aux_q_r
+    gchi_aux_q_r_sum = create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_loc, v_nonloc).sum_over_vn(
+        config.sys.beta, axis=(-1,), copy=False
+    )
+    logger.log_memory_usage(
+        f"Gchi_aux ({gchi_aux_q_r_sum.channel.value})",
+        gchi_aux_q_r_sum,
+        mpi_dist_irrq.comm.size * 2 * config.box.niv_core,
+    )
+    logger.info(f"Non-Local auxiliary susceptibility ({gchi_aux_q_r_sum.channel.value}) calculated.")
 
     vrg_q_r = create_vrg_r_q(gchi_aux_q_r_sum, gchi0_q_inv)
 
@@ -202,7 +205,7 @@ def calculate_sigma_kernel_r_q(
         )
 
     chi_phys_q_r = gchi_aux_q_r_sum.sum_over_all_vn(config.sys.beta)
-    del gchi_aux_q_r_sum
+    gchi_aux_q_r_sum.free()
 
     chi_phys_q_r = create_generalized_chi_q_with_shell_correction(
         chi_phys_q_r, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc
@@ -266,7 +269,7 @@ def perform_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
         chi_phys_q_r, lambda_r = lc.perform_single_lambda_correction(
             chi_phys_q_r, chi_r_loc.mat.sum() / config.sys.beta
         )
-        del chi_r_loc
+        chi_r_loc.free()
         logger.info(
             f"Lambda correction for the {chi_phys_q_r.channel.value} channel applied with lambda = {lambda_r:.6f}."
         )
@@ -491,13 +494,7 @@ def read_last_n_sigmas_from_files(n: int, output_path: str = "./", previous_sc_p
 
 
 def calculate_self_energy_q(
-    comm: MPI.Comm,
-    u_loc: LocalInteraction,
-    v_nonloc: Interaction,
-    sigma_dmft: SelfEnergy,
-    sigma_local: SelfEnergy,
-    gamma_dens: LocalFourPoint,
-    gamma_magn: LocalFourPoint,
+    comm: MPI.Comm, u_loc: LocalInteraction, v_nonloc: Interaction, sigma_dmft: SelfEnergy, sigma_local: SelfEnergy
 ) -> SelfEnergy:
     """
     Main routine for the non-local DGA self-energy calculation. Calculates the Hartree- and Fock-terms, the bubble,
@@ -566,32 +563,43 @@ def calculate_self_energy_q(
 
         f_dc_loc = 2 * LocalFourPoint.load(os.path.join(config.output.output_path, "f_magn_loc.npy"))
         kernel = -calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc)
-        del f_dc_loc
+        f_dc_loc.free()
         logger.info("Calculated double-counting kernel.")
 
         gchi0_q_full_sum = 1.0 / config.sys.beta * gchi0_q.sum_over_all_vn(config.sys.beta)
         gchi0_q_core = gchi0_q.cut_niv(config.box.niv_core)
-        del gchi0_q
+        gchi0_q.free()
         logger.log_memory_usage("Gchi0_q_core", gchi0_q_core, comm.size)
 
-        gchi0_q_core_inv = gchi0_q_core.invert().take_vn_diagonal()
+        gchi0_q_core_inv = deepcopy(gchi0_q_core).invert(False).take_vn_diagonal()
         logger.log_memory_usage("Gchi0_q_inv", gchi0_q_core_inv, comm.size)
 
         if config.eliashberg.perform_eliashberg:
             gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
 
         gchi0_q_core_sum = 1.0 / config.sys.beta * gchi0_q_core.sum_over_all_vn(config.sys.beta)
-        del gchi0_q_core
+        gchi0_q_core.free()
 
+        gamma_dens = LocalFourPoint.load(
+            os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
+        )
         kernel += calculate_sigma_kernel_r_q(
             gamma_dens, gchi0_q_core_inv, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc, mpi_dist_irrk
         )
+        gamma_dens.free()
+        comm.Barrier()
         logger.info("Calculated kernel for density channel.")
 
+        gamma_magn = LocalFourPoint.load(
+            os.path.join(config.output.output_path, "gamma_magn_loc.npy"), SpinChannel.MAGN
+        )
         kernel += 3 * calculate_sigma_kernel_r_q(
             gamma_magn, gchi0_q_core_inv, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc, mpi_dist_irrk
         )
-        del gchi0_q_core_inv, gchi0_q_full_sum, gchi0_q_core_sum
+        gchi0_q_core_inv.free()
+        gchi0_q_full_sum.free()
+        gchi0_q_core_sum.free()
+        gamma_magn.free()
         logger.info("Calculated kernel for magnetic channel.")
 
         kernel.mat = mpi_dist_irrk.gather(kernel.mat)
@@ -601,7 +609,7 @@ def calculate_self_energy_q(
         logger.info("Kernel mapped to full BZ and scattered across all MPI ranks.")
 
         sigma_new = calculate_sigma_from_kernel_auto(mpi_dist_fullbz, kernel, giwk_full, my_full_q_list)
-        del kernel
+        kernel.free()
         logger.info("Self-energy calculated from kernel.")
 
         sigma_new.mat = mpi_dist_irrk.allreduce(sigma_new.mat)

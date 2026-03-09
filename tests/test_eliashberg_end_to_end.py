@@ -51,11 +51,8 @@ def test_eliashberg_equation_without_local_part(setup, niw_core, niv_core, niv_s
 
     g_dga = GreensFunction(np.load(f"{folder}/giwk_dga.npy"))
 
-    gamma_dens = LocalFourPoint.load(f"{folder}/gamma_dens_loc.npy", channel=SpinChannel.DENS)
-    gamma_magn = LocalFourPoint.load(f"{folder}/gamma_magn_loc.npy", channel=SpinChannel.MAGN)
-
     lambdas_sing, lambdas_trip, gaps_sing, gaps_trip = eliashberg_solver.solve(
-        g_dga, g_dmft, u_loc, v_nonloc, gamma_dens, gamma_magn, comm_mock
+        g_dga, g_dmft, u_loc, v_nonloc, comm_mock
     )
     assert np.allclose(lambdas_sing, np.array([3.85828144, 3.70361068, 3.65005429, 3.5992988]), atol=1e-4)
     assert np.allclose(lambdas_trip, np.array([3.34166718, 2.9909934, 2.72114652, 2.72114537]), atol=1e-4)
@@ -82,11 +79,8 @@ def test_eliashberg_equation_with_local_part(setup, niw_core, niv_core, niv_shel
 
     g_dga = GreensFunction(np.load(f"{folder}/giwk_dga.npy"))
 
-    gamma_dens = LocalFourPoint.load(f"{folder}/gamma_dens_loc.npy", channel=SpinChannel.DENS)
-    gamma_magn = LocalFourPoint.load(f"{folder}/gamma_magn_loc.npy", channel=SpinChannel.MAGN)
-
     lambdas_sing, lambdas_trip, gaps_sing, gaps_trip = eliashberg_solver.solve(
-        g_dga, g_dmft, u_loc, v_nonloc, gamma_dens, gamma_magn, comm_mock
+        g_dga, g_dmft, u_loc, v_nonloc, comm_mock
     )
     assert np.allclose(lambdas_sing, np.array([3.7036108, 3.5992989, 3.32485204, 3.32485072]), atol=1e-4)
     assert np.allclose(lambdas_trip, np.array([2.72114656, 2.72114542, 2.69452022, 2.69451905]), atol=1e-4)

@@ -1,3 +1,7 @@
+import os
+import sys
+import types
+
 import numpy as np
 import pytest
 
@@ -616,3 +620,185 @@ def test_filter_small_values_preserves_values_with_one_large_component():
     # entries with at least one component above threshold must be preserved
     assert not (obj.mat[0].real == 0.0 and obj.mat[0].imag == 0.0)
     assert not (obj.mat[1].real == 0.0 and obj.mat[1].imag == 0.0)
+
+
+def test_free_releases_underlying_matrix():
+    mat = np.array([[1, 2], [3, 4]])
+    obj = IHaveMat(mat)
+
+    # ensure matrix is set initially
+    assert obj.mat is not None
+
+    # free without trim should release the array
+    obj.free(trim=False)
+    assert obj.mat is None
+
+
+def test_free_with_trim_calls_malloc_trim(monkeypatch):
+    mat = np.array([[1, 2], [3, 4]])
+    obj = IHaveMat(mat)
+
+    # prepare a fake libc with a malloc_trim that records calls
+    class FakeLibc:
+        def __init__(self):
+            self.called = False
+
+        def malloc_trim(self, arg):
+            # record that the function was invoked
+            self.called = True
+
+    fake = FakeLibc()
+
+    # make the class think malloc_trim is available and supply our fake libc
+    monkeypatch.setattr(IHaveMat, "_malloc_trim_available", True)
+    monkeypatch.setattr(IHaveMat, "_libc", fake)
+
+    # call free with trim and ensure the libc's malloc_trim was invoked
+    obj.free(trim=True)
+    assert fake.called is True
+    assert obj.mat is None
+
+
+def test__malloc_trim_is_noop_when_unavailable(monkeypatch):
+    # ensure that when _malloc_trim_available is False, calling _malloc_trim does nothing
+    monkeypatch.setattr(IHaveMat, "_malloc_trim_available", False)
+
+    # set a libc that would raise if called to ensure it's not invoked
+    class ExplodingLibc:
+        def malloc_trim(self, arg):
+            raise RuntimeError("should not be called")
+
+    monkeypatch.setattr(IHaveMat, "_libc", ExplodingLibc())
+
+    # should not raise
+    IHaveMat._malloc_trim()
+
+    # also ensure free(trim=True) will not try to call malloc_trim when availability is False
+    mat = np.array([1.0, 2.0, 3.0])
+    obj = IHaveMat(mat)
+    obj.free(trim=True)
+    assert obj.mat is None
+
+
+def test_enter_returns_self():
+    mat = np.array([[1.0]])
+    obj = IHaveMat(mat)
+    assert obj.__enter__() is obj
+
+
+def test_exit_calls_free_without_trim(monkeypatch):
+    mat = np.array([[1.0]])
+    obj = IHaveMat(mat)
+
+    called = {}
+
+    def fake_free(self, trim=False):
+        called["called"] = True
+        called["trim"] = trim
+        self._mat = None
+
+    monkeypatch.setattr(IHaveMat, "free", fake_free)
+
+    # simulate context manager exit
+    obj.__exit__(None, None, None)
+
+    assert called.get("called") is True
+    assert called.get("trim") is True
+    assert obj.mat is None
+
+
+def test_del_calls_free_without_trim(monkeypatch):
+    mat = np.array([[1.0]])
+    obj = IHaveMat(mat)
+
+    called = {}
+
+    def fake_free(self, trim=False):
+        called["called"] = True
+        called["trim"] = trim
+        self._mat = None
+
+    monkeypatch.setattr(IHaveMat, "free", fake_free)
+
+    # call destructor implementation directly
+    obj.__del__()
+
+    assert called.get("called") is True
+    assert called.get("trim") is True
+    assert obj.mat is None
+
+
+def test_skip_on_non_posix_or_no_proc(monkeypatch):
+    # simulate non-posix or missing /proc -> should mark unavailable and return
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(os.path, "exists", lambda p: False)
+    monkeypatch.setattr(IHaveMat, "_malloc_trim_available", None, raising=False)
+
+    IHaveMat._malloc_trim()
+
+    assert IHaveMat._malloc_trim_available is False
+
+
+def test_loads_libc_and_calls_malloc_trim(monkeypatch):
+    # simulate posix with /proc and a working ctypes.CDLL returning a libc with malloc_trim
+    class FakeLib:
+        def __init__(self):
+            self.called = False
+
+        def malloc_trim(self, arg):
+            self.called = True
+            return 1
+
+    fake_lib = FakeLib()
+    fake_ctypes = types.ModuleType("ctypes")
+    fake_ctypes.CDLL = lambda name: fake_lib
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os.path, "exists", lambda p: True)
+    monkeypatch.setitem(sys.modules, "ctypes", fake_ctypes)
+    monkeypatch.setattr(IHaveMat, "_malloc_trim_available", None, raising=False)
+
+    IHaveMat._malloc_trim()
+
+    assert IHaveMat._malloc_trim_available is True
+    assert getattr(IHaveMat, "_libc") is fake_lib
+    assert fake_lib.called is True
+
+
+def test_ctypes_cdll_failure_sets_unavailable(monkeypatch):
+    # simulate posix with /proc but CDLL raises -> should mark unavailable and not raise
+    def failing_cdll(name):
+        raise OSError("no libc")
+
+    fake_ctypes = types.ModuleType("ctypes")
+    fake_ctypes.CDLL = failing_cdll
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os.path, "exists", lambda p: True)
+    monkeypatch.setitem(sys.modules, "ctypes", fake_ctypes)
+    monkeypatch.setattr(IHaveMat, "_malloc_trim_available", None, raising=False)
+
+    IHaveMat._malloc_trim()
+
+    assert IHaveMat._malloc_trim_available is False
+
+
+def test_malloc_trim_exception_is_suppressed(monkeypatch):
+    # simulate libc present but malloc_trim itself raises -> should be suppressed (no exception)
+    class BadLib:
+        def malloc_trim(self, arg):
+            raise RuntimeError("boom")
+
+    fake_ctypes = types.ModuleType("ctypes")
+    fake_ctypes.CDLL = lambda name: BadLib()
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os.path, "exists", lambda p: True)
+    monkeypatch.setitem(sys.modules, "ctypes", fake_ctypes)
+    monkeypatch.setattr(IHaveMat, "_malloc_trim_available", None, raising=False)
+
+    # must not raise
+    IHaveMat._malloc_trim()
+
+    # when ctypes loaded successfully, availability should be True even if malloc_trim raised
+    assert IHaveMat._malloc_trim_available is True

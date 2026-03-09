@@ -84,7 +84,4 @@ class DgaLogger:
         """
         if obj is None:
             return
-        self.info(
-            f"{obj_name} {"uses" if n_exists <= self._comm.size else "use"} (GB): {obj.memory_usage_in_gb * n_exists:.6f}",
-            allowed_ranks=allowed_ranks,
-        )
+        self.info(f"{obj_name} use(s) (GB): {obj.memory_usage_in_gb * n_exists:.6f}", allowed_ranks=allowed_ranks)

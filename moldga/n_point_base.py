@@ -37,6 +37,9 @@ class IHaveMat(ABC):
     Also adds a way to easily delete the underlying matrix to free memory.
     """
 
+    _libc = None
+    _malloc_trim_available = None
+
     def __init__(self, mat: np.ndarray):
         self.mat = mat
         self._original_shape = self.mat.shape
@@ -133,10 +136,41 @@ class IHaveMat(ABC):
 
     def __del__(self):
         """
-        Deletes the underlying numpy array to free memory. Calls the garbage collector to free memory immediately.
+        Deletes the underlying numpy array to free memory. However, the memory might not be immediately freed by Python
+        if you call this method directly, e.g. by del obj, because the object might still be part of a reference cycle.
+        In this case, the memory will be freed when the reference cycle is collected by the garbage collector, which
+        can be forced by calling gc.collect() after del obj. However, it is generally recommended to use the free()
+        method instead of del obj to explicitly free memory, since it also allows for the option to return freed heap
+        memory back to the OS on Linux systems. If you want to use the context manager, you can use "with obj:" which
+        will automatically free memory after the block.
         """
-        del self._mat
+        self.free(True)
+
+    def __enter__(self):
+        """
+        Context manager for the object. Allows for the use of "with obj:" to automatically free memory after the block.
+        """
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        """
+        Context manager for the object. Allows for the use of "with obj:" to automatically free memory after the block.
+        """
+        self.free(True)
+
+    def free(self, trim: bool = False):
+        """
+        Explicitly releases the underlying numpy array. If True and running on Linux, attempts to return freed heap
+        memory back to the OS using malloc_trim.
+        """
+
+        if self._mat is not None:
+            self._mat = None
+
         gc.collect()
+
+        if trim:
+            self._malloc_trim()
 
     def update_original_shape(self):
         """
@@ -163,6 +197,36 @@ class IHaveMat(ABC):
         """
         self.mat[(np.abs(self.mat.real) < threshold) & (np.abs(self.mat.imag) < threshold)] = 0.0
         return self
+
+    @classmethod
+    def _malloc_trim(cls):
+        """
+        Returns unused heap memory to the OS using glibc malloc_trim.
+        Only available on Linux systems.
+        """
+        import os
+
+        if cls._malloc_trim_available is False:
+            return
+
+        if cls._malloc_trim_available is None:
+            if os.name != "posix" or not os.path.exists("/proc"):
+                cls._malloc_trim_available = False
+                return
+
+            try:
+                import ctypes
+
+                cls._libc = ctypes.CDLL("libc.so.6")
+                cls._malloc_trim_available = True
+            except Exception:
+                cls._malloc_trim_available = False
+                return
+
+        try:
+            cls._libc.malloc_trim(0)
+        except Exception:
+            pass
 
 
 class IHaveChannel(ABC):

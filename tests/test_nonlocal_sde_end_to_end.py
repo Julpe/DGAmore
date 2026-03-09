@@ -113,10 +113,10 @@ def test_calculates_nonlocal_sde_correctly(setup, niw_core, niv_core, niv_shell,
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
 
-    (gamma_d, gamma_m, *_, s_loc) = local_sde.perform_local_schwinger_dyson(g_loc, g2_dens, g2_magn, u_loc)
+    (*_, s_loc) = local_sde.perform_local_schwinger_dyson(g_loc, g2_dens, g2_magn, u_loc)
 
     with gpu_cpu_context(use_gpu) as mock_gpu:
-        sigma_dga = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft, s_loc, gamma_d, gamma_m)
+        sigma_dga = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft, s_loc)
 
     sigma_dga_mat = sigma_dga.decompress_q_dimension().mat
     sigma_dga_ref = np.load(f"{folder}/sigma_dga.npy")

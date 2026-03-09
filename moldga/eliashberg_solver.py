@@ -86,10 +86,12 @@ def create_full_vertex_q_r(
     logger.info(f"Non-Local auxiliary susceptibility ({gamma_r.channel.value}) calculated.")
 
     f_q_r = config.sys.beta**2 * (gchi0_q_inv - gchi0_q_inv @ f_q_r @ gchi0_q_inv)
-    del gchi0_q_inv
+    gchi0_q_inv.free()
 
     if not config.eliashberg.save_fq:
         f_q_r = transform_vertex_q_frequencies_w0(f_q_r, niv_pp)
+
+    comm.Barrier()
 
     logger.info(f"Calculated first part of full {gamma_r.channel.value} vertex.")
 
@@ -107,12 +109,15 @@ def create_full_vertex_q_r(
 
     u = u_loc.as_channel(gamma_r.channel) + v_nonloc.as_channel(gamma_r.channel)
     f_q_r_2 = u @ (vrg_q_r * vrg_q_r) - u @ gchi_aux_q_r_sum @ u @ (vrg_q_r * vrg_q_r)
-    del gchi_aux_q_r_sum, vrg_q_r
+    vrg_q_r.free()
+    gchi_aux_q_r_sum.free()
 
     if not config.eliashberg.save_fq:
         f_q_r_2 = transform_vertex_q_frequencies_w0(f_q_r_2, niv_pp)
     f_q_r += f_q_r_2
-    del f_q_r_2
+    f_q_r_2.free()
+
+    comm.Barrier()
 
     logger.info(f"Calculated second part of full {f_q_r.channel.value} vertex.")
 
@@ -321,13 +326,7 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
 
 # --- Main solve orchestration ---
 def solve(
-    giwk_dga: GreensFunction,
-    g_loc: GreensFunction,
-    u_loc: LocalInteraction,
-    v_nonloc: Interaction,
-    gamma_dens: LocalFourPoint,
-    gamma_magn: LocalFourPoint,
-    comm: MPI.Comm,
+    giwk_dga: GreensFunction, g_loc: GreensFunction, u_loc: LocalInteraction, v_nonloc: Interaction, comm: MPI.Comm
 ):
     """
     Solves the Eliashberg equation for largest the superconducting eigenvalues and corresponding gap functions.
@@ -342,8 +341,13 @@ def solve(
 
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
 
+    gamma_dens = LocalFourPoint.load(os.path.join(config.output.output_path, f"gamma_dens_loc.npy"), SpinChannel.DENS)
     f_dens_pp = create_full_vertex_q_r_pp_w0(u_loc, v_nonloc, gamma_dens, niv_pp, mpi_dist_irrk)
+    gamma_dens.free()
+
+    gamma_magn = LocalFourPoint.load(os.path.join(config.output.output_path, f"gamma_magn_loc.npy"), SpinChannel.MAGN)
     f_magn_pp = create_full_vertex_q_r_pp_w0(u_loc, v_nonloc, gamma_magn, niv_pp, mpi_dist_irrk)
+    gamma_magn.free()
 
     delete_files(config.output.eliashberg_path, f"gchi0_q_inv_rank_{comm.rank}.npy")
     delete_files(config.output.output_path, f"gchi0_q_rank_{comm.rank}.npy")
@@ -356,7 +360,8 @@ def solve(
 
     gamma_trip_pp = 0.5 * f_dens_pp + 0.5 * f_magn_pp
     gamma_trip_pp.channel = SpinChannel.TRIP
-    del f_dens_pp, f_magn_pp
+    f_dens_pp.free()
+    f_magn_pp.free()
     logger.info("Calculated full ladder-vertex (triplet) in pp notation.")
 
     gamma_sing_pp.mat = mpi_dist_irrk.gather(gamma_sing_pp.mat)
