@@ -53,6 +53,8 @@ eliashberg:
   symmetry: "random" # Symmetry of the gap function that will be used as a starting point for the power iteration. Available: p-wave-x, p-wave-y, d-wave, random
   include_local_part: False # If True, the local part of the pairing vertex is included in the Eliashberg calculation. This is only relevant if one might expect s-wave symmetry.
   # setting this to True will reduce the frequency box of the pairing vertex slightly due to an additional frequency shift that is necessary.
+  use_shift_invert_mode: False # If True, the code will use shift-invert mode for the power iteration additionally to the regular Lanczos,
+  # which picks out the eigenvalues closest to 1. These eigenvalues are then saved to a different file.
   subfolder_name: "Eliashberg" # name for the subfolder where certain outputs are generated
 
 self_energy_interpolation:

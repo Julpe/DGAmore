@@ -244,9 +244,16 @@ def execute_dga_routine():
         if not np.allclose(config.lattice.q_grid.nk, config.lattice.k_grid.nk):
             raise ValueError("Eliashberg equation can only be solved when nq = nk.")
         logger.info("Starting with Eliashberg equation.")
-        lambdas_sing, lambdas_trip, gaps_sing, gaps_trip = eliashberg_solver.solve(
-            giwk_dga, g_loc, u_loc, v_nonloc, comm
-        )
+        (
+            lambdas_sing,
+            lambdas_trip,
+            gaps_sing,
+            gaps_trip,
+            lambdas_sing_si,
+            lambdas_trip_si,
+            gaps_sing_si,
+            gaps_trip_si,
+        ) = eliashberg_solver.solve(giwk_dga, g_loc, u_loc, v_nonloc, comm)
 
         if config.output.save_quantities and comm.rank == 0:
             np.savetxt(
@@ -256,9 +263,21 @@ def execute_dga_routine():
                 fmt="%.9f",
             )
 
+            if lambdas_sing_si is not None and lambdas_trip_si is not None:
+                np.savetxt(
+                    os.path.join(config.output.eliashberg_path, "eigenvalues_si.txt"),
+                    [lambdas_sing_si.real, lambdas_trip_si.real],
+                    delimiter=",",
+                    fmt="%.9f",
+                )
+
             for i in range(len(gaps_sing)):
                 gaps_sing[i].save(name=f"gap_sing_{i+1}", output_dir=config.output.eliashberg_path)
                 gaps_trip[i].save(name=f"gap_trip_{i+1}", output_dir=config.output.eliashberg_path)
+
+                if gaps_sing_si is not None and gaps_trip_si is not None:
+                    gaps_sing_si[i].save(name=f"gap_sing_si_{i+1}", output_dir=config.output.eliashberg_path)
+                    gaps_trip_si[i].save(name=f"gap_trip_si_{i+1}", output_dir=config.output.eliashberg_path)
             logger.info("Saved singlet and triplet gap functions to files.")
 
         if config.output.do_plotting and comm.rank == 0:
@@ -270,6 +289,14 @@ def execute_dga_routine():
                 plotting.plot_gap_function(
                     gaps_trip[i], kx, ky, name=f"gap_trip_{i+1}", output_dir=config.output.eliashberg_path
                 )
+
+                if gaps_sing_si is not None and gaps_trip_si is not None:
+                    plotting.plot_gap_function(
+                        gaps_sing_si[i], kx, ky, name=f"gap_sing_si_{i+1}", output_dir=config.output.eliashberg_path
+                    )
+                    plotting.plot_gap_function(
+                        gaps_trip_si[i], kx, ky, name=f"gap_trip_si_{i+1}", output_dir=config.output.eliashberg_path
+                    )
             logger.info("Plotted singlet and triplet gap functions.")
 
     logger.info("Exiting ...")

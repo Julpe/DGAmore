@@ -183,6 +183,7 @@ class ConfigParser:
         conf.symmetry = self._try_parse(section, "symmetry", "random")
         conf.subfolder_name = self._try_parse(section, "subfolder_name", "Eliashberg")
         conf.include_local_part = self._try_parse(section, "include_local_part", True)
+        conf.use_shift_invert_mode = self._try_parse(section, "use_shift_invert_mode", False)
 
         return conf
 
