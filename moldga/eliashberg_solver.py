@@ -231,7 +231,7 @@ def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
 
 
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
-def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
+def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint, use_shift_invert_mode: bool = False):
     """
     Solves the Eliashberg equation for the superconducting eigenvalue and gap function using ARPACK.
     Returns (lambdas, gaps).
@@ -243,9 +243,11 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
         allowed_ranks=(0, 1),
     )
 
-    gamma_q_r_pp = gamma_q_r_pp.map_to_full_bz(
-        config.lattice.q_grid.irrk_inv, config.lattice.q_grid.nk
-    ).decompress_q_dimension()
+    gamma_q_r_pp = (
+        gamma_q_r_pp.compress_q_dimension()
+        .map_to_full_bz(config.lattice.q_grid.irrk_inv, config.lattice.q_grid.nk)
+        .decompress_q_dimension()
+    )
     logger.log_memory_usage(f"Gamma_pp_{gamma_q_r_pp.channel.value}", gamma_q_r_pp, 1, allowed_ranks=(0, 1))
 
     sign = 1 if gamma_q_r_pp.channel == SpinChannel.SING else -1
@@ -285,20 +287,31 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
     n_eig = config.eliashberg.n_eig
     eig_label = "" if n_eig > 1 else f" {n_eig}"
     plural = "" if n_eig == 1 else "s"
-    logger.info(
-        f"Starting Lanczos method to retrieve largest{eig_label} eigenvalue{plural} and eigenvector{plural} "
-        f"for the {gamma_q_r_pp.channel.value}let channel.",
-        allowed_ranks=(0, 1),
-    )
 
-    lambdas, gaps = sp.sparse.linalg.eigsh(
-        mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0, which="LA", maxiter=10000
-    )
+    if not use_shift_invert_mode:
+        logger.info(
+            f"Starting Lanczos method to retrieve largest{eig_label} eigenvalue{plural} and eigenvector{plural} "
+            f"for the {gamma_q_r_pp.channel.value}let channel.",
+            allowed_ranks=(0, 1),
+        )
+
+        lambdas, gaps = sp.sparse.linalg.eigsh(
+            mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0, which="LA", maxiter=10000
+        )
+    else:
+        logger.info(
+            f"Starting Lanczos method to retrieve {eig_label} eigenvalue{plural} and eigenvector{plural} "
+            f"for the {gamma_q_r_pp.channel.value}let channel that are closest to one using shift-invert mode.",
+            allowed_ranks=(0, 2, 3),
+        )
+
+        lambdas, gaps = sp.sparse.linalg.eigsh(
+            mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0, sigma=1.0, which="LM", maxiter=10000
+        )
 
     logger.info(
-        f"Finished Lanczos method for the largest{eig_label} eigenvalue{plural} and eigenvector{plural} "
-        f"for the {gamma_q_r_pp.channel.value}let channel.",
-        allowed_ranks=(0, 1),
+        f"Finished Lanczos method for the {gamma_q_r_pp.channel.value}let channel{" in shift-invert mode" if config.eliashberg.use_shift_invert_mode else ""}.",
+        allowed_ranks=(0, 1, 2, 3),
     )
 
     order = lambdas.argsort()[::-1]  # sort eigenvalues in descending order
@@ -307,8 +320,9 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
 
     logger.info(
         f"Largest{eig_label} eigenvalue{plural} for the {gamma_q_r_pp.channel.value}let "
-        f"channel {"is" if n_eig == 1 else "are"}: " + ", ".join(f"{lam:.6f}" for lam in lambdas),
-        allowed_ranks=(0, 1),
+        f"channel {"using shift-invert mode" if use_shift_invert_mode else ""} "
+        f"{"is" if n_eig == 1 else "are"}: " + ", ".join(f"{lam:.6f}" for lam in lambdas),
+        allowed_ranks=(0, 1, 2, 3),
     )
 
     gaps = [
@@ -317,8 +331,9 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
     ]
 
     logger.info(
-        f"Finished solving the Eliashberg equation for the {gamma_q_r_pp.channel.value}let channel.",
-        allowed_ranks=(0, 1),
+        f"Finished solving the Eliashberg equation for the {gamma_q_r_pp.channel.value}let "
+        f"channel{" in shift-invert mode" if use_shift_invert_mode else ""}.",
+        allowed_ranks=(0, 1, 2, 3),
     )
 
     return lambdas, gaps
@@ -411,20 +426,53 @@ def solve(
             )
 
     gchi0_q0_pp = mpi_dist_irrk.bcast(gchi0_q0_pp, root=0)
+    gamma_sing_pp = mpi_dist_irrk.bcast(gamma_sing_pp, root=0)
     gamma_trip_pp = mpi_dist_irrk.bcast(gamma_trip_pp, root=0)
 
     lambdas_sing, lambdas_trip, gaps_sing, gaps_trip = (None,) * 4
-    if mpi_dist_irrk.my_rank == 0:
-        lambdas_sing, gaps_sing = solve_eliashberg_lanczos(gamma_sing_pp, gchi0_q0_pp)
-    if mpi_dist_irrk.mpi_size == 1 or mpi_dist_irrk.my_rank == 1:
-        lambdas_trip, gaps_trip = solve_eliashberg_lanczos(gamma_trip_pp, gchi0_q0_pp)
+    lambdas_sing_si, lambdas_trip_si, gaps_sing_si, gaps_trip_si = (None,) * 4
+
+    size = mpi_dist_irrk.mpi_size
+
+    root_sing = 0 % size
+    root_trip = 1 % size
+    root_sing_si = 2 % size
+    root_trip_si = 3 % size
+
+    if mpi_dist_irrk.my_rank == root_sing:
+        lambdas_sing, gaps_sing = solve_eliashberg_lanczos(gamma_sing_pp, gchi0_q0_pp, False)
+
+    if mpi_dist_irrk.my_rank == root_trip:
+        lambdas_trip, gaps_trip = solve_eliashberg_lanczos(gamma_trip_pp, gchi0_q0_pp, False)
+
+    if config.eliashberg.use_shift_invert_mode:
+        if mpi_dist_irrk.my_rank == root_sing_si:
+            lambdas_sing_si, gaps_sing_si = solve_eliashberg_lanczos(gamma_sing_pp, gchi0_q0_pp, True)
+
+        if mpi_dist_irrk.my_rank == root_trip_si:
+            lambdas_trip_si, gaps_trip_si = solve_eliashberg_lanczos(gamma_trip_pp, gchi0_q0_pp, True)
+
+    lambdas_sing = mpi_dist_irrk.bcast(lambdas_sing, root=root_sing)
+    gaps_sing = mpi_dist_irrk.bcast(gaps_sing, root=root_sing)
+
+    lambdas_trip = mpi_dist_irrk.bcast(lambdas_trip, root=root_trip)
+    gaps_trip = mpi_dist_irrk.bcast(gaps_trip, root=root_trip)
+
+    lambdas_sing_si = mpi_dist_irrk.bcast(lambdas_sing_si, root=root_sing_si)
+    gaps_sing_si = mpi_dist_irrk.bcast(gaps_sing_si, root=root_sing_si)
+
+    lambdas_trip_si = mpi_dist_irrk.bcast(lambdas_trip_si, root=root_trip_si)
+    gaps_trip_si = mpi_dist_irrk.bcast(gaps_trip_si, root=root_trip_si)
 
     mpi_dist_irrk.delete_file()
 
-    lambdas_sing = mpi_dist_irrk.bcast(lambdas_sing, root=0)
-    lambdas_trip = mpi_dist_irrk.bcast(lambdas_trip, root=1 if mpi_dist_irrk.mpi_size > 1 else 0)
-
-    gaps_sing = mpi_dist_irrk.bcast(gaps_sing, root=0)
-    gaps_trip = mpi_dist_irrk.bcast(gaps_trip, root=1 if mpi_dist_irrk.mpi_size > 1 else 0)
-
-    return lambdas_sing, lambdas_trip, gaps_sing, gaps_trip
+    return (
+        lambdas_sing,
+        lambdas_trip,
+        gaps_sing,
+        gaps_trip,
+        lambdas_sing_si,
+        lambdas_trip_si,
+        gaps_sing_si,
+        gaps_trip_si,
+    )

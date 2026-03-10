@@ -99,6 +99,7 @@ class EliashbergConfig:
         self.symmetry: str = "random"
         self.subfolder_name: str = "Eliashberg"
         self.include_local_part: bool = True
+        self.use_shift_invert_mode: bool = False
 
 
 class LambdaCorrectionConfig:

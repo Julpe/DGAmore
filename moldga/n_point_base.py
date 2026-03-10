@@ -204,7 +204,10 @@ class IHaveMat(ABC):
         Returns unused heap memory to the OS using glibc malloc_trim.
         Only available on Linux systems.
         """
-        import os
+        try:
+            import os
+        except ImportError:
+            return
 
         if cls._malloc_trim_available is False:
             return
