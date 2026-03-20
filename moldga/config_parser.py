@@ -107,6 +107,9 @@ class ConfigParser:
 
         conf.interaction_type = self._try_parse(section, "interaction_type", "one_band_from_dmft")
         conf.interaction_input = section["interaction_input"]  # can be multiple types
+
+        conf.orbital_basis = self._try_parse(section, "orbital_basis", "")
+
         return conf
 
     def _build_dmft_config(self, config_file) -> DmftConfig:
@@ -178,6 +181,7 @@ class ConfigParser:
         conf.perform_eliashberg = self._try_parse(section, "perform_eliashberg", False)
         conf.save_pairing_vertex = self._try_parse(section, "save_pairing_vertex", False)
         conf.save_fq = self._try_parse(section, "save_fq", False)
+        conf.construct_fq_cheap = self._try_parse(section, "construct_fq_cheap", False)
         conf.n_eig = self._try_parse(section, "n_eig", 2)
         conf.epsilon = self._try_parse(section, "epsilon", 1e-6)
         conf.symmetry = self._try_parse(section, "symmetry", "random")

@@ -1,8 +1,10 @@
+import gc
 from copy import deepcopy
 
 import numpy as np
 from numpy.ma.core import swapaxes
 
+from moldga.brillouin_zone import KGrid
 from moldga.interaction import Interaction, LocalInteraction
 from moldga.local_four_point import LocalFourPoint
 from moldga.n_point_base import IAmNonLocal, SpinChannel, FrequencyNotation
@@ -113,7 +115,10 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             raise ValueError(f"Cannot sum over more fermionic axes than available in {self.current_shape}.")
 
         if not copy:
-            self.mat = 1 / beta ** len(axis) * np.sum(self.mat, axis=axis)
+            summed = 1 / beta ** len(axis) * np.sum(self.mat, axis=axis)
+            self.mat = None
+            gc.collect()
+            self.mat = summed
             self._num_vn_dimensions -= len(axis)
             self.update_original_shape()
             return self
@@ -315,6 +320,9 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         copy = deepcopy(self)
         copy.mat = np.einsum(permutation, copy.mat, optimize=True)
         return copy
+
+    def map_to_full_bz(self, grid: KGrid, nq: tuple = None):
+        return self._map_to_full_bz(grid, 4, nq)
 
     def add(self, other) -> "FourPoint":
         """

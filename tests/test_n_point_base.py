@@ -5,6 +5,8 @@ import types
 import numpy as np
 import pytest
 
+from moldga import brillouin_zone
+from moldga import brillouin_zone as bz
 from moldga.n_point_base import IHaveChannel, IHaveMat, IAmNonLocal, SpinChannel, FrequencyNotation
 
 
@@ -418,9 +420,10 @@ def test_raises_error_for_out_of_bounds_momentum():
 def test_maps_to_full_bz_correctly_with_valid_inverse_map():
     mat = np.arange(64)
     nq = (4, 4, 4)
-    inverse_map = np.array([0, 1, 2, 3, 4, 5, 6, 7])
+    np.array([0, 1, 2, 3, 4, 5, 6, 7])
     obj = IAmNonLocal(mat, nq, has_compressed_q_dimension=True)
-    obj.map_to_full_bz(inverse_map, nq=(2, 2, 2))
+    grid = brillouin_zone.KGrid(nk=(2, 2, 2), symmetries=[])
+    obj.map_to_full_bz(grid, nq=(2, 2, 2))
     assert obj.mat.shape == (8,)
     assert obj.nq == (2, 2, 2)
 
@@ -437,18 +440,18 @@ def test_raises_error_when_mapping_to_full_bz_without_compressed_q_dimension():
 def test_updates_nq_correctly_when_provided():
     mat = np.arange(64)
     nq = (4, 4, 4)
-    inverse_map = np.array([0, 1, 2, 3, 4, 5, 6, 7])
     obj = IAmNonLocal(mat, nq, has_compressed_q_dimension=True)
-    obj.map_to_full_bz(inverse_map, nq=(2, 2, 2))
+    grid = brillouin_zone.KGrid(nk=(2, 2, 2), symmetries=[])
+    obj.map_to_full_bz(grid, nq=(2, 2, 2))
     assert obj.nq == (2, 2, 2)
 
 
 def test_retains_original_nq_when_not_provided():
     mat = np.arange(64)
     nq = (4, 4, 4)
-    inverse_map = np.arange(64) - 64
+    grid = brillouin_zone.KGrid(nk=nq, symmetries=[])
     obj = IAmNonLocal(mat, nq, has_compressed_q_dimension=True)
-    obj.map_to_full_bz(inverse_map)
+    obj.map_to_full_bz(grid)
     assert obj.nq == (4, 4, 4)
 
 
@@ -802,3 +805,140 @@ def test_malloc_trim_exception_is_suppressed(monkeypatch):
 
     # when ctypes loaded successfully, availability should be True even if malloc_trim raised
     assert IHaveMat._malloc_trim_available is True
+
+
+def test_map_to_full_bz_momentum_expansion_is_correct():
+    """
+    With identity U, map_to_full_bz must correctly copy each IBZ value
+    to all its FBZ images according to irrk_inv.
+    """
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+    k_grid.orbital_rot_u = np.tile(np.eye(nb, dtype=complex), (k_grid.nk_tot, 1, 1))
+
+    rng = np.random.default_rng(0)
+    ibz_mat = rng.random((k_grid.nk_irr, nb, nb, nb, nb)) + 1j * rng.random((k_grid.nk_irr, nb, nb, nb, nb))
+
+    mat = ibz_mat[k_grid.irrk_inv.ravel()]
+    u = k_grid.orbital_rot_u
+    uc = u.conj()
+    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
+
+    irrk_inv_flat = k_grid.irrk_inv.ravel()
+    for iq_fbz in range(k_grid.nk_tot):
+        iq_irr = irrk_inv_flat[iq_fbz]
+        assert np.allclose(
+            mat[iq_fbz], ibz_mat[iq_irr]
+        ), f"FBZ point {iq_fbz} does not match its IBZ representative {iq_irr}"
+
+
+def test_map_to_full_bz_identity_u_leaves_values_unchanged():
+    """With all-identity U, the orbital content must be unchanged after mapping."""
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+    k_grid.orbital_rot_u = np.tile(np.eye(nb, dtype=complex), (k_grid.nk_tot, 1, 1))
+
+    rng = np.random.default_rng(1)
+    ibz_mat = rng.random((k_grid.nk_irr, nb, nb, nb, nb)) + 1j * rng.random((k_grid.nk_irr, nb, nb, nb, nb))
+
+    mat = ibz_mat[k_grid.irrk_inv.ravel()]
+    u = k_grid.orbital_rot_u
+    uc = u.conj()
+    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
+
+    irrk_inv_flat = k_grid.irrk_inv.ravel()
+    for iq_fbz in range(k_grid.nk_tot):
+        iq_irr = irrk_inv_flat[iq_fbz]
+        assert np.allclose(mat[iq_fbz], ibz_mat[iq_irr]), f"Identity U changed values at FBZ point {iq_fbz}"
+
+
+def test_map_to_full_bz_orbital_rotation_permutes_correct_indices():
+    """
+    For each non-identity FBZ point, the mapped value must equal
+    U @ M_irr @ U^T (4-index version) as computed manually.
+    """
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+
+    rng = np.random.default_rng(2)
+    ibz_mat = rng.random((k_grid.nk_irr, nb, nb, nb, nb)) + 1j * rng.random((k_grid.nk_irr, nb, nb, nb, nb))
+
+    u = k_grid.orbital_rot_u
+    uc = u.conj()
+    mat = ibz_mat[k_grid.irrk_inv.ravel()]
+    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
+
+    irrk_inv_flat = k_grid.irrk_inv.ravel()
+    identity = np.eye(nb)
+    for iq_fbz in range(k_grid.nk_tot):
+        u_ik = k_grid.orbital_rot_u[iq_fbz]
+        if np.allclose(u_ik, identity):
+            continue
+        iq_irr = irrk_inv_flat[iq_fbz]
+        m_irr = ibz_mat[iq_irr]
+        m_expected = np.einsum("ap,br,cs,dt,prst->abcd", u_ik, u_ik.conj(), u_ik, u_ik.conj(), m_irr)
+        assert np.allclose(
+            mat[iq_fbz], m_expected, atol=1e-10
+        ), f"Orbital rotation at FBZ point {iq_fbz} does not match expected"
+
+
+def test_map_to_full_bz_irrk_count_weighted_sum():
+    """
+    With identity U, sum over full BZ must equal irrk_count-weighted IBZ sum.
+    """
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+    k_grid.orbital_rot_u = np.tile(np.eye(nb, dtype=complex), (k_grid.nk_tot, 1, 1))
+
+    rng = np.random.default_rng(3)
+    ibz_mat = rng.random((k_grid.nk_irr, nb, nb, nb, nb)) + 1j * rng.random((k_grid.nk_irr, nb, nb, nb, nb))
+
+    u = k_grid.orbital_rot_u
+    uc = u.conj()
+    mat = ibz_mat[k_grid.irrk_inv.ravel()]
+    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
+
+    sum_fbz = mat.sum(axis=0)
+    sum_ibz_weighted = (ibz_mat * k_grid.irrk_count[:, None, None, None, None]).sum(axis=0)
+    assert np.allclose(sum_fbz, sum_ibz_weighted, atol=1e-10), "FBZ sum does not match irrk_count-weighted IBZ sum"
+
+
+def test_map_to_full_bz_ibz_representatives_unchanged():
+    """IBZ representative points must have identical values before and after mapping."""
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+
+    rng = np.random.default_rng(4)
+    ibz_mat = rng.random((k_grid.nk_irr, nb, nb, nb, nb)) + 1j * rng.random((k_grid.nk_irr, nb, nb, nb, nb))
+
+    u = k_grid.orbital_rot_u
+    uc = u.conj()
+    mat = ibz_mat[k_grid.irrk_inv.ravel()]
+    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
+
+    irrk_inv_flat = k_grid.irrk_inv.ravel()
+    for iq_fbz in k_grid.irrk_ind:
+        iq_irr = irrk_inv_flat[iq_fbz]
+        assert np.allclose(
+            mat[iq_fbz], ibz_mat[iq_irr], atol=1e-10
+        ), f"IBZ representative {iq_fbz} was modified during FBZ mapping"
+
+
+def test_map_to_full_bz_output_has_nk_tot_points():
+    """After mapping, the first dimension of mat must be nk_tot."""
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+
+    ibz_mat = np.ones((k_grid.nk_irr, nb, nb, nb, nb), dtype=complex)
+    u = k_grid.orbital_rot_u
+    uc = u.conj()
+    mat = ibz_mat[k_grid.irrk_inv.ravel()]
+    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
+
+    assert mat.shape[0] == k_grid.nk_tot, f"Expected first dim {k_grid.nk_tot}, got {mat.shape[0]}"

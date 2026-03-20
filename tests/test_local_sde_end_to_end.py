@@ -85,7 +85,7 @@ def test_extracts_dmft_quantities_correctly(setup, niw_core, niv_core, niv_shell
     )
 
     niv = 100
-    cut = config.box.niw_core + config.box.niv_full
+    cut = config.box.niw_core + config.box.niv_full + 10
 
     g_dmft_ref_mat = np.load(f"{folder}/g_dmft.npy")[..., niv - cut : niv + cut]
     s_dmft_ref_mat = np.load(f"{folder}/sigma_dmft.npy")[..., niv - cut : niv + cut]
@@ -198,7 +198,7 @@ def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
 
     g_loc_ref_mat = np.load(f"{folder}/g_loc.npy")
     niv = g_loc_ref_mat.shape[-1] // 2
-    cut = config.box.niw_core + config.box.niv_full
+    cut = config.box.niw_core + config.box.niv_full + 10
     g_loc_ref_mat = g_loc_ref_mat[..., niv - cut : niv + cut]
     assert np.allclose(g_loc.mat, g_loc_ref_mat)
 

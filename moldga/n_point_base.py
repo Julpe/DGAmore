@@ -5,20 +5,22 @@ from enum import Enum
 
 import numpy as np
 
+from moldga.brillouin_zone import KGrid
+
 
 class SpinChannel(Enum):
     """
     Enum for the different spin combinations.
     """
 
-    DENS: str = "dens"
-    MAGN: str = "magn"
-    SING: str = "sing"
-    TRIP: str = "trip"
-    UU: str = "uu"
-    UD: str = "ud"
-    UD_BAR: str = "ud_bar"
-    NONE: str = "none"
+    DENS = "dens"
+    MAGN = "magn"
+    SING = "sing"
+    TRIP = "trip"
+    UU = "uu"
+    UD = "ud"
+    UD_BAR = "ud_bar"
+    NONE = "none"
 
 
 class FrequencyNotation(Enum):
@@ -26,9 +28,9 @@ class FrequencyNotation(Enum):
     Enum for the different frequency notations. Is interchangeable with the channel reducibility.
     """
 
-    PH: str = "ph"
-    PH_BAR: str = "ph_bar"
-    PP: str = "pp"
+    PH = "ph"
+    PH_BAR = "ph_bar"
+    PP = "pp"
 
 
 class IHaveMat(ABC):
@@ -58,6 +60,9 @@ class IHaveMat(ABC):
         higher precision, they can always change it to complex128 themselves. Per default, we use complex64 to save
         memory.
         """
+        if value is None:
+            self._mat = None
+            return
         self._mat = value.astype(np.complex64)
 
     @property
@@ -163,7 +168,6 @@ class IHaveMat(ABC):
         Explicitly releases the underlying numpy array. If True and running on Linux, attempts to return freed heap
         memory back to the OS using malloc_trim.
         """
-
         if self._mat is not None:
             self._mat = None
 
@@ -425,19 +429,92 @@ class IAmNonLocal(IHaveMat, ABC):
 
         return result
 
-    def map_to_full_bz(self, inverse_map: np.ndarray, nq: tuple = None):
+    def map_to_full_bz(self, k_grid: KGrid, nq: tuple = None):
         """
-        Maps the object to the full Brillouin zone using the inverse of the irreducible k-point mesh and
-        returns the new object with a compressed momentum dimension. The inverse map can be obtained from the
-        `brillouin_zone` module.
+        Maps to full BZ using k_grid's inverse map and precomputed orbital rotation tensors.
+        Call k_grid.set_orbital_rotations() before this if orbital mixing is needed,
+        otherwise identity is assumed for all k-points.
+        """
+        return self._map_to_full_bz(k_grid, 4, nq)
+
+    def _map_to_full_bz(self, k_grid: KGrid, num_orbital_dimensions: int, nq: tuple = None):
+        """
+        Maps the object from the irreducible to the full Brillouin zone.
+
+        First expands the compressed IBZ momentum dimension to the full BZ by copying each IBZ
+        value to all its symmetry-equivalent FBZ images via k_grid.irrk_inv. Then applies the
+        precomputed orbital rotation tensors from k_grid.orbital_rot_u to account for the orbital
+        mixing introduced by mirror symmetry operations during the IBZ reduction.
+
+        The orbital transformation is applied per group of k-points that share the same rotation
+        matrix, using a Kronecker-product representation of the full transformation to reduce the
+        problem to a single batched matrix multiplication per group. This avoids the O(nb^8) cost
+        of a naive einsum over all four orbital indices simultaneously.
+
+        The transformation convention follows the operator ordering in
+        G_abcd := <T[c_a c†_b c_c c†_d]>, where a, c are annihilation indices transforming
+        with U and b, d are creation indices transforming with U*:
+            2-index: M'_ab(k)   = U_aa' U*_bb' M_a'b'(k')
+            4-index: M'_abcd(k) = U_aa' U*_bb' U_cc' U*_dd' M_a'b'c'd'(k')
+
+        Requires k_grid.specify_orbital_basis() to have been called beforehand if orbital mixing
+        is needed. If k_grid.orbital_rot_u is None, only the momentum expansion is performed and
+        orbital indices are left unchanged.
         """
         if not self.has_compressed_q_dimension:
-            raise ValueError("Mapping to full Brillouin zone only possible for compressed momentum dimension.")
+            raise ValueError("Mapping to full BZ only possible for compressed momentum dimension.")
+
+        assert num_orbital_dimensions in (2, 4), "Number of orbital dimensions must be 2 or 4."
 
         if nq is not None:
             self._nq = nq
 
-        self.mat = self.mat[inverse_map, ...].reshape((np.prod(self.nq), *self.original_shape[1:]))
+        self.mat = self.mat[k_grid.irrk_inv.ravel()].reshape((np.prod(self.nq), *self.original_shape[1:]))
+
+        if k_grid.orbital_rot_u is not None:
+            u_all = k_grid.orbital_rot_u
+            nb = u_all.shape[1]
+            identity = np.eye(nb, dtype=u_all.dtype)
+
+            groups = {}
+            for ik in range(u_all.shape[0]):
+                key = tuple(u_all[ik].real.round(6).ravel())
+                if key not in groups:
+                    groups[key] = []
+                groups[key].append(ik)
+
+            path_2 = path_4 = None
+
+            for key, indices in groups.items():
+                u_ref = u_all[indices[0]]
+                if np.allclose(u_ref, identity):
+                    continue
+
+                uc_ref = u_ref.conj()
+                idx = np.array(indices)
+
+                if num_orbital_dimensions == 2:
+                    if path_2 is None:
+                        path_2 = np.einsum_path(
+                            "ap,bq,kpq...->kab...", u_ref, uc_ref, self.mat[idx], optimize="optimal"
+                        )[0]
+                    self.mat[idx] = np.einsum("ap,bq,kpq...->kab...", u_ref, uc_ref, self.mat[idx], optimize=path_2)
+                elif num_orbital_dimensions == 4:
+                    if path_4 is None:
+                        path_4 = np.einsum_path(
+                            "ap,bq,cr,ds,kpqrs...->kabcd...",
+                            u_ref,
+                            uc_ref,
+                            u_ref,
+                            uc_ref,
+                            self.mat[idx],
+                            optimize="optimal",
+                        )[0]
+                    self.mat[idx] = np.einsum(
+                        "ap,bq,cr,ds,kpqrs...->kabcd...", u_ref, uc_ref, u_ref, uc_ref, self.mat[idx], optimize=path_4
+                    )
+
+        self.mat = self.mat.reshape((np.prod(self.nq), *self.original_shape[1:]))
         self.update_original_shape()
         return self
 

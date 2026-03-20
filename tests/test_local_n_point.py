@@ -91,11 +91,11 @@ def test_raises_error_when_cutting_bosonic_frequencies_with_no_wn_dimensions():
         obj.cut_niw(1)
 
 
-def test_raises_error_when_cutting_more_bosonic_frequencies_than_available():
-    mat = np.zeros((4, 4, 10))
+def test_does_not_raise_error_when_cutting_more_bosonic_frequencies_than_available():
+    mat = np.zeros((4, 4, 10, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
-    with pytest.raises(ValueError):
-        obj.cut_niw(6)
+    res = obj.cut_niw(6)
+    assert res is obj
 
 
 def test_cuts_bosonic_frequencies_correctly_with_full_range():
@@ -126,11 +126,11 @@ def test_raises_error_when_cutting_fermionic_frequencies_with_no_vn_dimensions()
         obj.cut_niv(1)
 
 
-def test_raises_error_when_cutting_more_fermionic_frequencies_than_available():
-    mat = np.zeros((4, 4, 10))
+def test_does_not_raise_error_when_cutting_more_fermionic_frequencies_than_available():
+    mat = np.zeros((4, 4, 10, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
-    with pytest.raises(ValueError):
-        obj.cut_niv(6)
+    res = obj.cut_niv(6)
+    assert res is obj
 
 
 def test_cuts_fermionic_frequencies_correctly_with_full_range():
@@ -155,18 +155,20 @@ def test_preserves_matrix_shape_when_cutting_with_no_wn_dimensions():
     assert result.mat.shape == (4, 4, 4)
 
 
-def test_raises_error_when_cutting_both_frequencies_with_invalid_bosonic_cut():
+def test_does_not_raise_error_when_cutting_both_frequencies_with_invalid_bosonic_cut():
     mat = np.zeros((4, 4, 10, 10))
-    obj = LocalNPoint(mat, 2, 1, 2)
-    with pytest.raises(ValueError):
-        obj.cut_niw_and_niv(6, 3)
+    obj = LocalNPoint(mat, 2, 1, 1)
+    res = obj.cut_niw_and_niv(6, 3)
+    assert res.niv == 3
+    assert res.niw == 5
 
 
-def test_raises_error_when_cutting_both_frequencies_with_invalid_fermionic_cut():
+def test_does_not_raise_error_when_cutting_both_frequencies_with_invalid_fermionic_cut():
     mat = np.zeros((4, 4, 10, 10))
-    obj = LocalNPoint(mat, 2, 1, 2)
-    with pytest.raises(ValueError):
-        obj.cut_niw_and_niv(3, 6)
+    obj = LocalNPoint(mat, 2, 1, 1)
+    res = obj.cut_niw_and_niv(3, 6)
+    assert res.niw == 3
+    assert res.niv == 5
 
 
 def test_cuts_both_frequencies_correctly_with_full_ranges():

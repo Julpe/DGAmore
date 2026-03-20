@@ -1,3 +1,4 @@
+import gc
 import os
 
 import h5py
@@ -146,6 +147,14 @@ class MpiDistributor:
             os.remove(self._fname)
         except:
             pass
+
+    def barrier(self):
+        """
+        Waits for all ranks until each MPI process has hit this statement. Explicitly calls garbage collection before
+        to make sure that all ranks have freed their memory before synchronization.
+        """
+        gc.collect()
+        self.comm.Barrier()
 
     def allgather(self, rank_result: np.ndarray = None) -> np.ndarray:
         """

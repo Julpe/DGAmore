@@ -70,7 +70,7 @@ def transform_vertex_q_frequencies_w0(f_q_r: FourPoint, niv_pp: int) -> FourPoin
 
 # --- Full q-dependent vertex creation and transformation ---
 def create_full_vertex_q_r(
-    u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, comm: MPI.Comm
+    u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist: MpiDistributor
 ) -> FourPoint:
     """
     Calculates the full vertex in the given channel (either density or magnetic).
@@ -79,8 +79,13 @@ def create_full_vertex_q_r(
     logger.info(f"Starting to calculate the full {gamma_r.channel.value} vertex.")
 
     gchi0_q_inv = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"gchi0_q_inv_rank_{comm.rank}.npy"), num_vn_dimensions=1
+        os.path.join(config.output.eliashberg_path, f"gchi0_q_inv_rank_{mpi_dist.my_rank}.npy"), num_vn_dimensions=1
     )
+
+    if config.eliashberg.construct_fq_cheap:
+        gamma_r = gamma_r.cut_niv(niv_pp)
+        gchi0_q_inv = gchi0_q_inv.cut_niv(niv_pp)
+
     logger.info(f"Loaded gchi0_q_inv from file.")
     f_q_r = nonlocal_sde.create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_loc, v_nonloc)
     logger.info(f"Non-Local auxiliary susceptibility ({gamma_r.channel.value}) calculated.")
@@ -91,17 +96,23 @@ def create_full_vertex_q_r(
     if not config.eliashberg.save_fq:
         f_q_r = transform_vertex_q_frequencies_w0(f_q_r, niv_pp)
 
-    comm.Barrier()
+    mpi_dist.barrier()
 
     logger.info(f"Calculated first part of full {gamma_r.channel.value} vertex.")
 
     vrg_q_r = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"vrg_q_{gamma_r.channel.value}_rank_{comm.rank}.npy"),
+        os.path.join(config.output.eliashberg_path, f"vrg_q_{gamma_r.channel.value}_rank_{mpi_dist.my_rank}.npy"),
         channel=gamma_r.channel,
         num_vn_dimensions=1,
     )
+
+    if config.eliashberg.construct_fq_cheap:
+        vrg_q_r = vrg_q_r.cut_niv(niv_pp)
+
     gchi_aux_q_r_sum = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"gchi_aux_q_{gamma_r.channel.value}_sum_rank_{comm.rank}.npy"),
+        os.path.join(
+            config.output.eliashberg_path, f"gchi_aux_q_{gamma_r.channel.value}_sum_rank_{mpi_dist.my_rank}.npy"
+        ),
         channel=gamma_r.channel,
         num_vn_dimensions=0,
     )
@@ -117,14 +128,14 @@ def create_full_vertex_q_r(
     f_q_r += f_q_r_2
     f_q_r_2.free()
 
-    comm.Barrier()
+    mpi_dist.barrier()
 
     logger.info(f"Calculated second part of full {f_q_r.channel.value} vertex.")
 
     delete_files(
         config.output.eliashberg_path,
-        f"vrg_q_{gamma_r.channel.value}_rank_{comm.rank}.npy",
-        f"gchi_aux_q_{gamma_r.channel.value}_sum_rank_{comm.rank}.npy",
+        f"vrg_q_{gamma_r.channel.value}_rank_{mpi_dist.my_rank}.npy",
+        f"gchi_aux_q_{gamma_r.channel.value}_sum_rank_{mpi_dist.my_rank}.npy",
     )
 
     return f_q_r
@@ -138,7 +149,7 @@ def create_full_vertex_q_r_pp_w0(
     """
     logger = config.logger
 
-    f_q_r = create_full_vertex_q_r(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk.comm)
+    f_q_r = create_full_vertex_q_r(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk)
 
     if config.eliashberg.save_fq:
         f_q_r.mat = mpi_dist_irrk.gather(f_q_r.mat)
@@ -243,9 +254,7 @@ def solve_eliashberg_lanczos(gamma_q_r_pp: FourPoint, gchi0_q0_pp: FourPoint):
         allowed_ranks=(0, 1),
     )
 
-    gamma_q_r_pp = gamma_q_r_pp.map_to_full_bz(
-        config.lattice.q_grid.irrk_inv, config.lattice.q_grid.nk
-    ).decompress_q_dimension()
+    gamma_q_r_pp = gamma_q_r_pp.map_to_full_bz(config.lattice.q_grid, config.lattice.q_grid.nk).decompress_q_dimension()
     logger.log_memory_usage(f"Gamma_pp_{gamma_q_r_pp.channel.value}", gamma_q_r_pp, 1, allowed_ranks=(0, 1))
 
     sign = 1 if gamma_q_r_pp.channel == SpinChannel.SING else -1
@@ -345,9 +354,13 @@ def solve(
     f_dens_pp = create_full_vertex_q_r_pp_w0(u_loc, v_nonloc, gamma_dens, niv_pp, mpi_dist_irrk)
     gamma_dens.free()
 
+    mpi_dist_irrk.barrier()
+
     gamma_magn = LocalFourPoint.load(os.path.join(config.output.output_path, f"gamma_magn_loc.npy"), SpinChannel.MAGN)
     f_magn_pp = create_full_vertex_q_r_pp_w0(u_loc, v_nonloc, gamma_magn, niv_pp, mpi_dist_irrk)
     gamma_magn.free()
+
+    mpi_dist_irrk.barrier()
 
     delete_files(config.output.eliashberg_path, f"gchi0_q_inv_rank_{comm.rank}.npy")
     delete_files(config.output.output_path, f"gchi0_q_rank_{comm.rank}.npy")

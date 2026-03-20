@@ -6,6 +6,7 @@ import numpy as np
 from scipy.interpolate import interp1d
 
 import moldga.config as config
+from moldga.brillouin_zone import KGrid
 from moldga.local_n_point import LocalNPoint
 from moldga.matsubara_frequencies import MFHelper
 from moldga.n_point_base import IAmNonLocal
@@ -220,6 +221,9 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
         """
         orbital_axes = self._get_orbital_axes()
         return self._is_orbitally_symmetrized(orbitals, orbital_axes)
+
+    def map_to_full_bz(self, k_grid: KGrid, nq: tuple = None):
+        return self._map_to_full_bz(k_grid, 2, nq)
 
     def interpolate(self, beta_source: float, beta_target: float, niv_target: int) -> "SelfEnergy":
         """

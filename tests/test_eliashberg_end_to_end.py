@@ -45,6 +45,7 @@ def test_eliashberg_equation_without_local_part(setup, niw_core, niv_core, niv_s
     config.output.eliashberg_path = config.output.output_path
     config.eliashberg.include_local_part = False
     config.eliashberg.save_fq = save_fq
+    config.eliashberg.construct_fq_cheap = False
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
@@ -73,6 +74,7 @@ def test_eliashberg_equation_with_local_part(setup, niw_core, niv_core, niv_shel
     config.output.eliashberg_path = config.output.output_path
     config.eliashberg.include_local_part = True
     config.eliashberg.save_fq = save_fq
+    config.eliashberg.construct_fq_cheap = False
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
