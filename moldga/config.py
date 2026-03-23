@@ -53,6 +53,7 @@ class LatticeConfig:
         self.er_input: str | list = "./wannier_hr.dat"
         self.interaction_type: str = "one_band_from_dmft"
         self.interaction_input: str | list = ""
+        self.orbital_basis: str = ""
         self.nk: tuple[int, int, int] = (16, 16, 1)
         self.nq: tuple[int, int, int] = self.nk
 
@@ -94,6 +95,7 @@ class EliashbergConfig:
         self.perform_eliashberg: bool = True
         self.save_pairing_vertex: bool = True
         self.save_fq: bool = False
+        self.construct_fq_cheap: bool = True
         self.n_eig: int = 2
         self.epsilon: float = 1e-4
         self.symmetry: str = "random"

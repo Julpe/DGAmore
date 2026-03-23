@@ -2,4 +2,7 @@
 extend-ignore-words-re = [
     "ba",
     "nd",
+    "ix",
+    "iy",
+    "iz"
 ]

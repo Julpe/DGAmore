@@ -12,6 +12,10 @@ lattice:
   # calculation. If 'custom', please specify the full path to a file in 'interaction_input' containing orbital and spacial entries for the interaction matrix
   # (similar to how a wannier_hr.dat file is structured, but with 4 orbital indices).
   interaction_input: "" # Full path to the interaction file if interaction_type is 'custom', otherwise the interaction data will be taken from DMFT
+  orbital_basis: "" # Basis of the orbitals. Available options are 't2g'. Notice that this is relevant if one uses lattice symmetries such as three_dimensional_cubic etc.
+  # This has to be set in conjunction with the symmetries of the lattice! If the orbital basis is not set but lattice symmetries are entered, we cannot guarantee that the
+  # symmetries are correctly applied to the orbitals. This setting is only relevant for multi-orbital systems. ATTENTION: make sure that if you use t2g, the order of the orbitals
+  # in the wannier files has to be alphabetical! For example, for a t2g system with three orbitals, the order of the orbitals in the wannier file has to be: dxy, dxz, dyz.
   nk: [ 16, 16, 1 ] # Number of k-points in x, y and z-direction. Default: [ 16, 16, 1 ]
   #nq: [ 16, 16, 1 ] # Number of q-points in x, y and z-direction. Default: [ 16, 16, 1 ]. If left empty, nq is set to nk
 
@@ -48,6 +52,7 @@ eliashberg:
   perform_eliashberg: False # If True, the code will perform a power iteration to solve the linearized Eliashberg equation for the superconducting eigenvalues and gap functions
   save_pairing_vertex: False # if true, saves the s/t pairing vertices Gamma(qvv') for the irreducible BZ to files. Attention: this could be a large file!
   save_fq: False # If True, saves the full d/m vertex F(qvv') for the irreducible BZ to files. Attention: this could be a large file!
+  construct_fq_cheap: False # If True, the code will construct F(qvv') for the d/m channels in a way that is less memory intensive (only 1/4) but also less accurate. This is recommended for large frequency boxes.
   n_eig: 4 # Number of eigenvalues and eigenvectors to be calculated. Default: 4
   epsilon: 1e-6 # Convergence criterion for the eigenvalues and eigenvectors
   symmetry: "random" # Symmetry of the gap function that will be used as a starting point for the power iteration. Available: p-wave-x, p-wave-y, d-wave, random

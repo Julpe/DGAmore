@@ -109,7 +109,7 @@ class LocalNPoint(IHaveMat):
             raise ValueError("Cannot cut bosonic frequencies if there are none.")
 
         if niw_cut > self.niw:
-            raise ValueError("Cannot cut more bosonic frequencies than the object has.")
+            return self
 
         copy = deepcopy(self)
 
@@ -133,7 +133,7 @@ class LocalNPoint(IHaveMat):
             raise ValueError("Cannot cut fermionic frequencies if there are none.")
 
         if niv_cut > self.niv:
-            raise ValueError("Cannot cut more fermionic frequencies than the object has.")
+            return self
 
         copy = deepcopy(self)
 

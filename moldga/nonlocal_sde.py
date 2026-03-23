@@ -1,3 +1,4 @@
+import gc
 import glob
 import os
 import re
@@ -128,7 +129,7 @@ def calculate_kernel_r_q(
     return u_r @ kernel
 
 
-def perform_ornstein_zernicke_fit(chi_phys_q_r: FourPoint, irrk_inv: np.ndarray) -> None:
+def perform_ornstein_zernicke_fit(chi_phys_q_r: FourPoint) -> None:
     def oz_spin_w0(q_grid: KGrid, a: float, xi: float):
         qx = qy = np.pi
         qz = 0
@@ -145,7 +146,7 @@ def perform_ornstein_zernicke_fit(chi_phys_q_r: FourPoint, irrk_inv: np.ndarray)
         return opt.curve_fit(oz_spin_w0, q_grid, mat, p0=initial_guess)
 
     chi = deepcopy(chi_phys_q_r)
-    chi_mat = chi.map_to_full_bz(irrk_inv).to_half_niw_range().take_first_wn().mat.real
+    chi_mat = chi.map_to_full_bz(config.lattice.q_grid).to_half_niw_range().take_first_wn().mat.real
     orb_shape = (config.sys.n_bands,) * 4
     oz_coeffs = np.zeros(orb_shape + (2,), dtype=float)
 
@@ -186,6 +187,8 @@ def calculate_sigma_kernel_r_q(
     gchi_aux_q_r_sum = create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_loc, v_nonloc).sum_over_vn(
         config.sys.beta, axis=(-1,), copy=False
     )
+    mpi_dist_irrq.barrier()
+
     logger.log_memory_usage(
         f"Gchi_aux ({gchi_aux_q_r_sum.channel.value})",
         gchi_aux_q_r_sum,
@@ -232,7 +235,7 @@ def calculate_sigma_kernel_r_q(
 
             # perform Ornstein-Zernicke fit
             if chi_phys_q_r.channel == SpinChannel.MAGN:
-                perform_ornstein_zernicke_fit(chi_phys_q_r, irrk_inv=config.lattice.q_grid.irrk_inv)
+                perform_ornstein_zernicke_fit(chi_phys_q_r)
 
         chi_phys_q_r.mat = mpi_dist_irrq.scatter(chi_phys_q_r.mat)
         logger.info(f"Saved physical susceptibility ({chi_phys_q_r.channel.value}) to file.")
@@ -530,8 +533,8 @@ def calculate_self_energy_q(
             f"Using previous calculation and starting the self-consistency loop at iteration {starting_iter+1}."
         )
 
-    sigma_old = sigma_old.cut_niv(config.box.niw_core + config.box.niv_full)
-    sigma_dmft = sigma_dmft.cut_niv(config.box.niw_core + config.box.niv_full)
+    sigma_old = sigma_old.cut_niv(config.box.niw_core + config.box.niv_full + 10)
+    sigma_dmft = sigma_dmft.cut_niv(config.box.niw_core + config.box.niv_full + 10)
 
     delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_local.cut_niv(config.box.niv_core)
     mu_history = (
@@ -559,7 +562,7 @@ def calculate_self_energy_q(
             gchi0_q.save(name=f"gchi0_q_rank_{comm.rank}", output_dir=config.output.output_path)
 
         logger.log_memory_usage("Gchi0_q_full", gchi0_q, comm.size)
-        giwk_full = giwk_full.cut_niv(config.box.niw_core + config.box.niv_full)
+        giwk_full = giwk_full.cut_niv(config.box.niw_core + config.box.niv_full + 10)
 
         f_dc_loc = 2 * LocalFourPoint.load(os.path.join(config.output.output_path, "f_magn_loc.npy"))
         kernel = -calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc)
@@ -587,7 +590,7 @@ def calculate_self_energy_q(
             gamma_dens, gchi0_q_core_inv, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc, mpi_dist_irrk
         )
         gamma_dens.free()
-        comm.Barrier()
+        mpi_dist_irrk.barrier()
         logger.info("Calculated kernel for density channel.")
 
         gamma_magn = LocalFourPoint.load(
@@ -604,7 +607,7 @@ def calculate_self_energy_q(
 
         kernel.mat = mpi_dist_irrk.gather(kernel.mat)
         if comm.rank == 0:
-            kernel = kernel.map_to_full_bz(config.lattice.q_grid.irrk_inv)
+            kernel = kernel.map_to_full_bz(config.lattice.q_grid)
         kernel.mat = mpi_dist_fullbz.scatter(kernel.mat)
         logger.info("Kernel mapped to full BZ and scattered across all MPI ranks.")
 

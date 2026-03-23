@@ -64,7 +64,7 @@ def load_from_w2dyn_file_and_update_config() -> tuple[GreensFunction, SelfEnergy
 
     giw_spin_mean = np.mean(file.get_giw(), axis=1)  # [band,spin,niv]
     niv_dmft = giw_spin_mean.shape[-1] // 2
-    niv_cut = config.box.niw_core + config.box.niv_full
+    niv_cut = config.box.niw_core + config.box.niv_full + 10
     giw_spin_mean = giw_spin_mean[..., niv_dmft - niv_cut : niv_dmft + niv_cut]
     g_dmft = GreensFunction(extend_orbital(giw_spin_mean))
 
@@ -118,6 +118,9 @@ def load_from_w2dyn_file_and_update_config() -> tuple[GreensFunction, SelfEnergy
         g2_dens = g2_dens.symmetrize_v_vp()
         g2_magn = g2_magn.symmetrize_v_vp()
         config.logger.info(f"Symmetrized G2 with respect to v and v'.")
+
+    config.lattice.k_grid.specify_orbital_basis(config.sys.n_bands, config.lattice.orbital_basis)
+    config.lattice.q_grid.specify_orbital_basis(config.sys.n_bands, config.lattice.orbital_basis)
 
     return g_dmft, sigma_dmft, g2_dens, g2_magn
 

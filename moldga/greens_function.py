@@ -1,10 +1,10 @@
-import itertools
 from copy import deepcopy
 
 import numpy as np
 from scipy import optimize as opt
 
 import moldga.config as config
+from moldga.brillouin_zone import KGrid
 from moldga.local_n_point import LocalNPoint
 from moldga.matsubara_frequencies import MFHelper
 from moldga.n_point_base import IAmNonLocal
@@ -181,6 +181,9 @@ class GreensFunction(IAmNonLocal, LocalNPoint):
         """
         orbital_axes = self._get_orbital_axes()
         return self._is_orbitally_symmetrized(orbitals, orbital_axes)
+
+    def map_to_full_bz(self, k_grid: KGrid, nq: tuple = None):
+        return self._map_to_full_bz(k_grid, 2, nq)
 
     def transpose_orbitals(self):
         r"""

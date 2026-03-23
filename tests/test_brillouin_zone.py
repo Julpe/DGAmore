@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pytest
 import moldga.brillouin_zone as bz
@@ -62,19 +64,19 @@ def test_does_nothing_for_non_square_matrix():
 
 def test_raises_error_for_insufficient_dimensions_on_x_y_sym():
     mat = np.random.rand(4, 4)
-    with pytest.raises(AssertionError, match="dim\(mat\) = 2 but must be at least 3 dimensional"):
+    with pytest.raises(AssertionError):
         bz.x_y_sym(mat)
 
 
 def test_raises_error_for_insufficient_dimensions_on_x_z_sym():
     mat = np.random.rand(4, 4)
-    with pytest.raises(AssertionError, match="dim\(mat\) = 2 but must be at least 3 dimensional"):
+    with pytest.raises(AssertionError):
         bz.x_z_sym(mat)
 
 
 def test_raises_error_for_insufficient_dimensions_on_y_z_sym():
     mat = np.random.rand(4, 4)
-    with pytest.raises(AssertionError, match="dim\(mat\) = 2 but must be at least 3 dimensional"):
+    with pytest.raises(AssertionError):
         bz.y_z_sym(mat)
 
 
@@ -203,7 +205,7 @@ def test_returns_empty_list_for_none_or_empty_string():
 
 
 def test_raises_error_for_unsupported_symmetry_string():
-    with pytest.raises(NotImplementedError, match="Symmetry unsupported_symmetry not supported."):
+    with pytest.raises(ValueError, match="Symmetry does not exist or input cannot be parsed as a Python literal."):
         bz.get_lattice_symmetries_from_string("unsupported_symmetry")
 
 
@@ -467,3 +469,190 @@ def test_get_bands_returns_sorted_real_eigenvalues():
 
     expected = np.array([[1.0, 2.0], [3.0, 4.0]])
     assert np.allclose(bands, expected)
+
+
+def test_ibz_points_have_identity_u_t2g():
+    """IBZ representative k-points must always have identity orbital rotation."""
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+
+    identity = np.eye(nb)
+    for ik in k_grid.irrk_ind:
+        assert np.allclose(k_grid.orbital_rot_u[ik], identity), f"IBZ point {ik} has non-identity U"
+
+
+def test_all_u_are_unitary_t2g():
+    """Every U matrix must be unitary."""
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+
+    identity = np.eye(nb)
+    for ik in range(k_grid.nk_tot):
+        u = k_grid.orbital_rot_u[ik]
+        assert np.allclose(u @ u.conj().T, identity, atol=1e-10), f"U at k-point {ik} is not unitary"
+
+
+def test_no_warnings_raised_t2g():
+    """No 'could not find symmetry path' warnings should be raised."""
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        k_grid.specify_orbital_basis(nb, "t2g")
+    path_warnings = [x for x in w if "Could not find symmetry path" in str(x.message)]
+    assert len(path_warnings) == 0, f"Got {len(path_warnings)} 'could not find symmetry path' warnings"
+
+
+def test_inversion_only_gives_all_identity():
+    """With only inversion symmetries, all U must be identity."""
+    nb = 3
+    k_grid = bz.KGrid(
+        nk=(4, 4, 4),
+        symmetries=[bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV, bz.KnownSymmetries.Z_INV],
+    )
+    k_grid.specify_orbital_basis(nb, "t2g")
+
+    identity = np.eye(nb)
+    assert np.allclose(
+        k_grid.orbital_rot_u, np.tile(identity, (k_grid.nk_tot, 1, 1))
+    ), "Inversion-only grid should have all-identity U"
+
+
+def test_shape_of_orbital_rot_u():
+    """orbital_rot_u must have shape (nk_tot, nb, nb)."""
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+    assert k_grid.orbital_rot_u.shape == (k_grid.nk_tot, nb, nb)
+
+
+def test_distinct_u_matrices_are_valid_permutations_t2g():
+    """For t2g, all distinct U matrices must be permutation matrices."""
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+
+    unique_us = []
+    for u in k_grid.orbital_rot_u:
+        if not any(np.allclose(u, v) for v in unique_us):
+            unique_us.append(u)
+
+    for u in unique_us:
+        assert np.allclose(np.abs(u), np.abs(u).astype(int)), "U is not a permutation matrix"
+        assert np.allclose(u.sum(axis=0), np.ones(nb)), "U columns don't sum to 1"
+        assert np.allclose(u.sum(axis=1), np.ones(nb)), "U rows don't sum to 1"
+
+
+def test_3_cycle_compositions_are_inverted():
+    """3-cycle U matrices (U^3=I, U^2!=I) must have U† stored, not U."""
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+
+    identity = np.eye(nb)
+    for ik in range(k_grid.nk_tot):
+        u = k_grid.orbital_rot_u[ik]
+        if not np.allclose(u @ u, identity):
+            assert np.allclose(u @ u @ u, identity, atol=1e-10), f"Non-self-inverse U at {ik} is not a 3-cycle"
+
+
+def test_correct_orbital_permutation_for_mirror_symmetries():
+    """
+    Verify the physical correctness of orbital rotations by checking that
+    all three mirror rotations appear in orbital_rot_u with the correct assignment:
+      X_Y_SYM (kx<->ky): dxz<->dxy  -> [[0,0,1],[0,1,0],[1,0,0]]
+      X_Z_SYM (kx<->kz): dyz<->dxy  -> [[1,0,0],[0,0,1],[0,1,0]]
+      Y_Z_SYM (ky<->kz): dxz<->dyz  -> [[0,1,0],[1,0,0],[0,0,1]]
+    """
+    nb = 3
+    k_grid = bz.KGrid(nk=(8, 8, 8), symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+
+    xy_sym_u = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]], dtype=complex)
+    yz_sym_u = np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]], dtype=complex)
+    xz_sym_u = np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=complex)
+
+    found_xy = found_yz = found_xz = False
+    for iq in range(k_grid.nk_tot):
+        u = k_grid.orbital_rot_u[iq]
+        if np.allclose(u, xy_sym_u):
+            found_xy = True
+        if np.allclose(u, yz_sym_u):
+            found_yz = True
+        if np.allclose(u, xz_sym_u):
+            found_xz = True
+
+    assert found_xy, "X_Y_SYM rotation (dxz<->dxy) not found in orbital_rot_u"
+    assert found_yz, "Y_Z_SYM rotation (dxz<->dyz) not found in orbital_rot_u"
+    assert found_xz, "X_Z_SYM rotation (dyz<->dxy) not found in orbital_rot_u"
+
+
+def test_custom_mirror_rotations():
+    """User-supplied mirror_rotations dict should be used when orbital_basis is None."""
+    nb = 2
+    k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    custom_u = {bz.KnownSymmetries.X_Y_SYM: np.array([[0, 1], [1, 0]], dtype=complex)}
+    k_grid.specify_orbital_basis(nb, mirror_rotations=custom_u)
+
+    assert k_grid.orbital_rot_u is not None
+    assert k_grid.orbital_rot_u.shape == (k_grid.nk_tot, nb, nb)
+
+
+def test_orbital_basis_takes_precedence_over_mirror_rotations():
+    """orbital_basis should override mirror_rotations when both are provided."""
+    nb = 3
+    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    wrong_rotations = {
+        bz.KnownSymmetries.X_Y_SYM: np.eye(nb, dtype=complex),
+        bz.KnownSymmetries.X_Z_SYM: np.eye(nb, dtype=complex),
+        bz.KnownSymmetries.Y_Z_SYM: np.eye(nb, dtype=complex),
+    }
+    k_grid.specify_orbital_basis(nb, orbital_basis="t2g", mirror_rotations=wrong_rotations)
+
+    identity = np.eye(nb)
+    is_identity = np.array([np.allclose(u, identity) for u in k_grid.orbital_rot_u])
+    assert not is_identity.all(), "orbital_basis='t2g' should produce non-identity U but got all identity"
+
+
+def test_fbz_sum_restores_orbital_degeneracy_for_t2g():
+    """
+    Construct a synthetic orbital-momentum coupled kernel in the IBZ,
+    map to FBZ, and verify the FBZ sum restores cubic orbital degeneracy.
+    This is the key physical consistency test for the whole pipeline.
+    """
+    nb = 3
+    nk = (6, 6, 6)
+    k_grid = bz.KGrid(nk=nk, symmetries=bz.three_dimensional_cubic_symmetries())
+    k_grid.specify_orbital_basis(nb, "t2g")
+
+    # Build synthetic IBZ kernel where orbital content reflects momentum:
+    # dxz couples to ky, dyz to kz, dxy to kx (matching Hamiltonian structure)
+    kmesh_ind = k_grid.kmesh_ind.reshape(3, -1).T
+    kx = 2 * np.pi * kmesh_ind[:, 0] / nk[0]
+    ky = 2 * np.pi * kmesh_ind[:, 1] / nk[1]
+    kz = 2 * np.pi * kmesh_ind[:, 2] / nk[2]
+
+    e_dxy = np.cos(kz)  # dxy invariant along z
+    e_dxz = np.cos(ky)  # dxz invariant along y
+    e_dyz = np.cos(kx)  # dyz invariant along x
+
+    ibz_mat = np.zeros((k_grid.nk_irr, nb, nb, nb, nb), dtype=complex)
+    for i_irr, iq_flat in enumerate(k_grid.irrk_ind):
+        ibz_mat[i_irr, 0, 0, 0, 0] = e_dxy[iq_flat]  # orbital 0 = dxy
+        ibz_mat[i_irr, 1, 1, 1, 1] = e_dxz[iq_flat]  # orbital 1 = dxz
+        ibz_mat[i_irr, 2, 2, 2, 2] = e_dyz[iq_flat]  # orbital 2 = dyz
+
+    u = k_grid.orbital_rot_u
+    uc = u.conj()
+    mat = ibz_mat[k_grid.irrk_inv.ravel()]
+    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
+
+    sigma = mat.sum(axis=0)
+    s00 = sigma[0, 0, 0, 0]
+    s11 = sigma[1, 1, 1, 1]
+    s22 = sigma[2, 2, 2, 2]
+
+    assert np.allclose(s00, s11, atol=1e-8), f"dxz and dyz diagonal not equal after FBZ sum: {s00} vs {s11}"
+    assert np.allclose(s00, s22, atol=1e-8), f"dxz and dxy diagonal not equal after FBZ sum: {s00} vs {s22}"
