@@ -8,15 +8,17 @@ import gc
 import glob
 import itertools as it
 import os
+import re
 import readline
+from pathlib import Path
 
 import h5py
 import numpy as np
 
 
-def index2component_general(num_bands: int, n: int, ind: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def index2component_general_4(num_bands: int, n: int, ind: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Returns the band and spin components corresponding to a compound index.
+    Returns the band and spin components corresponding to a compound index for four-legged objects.
     """
     bandspin = np.zeros(n, dtype=np.int_)
     spin = np.zeros(n, dtype=np.int_)
@@ -33,9 +35,23 @@ def index2component_general(num_bands: int, n: int, ind: int) -> tuple[np.ndarra
     return bandspin, band, spin
 
 
-def component2index_general(num_bands: int, bands: list, spins: list) -> int:
+def component2index_general_2(num_bands: int, bands: list, spins: list) -> int:
     """
-    Computes a compound index from band and spin indices.
+    Computes a compound index from band and spin indices for a two-legged object.
+    """
+    assert num_bands > 0, "Number of bands has to be set to non-zero positive integers."
+
+    n_spins = 2
+    dims_bs = 2 * (num_bands * n_spins,)
+    dims_1 = (num_bands, n_spins)
+
+    bandspin = np.ravel_multi_index((bands, spins), dims_1)
+    return np.ravel_multi_index(bandspin, dims_bs) + 1
+
+
+def component2index_general_4(num_bands: int, bands: list, spins: list) -> int:
+    """
+    Computes a compound index from band and spin indices for a four-legged object.
     """
     assert num_bands > 0, "Number of bands has to be set to non-zero positive integers."
 
@@ -47,9 +63,9 @@ def component2index_general(num_bands: int, bands: list, spins: list) -> int:
     return np.ravel_multi_index(bandspin, dims_bs) + 1
 
 
-def index2component_band(num_bands: int, n: int, ind: int) -> list:
+def index2component_band_4(num_bands: int, n: int, ind: int) -> list:
     """
-    Computes only orbital indices from a compound index.
+    Computes only orbital indices from a compound index for four-legged objects.
     """
     b = []
     ind_tmp = ind - 1
@@ -59,9 +75,9 @@ def index2component_band(num_bands: int, n: int, ind: int) -> list:
     return b
 
 
-def component2index_band(num_bands: int, n: int, b: list) -> int:
+def component2index_band_4(num_bands: int, n: int, b: list) -> int:
     """
-    Computes a compound index from orbital indices only.
+    Computes a compound index from only orbital indices for four-legged objects.
     """
     ind = 1
     for i in range(n):
@@ -69,20 +85,79 @@ def component2index_band(num_bands: int, n: int, b: list) -> int:
     return ind
 
 
-def get_worm_components(num_bands: int) -> list[int]:
+def _get_worm_components_2(num_bands: int, orbs: list[list[int]]) -> list[int]:
     """
-    Returns the list of worm components for a given number of bands, where only relevant spin combinations for the
-    density and magnetic channels in the case of SU(2) symmetry are picked. If one wants to speed up the w2dynamics
-    simulation, one can furthermore restrict the worm components to only allow spins = [0, 0, 0, 0], [0, 0, 1, 1] at
-    the cost of more stochastic noise.
+    Returns the worm components for two-legged objects.
     """
-    orbs = [list(orb) for orb in it.product(range(num_bands), repeat=4)]
+    spins = [0, 0], [1, 1]
+    component_indices = []
+    for o in orbs:
+        for s in spins:
+            component_indices.append(int(component2index_general_2(num_bands, o, s)))
+    return sorted(component_indices)
+
+
+def get_worm_components_2(num_bands: int) -> list[int]:
+    """
+    Returns the list of worm components for a given number of bands for two-legged objects,
+    where only relevant spin combinations for the
+    density and magnetic channels in the case of SU(2) symmetry are picked.
+    """
+    orbs = [list(orb) for orb in it.product(range(num_bands), repeat=2)]
+    return _get_worm_components_2(num_bands, orbs)
+
+
+def get_worm_components_partial_2(num_bands: int) -> list[int]:
+    """
+    Returns the list of worm components for a given number of bands for two-legged objects,
+    where only relevant spin combinations for the
+    density and magnetic channels in the case of SU(2) symmetry are picked.
+    It only lists orbital-diagonal components.
+    """
+    orbs = [[orb, orb] for orb in range(num_bands)]
+    return _get_worm_components_2(num_bands, orbs)
+
+
+def _get_worm_components_4(num_bands: int, orbs: list[list[int]]) -> list[int]:
+    """
+    Returns the worm components for 4-legged objects.
+    """
     spins = [0, 0, 0, 0], [1, 1, 1, 1], [0, 0, 1, 1], [1, 1, 0, 0], [1, 0, 0, 1], [0, 1, 1, 0]
     component_indices = []
     for o in orbs:
         for s in spins:
-            component_indices.append(int(component2index_general(num_bands, o, s)))
+            component_indices.append(int(component2index_general_4(num_bands, o, s)))
     return sorted(component_indices)
+
+
+def get_worm_components_4(num_bands: int) -> list[int]:
+    """
+    Returns the list of worm components for a given number of bands for four-legged objecst,
+    where only relevant spin combinations for the
+    density and magnetic channels in the case of SU(2) symmetry are picked.
+    """
+    orbs = [list(orb) for orb in it.product(range(num_bands), repeat=4)]
+    return _get_worm_components_4(num_bands, orbs)
+
+
+def get_worm_components_partial_4(num_bands: int) -> list[int]:
+    """
+    Returns the list of worm components for a given number of bands for four-legged objects,
+    where only relevant spin combinations for the
+    density and magnetic channels in the case of SU(2) symmetry are picked.
+    It only lists worm components where the orbitals are not of type ijjj, jijj, jjij or jjji.
+    """
+    orbs = [
+        list(orb)
+        for orb in it.product(range(num_bands), repeat=4)
+        if not (
+            orb[1] == orb[2] == orb[3] != orb[0]  # ijjj
+            or orb[0] == orb[2] == orb[3] != orb[1]  # jijj
+            or orb[0] == orb[1] == orb[3] != orb[2]  # jjij
+            or orb[0] == orb[1] == orb[2] != orb[3]  # jjji
+        )
+    ]
+    return _get_worm_components_4(num_bands, orbs)
 
 
 def extract_g2_general(group_string: str, indices: list, file: h5py.File, niw: int, niv: int) -> tuple:
@@ -102,7 +177,7 @@ def extract_g2_general(group_string: str, indices: list, file: h5py.File, niw: i
     elements = elements.transpose(0, 1, 3, 2)
 
     # construct G2dens and G2magn the output file
-    bands, spins = zip(*(index2component_general(n_bands, 4, int(i))[1:3] for i in indices))
+    bands, spins = zip(*(index2component_general_4(n_bands, 4, int(i))[1:3] for i in indices))
 
     # since we are SU(2) symmetric, we only have to pick out the elements where the spin is either
     # [0,0,0,0] or [1,1,1,1] for uu component, [0,0,1,1] or [1,1,0,0] for ud component and [0,1,1,0] or [1,0,0,1] for ud_bar component
@@ -143,16 +218,16 @@ def extract_g2_general(group_string: str, indices: list, file: h5py.File, niw: i
     return g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud
 
 
-def save_to_file(g2_list: list[np.ndarray], names: list[str], niw: int, nb: int):
+def save_to_file(g2_list: list[np.ndarray], names: list[str], niw: int, nb: int, ineq: int):
     """
     Saves the given g2 to the output file.
     """
     assert len(g2_list) == len(names)
     for wn in range(2 * niw + 1):
         for i, j, k, l in it.product(range(nb), repeat=4):
-            idx = component2index_band(nb, 4, [i, j, k, l])
+            idx = component2index_band_4(nb, 4, [i, j, k, l])
             for g2, name in zip(g2_list, names):
-                output_file[f"ineq-001/{name}/{wn:05}/{idx:05}/value"] = g2[i, j, k, l, wn].transpose()
+                output_file[f"ineq-{ineq:03}/{name}/{wn:05}/{idx:05}/value"] = g2[i, j, k, l, wn].transpose()
 
 
 def get_niw_niv(vertex_file, g4iw_groupstring, indices):
@@ -179,8 +254,6 @@ if __name__ == "__main__":
     default_filename = "Vertex.hdf5"
     default_output_filename = "g4iw_sym.hdf5"
 
-    g4iw_groupstring = "worm-last/ineq-001/g4iw-worm"
-
     readline.parse_and_bind("tab: complete")
     readline.set_completer_delims(" \t\n;")
     readline.set_completer(complete)
@@ -191,42 +264,68 @@ if __name__ == "__main__":
     input_filename = input_filename.strip() if input_filename else default_filename
     output_filename = output_filename.strip() if output_filename else default_output_filename
 
+    input_filename = str(Path(input_filename).with_suffix(".hdf5"))
+    output_filename = str(Path(output_filename).with_suffix(".hdf5"))
+
     vertex_file = h5py.File(input_filename, "r")
     output_file = h5py.File(output_filename, "w")
 
+    group = vertex_file["worm-last"]
+
+    ineq_numbers = []
+    for key in group.keys():
+        match = re.match(r"ineq-(\d+)", key)
+        if match:
+            ineq_numbers.append(int(match.group(1)))
+
+    ineq_numbers.sort()
+
     n_bands = int(vertex_file[".config"].attrs[f"atoms.1.nd"]) + int(vertex_file[".config"].attrs[f"atoms.1.np"])
 
-    indices = None
-    try:
-        indices = list(vertex_file[g4iw_groupstring].keys())
-    except KeyError:
-        print("WARNING: No g4iw-worm group found in the input file. Aborting.")
-        exit()
+    for ineq in ineq_numbers:
+        print("-----------------------------------------")
+        print("Processing inequivalent atom number:", ineq)
+        print("-----------------------------------------")
+        g4iw_groupstring = f"worm-last/ineq-{ineq:03}/g4iw-worm"
 
-    niw, niv = get_niw_niv(vertex_file, g4iw_groupstring, indices)
+        indices = None
+        try:
+            indices = list(vertex_file[g4iw_groupstring].keys())
+        except KeyError:
+            if ineq == max(ineq_numbers):
+                print(f"WARNING: No g4iw-worm group found for atom {ineq} in the input file. Aborting.")
+                exit()
+            else:
+                print(
+                    f"WARNING: No g4iw-worm group found for atom {ineq} in the input file. Continuing with next atom."
+                )
+                continue
 
-    print("Number of bands:", n_bands)
-    print("Number of fermionic Matsubara frequencies:", niv)
-    print("Number of bosonic Matsubara frequencies:", niw)
+        niw, niv = get_niw_niv(vertex_file, g4iw_groupstring, indices)
 
-    print("Extracting G2 ...")
-    g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud = extract_g2_general(
-        g4iw_groupstring, indices, vertex_file, niw, niv
-    )
-    print("G2 extracted. Calculating G2_dens and G2_magn ...")
-    g2_dens = 0.5 * (g2_uuuu + g2_dddd + g2_uudd + g2_dduu)
-    g2_magn = 0.5 * (g2_uddu + g2_duud)
+        print("Number of bands:", n_bands)
+        print("Number of fermionic Matsubara frequencies:", niv)
+        print("Number of bosonic Matsubara frequencies:", niw)
 
-    del g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud
-    gc.collect()
-    print("G2_dens and G2_magn calculated. Writing to file ...")
+        print(f"Extracting G2 for atom {ineq} ...")
+        g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud = extract_g2_general(
+            g4iw_groupstring, indices, vertex_file, niw, niv
+        )
+        print(f"G2 extracted. Calculating G2_dens and G2_magn for atom {ineq} ...")
+        g2_dens = 0.5 * (g2_uuuu + g2_dddd + g2_uudd + g2_dduu)
+        g2_magn = 0.5 * (g2_uddu + g2_duud)
 
-    save_to_file([g2_dens, g2_magn], ["dens", "magn"], niw, n_bands)
-    del g2_dens, g2_magn
-    gc.collect()
-    print("G2_dens and G2_magn successfully written to file.")
+        del g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud
+        gc.collect()
+        print(f"G2_dens and G2_magn for atom {ineq} calculated. Writing to file ...")
+
+        save_to_file([g2_dens, g2_magn], ["dens", "magn"], niw, n_bands, ineq)
+        del g2_dens, g2_magn
+        gc.collect()
+        print(f"G2_dens and G2_magn for atom {ineq} successfully written to file.")
 
     output_file.close()
     vertex_file.close()
+    print(f"{len(ineq_numbers)} inequivalent atom(s) written to {output_filename}.")
     print("Done!")
     exit()

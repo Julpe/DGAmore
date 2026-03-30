@@ -496,9 +496,7 @@ def read_last_n_sigmas_from_files(n: int, output_path: str = "./", previous_sc_p
     last_iterations = sorted(
         [(int(match.group(1)), f) for f in files if (match := re.search(r"sigma_dga_iteration_(\d+)\.npy$", f))],
         key=lambda x: x[0],
-        reverse=True,
-    )
-    last_iterations = last_iterations[:n] if len(last_iterations) >= n else last_iterations
+    )[-n:]
     return [np.load(file) for _, file in last_iterations]
 
 
@@ -536,7 +534,7 @@ def calculate_self_energy_q(
     sigma_old, starting_iter = get_starting_sigma(config.self_consistency.previous_sc_path, sigma_dmft)
     if starting_iter > 0:
         logger.info(
-            f"Using previous calculation and starting the self-consistency loop at iteration {starting_iter+1}."
+            f"Using previous calculation and starting the self-consistency loop at iteration {starting_iter + 1}."
         )
 
     sigma_old = sigma_old.cut_niv(config.box.niw_core + config.box.niv_full + 10)
@@ -637,7 +635,7 @@ def calculate_self_energy_q(
             config.sys.mu = update_mu(
                 old_mu, config.sys.n, giwk_full.ek, sigma_new.mat, config.sys.beta, sigma_new.fit_smom()[0]
             )
-            # linear mixing of mu to ensure more stable mu convergence
+
             config.sys.mu = (
                 config.self_consistency.mixing * config.sys.mu + (1 - config.self_consistency.mixing) * old_mu
             )
@@ -771,8 +769,95 @@ def apply_mixing_strategy(
         sigma_new.mat[..., niv - niv_core : niv + niv_core] = get_proposal(-1).reshape(shape) + update.reshape(shape)
 
         logger.info(
-            f"Pulay mixing applied with {n_hist} previous iterations and a mixing parameter of {config.self_consistency.mixing}."
+            f"Pulay mixing applied with {n_hist} previous iterations and "
+            f"a mixing parameter of {config.self_consistency.mixing}."
         )
+
+        return sigma_new
+    if (
+        config.self_consistency.mixing_strategy == "anderson"
+        and current_iter > n_hist
+        and config.self_consistency.save_iter
+        and config.output.save_quantities
+    ):
+        last_sigmas = read_last_n_sigmas_from_files(
+            n_hist, config.output.output_path, config.self_consistency.previous_sc_path
+        )
+
+        niv = sigma_new.current_shape[-1] // 2
+        niv_core = config.box.niv_core
+        sl = slice(niv - niv_core, niv + niv_core)
+
+        sigma_dmft_stacked = np.tile(sigma_dmft.mat, (config.lattice.k_grid.nk_tot, 1, 1, 1))
+
+        last_proposals = [sigma_dmft_stacked] + last_sigmas  # [dmft, s1, ..., s_{n-1}]
+        last_results = last_sigmas + [sigma_new.mat]  # [s1,  s2, ..., s_new]
+        last_proposals = [s[..., sl] for s in last_proposals]
+        last_results = [s[..., sl] for s in last_results]
+
+        shape = last_results[-1].shape
+        n_total = int(np.prod(shape))
+        flat = lambda x: x.reshape(-1)
+
+        # Current residual f_n = F(x_n) - x_n
+        f_curr = flat(last_results[-1]) - flat(last_proposals[-1])
+        f_vec = np.concatenate([f_curr.real, f_curr.imag])
+        norm_f = np.linalg.norm(f_vec)
+
+        # Build dX and dF matrices (n_hist columns)
+        # dX[:,i] = x_{n-i} - x_{n-i-1}  (proposal differences)
+        # dF[:,i] = f_{n-i} - f_{n-i-1}  (residual differences)
+        dx_cols = []
+        df_cols = []
+        for i in range(n_hist):
+            dx = flat(last_proposals[-1 - i]) - flat(last_proposals[-2 - i])
+            dx_cols.append(np.concatenate([dx.real, dx.imag]))
+
+            df_i = flat(last_results[-1 - i]) - flat(last_proposals[-1 - i])
+            df_im1 = flat(last_results[-2 - i]) - flat(last_proposals[-2 - i])
+            df = df_i - df_im1
+            df_cols.append(np.concatenate([df.real, df.imag]))
+
+        dx_matrix = np.column_stack(dx_cols)  # (2*n_total, n_hist)
+        df_matrix = np.column_stack(df_cols)  # (2*n_total, n_hist)
+
+        # Anderson: solve min ||f_curr - dF @ c||
+        try:
+            u, s, vh = np.linalg.svd(df_matrix, full_matrices=False)
+
+            s_max = s[0] if len(s) > 0 else 1.0
+            cutoff = 1e-5 * s_max
+            mask = s > cutoff
+
+            if not np.any(mask):
+                raise np.linalg.LinAlgError("All singular values below threshold.")
+
+            s_reg = s[mask] / (s[mask] ** 2 + cutoff**2)
+            coeffs = vh[mask].T @ (s_reg * (u[:, mask].T @ f_vec))
+
+        except np.linalg.LinAlgError:
+            logger.warning("Anderson SVD failed — falling back to linear mixing.")
+            return alpha * sigma_new + (1 - alpha) * sigma_old
+
+        # Undamped Anderson proposal: x_n + f_n - (dX + dF) @ c
+        x_n = flat(last_proposals[-1])
+        x_anderson = np.concatenate([x_n.real, x_n.imag]) + f_vec - (dx_matrix + df_matrix) @ coeffs
+        x_anderson = x_anderson[:n_total] + 1j * x_anderson[n_total:]
+
+        # Damp between old proposal and Anderson proposal
+        x_n_complex = x_n
+        candidate = (1 - alpha) * x_n_complex + alpha * x_anderson.reshape(-1)
+
+        # Safety clamp
+        update = candidate - x_n_complex
+        norm_u = np.linalg.norm(update)
+        if norm_f > 0 and norm_u > 3.0 * norm_f:
+            candidate = x_n_complex + update * (3.0 * norm_f / norm_u)
+            logger.warning(f"Anderson step clamped (norm_u={norm_u:.3e}, norm_f={norm_f:.3e}).")
+
+        sigma_new.mat[..., sl] = candidate.reshape(shape)
+
+        logger.info(f"Anderson acceleration applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}).")
 
         return sigma_new
 

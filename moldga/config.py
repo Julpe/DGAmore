@@ -88,6 +88,7 @@ class SelfConsistencyConfig:
         self.previous_sc_path: str = "./"
         self.use_lambda_correction: bool = False
         self.restrict_chi_phys: bool = False
+        self.anderson_prev_res: float | None = None
 
 
 class EliashbergConfig:
@@ -148,6 +149,8 @@ class SystemConfig:
         self.mu: float = 0.0
         self.n: float = 0.0
         self.n_bands: int = 1
+        self.nd_bands: int = 1
+        self.np_bands: int = 0
         self.occ: np.ndarray = np.ndarray(0)
         self.occ_k: np.ndarray = np.ndarray(0)
         self.occ_dmft: np.ndarray = np.ndarray(0)

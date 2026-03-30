@@ -107,26 +107,81 @@ class Hamiltonian:
 
         return self._add_interaction_term(interaction_elements)
 
-    def kanamori_interaction(self, n_bands: int, udd: float, jdd: float, vdd: float = None) -> "Hamiltonian":
+    def kanamori_interaction_d(self, n_bands: int, udd: float, jdd: float, vdd: float = None) -> "Hamiltonian":
         """
-        Adds the Kanamori interaction terms to the Hamiltonian. The interaction terms are defined by the Hubbard 'udd' (U),
-        the exchange interaction 'jdd' (J) and the pair hopping 'vdd' (V or sometimes U'). 'vdd' is an optional parameter, if left empty,
-        it is set to U-2J.
+        Adds the Kanamori interaction terms ONLY for d orbitals to the Hamiltonian.
+        The interaction terms are defined by the Hubbard 'udd' (U),
+        the exchange interaction 'jdd' (J) and the pair hopping 'vdd' (V or sometimes U').
+        'vdd' is an optional parameter, if left empty, it is set to V=U-2J.
         """
+        return self.kanamori_interaction_dp(nd_bands=n_bands, udd=udd, jdd=jdd, vdd=vdd)
+
+    def kanamori_interaction_p(self, n_bands: int, upp: float, jpp: float, vpp: float = None) -> "Hamiltonian":
+        """
+        Adds the Kanamori interaction terms ONLY for p orbitals to the Hamiltonian.
+        The interaction terms are defined by the Hubbard 'udd' (U),
+        the exchange interaction 'jpp' (J) and the pair hopping 'vpp' (V or sometimes U').
+        'vpp' is an optional parameter, if left empty, it is set to V=U-2J.
+        """
+        return self.kanamori_interaction_dp(np_bands=n_bands, upp=upp, jpp=jpp, vpp=vpp)
+
+    def kanamori_interaction_dp(
+        self,
+        nd_bands: int = 0,
+        np_bands: int = 0,
+        udd: float = 0.0,
+        upp: float = 0.0,
+        udp: float = 0.0,
+        jdd: float = 0.0,
+        jpp: float = 0.0,
+        jdp: float = 0.0,
+        vdd: float = None,
+        vpp: float = None,
+    ) -> "Hamiltonian":
+        """
+        Adds the full Kanamori interaction terms for d and p orbitals to the Hamiltonian.
+        The interaction terms are defined by the local interaction Hubbard U,
+        the exchange interaction J and the pair hopping V or sometimes U'.
+        vdd (vpp) (vdp) are optional parameters, if left empty, they are set to V=U-2J.
+        """
+
+        # Default V=U-2J
         if vdd is None:
             vdd = udd - 2 * jdd
+        if vpp is None:
+            vpp = upp - 2 * jpp
+
+        def orb_type(i: int) -> str:
+            return "d" if i < nd_bands else "p"  # d bands come first
+
+        def get_params(o1: int, o2: int) -> tuple[float, float, float]:
+            # Return correct (U, J, V) depending on orbital types of o1, o2
+            t1, t2 = orb_type(o1), orb_type(o2)
+
+            if t1 == "d" and t2 == "d":
+                return udd, jdd, vdd
+            elif t1 == "p" and t2 == "p":
+                return upp, jpp, vpp
+            else:
+                return 0, jdp, udp  # udp is used as "Vdp", since there is no Udp possible that fits U_llll
 
         r_loc = [0, 0, 0]
+        n_tot = nd_bands + np_bands
 
         interaction_elements = []
-        for a, b, c, d in it.product(range(n_bands), repeat=4):
+
+        for a, b, c, d in it.product(range(n_tot), repeat=4):
             bands = [a + 1, b + 1, c + 1, d + 1]
+
+            # choose parameters based on (a,b) pair (equivalently (c,d))
+            u, j, v = get_params(a, b)
+
             if a == b == c == d:  # U_{llll}
-                interaction_elements.append(InteractionElement(r_loc, bands, udd))
-            elif (a == d and b == c) or (a == b and c == d):  # U_{lmml} or U_{llmm}
-                interaction_elements.append(InteractionElement(r_loc, bands, jdd))
+                interaction_elements.append(InteractionElement(r_loc, bands, u))
+            elif (a == d and b == c) or (a == b and c == d):  # U_{lmml}, U_{llmm}
+                interaction_elements.append(InteractionElement(r_loc, bands, j))
             elif a == c and b == d:  # U_{lmlm}
-                interaction_elements.append(InteractionElement(r_loc, bands, vdd))
+                interaction_elements.append(InteractionElement(r_loc, bands, v))
 
         return self._add_interaction_term(interaction_elements)
 

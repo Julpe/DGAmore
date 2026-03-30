@@ -34,23 +34,23 @@ class W2dynFile:
         """
         self._file = h5py.File(self._fname, "r")
 
-    def atom_group(self, dmft_iter="dmft-last", atom=1):
+    def ineq_group(self, dmft_iter="dmft-last", ineq=1):
         """
-        Returns the group string for a given DMFT iteration and atom.
+        Returns the group string for a given DMFT iteration and ineq.
         """
-        return dmft_iter + f"/ineq-{atom:03}"
+        return dmft_iter + f"/ineq-{ineq:03}"
 
-    def get_nd(self, atom: int = 1) -> int:
+    def get_nd(self, ineq: int = 1) -> int:
         """
         Returns the number of d orbitals of the DMFT calculation.
         """
-        return self._from_atom_config("nd", atom=atom)
+        return self._from_ineq_config("nd", ineq=ineq)
 
-    def get_np(self, atom: int = 1) -> int:
+    def get_np(self, ineq: int = 1) -> int:
         """
         Returns the number of p orbitals of the DMFT calculation.
         """
-        return self._from_atom_config("np", atom=atom)
+        return self._from_ineq_config("np", ineq=ineq)
 
     def get_beta(self) -> float:
         r"""
@@ -70,107 +70,107 @@ class W2dynFile:
         """
         return self._file[".config"].attrs["general.totdens"]
 
-    def get_jdd(self, atom: int = 1) -> float:
+    def get_jdd(self, ineq: int = 1) -> float:
         """
         Extracts the Hund's coupling for d orbitals.
         """
-        return self._from_atom_config("jdd", atom=atom)
+        return self._from_ineq_config("jdd", ineq=ineq)
 
-    def get_jdp(self, atom: int = 1) -> float:
+    def get_jdp(self, ineq: int = 1) -> float:
         """
         Extracts the Hund's coupling between d and p orbitals.
         """
-        return self._from_atom_config("jdp", atom=atom)
+        return self._from_ineq_config("jdp", ineq=ineq)
 
-    def get_jpp(self, atom: int = 1) -> float:
+    def get_jpp(self, ineq: int = 1) -> float:
         """
         Extracts the Hund's coupling for p orbitals.
         """
-        return self._from_atom_config("jpp", atom=atom)
+        return self._from_ineq_config("jpp", ineq=ineq)
 
-    def get_jppod(self, atom: int = 1) -> float:
+    def get_jppod(self, ineq: int = 1) -> float:
         """
         Extracts the offdiagonal terms for jpp.
         """
-        return self._from_atom_config("jppod", atom=atom)
+        return self._from_ineq_config("jppod", ineq=ineq)
 
-    def get_udd(self, atom: int = 1) -> float:
+    def get_udd(self, ineq: int = 1) -> float:
         """
         Extracts the Hubbard U for d orbitals.
         """
-        return self._from_atom_config("udd", atom=atom)
+        return self._from_ineq_config("udd", ineq=ineq)
 
-    def get_udp(self, atom: int = 1) -> float:
+    def get_udp(self, ineq: int = 1) -> float:
         """
         Extracts the Hubbard U between d and p orbitals.
         """
-        return self._from_atom_config("udp", atom=atom)
+        return self._from_ineq_config("udp", ineq=ineq)
 
-    def get_upp(self, atom: int = 1) -> float:
+    def get_upp(self, ineq: int = 1) -> float:
         """
         Extracts the Hubbard U for p orbitals.
         """
-        return self._from_atom_config("upp", atom=atom)
+        return self._from_ineq_config("upp", ineq=ineq)
 
-    def get_uppod(self, atom: int = 1):
+    def get_uppod(self, ineq: int = 1):
         """
         Extracts the offdiagonal terms for upp.
         """
-        return self._from_atom_config("uppod", atom=atom)
+        return self._from_ineq_config("uppod", ineq=ineq)
 
-    def get_vdd(self, atom: int = 1) -> float:
+    def get_vdd(self, ineq: int = 1) -> float:
         """
         Extracts the intersite interaction between d orbitals.
         """
-        return self._from_atom_config("vdd", atom=atom)
+        return self._from_ineq_config("vdd", ineq=ineq)
 
-    def get_vpp(self, atom: int = 1) -> float:
+    def get_vpp(self, ineq: int = 1) -> float:
         """
         Extracts the intersite interaction between p orbitals.
         """
-        return self._from_atom_config("vpp", atom=atom)
+        return self._from_ineq_config("vpp", ineq=ineq)
 
-    def get_siw(self, dmft_iter: str = "dmft-last", atom: int = 1) -> list:
+    def get_siw(self, dmft_iter: str = "dmft-last", ineq: int = 1) -> list:
         """
         Extracts the DMFT self-energy in Matsubara frequency space as [band, spin, iv].
         """
-        return self._file[self.atom_group(dmft_iter=dmft_iter, atom=atom) + "/siw/value"][()]
+        return self._file[self.ineq_group(dmft_iter=dmft_iter, ineq=ineq) + "/siw/value"][()]
 
-    def get_giw(self, dmft_iter: str = "dmft-last", atom: int = 1) -> list:
+    def get_giw(self, dmft_iter: str = "dmft-last", ineq: int = 1) -> list:
         """
         Extracts the DMFT Green's function in Matsubara frequency space as [band, spin, iv].
         """
-        return self._file[self.atom_group(dmft_iter=dmft_iter, atom=atom) + "/giw/value"][()]
+        return self._file[self.ineq_group(dmft_iter=dmft_iter, ineq=ineq) + "/giw/value"][()]
 
-    def get_occ(self, dmft_iter: str = "dmft-last", atom: int = 1) -> list:
+    def get_occ(self, dmft_iter: str = "dmft-last", ineq: int = 1) -> list:
         """
         Extracts the occupation matrix as [band1, spin1, band2, spin2].
         """
-        return self._file[self.atom_group(dmft_iter=dmft_iter, atom=atom) + "/occ/value"][()]
+        return self._file[self.ineq_group(dmft_iter=dmft_iter, ineq=ineq) + "/occ/value"][()]
 
-    def get_rho1(self, dmft_iter: str = "dmft-last", atom: int = 1) -> list:
+    def get_rho1(self, dmft_iter: str = "dmft-last", ineq: int = 1) -> list:
         """
         Extracts the 1-particle density matrix as [band1, spin1, band2, spin2].
         """
-        return self._file[self.atom_group(dmft_iter=dmft_iter, atom=atom) + "/rho1/value"][()]
+        return self._file[self.ineq_group(dmft_iter=dmft_iter, ineq=ineq) + "/rho1/value"][()]
 
-    def get_rho2(self, dmft_iter: str = "dmft-last", atom: int = 1) -> list:
+    def get_rho2(self, dmft_iter: str = "dmft-last", ineq: int = 1) -> list:
         """
         Extracts the 2-particle density matrix as [band1, spin1, band2, spin2, band3, spin3, band4, spin4].
         """
-        return self._file[self.atom_group(dmft_iter=dmft_iter, atom=atom) + "/rho2/value"][()]
+        return self._file[self.ineq_group(dmft_iter=dmft_iter, ineq=ineq) + "/rho2/value"][()]
 
-    def _from_atom_config(self, key: str, atom: int = 1):
+    def _from_ineq_config(self, key: str, ineq: int = 1):
         """
-        Extracts a value from the .config group for a given atom.
+        Extracts a value from the .config group for a given ineq.
         """
-        return self._file[".config"].attrs[f"atoms.{atom:1}.{key}"]
+        return self._file[".config"].attrs[f"atoms.{ineq:1}.{key}"]
 
-    def get_dc(self, dmft_iter: str = "dmft-last", atom: int = 1) -> list:
+    def get_dc(self, dmft_iter: str = "dmft-last", ineq: int = 1) -> list:
         """
         Extracts the DMFT double-counting correction as [band, spin].
         """
-        return self._file[self.atom_group(dmft_iter=dmft_iter, atom=atom) + "/dc/value"][()]
+        return self._file[self.ineq_group(dmft_iter=dmft_iter, ineq=ineq) + "/dc/value"][()]
 
 
 class W2dynG4iwFile:
@@ -210,11 +210,11 @@ class W2dynG4iwFile:
             self._file[f"{channel_group_string}/00000/{first_index:05}/value"][()]
         )  # extract niv from the size of the array
 
-        g2 = np.zeros((n_bands,) * 4 + (niw_full,) + 2 * (niv_full,), dtype=np.complex64)
+        g2 = np.zeros((n_bands,) * 4 + (niw_full,) + 2 * (niv_full,), dtype=np.complex128)
         for wn in range(niw_full):
             wn_group_string = f"{channel_group_string}/{wn:05}"
             for ind in self._file[wn_group_string].keys():
-                bands = sym.index2component_band(n_bands, 4, int(ind))
+                bands = sym.index2component_band_4(n_bands, 4, int(ind))
                 val = self._file[f"{wn_group_string}/{ind}/value"][()].T
                 g2[bands[0], bands[1], bands[2], bands[3], wn, ...] = val
 

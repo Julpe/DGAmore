@@ -76,12 +76,12 @@ def test_single_band_interaction_sets_correct_u():
 
 
 def test_kanamori_interaction_defaults_1_band():
-    h = Hamiltonian().kanamori_interaction(n_bands=1, udd=5.0, jdd=1.0)
+    h = Hamiltonian().kanamori_interaction_d(n_bands=1, udd=5.0, jdd=1.0)
     assert np.isclose(h._ur_local[0, 0, 0, 0], 5.0)
 
 
 def test_kanamori_interaction_with_vdd_1_band():
-    h = Hamiltonian().kanamori_interaction(n_bands=1, udd=5.0, jdd=1.0, vdd=2.0)
+    h = Hamiltonian().kanamori_interaction_d(n_bands=1, udd=5.0, jdd=1.0, vdd=2.0)
     assert np.isclose(h._ur_local[0, 0, 0, 0], 5.0)
 
 
@@ -92,7 +92,7 @@ def test_kanamori_interaction_with_vdd_2_band():
         "vdd": np.random.rand(),
     }
 
-    h = Hamiltonian().kanamori_interaction(n_bands=2, **params)
+    h = Hamiltonian().kanamori_interaction_d(n_bands=2, **params)
 
     assert np.isclose(h._ur_local[0, 0, 0, 0], params["udd"])
     assert np.isclose(h._ur_local[1, 1, 1, 1], params["udd"])
@@ -206,3 +206,120 @@ def test_read_write_hr_hk_files():
     wannier_hk_twoband, _ = Hamiltonian().read_hk_w2k(f"{folder}/wannier_twoband_24x24.hk")
     ek_ref = wannier_hk_twoband.get_ek(k_grid).reshape(ek.shape)
     assert np.allclose(ek, ek_ref)
+
+
+def test_kanamori_d_basic():
+    ham = Hamiltonian()
+    n = 3
+    u_val = 4.0
+    j = 1.0
+
+    ham.kanamori_interaction_d(n_bands=n, udd=u_val, jdd=j)
+    u = ham.get_local_u()
+
+    v = u_val - 2 * j
+
+    for a in range(n):
+        for b in range(n):
+            for c in range(n):
+                for d in range(n):
+                    if a == b == c == d:
+                        assert np.isclose(u[a, b, c, d], u_val)
+                    elif (a == d and b == c) or (a == b and c == d):
+                        assert np.isclose(u[a, b, c, d], j)
+                    elif a == c and b == d:
+                        assert np.isclose(u[a, b, c, d], v)
+                    else:
+                        assert np.isclose(u[a, b, c, d], 0.0)
+
+
+def test_kanamori_p_basic():
+    ham = Hamiltonian()
+    n = 2
+    u_val = 3.0
+    j = 0.5
+
+    ham.kanamori_interaction_p(n_bands=n, upp=u_val, jpp=j)
+    u = ham.get_local_u()
+
+    v = u_val - 2 * j
+
+    for a in range(n):
+        for b in range(n):
+            for c in range(n):
+                for d in range(n):
+                    if a == b == c == d:
+                        assert np.isclose(u[a, b, c, d], u_val)
+                    elif (a == d and b == c) or (a == b and c == d):
+                        assert np.isclose(u[a, b, c, d], j)
+                    elif a == c and b == d:
+                        assert np.isclose(u[a, b, c, d], v)
+                    else:
+                        assert np.isclose(u[a, b, c, d], 0.0)
+
+
+def test_kanamori_dp_block_structure():
+    ham = Hamiltonian()
+
+    nd, npb = 2, 2
+
+    udd, jdd = 8.0, 1.0
+    upp, jpp = 4.0, 0.5
+    udp, jdp = 2.0, 0.2
+
+    ham.kanamori_interaction_dp(nd_bands=nd, np_bands=npb, udd=udd, upp=upp, udp=udp, jdd=jdd, jpp=jpp, jdp=jdp)
+
+    u = ham.get_local_u().mat
+    vdd = udd - 2 * jdd
+    vpp = upp - 2 * jpp
+
+    def is_d(i):
+        return i < nd
+
+    for a in range(nd + npb):
+        for b in range(nd + npb):
+            for c in range(nd + npb):
+                for d in range(nd + npb):
+
+                    if is_d(a) and is_d(b):
+                        uu, jj, vv = udd, jdd, vdd
+                    elif (not is_d(a)) and (not is_d(b)):
+                        uu, jj, vv = upp, jpp, vpp
+                    else:
+                        uu, jj, vv = 0, jdp, udp
+
+                    if a == b == c == d:
+                        assert np.isclose(u[a, b, c, d], uu)
+                    elif (a == d and b == c) or (a == b and c == d):
+                        assert np.isclose(u[a, b, c, d], jj)
+                    elif a == c and b == d:
+                        assert np.isclose(u[a, b, c, d], vv)
+                    else:
+                        assert np.isclose(u[a, b, c, d], 0.0)
+
+
+def test_kanamori_dp_index_split():
+    ham = Hamiltonian()
+
+    nd, npb = 1, 1
+
+    ham.kanamori_interaction_dp(nd_bands=nd, np_bands=npb, udd=10.0, upp=5.0, udp=2.0, jdd=1.0, jpp=0.5, jdp=0.1)
+
+    u = ham.get_local_u()
+
+    assert np.isclose(u[0, 0, 0, 0], 10.0)
+    assert np.isclose(u[1, 1, 1, 1], 5.0)
+
+    assert np.isclose(u[0, 1, 0, 1], 2.0)
+    assert np.isclose(u[0, 1, 1, 0], 0.1)
+
+
+def test_kanamori_dp_no_unexpected_terms():
+    ham = Hamiltonian()
+
+    ham.kanamori_interaction_dp(nd_bands=2, np_bands=1, udd=6.0, upp=3.0, udp=1.0, jdd=1.0, jpp=0.5, jdp=0.2)
+
+    u = ham.get_local_u()
+
+    assert np.isclose(u[0, 1, 2, 0], 0.0)
+    assert np.isclose(u[2, 0, 1, 2], 0.0)
