@@ -180,79 +180,79 @@ class MpiDistributor:
         """
         Gathers the numpy array from all ranks in the correct q-list order to the root rank.
         """
-        tot_shape = (self.ntasks,) + rank_result.shape[1:]
-        tot_result = np.empty(tot_shape, rank_result.dtype)
-        other_dims = np.prod(rank_result.shape[1:])
-        rank_result = np.ascontiguousarray(rank_result, dtype=rank_result.dtype)
-        self.comm.Gatherv(rank_result, [tot_result, self.sizes * other_dims], root=root)
+        rank_result = np.ascontiguousarray(rank_result)
+        other_dims = int(np.prod(rank_result.shape[1:]))
+        tot_result = (
+            np.empty((self.ntasks,) + rank_result.shape[1:], dtype=rank_result.dtype)
+            if self.comm.rank == root
+            else None
+        )
+        self.comm.Gatherv(
+            rank_result, [tot_result, self.sizes * other_dims] if self.comm.rank == root else None, root=root
+        )
         return tot_result
 
-    def scatter(self, full_data: np.ndarray = None, root: int = 0):
-        MAX_MPI_BYTES = 2**31 - 1
-
-        def chunk_bounds(n_items: int, itemsize: int, items_per_element: int):
-            max_elems = max(1, MAX_MPI_BYTES // (itemsize * items_per_element))
-            for i in range(0, n_items, max_elems):
-                yield i, min(n_items, i + max_elems)
-
-        def send_in_chunks(arr: np.ndarray, dest: int, base_tag: int = 0):
-            arr = np.ascontiguousarray(arr)
-            itemsize = arr.dtype.itemsize
-            items_per_element = int(np.prod(arr.shape[1:])) if arr.ndim > 1 else 1
-            for idx, (i, j) in enumerate(chunk_bounds(arr.shape[0], itemsize, items_per_element)):
-                self.comm.Send(arr[i:j], dest=dest, tag=base_tag + idx)
-
-        def recv_in_chunks(shape, dtype, source: int, base_tag: int = 0):
-            out = np.empty(shape, dtype=dtype)
-            itemsize = np.dtype(dtype).itemsize
-            items_per_element = int(np.prod(shape[1:])) if len(shape) > 1 else 1
-            for idx, (i, j) in enumerate(chunk_bounds(shape[0], itemsize, items_per_element)):
-                tmp = np.empty((j - i,) + tuple(shape[1:]), dtype=dtype)
-                self.comm.Recv(tmp, source=source, tag=base_tag + idx)
-                out[i:j] = tmp
-            return out
-
-        if full_data is not None and not isinstance(full_data, np.ndarray):
-            raise TypeError("full_data must be a numpy array or None")
-
-        if full_data is not None:
-            data_len = full_data.shape[0]
+    def scatter(self, full_data: np.ndarray = None, root: int = 0) -> np.ndarray:
+        """
+        Scatters the data along the first axis.
+        """
+        if self.my_rank == root:
             rest_shape = full_data.shape[1:]
             data_type = full_data.dtype
         else:
-            data_len = None
+
             rest_shape = None
             data_type = None
 
-        data_type = self.comm.bcast(data_type, root)
-        rest_shape = self.comm.bcast(rest_shape, root)
+        rest_shape = self.comm.bcast(rest_shape, root=root)
+        data_type = self.comm.bcast(data_type, root=root)
 
-        rank_shape = (self._my_size,) + rest_shape if rest_shape else (self._my_size,)
+        rank_shape = (self._my_size,) + rest_shape
         rank_data = np.empty(rank_shape, dtype=data_type)
 
+        other_dims = int(np.prod(rest_shape)) if rest_shape else 1
+        itemsize = np.dtype(data_type).itemsize
+        MAX_MPI_BYTES = 2**31 - 1
+        max_rows = max(1, MAX_MPI_BYTES // (itemsize * other_dims))
+
         if self.my_rank == root:
-            if full_data is None:
-                return rank_data
+            full_data = np.ascontiguousarray(full_data, dtype=data_type)
 
-            full_data = np.asarray(full_data, dtype=data_type)
+        # track how many rows have been sent/received per rank
+        sent = np.zeros(self.mpi_size, dtype=int)
+        received = 0
 
-            if data_len == self.ntasks:
-                for r in range(self.mpi_size):
-                    n = self._sizes[r]
-                    if n == 0:
-                        continue
-                    sl = self._slices[r]
-                    if r == root:
-                        rank_data[...] = full_data[sl]
-                    else:
-                        send_in_chunks(full_data[sl], dest=r, base_tag=0)
-            elif data_len == self._my_size and self.mpi_size == 1:
-                rank_data[...] = np.ascontiguousarray(full_data)
-            else:
-                raise ValueError(f"Mismatch in scatter!")
-        else:
-            if self._my_size > 0:
-                rank_data = recv_in_chunks(rank_shape, data_type, source=root, base_tag=0)
+        while received < self._my_size:
+            # compute chunk sizes respecting _sizes and _slices per rank
+            chunk_sizes = None
+            if self.my_rank == root:
+                chunk_sizes = np.array([min(max_rows, self._sizes[r] - sent[r]) for r in range(self.mpi_size)])
+                chunk_sizes = np.maximum(chunk_sizes, 0)
+
+            chunk_sizes = self.comm.bcast(chunk_sizes, root=root)
+            my_chunk = chunk_sizes[self.my_rank]
+
+            if my_chunk == 0:
+                break
+
+            send_buf = None
+            if self.my_rank == root:
+                # use _slices to get the correct data for each rank
+                rows = [
+                    full_data[self._slices[r].start + sent[r] : self._slices[r].start + sent[r] + chunk_sizes[r]]
+                    for r in range(self.mpi_size)
+                ]
+                send_buf = np.ascontiguousarray(np.concatenate(rows, axis=0))
+
+            recv_buf = np.empty((my_chunk,) + rest_shape, dtype=data_type)
+            self.comm.Scatterv(
+                [send_buf, chunk_sizes * other_dims] if self.my_rank == root else None, recv_buf, root=root
+            )
+
+            rank_data[received : received + my_chunk] = recv_buf
+            received += my_chunk
+            if self.my_rank == root:
+                sent += chunk_sizes
 
         return rank_data
 
@@ -264,11 +264,10 @@ class MpiDistributor:
 
     def allreduce(self, rank_result=None) -> np.ndarray:
         """
-        Reduces the numpy array from all ranks by summing it up on the first axis.
+        Reduces the numpy array from all ranks by summing it up and returns the result on all ranks.
         """
-        tot_result = np.zeros(np.shape(rank_result), dtype=rank_result.dtype)
-        self.comm.Allreduce(rank_result, tot_result)
-        return tot_result
+        self.comm.Allreduce(MPI.IN_PLACE, rank_result)
+        return rank_result
 
     @staticmethod
     def create_distributor(ntasks: int, comm: MPI.Comm, name: str = "") -> "MpiDistributor":

@@ -8,6 +8,7 @@ import logging
 import os
 from unittest.mock import MagicMock
 
+import mpi4py.MPI as MPI
 import numpy as np
 import pytest
 
@@ -65,11 +66,22 @@ def create_comm_mock():
     comm_mock.size = 1
     comm_mock.rank = 0
     comm_mock.barrier.return_value = None
+
+    # lowercase bcast for arbitrary Python objects
     comm_mock.bcast.side_effect = lambda obj, root=0: obj
 
-    def allreduce_mock(sendbuf, recvbuf, op=None):
-        np.copyto(recvbuf, sendbuf)
-        return recvbuf
+    # uppercase Bcast for NumPy arrays (in-place)
+    def bcast_mock(buf, root=0):
+        pass  # already in place, nothing to do for single rank
+
+    comm_mock.Bcast.side_effect = bcast_mock
+
+    # in-place Allreduce
+    def allreduce_mock(sendbuf, recvbuf=None, op=None):
+        if sendbuf is MPI.IN_PLACE:
+            pass  # recvbuf is the array, already correct for single rank
+        else:
+            np.copyto(recvbuf, sendbuf)
 
     comm_mock.Allreduce.side_effect = allreduce_mock
 
@@ -81,9 +93,12 @@ def create_comm_mock():
     comm_mock.Gatherv.side_effect = gatherv_mock
 
     def scatterv_mock(sendlist, recvbuf, root=0):
+        if sendlist is None:
+            return recvbuf
         full_data = sendlist[0]
         np.copyto(recvbuf, full_data)
         return recvbuf
 
     comm_mock.Scatterv.side_effect = scatterv_mock
+
     return comm_mock
