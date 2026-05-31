@@ -15,6 +15,32 @@ import pytest
 import moldga.brillouin_zone as bz
 
 
+def pytest_addoption(parser):
+    """Register the --runslow flag so individual tests can be marked @pytest.mark.slow
+    and skipped by default. CI can opt in via `pytest --runslow`."""
+    parser.addoption(
+        "--runslow",
+        action="store_true",
+        default=False,
+        help="Run tests marked as slow (large-grid auto-symmetry discovery, etc.).",
+    )
+
+
+def pytest_configure(config):
+    """Register the 'slow' marker so pytest doesn't warn about an unknown marker."""
+    config.addinivalue_line("markers", "slow: mark test as slow (deselect with '-m \"not slow\"')")
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip @pytest.mark.slow tests unless --runslow was given."""
+    if config.getoption("--runslow"):
+        return
+    skip_slow = pytest.mark.skip(reason="need --runslow option to run")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip_slow)
+
+
 @pytest.fixture(autouse=True)
 def mock_does_not_delete_files(monkeypatch):
     # Make os.remove do nothing
@@ -34,6 +60,7 @@ def mock_numpy_save(monkeypatch):
         pass
 
     monkeypatch.setattr(np, "save", fake_save)
+    monkeypatch.setattr(np, "savetxt", fake_save)
     yield
 
 
@@ -60,6 +87,9 @@ def create_default_config(config, folder: str):
     config.lattice.er_input = f"{folder}/wannier.hk"
     config.dmft.input_path = folder
     config.dmft.do_sym_v_vp = True
+    config.dmft.n_ineq = 1
+    config.dmft.ineq_ordering = [1]
+    config.dmft.n_bands_per_ineq = []
     config.eliashberg.perform_eliashberg = False
     config.self_consistency.mixing = 1
     config.self_consistency.max_iter = 1
@@ -67,44 +97,68 @@ def create_default_config(config, folder: str):
 
 def create_comm_mock():
     comm_mock = MagicMock()
+
+    # Fundamental MPI properties
     comm_mock.Get_size.return_value = 1
     comm_mock.Get_rank.return_value = 0
     comm_mock.size = 1
     comm_mock.rank = 0
-    comm_mock.barrier.return_value = None
+    comm_mock.IN_PLACE = MPI.IN_PLACE
 
-    # lowercase bcast for arbitrary Python objects
-    comm_mock.bcast.side_effect = lambda obj, root=0: obj
+    # Internal state to track pending non-blocking operations
+    # {tag: buffer_pointer}
+    pending_irecvs = {}
+    pending_isends = {}
 
-    # uppercase Bcast for NumPy arrays (in-place)
-    def bcast_mock(buf, root=0):
-        pass  # already in place, nothing to do for single rank
-
-    comm_mock.Bcast.side_effect = bcast_mock
-
-    # in-place Allreduce
-    def allreduce_mock(sendbuf, recvbuf=None, op=None):
-        if sendbuf is MPI.IN_PLACE:
-            pass  # recvbuf is the array, already correct for single rank
+    def mock_Irecv(buf, source, tag=0):
+        if tag in pending_isends:
+            np.copyto(buf, pending_isends[tag])
+            del pending_isends[tag]
         else:
+            pending_irecvs[tag] = buf
+        return MPI.REQUEST_NULL
+
+    def mock_Isend(buf, dest, tag=0):
+        if tag in pending_irecvs:
+            np.copyto(pending_irecvs[tag], buf)
+            del pending_irecvs[tag]
+        else:
+            pending_isends[tag] = np.copy(buf)
+        return MPI.REQUEST_NULL
+
+    comm_mock.Irecv.side_effect = mock_Irecv
+    comm_mock.Isend.side_effect = mock_Isend
+
+    # --- Lowercase (Object) Loopback ---
+    # Used for bcast/scatter/send_to_rank
+    comm_mock.bcast.side_effect = lambda obj, root=0: obj
+    comm_mock.allgather.side_effect = lambda obj: [obj]
+
+    # Point-to-point object exchange
+    obj_bus = {}
+
+    def mock_send(obj, dest, tag=0):
+        obj_bus[tag] = obj
+
+    def mock_recv(source=0, tag=0):
+        return obj_bus.get(tag, None)
+
+    comm_mock.send.side_effect = mock_send
+    comm_mock.recv.side_effect = mock_recv
+
+    # --- Collective Uppercase (NumPy) ---
+    def bcast_numpy(buf, root=0):
+        return None  # Data already in-place for 1-rank
+
+    def allreduce_numpy(sendbuf, recvbuf, op=None):
+        if sendbuf is not MPI.IN_PLACE:
             np.copyto(recvbuf, sendbuf)
+        return None
 
-    comm_mock.Allreduce.side_effect = allreduce_mock
+    comm_mock.Bcast.side_effect = bcast_numpy
+    comm_mock.Allreduce.side_effect = allreduce_numpy
 
-    def gatherv_mock(sendbuf, recvlist, root=0):
-        tot_result = recvlist[0]
-        np.copyto(tot_result, sendbuf)
-        return tot_result
-
-    comm_mock.Gatherv.side_effect = gatherv_mock
-
-    def scatterv_mock(sendlist, recvbuf, root=0):
-        if sendlist is None:
-            return recvbuf
-        full_data = sendlist[0]
-        np.copyto(recvbuf, full_data)
-        return recvbuf
-
-    comm_mock.Scatterv.side_effect = scatterv_mock
+    # Split should return itself
+    comm_mock.Split.return_value = comm_mock
 
     return comm_mock

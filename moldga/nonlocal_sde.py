@@ -4,7 +4,6 @@
 # moLDGA — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #          Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
-import gc
 import glob
 import os
 import re
@@ -16,6 +15,7 @@ from scipy import optimize as opt
 
 import moldga.config as config
 import moldga.lambda_correction as lc
+import moldga.mpi_utils as mpi_utils
 from moldga.brillouin_zone import KGrid
 from moldga.bubble_gen import BubbleGenerator
 from moldga.four_point import FourPoint
@@ -38,7 +38,7 @@ def get_hartree_fock(
     .. math:: \Sigma_{HF}^k = 2(U_{abcd} + V^{q=0}_{abcd}) n_{dc} - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}
     where the Hartree-term reads :math:`\Sigma_{H} = 2(U_{abcd} + V^{q=0}_{abcd}) n_{dc}` and the Fock-term reads
     :math:`\Sigma_{F}^k = - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}`.
-    Processes the Fock-Term in block-diagonal orbital space to save memory, as for high momentum grids,
+    Processes the Fock-Term for each individual orbital to save memory, as for high momentum grids,
     the occ_qk property can become large.
     """
     v_q0 = v_nonloc.find_q((0, 0, 0))
@@ -48,7 +48,6 @@ def get_hartree_fock(
     nk_tot = np.prod(config.lattice.nk)
     nq_tot = np.prod(config.lattice.nq)
 
-    occ_k = config.sys.occ_k
     uq = (u_loc + v_nonloc.reduce_q(q_list)).permute_orbitals("abcd->adcb")  # (nq,a,d,c,b)
 
     fock = np.zeros((nk_tot, nb, nb), dtype=uq.mat.dtype)
@@ -59,7 +58,9 @@ def get_hartree_fock(
             if not np.any(u_slice):
                 continue
 
-            occ_qk_dc = np.array([np.roll(occ_k[..., d, c], [-i for i in q], axis=(0, 1, 2)) for q in q_list])
+            occ_qk_dc = np.array(
+                [np.roll(config.sys.occ_k[..., d, c], [-i for i in q], axis=(0, 1, 2)) for q in q_list]
+            )
             occ_qk_dc = occ_qk_dc.reshape(len(q_list), nk_tot)
             contribution = u_slice[:, None, :, :] * occ_qk_dc[:, :, None, None]
             fock += contribution.sum(axis=0)
@@ -79,6 +80,80 @@ def create_auxiliary_chi_r_q(
         (gchi0_q_inv + 1.0 / config.sys.beta**2 * gamma_r)
         - 1.0 / config.sys.beta**2 * (v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel))
     ).invert(False)
+
+
+def create_auxiliary_chi_r_q_sum_v1(
+    gamma_r: LocalFourPoint, gchi0_q_inv: FourPoint, u_loc: LocalInteraction, v_nonloc: Interaction
+) -> FourPoint:
+    r"""
+    Returns the auxiliary susceptibility, see Eq. (3.60) in my master's thesis.
+    .. math:: \chi^{*;qvv'}_{r;abcd} = ((\chi_{0;abcd}^{qv})^{-1} +
+    (\Gamma_{r;abcd}^{wvv'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}
+    """
+    return (
+        (gchi0_q_inv + 1.0 / config.sys.beta**2 * gamma_r)
+        - 1.0 / config.sys.beta**2 * (v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel))
+    ).invert_and_sum_over_last_vn(config.sys.beta)
+
+
+def create_auxiliary_chi_r_q_sum_v2(
+    gamma_r: LocalFourPoint,
+    gchi0_q_inv: FourPoint,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    mpi_dist_irrq: MpiDistributor,
+) -> FourPoint:
+    r"""
+    Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis.
+    .. math:: \sum_{v'}\chi^{*;qvv'}_{r;abcd} = \sum_{v'}((\chi_{0;abcd}^{qv})^{-1} +
+    (\Gamma_{r;abcd}^{wvv'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}
+    """
+    irrk_q_list = config.lattice.q_grid.get_irrq_list()
+    my_irr_q_list = irrk_q_list[mpi_dist_irrq.my_slice]
+    chi_r_q_sum_mat = np.zeros_like(gchi0_q_inv.mat)
+
+    for idx in range(len(my_irr_q_list)):
+        chi_r_q_sum_mat[idx] = (
+            (
+                (gchi0_q_inv.filter_q_index(idx) + 1.0 / config.sys.beta**2 * gamma_r)
+                - 1.0
+                / config.sys.beta**2
+                * (v_nonloc.as_channel(gamma_r.channel).filter_q_index(idx) + u_loc.as_channel(gamma_r.channel))
+            )
+            .invert_and_sum_over_last_vn(config.sys.beta)
+            .mat
+        )
+    return FourPoint(chi_r_q_sum_mat, gamma_r.channel, config.lattice.nq, 1, 1, False, has_compressed_q_dimension=True)
+
+
+def create_auxiliary_chi_r_q_sum_v3(
+    gamma_r: LocalFourPoint,
+    gchi0_q_inv: FourPoint,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    mpi_dist_irrq: MpiDistributor,
+) -> FourPoint:
+    r"""
+    Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis.
+    .. math:: \sum_{v'}\chi^{*;qvv'}_{r;abcd} = \sum_{v'}((\chi_{0;abcd}^{qv})^{-1} +
+    (\Gamma_{r;abcd}^{wvv'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}
+    """
+    irrk_q_list = config.lattice.q_grid.get_irrq_list()
+    my_irr_q_list = irrk_q_list[mpi_dist_irrq.my_slice]
+    chi_r_q_sum_mat = np.zeros_like(gchi0_q_inv.mat)
+
+    for idx in range(len(my_irr_q_list)):
+        chi_r_q_sum_mat[idx] = (
+            (
+                (gchi0_q_inv.filter_q_index(idx) + 1.0 / config.sys.beta**2 * gamma_r)
+                - 1.0
+                / config.sys.beta**2
+                * (v_nonloc.as_channel(gamma_r.channel).filter_q_index(idx) + u_loc.as_channel(gamma_r.channel))
+            )
+            .invert_and_sum_over_last_vn_v2(config.sys.beta)
+            .mat
+        )
+    return FourPoint(chi_r_q_sum_mat, gamma_r.channel, config.lattice.nq, 1, 1, False, has_compressed_q_dimension=True)
 
 
 def create_vrg_r_q(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint) -> FourPoint:
@@ -109,13 +184,18 @@ def create_generalized_chi_q_with_shell_correction(
 
 def calculate_sigma_dc_kernel(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, u_loc: LocalInteraction) -> FourPoint:
     """
-    Returns the double-counting kernel for the self-energy calculation. For details, see Eq. (4.28) in my master's thesis.
+    Returns the double-counting kernel for the self-energy calculation. For details, see Eq. (4.28) in my
+    master's thesis.
     """
     kernel = 1.0 / config.sys.beta**2 * u_loc.permute_orbitals("abcd->adcb") @ gchi0_q
-    kernel = kernel.times("qabcdwv,dcefwvp->qabefwp", f_dc_loc.permute_orbitals("abcd->cbad"))
-    return FourPoint(kernel, SpinChannel.NONE, config.lattice.nq, 1, 1, gchi0_q.full_niw_range, True, True).cut_niv(
-        config.box.niv_core
-    )
+
+    einsum_str = "abcdwv,dcefwvp->abefwp"
+    path, _ = np.einsum_path(einsum_str, kernel.mat[0].copy(), f_dc_loc.mat, optimize="optimal")
+
+    for q in range(kernel.current_shape[0]):
+        kernel[q] = np.einsum(einsum_str, kernel[q].copy(), f_dc_loc.mat, optimize=path)
+
+    return kernel.cut_niv(config.box.niv_core)
 
 
 def calculate_kernel_r_q(
@@ -190,9 +270,11 @@ def calculate_sigma_kernel_r_q(
     """
     logger = config.logger
 
-    gchi_aux_q_r_sum = create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_loc, v_nonloc).sum_over_vn(
-        config.sys.beta, axis=(-1,), copy=False
-    )
+    if config.memory.save_memory_for_chiq_aux:
+        gchi_aux_q_r_sum = create_auxiliary_chi_r_q_sum_v3(gamma_r, gchi0_q_inv, u_loc, v_nonloc, mpi_dist_irrq)
+    else:
+        gchi_aux_q_r_sum = create_auxiliary_chi_r_q_sum_v1(gamma_r, gchi0_q_inv, u_loc, v_nonloc)
+
     mpi_dist_irrq.barrier()
 
     logger.log_memory_usage(
@@ -262,12 +344,12 @@ def perform_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
     """
     logger = config.logger
 
-    if config.lambda_correction.type not in ["spch", "sp"]:
+    if config.lambda_correction.type.lower() not in ["spch", "sp"]:
         raise ValueError("Lambda correction type must be either 'spch' or 'sp'.")
 
     logger.info(f"Lambda correction type set to '{config.lambda_correction.type}'.")
 
-    if config.lambda_correction.type == "spch":
+    if config.lambda_correction.type.lower() == "spch":
         logger.info(f"Performing lambda correction for {chi_phys_q_r.channel.value} channel.")
         chi_r_loc = LocalFourPoint.load(
             os.path.join(config.output.output_path, f"chi_{chi_phys_q_r.channel.value}_loc.npy"),
@@ -342,7 +424,7 @@ def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full
             mat += np.einsum("aijdv,xyzadv->xyzijv", k_slice, g_qk, optimize=path)
 
     mat *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
-    return SelfEnergy(mat, config.lattice.nk, False).compress_q_dimension()
+    return SelfEnergy(mat, config.lattice.nk, False).compress_q_dimension().to_full_niv_range()
 
 
 def calculate_sigma_from_kernel_cpu(
@@ -363,7 +445,7 @@ def calculate_sigma_from_kernel_cpu(
     wn = MFHelper.wn(config.box.niw_core)
 
     giwk_mat = np.asfortranarray(giwk.mat)
-    kernel_mat = np.asfortranarray(kernel.to_full_niw_range().mat)[..., niv_core:]
+    kernel = np.asfortranarray(kernel.to_full_niw_range().mat[..., niv_core:])
 
     kxs, kys, kzs = np.arange(nkx), np.arange(nky), np.arange(nkz)
     kx_indices = [((kxs + q[0]) % nkx) for q in my_full_q_list]
@@ -379,12 +461,12 @@ def calculate_sigma_from_kernel_cpu(
 
         for iw, w in enumerate(wn):
             g_slice = g_q_view[..., giwk.niv - w : giwk.niv + niv_core - w]
-            k_slice = kernel_mat[iq, ..., iw, :]
+            k_slice = kernel[iq, ..., iw, :]
             np.einsum("xyzadv,aijdv->xyzijv", g_slice, k_slice, out=acc, optimize=True)
             np.add(mat, acc, out=mat)
 
     mat *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
-    return SelfEnergy(np.ascontiguousarray(mat), config.lattice.nk, False).compress_q_dimension()
+    return SelfEnergy(np.ascontiguousarray(mat), config.lattice.nk, False).compress_q_dimension().to_full_niv_range()
 
 
 def calculate_sigma_from_kernel_gpu(
@@ -407,7 +489,7 @@ def calculate_sigma_from_kernel_gpu(
     wn = MFHelper.wn(config.box.niw_core)
 
     giwk_mat = cp.asarray(giwk.mat, order="F")
-    kernel_mat = cp.asarray(kernel.to_full_niw_range().mat, order="F")[..., niv_core:]
+    kernel = cp.asarray(kernel.to_full_niw_range().mat, order="F")[..., niv_core:]
 
     kxs, kys, kzs = cp.arange(nkx), cp.arange(nky), cp.arange(nkz)
     kx_indices = [((kxs + q[0]) % nkx) for q in my_full_q_list]
@@ -421,11 +503,15 @@ def calculate_sigma_from_kernel_gpu(
 
         for iw, w in enumerate(wn):
             g_slice = g_q_view[..., giwk.niv - w : giwk.niv + niv_core - w]
-            k_slice = kernel_mat[iq, ..., iw, :]
+            k_slice = kernel[iq, ..., iw, :]
             mat_gpu += cp.einsum("xyzadv,aijdv->xyzijv", g_slice, k_slice, optimize=True)
 
     mat_gpu *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
-    return SelfEnergy(np.ascontiguousarray(cp.asnumpy(mat_gpu)), config.lattice.nk, False).compress_q_dimension()
+    return (
+        SelfEnergy(np.ascontiguousarray(cp.asnumpy(mat_gpu)), config.lattice.nk, False)
+        .compress_q_dimension()
+        .to_full_niv_range()
+    )
 
 
 def calculate_sigma_from_kernel_auto(
@@ -448,11 +534,144 @@ def calculate_sigma_from_kernel_auto(
             gpu_id = mpi_distributor.my_rank % n_gpus
             cp.cuda.Device(gpu_id).use()
             return calculate_sigma_from_kernel_gpu(kernel, giwk, my_full_q_list)
-    except ImportError:
-        # CuPy not installed
+    except:
+        # CuPy not installed or device could not be found
         pass
 
     return calculate_sigma_from_kernel_cpu(kernel, giwk, my_full_q_list)
+
+
+def calculate_sigma_from_kernel_fft_cpu(
+    mpi_dist: MpiDistributor, kernel: FourPoint, giwk: GreensFunction
+) -> SelfEnergy:
+    """
+    Optimized Sigma calculation using Distributed FFTs.
+    Replaces the iq-loop with a real-space pointwise multiplication.
+    Returns Sigma in R-space, positive-v half only; caller must ifft over (kx,ky,kz)
+    and then call .to_full_niv_range() before using.
+    """
+    comm = mpi_dist.comm
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    nkx, nky, nkz = config.lattice.k_grid.nk
+    nk_tot = config.lattice.q_grid.nk_tot
+    nb = config.sys.n_bands
+    niv_core = config.box.niv_core
+    niw = config.box.niw_core
+    beta = config.sys.beta
+
+    # G(k) -> F[G](R), forward FFT, replicated on every rank
+    g_r_mat = giwk.fft().mat
+
+    # K(q) -> F[K](-R) via the conjugate trick: conj, fft, conj.
+    kernel = kernel.to_full_niw_range().to_half_niv_range()
+    kernel.mat = np.conj(kernel.mat)
+    kernel = mpi_utils.execute_distributed_fft(kernel, comm)
+    kernel.mat = np.conj(kernel.mat)
+
+    # Local R-space contraction; each rank owns a slice of R-points
+    n_r_local = kernel.mat.shape[0]
+    mat = np.zeros((n_r_local, nb, nb, niv_core), dtype=kernel.mat.dtype)
+    acc = np.empty_like(mat)
+
+    my_r_indices = mpi_utils.get_pencil_indices(rank, size, (nkx, nky, nkz), "flat")
+    g_r_local = g_r_mat.reshape(nk_tot, nb, nb, -1)[my_r_indices]
+
+    wn = MFHelper.wn(niw)
+    for iw, w in enumerate(wn):
+        g_slice = g_r_local[..., giwk.niv - w : giwk.niv + niv_core - w]
+        k_slice = kernel.mat[..., iw, :]
+        np.einsum("Radv,Raijdv->Rijv", g_slice, k_slice, out=acc, optimize=True)
+        np.add(mat, acc, out=mat)
+
+    mat *= -0.5 / beta / nk_tot
+    return SelfEnergy(
+        np.ascontiguousarray(mat),
+        config.lattice.nk,
+        full_niv_range=False,
+        has_compressed_q_dimension=True,
+        calc_smom=False,
+    )
+
+
+def calculate_sigma_from_kernel_fft_gpu(
+    mpi_dist: MpiDistributor, kernel: FourPoint, giwk: GreensFunction
+) -> SelfEnergy:
+    """
+    Optimized Sigma calculation using Distributed FFTs, running on GPUs.
+    Replaces the iq-loop with a real-space pointwise multiplication.
+    Returns Sigma in R-space, positive-v half only; caller must ifft over (kx,ky,kz)
+    and then call .to_full_niv_range() before using.
+    """
+    import cupy as cp
+
+    comm = mpi_dist.comm
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    nkx, nky, nkz = config.lattice.k_grid.nk
+    nk_tot = config.lattice.q_grid.nk_tot
+    nb = config.sys.n_bands
+    niv_core = config.box.niv_core
+    niw = config.box.niw_core
+    beta = config.sys.beta
+
+    # G(k) -> F[G](R), forward FFT, replicated on every rank
+    g_r_mat = cp.asarray(giwk.fft().mat)
+
+    # K(q) -> F[K](-R) via the conjugate trick: conj, fft, conj.
+    kernel = kernel.to_full_niw_range().to_half_niv_range()
+    kernel.mat = np.conj(kernel.mat)
+    kernel = mpi_utils.execute_distributed_fft(kernel, comm)
+    kernel.mat = cp.conj(cp.asarray(kernel.mat))
+
+    # Local R-space contraction; each rank owns a slice of R-points
+    n_r_local = kernel.mat.shape[0]
+    mat = cp.zeros((n_r_local, nb, nb, niv_core), dtype=kernel.mat.dtype)
+
+    my_r_indices = mpi_utils.get_pencil_indices(rank, size, (nkx, nky, nkz), "flat")
+    g_r_local = g_r_mat.reshape(nk_tot, nb, nb, -1)[cp.asarray(my_r_indices)]
+
+    wn = MFHelper.wn(niw)
+    for iw, w in enumerate(wn):
+        g_slice = g_r_local[..., giwk.niv - w : giwk.niv + niv_core - w]
+        k_slice = kernel.mat[..., iw, :]
+        mat += cp.einsum("Radv,Raijdv->Rijv", g_slice, k_slice, optimize=True)
+
+    mat *= -0.5 / beta / nk_tot
+    return SelfEnergy(
+        np.ascontiguousarray(cp.asnumpy(mat)),
+        config.lattice.nk,
+        full_niv_range=False,
+        has_compressed_q_dimension=True,
+        calc_smom=False,
+    )
+
+
+def calculate_sigma_from_kernel_fft_auto(
+    mpi_distributor: MpiDistributor, kernel: FourPoint, giwk: GreensFunction
+) -> SelfEnergy:
+    """
+    Automatically tries to calculate the self-energy from the kernel on the GPU using CuPy. If CuPy is not installed
+    or no GPU is available, it falls back to the CPU implementation.
+    """
+    logger = config.logger
+
+    try:
+        import cupy as cp
+
+        n_gpus = cp.cuda.runtime.getDeviceCount()
+
+        if cp.cuda.is_available() and n_gpus > 0:
+            logger.info(f"CuPy detected {n_gpus} GPU(s). Using GPU acceleration for self-energy calculation.")
+
+            gpu_id = mpi_distributor.my_rank % n_gpus
+            cp.cuda.Device(gpu_id).use()
+            return calculate_sigma_from_kernel_fft_gpu(mpi_distributor, kernel, giwk)
+    except:
+        # CuPy not installed or device could not be found
+        pass
+
+    return calculate_sigma_from_kernel_fft_cpu(mpi_distributor, kernel, giwk)
 
 
 def get_starting_sigma(output_path: str, default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
@@ -520,6 +739,35 @@ def calculate_self_energy_q(
     mpi_dist_fullbz = MpiDistributor.create_distributor(ntasks=config.lattice.q_grid.nk_tot, comm=comm, name="FBZ")
     my_full_q_list = full_q_list[mpi_dist_fullbz.my_slice]
 
+    sigma_old, starting_iter = get_starting_sigma(config.self_consistency.previous_sc_path, sigma_dmft)
+    if starting_iter > 0:
+        logger.info(
+            f"Using previous calculation and starting the self-consistency loop at iteration {starting_iter + 1}."
+        )
+
+    mu_history = (
+        [config.sys.mu]
+        if starting_iter == 0
+        else [float(np.load(os.path.join(config.self_consistency.previous_sc_path, "mu_history.npy"))[-1])]
+    )
+
+    niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
+    if comm.rank == 0:
+        giwk_full = GreensFunction.get_g_full(sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek())
+        config.sys.n, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
+        giwk_full.cut_niv(niv_cut)
+
+        if sigma_old is sigma_dmft:
+            giwk_full.save(output_dir=config.output.output_path, name="g_latt_dmft")
+    config.sys.n, config.sys.occ, config.sys.occ_k = comm.bcast(
+        (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
+    )
+
+    sigma_old = sigma_old.cut_niv(niv_cut)
+    sigma_dmft = sigma_dmft.cut_niv(niv_cut)
+
+    delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_local.cut_niv(config.box.niv_core)
+
     # Hartree- and Fock-terms
     v_nonloc = v_nonloc.compress_q_dimension()
     hartree, fock = get_hartree_fock(u_loc, v_nonloc, my_full_q_list)
@@ -528,22 +776,6 @@ def calculate_self_energy_q(
 
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
 
-    sigma_old, starting_iter = get_starting_sigma(config.self_consistency.previous_sc_path, sigma_dmft)
-    if starting_iter > 0:
-        logger.info(
-            f"Using previous calculation and starting the self-consistency loop at iteration {starting_iter + 1}."
-        )
-
-    sigma_old = sigma_old.cut_niv(config.box.niw_core + config.box.niv_full + 10)
-    sigma_dmft = sigma_dmft.cut_niv(config.box.niw_core + config.box.niv_full + 10)
-
-    delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_local.cut_niv(config.box.niv_core)
-    mu_history = (
-        [config.sys.mu]
-        if starting_iter == 0
-        else [float(np.load(os.path.join(config.self_consistency.previous_sc_path, "mu_history.npy"))[-1])]
-    )
-
     for current_iter in range(starting_iter + 1, starting_iter + config.self_consistency.max_iter + 1):
         logger.info("----------------------------------------")
         logger.info(f"Starting iteration {current_iter}.")
@@ -551,28 +783,38 @@ def calculate_self_energy_q(
 
         giwk_full = GreensFunction.get_g_full(sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek())
 
-        if comm.rank == 0:
-            giwk_full.save(output_dir=config.output.output_path, name="g_dga")
-
         logger.log_memory_usage("giwk", giwk_full, comm.size)
-        gchi0_q = BubbleGenerator.create_generalized_chi0_q_auto(
-            mpi_dist_irrk,
-            giwk_full,
-            config.box.niw_core,
-            config.box.niv_full,
-            my_irr_q_list,
-            config.lattice.q_grid,
-            config.sys.beta,
-            config.logger,
-        )
+        if config.memory.save_memory_for_chi0q:
+            gchi0_q = BubbleGenerator.create_generalized_chi0_q_auto(
+                mpi_dist_irrk,
+                giwk_full,
+                config.box.niw_core,
+                config.box.niv_full,
+                my_irr_q_list,
+                config.lattice.q_grid,
+                config.sys.beta,
+                config.logger,
+            )
+        else:
+            gchi0_q = BubbleGenerator.create_generalized_chi0_q_fft_auto(
+                mpi_dist_irrk,
+                giwk_full,
+                config.box.niw_core,
+                config.box.niv_full,
+                config.lattice.k_grid,
+                config.sys.beta,
+                config.logger,
+            )
 
         if config.eliashberg.perform_eliashberg:
             gchi0_q.save(name=f"gchi0_q_rank_{comm.rank}", output_dir=config.output.output_path)
 
         logger.log_memory_usage("Gchi0_q_full", gchi0_q, comm.size)
-        giwk_full = giwk_full.cut_niv(config.box.niw_core + config.box.niv_full + 10)
+        giwk_full = giwk_full.cut_niv(niv_cut)
 
-        f_dc_loc = 2 * LocalFourPoint.load(os.path.join(config.output.output_path, "f_magn_loc.npy"))
+        f_dc_loc = 2 * LocalFourPoint.load(os.path.join(config.output.output_path, "f_magn_loc.npy")).permute_orbitals(
+            "abcd->cbad"
+        )
         kernel = -calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc)
         f_dc_loc.free()
         logger.info("Calculated double-counting kernel.")
@@ -582,7 +824,7 @@ def calculate_self_energy_q(
         gchi0_q.free()
         logger.log_memory_usage("Gchi0_q_core", gchi0_q_core, comm.size)
 
-        gchi0_q_core_inv = deepcopy(gchi0_q_core).invert(False).take_vn_diagonal()
+        gchi0_q_core_inv = deepcopy(gchi0_q_core).invert(False)
         logger.log_memory_usage("Gchi0_q_inv", gchi0_q_core_inv, comm.size)
 
         if config.eliashberg.perform_eliashberg:
@@ -613,17 +855,28 @@ def calculate_self_energy_q(
         gamma_magn.free()
         logger.info("Calculated kernel for magnetic channel.")
 
-        kernel.mat = mpi_dist_irrk.gather(kernel.mat)
-        if comm.rank == 0:
-            kernel = kernel.map_to_full_bz(config.lattice.q_grid)
-        kernel.mat = mpi_dist_fullbz.scatter(kernel.mat)
-        logger.info("Kernel mapped to full BZ and scattered across all MPI ranks.")
+        if not config.memory.save_memory_for_chiq_aux:
+            kernel = mpi_utils.map_irrbz_fullbz(kernel, mpi_dist_irrk, mpi_dist_fullbz)
+            logger.info("Kernel mapped to full BZ and scattered across all MPI ranks.")
+        else:
+            kernel = mpi_utils.exchange_and_map_irrbz_fullbz(kernel, mpi_dist_irrk, mpi_dist_fullbz)
+            logger.info("Kernel mapped to full BZ individually on each rank.")
 
-        sigma_new = calculate_sigma_from_kernel_auto(mpi_dist_fullbz, kernel, giwk_full, my_full_q_list)
-        kernel.free()
+        logger.info("Started calculation of DGA self-energy.")
+
+        if config.memory.save_memory_for_sde:
+            sigma_new = calculate_sigma_from_kernel_auto(mpi_dist_fullbz, kernel, giwk_full, my_full_q_list)
+            kernel.free()
+            sigma_new.mat = mpi_dist_fullbz.allreduce(sigma_new.mat)
+        else:
+            sigma_new = calculate_sigma_from_kernel_fft_auto(mpi_dist_irrk, kernel, giwk_full)
+            kernel.free()
+            sigma_new.mat = mpi_dist_fullbz.gather(sigma_new.mat)
+            if comm.rank == 0:
+                sigma_new = sigma_new.ifft().to_full_niv_range()
+            sigma_new = mpi_dist_fullbz.bcast(sigma_new)
+
         logger.info("Self-energy calculated from kernel.")
-
-        sigma_new.mat = mpi_dist_irrk.allreduce(sigma_new.mat)
         logger.log_memory_usage("Non-local sigma", sigma_new, comm.size)
 
         sigma_new = sigma_new + hartree + fock
@@ -636,13 +889,16 @@ def calculate_self_energy_q(
 
         old_mu = mu_history[-1]
         if comm.rank == 0:
-            config.sys.mu = update_mu(
+            mu_finding_failed = False
+            new_mu = update_mu(
                 old_mu, config.sys.n, giwk_full.ek, sigma_new.mat, config.sys.beta, sigma_new.fit_smom()[0]
             )
 
-            config.sys.mu = (
-                config.self_consistency.mixing * config.sys.mu + (1 - config.self_consistency.mixing) * old_mu
-            )
+            if new_mu is np.nan:
+                mu_finding_failed = True
+
+            # will not be changed if mu finding failed
+            config.sys.mu = config.self_consistency.mixing * new_mu + (1 - config.self_consistency.mixing) * old_mu
 
         config.sys.mu = comm.bcast(config.sys.mu)
         mu_history.append(config.sys.mu)
@@ -676,7 +932,9 @@ def calculate_self_energy_q(
             )
             logger.info(f"Self-energy convergence: {sigma_converged}.")
 
-            mu_converged = abs(mu_history[-1] - mu_history[-2]) < np.pi / (10 * config.sys.beta)
+            mu_converged = (
+                abs(mu_history[-1] - mu_history[-2]) < np.pi / (10 * config.sys.beta)
+            ) and not mu_finding_failed
             logger.info(f"Chemical potential convergence: {mu_converged}.")
 
             converged = mu_converged and sigma_converged
@@ -687,7 +945,9 @@ def calculate_self_energy_q(
         sigma_old = sigma_new
         if converged:
             if config.self_consistency.restrict_chi_phys:
-                logger.info("ATTENTION: Self-consistency with modified susceptibility reached. Disabling restriction.")
+                logger.info(
+                    "ATTENTION: Self-consistency with restricted susceptibility reached. Disabling restriction."
+                )
                 config.self_consistency.restrict_chi_phys = False
             else:
                 logger.info(f"Self-consistency of sigma and mu reached at iteration {current_iter}.")
@@ -714,7 +974,7 @@ def apply_mixing_strategy(
     n_hist = config.self_consistency.mixing_history_length
     alpha = config.self_consistency.mixing
 
-    if config.self_consistency.mixing_strategy == "pulay" and current_iter > n_hist:
+    if config.self_consistency.mixing_strategy.lower() == "pulay" and current_iter > n_hist:
         last_results = read_last_n_sigmas_from_files(
             n_hist, config.output.output_path, config.self_consistency.previous_sc_path
         )
@@ -772,7 +1032,7 @@ def apply_mixing_strategy(
         )
 
         return sigma_new
-    if config.self_consistency.mixing_strategy == "anderson" and current_iter > n_hist:
+    if config.self_consistency.mixing_strategy.lower() == "anderson" and current_iter > n_hist:
         last_sigmas = read_last_n_sigmas_from_files(
             n_hist, config.output.output_path, config.self_consistency.previous_sc_path
         )

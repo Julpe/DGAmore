@@ -4,13 +4,13 @@
 # moLDGA — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #          Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
-import warnings
+from unittest.mock import patch
 
 import numpy as np
 import pytest
+
 import moldga.brillouin_zone as bz
 from moldga.brillouin_zone import KPath, KnownKPoints, Labels
-from unittest.mock import patch
 
 
 def test_applies_inversion_symmetry_along_x_axis():
@@ -477,188 +477,331 @@ def test_get_bands_returns_sorted_real_eigenvalues():
     assert np.allclose(bands, expected)
 
 
-def test_ibz_points_have_identity_u_t2g():
-    """IBZ representative k-points must always have identity orbital rotation."""
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
-
-    identity = np.eye(nb)
-    for ik in k_grid.irrk_ind:
-        assert np.allclose(k_grid.orbital_rot_u[ik], identity), f"IBZ point {ik} has non-identity U"
+# =============================================================================
+# Auto-symmetry sentinel and is_auto_symmetries helper
+# =============================================================================
 
 
-def test_all_u_are_unitary_t2g():
-    """Every U matrix must be unitary."""
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
-
-    identity = np.eye(nb)
-    for ik in range(k_grid.nk_tot):
-        u = k_grid.orbital_rot_u[ik]
-        assert np.allclose(u @ u.conj().T, identity, atol=1e-10), f"U at k-point {ik} is not unitary"
+def test_auto_symmetries_sentinel_is_singleton():
+    """``_AutoSymmetriesSentinel`` is a singleton: every instantiation returns the
+    canonical ``AUTO_SYMMETRIES_SENTINEL`` object."""
+    a = bz._AutoSymmetriesSentinel()
+    b = bz._AutoSymmetriesSentinel()
+    assert a is b
+    assert a is bz.AUTO_SYMMETRIES_SENTINEL
 
 
-def test_no_warnings_raised_t2g():
-    """No 'could not find symmetry path' warnings should be raised."""
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        k_grid.specify_orbital_basis(nb, "t2g")
-    path_warnings = [x for x in w if "Could not find symmetry path" in str(x.message)]
-    assert len(path_warnings) == 0, f"Got {len(path_warnings)} 'could not find symmetry path' warnings"
+def test_auto_symmetries_sentinel_repr_is_stable():
+    assert repr(bz.AUTO_SYMMETRIES_SENTINEL) == "<auto-symmetries>"
 
 
-def test_inversion_only_gives_all_identity():
-    """With only inversion symmetries, all U must be identity."""
-    nb = 3
-    k_grid = bz.KGrid(
-        nk=(4, 4, 4),
-        symmetries=[bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV, bz.KnownSymmetries.Z_INV],
-    )
-    k_grid.specify_orbital_basis(nb, "t2g")
-
-    identity = np.eye(nb)
-    assert np.allclose(
-        k_grid.orbital_rot_u, np.tile(identity, (k_grid.nk_tot, 1, 1))
-    ), "Inversion-only grid should have all-identity U"
+def test_auto_symmetries_sentinel_iterates_as_empty():
+    """The sentinel is iterable and yields nothing, so legacy ``for s in symmetries``
+    code paths see no operations to apply."""
+    assert list(bz.AUTO_SYMMETRIES_SENTINEL) == []
 
 
-def test_shape_of_orbital_rot_u():
-    """orbital_rot_u must have shape (nk_tot, nb, nb)."""
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
-    assert k_grid.orbital_rot_u.shape == (k_grid.nk_tot, nb, nb)
+def test_auto_symmetries_sentinel_has_length_zero():
+    assert len(bz.AUTO_SYMMETRIES_SENTINEL) == 0
 
 
-def test_distinct_u_matrices_are_valid_permutations_t2g():
-    """For t2g, all distinct U matrices must be permutation matrices."""
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
-
-    unique_us = []
-    for u in k_grid.orbital_rot_u:
-        if not any(np.allclose(u, v) for v in unique_us):
-            unique_us.append(u)
-
-    for u in unique_us:
-        assert np.allclose(np.abs(u), np.abs(u).astype(int)), "U is not a permutation matrix"
-        assert np.allclose(u.sum(axis=0), np.ones(nb)), "U columns don't sum to 1"
-        assert np.allclose(u.sum(axis=1), np.ones(nb)), "U rows don't sum to 1"
+def test_auto_symmetries_sentinel_is_truthy():
+    """Truthy so ``if symmetries:`` branches still enter, even though iteration is empty.
+    This is what lets KGrid detect auto-mode intent without triggering legacy code."""
+    assert bool(bz.AUTO_SYMMETRIES_SENTINEL) is True
 
 
-def test_3_cycle_compositions_are_inverted():
-    """3-cycle U matrices (U^3=I, U^2!=I) must have U† stored, not U."""
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
-
-    identity = np.eye(nb)
-    for ik in range(k_grid.nk_tot):
-        u = k_grid.orbital_rot_u[ik]
-        if not np.allclose(u @ u, identity):
-            assert np.allclose(u @ u @ u, identity, atol=1e-10), f"Non-self-inverse U at {ik} is not a 3-cycle"
+def test_is_auto_symmetries_true_for_sentinel_only():
+    assert bz.is_auto_symmetries(bz.AUTO_SYMMETRIES_SENTINEL) is True
 
 
-def test_correct_orbital_permutation_for_mirror_symmetries():
-    """
-    Verify the physical correctness of orbital rotations by checking that
-    all three mirror rotations appear in orbital_rot_u with the correct assignment:
-      X_Y_SYM (kx<->ky): dxz<->dxy  -> [[0,0,1],[0,1,0],[1,0,0]]
-      X_Z_SYM (kx<->kz): dyz<->dxy  -> [[1,0,0],[0,0,1],[0,1,0]]
-      Y_Z_SYM (ky<->kz): dxz<->dyz  -> [[0,1,0],[1,0,0],[0,0,1]]
-    """
-    nb = 3
-    k_grid = bz.KGrid(nk=(8, 8, 8), symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
-
-    xy_sym_u = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]], dtype=complex)
-    yz_sym_u = np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]], dtype=complex)
-    xz_sym_u = np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=complex)
-
-    found_xy = found_yz = found_xz = False
-    for iq in range(k_grid.nk_tot):
-        u = k_grid.orbital_rot_u[iq]
-        if np.allclose(u, xy_sym_u):
-            found_xy = True
-        if np.allclose(u, yz_sym_u):
-            found_yz = True
-        if np.allclose(u, xz_sym_u):
-            found_xz = True
-
-    assert found_xy, "X_Y_SYM rotation (dxz<->dxy) not found in orbital_rot_u"
-    assert found_yz, "Y_Z_SYM rotation (dxz<->dyz) not found in orbital_rot_u"
-    assert found_xz, "X_Z_SYM rotation (dyz<->dxy) not found in orbital_rot_u"
+def test_is_auto_symmetries_false_for_legacy_list():
+    assert bz.is_auto_symmetries(bz.two_dimensional_square_symmetries()) is False
+    assert bz.is_auto_symmetries(bz.three_dimensional_cubic_symmetries()) is False
 
 
-def test_custom_mirror_rotations():
-    """User-supplied mirror_rotations dict should be used when orbital_basis is None."""
-    nb = 2
-    k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
-    custom_u = {bz.KnownSymmetries.X_Y_SYM: np.array([[0, 1], [1, 0]], dtype=complex)}
-    k_grid.specify_orbital_basis(nb, mirror_rotations=custom_u)
-
-    assert k_grid.orbital_rot_u is not None
-    assert k_grid.orbital_rot_u.shape == (k_grid.nk_tot, nb, nb)
-
-
-def test_orbital_basis_takes_precedence_over_mirror_rotations():
-    """orbital_basis should override mirror_rotations when both are provided."""
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    wrong_rotations = {
-        bz.KnownSymmetries.X_Y_SYM: np.eye(nb, dtype=complex),
-        bz.KnownSymmetries.X_Z_SYM: np.eye(nb, dtype=complex),
-        bz.KnownSymmetries.Y_Z_SYM: np.eye(nb, dtype=complex),
-    }
-    k_grid.specify_orbital_basis(nb, orbital_basis="t2g", mirror_rotations=wrong_rotations)
-
-    identity = np.eye(nb)
-    is_identity = np.array([np.allclose(u, identity) for u in k_grid.orbital_rot_u])
-    assert not is_identity.all(), "orbital_basis='t2g' should produce non-identity U but got all identity"
+def test_is_auto_symmetries_false_for_empty_list_none_or_other():
+    assert bz.is_auto_symmetries([]) is False
+    assert bz.is_auto_symmetries(None) is False
+    # Identity-based check: only the sentinel singleton qualifies, the string
+    # "auto" should NOT (callers must go through get_lattice_symmetries_from_string).
+    assert bz.is_auto_symmetries("auto") is False
+    assert bz.is_auto_symmetries(0) is False
+    assert bz.is_auto_symmetries({}) is False
 
 
-def test_fbz_sum_restores_orbital_degeneracy_for_t2g():
-    """
-    Construct a synthetic orbital-momentum coupled kernel in the IBZ,
-    map to FBZ, and verify the FBZ sum restores cubic orbital degeneracy.
-    This is the key physical consistency test for the whole pipeline.
-    """
-    nb = 3
-    nk = (6, 6, 6)
-    k_grid = bz.KGrid(nk=nk, symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
+def test_get_lattice_symmetries_from_string_returns_sentinel_for_auto():
+    """The "auto" string is the documented public entry point for opting into
+    auto-discovery; it must resolve to the singleton sentinel."""
+    result = bz.get_lattice_symmetries_from_string("auto")
+    assert result is bz.AUTO_SYMMETRIES_SENTINEL
 
-    # Build synthetic IBZ kernel where orbital content reflects momentum:
-    # dxz couples to ky, dyz to kz, dxy to kx (matching Hamiltonian structure)
-    kmesh_ind = k_grid.kmesh_ind.reshape(3, -1).T
-    kx = 2 * np.pi * kmesh_ind[:, 0] / nk[0]
-    ky = 2 * np.pi * kmesh_ind[:, 1] / nk[1]
-    kz = 2 * np.pi * kmesh_ind[:, 2] / nk[2]
 
-    e_dxy = np.cos(kz)  # dxy invariant along z
-    e_dxz = np.cos(ky)  # dxz invariant along y
-    e_dyz = np.cos(kx)  # dyz invariant along x
+def test_get_lattice_symmetries_from_string_auto_is_case_insensitive():
+    """Lowercase normalization is applied to all string inputs; "auto" / "AUTO" / "Auto" all work."""
+    for s in ("auto", "AUTO", "Auto", "AuTo"):
+        assert bz.get_lattice_symmetries_from_string(s) is bz.AUTO_SYMMETRIES_SENTINEL
 
-    ibz_mat = np.zeros((k_grid.nk_irr, nb, nb, nb, nb), dtype=complex)
-    for i_irr, iq_flat in enumerate(k_grid.irrk_ind):
-        ibz_mat[i_irr, 0, 0, 0, 0] = e_dxy[iq_flat]  # orbital 0 = dxy
-        ibz_mat[i_irr, 1, 1, 1, 1] = e_dxz[iq_flat]  # orbital 1 = dxz
-        ibz_mat[i_irr, 2, 2, 2, 2] = e_dyz[iq_flat]  # orbital 2 = dyz
 
-    u = k_grid.orbital_rot_u
-    uc = u.conj()
-    mat = ibz_mat[k_grid.irrk_inv.ravel()]
-    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
+# =============================================================================
+# KGrid construction in auto mode
+# =============================================================================
 
-    sigma = mat.sum(axis=0)
-    s00 = sigma[0, 0, 0, 0]
-    s11 = sigma[1, 1, 1, 1]
-    s22 = sigma[2, 2, 2, 2]
 
-    assert np.allclose(s00, s11, atol=1e-8), f"dxz and dyz diagonal not equal after FBZ sum: {s00} vs {s11}"
-    assert np.allclose(s00, s22, atol=1e-8), f"dxz and dxy diagonal not equal after FBZ sum: {s00} vs {s22}"
+def _make_small_real_cubic_h(nx=4, ny=4, nz=4, nb=1):
+    """A simple real, Hermitian, cubic-symmetric H on a small grid — convenient for
+    testing auto-detection. With a single band the orbital action is trivial; the
+    discovered symmetry is the spatial cubic group (8 ops for nx=ny=nz with all-axes
+    inversions + permutations)."""
+    j1, j2, j3 = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
+    k1 = 2 * np.pi * j1 / nx
+    k2 = 2 * np.pi * j2 / ny
+    k3 = 2 * np.pi * j3 / nz
+    H = np.zeros((nx, ny, nz, nb, nb), dtype=complex)
+    e = -2.0 * (np.cos(k1) + np.cos(k2) + np.cos(k3))
+    for o in range(nb):
+        H[..., o, o] = e
+    return H
+
+
+def test_kgrid_with_auto_sentinel_sets_auto_mode_flag():
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    assert grid._auto_mode is True
+
+
+def test_kgrid_with_legacy_symmetries_does_not_set_auto_mode():
+    """A KGrid built with predefined symmetries must NOT enter auto mode."""
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    assert grid._auto_mode is False
+
+
+def test_kgrid_with_no_symmetries_does_not_set_auto_mode():
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
+    assert grid._auto_mode is False
+
+
+def test_kgrid_auto_mode_starts_with_trivial_ibz_and_no_auto_data():
+    """Before specify_auto_symmetries() is called, the auto-mode KGrid behaves like
+    the symmetry-free case: the IBZ equals the FBZ. The auto-data slots are unset."""
+    nx, ny, nz = 4, 4, 4
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    assert grid._auto_us is None
+    assert grid._auto_sigmas is None
+    assert grid._auto_conjs is None
+    # Trivial IBZ = FBZ before discovery
+    assert grid.nk_irr == nx * ny * nz
+
+
+def test_kgrid_is_auto_property_is_false_before_specify_auto_symmetries():
+    """``is_auto`` is the runtime indicator that auto-data has been populated.
+    It must be False between construction and specify_auto_symmetries()."""
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    assert grid.is_auto is False
+
+
+def test_kgrid_is_auto_property_is_false_for_legacy_grid():
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    assert grid.is_auto is False
+
+
+def test_kgrid_is_auto_property_is_true_after_specify_auto_symmetries():
+    nx, ny, nz = 4, 4, 4
+    H = _make_small_real_cubic_h(nx, ny, nz, nb=1)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid.specify_auto_symmetries(H)
+    assert grid.is_auto is True
+
+
+# =============================================================================
+# KGrid.specify_auto_symmetries: happy path
+# =============================================================================
+
+
+def test_specify_auto_symmetries_populates_all_expected_arrays():
+    """After a successful call, every cached IBZ-related field plus the new auto-data
+    fields must be populated and internally consistent."""
+    nx, ny, nz, nb = 4, 4, 4, 1
+    H = _make_small_real_cubic_h(nx, ny, nz, nb)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid.specify_auto_symmetries(H)
+
+    # IBZ fields
+    assert grid.fbz2irrk.shape == (nx, ny, nz)
+    assert grid.irrk_ind is not None
+    assert grid.irrk_inv is not None
+    assert grid.irrk_count is not None
+    assert grid.irr_kmesh is not None
+    assert grid.nk_irr == len(grid.irrk_ind)
+    assert grid.nk_irr <= nx * ny * nz
+
+    # Auto-data fields
+    assert grid._auto_us.shape == (nx, ny, nz, nb, nb)
+    assert grid._auto_sigmas.shape == (nx, ny, nz)
+    assert grid._auto_conjs.shape == (nx, ny, nz)
+    assert grid._auto_us.dtype == complex
+    assert grid._auto_conjs.dtype == bool
+
+
+def test_specify_auto_symmetries_produces_consistent_fbz2irrk_and_irrk_inv():
+    """irrk_inv must be a true inverse of irrk_ind w.r.t. fbz2irrk:
+    irrk_ind[irrk_inv[k]] == fbz2irrk.flat[k] for every k."""
+    nx, ny, nz, nb = 4, 4, 4, 1
+    H = _make_small_real_cubic_h(nx, ny, nz, nb)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid.specify_auto_symmetries(H)
+
+    fbz_flat = grid.fbz2irrk.ravel()
+    inv_flat = grid.irrk_inv.ravel()
+    # For each FBZ point k: fbz2irrk[k] is the flat IBZ index, irrk_ind[irrk_inv[k]] should equal it
+    assert np.array_equal(grid.irrk_ind[inv_flat], fbz_flat)
+
+
+def test_specify_auto_symmetries_irrk_count_sums_to_full_bz():
+    """The duplicity counts must sum to the total number of FBZ points."""
+    nx, ny, nz, nb = 4, 4, 4, 1
+    H = _make_small_real_cubic_h(nx, ny, nz, nb)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid.specify_auto_symmetries(H)
+
+    assert grid.irrk_count.sum() == nx * ny * nz
+
+
+def test_specify_auto_symmetries_us_are_unitary():
+    """Every stored per-k transformation must be unitary: U U^dag = I."""
+    nx, ny, nz, nb = 4, 4, 4, 1
+    H = _make_small_real_cubic_h(nx, ny, nz, nb)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid.specify_auto_symmetries(H)
+    Us = grid._auto_us.reshape(-1, nb, nb)
+    identity = np.eye(nb, dtype=complex)
+    products = np.einsum("...ij,...kj->...ik", Us, Us.conj())
+    assert np.allclose(products, identity[None, ...], atol=1e-10)
+
+
+def test_specify_auto_symmetries_sigmas_are_plus_or_minus_one():
+    nx, ny, nz, nb = 4, 4, 4, 1
+    H = _make_small_real_cubic_h(nx, ny, nz, nb)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid.specify_auto_symmetries(H)
+    sig = grid._auto_sigmas.ravel()
+    assert np.all(np.isin(sig, [-1.0, +1.0]))
+
+
+def test_specify_auto_symmetries_default_drops_antiunitary_ops():
+    """The default ``include_antiunitary=False`` filters out time-reversal-like ops
+    so the FBZ expansion is safe for frequency-dependent objects: no per-k
+    transformation should carry conj=True."""
+    nx, ny, nz, nb = 4, 4, 4, 1
+    H = _make_small_real_cubic_h(nx, ny, nz, nb)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid.specify_auto_symmetries(H)
+    assert int(grid._auto_conjs.sum()) == 0
+
+
+def test_specify_auto_symmetries_with_include_antiunitary_admits_conj_ops():
+    """Opting in via ``include_antiunitary=True`` produces a larger group; for a
+    purely-real H, anti-unitary ops always exist (H(k) = H(k)*), so at least some
+    FBZ k-points will carry conj=True."""
+    nx, ny, nz, nb = 4, 4, 4, 1
+    H = _make_small_real_cubic_h(nx, ny, nz, nb)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid.specify_auto_symmetries(H, include_antiunitary=True)
+    assert int(grid._auto_conjs.sum()) > 0
+
+
+def test_specify_auto_symmetries_with_include_antiunitary_yields_smaller_or_equal_ibz():
+    """Adding TR ops can only shrink the IBZ (or leave it unchanged)."""
+    nx, ny, nz, nb = 4, 4, 4, 1
+    H = _make_small_real_cubic_h(nx, ny, nz, nb)
+    g_spatial = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    g_spatial.specify_auto_symmetries(H, include_antiunitary=False)
+    g_full = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    g_full.specify_auto_symmetries(H, include_antiunitary=True)
+    assert g_full.nk_irr <= g_spatial.nk_irr
+
+
+# =============================================================================
+# KGrid.specify_auto_symmetries: input validation
+# =============================================================================
+
+
+def test_specify_auto_symmetries_raises_when_kgrid_is_not_in_auto_mode():
+    """Calling specify_auto_symmetries on a legacy KGrid must fail loudly so users
+    don't accidentally clobber a non-auto setup."""
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    H = _make_small_real_cubic_h(4, 4, 4, 1)
+    with pytest.raises(RuntimeError, match="auto mode"):
+        grid.specify_auto_symmetries(H)
+
+
+def test_specify_auto_symmetries_raises_on_grid_shape_mismatch():
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    H_wrong = _make_small_real_cubic_h(4, 4, 2, 1)  # nz=2 instead of 4
+    with pytest.raises(ValueError, match="k-grid shape"):
+        grid.specify_auto_symmetries(H_wrong)
+
+
+def test_specify_auto_symmetries_raises_on_wrong_ndim():
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    bad = np.zeros((4, 4, 4), dtype=complex)  # missing orbital axes
+    with pytest.raises(ValueError, match="must have shape"):
+        grid.specify_auto_symmetries(bad)
+
+
+def test_specify_auto_symmetries_raises_on_non_square_orbital_axes():
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    bad = np.zeros((4, 4, 4, 2, 3), dtype=complex)  # mismatched orbital dims
+    with pytest.raises(ValueError, match="must have shape"):
+        grid.specify_auto_symmetries(bad)
+
+
+def test_specify_auto_symmetries_accepts_non_contiguous_input():
+    """The implementation casts to complex128 explicitly; non-contiguous or
+    non-complex128 input should be accepted without crashing."""
+    H = _make_small_real_cubic_h(4, 4, 4, 1).astype(np.complex64)
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    # Should not raise
+    grid.specify_auto_symmetries(H)
+    assert grid.is_auto is True
+
+
+# =============================================================================
+# Regression: legacy KGrid still works unchanged
+# =============================================================================
+
+
+def test_legacy_kgrid_two_dimensional_square_unchanged():
+    """Legacy code paths must continue to produce the same IBZ they always did."""
+    grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    # Known: 4x4x1 with full square symmetry has a small IBZ (Γ, X, M, and one interior)
+    assert grid.nk_irr <= 16
+    # Sanity-consistent IBZ
+    assert grid.irrk_count.sum() == 16
+    assert grid.fbz2irrk.shape == (4, 4, 1)
+
+
+def test_legacy_kgrid_three_dimensional_cubic_unchanged():
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    assert grid.nk_irr <= 64
+    assert grid.irrk_count.sum() == 64
+
+
+def test_specify_auto_symmetries_finds_at_least_legacy_symmetries_for_cubic_h():
+    """For a real cubic H, the auto-discovered spatial group must be at least as
+    large as the legacy ``three_dimensional_cubic`` group, so the auto IBZ must
+    be no larger than the legacy IBZ. (Auto can find accidental extra symmetries
+    on small grids, so we don't insist on strict equality here.)"""
+    H = _make_small_real_cubic_h(4, 4, 4, 1)
+    g_auto = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    g_auto.specify_auto_symmetries(H)
+    g_legacy = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    assert g_auto.nk_irr <= g_legacy.nk_irr
+    # The cubic orbit structure must be refined by auto: every legacy orbit member
+    # should map to the same auto IBZ representative (i.e., auto is a refinement).
+    # Equivalent statement: fbz2irrk_auto is constant on each legacy orbit.
+    fbz_auto = g_auto.fbz2irrk.ravel()
+    fbz_legacy = g_legacy.fbz2irrk.ravel()
+    for legacy_rep in np.unique(fbz_legacy):
+        members = np.where(fbz_legacy == legacy_rep)[0]
+        # All members of the legacy orbit should be in the same auto orbit
+        assert len(np.unique(fbz_auto[members])) == 1

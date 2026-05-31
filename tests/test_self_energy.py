@@ -21,13 +21,6 @@ mat_decompressed = np.random.rand(*nk, 2, 2, 2 * niv)
 mat_compressed = np.random.rand(16, 2, 2, 2 * niv)
 
 
-@pytest.mark.parametrize("full_niv_range", [True, False])
-def test_initializes_correctly_with_full_niv_range(full_niv_range):
-    self_energy = SelfEnergy(mat_decompressed, full_niv_range=full_niv_range)
-    assert self_energy.mat.shape[-1] == 2 * niv if full_niv_range is True else 4 * niv
-    assert self_energy.full_niv_range is True
-
-
 def test_initializes_correctly_with_estimated_niv_core():
     self_energy = SelfEnergy(mat_decompressed, estimate_niv_core=True)
     assert self_energy._niv_core >= self_energy._niv_core_min

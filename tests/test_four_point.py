@@ -4,7 +4,7 @@
 # moLDGA — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #          Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
-from unittest.mock import MagicMock
+from copy import deepcopy
 
 import numpy as np
 import pytest
@@ -461,3 +461,72 @@ def test_to_full_indices_with_incorrect_shape_argument(rng):
     wrong_shape = shape[:-1]
     with pytest.raises(ValueError):
         fp_ci.to_full_indices(wrong_shape)
+
+
+def test_invert_and_sum_methods_agree_on_decompressed_fp(small_fourpoint):
+    fp = deepcopy(small_fourpoint)
+    beta = 7.0
+
+    out1 = fp.invert_and_sum_over_last_vn(beta)
+    fp2 = deepcopy(small_fourpoint)
+    out2 = fp2.invert_and_sum_over_last_vn_v2(beta)
+
+    assert out1._num_vn_dimensions == 1
+    assert out2._num_vn_dimensions == 1
+    assert out1.current_shape == out2.current_shape
+    assert np.allclose(out1.mat, out2.mat, rtol=1e-6, atol=1e-8)
+
+
+def test_invert_and_sum_methods_agree_on_compressed_fp(small_fourpoint_compressed):
+    fp = deepcopy(small_fourpoint_compressed)
+    beta = 11.0
+
+    out1 = fp.invert_and_sum_over_last_vn(beta)
+    fp2 = deepcopy(small_fourpoint_compressed)
+    out2 = fp2.invert_and_sum_over_last_vn_v2(beta)
+
+    assert out1._num_vn_dimensions == 1
+    assert out2._num_vn_dimensions == 1
+    assert out1.current_shape == out2.current_shape
+    assert np.allclose(out1.mat, out2.mat, rtol=1e-6, atol=1e-8)
+
+
+def test_invert_and_sum_scales_with_beta(small_fourpoint_compressed):
+    fp = deepcopy(small_fourpoint_compressed)
+
+    beta1 = 1.0
+    beta2 = 5.0
+
+    out_beta1 = deepcopy(fp).invert_and_sum_over_last_vn_v2(beta1)
+    out_beta2 = deepcopy(fp).invert_and_sum_over_last_vn_v2(beta2)
+
+    scale = beta1 / beta2
+    assert np.allclose(out_beta2.mat, out_beta1.mat * scale, rtol=1e-8, atol=1e-10)
+
+
+def test_invert_and_sum_matches_manual_small_case():
+    rng_local = np.random.default_rng(42)
+    nq_tot = 1
+    o = 2
+    niw = 1
+    niv = 1
+    shape = (nq_tot, o, o, o, o, 2 * niw + 1, 2 * niv, 2 * niv)
+    mat = rng_local.standard_normal(shape) + 1j * rng_local.standard_normal(shape)
+
+    fp = FourPoint(
+        mat,
+        nq=(1, 1, 1),
+        num_wn_dimensions=1,
+        num_vn_dimensions=2,
+        has_compressed_q_dimension=True,
+        full_niw_range=True,
+    )
+
+    beta = 3.0
+
+    computed = deepcopy(fp).invert(False).sum_over_vn(beta, axis=(-1,))
+    computed_v1 = deepcopy(fp).invert_and_sum_over_last_vn(beta)
+    computed_v2 = deepcopy(fp).invert_and_sum_over_last_vn_v2(beta)
+    assert np.allclose(computed.mat, computed_v1.mat)
+    assert np.allclose(computed.mat, computed_v2.mat)
+    assert computed._num_vn_dimensions == 1

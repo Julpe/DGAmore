@@ -28,85 +28,6 @@ class KnownSymmetries(Enum):
     X_Y_INV = "x-y-inv"
 
 
-class KnownOrbitalBases(Enum):
-    """
-    Known orbital bases and their mirror symmetry transformation matrices.
-
-    Each entry contains the unitary matrices U such that under a mirror symmetry g:
-        O_ab(k) = U_aa' U*_bb' O_a'b'(k')
-    where 'a' is an annihilation index and 'b' is a creation index,
-    consistent with G_abcd := <T[c_a c†_b c_c c†_d]>.
-
-    Orbital orderings:
-        EG  : {d3z2-r2, dx2-y2}
-        T2G : {dxz, dyz, dxy}
-    """
-
-    EG = "eg"
-    T2G = "t2g"
-
-    @staticmethod
-    def from_string(s: str) -> "KnownOrbitalBases":
-        s = s.strip().lower()
-        for basis in KnownOrbitalBases:
-            if s == basis.value:
-                return basis
-        raise ValueError(f"Unknown orbital basis '{s}'. " f"Supported bases: {[b.value for b in KnownOrbitalBases]}.")
-
-    def get_mirror_rotations(self) -> dict["KnownSymmetries", np.ndarray]:
-        """
-        Returns the mirror symmetry orbital rotation matrices for this basis.
-        Only mirror symmetries are included; inversion symmetries are always identity
-        and are handled separately in build_orbital_rotations.
-        """
-        match self:
-            case KnownOrbitalBases.EG:
-                # eg orbitals: {d3z2-r2, dx2-y2}
-                # kx <-> ky: dx2-y2 sign change, d3z2-r2 unchanged
-                # kx <-> kz, ky <-> kz: mix d3z2-r2 and dx2-y2 via cubic rotation
-                sqrt3 = np.sqrt(3)
-                return {
-                    KnownSymmetries.X_Y_SYM: np.array(
-                        [[1, 0], [0, -1]], dtype=complex  # d3z2-r2 -> d3z2-r2  # dx2-y2  -> -dx2-y2
-                    ),
-                    KnownSymmetries.X_Z_SYM: np.array([[-1 / 2, sqrt3 / 2], [sqrt3 / 2, 1 / 2]], dtype=complex),
-                    KnownSymmetries.Y_Z_SYM: np.array([[-1 / 2, -sqrt3 / 2], [-sqrt3 / 2, 1 / 2]], dtype=complex),
-                }
-            case KnownOrbitalBases.T2G:
-                # NOTE: it depends on the ordering of the orbitals in the wannier files which matrices to choose!
-                # if {dxy=0, dxz=1, dyz=2} (alphabetical ordering)
-                # dxy lies in the xy plane -> invariant under X_Y_SYM
-                # dxz lies in the xz plane -> invariant under X_Z_SYM
-                # dyz lies in the yz plane -> invariant under Y_Z_SYM
-                # X_Y_SYM (kx<->ky): dxz(1) <-> dyz(2), dxy(0) unchanged
-                # X_Z_SYM (kx<->kz): dxy(0) <-> dyz(2), dxz(1) unchanged
-                # Y_Z_SYM (ky<->kz): dxy(0) <-> dxz(1), dyz(2) unchanged
-                return {
-                    KnownSymmetries.X_Y_SYM: np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=complex),
-                    KnownSymmetries.X_Z_SYM: np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]], dtype=complex),
-                    KnownSymmetries.Y_Z_SYM: np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]], dtype=complex),
-                }
-
-                """
-                # If {dxz=0, dxy=1, dyz=2}
-                # X_Y_SYM (kx<->ky): dxz(0) <-> dyz(2), dxy(1) unchanged
-                # X_Z_SYM (kx<->kz): dxy(1) <-> dyz(2), dxz(0) unchanged
-                # Y_Z_SYM (ky<->kz): dxz(0) <-> dxy(1), dyz(2) unchanged
-                return {
-                    KnownSymmetries.X_Y_SYM: np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]], dtype=complex),
-                    KnownSymmetries.X_Z_SYM: np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=complex),
-                    KnownSymmetries.Y_Z_SYM: np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]], dtype=complex),
-                }
-                """
-
-
-INVERSION_SYMMETRIES = frozenset(
-    {KnownSymmetries.X_INV, KnownSymmetries.Y_INV, KnownSymmetries.Z_INV, KnownSymmetries.X_Y_INV}
-)
-
-MIRROR_SYMMETRIES = frozenset({KnownSymmetries.X_Y_SYM, KnownSymmetries.X_Z_SYM, KnownSymmetries.Y_Z_SYM})
-
-
 class KnownKPoints(Enum):
     """
     Known k-points in the Brillouin zone.
@@ -120,6 +41,7 @@ class KnownKPoints(Enum):
     M2 = (0.25, 0.25, 0.0)
     R = (0.5, 0.0, 0.5)
     A = (0.5, 0.5, 0.5)
+    T = (0.0, 0.5, 0.5)
 
 
 class Labels(Enum):
@@ -135,6 +57,7 @@ class Labels(Enum):
     M2 = ("m2", "M2")
     R = ("r", "R")
     A = ("a", "A")
+    T = ("t", "T")
 
     @property
     def key(self):
@@ -298,20 +221,33 @@ def apply_symmetries(mat: np.ndarray, symmetries: list[KnownSymmetries]) -> None
 def get_lattice_symmetries_from_string(symmetry_string: str | tuple | list) -> list[KnownSymmetries]:
     """
     Return the lattice symmetries from a string.
+
+    The special string "auto" signals that symmetries should be auto-detected
+    from a Hamiltonian H(k) at runtime via KGrid.specify_auto_symmetries(hk).
+    In that case an empty list is returned here, but a marker is set so that
+    the KGrid defers building fbz2irrk until specify_auto_symmetries is called.
     """
-    if symmetry_string == "two_dimensional_square":
-        return two_dimensional_square_symmetries()
-    elif symmetry_string == "three_dimensional_cubic":
-        return three_dimensional_cubic_symmetries()
-    elif symmetry_string == "quasi_one_dimensional_square":
-        return quasi_one_dimensional_square_symmetries()
-    elif symmetry_string == "simultaneous_x_y_inversion":
-        return simultaneous_x_y_inversion()
-    elif symmetry_string == "quasi_two_dimensional_square_symmetries":
-        return quasi_two_dimensional_square_symmetries()
-    elif not symmetry_string or symmetry_string == "none":
+    if not symmetry_string:
         return []
 
+    if isinstance(symmetry_string, str):
+        symmetry_string = symmetry_string.lower()
+        if symmetry_string == "two_dimensional_square":
+            return two_dimensional_square_symmetries()
+        elif symmetry_string == "three_dimensional_cubic":
+            return three_dimensional_cubic_symmetries()
+        elif symmetry_string == "quasi_one_dimensional_square":
+            return quasi_one_dimensional_square_symmetries()
+        elif symmetry_string == "simultaneous_x_y_inversion":
+            return simultaneous_x_y_inversion()
+        elif symmetry_string == "quasi_two_dimensional_square_symmetries":
+            return quasi_two_dimensional_square_symmetries()
+        elif symmetry_string == "auto":
+            # Sentinel: KGrid will recognize this and defer symmetry reduction
+            # until specify_auto_symmetries(hk) is called with a Hamiltonian.
+            return AUTO_SYMMETRIES_SENTINEL
+        elif symmetry_string == "" or symmetry_string == "none":
+            return []
     try:
         import ast
 
@@ -331,9 +267,55 @@ def get_lattice_symmetries_from_string(symmetry_string: str | tuple | list) -> l
         raise NotImplementedError(f"Symmetry {symmetry_string} not supported.")
 
 
+# Sentinel object returned by get_lattice_symmetries_from_string for "auto".
+# Identity-checked, so it must be a unique singleton — a small dedicated object.
+class _AutoSymmetriesSentinel:
+    """Marker indicating that lattice symmetries are to be detected automatically
+    from a Hamiltonian, via KGrid.specify_auto_symmetries()."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return "<auto-symmetries>"
+
+    # Behave like an empty list for code that iterates over symmetries before
+    # auto-detection has populated the real data (e.g. apply_symmetries(...)).
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+    def __bool__(self):
+        # Truthy so that "if symmetries:" enters the branch (it indicates intent),
+        # but iteration still yields nothing.
+        return True
+
+
+AUTO_SYMMETRIES_SENTINEL = _AutoSymmetriesSentinel()
+
+
+def is_auto_symmetries(symmetries) -> bool:
+    """Returns True if the given symmetries value is the auto sentinel."""
+    return symmetries is AUTO_SYMMETRIES_SENTINEL
+
+
 class KGrid:
     """
     Class to build the k-grid for the Brillouin zone.
+
+    The ``symmetries`` argument accepts the usual list of ``KnownSymmetries``
+    *and* the special "auto" mode (passed as the ``AUTO_SYMMETRIES_SENTINEL``,
+    typically obtained from ``get_lattice_symmetries_from_string("auto")``).
+    In auto mode the symmetry group is discovered from a Hamiltonian H(k) at
+    runtime: instantiate the grid with the sentinel, then call
+    :meth:`specify_auto_symmetries` with the Hamiltonian. Until that call the
+    grid behaves as if no symmetries were applied (full BZ = IBZ).
     """
 
     def __init__(self, nk: tuple = None, symmetries: list[KnownSymmetries] = None):
@@ -348,7 +330,14 @@ class KGrid:
         self.fbz2sym = None  # Index of symmetry operation mapping each FBZ point to its representative
         self.symmetries = symmetries
         self.ind = None
-        self.orbital_rot_u = None
+
+        # Auto-discovered symmetry data, populated by specify_auto_symmetries().
+        # When set, _map_to_full_bz uses these to apply the per-k orbital
+        # transformation.
+        self._auto_mode = is_auto_symmetries(symmetries)
+        self._auto_us = None  # shape (nx, ny, nz, nb, nb), complex
+        self._auto_sigmas = None  # shape (nx, ny, nz), float (+/-1)
+        self._auto_conjs = None  # shape (nx, ny, nz), bool
 
         self.nk = nk
         self.set_k_axes()
@@ -373,134 +362,91 @@ class KGrid:
         )
         self.fbz2sym = self._build_fbz2sym()
 
-    def _build_orbital_rotations(
+    def specify_auto_symmetries(
         self,
-        nb: int,
-        orbital_basis: str | KnownOrbitalBases = None,
-        mirror_rotations: dict[KnownSymmetries, np.ndarray] = None,
-    ) -> dict[KnownSymmetries, np.ndarray]:
-        """
-        Constructs orbital rotation matrices for each symmetry operation of this k-grid.
-
-        Inversion symmetries always yield identity matrices since they do not mix orbitals.
-        Mirror symmetry rotations are constructed from orbital_basis if provided,
-        or from mirror_rotations if provided, or default to identity with a warning.
-        orbital_basis takes precedence over mirror_rotations if both are given.
-
-        Parameters
-        ----------
-        nb:
-            Number of orbitals/bands.
-        orbital_basis:
-            KnownOrbitalBases enum or string specifying the orbital basis.
-            Supported: 'eg', 't2g'.
-        mirror_rotations:
-            dict mapping mirror KnownSymmetries -> unitary (nb, nb) matrix.
-            Used if orbital_basis is not provided.
-        """
-        identity = np.eye(nb, dtype=complex)
-
-        if orbital_basis is not None and orbital_basis != "":
-            if isinstance(orbital_basis, str):
-                orbital_basis = KnownOrbitalBases.from_string(orbital_basis)
-            mirror_rotations = orbital_basis.get_mirror_rotations()
-
-        orbital_rotations = {}
-        for sym in self.symmetries:
-            if sym in INVERSION_SYMMETRIES:
-                orbital_rotations[sym] = identity
-            elif sym in MIRROR_SYMMETRIES:
-                if mirror_rotations is not None and sym in mirror_rotations:
-                    u = mirror_rotations[sym]
-                    assert u.shape == (nb, nb), f"Rotation matrix for {sym} must be ({nb},{nb}), got {u.shape}."
-                    assert np.allclose(u @ u.conj().T, identity), f"Rotation matrix for {sym} must be unitary."
-                    orbital_rotations[sym] = u
-                else:
-                    warnings.warn(
-                        f"No orbital rotation provided for mirror symmetry {sym}. "
-                        f"Assuming identity, which is only correct if orbitals are "
-                        f"invariant under this mirror. This may cause incorrect results."
-                    )
-                    orbital_rotations[sym] = identity
-
-        return orbital_rotations
-
-    def specify_orbital_basis(
-        self,
-        nb: int,
-        orbital_basis: str | KnownOrbitalBases = None,
-        mirror_rotations: dict[KnownSymmetries, np.ndarray] = None,
+        hk: np.ndarray,
+        atol: float = 1e-8,
+        verbose: bool = False,
+        include_antiunitary: bool = False,
     ) -> None:
         """
-        Builds orbital_rot_u[k] for every FBZ point k by replaying the exact same
-        symmetry reduction sequence used in set_fbz2irrk, composing orbital rotation
-        matrices in lockstep.
+        Auto-detect the symmetry group of the Hamiltonian ``hk`` and replay
+        the IBZ reduction onto this grid.
 
-        For each k, orbital_rot_u[k] is the composed unitary U such that:
-            M_ab(k) = U_aa' U*_bb' M_a'b'(k_irr)
-        For irreducible points (own representatives), U = identity.
+        Only applicable when this ``KGrid`` was constructed in auto mode
+        (``symmetries`` is the ``AUTO_SYMMETRIES_SENTINEL``). Discovers all
+        operations ``(M, q, U, sigma, conj)`` that leave H(k) invariant, then
+        repopulates ``fbz2irrk``, ``irrk_ind``, ``irrk_inv``, ``irrk_count``,
+        ``irr_kmesh``, and stores per-k transformation data used by
+        ``_map_to_full_bz`` to apply the orbital transformation when expanding
+        IBZ -> FBZ.
 
         Parameters
         ----------
-        nb:
-            Number of orbitals/bands.
-        orbital_basis:
-            KnownOrbitalBases enum or string specifying the orbital basis.
-            Supported: 'eg', 't2g'.
-        mirror_rotations:
-            dict mapping mirror KnownSymmetries -> unitary (nb, nb) matrix.
-            Used if orbital_basis is not provided.
+        hk:
+            Complex Hermitian Hamiltonian of shape
+            ``(nk[0], nk[1], nk[2], nb, nb)`` indexed on the same grid as this
+            KGrid, with axes corresponding to the primitive reciprocal-lattice
+            basis (i.e. each axis is a fractional coordinate along ``b_i``).
+        atol:
+            Absolute tolerance for symmetry validation.
+        verbose:
+            If True, print diagnostics about the discovered group.
+        include_antiunitary:
+            If False (default), anti-unitary symmetries (operations with
+            ``conj=True``, i.e. ``H(k) = H(k)*``-style time-reversal) are
+            dropped after discovery. These are valid symmetries of H itself
+            but, for frequency-dependent quantities (Green's functions,
+            vertices), they additionally require a Matsubara-frequency flip
+            that ``_map_to_full_bz`` does not perform. Keeping ``False`` makes
+            the IBZ-to-FBZ expansion safe for any object with the same lattice
+            symmetry as H, at the cost of a possibly larger IBZ.
         """
-        if nb == 1:
-            return
+        if not self._auto_mode:
+            raise RuntimeError(
+                "specify_auto_symmetries() may only be called when the KGrid "
+                "was constructed in auto mode (symmetries='auto')."
+            )
+        if hk.shape[:3] != tuple(self.nk):
+            raise ValueError(f"Hamiltonian k-grid shape {hk.shape[:3]} does not match KGrid {tuple(self.nk)}.")
+        if hk.ndim != 5 or hk.shape[3] != hk.shape[4]:
+            raise ValueError(f"Hamiltonian must have shape (nx, ny, nz, nb, nb); got {hk.shape}.")
 
-        identity = np.eye(nb, dtype=complex)
-        orbital_rotations = self._build_orbital_rotations(nb, orbital_basis, mirror_rotations)
+        # Late import to keep the dependency optional at module load time and
+        # to avoid a circular import if symmetry_reduction ever imports from here.
+        from moldga.symmetry_reduction import get_symmetry_reduction
 
-        self.orbital_rot_u = np.tile(identity, (self.nk_tot, 1, 1)).astype(complex)
+        res = get_symmetry_reduction(
+            np.asarray(hk, dtype=np.complex128),
+            atol=atol,
+            verbose=verbose,
+            include_antiunitary=include_antiunitary,
+        )
 
-        nx, ny, nz = self.nk
+        # Refresh the IBZ maps based on the discovered orbits.
+        # ``fbz2irrk`` is the (nx,ny,nz) flat-index field; we use ``np.unique``
+        # on it to recover irrk_ind/irrk_inv/irrk_count exactly as the rest of
+        # the code expects.
+        self.fbz2irrk = res["fbz2irrk"].astype(self.fbz2irrk.dtype, copy=True)
+        _, self.irrk_ind, self.irrk_inv, self.irrk_count = np.unique(
+            self.fbz2irrk, return_index=True, return_inverse=True, return_counts=True
+        )
+        self.set_irrk_mesh()
 
-        def to_flat(ix, iy, iz):
-            return (ix % nx) * ny * nz + (iy % ny) * nz + (iz % nz)
+        # Stash per-k transformation tensors for use by _map_to_full_bz.
+        self._auto_us = res["Us"]
+        self._auto_sigmas = res["sigmas"]
+        self._auto_conjs = res["conjs"]
 
-        def sym_image_flat(sym, flat_indices):
-            """Return the flat index each point maps to under sym."""
-            ix = flat_indices // (ny * nz)
-            iy = (flat_indices % (ny * nz)) // nz
-            iz = flat_indices % nz
-            if sym == KnownSymmetries.X_INV:
-                return to_flat(-ix, iy, iz)
-            elif sym == KnownSymmetries.Y_INV:
-                return to_flat(ix, -iy, iz)
-            elif sym == KnownSymmetries.Z_INV:
-                return to_flat(ix, iy, -iz)
-            elif sym == KnownSymmetries.X_Y_SYM:
-                return to_flat(iy, ix, iz)
-            elif sym == KnownSymmetries.X_Z_SYM:
-                return to_flat(iz, iy, ix)
-            elif sym == KnownSymmetries.Y_Z_SYM:
-                return to_flat(ix, iz, iy)
-            elif sym == KnownSymmetries.X_Y_INV:
-                return to_flat(-ix, -iy, iz)
-            return flat_indices.copy()
+        # fbz2sym is kept as built by the trivial set_fbz2irrk path on the
+        # auto sentinel; it is not consumed by _map_to_full_bz in auto mode
+        # and remains here for backwards compatibility only.
 
-        all_flat = np.arange(self.nk_tot)
-        current_rep = all_flat.copy()
-
-        for sym in self.symmetries:
-            u_sym = orbital_rotations.get(sym, identity)
-            images = sym_image_flat(sym, current_rep)  # where current_rep maps to under sym
-
-            # np.minimum logic: update where image is smaller
-            changed = images < current_rep
-
-            # Compose orbital rotation for changed points
-            self.orbital_rot_u[changed] = self.orbital_rot_u[changed] @ u_sym
-
-            current_rep = np.minimum(current_rep, images)
-
-        assert np.allclose(current_rep, self.fbz2irrk.ravel()), "Orbital basis replay does not match fbz2irrk!"
+    @property
+    def is_auto(self) -> bool:
+        """Returns True if this KGrid is in auto-discovered symmetry mode and
+        :meth:`specify_auto_symmetries` has populated the transformation data."""
+        return self._auto_mode and self._auto_us is not None
 
     def _build_fbz2sym(self) -> np.ndarray:
         """

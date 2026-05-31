@@ -10,7 +10,9 @@ from copy import deepcopy
 from enum import Enum
 
 import numpy as np
+import scipy as sp
 
+from moldga import symmetry_reduction
 from moldga.brillouin_zone import KGrid
 
 
@@ -344,19 +346,19 @@ class IAmNonLocal(IHaveMat, ABC):
 
     def shift_k_by_q(self, q: tuple | list[int] = (0, 0, 0)):
         """
-        Shifts all momenta by the given values and returns the object with a decompressed momentum dimension.
+        Shifts all momenta by the given values and returns a copy of the object with a decompressed momentum dimension.
         """
         copy = deepcopy(self)
 
         compress = False
-        if self.has_compressed_q_dimension:
+        if copy.has_compressed_q_dimension:
             compress = True
-            self.decompress_q_dimension()
+            copy.decompress_q_dimension()
 
-        copy.mat = np.roll(self.mat, [-i for i in q], axis=(0, 1, 2))
+        copy.mat = np.roll(copy.mat, [-i for i in q], axis=(0, 1, 2))
 
         if compress:
-            self.compress_q_dimension()
+            copy.compress_q_dimension()
         return copy
 
     def shift_k_by_pi(self):
@@ -435,6 +437,20 @@ class IAmNonLocal(IHaveMat, ABC):
 
         return result
 
+    def filter_q_index(self, index: int = 0):
+        r"""
+        Filters the object to the given index of the momentum dimension and returns a copy. Acts like a filter.
+        Makes it possible to use e.g. only the first component of a non-local object.
+        """
+        if not self.has_compressed_q_dimension:
+            self.compress_q_dimension()
+
+        copy = deepcopy(self)
+        copy.mat = copy.mat[index][None, ...]
+        copy.update_original_shape()
+        copy._nq = (1, 1, 1)
+        return copy
+
     def map_to_full_bz(self, k_grid: KGrid, nq: tuple = None):
         """
         Maps to full BZ using k_grid's inverse map and precomputed orbital rotation tensors.
@@ -448,24 +464,19 @@ class IAmNonLocal(IHaveMat, ABC):
         Maps the object from the irreducible to the full Brillouin zone.
 
         First expands the compressed IBZ momentum dimension to the full BZ by copying each IBZ
-        value to all its symmetry-equivalent FBZ images via k_grid.irrk_inv. Then applies the
-        precomputed orbital rotation tensors from k_grid.orbital_rot_u to account for the orbital
-        mixing introduced by mirror symmetry operations during the IBZ reduction.
+        value to all its symmetry-equivalent FBZ images via ``k_grid.irrk_inv``. Then applies the
+        per-k orbital transformation stored on ``k_grid`` by ``specify_auto_symmetries(hk)``.
 
-        The orbital transformation is applied per group of k-points that share the same rotation
-        matrix, using a Kronecker-product representation of the full transformation to reduce the
-        problem to a single batched matrix multiplication per group. This avoids the O(nb^8) cost
-        of a naive einsum over all four orbital indices simultaneously.
+        The orbital transformation follows the ket/bra convention of the operator ordering
+        G_abcd := <T[c_a c†_b c_c c†_d]> -- annihilation indices (positions 1, 3) transform with
+        U, creation indices (positions 2, 4) with U^dagger -- combined with a per-k antisymmetry
+        sign ``sigma_k`` and an optional complex conjugation ``conj_k``:
 
-        The transformation convention follows the operator ordering in
-        G_abcd := <T[c_a c†_b c_c c†_d]>, where a, c are annihilation indices transforming
-        with U and b, d are creation indices transforming with U*:
-            2-index: M'_ab(k)   = U_aa' U*_bb' M_a'b'(k')
-            4-index: M'_abcd(k) = U_aa' U*_bb' U_cc' U*_dd' M_a'b'c'd'(k')
+            2-index : M_ab(k)   = sigma_k     * U_aa' [M_a'b'(k_rep)]^{[*conj_k]} U^dag_b'b
+            4-index : M_abcd(k) = sigma_k^2 * U_aa' [M_a'b'c'd'(k_rep)]^{[*conj_k]} U^dag_b'b U_cc' U^dag_d'd
 
-        Requires k_grid.specify_orbital_basis() to have been called beforehand if orbital mixing
-        is needed. If k_grid.orbital_rot_u is None, only the momentum expansion is performed and
-        orbital indices are left unchanged.
+        If ``k_grid`` is not yet in auto mode (``specify_auto_symmetries`` has not been called),
+        only the momentum expansion is performed and orbital indices are left unchanged.
         """
         if not self.has_compressed_q_dimension:
             raise ValueError("Mapping to full BZ only possible for compressed momentum dimension.")
@@ -475,121 +486,92 @@ class IAmNonLocal(IHaveMat, ABC):
         if nq is not None:
             self._nq = nq
 
-        self.mat = self.mat[k_grid.irrk_inv.ravel()].reshape((np.prod(self.nq), *self.original_shape[1:]))
+        # Expand IBZ -> FBZ via the standard irrk_inv map (no orbital action yet).
+        flat_inv = k_grid.irrk_inv.ravel()
+        out_shape = (np.prod(self.nq), *self.current_shape[1:])
+        expanded = np.empty(out_shape, dtype=self.mat.dtype)
+        np.take(self.mat, flat_inv, axis=0, out=expanded)
+        self.mat = expanded
 
-        if k_grid.orbital_rot_u is not None:
-            u_all = k_grid.orbital_rot_u
-            nb = u_all.shape[1]
-            identity = np.eye(nb, dtype=u_all.dtype)
+        # Apply per-k orbital transformation if auto-mode data is present.
+        if getattr(k_grid, "is_auto", False):
+            self.mat = symmetry_reduction.apply_auto_orbital_transform(
+                self.mat,
+                us=k_grid._auto_us.reshape(np.prod(k_grid.nk), *k_grid._auto_us.shape[3:]),
+                sigmas=k_grid._auto_sigmas.reshape(-1),
+                conjs=k_grid._auto_conjs.reshape(-1),
+                num_orbital_dimensions=num_orbital_dimensions,
+            )
 
-            groups = {}
-            for ik in range(u_all.shape[0]):
-                key = tuple(u_all[ik].real.round(6).ravel())
-                if key not in groups:
-                    groups[key] = []
-                groups[key].append(ik)
-
-            path_2 = path_4 = None
-
-            for key, indices in groups.items():
-                u_ref = u_all[indices[0]]
-                if np.allclose(u_ref, identity):
-                    continue
-
-                idx = np.array(indices)
-
-                def _is_permutation_matrix(u: np.ndarray) -> bool:
-                    return (
-                        np.allclose(np.abs(u), np.abs(u).astype(int))  # only 0s and 1s
-                        and np.allclose(u.sum(axis=0), 1)  # one 1 per column
-                        and np.allclose(u.sum(axis=1), 1)  # one 1 per row
-                    )
-
-                if _is_permutation_matrix(u_ref):
-                    # For real permutation matrices, U @ M @ U^T is just index reordering.
-                    # Find the permutation: perm[i] = j means orbital i gets content from orbital j.
-                    perm = np.argmax(u_ref.real, axis=1)
-
-                    if num_orbital_dimensions == 2:
-                        self.mat[idx] = self.mat[idx][:, perm, ...][:, :, perm, ...]
-                    elif num_orbital_dimensions == 4:
-                        self.mat[idx] = self.mat[idx][:, perm, ...][:, :, perm, ...][:, :, :, perm, ...][
-                            :, :, :, :, perm, ...
-                        ]
-                else:
-                    uc_ref = u_ref.conj()
-                    if num_orbital_dimensions == 2:
-                        if path_2 is None:
-                            path_2 = np.einsum_path(
-                                "ap,bq,kpq...->kab...", u_ref, uc_ref, self.mat[idx], optimize="optimal"
-                            )[0]
-                        self.mat[idx] = np.einsum("ap,bq,kpq...->kab...", u_ref, uc_ref, self.mat[idx], optimize=path_2)
-                    elif num_orbital_dimensions == 4:
-                        if path_4 is None:
-                            path_4 = np.einsum_path(
-                                "ap,bq,cr,ds,kpqrs...->kabcd...",
-                                u_ref,
-                                uc_ref,
-                                u_ref,
-                                uc_ref,
-                                self.mat[idx],
-                                optimize="optimal",
-                            )[0]
-                        self.mat[idx] = np.einsum(
-                            "ap,bq,cr,ds,kpqrs...->kabcd...",
-                            u_ref,
-                            uc_ref,
-                            u_ref,
-                            uc_ref,
-                            self.mat[idx],
-                            optimize=path_4,
-                        )
-
-        self.mat = self.mat.reshape((np.prod(self.nq), *self.original_shape[1:]))
         self.update_original_shape()
         return self
 
-    def fft(self):
+    def fft(self, copy: bool = True):
         """
-        Performs a discrete forward Fourier transform over the momentum dimension.
+        Performs a discrete forward Fourier transform over the momentum dimension and returns a copy if specified.
         """
-        copy = deepcopy(self)
+        if copy:
+            copy = deepcopy(self)
+
+            compress = False
+            if copy.has_compressed_q_dimension:
+                compress = True
+                copy.decompress_q_dimension()
+
+            sp.fft.fftn(copy.mat, axes=(0, 1, 2), overwrite_x=True)
+            return copy.compress_q_dimension() if compress else copy
 
         compress = False
-        if copy.has_compressed_q_dimension:
+        if self.has_compressed_q_dimension:
             compress = True
-            copy.decompress_q_dimension()
+            self.decompress_q_dimension()
+        sp.fft.fftn(self.mat, axes=(0, 1, 2), overwrite_x=True)
+        return self.compress_q_dimension() if compress else self
 
-        np.fft.fftn(copy.mat, axes=(0, 1, 2), out=copy.mat)
-        return copy.compress_q_dimension() if compress else copy
+    def ifft(self, copy: bool = True):
+        """
+        Performs a discrete inverse Fourier transform over the momentum dimension and returns a copy if specified.
+        """
+        if copy:
+            copy = deepcopy(self)
 
-    def ifft(self):
-        """
-        Performs a discrete inverse Fourier transform over the momentum dimension.
-        """
-        copy = deepcopy(self)
+            compress = False
+            if copy.has_compressed_q_dimension:
+                compress = True
+                copy.decompress_q_dimension()
+
+            sp.fft.ifftn(copy.mat, axes=(0, 1, 2), overwrite_x=True)
+            return copy.compress_q_dimension() if compress else copy
 
         compress = False
-        if copy.has_compressed_q_dimension:
+        if self.has_compressed_q_dimension:
             compress = True
-            copy.decompress_q_dimension()
+            self.decompress_q_dimension()
+        sp.fft.ifftn(self.mat, axes=(0, 1, 2), overwrite_x=True)
+        return self.compress_q_dimension() if compress else self
 
-        np.fft.ifftn(copy.mat, axes=(0, 1, 2), out=copy.mat)
-        return copy.compress_q_dimension() if compress else copy
-
-    def flip_momentum_axis(self):
+    def flip_momentum_axis(self, copy: bool = True):
         r"""
-        Flips the momentum axis :math:`F^{q}\to F^{-q}` of the object and returns a copy.
+        Flips the momentum axis :math:`F^{q}\to F^{-q}` of the object and returns a copy if specified.
         """
-        copy = deepcopy(self)
+        if copy:
+            copy = deepcopy(self)
+
+            compress = False
+            if copy.has_compressed_q_dimension:
+                compress = True
+                copy.decompress_q_dimension()
+
+            copy.mat = np.roll(np.flip(copy.mat, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+            return copy.compress_q_dimension() if compress else copy
 
         compress = False
-        if copy.has_compressed_q_dimension:
+        if self.has_compressed_q_dimension:
             compress = True
-            copy.decompress_q_dimension()
+            self.decompress_q_dimension()
 
-        copy.mat = np.roll(np.flip(copy.mat, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-        return copy.compress_q_dimension() if compress else copy
+        self.mat = np.roll(np.flip(self.mat, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+        return self.compress_q_dimension() if compress else self
 
     def _align_q_dimensions_for_operations(self, other: "IAmNonLocal"):
         """

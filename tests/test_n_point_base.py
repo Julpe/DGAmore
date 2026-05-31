@@ -256,10 +256,10 @@ def test_shifts_momentum_by_negative_values_correctly():
 
 
 def test_shifts_momentum_with_compressed_q_dimension_correctly():
-    mat = np.zeros((64,))
+    mat = np.zeros((64))
     obj = IAmNonLocal(mat, (4, 4, 4), has_compressed_q_dimension=True)
     shifted = obj.shift_k_by_q((1, 1, 1))
-    assert shifted.current_shape == (4, 4, 4)
+    assert shifted.current_shape == (64,)
 
 
 def test_raises_error_when_shifting_with_invalid_q_length():
@@ -813,138 +813,385 @@ def test_malloc_trim_exception_is_suppressed(monkeypatch):
     assert IHaveMat._malloc_trim_available is True
 
 
-def test_map_to_full_bz_momentum_expansion_is_correct():
-    """
-    With identity U, map_to_full_bz must correctly copy each IBZ value
-    to all its FBZ images according to irrk_inv.
-    """
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
-    k_grid.orbital_rot_u = np.tile(np.eye(nb, dtype=complex), (k_grid.nk_tot, 1, 1))
+def test_filter_q_index_returns_correct_index():
+    mat = np.arange(64 * 2).reshape((4, 4, 4, 2))
+    nq = (4, 4, 4)
+    obj = IAmNonLocal(mat, nq)
+    result = obj.filter_q_index(5)
+    assert result.mat.shape == (1, 2)
+    assert np.allclose(result.mat[0], mat.reshape(64, 2)[5], rtol=1e-2)
 
+
+def test_filter_q_index_default_index_is_zero():
+    mat = np.arange(64 * 2).reshape((4, 4, 4, 2))
+    nq = (4, 4, 4)
+    obj = IAmNonLocal(mat, nq)
+    result = obj.filter_q_index()
+    assert result.mat.shape == (1, 2)
+    assert np.allclose(result.mat[0], mat.reshape(64, 2)[0], rtol=1e-2)
+
+
+def test_filter_q_index_compresses_q_dimension_if_not_already_compressed():
+    mat = np.arange(64 * 2).reshape((4, 4, 4, 2))
+    nq = (4, 4, 4)
+    obj = IAmNonLocal(mat, nq)
+    assert not obj.has_compressed_q_dimension
+    _ = obj.filter_q_index(0)
+    assert obj.has_compressed_q_dimension
+
+
+def test_filter_q_index_does_not_modify_original_when_already_compressed():
+    mat = np.arange(64 * 2).reshape((64, 2))
+    nq = (4, 4, 4)
+    obj = IAmNonLocal(mat, nq, has_compressed_q_dimension=True)
+    original_mat = obj.mat.copy()
+    _ = obj.filter_q_index(3)
+    assert np.allclose(obj.mat, original_mat, rtol=1e-2)
+
+
+def test_filter_q_index_sets_nq_to_one():
+    mat = np.arange(64 * 2).reshape((4, 4, 4, 2))
+    nq = (4, 4, 4)
+    obj = IAmNonLocal(mat, nq)
+    result = obj.filter_q_index(0)
+    assert result.nq == (1, 1, 1)
+
+
+def test_filter_q_index_result_has_compressed_q_dimension():
+    mat = np.arange(64 * 2).reshape((4, 4, 4, 2))
+    nq = (4, 4, 4)
+    obj = IAmNonLocal(mat, nq)
+    result = obj.filter_q_index(0)
+    assert result.has_compressed_q_dimension
+
+
+def test_filter_q_index_result_original_shape_is_updated():
+    mat = np.arange(64 * 2).reshape((4, 4, 4, 2))
+    nq = (4, 4, 4)
+    obj = IAmNonLocal(mat, nq)
+    result = obj.filter_q_index(0)
+    assert result.original_shape == (1, 2)
+
+
+def test_filter_q_index_returns_deep_copy():
+    mat = np.arange(64 * 2).reshape((4, 4, 4, 2))
+    nq = (4, 4, 4)
+    obj = IAmNonLocal(mat, nq)
+    result = obj.filter_q_index(0)
+    result.mat[0, 0] = 9999
+    assert not np.allclose(obj.mat.reshape(64, 2)[0, 0], 9999, rtol=1e-2)
+
+
+def test_filter_q_index_last_index():
+    mat = np.arange(64 * 2).reshape((4, 4, 4, 2))
+    nq = (4, 4, 4)
+    obj = IAmNonLocal(mat, nq)
+    result = obj.filter_q_index(63)
+    assert np.allclose(result.mat[0], mat.reshape(64, 2)[63], rtol=1e-2)
+
+
+def test_filter_q_index_raises_for_out_of_bounds_index():
+    mat = np.arange(64 * 2).reshape((4, 4, 4, 2))
+    nq = (4, 4, 4)
+    obj = IAmNonLocal(mat, nq)
+    with pytest.raises(IndexError):
+        obj.filter_q_index(64)
+
+
+# =============================================================================
+# _map_to_full_bz: auto-mode branch
+# =============================================================================
+from unittest.mock import patch
+
+import moldga.symmetry_reduction as _sr
+
+
+def _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1, hopping=1.0, include_antiunitary=False):
+    """Build an auto-mode KGrid populated with a small real cubic Hamiltonian.
+    Returns (kgrid, H_full[nx,ny,nz,nb,nb])."""
+    j1, j2, j3 = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
+    k1 = 2 * np.pi * j1 / nx
+    k2 = 2 * np.pi * j2 / ny
+    k3 = 2 * np.pi * j3 / nz
+    H = np.zeros((nx, ny, nz, nb, nb), dtype=complex)
+    eps = -2.0 * hopping * (np.cos(k1) + np.cos(k2) + np.cos(k3))
+    for o in range(nb):
+        H[..., o, o] = eps + 0.1 * o
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid.specify_auto_symmetries(H, include_antiunitary=include_antiunitary)
+    return grid, H
+
+
+class _DoublePrecisionNonLocal(IAmNonLocal):
+    """IAmNonLocal subclass that preserves the input matrix dtype instead of
+    casting to complex64. Lets us verify the mapping logic against double-precision
+    references; the production class deliberately downcasts for memory savings."""
+
+    @IAmNonLocal.mat.setter
+    def mat(self, value):
+        if value is None:
+            self._mat = None
+            return
+        self._mat = np.asarray(value)
+
+
+def test_map_to_full_bz_legacy_kgrid_pure_replication():
+    """With a legacy (non-auto) KGrid, ``_map_to_full_bz`` reduces to a bare
+    IBZ→FBZ index expansion via ``irrk_inv``: each FBZ point gets the IBZ value
+    at the index pointed to by ``irrk_inv``, with no orbital transformation."""
+    grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    nb = 1
+    nq_tot = 16
+    # Make a clearly-non-trivial IBZ payload
+    ibz_payload = (np.arange(grid.nk_irr) + 1).astype(np.complex128).reshape(grid.nk_irr, nb, nb)
+    obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+
+    assert obj.mat.shape == (nq_tot, nb, nb)
+    # Every FBZ k must hold the IBZ value at irrk_inv[k]
+    inv = grid.irrk_inv.ravel()
+    expected = ibz_payload[inv]
+    assert np.array_equal(obj.mat, expected)
+
+
+def test_map_to_full_bz_auto_2idx_reconstructs_H_exactly():
+    """End-to-end: pick auto IBZ slice of H, _map_to_full_bz should reproduce H."""
+    grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
+    nb = 1
+    H_flat = H.reshape(-1, nb, nb)
+    H_ibz = H_flat[grid.irrk_ind].copy()
+    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+    H_rec = obj.mat.reshape(4, 4, 4, nb, nb)
+    assert np.allclose(H_rec, H, atol=1e-12)
+
+
+def test_map_to_full_bz_auto_2idx_reconstructs_H_for_multiorbital_case():
+    """Same as above but with multiple orbitals — exercises the orbital einsum path."""
+    grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=2)
+    nb = 2
+    H_flat = H.reshape(-1, nb, nb)
+    H_ibz = H_flat[grid.irrk_ind].copy()
+    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+    H_rec = obj.mat.reshape(4, 4, 4, nb, nb)
+    assert np.allclose(H_rec, H, atol=1e-12)
+
+
+def test_map_to_full_bz_auto_4idx_reconstructs_HotimesH_exactly():
+    """For Γ = H ⊗ H (which inherits H's symmetry trivially), reconstruction must
+    be exact under the 4-orbital-index code path."""
+    grid, H = _build_auto_kgrid(nx=3, ny=3, nz=3, nb=2)
+    nb = 2
+    Gamma_full = np.einsum("...ab,...cd->...abcd", H, H)
+    Gamma_flat = Gamma_full.reshape(-1, nb, nb, nb, nb)
+    Gamma_ibz = Gamma_flat[grid.irrk_ind].copy()
+    obj = _DoublePrecisionNonLocal(mat=Gamma_ibz, nq=(3, 3, 3), has_compressed_q_dimension=True)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=4)
+    G_rec = obj.mat.reshape(3, 3, 3, nb, nb, nb, nb)
+    assert np.allclose(G_rec, Gamma_full, atol=1e-12)
+
+
+def test_map_to_full_bz_auto_preserves_trailing_frequency_dimensions():
+    """The mapping is shape-polymorphic in the trailing axes (e.g. frequency axes).
+    A 1-band IBZ payload with 2 frequency axes after the orbital pair must come
+    back to the full BZ unmodified beyond the index expansion."""
+    grid, _ = _build_auto_kgrid(nx=4, ny=4, nz=1, nb=1)
+    nb = 1
+    n_freq = 5
+    # Distinct payload at every IBZ slot so missing/wrong indices show up
     rng = np.random.default_rng(0)
-    ibz_mat = rng.random((k_grid.nk_irr, nb, nb, nb, nb)) + 1j * rng.random((k_grid.nk_irr, nb, nb, nb, nb))
-
-    mat = ibz_mat[k_grid.irrk_inv.ravel()]
-    u = k_grid.orbital_rot_u
-    uc = u.conj()
-    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
-
-    irrk_inv_flat = k_grid.irrk_inv.ravel()
-    for iq_fbz in range(k_grid.nk_tot):
-        iq_irr = irrk_inv_flat[iq_fbz]
-        assert np.allclose(
-            mat[iq_fbz], ibz_mat[iq_irr]
-        ), f"FBZ point {iq_fbz} does not match its IBZ representative {iq_irr}"
+    ibz_payload = rng.standard_normal((grid.nk_irr, nb, nb, n_freq)) + 1j * rng.standard_normal(
+        (grid.nk_irr, nb, nb, n_freq)
+    )
+    obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+    # For 1-band the orbital transform is identity, so the result is pure replication
+    inv = grid.irrk_inv.ravel()
+    expected = ibz_payload[inv]
+    assert obj.mat.shape == expected.shape
+    assert np.allclose(obj.mat, expected, atol=1e-14)
 
 
-def test_map_to_full_bz_identity_u_leaves_values_unchanged():
-    """With all-identity U, the orbital content must be unchanged after mapping."""
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
-    k_grid.orbital_rot_u = np.tile(np.eye(nb, dtype=complex), (k_grid.nk_tot, 1, 1))
+def test_map_to_full_bz_auto_with_antiunitary_does_apply_conjugation():
+    """Opting into ``include_antiunitary=True`` produces conj=True at some FBZ
+    points, and the FBZ expansion then conjugates orbital values at those points.
+    For a complex IBZ payload, the result at those points must equal the
+    conjugate of the corresponding IBZ value."""
+    nb = 1
+    grid, _ = _build_auto_kgrid(nx=4, ny=4, nz=1, nb=nb, include_antiunitary=True)
+    assert int(grid._auto_conjs.sum()) > 0, "expected at least one conj=True point"
 
+    # Build a complex IBZ payload so conjugation has a visible effect
     rng = np.random.default_rng(1)
-    ibz_mat = rng.random((k_grid.nk_irr, nb, nb, nb, nb)) + 1j * rng.random((k_grid.nk_irr, nb, nb, nb, nb))
+    ibz_payload = rng.standard_normal((grid.nk_irr, nb, nb)) + 1j * rng.standard_normal((grid.nk_irr, nb, nb))
+    obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=2)
 
-    mat = ibz_mat[k_grid.irrk_inv.ravel()]
-    u = k_grid.orbital_rot_u
-    uc = u.conj()
-    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
-
-    irrk_inv_flat = k_grid.irrk_inv.ravel()
-    for iq_fbz in range(k_grid.nk_tot):
-        iq_irr = irrk_inv_flat[iq_fbz]
-        assert np.allclose(mat[iq_fbz], ibz_mat[iq_irr]), f"Identity U changed values at FBZ point {iq_fbz}"
+    inv = grid.irrk_inv.ravel()
+    conjs = grid._auto_conjs.reshape(-1)
+    # Expected: IBZ-replicated, with conj applied where conjs is True (since U=[[1]] for nb=1)
+    expected = ibz_payload[inv].copy()
+    expected[conjs] = expected[conjs].conj()
+    assert np.allclose(obj.mat, expected, atol=1e-14)
 
 
-def test_map_to_full_bz_orbital_rotation_permutes_correct_indices():
-    """
-    For each non-identity FBZ point, the mapped value must equal
-    U @ M_irr @ U^T (4-index version) as computed manually.
-    """
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
+def test_map_to_full_bz_auto_default_no_antiunitary_does_no_conjugation():
+    """Default (include_antiunitary=False): no FBZ point should ever be conjugated,
+    so a complex IBZ payload reconstructs as a pure index replication. This is
+    the safe semantics for frequency-dependent objects."""
+    nb = 1
+    grid, _ = _build_auto_kgrid(nx=4, ny=4, nz=1, nb=nb, include_antiunitary=False)
+    assert int(grid._auto_conjs.sum()) == 0
 
     rng = np.random.default_rng(2)
-    ibz_mat = rng.random((k_grid.nk_irr, nb, nb, nb, nb)) + 1j * rng.random((k_grid.nk_irr, nb, nb, nb, nb))
+    ibz_payload = rng.standard_normal((grid.nk_irr, nb, nb)) + 1j * rng.standard_normal((grid.nk_irr, nb, nb))
+    obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=2)
 
-    u = k_grid.orbital_rot_u
-    uc = u.conj()
-    mat = ibz_mat[k_grid.irrk_inv.ravel()]
-    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
-
-    irrk_inv_flat = k_grid.irrk_inv.ravel()
-    identity = np.eye(nb)
-    for iq_fbz in range(k_grid.nk_tot):
-        u_ik = k_grid.orbital_rot_u[iq_fbz]
-        if np.allclose(u_ik, identity):
-            continue
-        iq_irr = irrk_inv_flat[iq_fbz]
-        m_irr = ibz_mat[iq_irr]
-        m_expected = np.einsum("ap,br,cs,dt,prst->abcd", u_ik, u_ik.conj(), u_ik, u_ik.conj(), m_irr)
-        assert np.allclose(
-            mat[iq_fbz], m_expected, atol=1e-10
-        ), f"Orbital rotation at FBZ point {iq_fbz} does not match expected"
+    inv = grid.irrk_inv.ravel()
+    expected = ibz_payload[inv]
+    assert np.allclose(obj.mat, expected, atol=1e-14)
 
 
-def test_map_to_full_bz_irrk_count_weighted_sum():
-    """
-    With identity U, sum over full BZ must equal irrk_count-weighted IBZ sum.
-    """
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
-    k_grid.orbital_rot_u = np.tile(np.eye(nb, dtype=complex), (k_grid.nk_tot, 1, 1))
+def test_map_to_full_bz_auto_delegates_to_apply_auto_orbital_transform():
+    """The auto branch must call ``symmetry_reduction.apply_auto_orbital_transform``
+    with the correctly-sliced (Us, sigmas, conjs) arrays and the right ndim."""
+    grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=2)
+    nb = 2
+    nktot = 4 * 4 * 4
+    H_flat = H.reshape(-1, nb, nb)
+    H_ibz = H_flat[grid.irrk_ind].copy()
+    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
 
-    rng = np.random.default_rng(3)
-    ibz_mat = rng.random((k_grid.nk_irr, nb, nb, nb, nb)) + 1j * rng.random((k_grid.nk_irr, nb, nb, nb, nb))
-
-    u = k_grid.orbital_rot_u
-    uc = u.conj()
-    mat = ibz_mat[k_grid.irrk_inv.ravel()]
-    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
-
-    sum_fbz = mat.sum(axis=0)
-    sum_ibz_weighted = (ibz_mat * k_grid.irrk_count[:, None, None, None, None]).sum(axis=0)
-    assert np.allclose(sum_fbz, sum_ibz_weighted, atol=1e-10), "FBZ sum does not match irrk_count-weighted IBZ sum"
-
-
-def test_map_to_full_bz_ibz_representatives_unchanged():
-    """IBZ representative points must have identical values before and after mapping."""
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
-
-    rng = np.random.default_rng(4)
-    ibz_mat = rng.random((k_grid.nk_irr, nb, nb, nb, nb)) + 1j * rng.random((k_grid.nk_irr, nb, nb, nb, nb))
-
-    u = k_grid.orbital_rot_u
-    uc = u.conj()
-    mat = ibz_mat[k_grid.irrk_inv.ravel()]
-    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
-
-    irrk_inv_flat = k_grid.irrk_inv.ravel()
-    for iq_fbz in k_grid.irrk_ind:
-        iq_irr = irrk_inv_flat[iq_fbz]
-        assert np.allclose(
-            mat[iq_fbz], ibz_mat[iq_irr], atol=1e-10
-        ), f"IBZ representative {iq_fbz} was modified during FBZ mapping"
+    # Patch so we can assert it gets called with the right shapes and args
+    with patch.object(_sr, "apply_auto_orbital_transform", wraps=_sr.apply_auto_orbital_transform) as spy:
+        obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+    assert spy.call_count == 1
+    _, kwargs = spy.call_args
+    # The function was called with keyword arguments matching the signature
+    assert kwargs["num_orbital_dimensions"] == 2
+    assert kwargs["us"].shape == (nktot, nb, nb)
+    assert kwargs["sigmas"].shape == (nktot,)
+    assert kwargs["conjs"].shape == (nktot,)
 
 
-def test_map_to_full_bz_output_has_nk_tot_points():
-    """After mapping, the first dimension of mat must be nk_tot."""
-    nb = 3
-    k_grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    k_grid.specify_orbital_basis(nb, "t2g")
+def test_map_to_full_bz_auto_passes_num_orbital_dimensions_4_for_vertex():
+    grid, H = _build_auto_kgrid(nx=3, ny=3, nz=3, nb=2)
+    nb = 2
+    Gamma_full = np.einsum("...ab,...cd->...abcd", H, H)
+    Gamma_ibz = Gamma_full.reshape(-1, nb, nb, nb, nb)[grid.irrk_ind].copy()
+    obj = _DoublePrecisionNonLocal(mat=Gamma_ibz, nq=(3, 3, 3), has_compressed_q_dimension=True)
+    with patch.object(_sr, "apply_auto_orbital_transform", wraps=_sr.apply_auto_orbital_transform) as spy:
+        obj._map_to_full_bz(grid, num_orbital_dimensions=4)
+    _, kwargs = spy.call_args
+    assert kwargs["num_orbital_dimensions"] == 4
 
-    ibz_mat = np.ones((k_grid.nk_irr, nb, nb, nb, nb), dtype=complex)
-    u = k_grid.orbital_rot_u
-    uc = u.conj()
-    mat = ibz_mat[k_grid.irrk_inv.ravel()]
-    mat = np.einsum("qap,qbr,qcs,qdt,qprst->qabcd", u, uc, u, uc, mat)
 
-    assert mat.shape[0] == k_grid.nk_tot, f"Expected first dim {k_grid.nk_tot}, got {mat.shape[0]}"
+def test_map_to_full_bz_legacy_kgrid_does_not_call_orbital_transform():
+    """For a legacy KGrid (not auto-mode), the orbital transform helper must NOT
+    be called: only the IBZ→FBZ replication runs."""
+    grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    nb = 1
+    ibz_payload = np.arange(grid.nk_irr).astype(np.complex128).reshape(grid.nk_irr, nb, nb)
+    obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
+    with patch.object(_sr, "apply_auto_orbital_transform", wraps=_sr.apply_auto_orbital_transform) as spy:
+        obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+    assert spy.call_count == 0
+
+
+def test_map_to_full_bz_raises_for_invalid_num_orbital_dimensions():
+    """Only ``num_orbital_dimensions`` in {2, 4} are supported."""
+    grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
+    H_ibz = H.reshape(-1, 1, 1)[grid.irrk_ind].copy()
+    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
+    with pytest.raises(AssertionError, match="2 or 4"):
+        obj._map_to_full_bz(grid, num_orbital_dimensions=3)
+    with pytest.raises(AssertionError, match="2 or 4"):
+        obj._map_to_full_bz(grid, num_orbital_dimensions=1)
+
+
+def test_map_to_full_bz_raises_when_not_compressed():
+    """The compressed-q convention is required: an already-expanded matrix is
+    not a valid input to ``_map_to_full_bz``."""
+    grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
+    obj = _DoublePrecisionNonLocal(mat=H, nq=(4, 4, 4), has_compressed_q_dimension=False)
+    with pytest.raises(ValueError, match="compressed momentum dimension"):
+        obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+
+
+def test_map_to_full_bz_auto_uses_supplied_nq_override():
+    """The optional ``nq`` argument must override the object's stored ``nq``."""
+    grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
+    H_ibz = H.reshape(-1, 1, 1)[grid.irrk_ind].copy()
+    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(2, 2, 16), has_compressed_q_dimension=True)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=2, nq=(4, 4, 4))
+    assert obj.nq == (4, 4, 4)
+    H_rec = obj.mat.reshape(4, 4, 4, 1, 1)
+    assert np.allclose(H_rec, H, atol=1e-12)
+
+
+def test_map_to_full_bz_auto_returns_self_for_method_chaining():
+    """For ergonomic chaining the method returns ``self``."""
+    grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
+    H_ibz = H.reshape(-1, 1, 1)[grid.irrk_ind].copy()
+    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
+    result = obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+    assert result is obj
+
+
+def test_map_to_full_bz_legacy_returns_self_for_method_chaining():
+    grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    nb = 1
+    ibz_payload = np.arange(grid.nk_irr).astype(np.complex128).reshape(grid.nk_irr, nb, nb)
+    obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
+    result = obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+    assert result is obj
+
+
+def test_map_to_full_bz_auto_1x1x1_trivial_grid_is_identity():
+    """Edge case: a 1×1×1 grid has a single k-point, so the FBZ trivially equals the
+    IBZ and the mapping returns the input unchanged in value."""
+    nb = 2
+    H = np.zeros((1, 1, 1, nb, nb), dtype=complex)
+    H[0, 0, 0] = np.array([[1.0, 0.3], [0.3, 2.0]])
+    grid = bz.KGrid(nk=(1, 1, 1), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid.specify_auto_symmetries(H)
+    H_ibz = H.reshape(-1, nb, nb)[grid.irrk_ind].copy()
+    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(1, 1, 1), has_compressed_q_dimension=True)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+    assert np.allclose(obj.mat.reshape(1, 1, 1, nb, nb), H, atol=1e-14)
+
+
+def test_map_to_full_bz_auto_preserves_dtype():
+    """The output matrix has the same dtype as the input (the function does not
+    silently cast within the auto branch — the cast to complex64 happens elsewhere
+    in ``IHaveMat.mat = value``)."""
+    grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
+    H_ibz_64 = H.reshape(-1, 1, 1)[grid.irrk_ind].astype(np.complex64).copy()
+    obj = _DoublePrecisionNonLocal(mat=H_ibz_64, nq=(4, 4, 4), has_compressed_q_dimension=True)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+    assert obj.mat.dtype == np.complex64
+
+
+def test_map_to_full_bz_auto_irrk_inv_consistency_at_every_fbz_point():
+    """Every FBZ k must end up with the value at irrk_inv[k] transformed by the
+    stored (U_k, sigma_k, conj_k). Check this explicitly point-by-point."""
+    grid, H = _build_auto_kgrid(nx=3, ny=3, nz=3, nb=2)
+    nb = 2
+    H_flat = H.reshape(-1, nb, nb)
+    H_ibz = H_flat[grid.irrk_ind].copy()
+    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(3, 3, 3), has_compressed_q_dimension=True)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+    H_rec = obj.mat.reshape(-1, nb, nb)
+
+    inv = grid.irrk_inv.ravel()
+    Us = grid._auto_us.reshape(-1, nb, nb)
+    sigmas = grid._auto_sigmas.reshape(-1)
+    conjs = grid._auto_conjs.reshape(-1)
+    for k in range(H_rec.shape[0]):
+        block = H_ibz[inv[k]]
+        if conjs[k]:
+            block = block.conj()
+        expected = sigmas[k] * Us[k] @ block @ Us[k].conj().T
+        assert np.allclose(H_rec[k], expected, atol=1e-12), f"mismatch at FBZ k={k}"

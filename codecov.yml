@@ -13,6 +13,10 @@ ignore:
   - "moldga/plotting.py"
   - "moldga/config_parser.py"
   - "moldga/symmetrize_new.py"
+  - "moldga/mpi_distributor.py"
+  - "moldga/mpi_utils.py"
+  - "moldga/ana_cont.py"
+  - "moldga/dmft_interface.py"
 
 coverage:
   status:

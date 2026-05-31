@@ -198,11 +198,28 @@ class LocalNPoint(IHaveMat):
             return self
 
         niw_axis = -(self.num_wn_dimensions + self.num_vn_dimensions)
-        ind = np.arange(1, self.current_shape[niw_axis])
-        freq_axis = tuple(range(-(self.num_wn_dimensions + self.num_vn_dimensions), 0))
-        self.mat = np.concatenate(
-            (np.conj(np.flip(np.take(self.mat, ind, axis=niw_axis), freq_axis)), self.mat), axis=niw_axis
-        )
+        freq_axes = tuple(range(-(self.num_wn_dimensions + self.num_vn_dimensions), 0))
+        n = self.mat.shape[niw_axis]
+
+        out_shape = list(self.mat.shape)
+        out_shape[niw_axis] = n * 2 - 1  # w=0 appears once, not twice
+
+        full_mat = np.empty(out_shape, dtype=self.mat.dtype)
+
+        neg_slice = [slice(None)] * self.mat.ndim
+        neg_slice[niw_axis] = slice(None, n - 1)
+
+        pos_slice = [slice(None)] * self.mat.ndim
+        pos_slice[niw_axis] = slice(n - 1, None)
+
+        src_slice = [slice(None)] * self.mat.ndim
+        src_slice[niw_axis] = slice(1, None)
+
+        np.copyto(full_mat[tuple(pos_slice)], self.mat)
+        np.copyto(full_mat[tuple(neg_slice)], np.flip(self.mat[tuple(src_slice)], axis=freq_axes))
+        np.conj(full_mat[tuple(neg_slice)], out=full_mat[tuple(neg_slice)])
+
+        self.mat = full_mat
         self.update_original_shape()
         self._full_niw_range = True
         return self
@@ -222,9 +239,26 @@ class LocalNPoint(IHaveMat):
         self._full_niw_range = False
         return self
 
-    def flip_frequency_axis(self, axis: tuple | int):
+    def to_half_niv_range(self):
+        r"""
+        Converts the object to the half fermionic frequency range by taking
+        :math:`F^{\omega\nu\nu'}_{abcd}\to F^{\omega;\nu\geq0,\nu'\geq0}_{abcd}`. Returns the original object.
         """
-        Flips the matrix along the specified frequency axis and returns a copy.
+        if self.num_vn_dimensions == 0 or not self.full_niv_range:
+            return self
+
+        if self.num_vn_dimensions == 1:
+            self.mat = self.mat[..., self.niv :]
+        if self.num_vn_dimensions == 2:
+            self.mat = self.mat[..., self.niv :, self.niv :]
+
+        self.update_original_shape()
+        self._full_niv_range = False
+        return self
+
+    def flip_frequency_axis(self, axis: tuple | int, copy: bool = True):
+        """
+        Flips the matrix along the specified frequency axis and returns a copy if specified.
         """
         if self.num_wn_dimensions + self.num_vn_dimensions == 0:
             raise ValueError("Cannot flip the matrix if there are no frequency dimensions.")
@@ -236,20 +270,28 @@ class LocalNPoint(IHaveMat):
         if not set(axis).issubset(axis_possible):
             raise ValueError(f"Invalid axis {axis}. Possible axes are {axis_possible}.")
 
-        copy = deepcopy(self)
-        copy.mat = np.flip(copy.mat, axis=axis)
-        return copy
+        if copy:
+            copy = deepcopy(self)
+            copy.mat = np.flip(copy.mat, axis=axis)
+            return copy
 
-    def swap_fermionic_frequency_axes(self):
+        self.mat = np.flip(self.mat, axis=axis)
+        return self
+
+    def swap_fermionic_frequency_axes(self, copy: bool = True):
         """
-        Swaps two frequency axes of the matrix and returns a copy.
+        Swaps two frequency axes of the matrix and returns a copy if specified.
         """
         if self.num_vn_dimensions < 2:
             raise ValueError("Cannot swap axes if there are less than two fermionic frequency dimensions.")
 
-        copy = deepcopy(self)
-        copy.mat = np.swapaxes(copy.mat, -1, -2)
-        return copy
+        if copy:
+            copy = deepcopy(self)
+            copy.mat = np.swapaxes(copy.mat, -1, -2)
+            return copy
+
+        self.mat = np.swapaxes(self.mat, -1, -2)
+        return self
 
     def save(self, output_dir: str = "./", name: str = "please_give_me_a_name") -> None:
         """

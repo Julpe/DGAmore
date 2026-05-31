@@ -541,7 +541,11 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             )
 
             return FourPoint(
-                np.einsum(einsum_str, self.mat, other.mat, optimize=True),
+                (
+                    np.einsum(einsum_str, self.mat, other.mat, optimize=True)
+                    if left_hand_side
+                    else np.einsum(einsum_str, other.mat, self.mat, optimize=True)
+                ),
                 channel,
                 self.nq,
                 self.num_wn_dimensions,
@@ -594,10 +598,90 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
                 copy.mat[i] = np.linalg.inv(copy.mat[i])
             return copy.to_full_indices()
 
-        self.to_half_niw_range().to_compound_indices()
+        self.to_half_niw_range()
+        if self.num_vn_dimensions == 1:
+            w_dim = self.original_shape[5] if self.has_compressed_q_dimension else self.original_shape[7]
+            self.compress_q_dimension()
+            self.mat = self.mat.transpose(0, 5, 6, 1, 2, 4, 3).reshape(
+                (self.current_shape[0], w_dim, 2 * self.niv, self.n_bands**2, self.n_bands**2)
+            )  # transpose to [q,w,v,o1,o2,o4,o3] and collecting [q,w,v,x1,x2]
+            self.mat = np.linalg.inv(self.mat)  # invert in [x1,x2]
+            # reshape to [q,w,v,o1,o2,o4,o3] and transpose to [q,o1,o2,o3,o4,w,v]
+            self.mat = self.mat.reshape(
+                (self.current_shape[0], w_dim, 2 * self.niv, self.n_bands, self.n_bands, self.n_bands, self.n_bands)
+            ).transpose(0, 3, 4, 6, 5, 1, 2)
+            return self
+
+        self.to_compound_indices()
         for i in range(self.current_shape[0]):
             self.mat[i] = np.linalg.inv(self.mat[i])
         return self.to_full_indices()
+
+    def invert_and_sum_over_last_vn(self, beta: float):
+        """
+        Helper method that explicitly handles the calculation of the sum over the auxiliary susceptibility.
+        """
+        if self.num_vn_dimensions != 2:
+            raise NotImplementedError("Method only implemented for objects with two fermionic frequency dimensions.")
+
+        compound_index_shape = (self.n_bands, self.n_bands, 2 * self.niv)
+        size = np.prod(compound_index_shape)
+
+        self.to_half_niw_range().compress_q_dimension()
+        w_dim = self.original_shape[5] if self.has_compressed_q_dimension else self.original_shape[7]
+
+        new_arr = np.empty(self.original_shape[:-1], dtype=self.mat.dtype)
+        for i in range(self.current_shape[0]):
+            compound_arr = self.mat[i].transpose(4, 0, 1, 5, 3, 2, 6).reshape(w_dim, size, size)
+            new_arr[i] = (
+                np.linalg.inv(compound_arr).reshape((w_dim,) + compound_index_shape * 2).transpose(1, 2, 5, 4, 0, 3, 6)
+            ).sum(axis=-1)
+        self.mat = new_arr / beta
+        self._num_vn_dimensions = 1
+        self.update_original_shape()
+        return self
+
+    def invert_and_sum_over_last_vn_v2(self, beta: float):
+        """
+        Helper method that explicitly handles the calculation of the sum over the auxiliary susceptibility while
+        being highly memory-efficient. Does not invert the matrix directly but uses a linear solver to avoid the
+        creation of large intermediate arrays. This is especially important for objects with a large number of
+        orbital degrees of freedom, where the matrix in compound index space can become very large. Is up to
+        numerical precision the same as 'invert_and_sum_over_last_vn'.
+        """
+        o = self.n_bands
+        vn = 2 * self.niv
+        compound_size = o * o * vn
+
+        self.to_half_niw_range().compress_q_dimension()
+        w_dim = self.original_shape[5] if self.has_compressed_q_dimension else self.original_shape[7]
+
+        new_arr = np.empty(self.original_shape[:-1], dtype=self.mat.dtype)
+
+        idx = np.arange(compound_size)
+
+        # decode flat index -> (o4,o3)
+        idx_o4 = idx // (o * vn)
+        idx_o3 = (idx // vn) % o
+
+        rhs = np.zeros((compound_size, o * o), dtype=self.mat.dtype)
+        rhs[idx, idx_o4 * o + idx_o3] = 1.0
+        rhs = np.ascontiguousarray(rhs)
+
+        rhs_batched = np.broadcast_to(rhs, (w_dim, compound_size, o * o))
+
+        for i in range(self.current_shape[0]):
+            compound_arr = np.ascontiguousarray(self.mat[i].transpose(4, 0, 1, 5, 3, 2, 6)).reshape(
+                w_dim, compound_size, compound_size
+            )
+            new_arr[i] = (
+                np.linalg.solve(compound_arr, rhs_batched).reshape((w_dim, o, o, vn, o, o)).transpose(1, 2, 5, 4, 0, 3)
+            )
+
+        self.mat = new_arr / beta
+        self._num_vn_dimensions = 1
+        self.update_original_shape()
+        return self
 
     @staticmethod
     def load(

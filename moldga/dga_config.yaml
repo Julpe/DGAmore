@@ -4,7 +4,7 @@ box_sizes:
   niv_shell: 0 # Number of fermionic frequencies used for explicit asymptotics. If left at 0, no asymptotics are used. Default: 0
 
 lattice:
-  symmetries: "two_dimensional_square" # Specify lattice symmetry group. For availability, check out the file 'brillouin_zone.py'
+  symmetries: "auto" # Specify lattice symmetry group. For availability, check out the file 'brillouin_zone.py'
   type: "from_wannier90" # Specifies the hopping elements, either from a wannier90 file 'from_wannier90', from a hk file 'from_wannierHK' or from tight-binding parameters 't_tp_tpp'
   hr_input: "/path/to/file" # full path to the wannier_hr.dat/wannier.hk file or list of tight-binding parameters [t, tp, tpp] (only for single-orbital)
   interaction_type: "one_band_from_dmft" # Type of interaction. Available: ['one_band_from_dmft', 'kanamori_from_dmft', 'custom'].
@@ -12,11 +12,7 @@ lattice:
   # calculation. If 'custom', please specify the full path to a file in 'interaction_input' containing orbital and spacial entries for the interaction matrix
   # (similar to how a wannier_hr.dat file is structured, but with 4 orbital indices).
   interaction_input: "" # Full path to the interaction file if interaction_type is 'custom', otherwise the interaction data will be taken from DMFT
-  orbital_basis: "" # Basis of the orbitals. Available options are 't2g'. Notice that this is relevant if one uses lattice symmetries such as three_dimensional_cubic etc.
-  # This has to be set in conjunction with the symmetries of the lattice! If the orbital basis is not set but lattice symmetries are entered, we cannot guarantee that the
-  # symmetries are correctly applied to the orbitals. This setting is only relevant for multi-orbital systems. ATTENTION: make sure that if you use t2g, the order of the orbitals
-  # in the wannier files has to be alphabetical! For example, for a t2g system with three orbitals, the order of the orbitals in the wannier file has to be: dxy, dxz, dyz.
-  nk: [ 16, 16, 1 ] # Number of k-points in x, y and z-direction. Default: [ 16, 16, 1 ]
+  nk: [ 32, 32, 1 ] # Number of k-points in x, y and z-direction. Default: [ 16, 16, 1 ]
   #nq: [ 16, 16, 1 ] # Number of q-points in x, y and z-direction. Default: [ 16, 16, 1 ]. If left empty, nq is set to nk
 
 self_consistency:
@@ -45,6 +41,10 @@ dmft_input:
   # If left empty, no symmetrization will be performed in the orbital indices. This is only relevant for multi-orbital systems.
   # Can be [1,2] or [[1,2]] for a two-orbital system with degenerate orbitals, for example. Also possible are statements like
   # [[1,2], [3,4]] for a four-orbital system with two pairs of degenerate orbitals or [[1,2,3,4]] for a four-orbital system with four degenerate orbitals.
+  # This will be applied on every inequivalent atom individually!
+  n_ineq: 1 # Number of inequivalent atoms in w2dynamics
+  ineq_ordering: [ 1 ] # List of ordering of the inequivalent atoms for the orbital-diagonal entries in DGA. This is only relevant
+  # for multi-orbital systems with more than one inequivalent atom specified in w2dynamics.
 
 eliashberg:
   perform_eliashberg: False # If True, the code will perform a power iteration to solve the linearized Eliashberg equation for the superconducting eigenvalues and gap functions
@@ -67,3 +67,29 @@ output:
   output_path: "" # Path, where the DGA output folders are created. If not specified, the output is created in the input folder directory of the DMFT files
   do_plotting: True # If True, the code will plot some results into the output folder
   plotting_subfolder_name: "Plots" # name for the subfolder where the plots are saved
+
+ana_cont:
+  do_ana_cont_green_dga: False # If True, the code will perform an analytic continuation of the DGA Green's function
+  # using the maximum entropy method from the ana_cont package.
+  do_ana_cont_green_dmft: False # If True, the code will perform an analytic continuation of the DMFT Green's function
+  # and self-energy using the maximum entropy method from the ana_cont package.
+  w_count: 1001 # Number of real-frequency points for the analytic continuation.
+  plot_spectrum: True # If True, the code will plot the spectral function after the analytic continuation.
+  k_path: [ [0.0, 0.0, 0.0, "Gamma"], [0.0, 0.5, 0.0, "X"], [0.5, 0.5, 0.0, "M"], [0.0, 0.0, 0.0, "Gamma"] ] # k-path
+  # for the plot of the spectral function. The format is a list of lists, where each sub-list contains the 3d k-point in
+  # fractional coordinates in the primitive (not conventional!) k-space basis, and the label for the plot.
+  energy_window: [ -2, 3 ] # Energy window for the plot of the spectral function in eV.
+
+memory:
+  save_memory_for_chi0q: False # If True, the code will construct chi0(q) in a way that is more memory efficient,
+  # but much slower. If False, the code will use FFT, which requires larger intermediate arrays, but is much faster.
+  save_memory_for_chiq_aux: False # If True, the code will construct the auxiliary susceptibility chi(q) (equal in size
+  # compared to F(q)) in a way that is more memory efficient, but much slower.
+  save_memory_for_sde: False # If True, the code will perform the calculations in a more
+  # memory efficient way, without the use of FFTs. Setting it to False will not increase the memory usage significantly,
+  # but it is much faster.
+  save_memory_for_fq: False # If True, the code will construct F(qvv') for the d/m channels in a way that is
+  # less memory intensive, but it will increase runtime.
+  save_memory_for_lanczos: False # If True, the code will perform the Lanczos algorithm with the pairing vertex for
+  # the Eliashberg calculation in a more memory efficient way. This will reduce memory usage but increase runtime
+  # due to required MPI communication in each Lanczos step.

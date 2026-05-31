@@ -10,6 +10,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib import ticker
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from scipy.interpolate import RegularGridInterpolator
 
 from moldga.brillouin_zone import KGrid
 from moldga.gap_function import GapFunction
@@ -454,3 +455,104 @@ def plot_gap_function(
         plt.show()
     else:
         plt.close()
+
+
+def plot_spectrum(
+    a_w: np.ndarray,
+    kx: np.ndarray,
+    ky: np.ndarray,
+    kz: np.ndarray,
+    high_sym_points: list[tuple[float, float, float, str]],
+    energy_window: tuple[float, float],
+    beta: float,
+    title: str,
+    fermi_energy: float = 0,
+    output_dir="./",
+    name: str = "",
+    cmap="magma",
+    do_save: bool = True,
+    show: bool = False,
+):
+    """
+    Plots the total (band-summed) spectral function along a high-symmetry path. A(k,w) is
+    expected to be in band-diagonal space already.
+    """
+    n_per_seg = 200
+    # Determine Grid Properties for wrapping
+    k_axes = (kx, ky, kz)
+
+    a_w = np.sum(a_w, axis=-2)  # sum over bands to get total spectral function
+
+    periods = []
+    for ax in k_axes:
+        if len(ax) > 1:
+            step = ax[1] - ax[0]
+            periods.append(ax.max() - ax.min() + step)
+        else:
+            periods.append(2 * np.pi)
+    periods = np.array(periods)
+
+    k_mins = np.array([ax.min() for ax in k_axes])
+
+    path_segments = []
+    labels = [rf"$\Gamma$" if "gamma" in p[3].lower() else rf"${p[3]}$" for p in high_sym_points]
+    points = np.array([p[:3] for p in high_sym_points])
+    points *= periods
+
+    for i in range(len(points) - 1):
+        start, end = points[i], points[i + 1]
+        # Linear interpolation between high-symmetry points
+        seg = np.linspace(start, end, n_per_seg, endpoint=(i == len(points) - 2))
+        path_segments.append(seg)
+    full_path = np.vstack(path_segments)
+
+    # Wrapping & Interpolation
+    path_wrapped = k_mins + (full_path - k_mins) % periods
+
+    nw = a_w.shape[-1]
+    a_on_path = np.zeros((len(full_path), nw))
+
+    # Create interpolator for each energy slice
+    for i in range(nw):
+        interp = RegularGridInterpolator(k_axes, a_w[..., i], bounds_error=False, fill_value=None)
+        a_on_path[:, i] = interp(path_wrapped)
+
+    a_on_path = np.nan_to_num(a_on_path)
+
+    # Calculate X-axis (Arc Length)
+    dists = np.sqrt(np.sum(np.diff(full_path, axis=0) ** 2, axis=1))
+    arc = np.concatenate(([0], np.cumsum(dists)))
+    tick_indices = [min(i * n_per_seg, len(arc) - 1) for i in range(len(labels))]
+    tick_x = arc[tick_indices]
+
+    # 5. Plotting
+    fig, ax = plt.subplots(figsize=(8, 5))
+    v_max = np.percentile(a_on_path, 98)
+
+    w_axis = 5 * beta * np.tan(np.linspace(-np.pi / 2.1, np.pi / 2.1, num=nw, endpoint=True)) / np.tan(np.pi / 2.1)
+
+    pm = ax.pcolormesh(
+        arc, w_axis - fermi_energy, a_on_path.T, cmap=cmap, shading="gouraud", rasterized=True, vmin=0, vmax=v_max
+    )
+
+    # Formatting
+    ax.set_xticks(tick_x)
+    ax.set_xticklabels(labels)
+    ax.set_xlim(arc[0], arc[-1])
+    ax.set_ylim(*energy_window)
+    ax.set_ylabel(r"$\omega - \varepsilon_{\mathrm{F}}$ [eV]")
+    ax.set_title(title)
+
+    # Guidelines
+    for tx in tick_x:
+        ax.axvline(tx, color="white", alpha=0.3, lw=0.8)
+    ax.axhline(0, color="white", lw=1.2, ls="--", alpha=0.6)
+
+    cbar = fig.colorbar(pm, pad=0.02)
+    cbar.set_label(r"$A(\mathbf{k}, \omega)$")
+
+    plt.tight_layout()
+    if do_save:
+        plt.savefig(os.path.join(output_dir, f"spectrum_{name}.png"), dpi=400)
+    if show:
+        plt.show()

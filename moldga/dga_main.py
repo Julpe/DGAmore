@@ -7,6 +7,7 @@
 import itertools as it
 import logging
 import os
+from copy import deepcopy
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,8 +20,13 @@ import moldga.eliashberg_solver as eliashberg_solver
 import moldga.local_sde as local_sde
 import moldga.nonlocal_sde as nonlocal_sde
 import moldga.plotting as plotting
+from moldga import max_ent
+from moldga.brillouin_zone import AUTO_SYMMETRIES_SENTINEL
 from moldga.config_parser import ConfigParser
 from moldga.greens_function import GreensFunction
+from moldga.interaction import LocalInteraction
+from moldga.local_four_point import LocalFourPoint
+from moldga.self_energy import SelfEnergy
 
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
@@ -36,11 +42,14 @@ def execute_dga_routine():
     logger.info(f"Running on {str(comm.size)} {"process" if comm.size == 1 else "processes"}.")
 
     if comm.rank == 0:
-        g_dmft, sigma_dmft, g2_dens, g2_magn = dga_io.load_from_w2dyn_file_and_update_config()
+        g_dmft_per_ineq, sigma_dmft_per_ineq, g2_dens_per_ineq, g2_magn_per_ineq = (
+            dga_io.load_from_dmft_file_and_update_config()
+        )
     else:
-        g_dmft, sigma_dmft, g2_dens, g2_magn = None, None, None, None
+        g_dmft_per_ineq, sigma_dmft_per_ineq, g2_dens_per_ineq, g2_magn_per_ineq = None, None, None, None
 
     (
+        config.dmft,
         config.lattice,
         config.box,
         config.output,
@@ -48,8 +57,12 @@ def execute_dga_routine():
         config.self_consistency,
         config.eliashberg,
         config.lambda_correction,
+        config.self_energy_interpolation,
+        config.memory,
+        config.ana_cont,
     ) = comm.bcast(
         (
+            config.dmft,
             config.lattice,
             config.box,
             config.output,
@@ -57,6 +70,9 @@ def execute_dga_routine():
             config.self_consistency,
             config.eliashberg,
             config.lambda_correction,
+            config.self_energy_interpolation,
+            config.memory,
+            config.ana_cont,
         ),
         root=0,
     )
@@ -68,97 +84,225 @@ def execute_dga_routine():
     logger.info("Config init and folder setup done.")
     logger.info("Loaded data from w2dyn file.")
 
-    g_dmft = comm.bcast(g_dmft, root=0)
-    sigma_dmft = comm.bcast(sigma_dmft, root=0)
-
-    logger.log_memory_usage("g_dmft & sigma_dmft", g_dmft, 2 * comm.size)
-    logger.log_memory_usage("g2_dens & g2_magn", g2_dens, 2)
+    g_dmft_per_ineq = comm.bcast(g_dmft_per_ineq, root=0)
+    sigma_dmft_per_ineq = comm.bcast(sigma_dmft_per_ineq, root=0)
 
     if comm.rank == 0:
-        sigma_dmft.save(name="sigma_dmft", output_dir=config.output.output_path)
-        g_dmft.save(name="g_dmft", output_dir=config.output.output_path)
-        logger.info("Saved sigma_dmft as numpy file.")
+        logger.log_memory_usage("g_dmft & sigma_dmft", g_dmft_per_ineq[0] * len(g_dmft_per_ineq), 2 * comm.size)
+        logger.log_memory_usage("g2_dens & g2_magn", g2_dens_per_ineq[0] * len(g2_dens_per_ineq), 2)
 
-    if config.output.do_plotting and comm.rank == 0:
-        for g2, name in [(g2_dens, "G2_dens"), (g2_magn, "G2_magn")]:
-            for omega in ([0, -10, 10] if config.box.niw_core > 10 else [0]):
-                plotting.plot_nu_nup(g2, omega=omega, name=name, output_dir=config.output.plotting_path)
-        logger.info("Plotted g2 (dens) and g2 (magn).")
+    logger.info("Preprocessing done.")
 
     ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
-    g_loc = GreensFunction.create_g_loc(sigma_dmft.create_with_asympt_up_to_core(), ek)
 
-    if comm.rank == 0:
-        g_loc.save(output_dir=config.output.output_path, name="g_loc")
+    if isinstance(config.lattice.k_grid.symmetries, type(AUTO_SYMMETRIES_SENTINEL)):
+        config.lattice.k_grid.specify_auto_symmetries(ek)
+        logger.info(
+            f"Automatically determined symmetries for the k-grid. The irreducible BZ has "
+            f"{config.lattice.k_grid.nk_irr}/{config.lattice.k_grid.nk_tot} elements."
+        )
+
+        if config.lattice.k_grid.nk == config.lattice.q_grid.nk:
+            config.lattice.q_grid = config.lattice.k_grid
+        else:
+            config.lattice.q_grid.specify_auto_symmetries(ek)
+
+        logger.info(
+            f"Automatically determined symmetries for the q-grid. The irreducible BZ has "
+            f"{config.lattice.q_grid.nk_irr}/{config.lattice.q_grid.nk_tot} elements."
+        )
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
 
-    logger.info("Preprocessing done.")
-    logger.info("Starting local Schwinger-Dyson equation (SDE).")
+    if comm.rank == 0:
+        (
+            g2_dens_full,
+            g2_magn_full,
+            gamma_d_full,
+            gamma_m_full,
+            chi_d_full,
+            chi_m_full,
+            vrg_d_full,
+            vrg_m_full,
+            f_d_full,
+            f_m_full,
+            gchi_d_full,
+            gchi_m_full,
+            sigma_loc_full,
+            sigma_dmft_full,
+            g_dmft_full,
+        ) = (None,) * 15
+        offsets = []
+        offset = 0
+
+        for ineq in config.dmft.ineq_ordering:
+            offsets.append(offset)
+            offset += config.dmft.n_bands_per_ineq[ineq - 1]
+
+        first_block = {}
+        for k, ineq in enumerate(config.dmft.ineq_ordering):
+            if ineq not in first_block:
+                first_block[ineq] = k
+
+        (
+            gamma_d_per_ineq,
+            gamma_m_per_ineq,
+            chi_d_per_ineq,
+            chi_m_per_ineq,
+            vrg_d_per_ineq,
+            vrg_m_per_ineq,
+            f_d_per_ineq,
+            f_m_per_ineq,
+            gchi_d_per_ineq,
+            gchi_m_per_ineq,
+            sigma_loc_per_ineq,
+        ) = ([], [], [], [], [], [], [], [], [], [], [])
+        for ineq in range(1, config.dmft.n_ineq + 1):
+            k = first_block[ineq]
+            n_start = offsets[k]
+            n_end = n_start + config.dmft.n_bands_per_ineq[ineq - 1]
+
+            config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[ineq - 1]
+
+            u_loc_ineq = LocalInteraction(u_loc.mat[n_start:n_end, n_start:n_end, n_start:n_end, n_start:n_end])
+
+            logger.info(f"Starting local Schwinger-Dyson equation (SDE) for atom {ineq}.")
+
+            if comm.rank == 0:
+                (gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc) = (
+                    local_sde.perform_local_schwinger_dyson(
+                        g_dmft_per_ineq[ineq - 1], g2_dens_per_ineq[ineq - 1], g2_magn_per_ineq[ineq - 1], u_loc_ineq
+                    )
+                )
+            else:
+                (gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc) = (None,) * 11
+
+            gamma_d_per_ineq.append(gamma_d)
+            gamma_m_per_ineq.append(gamma_m)
+            chi_d_per_ineq.append(chi_d)
+            chi_m_per_ineq.append(chi_m)
+            vrg_d_per_ineq.append(vrg_d)
+            vrg_m_per_ineq.append(vrg_m)
+            f_d_per_ineq.append(f_d)
+            f_m_per_ineq.append(f_m)
+            gchi_d_per_ineq.append(gchi_d)
+            gchi_m_per_ineq.append(gchi_m)
+            sigma_loc_per_ineq.append(sigma_loc)
+
+            logger.info(f"Local Schwinger-Dyson equation (SDE) for atom {ineq} done.")
+
+        def write_to_full_4pt_quantity(obj_full, obj_ineq: LocalFourPoint, sl: slice):
+            if obj_full is None:
+                obj_full = deepcopy(obj_ineq)
+                obj_full.mat = np.zeros(
+                    (config.sys.n_bands,) * 4 + obj_ineq.current_shape[4:], dtype=obj_ineq.mat.dtype
+                )
+                obj_full.update_original_shape()
+            obj_full[sl, sl, sl, sl] = obj_ineq.mat
+            return obj_full
+
+        def write_to_full_2pt_quantity(
+            obj_full, obj_ineq: SelfEnergy | GreensFunction, sl: slice, has_momentum: bool = True
+        ):
+            if obj_full is None:
+                obj_full = deepcopy(obj_ineq)
+                obj_full.mat = np.zeros(
+                    ((1, 1, 1) + (config.sys.n_bands,) * 2 if has_momentum else (config.sys.n_bands,) * 2)
+                    + (obj_ineq.current_shape[-1],),
+                    dtype=obj_ineq.mat.dtype,
+                )
+                obj_full.update_original_shape()
+            if has_momentum:
+                obj_full[0, 0, 0, sl, sl, :] = obj_ineq.mat
+                obj_full._smom0 = np.zeros((config.sys.n_bands,) * 2)
+                obj_full._smom1 = np.zeros((config.sys.n_bands,) * 2)
+            else:
+                obj_full[sl, sl] = obj_ineq.mat
+            return obj_full
+
+        def write_smom(obj_full: SelfEnergy, obj_ineq: SelfEnergy, sl: slice):
+            obj_full._smom0[sl, sl] = obj_ineq._smom0
+            obj_full._smom1[sl, sl] = obj_ineq._smom1
+            return obj_full
+
+        for idx, ineq in enumerate(config.dmft.ineq_ordering):
+            if comm.rank != 0:
+                continue
+
+            n_start = sum([config.dmft.n_bands_per_ineq[i - 1] for i in config.dmft.ineq_ordering[:idx]])
+            n_end = n_start + config.dmft.n_bands_per_ineq[ineq - 1]
+            s = slice(n_start, n_end)
+
+            g2_dens_full = write_to_full_4pt_quantity(g2_dens_full, g2_dens_per_ineq[ineq - 1], s)
+            g2_magn_full = write_to_full_4pt_quantity(g2_magn_full, g2_magn_per_ineq[ineq - 1], s)
+            gamma_d_full = write_to_full_4pt_quantity(gamma_d_full, gamma_d_per_ineq[ineq - 1], s)
+            gamma_m_full = write_to_full_4pt_quantity(gamma_m_full, gamma_m_per_ineq[ineq - 1], s)
+            chi_d_full = write_to_full_4pt_quantity(chi_d_full, chi_d_per_ineq[ineq - 1], s)
+            chi_m_full = write_to_full_4pt_quantity(chi_m_full, chi_m_per_ineq[ineq - 1], s)
+            vrg_d_full = write_to_full_4pt_quantity(vrg_d_full, vrg_d_per_ineq[ineq - 1], s)
+            vrg_m_full = write_to_full_4pt_quantity(vrg_m_full, vrg_m_per_ineq[ineq - 1], s)
+            f_d_full = write_to_full_4pt_quantity(f_d_full, f_d_per_ineq[ineq - 1], s)
+            f_m_full = write_to_full_4pt_quantity(f_m_full, f_m_per_ineq[ineq - 1], s)
+            gchi_d_full = write_to_full_4pt_quantity(gchi_d_full, gchi_d_per_ineq[ineq - 1], s)
+            gchi_m_full = write_to_full_4pt_quantity(gchi_m_full, gchi_m_per_ineq[ineq - 1], s)
+            sigma_dmft_full = write_to_full_2pt_quantity(sigma_dmft_full, sigma_dmft_per_ineq[ineq - 1], s)
+            g_dmft_full = write_to_full_2pt_quantity(g_dmft_full, g_dmft_per_ineq[ineq - 1], s, has_momentum=False)
+            sigma_loc_full = write_to_full_2pt_quantity(sigma_loc_full, sigma_loc_per_ineq[ineq - 1], s)
+
+            sigma_loc_full = write_smom(sigma_loc_full, sigma_loc_per_ineq[ineq - 1], s)
+            sigma_dmft_full = write_smom(sigma_dmft_full, sigma_dmft_per_ineq[ineq - 1], s)
+
+    if config.lambda_correction.perform_lambda_correction and comm.rank == 0:
+        chi_d_full.save(name="chi_dens_loc", output_dir=config.output.output_path)
+        chi_m_full.save(name="chi_magn_loc", output_dir=config.output.output_path)
 
     if comm.rank == 0:
-        (gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc) = (
-            local_sde.perform_local_schwinger_dyson(g_loc, g2_dens, g2_magn, u_loc)
-        )
-    else:
-        (gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc) = (None,) * 11
+        g2_dens_full.save(name="g2_dens_loc", output_dir=config.output.output_path)
+        g2_magn_full.save(name="g2_magn_loc", output_dir=config.output.output_path)
+        del g2_dens_per_ineq, g2_magn_per_ineq
 
-    # there is no need to broadcast the other quantities
-    sigma_loc = comm.bcast(sigma_loc, root=0)
+        gamma_d_full.save(name="gamma_dens_loc", output_dir=config.output.output_path)
+        gamma_m_full.save(name="gamma_magn_loc", output_dir=config.output.output_path)
 
-    logger.info("Local Schwinger-Dyson equation (SDE) done.")
+        vrg_d_full.save(name="vrg_dens_loc", output_dir=config.output.output_path)
+        vrg_m_full.save(name="vrg_magn_loc", output_dir=config.output.output_path)
+        del vrg_d_full, vrg_m_full
 
-    if (config.lambda_correction.perform_lambda_correction) and comm.rank == 0:
-        chi_d.save(name="chi_dens_loc", output_dir=config.output.output_path)
-        chi_m.save(name="chi_magn_loc", output_dir=config.output.output_path)
-
-    if comm.rank == 0:
-        g2_dens.save(name="g2_dens_loc", output_dir=config.output.output_path)
-        g2_magn.save(name="g2_magn_loc", output_dir=config.output.output_path)
-        del g2_dens, g2_magn
-
-        gamma_d.save(name="gamma_dens_loc", output_dir=config.output.output_path)
-        gamma_m.save(name="gamma_magn_loc", output_dir=config.output.output_path)
-        sigma_loc.save(name="siw_dga_local", output_dir=config.output.output_path)
-
-        vrg_d.save(name="vrg_dens_loc", output_dir=config.output.output_path)
-        vrg_m.save(name="vrg_magn_loc", output_dir=config.output.output_path)
-        del vrg_d, vrg_m
-
-        gchi_d.save(name="gchi_dens_loc", output_dir=config.output.output_path)
-        gchi_m.save(name="gchi_magn_loc", output_dir=config.output.output_path)
-        f_d.save(name="f_dens_loc", output_dir=config.output.output_path)
-        f_m.save(name="f_magn_loc", output_dir=config.output.output_path)
-        del f_d, f_m
+        gchi_d_full.save(name="gchi_dens_loc", output_dir=config.output.output_path)
+        gchi_m_full.save(name="gchi_magn_loc", output_dir=config.output.output_path)
+        f_d_full.save(name="f_dens_loc", output_dir=config.output.output_path)
+        f_m_full.save(name="f_magn_loc", output_dir=config.output.output_path)
+        del f_d_full, f_m_full
         logger.info("Saved all relevant quantities as numpy files.")
 
     if config.output.do_plotting and comm.rank == 0:
-        plotting.plot_nu_nup(gchi_d, omega=0, name=f"Gchi_dens", output_dir=config.output.plotting_path)
-        plotting.plot_nu_nup(gchi_m, omega=0, name=f"Gchi_magn", output_dir=config.output.plotting_path)
+        plotting.plot_nu_nup(gchi_d_full, omega=0, name=f"Gchi_dens", output_dir=config.output.plotting_path)
+        plotting.plot_nu_nup(gchi_m_full, omega=0, name=f"Gchi_magn", output_dir=config.output.plotting_path)
         logger.info(f"Local generalized susceptibilities dens & magn plotted.")
-        del gchi_m, gchi_d
+        del gchi_m_full, gchi_d_full
 
-        gamma_dens_plot = gamma_d.cut_niv(min(config.box.niv_core, 2 * int(config.sys.beta)))
+        gamma_dens_plot = gamma_d_full.cut_niv(min(config.box.niv_core, 2 * int(config.sys.beta)))
         plotting.plot_nu_nup(gamma_dens_plot, omega=0, name="Gamma_dens", output_dir=config.output.plotting_path)
         plotting.plot_nu_nup(gamma_dens_plot, omega=10, name="Gamma_dens", output_dir=config.output.plotting_path)
         plotting.plot_nu_nup(gamma_dens_plot, omega=-10, name="Gamma_dens", output_dir=config.output.plotting_path)
         logger.info("Plotted gamma (dens).")
-        del gamma_dens_plot, gamma_d
+        del gamma_dens_plot, gamma_d_full
 
-        gamma_magn_plot = gamma_m.cut_niv(min(config.box.niv_core, 2 * int(config.sys.beta)))
+        gamma_magn_plot = gamma_m_full.cut_niv(min(config.box.niv_core, 2 * int(config.sys.beta)))
         plotting.plot_nu_nup(gamma_magn_plot, omega=0, name="Gamma_magn", output_dir=config.output.plotting_path)
         plotting.plot_nu_nup(gamma_magn_plot, omega=10, name="Gamma_magn", output_dir=config.output.plotting_path)
         plotting.plot_nu_nup(gamma_magn_plot, omega=-10, name="Gamma_magn", output_dir=config.output.plotting_path)
         logger.info("Plotted gamma (magn).")
-        del gamma_magn_plot, gamma_m
+        del gamma_magn_plot, gamma_m_full
 
+        g_dmft_full._ek = ek
         plotting.chi_checks(
-            [chi_d.mat],
-            [chi_m.mat],
+            [chi_d_full.mat],
+            [chi_m_full.mat],
             config.sys.beta,
             ["Loc-tilde"],
-            g_loc.e_kin,
+            g_dmft_full.e_kin,
             name="loc",
             output_dir=config.output.plotting_path,
         )
@@ -169,8 +313,8 @@ def execute_dga_routine():
         sigma_names = []
         for i, j in it.product(range(config.sys.n_bands), repeat=2):
             try:
-                sigma_list.append(sigma_loc[0, 0, 0, i, j])
-                sigma_list.append(sigma_dmft[0, 0, 0, i, j])
+                sigma_list.append(sigma_loc_full[0, 0, 0, i, j])
+                sigma_list.append(sigma_dmft_full[0, 0, 0, i, j])
                 sigma_names.append(f"SDE{i}{j}")
                 sigma_names.append(f"Input{i}{j}")
             except IndexError:
@@ -191,14 +335,76 @@ def execute_dga_routine():
 
     logger.info("Local DGA routine finished.")
 
+    if comm.rank == 0:
+        sigma_dmft_full.save(name="sigma_dmft", output_dir=config.output.output_path)
+        g_dmft_full.save(name="g_dmft", output_dir=config.output.output_path)
+        sigma_loc_full.save(name="siw_dga_local", output_dir=config.output.output_path)
+
+    if config.output.do_plotting and comm.rank == 0:
+        for g2, name in [(g2_dens_full, f"G2_dens"), (g2_magn_full, f"G2_magn")]:
+            for omega in ([0, -10, 10] if config.box.niw_core > 10 else [0]):
+                plotting.plot_nu_nup(g2, omega=omega, name=name, output_dir=config.output.plotting_path)
+        logger.info(f"Plotted g2 (dens) and g2 (magn).")
+        del g2_dens_full, g2_magn_full
+
+    if comm.rank != 0:
+        sigma_loc_full, sigma_dmft_full, g_dmft_full = (None,) * 3
+
+    # there is no need to broadcast the other quantities
+    sigma_loc_full = comm.bcast(sigma_loc_full, root=0)
+    sigma_dmft_full = comm.bcast(sigma_dmft_full, root=0)
+    g_dmft_full = comm.bcast(g_dmft_full, root=0)
+
     logger.info("Starting non-local ladder-DGA routine.")
-    sigma_dga = nonlocal_sde.calculate_self_energy_q(comm, u_loc, v_nonloc, sigma_dmft, sigma_loc)
-    del sigma_dmft, sigma_loc
+    sigma_dga = nonlocal_sde.calculate_self_energy_q(comm, u_loc, v_nonloc, sigma_dmft_full, sigma_loc_full)
+    del sigma_dmft_full, sigma_loc_full
     logger.info("Non-local ladder-DGA routine finished.")
 
-    giwk_dga = GreensFunction.get_g_full(sigma_dga, config.sys.mu, ek).cut_niv(
-        config.box.niv_full + config.box.niw_core
-    )
+    giwk_dga = GreensFunction.get_g_full(sigma_dga, config.sys.mu, ek)
+
+    if config.ana_cont.do_ana_cont_green_dga:
+        spectrum = max_ent.perform_maxent_giwk(giwk_dga, "DGA", comm)
+
+        if config.ana_cont.plot_spectrum and comm.rank == 0:
+            plotting.plot_spectrum(
+                spectrum,
+                config.lattice.k_grid.kx,
+                config.lattice.k_grid.ky,
+                config.lattice.k_grid.kz,
+                config.ana_cont.k_path,
+                config.ana_cont.energy_window,
+                config.sys.beta,
+                r"$\mathrm{D}\Gamma\mathrm{A} Spectrum$",
+                output_dir=config.output.output_path,
+                name="dga",
+            )
+            logger.info("Plotted DGA spectrum.")
+        del spectrum
+
+    if config.ana_cont.do_ana_cont_green_dmft:
+        g_latt = None
+        if comm.rank == 0:
+            g_latt = GreensFunction(np.load(os.path.join(config.output.output_path, "g_latt_dmft.npy"))).cut_niv(
+                config.box.niv_core
+            )
+        g_latt = comm.bcast(g_latt, root=0)
+        spectrum = max_ent.perform_maxent_giwk(g_latt, "DMFT", comm)
+
+        if config.ana_cont.plot_spectrum and comm.rank == 0:
+            plotting.plot_spectrum(
+                spectrum,
+                config.lattice.k_grid.kx,
+                config.lattice.k_grid.ky,
+                config.lattice.k_grid.kz,
+                config.ana_cont.k_path,
+                config.ana_cont.energy_window,
+                config.sys.beta,
+                r"$\mathrm{DMFT}$",
+                output_dir=config.output.output_path,
+                name="dmft",
+            )
+            logger.info("Plotted DMFT spectrum.")
+        del spectrum
 
     if comm.rank == 0:
         sigma_dga.save(name=f"sigma_dga", output_dir=config.output.output_path)
@@ -252,7 +458,7 @@ def execute_dga_routine():
             raise ValueError("Eliashberg equation can only be solved when nq = nk.")
         logger.info("Starting with Eliashberg equation.")
         lambdas_sing, lambdas_trip, gaps_sing, gaps_trip = eliashberg_solver.solve(
-            giwk_dga, g_loc, u_loc, v_nonloc, comm
+            giwk_dga, g_dmft_full, u_loc, v_nonloc, comm
         )
 
         if comm.rank == 0:
