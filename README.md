@@ -4,9 +4,9 @@
 ---
 
 <p align="center">
-  <img src="dgamore/logos/DGAmore_light.png" alt="DGAmore" width="38%" />
+  <img src="logos/DGAmore_light.png" alt="DGAmore" width="38%" />
   &nbsp;&nbsp;&nbsp;
-  <img src="dgamore/logos/DGAmore_dark.png" alt="DGAmore" width="38%" />
+  <img src="logos/DGAmore_dark.png" alt="DGAmore" width="38%" />
 </p>
 
 ## Introduction
