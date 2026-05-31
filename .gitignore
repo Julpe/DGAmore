@@ -9,7 +9,7 @@ __pycache__/
 *.dat
 
 # Custom configuration files
-moldga/dga_config_*.yaml
+dgamore/dga_config_*.yaml
 
 # Any other files generated during DGA runs
 tests/**/*.hdf5

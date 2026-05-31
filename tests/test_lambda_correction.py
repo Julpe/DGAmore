@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# moLDGA — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
-#          Eliashberg Equation Solver for Strongly Correlated Electron Systems
+# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+#           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
 from unittest.mock import patch
@@ -11,14 +11,14 @@ import mpi4py
 import numpy as np
 import pytest
 
-import moldga.lambda_correction as lc
-from moldga import nonlocal_sde
-from moldga.dga_logger import DgaLogger
-from moldga.four_point import FourPoint
-from moldga.local_four_point import LocalFourPoint
-from moldga.n_point_base import SpinChannel
-import moldga.config as config
-import moldga.brillouin_zone as bz
+import dgamore.lambda_correction as lc
+from dgamore import nonlocal_sde
+from dgamore.dga_logger import DgaLogger
+from dgamore.four_point import FourPoint
+from dgamore.local_four_point import LocalFourPoint
+from dgamore.n_point_base import SpinChannel
+import dgamore.config as config
+import dgamore.brillouin_zone as bz
 
 
 def load_four_point(lc_type: str, filename: str, channel: SpinChannel) -> FourPoint:

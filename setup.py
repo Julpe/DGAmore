@@ -5,7 +5,7 @@ with open("requirements.txt") as f:
     requirements = f.read().splitlines()
 
 setup(
-    name="moldga",
+    name="DGAmore",
     version="1.0.0",
     description="Self-consistent multi-orbital ladder-DGA code for the multi-band Hubbard Model",
     author="Julian Peil",

@@ -1,17 +1,17 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# moLDGA — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
-#          Eliashberg Equation Solver for Strongly Correlated Electron Systems
+# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+#           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
 
 import numpy as np
 import pytest
 
-from moldga import brillouin_zone
-from moldga.brillouin_zone import KGrid
-from moldga.hamiltonian import Hamiltonian, HoppingElement, InteractionElement
+from dgamore import brillouin_zone
+from dgamore.brillouin_zone import KGrid
+from dgamore.hamiltonian import Hamiltonian, HoppingElement, InteractionElement
 
 
 def test_hoppingelement_valid():

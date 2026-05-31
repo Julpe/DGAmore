@@ -1,18 +1,18 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# moLDGA — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
-#          Eliashberg Equation Solver for Strongly Correlated Electron Systems
+# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+#           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from moldga.interaction import LocalInteraction, Interaction
-from moldga.local_four_point import LocalFourPoint
+from dgamore.interaction import LocalInteraction, Interaction
+from dgamore.local_four_point import LocalFourPoint
 import numpy as np
 
-from moldga.n_point_base import SpinChannel
+from dgamore.n_point_base import SpinChannel
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])

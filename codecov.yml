@@ -9,14 +9,15 @@ ignore:
   - "*.txt"
   - "*.html"
   - "**/setup.py"
-  - "moldga/dga_main.py"
-  - "moldga/plotting.py"
-  - "moldga/config_parser.py"
-  - "moldga/symmetrize_new.py"
-  - "moldga/mpi_distributor.py"
-  - "moldga/mpi_utils.py"
-  - "moldga/ana_cont.py"
-  - "moldga/dmft_interface.py"
+  - "dgamore/DGAmore.py"
+  - "dgamore/plotting.py"
+  - "dgamore/config_parser.py"
+  - "dgamore/symmetrize_new.py"
+  - "dgamore/mpi_distributor.py"
+  - "dgamore/mpi_utils.py"
+  - "dgamore/ana_cont.py"
+  - "dgamore/max_ent.py"
+  - "dgamore/dmft_interface.py"
 
 coverage:
   status:

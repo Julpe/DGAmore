@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# moLDGA — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
-#          Eliashberg Equation Solver for Strongly Correlated Electron Systems
+# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+#           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 
-import moldga.brillouin_zone as bz
-from moldga.brillouin_zone import KPath, KnownKPoints, Labels
+import dgamore.brillouin_zone as bz
+from dgamore.brillouin_zone import KPath, KnownKPoints, Labels
 
 
 def test_applies_inversion_symmetry_along_x_axis():
@@ -100,56 +100,56 @@ def test_raises_error_for_insufficient_dimensions_on_x_y_inv():
 
 def test_applies_x_inversion_symmetry_correctly_with_mock():
     mat = np.random.rand(6, 4, 4)
-    with patch("moldga.brillouin_zone.inv_sym") as mock_inv_sym:
+    with patch("dgamore.brillouin_zone.inv_sym") as mock_inv_sym:
         bz.apply_symmetry(mat, bz.KnownSymmetries.X_INV)
         mock_inv_sym.assert_called_once_with(mat, 0)
 
 
 def test_applies_y_inversion_symmetry_correctly_with_mock():
     mat = np.random.rand(4, 6, 4)
-    with patch("moldga.brillouin_zone.inv_sym") as mock_inv_sym:
+    with patch("dgamore.brillouin_zone.inv_sym") as mock_inv_sym:
         bz.apply_symmetry(mat, bz.KnownSymmetries.Y_INV)
         mock_inv_sym.assert_called_once_with(mat, 1)
 
 
 def test_applies_z_inversion_symmetry_correctly_with_mock():
     mat = np.random.rand(4, 4, 6)
-    with patch("moldga.brillouin_zone.inv_sym") as mock_inv_sym:
+    with patch("dgamore.brillouin_zone.inv_sym") as mock_inv_sym:
         bz.apply_symmetry(mat, bz.KnownSymmetries.Z_INV)
         mock_inv_sym.assert_called_once_with(mat, 2)
 
 
 def test_applies_x_y_symmetry_correctly_with_mock():
     mat = np.random.rand(4, 4, 6)
-    with patch("moldga.brillouin_zone.x_y_sym") as mock_x_y_sym:
+    with patch("dgamore.brillouin_zone.x_y_sym") as mock_x_y_sym:
         bz.apply_symmetry(mat, bz.KnownSymmetries.X_Y_SYM)
         mock_x_y_sym.assert_called_once_with(mat)
 
 
 def test_applies_x_z_symmetry_correctly_with_mock():
     mat = np.random.rand(4, 6, 4)
-    with patch("moldga.brillouin_zone.x_z_sym") as mock_x_z_sym:
+    with patch("dgamore.brillouin_zone.x_z_sym") as mock_x_z_sym:
         bz.apply_symmetry(mat, bz.KnownSymmetries.X_Z_SYM)
         mock_x_z_sym.assert_called_once_with(mat)
 
 
 def test_applies_y_z_symmetry_correctly_with_mock():
     mat = np.random.rand(6, 4, 4)
-    with patch("moldga.brillouin_zone.y_z_sym") as mock_y_z_sym:
+    with patch("dgamore.brillouin_zone.y_z_sym") as mock_y_z_sym:
         bz.apply_symmetry(mat, bz.KnownSymmetries.Y_Z_SYM)
         mock_y_z_sym.assert_called_once_with(mat)
 
 
 def test_applies_x_y_inversion_symmetry_correctly_with_mock():
     mat = np.random.rand(6, 6, 4)
-    with patch("moldga.brillouin_zone.x_y_inv") as mock_x_y_inv:
+    with patch("dgamore.brillouin_zone.x_y_inv") as mock_x_y_inv:
         bz.apply_symmetry(mat, bz.KnownSymmetries.X_Y_INV)
         mock_x_y_inv.assert_called_once_with(mat)
 
 
 def test_raises_error_for_unknown_symmetry_with_mock():
     mat = np.random.rand(4, 4, 4)
-    with patch("moldga.brillouin_zone.KnownSymmetries") as mock_known_symmetries:
+    with patch("dgamore.brillouin_zone.KnownSymmetries") as mock_known_symmetries:
         with pytest.raises(AssertionError, match="sym = .* not in known symmetries .*"):
             bz.apply_symmetry(mat, "unknown_symmetry")
         mock_known_symmetries.__contains__.assert_called()
@@ -157,7 +157,7 @@ def test_raises_error_for_unknown_symmetry_with_mock():
 
 def test_applies_multiple_symmetries_in_order():
     mat = np.random.rand(6, 6, 6)
-    with patch("moldga.brillouin_zone.apply_symmetry") as mock_apply_symmetry:
+    with patch("dgamore.brillouin_zone.apply_symmetry") as mock_apply_symmetry:
         bz.apply_symmetries(mat, [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV, bz.KnownSymmetries.Z_INV])
         mock_apply_symmetry.assert_any_call(mat, bz.KnownSymmetries.X_INV)
         mock_apply_symmetry.assert_any_call(mat, bz.KnownSymmetries.Y_INV)
@@ -167,7 +167,7 @@ def test_applies_multiple_symmetries_in_order():
 
 def test_does_nothing_when_no_symmetries_provided():
     mat = np.random.rand(6, 6, 6)
-    with patch("moldga.brillouin_zone.apply_symmetry") as mock_apply_symmetry:
+    with patch("dgamore.brillouin_zone.apply_symmetry") as mock_apply_symmetry:
         bz.apply_symmetries(mat, [])
         mock_apply_symmetry.assert_not_called()
 
@@ -229,7 +229,7 @@ def test_maps_full_bz_to_irreducible_correctly():
     nk = (4, 4, 4)
     symmetries = [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV]
     kgrid = bz.KGrid(nk=nk, symmetries=symmetries)
-    with patch("moldga.brillouin_zone.apply_symmetries") as mock_apply_symmetries:
+    with patch("dgamore.brillouin_zone.apply_symmetries") as mock_apply_symmetries:
         kgrid.set_fbz2irrk()
         mock_apply_symmetries.assert_called_once_with(kgrid.fbz2irrk, symmetries)
 
@@ -238,7 +238,7 @@ def test_handles_empty_symmetry_list_without_error():
     nk = (4, 4, 4)
     symmetries = []
     kgrid = bz.KGrid(nk=nk, symmetries=symmetries)
-    with patch("moldga.brillouin_zone.apply_symmetries") as mock_apply_symmetries:
+    with patch("dgamore.brillouin_zone.apply_symmetries") as mock_apply_symmetries:
         kgrid.set_fbz2irrk()
         mock_apply_symmetries.assert_called_once_with(kgrid.fbz2irrk, symmetries)
 

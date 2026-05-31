@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# moLDGA — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
-#          Eliashberg Equation Solver for Strongly Correlated Electron Systems
+# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+#           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
 import sys
@@ -11,9 +11,9 @@ import types
 import numpy as np
 import pytest
 
-from moldga import brillouin_zone
-from moldga import brillouin_zone as bz
-from moldga.n_point_base import IHaveChannel, IHaveMat, IAmNonLocal, SpinChannel, FrequencyNotation
+from dgamore import brillouin_zone
+from dgamore import brillouin_zone as bz
+from dgamore.n_point_base import IHaveChannel, IHaveMat, IAmNonLocal, SpinChannel, FrequencyNotation
 
 
 # ----- Tests for IHaveMat -----
@@ -903,7 +903,7 @@ def test_filter_q_index_raises_for_out_of_bounds_index():
 # =============================================================================
 from unittest.mock import patch
 
-import moldga.symmetry_reduction as _sr
+import dgamore.symmetry_reduction as _sr
 
 
 def _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1, hopping=1.0, include_antiunitary=False):

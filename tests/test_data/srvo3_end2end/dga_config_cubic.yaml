@@ -6,7 +6,7 @@ box_sizes:
 lattice:
   symmetries: "three_dimensional_cubic" # Specify lattice symmetry group. For availability, check out the file 'brillouin_zone.py'
   type: "from_wannierHK" # Specifies the hopping elements, either from a wannier90 file 'from_wannier90', from a hk file 'from_wannierHK' or from tight-binding parameters 't_tp_tpp'
-  hr_input: "/home/julpe/Documents/repos/moLDGA/tests/test_data/srvo3_end2end/wan_4x4.hk" # full path to the wannier_hr.dat/wannier.hk file or list of tight-binding parameters [t, tp, tpp] (only for single-orbital)
+  hr_input: "/home/julpe/Documents/repos/DGAmore/tests/test_data/srvo3_end2end/wan_4x4.hk" # full path to the wannier_hr.dat/wannier.hk file or list of tight-binding parameters [t, tp, tpp] (only for single-orbital)
   interaction_type: "kanamori_from_dmft" # Type of interaction. Available: ['one_band_from_dmft', 'kanamori_from_dmft', 'custom'].
   # If 'one_band_from_dmft' or if interaction_type is left empty, we use the single-band interaction from DMFT. If 'kanamori_from_dmft', the interaction is parsed from the DMFT
   # calculation. If 'custom', please specify the full path to a file in 'interaction_input' containing orbital and spacial entries for the interaction matrix
@@ -35,7 +35,7 @@ lambda_correction:
 
 dmft_input:
   type: "w2dyn" # Input format. Available is 'w2dyn'
-  input_path: "/home/julpe/Documents/repos/moLDGA/tests/test_data/srvo3_end2end/" # Folder containing the input files. Default: current directory
+  input_path: "/home/julpe/Documents/repos/DGAmore/tests/test_data/srvo3_end2end/" # Folder containing the input files. Default: current directory
   fname_1p: "1p-data.hdf5" # Filename of the one-particle DMFT calculation; default: 1p_data.hdf5
   fname_2p: "g4iw_sym.hdf5" # Name of the two-particle DMFT calculation; default: g4iw_sym.hdf5
   do_sym_v_vp: True # If True, the code will symmetrize G2 in the v and vp indices

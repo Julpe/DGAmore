@@ -1,12 +1,18 @@
+# SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
+# SPDX-License-Identifier: MIT
+#
+# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+#           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+
 from copy import deepcopy
 
 import numpy as np
 import pytest
 from unittest.mock import patch
 
-import moldga.config as real_config
-from moldga.self_energy import SelfEnergy
-from moldga.nonlocal_sde import apply_mixing_strategy
+import dgamore.config as real_config
+from dgamore.self_energy import SelfEnergy
+from dgamore.nonlocal_sde import apply_mixing_strategy
 
 
 BETA = 10.0
@@ -46,7 +52,7 @@ def make_config_mock(
     output_path: str = "./",
     previous_sc_path: str = "./",
 ):
-    """Builds a mock config object for patching moldga.nonlocal_sde.config."""
+    """Builds a mock config object for patching dgamore.nonlocal_sde.config."""
     from unittest.mock import MagicMock
 
     cfg = MagicMock()
@@ -62,7 +68,7 @@ def make_config_mock(
 
 
 def patch_config(**kwargs):
-    return patch("moldga.nonlocal_sde.config", make_config_mock(**kwargs))
+    return patch("dgamore.nonlocal_sde.config", make_config_mock(**kwargs))
 
 
 def run_pulay(
@@ -78,7 +84,7 @@ def run_pulay(
     nk_tot = int(np.prod(NK))
     with (
         patch_config(strategy="pulay", mixing=mixing, n_hist=n_hist, niv_core=niv_core, nk_tot=nk_tot),
-        patch("moldga.nonlocal_sde.read_last_n_sigmas_from_files", return_value=file_sigmas),
+        patch("dgamore.nonlocal_sde.read_last_n_sigmas_from_files", return_value=file_sigmas),
     ):
         return apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=current_iter)
 
@@ -96,7 +102,7 @@ def run_anderson(
     nk_tot = int(np.prod(NK))
     with (
         patch_config(strategy="anderson", mixing=mixing, n_hist=n_hist, niv_core=niv_core, nk_tot=nk_tot),
-        patch("moldga.nonlocal_sde.read_last_n_sigmas_from_files", return_value=file_sigmas),
+        patch("dgamore.nonlocal_sde.read_last_n_sigmas_from_files", return_value=file_sigmas),
     ):
         return apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=current_iter)
 

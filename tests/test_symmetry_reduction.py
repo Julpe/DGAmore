@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# moLDGA — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
-#          Eliashberg Equation Solver for Strongly Correlated Electron Systems
+# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+#           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
 
@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from unittest.mock import patch
 
-import moldga.symmetry_reduction as sr
+import dgamore.symmetry_reduction as sr
 
 
 def test_enumerate_integer_matrices_returns_only_gl3z_matrices():
@@ -855,7 +855,7 @@ def test_auto_discovery_finds_smaller_group_for_anisotropic_lattice():
 def test_auto_discovery_matches_legacy_for_12cubed_cubic_hamiltonian():
     """Auto-discovered IBZ partition must match the legacy three_dimensional_cubic
     partition for a genuinely cubic 3-band Hamiltonian. (12^3 — slower.)"""
-    import moldga.brillouin_zone as bz
+    import dgamore.brillouin_zone as bz
 
     fname, shape = "hk_3band_srvo3_cubic_12x12x12.npy", (12, 12, 12, 3, 3)
     H = _require_hamiltonian(fname, shape)
@@ -873,7 +873,7 @@ def test_auto_discovery_matches_legacy_for_12cubed_cubic_hamiltonian():
 @pytest.mark.slow
 def test_auto_discovery_matches_legacy_for_20cubed_cubic_hamiltonian():
     """Same as above for the 20^3 grid. (Even slower — covers the larger-grid path.)"""
-    import moldga.brillouin_zone as bz
+    import dgamore.brillouin_zone as bz
 
     fname, shape = "hk_3band_srvo3_cubic_20x20x20.npy", (20, 20, 20, 3, 3)
     H = _require_hamiltonian(fname, shape)

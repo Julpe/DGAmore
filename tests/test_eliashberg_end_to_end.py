@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# moLDGA — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
-#          Eliashberg Equation Solver for Strongly Correlated Electron Systems
+# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+#           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
 from contextlib import ExitStack
@@ -12,9 +12,9 @@ import numpy as np
 import pytest
 from mpi4py import MPI as RealMPI
 
-from moldga import config, eliashberg_solver, dga_io
-from moldga.dga_logger import DgaLogger
-from moldga.greens_function import GreensFunction
+from dgamore import config, eliashberg_solver, dga_io
+from dgamore.dga_logger import DgaLogger
+from dgamore.greens_function import GreensFunction
 from tests import conftest
 
 
@@ -31,7 +31,7 @@ def setup():
 
     # 2. Identify all modules that call MPI.Request.Waitall
     # We must patch the 'MPI' name inside these specific modules to bypass the C-extension
-    modules_to_patch = ["moldga.mpi_utils", "moldga.eliashberg_solver"]
+    modules_to_patch = ["dgamore.mpi_utils", "dgamore.eliashberg_solver"]
 
     with ExitStack() as stack:
         # Patch the MPI module reference in each relevant file
@@ -47,7 +47,7 @@ def setup():
         # 3. Apply the global COMM_WORLD patch for general use
         stack.enter_context(patch("mpi4py.MPI.COMM_WORLD", comm_mock))
 
-        # 4. Standard moLDGA Configuration
+        # 4. Standard DGAmore Configuration
         config.logger = DgaLogger(comm_mock, "./")
         conftest.create_default_config(config, folder)
 
