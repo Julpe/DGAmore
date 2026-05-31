@@ -4,5 +4,6 @@ extend-ignore-words-re = [
     "nd",
     "ix",
     "iy",
-    "iz"
+    "iz",
+    "ket"
 ]

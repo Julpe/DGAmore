@@ -12,13 +12,7 @@ import numpy as np
 import pytest
 
 import moldga.config as config
-import moldga.dga_io
-import moldga.greens_function
-import moldga.hamiltonian
-import moldga.local_four_point
-import moldga.self_energy
-import moldga.w2dyn_aux
-from moldga import local_sde
+from moldga import local_sde, dga_io
 from moldga.dga_logger import DgaLogger
 from moldga.greens_function import GreensFunction
 from moldga.local_four_point import LocalFourPoint
@@ -70,7 +64,7 @@ def test_extracts_dmft_quantities_correctly(setup, niw_core, niv_core, niv_shell
     config.box.niv_core = niv_core
     config.box.niv_shell = niv_shell
 
-    g_dmft, s_dmft, g2_dens, g2_magn = moldga.dga_io.load_from_w2dyn_file_and_update_config()
+    g_dmft, s_dmft, g2_dens, g2_magn = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
 
     if niw_core == -1:
         assert config.box.niw_core == 20
@@ -145,7 +139,7 @@ def test_extracts_dmft_quantities_correctly_with_symmetrization(setup, niw_core,
     config.box.niv_shell = niv_shell
     config.dmft.symmetrize_orbitals = [1, 2]
 
-    g_dmft, s_dmft, g2_dens, g2_magn = moldga.dga_io.load_from_w2dyn_file_and_update_config()
+    g_dmft, s_dmft, g2_dens, g2_magn = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
 
     if niw_core == -1:
         assert config.box.niw_core == 20
@@ -196,20 +190,13 @@ def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
     config.box.niv_shell = niv_shell
     config.dmft.symmetrize_orbitals = []
 
-    g_dmft, s_dmft, g2_dens, g2_magn = moldga.dga_io.load_from_w2dyn_file_and_update_config()
+    g_dmft, s_dmft, g2_dens, g2_magn = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
+    config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
 
-    ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
-    g_loc = GreensFunction.create_g_loc(s_dmft.create_with_asympt_up_to_core(), ek)
     u_loc = config.lattice.hamiltonian.get_local_u()
 
-    g_loc_ref_mat = np.load(f"{folder}/g_loc.npy")
-    niv = g_loc_ref_mat.shape[-1] // 2
-    cut = config.box.niw_core + config.box.niv_full + 10
-    g_loc_ref_mat = g_loc_ref_mat[..., niv - cut : niv + cut]
-    assert np.allclose(g_loc.mat, g_loc_ref_mat)
-
     (gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc) = (
-        local_sde.perform_local_schwinger_dyson(g_loc, g2_dens, g2_magn, u_loc)
+        local_sde.perform_local_schwinger_dyson(g_dmft, g2_dens, g2_magn, u_loc)
     )
 
     def compare_quantity(obj_dens_sde, obj_magn_sde, dens_name: str, magn_name: str, num_vn_dimensions: int, niv: int):
@@ -251,4 +238,4 @@ def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
     compare_quantity(gchi_d, gchi_m, "gchi_dens_loc", "gchi_magn_loc", 2, config.box.niv_core)
 
     sigma_loc_ref = np.load(f"{folder}/siw_dga_local.npy")
-    assert np.allclose(sigma_loc.mat, sigma_loc_ref, atol=5e-3)
+    assert np.allclose(sigma_loc.mat, sigma_loc_ref, atol=1e-5)

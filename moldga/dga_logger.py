@@ -57,10 +57,12 @@ class DgaLogger:
         """
         return str(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"))[:-3]
 
-    def _log(self, message: str, level: int, allowed_ranks: tuple = (0,)):
+    def _log(self, message: str, level: int, allowed_ranks: tuple | int = (0,)):
         """
         Logs a message with a specific logging level, but only if the current rank is in the allowed ranks.
         """
+        if isinstance(allowed_ranks, int):
+            allowed_ranks = (allowed_ranks,)
         if self._comm.rank not in allowed_ranks or message is None or message == "" or level < 0:
             return
         self._logger.log(level, f"{self.current_time} | {self.total_elapsed_time} | {message}")

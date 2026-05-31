@@ -69,6 +69,8 @@ class ConfigParser:
         config.lattice = self._build_lattice_config(config_file)
         config.self_energy_interpolation = self._build_self_energy_interpolation_config(config_file)
         config.sys = self._build_system_config(config_file)
+        config.memory = self._build_memory_config(config_file)
+        config.ana_cont = self._build_ana_cont_config(config_file)
 
     def _build_box_config(self, config_file) -> BoxConfig:
         """
@@ -121,7 +123,6 @@ class ConfigParser:
 
         conf.interaction_type = self._try_parse(section, "interaction_type", conf.interaction_type)
         conf.interaction_input = self._try_parse(section, "interaction_input", conf.interaction_input)
-        conf.orbital_basis = self._try_parse(section, "orbital_basis", conf.orbital_basis)
 
         return conf
 
@@ -142,6 +143,8 @@ class ConfigParser:
         conf.fname_2p = self._try_parse(section, "fname_2p", conf.fname_2p)
         conf.do_sym_v_vp = self._try_parse(section, "do_sym_v_vp", conf.do_sym_v_vp)
         conf.symmetrize_orbitals = self._try_parse(section, "symmetrize_orbitals", conf.symmetrize_orbitals)
+        conf.n_ineq = self._try_parse(section, "n_ineq", conf.n_ineq)
+        conf.ineq_ordering = self._try_parse(section, "ineq_ordering", conf.ineq_ordering)
 
         return conf
 
@@ -246,6 +249,47 @@ class ConfigParser:
         conf.do_interpolation = self._try_parse(section, "do_interpolation", conf.do_interpolation)
         conf.beta_target = self._try_parse(section, "target_beta", conf.beta_target)
         conf.niv_target = self._try_parse(section, "target_niv", conf.niv_target)
+
+        return conf
+
+    def _build_memory_config(self, config_file):
+        """
+        Builds the memory config from the config file.
+        """
+        conf = MemoryConfig()
+        try:
+            section = config_file["memory"]
+        except KeyError:
+            config.logger.info(f"'memory' section not found. Using default values.")
+            return conf
+
+        conf.save_memory_for_chi0q = self._try_parse(section, "save_memory_for_chi0q", conf.save_memory_for_chi0q)
+        conf.save_memory_for_chiq_aux = self._try_parse(
+            section, "save_memory_for_chiq_aux", conf.save_memory_for_chiq_aux
+        )
+        conf.save_memory_for_sde = self._try_parse(section, "save_memory_for_sde", conf.save_memory_for_sde)
+        conf.save_memory_for_fq = self._try_parse(section, "save_memory_for_fq", conf.save_memory_for_fq)
+        conf.save_memory_for_lanczos = self._try_parse(section, "save_memory_for_lanczos", conf.save_memory_for_lanczos)
+
+        return conf
+
+    def _build_ana_cont_config(self, config_file):
+        """
+        Builds the analytic continuation config from the config file.
+        """
+        conf = AnaContConfig()
+        try:
+            section = config_file["ana_cont"]
+        except KeyError:
+            config.logger.info(f"'ana_cont' section not found. Using default values.")
+            return conf
+
+        conf.do_ana_cont_green_dga = self._try_parse(section, "do_ana_cont_green_dga", conf.do_ana_cont_green_dga)
+        conf.do_ana_cont_green_dmft = self._try_parse(section, "do_ana_cont_green_dmft", conf.do_ana_cont_green_dmft)
+        conf.w_count = self._try_parse(section, "w_count", conf.w_count)
+        conf.plot_spectrum = self._try_parse(section, "plot_spectrum", conf.plot_spectrum)
+        conf.k_path = self._try_parse(section, "k_path", conf.k_path)
+        conf.energy_window = self._try_parse(section, "energy_window", conf.energy_window)
 
         return conf
 

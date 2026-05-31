@@ -8,7 +8,7 @@ import os
 
 import moldga.brillouin_zone as bz
 import moldga.config as config
-import moldga.w2dyn_aux as w2dyn_aux
+from moldga.dmft_interface import W2dynInterface, TriqsInterface
 from moldga.greens_function import GreensFunction
 from moldga.hamiltonian import Hamiltonian
 from moldga.local_four_point import LocalFourPoint
@@ -31,137 +31,56 @@ def uniquify_path(path: str = None):
     return path
 
 
-def load_from_w2dyn_file_and_update_config(
-    combine_two_atoms_to_one_obj: bool = False,
-) -> tuple[GreensFunction, SelfEnergy, LocalFourPoint, LocalFourPoint]:
+def load_from_dmft_file_and_update_config() -> (
+    tuple[list[GreensFunction], list[SelfEnergy], list[LocalFourPoint], list[LocalFourPoint]]
+):
     """
     Loads data from the w2dyn file and updates the config file.
     If combine_atoms_to_one_obj is True, we are doubling the orbital space and putting the data from the
-    inequivalent atoms into the diagonal blocks after we average over them.
+    (in)equivalent atoms into the diagonal blocks after we average over them.
     """
-    file = w2dyn_aux.W2dynFile(fname=str(os.path.join(config.dmft.input_path, config.dmft.fname_1p)))
+    if config.dmft.type.lower() == "w2dyn":
+        dmft_interface = W2dynInterface()
+    elif config.dmft.type.lower() == "triqs":
+        dmft_interface = TriqsInterface()
+    else:
+        raise ValueError("DMFT input not supported.")
 
-    config.sys.beta = file.get_beta()
+    config.sys.beta = dmft_interface.get_beta()
 
-    config.lattice.interaction.udd = file.get_udd()
-    config.lattice.interaction.udp = file.get_udp()
-    config.lattice.interaction.upp = file.get_upp()
-    config.lattice.interaction.uppod = file.get_uppod()
-    config.lattice.interaction.jdd = file.get_jdd()
-    config.lattice.interaction.jdp = file.get_jdp()
-    config.lattice.interaction.jpp = file.get_jpp()
-    config.lattice.interaction.jppod = file.get_jppod()
-    config.lattice.interaction.vdd = file.get_vdd()
-    config.lattice.interaction.vpp = file.get_vpp()
+    config.lattice.interaction.udd = dmft_interface.get_udd()
+    config.lattice.interaction.jdd = dmft_interface.get_jdd()
+    config.lattice.interaction.vdd = dmft_interface.get_vdd()
 
-    config.sys.mu = file.get_mu()
-    config.sys.nd_bands = file.get_nd()
-    config.sys.np_bands = file.get_np()
-    config.sys.n_bands = config.sys.nd_bands + config.sys.np_bands
-    config.sys.n = file.get_totdens()
-    config.sys.occ_dmft = 2 * np.mean(file.get_rho1(), axis=(1, 3))
+    config.sys.mu = dmft_interface.get_mu()
+    config.sys.mu_dmft = config.sys.mu
+    config.sys.n = dmft_interface.get_totdens()
 
-    if combine_two_atoms_to_one_obj:
-        config.sys.n_bands *= 2
-        config.sys.nd_bands *= 2
-        config.sys.np_bands *= 2
-        config.sys.n *= 2
+    sigma_per_ineq, g_per_ineq, g2_dens_per_ineq, g2_magn_per_ineq = [], [], [], []
+    for ineq in range(1, config.dmft.n_ineq + 1):
+        config.dmft.n_bands_per_ineq.append(dmft_interface.get_nd(ineq))
+        config.sys.occ_dmft_per_ineq.append(dmft_interface.get_occ(ineq))
 
-        config.sys.occ_dmft = np.zeros((config.sys.n_bands, config.sys.n_bands))
-        rho_1_mean = 0.5 * (np.mean(file.get_rho1(), axis=(1, 3)) + np.mean(file.get_rho1(ineq=2), axis=(1, 3)))
-        config.sys.occ_dmft[0:2, 0:2] = 2 * rho_1_mean
-        config.sys.occ_dmft[2:4, 2:4] = 2 * rho_1_mean
+        g2_dens = dmft_interface.get_g2iw(SpinChannel.DENS, ineq)
+        g2_dens_per_ineq.append(g2_dens)
+        g2_magn = dmft_interface.get_g2iw(SpinChannel.MAGN, ineq)
+        g2_magn_per_ineq.append(g2_magn)
 
-    if config.sys.n == 0:
-        config.sys.n = 2 * np.sum(config.sys.occ_dmft)
+        update_frequency_boxes(g2_dens.niw, g2_dens.niv)
 
-    file2 = w2dyn_aux.W2dynG4iwFile(fname=str(os.path.join(config.dmft.input_path, config.dmft.fname_2p)))
-    g2_dens = LocalFourPoint(
-        file2.read_g2_full_multiband(file.get_nd() + file.get_np(), name="dens"), channel=SpinChannel.DENS
-    )
-    g2_magn = LocalFourPoint(
-        file2.read_g2_full_multiband(file.get_nd() + file.get_np(), name="magn"), channel=SpinChannel.MAGN
-    )
+        g_dmft = dmft_interface.get_giw(ineq)
+        g_per_ineq.append(g_dmft)
 
-    if combine_two_atoms_to_one_obj:
-        g2_dens_2 = LocalFourPoint(
-            file2.read_g2_full_multiband(file.get_nd() + file.get_np(), ineq=2, name="dens"), channel=SpinChannel.DENS
-        )
-        g2_magn_2 = LocalFourPoint(
-            file2.read_g2_full_multiband(file.get_nd() + file.get_np(), ineq=2, name="magn"), channel=SpinChannel.MAGN
-        )
+        config.box.niv_dmft = g_dmft.niv
 
-        def construct_large_g2(g2_1: LocalFourPoint, g2_2: LocalFourPoint) -> LocalFourPoint:
-            g2_mean = 0.5 * (g2_1.mat + g2_2.mat)
-            del g2_2
-            g2_1.mat = np.zeros((4, 4, 4, 4, *g2_mean.shape[4:]))
-            g2_1.mat[0:2, 0:2, 0:2, 0:2] = g2_mean
-            g2_1.mat[2:4, 2:4, 2:4, 2:4] = g2_mean
-            del g2_mean
-            return g2_1
+        sigma_dmft = dmft_interface.get_siw(ineq)
+        sigma_per_ineq.append(sigma_dmft)
 
-        g2_dens = construct_large_g2(g2_dens, g2_dens_2)
-        g2_magn = construct_large_g2(g2_magn, g2_magn_2)
-
-    file2.close()
-
-    update_frequency_boxes(g2_dens.niw, g2_dens.niv)
-
-    def extend_orbital(arr: np.ndarray) -> np.ndarray:
-        return np.einsum("i...,ij->ij...", arr, np.eye(arr.shape[0]))
-
-    giw_spin_mean = np.mean(file.get_giw(), axis=1)  # [band,spin,niv]
-    niv_dmft = giw_spin_mean.shape[-1] // 2
-    niv_cut = config.box.niw_core + config.box.niv_full + 10
-    giw_spin_mean = giw_spin_mean[..., niv_dmft - niv_cut : niv_dmft + niv_cut]
-    g_dmft = GreensFunction(extend_orbital(giw_spin_mean))
-
-    if combine_two_atoms_to_one_obj:
-        giw_spin_mean_2 = np.mean(file.get_giw(ineq=2), axis=1)[..., niv_dmft - niv_cut : niv_dmft + niv_cut]
-        giw_spin_mean = 0.5 * (giw_spin_mean + giw_spin_mean_2)
-        del giw_spin_mean_2
-        giw_spin_mean_large = np.zeros((2 * giw_spin_mean.shape[0], *giw_spin_mean.shape[1:]))
-        giw_spin_mean_large[0:2] = giw_spin_mean
-        giw_spin_mean_large[2:4] = giw_spin_mean
-        g_dmft = GreensFunction(extend_orbital(giw_spin_mean_large))
-        del giw_spin_mean_large
-
-    siw_spin_mean = np.mean(file.get_siw(), axis=1)  # [band,spin,niv]
-    siw_spin_mean = extend_orbital(siw_spin_mean)[None, None, None, ...]
-    siw_dc_spin_mean = np.mean(file.get_dc(), axis=-1)  # [band,spin]
-    siw_dc_spin_mean = extend_orbital(siw_dc_spin_mean)[None, None, None, ..., None]
-    siw_spin_mean = siw_spin_mean[..., niv_dmft - niv_cut : niv_dmft + niv_cut]
-    sigma_dmft = SelfEnergy(siw_spin_mean, estimate_niv_core=True) + siw_dc_spin_mean
-
-    if combine_two_atoms_to_one_obj:
-        siw_spin_mean_2 = np.mean(file.get_siw(ineq=2), axis=1)
-        siw_spin_mean_2 = extend_orbital(siw_spin_mean_2)[None, None, None, ...]
-        siw_dc_spin_mean_2 = np.mean(file.get_dc(ineq=2), axis=-1)
-        siw_dc_spin_mean_2 = extend_orbital(siw_dc_spin_mean_2)[None, None, None, ..., None]
-        siw_spin_mean_2 = siw_spin_mean_2[..., niv_dmft - niv_cut : niv_dmft + niv_cut]
-        siw_spin_mean = 0.5 * (siw_spin_mean + siw_spin_mean_2)
-        del siw_spin_mean_2
-        siw_dc_spin_mean = 0.5 * (siw_dc_spin_mean + siw_dc_spin_mean_2)
-        del siw_dc_spin_mean_2
-
-        siw_spin_mean_large = np.zeros(
-            (1, 1, 1, 2 * siw_spin_mean.shape[3], 2 * siw_spin_mean.shape[3], siw_spin_mean.shape[-1])
-        )
-        siw_spin_mean_large[:, :, :, 0:2, 0:2, ...] = siw_spin_mean
-        siw_spin_mean_large[:, :, :, 2:4, 2:4, ...] = siw_spin_mean
-        siw_dc_spin_mean_large = np.zeros_like(siw_spin_mean_large)
-        siw_dc_spin_mean_large[:, :, :, 0:2, 0:2, ...] = siw_dc_spin_mean
-        siw_dc_spin_mean_large[:, :, :, 2:4, 2:4, ...] = siw_dc_spin_mean
-        sigma_dmft = SelfEnergy(siw_spin_mean_large, estimate_niv_core=True) + siw_dc_spin_mean_large
-        del siw_spin_mean_large, siw_dc_spin_mean_large
-
-    del giw_spin_mean, siw_spin_mean, siw_dc_spin_mean
-
-    file.close()
+    config.sys.n_bands = sum(config.dmft.n_bands_per_ineq[ineq - 1] for ineq in config.dmft.ineq_ordering)
 
     config.lattice.hamiltonian = set_hamiltonian(
         config.lattice.type, config.lattice.er_input, config.lattice.interaction_type, config.lattice.interaction_input
-    )
+    )  # Hamiltonian always has config.sys.n_bands orbitals
 
     output_format = "LDGA_Nk{}_Nq{}_wc{}_vc{}_vs{}".format(
         config.lattice.k_grid.nk_tot,
@@ -182,27 +101,26 @@ def load_from_w2dyn_file_and_update_config(
     if not os.path.exists(config.output.eliashberg_path) and config.eliashberg.perform_eliashberg:
         os.makedirs(config.output.eliashberg_path)
 
-    g2_dens = g2_dens.cut_niw_and_niv(config.box.niw_core, config.box.niv_core)
-    g2_magn = g2_magn.cut_niw_and_niv(config.box.niw_core, config.box.niv_core)
+    for i in range(len(g2_dens_per_ineq)):
+        g2_dens_per_ineq[i] = g2_dens_per_ineq[i].cut_niw_and_niv(config.box.niw_core, config.box.niv_core)
+        g2_magn_per_ineq[i] = g2_magn_per_ineq[i].cut_niw_and_niv(config.box.niw_core, config.box.niv_core)
 
-    if config.dmft.symmetrize_orbitals:
-        g2_dens = g2_dens.symmetrize_orbitals(config.dmft.symmetrize_orbitals)
-        g2_magn = g2_magn.symmetrize_orbitals(config.dmft.symmetrize_orbitals)
-        g_dmft = g_dmft.symmetrize_orbitals(config.dmft.symmetrize_orbitals)
-        sigma_dmft = sigma_dmft.symmetrize_orbitals(config.dmft.symmetrize_orbitals)
-        config.logger.info(
-            f"Symmetrized G2 with respect to orbitals {', '.join(str(o) for o in config.dmft.symmetrize_orbitals)}."
-        )
+        if config.dmft.symmetrize_orbitals:
+            g2_dens_per_ineq[i] = g2_dens_per_ineq[i].symmetrize_orbitals(config.dmft.symmetrize_orbitals)
+            g2_magn_per_ineq[i] = g2_magn_per_ineq[i].symmetrize_orbitals(config.dmft.symmetrize_orbitals)
+            g_per_ineq[i] = g_per_ineq[i].symmetrize_orbitals(config.dmft.symmetrize_orbitals)
+            sigma_per_ineq[i] = sigma_per_ineq[i].symmetrize_orbitals(config.dmft.symmetrize_orbitals)
+            config.logger.info(
+                f"Symmetrized G2 with respect to orbitals {', '.join(str(o) for o in config.dmft.symmetrize_orbitals)} "
+                f"for atom {i+1}."
+            )
 
-    if config.dmft.do_sym_v_vp:
-        g2_dens = g2_dens.symmetrize_v_vp()
-        g2_magn = g2_magn.symmetrize_v_vp()
-        config.logger.info(f"Symmetrized G2 with respect to v and v'.")
+        if config.dmft.do_sym_v_vp:
+            g2_dens_per_ineq[i] = g2_dens_per_ineq[i].symmetrize_v_vp()
+            g2_magn_per_ineq[i] = g2_magn_per_ineq[i].symmetrize_v_vp()
+            config.logger.info(f"Symmetrized G2 with respect to v and v' for atom {i+1}.")
 
-    config.lattice.k_grid.specify_orbital_basis(config.sys.n_bands, config.lattice.orbital_basis)
-    config.lattice.q_grid.specify_orbital_basis(config.sys.n_bands, config.lattice.orbital_basis)
-
-    return g_dmft, sigma_dmft, g2_dens, g2_magn
+    return g_per_ineq, sigma_per_ineq, g2_dens_per_ineq, g2_magn_per_ineq
 
 
 def update_frequency_boxes(niw: int, niv: int) -> None:
@@ -246,15 +164,15 @@ def set_hamiltonian(er_type: str, er_input: str | list, int_type: str, int_input
     3. By providing the full path + filename to the U-matrix file. \n
     """
     ham = Hamiltonian()
-    if er_type == "t_tp_tpp":
+    if er_type.lower() == "t_tp_tpp":
         if not isinstance(er_input, list):
             raise ValueError("Invalid input for t, tp, tpp.")
         ham = ham.kinetic_one_band_2d_t_tp_tpp(*er_input)
-    elif er_type == "from_wannier90":
+    elif er_type.lower() == "from_wannier90":
         if not isinstance(er_input, str):
             raise ValueError("Invalid input for wannier_hr.dat.")
         ham = ham.read_hr_w2k(er_input)
-    elif er_type == "from_wannierHK":
+    elif er_type.lower() == "from_wannierhk":
         if not isinstance(er_input, str):
             raise ValueError("Invalid input for wannier.hk.")
         ham, k_points = ham.read_hk_w2k(er_input)
@@ -269,16 +187,16 @@ def set_hamiltonian(er_type: str, er_input: str | list, int_type: str, int_input
     else:
         raise NotImplementedError(f"Hamiltonian type {er_type} not supported.")
 
-    if int_type == "one_band_from_dmft" or int_type == "" or int_type is None:
+    if int_type.lower() == "one_band_from_dmft" or int_type == "" or int_type is None:
         return ham.single_band_interaction(config.lattice.interaction.udd)
-    elif int_type == "kanamori_from_dmft":
+    elif int_type.lower() == "kanamori_from_dmft":
         return ham.kanamori_interaction_d(
-            config.sys.nd_bands,
+            config.sys.n_bands,
             config.lattice.interaction.udd,
             config.lattice.interaction.jdd,
             config.lattice.interaction.vdd,
         )
-    elif int_type == "custom":
+    elif int_type.lower() == "custom":
         if not isinstance(int_input, str):
             raise ValueError("Invalid input for umatrix file.")
         return ham.read_umatrix(int_input)

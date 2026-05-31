@@ -42,6 +42,7 @@ class BoxConfig:
         self.niv_core: int = -1
         self.niv_shell: int = 0
         self.niv_full: int = 0
+        self.niv_dmft: int = 0
 
 
 class LatticeConfig:
@@ -58,7 +59,6 @@ class LatticeConfig:
         self.er_input: str | list = "/path/to/file"
         self.interaction_type: str = "one_band_from_dmft"
         self.interaction_input: str | list = ""
-        self.orbital_basis: str = ""
         self.nk: tuple[int, int, int] = (16, 16, 1)
         self.nq: tuple[int, int, int] = self.nk
 
@@ -133,6 +133,9 @@ class DmftConfig:
         self.fname_2p: str = "g4iw_sym.hdf5"
         self.do_sym_v_vp: bool = True
         self.symmetrize_orbitals: list = []
+        self.n_ineq: int = 1
+        self.ineq_ordering: list[int] = [1]
+        self.n_bands_per_ineq = []
 
 
 class SystemConfig:
@@ -145,13 +148,13 @@ class SystemConfig:
     def __init__(self):
         self.beta: float = 0.0
         self.mu: float = 0.0
+        self.mu_dmft: float = 0.0
         self.n: float = 0.0
-        self.n_bands: int = 1
-        self.nd_bands: int = 1
-        self.np_bands: int = 0
+        self.n_bands: int = 0
         self.occ: np.ndarray = np.ndarray(0)
         self.occ_k: np.ndarray = np.ndarray(0)
         self.occ_dmft: np.ndarray = np.ndarray(0)
+        self.occ_dmft_per_ineq: list[np.ndarray] = []
 
 
 class SelfEnergyInterpolationConfig:
@@ -180,6 +183,39 @@ class OutputConfig:
         self.eliashberg_path: str = "./Eliashberg/"
 
 
+class MemoryConfig:
+    """
+    Class to store parameters that decide, whether the code should perform very fast (but memory-intensive) calculations
+    or less memory-intensive calculations that are substantially slower.
+    """
+
+    def __init__(self):
+        self.save_memory_for_chi0q: bool = False
+        self.save_memory_for_chiq_aux: bool = False
+        self.save_memory_for_sde: bool = False
+        self.save_memory_for_fq: bool = False
+        self.save_memory_for_lanczos: bool = False
+
+
+class AnaContConfig:
+    """
+    Class that takes care of the configuration for the analytic continuation using the maximum entropy method.
+    """
+
+    def __init__(self):
+        self.do_ana_cont_green_dga: bool = False
+        self.do_ana_cont_green_dmft: bool = False
+        self.w_count: int = 1001
+        self.plot_spectrum: bool = False
+        self.k_path: list[tuple[float, float, float, str]] = [
+            (0.0, 0.0, 0.0, "Gamma"),  # default for cubic, must be in primitive k-space
+            (0.0, 0.5, 0.0, "X"),
+            (0.5, 0.5, 0.0, "M"),
+            (0.0, 0.0, 0.0, "Gamma"),
+        ]
+        self.energy_window: tuple[float, float] = (-2, 3)
+
+
 logger: DgaLogger
 box: BoxConfig = BoxConfig()
 lattice: LatticeConfig = LatticeConfig()
@@ -190,3 +226,5 @@ output: OutputConfig = OutputConfig()
 self_energy_interpolation: SelfEnergyInterpolationConfig = SelfEnergyInterpolationConfig()
 self_consistency: SelfConsistencyConfig = SelfConsistencyConfig()
 eliashberg: EliashbergConfig = EliashbergConfig()
+memory: MemoryConfig = MemoryConfig()
+ana_cont: AnaContConfig = AnaContConfig()

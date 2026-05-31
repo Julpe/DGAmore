@@ -16,17 +16,17 @@ import h5py
 import numpy as np
 
 
-def index2component_general_4(num_bands: int, n: int, ind: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def index2component_general(num_bands: int, n_dims: int, ind: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Returns the band and spin components corresponding to a compound index for four-legged objects.
     """
-    bandspin = np.zeros(n, dtype=np.int_)
-    spin = np.zeros(n, dtype=np.int_)
-    band = np.zeros(n, dtype=np.int_)
+    bandspin = np.zeros(n_dims, dtype=np.int_)
+    spin = np.zeros(n_dims, dtype=np.int_)
+    band = np.zeros(n_dims, dtype=np.int_)
     ind_tmp = ind - 1
-    tmp = (2 * num_bands) ** np.arange(n, -1, -1)
+    tmp = (2 * num_bands) ** np.arange(n_dims, -1, -1)
 
-    for i in range(n):
+    for i in range(n_dims):
         bandspin[i] = ind_tmp // tmp[i + 1]
         spin[i] = bandspin[i] % 2
         band[i] = bandspin[i] // 2
@@ -35,57 +35,71 @@ def index2component_general_4(num_bands: int, n: int, ind: int) -> tuple[np.ndar
     return bandspin, band, spin
 
 
-def component2index_general_2(num_bands: int, bands: list, spins: list) -> int:
+def index2component_general_2dims(num_bands: int, ind: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns the band and spin components corresponding to a compound index for two-legged objects.
+    """
+    return index2component_general(num_bands, 2, ind)
+
+
+def index2component_general_4dims(num_bands: int, ind: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns the band and spin components corresponding to a compound index for four-legged objects.
+    """
+    return index2component_general(num_bands, 4, ind)
+
+
+def component2index_general(num_bands: int, n_dims: int, bands: list, spins: list) -> int:
+    """
+    Computes a compound index from band and spin indices for a n_dims-legged object.
+    """
+    assert num_bands > 0, "Number of bands has to be set to non-zero positive integers."
+
+    n_spins = 2
+    dims_bs = n_dims * (num_bands * n_spins,)
+    dims_1 = (num_bands, n_spins)
+
+    bandspin = np.ravel_multi_index((bands, spins), dims_1)
+    return np.ravel_multi_index(bandspin, dims_bs) + 1
+
+
+def component2index_general_2dims(num_bands: int, bands: list, spins: list) -> int:
     """
     Computes a compound index from band and spin indices for a two-legged object.
     """
-    assert num_bands > 0, "Number of bands has to be set to non-zero positive integers."
-
-    n_spins = 2
-    dims_bs = 2 * (num_bands * n_spins,)
-    dims_1 = (num_bands, n_spins)
-
-    bandspin = np.ravel_multi_index((bands, spins), dims_1)
-    return np.ravel_multi_index(bandspin, dims_bs) + 1
+    return component2index_general(num_bands, 2, bands, spins)
 
 
-def component2index_general_4(num_bands: int, bands: list, spins: list) -> int:
+def component2index_general_4dims(num_bands: int, bands: list, spins: list) -> int:
     """
     Computes a compound index from band and spin indices for a four-legged object.
     """
-    assert num_bands > 0, "Number of bands has to be set to non-zero positive integers."
-
-    n_spins = 2
-    dims_bs = 4 * (num_bands * n_spins,)
-    dims_1 = (num_bands, n_spins)
-
-    bandspin = np.ravel_multi_index((bands, spins), dims_1)
-    return np.ravel_multi_index(bandspin, dims_bs) + 1
+    return component2index_general(num_bands, 4, bands, spins)
 
 
-def index2component_band_4(num_bands: int, n: int, ind: int) -> list:
+def index2component_band(num_bands: int, n_dims: int, ind: int) -> list:
     """
     Computes only orbital indices from a compound index for four-legged objects.
     """
     b = []
     ind_tmp = ind - 1
-    for i in range(n):
-        b.append(ind_tmp // (num_bands ** (n - i - 1)))
-        ind_tmp = ind_tmp - b[i] * (num_bands ** (n - i - 1))
+    for i in range(n_dims):
+        b.append(ind_tmp // (num_bands ** (n_dims - i - 1)))
+        ind_tmp = ind_tmp - b[i] * (num_bands ** (n_dims - i - 1))
     return b
 
 
-def component2index_band_4(num_bands: int, n: int, b: list) -> int:
+def component2index_band(num_bands: int, n_dims: int, b: list) -> int:
     """
     Computes a compound index from only orbital indices for four-legged objects.
     """
     ind = 1
-    for i in range(n):
-        ind = ind + num_bands ** (n - i - 1) * b[i]
+    for i in range(n_dims):
+        ind = ind + num_bands ** (n_dims - i - 1) * b[i]
     return ind
 
 
-def _get_worm_components_2(num_bands: int, orbs: list[list[int]]) -> list[int]:
+def get_worm_components_2dims(num_bands: int, orbs: list[list[int]]) -> list[int]:
     """
     Returns the worm components for two-legged objects.
     """
@@ -93,21 +107,21 @@ def _get_worm_components_2(num_bands: int, orbs: list[list[int]]) -> list[int]:
     component_indices = []
     for o in orbs:
         for s in spins:
-            component_indices.append(int(component2index_general_2(num_bands, o, s)))
+            component_indices.append(int(component2index_general_2dims(num_bands, o, s)))
     return sorted(component_indices)
 
 
-def get_worm_components_2(num_bands: int) -> list[int]:
+def get_worm_components_all_2dims(num_bands: int) -> list[int]:
     """
     Returns the list of worm components for a given number of bands for two-legged objects,
     where only relevant spin combinations for the
     density and magnetic channels in the case of SU(2) symmetry are picked.
     """
     orbs = [list(orb) for orb in it.product(range(num_bands), repeat=2)]
-    return _get_worm_components_2(num_bands, orbs)
+    return get_worm_components_2dims(num_bands, orbs)
 
 
-def get_worm_components_partial_2(num_bands: int) -> list[int]:
+def get_worm_components_partial_2dims(num_bands: int) -> list[int]:
     """
     Returns the list of worm components for a given number of bands for two-legged objects,
     where only relevant spin combinations for the
@@ -115,10 +129,10 @@ def get_worm_components_partial_2(num_bands: int) -> list[int]:
     It only lists orbital-diagonal components.
     """
     orbs = [[orb, orb] for orb in range(num_bands)]
-    return _get_worm_components_2(num_bands, orbs)
+    return get_worm_components_2dims(num_bands, orbs)
 
 
-def _get_worm_components_4(num_bands: int, orbs: list[list[int]]) -> list[int]:
+def get_worm_components_4dims(num_bands: int, orbs: list[list[int]]) -> list[int]:
     """
     Returns the worm components for 4-legged objects.
     """
@@ -126,21 +140,21 @@ def _get_worm_components_4(num_bands: int, orbs: list[list[int]]) -> list[int]:
     component_indices = []
     for o in orbs:
         for s in spins:
-            component_indices.append(int(component2index_general_4(num_bands, o, s)))
+            component_indices.append(int(component2index_general_4dims(num_bands, o, s)))
     return sorted(component_indices)
 
 
-def get_worm_components_4(num_bands: int) -> list[int]:
+def get_worm_components_all_4dims(num_bands: int) -> list[int]:
     """
     Returns the list of worm components for a given number of bands for four-legged objecst,
     where only relevant spin combinations for the
     density and magnetic channels in the case of SU(2) symmetry are picked.
     """
     orbs = [list(orb) for orb in it.product(range(num_bands), repeat=4)]
-    return _get_worm_components_4(num_bands, orbs)
+    return get_worm_components_4dims(num_bands, orbs)
 
 
-def get_worm_components_partial_4(num_bands: int) -> list[int]:
+def get_worm_components_partial_4dims(num_bands: int) -> list[int]:
     """
     Returns the list of worm components for a given number of bands for four-legged objects,
     where only relevant spin combinations for the
@@ -157,7 +171,7 @@ def get_worm_components_partial_4(num_bands: int) -> list[int]:
             or orb[0] == orb[1] == orb[2] != orb[3]  # jjji
         )
     ]
-    return _get_worm_components_4(num_bands, orbs)
+    return get_worm_components_4dims(num_bands, orbs)
 
 
 def extract_g2_general(group_string: str, indices: list, file: h5py.File, niw: int, niv: int) -> tuple:
@@ -176,8 +190,8 @@ def extract_g2_general(group_string: str, indices: list, file: h5py.File, niw: i
     # therefore, every time we have to read or write, we have to transpose in vv' (this is a different transpose than above)
     elements = elements.transpose(0, 1, 3, 2)
 
-    # construct G2dens and G2magn the output file
-    bands, spins = zip(*(index2component_general_4(n_bands, 4, int(i))[1:3] for i in indices))
+    # construct G2_dens and G2_magn for the output file
+    bands, spins = zip(*(index2component_general(n_bands, 4, int(i))[1:3] for i in indices))
 
     # since we are SU(2) symmetric, we only have to pick out the elements where the spin is either
     # [0,0,0,0] or [1,1,1,1] for uu component, [0,0,1,1] or [1,1,0,0] for ud component and [0,1,1,0] or [1,0,0,1] for ud_bar component
@@ -192,7 +206,7 @@ def extract_g2_general(group_string: str, indices: list, file: h5py.File, niw: i
 
     for a, b, c, d in it.product(range(n_bands), repeat=4):
         target_orbital = [a, b, c, d]
-        print(f"Collecting G2 for orbitals {target_orbital} ...")
+        print(f"Collecting G2 for orbitals {[t+1 for t in target_orbital]} ...")
 
         idx_dddd, idx_dduu, idx_uudd, idx_uuuu, idx_uddu, idx_duud = (
             next(
@@ -225,7 +239,7 @@ def save_to_file(g2_list: list[np.ndarray], names: list[str], niw: int, nb: int,
     assert len(g2_list) == len(names)
     for wn in range(2 * niw + 1):
         for i, j, k, l in it.product(range(nb), repeat=4):
-            idx = component2index_band_4(nb, 4, [i, j, k, l])
+            idx = component2index_band(nb, 4, [i, j, k, l])
             for g2, name in zip(g2_list, names):
                 output_file[f"ineq-{ineq:03}/{name}/{wn:05}/{idx:05}/value"] = g2[i, j, k, l, wn].transpose()
 
@@ -280,7 +294,7 @@ if __name__ == "__main__":
 
     ineq_numbers.sort()
 
-    n_bands = int(vertex_file[".config"].attrs[f"atoms.1.nd"]) + int(vertex_file[".config"].attrs[f"atoms.1.np"])
+    n_bands = int(vertex_file[".config"].attrs[f"atoms.1.nd"])
 
     for ineq in ineq_numbers:
         print("-----------------------------------------")

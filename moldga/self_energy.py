@@ -19,8 +19,8 @@ from moldga.n_point_base import IAmNonLocal
 
 class SelfEnergy(IAmNonLocal, LocalNPoint):
     """
-    Represents the self-energy. Will automatically map to full niv range if full_niv_range is set to False. This class
-    is a bit of a mess and should be rewritten.
+    Represents the self-energy.
+    This class is a bit of a mess and could be rewritten.
     """
 
     def __init__(
@@ -30,16 +30,15 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
         full_niv_range: bool = True,
         has_compressed_q_dimension: bool = False,
         estimate_niv_core: bool = False,
+        calc_smom: bool = True,
     ):
         LocalNPoint.__init__(self, mat, 2, 0, 1, full_niv_range=full_niv_range)
         IAmNonLocal.__init__(self, mat, nk, has_compressed_q_dimension=has_compressed_q_dimension)
         # TODO: check if this is a reasonable value. I'd suggest it depends on the input data size.
         self._niv_core_min = 20
 
-        if not full_niv_range:
-            self.to_full_niv_range()
-
-        self._smom0, self._smom1 = self.fit_smom()
+        if calc_smom:
+            self._smom0, self._smom1 = self.fit_smom()
         self._niv_core = self._estimate_niv_core() if estimate_niv_core else self.niv
 
     @property
@@ -120,20 +119,6 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
         self._full_niv_range = True
         return self
 
-    def to_half_niv_range(self):
-        """
-        Converts the object to the half fermionic frequency range in-place. Works only on objects
-        with a single fermionic frequency dimension.
-        """
-        if self.num_vn_dimensions == 0 or not self.full_niv_range:
-            return self
-
-        ind = np.arange(self.current_shape[-1] // 2, self.current_shape[-1])
-        self.mat = np.take(self.mat, ind, axis=-1)
-        self.update_original_shape()
-        self._full_niv_range = False
-        return self
-
     def __add__(self, other):
         """
         Adds two SelfEnergy objects.
@@ -206,7 +191,9 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
                     poly = np.polyfit(vn_fit, fit_mat[k, o1, o2, ...], degree)
                     poly_mat[k, o1, o2, :] = np.polyval(poly, vn_full)
 
-        return SelfEnergy(poly_mat, copy.nq, copy.full_niv_range, copy.has_compressed_q_dimension, False)
+        return SelfEnergy(
+            poly_mat, copy.nq, copy.full_niv_range, copy.has_compressed_q_dimension, False
+        ).to_full_niv_range()
 
     def symmetrize_orbitals(self, orbitals: list | np.ndarray) -> "SelfEnergy":
         r"""
@@ -255,7 +242,7 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
             assume_sorted=True,
         )
 
-        return SelfEnergy(interp(vn_out), self.nq, False, self.has_compressed_q_dimension, False)
+        return SelfEnergy(interp(vn_out), self.nq, False, self.has_compressed_q_dimension, False).to_full_niv_range()
 
     def _estimate_niv_core(self, err: float = 1e-5):
         """

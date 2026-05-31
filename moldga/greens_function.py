@@ -66,7 +66,8 @@ def update_mu(
     try:
         mu = opt.newton(root_fun, mu, args=(target_filling, ek, sigma_mat, beta, smom0), tol=1e-6)
     except RuntimeError:
-        config.logger.debug("Root finding for chemical potential failed, using old chemical potential.")
+        config.logger.debug("Root finding for chemical potential failed.")
+        return np.nan
 
     if np.abs(mu.imag) < 1e-8:
         mu = mu.real
@@ -98,7 +99,7 @@ class GreensFunction(IAmNonLocal, LocalNPoint):
         if sigma is not None and ek is not None and calc_filling:
             self.mat = self._get_gloc_mat()
             # config.sys.n, config.sys.occ = self._get_fill()
-            config.sys.n, config.sys.occ, config.sys.occ_k = self._get_fill_nonlocal()
+            config.sys.n, config.sys.occ, config.sys.occ_k = self.get_fill_nonlocal()
 
     @property
     def e_kin(self):
@@ -204,7 +205,7 @@ class GreensFunction(IAmNonLocal, LocalNPoint):
         niv_cut_range = np.arange(-niv_cut, niv_cut)
         return self.mat[..., self.niv + niv_cut_range[None, :] - wn[:, None]]
 
-    def _get_fill_nonlocal(self) -> tuple[float, np.ndarray, np.ndarray]:
+    def get_fill_nonlocal(self) -> tuple[float, np.ndarray, np.ndarray]:
         """
         Returns the total filling, the k-mean of the occupation (shape [o1, o2]) and the occupation
         (shape [k, o1, o2]).
@@ -212,6 +213,7 @@ class GreensFunction(IAmNonLocal, LocalNPoint):
         mat = self._get_gfull_mat()
         g_model = self._get_g_model_k_mat()
         smom0 = self._sigma.smom[0][None, None, None, ...]
+
         mu_bands: np.ndarray = config.sys.mu * np.eye(self.n_bands)[None, None, None, ...]
 
         eigenvals, eigenvecs = np.linalg.eig(config.sys.beta * (self._ek.real + smom0 - mu_bands))
@@ -226,8 +228,10 @@ class GreensFunction(IAmNonLocal, LocalNPoint):
 
         rho_k = (eigenvecs @ rho_diag_k @ np.linalg.inv(eigenvecs)).reshape((*self.nq, self.n_bands, self.n_bands))
         occ_k = rho_k + np.sum(mat.real - g_model.real, axis=-1) / config.sys.beta
+        occ_k.real[np.abs(occ_k) < 1e-12] = 0.0
 
         occ_mean = np.mean(occ_k, axis=(0, 1, 2))
+        occ_mean.real[np.abs(occ_mean) < 1e-12] = 0.0
         n_el = 2.0 * np.trace(occ_mean).real
         return n_el, occ_mean, occ_k
 
