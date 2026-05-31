@@ -4,6 +4,7 @@
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import builtins
 import os
 
 import numpy as np
@@ -1101,3 +1102,394 @@ def test_get_symmetry_reduction_default_yields_no_conjugation_in_expansion():
     assert np.allclose(H_rec, H, atol=1e-12)
     # And: every per-k transformation has conj=False (asserted directly here).
     assert int(result["conjs"].sum()) == 0
+
+
+# ============================================================================
+# Full path / branch coverage for previously-untested branches.
+#
+# The tests below exercise the remaining defensive and rarely-hit branches so
+# that statement *and* branch coverage of symmetry_reduction.py is complete:
+#   * _canonicalize_sign_gauge: the norb > 6 row-canonicalization fallback
+#     (both the "canon succeeds" and "canon breaks the solution" outcomes) and
+#     the accepted lower-score sign-diagonal in the <=6 path.
+#   * _solve_U_for_op: the norb==1 None return (spectra close but H differs by
+#     more than atol), the per-point eigh-spectra-disagree `continue`, and the
+#     degenerate-cluster gauge-fix route.
+#   * _fix_phases_nondegenerate: the near-zero ratio `continue`.
+#   * _fix_gauge_degenerate: both np.linalg.LinAlgError fallbacks (stacked SVD
+#     and per-block SVD).
+#   * _discover_symmetries: hash-collision handling, zero-pivot U canonicalization,
+#     and the duplicate-action skip.
+#   * _grid_action_bytes: cache eviction past the size cap.
+#   * _close_group: the early return when max_size is reached mid-composition.
+#   * _GroupElement: near-zero U skips phase normalization.
+#   * apply_auto_orbital_transform: the 4-orbital einsum branch and the cached
+#     einsum-path reuse for a second non-identity group (2- and 4-index).
+# ============================================================================
+
+
+# ---- _canonicalize_sign_gauge ----------------------------------------------
+
+
+def test_canonicalize_sign_gauge_norb_gt_6_fallback_flips_negative_rows():
+    """For norb > 6 the routine uses a row-major canonicalization: each row is
+    scaled by the sign of its largest-magnitude entry. With a diagonal H the
+    sign flips cancel in U H U^dag, so the canonicalized U is returned."""
+    norb = 8
+    Hk = np.diag(np.arange(1.0, norb + 1)).astype(complex)[None, None, None]
+    Hg = Hk.copy()
+    U = np.diag([1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0]).astype(complex)
+
+    out = sr._canonicalize_sign_gauge(U, Hk, Hg, atol=1e-10)
+
+    for i in range(norb):
+        j = int(np.argmax(np.abs(out[i])))
+        assert out[i, j].real > 0  # every row's dominant entry made positive
+    rhs = np.einsum("ij,...jk,lk->...il", out, Hk, out.conj())
+    assert np.allclose(Hg, rhs, atol=1e-10)
+
+
+def test_canonicalize_sign_gauge_norb_gt_6_returns_original_when_canon_breaks_solution():
+    """If the row-major sign flip moves U out of the centralizer of a *non*-
+    degenerate H, the resulting matrix no longer solves U H U^dag = Hg and the
+    original U is returned unchanged. A rotation angle near pi/2 makes exactly
+    one row of the 2x2 block flip (so the flip does not cancel)."""
+    norb = 7
+    base = np.diag(np.arange(1.0, norb + 1))
+    base[0, 1] = base[1, 0] = 0.3  # off-diagonal: a single-row flip is detectable
+    Hk = base[None, None, None].astype(complex)
+
+    th = 1.3  # |sin| > |cos|, sin > 0: row 0's dominant entry (-sin) is negative,
+    #           row 1's dominant entry (sin) is positive -> exactly ONE row flips
+    c, s = np.cos(th), np.sin(th)
+    U = np.eye(norb)
+    U[0, 0] = c
+    U[0, 1] = -s
+    U[1, 0] = s
+    U[1, 1] = c
+    U = U.astype(complex)
+    Hg = np.einsum("ij,...jk,lk->...il", U, Hk, U.conj())
+
+    # Sanity on the flip pattern: row 0 dominant entry negative, row 1 positive.
+    assert U[0, 1].real < 0 and abs(U[0, 1]) > abs(U[0, 0])
+    assert U[1, 0].real > 0 and abs(U[1, 0]) > abs(U[1, 1])
+
+    out = sr._canonicalize_sign_gauge(U, Hk, Hg, atol=1e-10)
+    assert np.array_equal(out, U)  # canon broke the relation -> original returned
+
+
+def test_canonicalize_sign_gauge_accepts_lower_score_sign_diagonal():
+    """For norb <= 6 the routine searches sign-diagonals. Starting from U = -I
+    (two negative entries), D = -I yields +I (zero negative entries) which still
+    solves, so the lower-score solution is accepted."""
+    Hk = np.diag([1.0, 2.0]).astype(complex)[None, None, None]
+    Hg = Hk.copy()
+    U = -np.eye(2, dtype=complex)
+
+    out = sr._canonicalize_sign_gauge(U, Hk, Hg, atol=1e-10)
+    assert np.allclose(out, np.eye(2), atol=1e-12)
+
+
+# ---- _solve_U_for_op --------------------------------------------------------
+
+
+def test_solve_u_for_op_one_orbital_returns_none_when_close_but_outside_atol():
+    """norb==1: spectra agree within 10*atol (the pre-screen passes) but H itself
+    differs by more than atol, so the final validation fails and None is returned.
+    Near-zero values keep allclose's relative term from masking the difference."""
+    Hg = np.array([[[[[0.0 + 0j]]]]])
+    Hk = np.array([[[[[5e-12 + 0j]]]]])
+    assert sr._solve_U_for_op(Hg, Hk, atol=1e-12) is None
+
+
+def test_solve_u_for_op_continues_when_perpoint_eigh_spectra_disagree(monkeypatch):
+    """The global eigenvalue pre-screen passes (Hk == Hg), but a patched eigh
+    desynchronizes the per-point spectra between the Hk and Hg evaluations, so
+    every candidate reference point hits the `continue` and None is returned."""
+    Hk = np.zeros((2, 1, 1, 2, 2), dtype=complex)
+    Hk[..., 0, 0] = np.array([1.0, 1.0]).reshape(2, 1, 1)
+    Hk[..., 1, 1] = np.array([2.0, 3.0]).reshape(2, 1, 1)
+    Hg = Hk.copy()
+
+    calls = {"n": 0}
+
+    def fake_eigh(a):
+        calls["n"] += 1
+        if calls["n"] % 2 == 1:  # the Hk evaluation
+            return np.array([0.0, 1.0]), np.eye(2, dtype=complex)
+        return np.array([0.0, 2.0]), np.eye(2, dtype=complex)  # the Hg evaluation
+
+    monkeypatch.setattr(sr.np.linalg, "eigh", fake_eigh)
+    assert sr._solve_U_for_op(Hg, Hk, atol=1e-12) is None
+    assert calls["n"] >= 2
+
+
+def test_solve_u_for_op_routes_through_degenerate_gauge_fix():
+    """A 2-fold degenerate spectrum forces the degenerate-cluster branch: the
+    naive W @ V^dag picks an arbitrary orientation of the degenerate eigenspace
+    that does not match the (fixed) U relating Hk and Hg, so _fix_gauge_degenerate
+    must solve for the block rotation. The returned U must satisfy the relation."""
+    norb = 3
+    nk = (6, 1, 1)
+    rng = np.random.default_rng(0)
+    D = np.diag([0.0, 1.0, 1.0])  # eigenvalue 1 is 2-fold degenerate
+    th = 0.6
+    U_true = np.eye(norb)
+    U_true[1, 1] = np.cos(th)
+    U_true[1, 2] = -np.sin(th)
+    U_true[2, 1] = np.sin(th)
+    U_true[2, 2] = np.cos(th)
+
+    Hk = np.zeros((*nk, norb, norb), dtype=complex)
+    Hg = np.zeros((*nk, norb, norb), dtype=complex)
+    for kx in range(nk[0]):
+        B, _ = np.linalg.qr(rng.standard_normal((norb, norb)))
+        local = B @ D @ B.T
+        Hk[kx, 0, 0] = local
+        Hg[kx, 0, 0] = U_true @ local @ U_true.T
+
+    out = sr._solve_U_for_op(Hg, Hk, atol=1e-9)
+    assert out is not None
+    rhs = np.einsum("ij,...jk,lk->...il", out, Hk, out.conj())
+    assert np.allclose(rhs, Hg, atol=1e-8)
+
+
+# ---- _fix_phases_nondegenerate ---------------------------------------------
+
+
+def test_fix_phases_nondegenerate_hits_near_zero_ratio_continue():
+    """When A[r, col] is significant but B[r, col] ~ 0, the candidate phase has
+    near-zero magnitude and is skipped (`continue`). With no column yielding a
+    consistent phase, every trial fails and None is returned."""
+    nk = (3, 1, 1)
+    Hk = np.zeros((*nk, 2, 2), dtype=complex)
+    Hg = np.zeros((*nk, 2, 2), dtype=complex)
+    for kx in range(nk[0]):
+        Hk[kx, 0, 0] = np.array([[1.0, 0.5], [0.5, 2.0]])  # A[1,0] = 0.5 (> 1e-4)
+        Hg[kx, 0, 0] = np.array([[1.0, 0.0], [0.0, 2.0]])  # B[1,0] = 0
+    V = np.eye(2, dtype=complex)
+    W = np.eye(2, dtype=complex)
+
+    assert sr._fix_phases_nondegenerate(V, W, Hk, Hg, (0, 0, 0), atol=1e-12) is None
+
+
+# ---- _fix_gauge_degenerate (LinAlgError fallbacks) -------------------------
+
+
+def test_fix_gauge_degenerate_returns_none_on_stacked_svd_linalgerror(monkeypatch):
+    """If the SVD of the stacked constraint matrix raises LinAlgError, the routine
+    returns None."""
+    nk = (2, 1, 1)
+    Hk = np.zeros((*nk, 2, 2), dtype=complex)
+    Hg = np.zeros((*nk, 2, 2), dtype=complex)
+    Hk[:, 0, 0] = np.eye(2)
+    Hg[:, 0, 0] = np.eye(2)
+
+    def boom(*a, **k):
+        raise np.linalg.LinAlgError("forced")
+
+    monkeypatch.setattr(sr.np.linalg, "svd", boom)
+    out = sr._fix_gauge_degenerate(
+        np.eye(2, dtype=complex), np.eye(2, dtype=complex), [[0, 1]], Hk, Hg, atol=1e-12
+    )
+    assert out is None
+
+
+def test_fix_gauge_degenerate_returns_none_on_block_svd_linalgerror(monkeypatch):
+    """If the per-block SVD raises LinAlgError (after the stacked SVD succeeded
+    and a null vector was found), the routine returns None."""
+    nk = (2, 1, 1)
+    Hk = np.zeros((*nk, 2, 2), dtype=complex)
+    Hg = np.zeros((*nk, 2, 2), dtype=complex)
+    Hk[:, 0, 0] = np.eye(2)
+    Hg[:, 0, 0] = np.eye(2)
+
+    real_svd = np.linalg.svd
+    state = {"n": 0}
+
+    def flaky_svd(a, *args, **kwargs):
+        state["n"] += 1
+        if state["n"] == 1:
+            return real_svd(a, *args, **kwargs)  # stacked SVD succeeds
+        raise np.linalg.LinAlgError("forced on block")
+
+    monkeypatch.setattr(sr.np.linalg, "svd", flaky_svd)
+    out = sr._fix_gauge_degenerate(
+        np.eye(2, dtype=complex), np.eye(2, dtype=complex), [[0, 1]], Hk, Hg, atol=1e-12
+    )
+    assert out is None
+    assert state["n"] >= 2
+
+
+# ---- _discover_symmetries (rare branches) ----------------------------------
+
+
+def test_discover_symmetries_handles_hash_collision_of_grid_actions(monkeypatch):
+    """Two M's with distinct grid actions but a (forced) identical hash must both
+    be kept: the collision is confirmed via array comparison and the second M is
+    appended rather than dropped."""
+    H = np.zeros((2, 1, 1, 1, 1), dtype=complex)
+    with patch.object(
+        sr,
+        "_enumerate_integer_matrices",
+        return_value=[np.eye(3, dtype=np.int64), np.diag([-1, 1, 1]).astype(np.int64)],
+    ):
+        with patch.object(sr, "_M_preserves_grid", return_value=True):
+            with patch.object(
+                sr,
+                "_apply_M_to_kgrid_indices",
+                side_effect=[np.array([0, 1], dtype=np.int64), np.array([1, 0], dtype=np.int64)],
+            ):
+                with patch.object(sr, "_apply_M_to_ev_field", return_value=np.zeros((2, 1, 1, 1))):
+                    with patch.object(sr, "_solve_U_for_op", return_value=np.eye(1)):
+                        monkeypatch.setattr(builtins, "hash", lambda x: 1234)  # force collision
+                        ops, n = sr._discover_symmetries(H, atol=1e-12, verbose=False)
+    assert n == len(ops)
+    assert n >= 1
+
+
+def test_discover_symmetries_handles_zero_pivot_in_U_canonicalization():
+    """When the solver returns an all-near-zero U, the canonical-bytes helper has
+    a near-zero pivot magnitude and skips the phase division (the else branch)."""
+    H = np.zeros((1, 1, 1, 1, 1), dtype=complex)
+    with patch.object(sr, "_enumerate_integer_matrices", return_value=[np.eye(3, dtype=np.int64)]):
+        with patch.object(sr, "_M_preserves_grid", return_value=True):
+            with patch.object(sr, "_apply_M_to_kgrid_indices", return_value=np.array([0], dtype=np.int64)):
+                with patch.object(sr, "_apply_M_to_ev_field", return_value=np.zeros((1, 1, 1, 1))):
+                    with patch.object(sr, "_solve_U_for_op", return_value=np.zeros((1, 1), dtype=complex)):
+                        ops, n = sr._discover_symmetries(H, atol=1e-12, verbose=False)
+    assert n == len(ops)
+
+
+def test_discover_symmetries_skips_duplicate_action_key():
+    """Two distinct M's whose translated grid actions coincide for some q (with
+    identical sigma/conj/U) produce the same action key; the duplicate is skipped
+    rather than recorded twice."""
+    H = np.zeros((2, 1, 1, 1, 1), dtype=complex)
+    with patch.object(
+        sr,
+        "_enumerate_integer_matrices",
+        return_value=[np.eye(3, dtype=np.int64), np.diag([-1, 1, 1]).astype(np.int64)],
+    ):
+        with patch.object(sr, "_M_preserves_grid", return_value=True):
+            with patch.object(
+                sr,
+                "_apply_M_to_kgrid_indices",
+                side_effect=[np.array([0, 1], dtype=np.int64), np.array([1, 0], dtype=np.int64)],
+            ):
+                with patch.object(sr, "_apply_M_to_ev_field", return_value=np.zeros((2, 1, 1, 1))):
+                    with patch.object(sr, "_solve_U_for_op", return_value=np.eye(1)):
+                        ops, n = sr._discover_symmetries(H, atol=1e-12, verbose=False)
+    # With H == 0 every q matches, so both M's enumerate overlapping actions; the
+    # duplicate-action guard keeps the op set deduplicated.
+    assert n == len(ops)
+
+
+# ---- _grid_action_bytes (cache eviction) -----------------------------------
+
+
+def test_grid_action_bytes_evicts_cache_past_size_cap():
+    """When the cache grows beyond its cap, the next insertion clears it first."""
+    sr._clear_grid_action_cache()
+    try:
+        sr._grid_action_cache.update({i: b"" for i in range(200001)})
+        assert len(sr._grid_action_cache) > 200000
+        sr._grid_action_bytes(np.eye(3, dtype=np.int64), np.array([1, 0, 0], dtype=np.int64), (2, 2, 1))
+        assert len(sr._grid_action_cache) == 1  # cleared, then the new entry stored
+    finally:
+        sr._clear_grid_action_cache()
+
+
+# ---- _close_group (max_size early return) ----------------------------------
+
+
+def test_close_group_returns_early_when_max_size_reached_during_composition():
+    """A translation generator on an 8-point axis generates an 8-element cyclic
+    group; with max_size=4 the closure aborts mid-composition and returns the
+    partially-built group."""
+    nk = (8, 1, 1)
+    ops_raw = [
+        {
+            "M": np.eye(3, dtype=np.int64),
+            "q": np.array([1, 0, 0], dtype=np.int64),
+            "U": np.eye(1, dtype=complex),
+            "sigma": 1,
+            "conj": False,
+        }
+    ]
+    group = sr._close_group(ops_raw, norb=1, nk=nk, max_size=4)
+    assert len(group) >= 4
+
+
+# ---- _GroupElement (near-zero U) -------------------------------------------
+
+
+def test_group_element_with_near_zero_U_skips_phase_normalization():
+    """A U whose entries are all ~0 has a near-zero pivot magnitude, so the global
+    phase normalization is skipped (the False side of the pivot guard)."""
+    g = sr._GroupElement(
+        np.eye(3, dtype=np.int64),
+        np.zeros(3, dtype=np.int64),
+        np.zeros((2, 2), dtype=complex),
+        +1,
+        False,
+        (1, 1, 1),
+    )
+    assert np.allclose(g.U, 0.0)
+
+
+# ---- apply_auto_orbital_transform (einsum path + path reuse) ---------------
+
+
+def _rot2(theta):
+    return np.array(
+        [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]], dtype=np.complex128
+    )
+
+
+def test_apply_auto_orbital_transform_four_orbital_nonidentity_einsum():
+    """A non-identity U with 4 orbital axes exercises the rank-4 einsum branch
+    (the identity short-circuit does not apply)."""
+    u = _rot2(np.pi / 5)
+    mat = np.arange(1, 1 + 16, dtype=np.complex128).reshape(1, 2, 2, 2, 2)
+    us = np.array([u])
+    sigmas = np.array([1], dtype=int)
+    conjs = np.array([False], dtype=bool)
+
+    out = sr.apply_auto_orbital_transform(mat.copy(), us, sigmas, conjs, num_orbital_dimensions=4)
+
+    uc = u.conj()
+    expected = np.einsum("ap,bq,cr,ds,kpqrs->kabcd", u, uc, u, uc, mat)
+    assert np.allclose(out, expected)
+
+
+def test_apply_auto_orbital_transform_reuses_cached_path_two_dim():
+    """Two distinct non-identity groups in one call: the second reuses the cached
+    2-index einsum path (the False side of `if path_2 is None`)."""
+    us = np.stack([_rot2(np.pi / 5), _rot2(np.pi / 3)])
+    mat = np.arange(2 * 2 * 2, dtype=np.complex128).reshape(2, 2, 2)
+    sigmas = np.array([1, 1], dtype=int)
+    conjs = np.array([False, False], dtype=bool)
+
+    out = sr.apply_auto_orbital_transform(mat.copy(), us, sigmas, conjs, num_orbital_dimensions=2)
+
+    for i in range(2):
+        u = us[i]
+        exp = np.einsum("ap,bq,pq->ab", u, u.conj(), mat[i])
+        assert np.allclose(out[i], exp)
+
+
+def test_apply_auto_orbital_transform_reuses_cached_path_four_dim():
+    """Same path-reuse check for the 4-index einsum branch."""
+    us = np.stack([_rot2(np.pi / 5), _rot2(np.pi / 3)])
+    mat = np.arange(2 * 16, dtype=np.complex128).reshape(2, 2, 2, 2, 2)
+    sigmas = np.array([1, 1], dtype=int)
+    conjs = np.array([False, False], dtype=bool)
+
+    out = sr.apply_auto_orbital_transform(mat.copy(), us, sigmas, conjs, num_orbital_dimensions=4)
+
+    for i in range(2):
+        u = us[i]
+        uc = u.conj()
+        exp = np.einsum("ap,bq,cr,ds,pqrs->abcd", u, uc, u, uc, mat[i])
+        assert np.allclose(out[i], exp)
