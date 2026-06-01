@@ -768,12 +768,7 @@ def calculate_self_energy_q(
 
     delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_local.cut_niv(config.box.niv_core)
 
-    # Hartree- and Fock-terms
-    v_nonloc = v_nonloc.compress_q_dimension()
-    hartree, fock = get_hartree_fock(u_loc, v_nonloc, my_full_q_list)
-    fock = mpi_dist_fullbz.allreduce(fock)
-    logger.info("Calculated Hartree and Fock terms.")
-
+    v_nonloc_full = deepcopy(v_nonloc)
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
 
     for current_iter in range(starting_iter + 1, starting_iter + config.self_consistency.max_iter + 1):
@@ -781,7 +776,12 @@ def calculate_self_energy_q(
         logger.info(f"Starting iteration {current_iter}.")
         logger.info("----------------------------------------")
 
+        hartree, fock = get_hartree_fock(u_loc, v_nonloc_full, my_full_q_list)
+        fock = mpi_dist_fullbz.allreduce(fock)
+        logger.info("Calculated Hartree and Fock terms.")
+
         giwk_full = GreensFunction.get_g_full(sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek())
+        _, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()  # n should not change
 
         logger.log_memory_usage("giwk", giwk_full, comm.size)
         if config.memory.save_memory_for_chi0q:
