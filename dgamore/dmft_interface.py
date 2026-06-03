@@ -39,7 +39,7 @@ class DMFTInterface(ABC):
     def get_nd(self, ineq: int = 1) -> int:
         """
         Returns the number of interacting d-orbitals from DMFT.
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         raise NotImplementedError()
 
@@ -52,7 +52,7 @@ class DMFTInterface(ABC):
     def get_occ(self, ineq: int = 1) -> np.ndarray:
         """
         Returns the orbital-resolved occupation from DMFT.
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         raise NotImplementedError()
 
@@ -60,7 +60,7 @@ class DMFTInterface(ABC):
         """
         Returns the density-density interaction U from the DMFT calculation for the interacting d-orbitals.
         This is both used in simple density-density and Kanamori calculations for d-orbitals.
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         raise NotImplementedError()
 
@@ -68,7 +68,7 @@ class DMFTInterface(ABC):
         """
         Returns the Hund's coupling J from the DMFT calculation for the interacting d-orbitals.
         This is only supposed to be nonzero when the DMFT calculation uses a Kanamori interaction for the d-orbitals.
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         raise NotImplementedError()
 
@@ -77,14 +77,14 @@ class DMFTInterface(ABC):
         Returns the inter-orbital repulsion V (often called U') from the DMFT calculation for the interacting
         d-orbitals.
         This is only supposed to be nonzero when the DMFT calculation uses a Kanamori interaction for the d-orbitals.
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         raise NotImplementedError()
 
     def get_dc(self, ineq: int = 1) -> float:
         """
         Returns the double-counting correction for the self-energy from DMFT.
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         raise NotImplementedError()
 
@@ -93,7 +93,7 @@ class DMFTInterface(ABC):
         Returns the one-particle Green's function from DMFT.
         Attention: due to how the code handles the DMFT Green's function, it should be returned with an array of shape
         [nbands, nbands, 2*niv_dmft]
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         raise NotImplementedError()
 
@@ -101,17 +101,23 @@ class DMFTInterface(ABC):
         """
         Returns the one-particle Self-Energy from DMFT.
         Note: This should be already updated with the double-counting correction here!
-        Attention: due to how the code handles the DMFT Green's function, it should be returned with an array of shape
+        Attention: due to how the code handles the DMFT self-energy, it should be returned with an array of shape
         [1, 1, 1, nbands, nbands, 2*niv_dmft]
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         raise NotImplementedError()
 
     def get_g2iw(self, channel: SpinChannel, ineq: int = 1) -> LocalFourPoint:
         """
         Returns the two-particle Green's function from DMFT.
+        ATTENTION: Be wary that this code requires the input to be in the frequency convention of w2dynamics: \n
+        :math:`v_1 = v`,\n
+        :math:`v_2 = v-w`,\n
+        :math:`v_3 = v'-w` and \n
+        :math:`v_4 = v'`.\n
+        Hence it is important that the two-particle Green's function is returned here in the correct convention.
         :param channel: The spin channel of the two-particle quantity (should be either density or magnetic).
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         raise NotImplementedError()
 
@@ -135,29 +141,29 @@ class W2dynInterface(DMFTInterface):
     def get_mu(self, dmft_iter: str = "dmft-last") -> float:
         """
         Returns the chemical potential from the DMFT calculation.
-        :param dmft_iter The dmft iteration where the quantity will be taken from.
+        :param dmft_iter: The dmft iteration where the quantity will be taken from.
         """
         return self.file_1p[dmft_iter + "/mu/value"][()]
 
     def get_nd(self, ineq: int = 1) -> int:
         """
         Returns the number of interacting d-orbitals from DMFT.
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         return self._from_ineq_config("nd", ineq=ineq)
 
     def get_totdens(self, dmft_iter: str = "dmft-last") -> float:
         """
         Returns the total electron density from the DMFT calculation.
-        :param dmft_iter The dmft iteration where the quantity will be taken from.
+        :param dmft_iter: The dmft iteration where the quantity will be taken from.
         """
         return self.file_1p[".config"].attrs["general.totdens"]
 
     def get_occ(self, ineq: int = 1, dmft_iter: str = "dmft-last") -> np.ndarray:
         """
         Returns the orbital-resolved occupation from DMFT.
-        :param ineq: The index of the inequivalent atom.
-        :param dmft_iter The dmft iteration where the quantity will be taken from.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
+        :param dmft_iter: The dmft iteration where the quantity will be taken from.
         """
         rho1 = self.file_1p[self._ineq_group(ineq, dmft_iter) + "/rho1/value"][()]
         return 2 * np.mean(rho1, axis=(1, 3))
@@ -166,7 +172,7 @@ class W2dynInterface(DMFTInterface):
         """
         Returns the density-density interaction U from the DMFT calculation for the interacting d-orbitals.
         This is both used in simple density-density and Kanamori calculations for d-orbitals.
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         return self._from_ineq_config("udd", ineq=ineq)
 
@@ -174,7 +180,7 @@ class W2dynInterface(DMFTInterface):
         """
         Returns the Hund's coupling J from the DMFT calculation for the interacting d-orbitals.
         This is only supposed to be nonzero when the DMFT calculation uses a Kanamori interaction for the d-orbitals.
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         return self._from_ineq_config("jdd", ineq=ineq)
 
@@ -183,15 +189,15 @@ class W2dynInterface(DMFTInterface):
         Returns the inter-orbital repulsion V (often called U') from the DMFT calculation for the interacting
         d-orbitals.
         This is only supposed to be nonzero when the DMFT calculation uses a Kanamori interaction for the d-orbitals.
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         """
         return self._from_ineq_config("vdd", ineq=ineq)
 
     def get_dc(self, ineq: int = 1, dmft_iter: str = "dmft-last") -> float:
         """
         Returns the double-counting correction for the self-energy from DMFT.
-        :param ineq: The index of the inequivalent atom.
-        :param dmft_iter The dmft iteration where the quantity will be taken from.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
+        :param dmft_iter: The dmft iteration where the quantity will be taken from.
         """
         return self.file_1p[self._ineq_group(ineq, dmft_iter) + "/dc/value"][()]
 
@@ -200,8 +206,8 @@ class W2dynInterface(DMFTInterface):
         Returns the one-particle Green's function from DMFT.
         Attention: due to how the code handles the DMFT Green's function, it should be returned with an array of shape
         [nbands, nbands, 2*niv_dmft]
-        :param ineq: The index of the inequivalent atom.
-        :param dmft_iter The dmft iteration where the quantity will be taken from.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
+        :param dmft_iter: The dmft iteration where the quantity will be taken from.
         """
         giw = self.file_1p[self._ineq_group(ineq, dmft_iter) + "/giw/value"][()]  # [band, spin, niv]
         giw = np.mean(giw, axis=1)  # mean over spin
@@ -213,8 +219,8 @@ class W2dynInterface(DMFTInterface):
         Note: This should be already updated with the double-counting correction here!
         Attention: due to how the code handles the DMFT Green's function, it should be returned with an array of shape
         [1, 1, 1, nbands, nbands, 2*niv_dmft]
-        :param ineq: The index of the inequivalent atom.
-        :param dmft_iter The dmft iteration where the quantity will be taken from.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
+        :param dmft_iter: The dmft iteration where the quantity will be taken from.
         """
         siw = self.file_1p[self._ineq_group(ineq, dmft_iter) + "/siw/value"][()]  # [band, spin, niv]
         siw = np.mean(siw, axis=1)  # mean over spin
@@ -227,7 +233,7 @@ class W2dynInterface(DMFTInterface):
         """
         Returns the two-particle Green's function from DMFT.
         :param channel: The spin channel of the two-particle quantity (should be either density or magnetic).
-        :param ineq: The index of the inequivalent atom.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
         :raises ValueError: When entering an invalid spin channel that is not density or magnetic.
         """
         if channel not in (SpinChannel.DENS, SpinChannel.MAGN):
@@ -262,11 +268,11 @@ class W2dynInterface(DMFTInterface):
         """
         return np.einsum("i...,ij->ij...", obj, np.eye(obj.shape[0]))
 
-    def _ineq_group(self, ineq=1, dmft_iter="dmft-last"):
+    def _ineq_group(self, ineq: int = 1, dmft_iter: str = "dmft-last") -> str:
         """
         Returns the group string for a given DMFT iteration and ineq.
-        :param ineq: The index of the inequivalent atom.
-        :param dmft_iter The dmft iteration where the quantity will be taken from.
+        :param ineq: The index of the inequivalent atom in the case of multi-site DMFT.
+        :param dmft_iter: The dmft iteration where the quantity will be taken from.
         """
         return dmft_iter + f"/ineq-{ineq:03}"
 
@@ -276,14 +282,14 @@ class W2dynInterface(DMFTInterface):
         """
         return self.file_1p[".config"].attrs[f"atoms.{ineq:1}.{key}"]
 
-    def _open(self):
+    def _open(self) -> None:
         """
         Opens the w2dynamics output files in read mode.
         """
         self.file_1p = h5py.File(os.path.join(config.dmft.input_path, config.dmft.fname_1p), "r")
         self.file_2p = h5py.File(os.path.join(config.dmft.input_path, config.dmft.fname_2p), "r")
 
-    def _close(self):
+    def _close(self) -> None:
         """
         Closes the w2dynamics output files.
         """

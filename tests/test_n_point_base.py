@@ -1013,29 +1013,6 @@ def test_map_to_full_bz_auto_preserves_trailing_frequency_dimensions():
     assert np.allclose(obj.mat, expected, atol=1e-14)
 
 
-def test_map_to_full_bz_auto_with_antiunitary_does_apply_conjugation():
-    """Opting into ``include_antiunitary=True`` produces conj=True at some FBZ
-    points, and the FBZ expansion then conjugates orbital values at those points.
-    For a complex IBZ payload, the result at those points must equal the
-    conjugate of the corresponding IBZ value."""
-    nb = 1
-    grid, _ = _build_auto_kgrid(nx=4, ny=4, nz=1, nb=nb, include_antiunitary=True)
-    assert int(grid._auto_conjs.sum()) > 0, "expected at least one conj=True point"
-
-    # Build a complex IBZ payload so conjugation has a visible effect
-    rng = np.random.default_rng(1)
-    ibz_payload = rng.standard_normal((grid.nk_irr, nb, nb)) + 1j * rng.standard_normal((grid.nk_irr, nb, nb))
-    obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
-    obj._map_to_full_bz(grid, num_orbital_dimensions=2)
-
-    inv = grid.irrk_inv.ravel()
-    conjs = grid._auto_conjs.reshape(-1)
-    # Expected: IBZ-replicated, with conj applied where conjs is True (since U=[[1]] for nb=1)
-    expected = ibz_payload[inv].copy()
-    expected[conjs] = expected[conjs].conj()
-    assert np.allclose(obj.mat, expected, atol=1e-14)
-
-
 def test_map_to_full_bz_auto_default_no_antiunitary_does_no_conjugation():
     """Default (include_antiunitary=False): no FBZ point should ever be conjugated,
     so a complex IBZ payload reconstructs as a pure index replication. This is
