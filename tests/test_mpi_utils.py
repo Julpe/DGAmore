@@ -1,9 +1,8 @@
-"""Unit tests for dgamore.mpi_utils.
-
-Uses the in-process thread-based fake MPI communicator; no MPI installation is
-required. Faked dgamore submodules (config, four_point, brillouin_zone,
-symmetry_reduction) supply the minimal surface the code touches.
-"""
+# SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
+# SPDX-License-Identifier: MIT
+#
+# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+#           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import numpy as np
 import pytest

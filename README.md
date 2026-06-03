@@ -85,7 +85,8 @@ for single-core execution (mostly used for testing purposes) or
 ```bash
 mpiexec -np <n_proc> python DGAmore.py
 ```
-for multi-core processing with MPI. Instead of `mpiexec`, one can also use `mpirun` or `srun` (if you are using a 
+for multi-core processing with MPI. The entry point is added as an executable to the python environment and does not
+need the full path specified to run. Instead of `mpiexec`, one can also use `mpirun` or `srun` (if you are using a 
 slurm-based cluster). The number of processes, `<n_proc>`, should be chosen according to the size of the problem and the
 available computational resources.
 

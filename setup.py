@@ -22,5 +22,6 @@ setup(
         "Operating System :: POSIX",
         "Operating System :: POSIX :: Linux",
     ],
+    scripts=["dgamore/DGAmore.py", "dgamore/symmetrize_new.py"],
     python_requires=">=3.12",
 )
