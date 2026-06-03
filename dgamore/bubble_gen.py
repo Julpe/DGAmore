@@ -158,7 +158,7 @@ class BubbleGenerator:
         gchi0_q = np.zeros((nq, nb, nb, nb, nb, len(wn), 2 * niv), dtype=giwk.mat.dtype)
 
         g_left = giwk.cut_niv(niv + niw).mat
-        g_right = giwk.transpose_orbitals().cut_niv(niv + niw).mat
+        g_right = g_left.copy()
         giwk_niv = g_right.shape[-1] // 2
 
         g_r_buf = np.empty_like(g_left)
@@ -198,7 +198,7 @@ class BubbleGenerator:
         gchi0_q = cp.zeros((nq, nb, nb, nb, nb, len(wn), 2 * niv), dtype=giwk.mat.dtype, order="F")
 
         g_left = cp.asarray(giwk.cut_niv(niv + niw).mat, order="F")
-        g_right = cp.asarray(giwk.transpose_orbitals().cut_niv(niv + niw).mat, order="F")
+        g_right = g_left.copy()
         giwk_niv = g_right.shape[-1] // 2
 
         g_r_buf = cp.empty_like(g_left)

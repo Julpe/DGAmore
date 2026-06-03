@@ -162,3 +162,190 @@ def create_comm_mock():
     comm_mock.Split.return_value = comm_mock
 
     return comm_mock
+
+
+import queue as _queue
+import threading as _threading
+import traceback as _traceback
+import types as _types
+
+_tls = _threading.local()
+_BARRIER_TIMEOUT = _QUEUE_TIMEOUT = 20.0
+
+
+class _InPlace:
+    def __repr__(self):
+        return "IN_PLACE"
+
+
+IN_PLACE = _InPlace()
+REQUEST_NULL = object()
+
+
+def Get_processor_name():
+    return getattr(_tls, "hostname", "node0")
+
+
+class _Request:
+    def __init__(self, wait_fn=None):
+        self._wait_fn, self._done = wait_fn, False
+
+    def wait(self):
+        if not self._done and self._wait_fn is not None:
+            self._wait_fn()
+        self._done = True
+
+    Wait = wait
+
+
+class Request:
+    @staticmethod
+    def Waitall(reqs):
+        for r in reqs:
+            if r is not None:
+                r.wait()
+
+
+def _assign(buf, data):
+    try:
+        buf[...] = data
+    except (ValueError, TypeError):
+        buf.view(np.uint8).reshape(-1)[:] = np.ascontiguousarray(data).view(np.uint8).reshape(-1)
+
+
+class Comm:
+    def __init__(self, size=1):
+        self._size = int(size)
+        self._barrier = _threading.Barrier(self._size) if self._size > 1 else None
+        self._inboxes = [dict() for _ in range(self._size)]
+        self._lock = _threading.Lock()
+        self._store = [None] * self._size
+
+    def Get_rank(self):
+        return getattr(_tls, "rank", 0)
+
+    def Get_size(self):
+        return self._size
+
+    rank = property(Get_rank)
+    size = property(Get_size)
+
+    def _bw(self):
+        if self._barrier is not None:
+            self._barrier.wait(timeout=_BARRIER_TIMEOUT)
+
+    def Barrier(self):
+        self._bw()
+
+    def abort_barrier(self):
+        if self._barrier is not None:
+            self._barrier.abort()
+
+    def _collective(self, contribution):
+        r = self.rank
+        self._bw()
+        if r == 0:
+            self._store = [None] * self._size
+        self._bw()
+        self._store[r] = contribution
+        self._bw()
+        return self._store
+
+    def bcast(self, obj, root=0):
+        return self._collective(obj if self.rank == root else None)[root]
+
+    def Bcast(self, buf, root=0):
+        store = self._collective(np.array(buf, copy=True) if self.rank == root else None)
+        if self.rank != root:
+            _assign(buf, store[root])
+        return buf
+
+    def Allreduce(self, sendbuf, recvbuf=None):
+        buf = recvbuf
+        if sendbuf is not IN_PLACE:
+            _assign(buf, sendbuf)
+        total = None
+        for part in self._collective(np.array(buf, copy=True)):
+            total = part.copy() if total is None else total + part
+        _assign(buf, total)
+        return buf
+
+    def Allgather(self, sendbuf, recvbuf):
+        if sendbuf is IN_PLACE:
+            store = self._collective(np.array(recvbuf, copy=True))
+            for i in range(self._size):
+                recvbuf[i] = store[i][i]
+            return recvbuf
+        store = self._collective(np.array(sendbuf, copy=True))
+        for i in range(self._size):
+            recvbuf[i] = store[i]
+        return recvbuf
+
+    def allgather(self, obj):
+        return list(self._collective(obj))
+
+    def Alltoall(self, sendbuf, recvbuf):
+        store = self._collective(np.array(sendbuf, copy=True))
+        for j in range(self._size):
+            recvbuf[j] = store[j][self.rank]
+        return recvbuf
+
+    def _queue(self, owner, key):
+        with self._lock:
+            return self._inboxes[owner].setdefault(key, _queue.Queue())
+
+    def Send(self, buf, dest, tag=0):
+        self._queue(dest, (self.rank, tag)).put(np.array(np.ascontiguousarray(buf), copy=True))
+
+    def Recv(self, buf, source, tag=0):
+        _assign(buf, self._queue(self.rank, (source, tag)).get(timeout=_QUEUE_TIMEOUT))
+        return buf
+
+    def send(self, obj, dest, tag=0):
+        self._queue(dest, ("py", self.rank, tag)).put(obj)
+
+    def recv(self, source, tag=0):
+        return self._queue(self.rank, ("py", source, tag)).get(timeout=_QUEUE_TIMEOUT)
+
+    def Isend(self, buf, dest, tag=0):
+        self.Send(buf, dest, tag)
+        return _Request()
+
+    def Irecv(self, buf, source, tag=0):
+        return _Request(lambda: _assign(buf, self._queue(self.rank, (source, tag)).get(timeout=_QUEUE_TIMEOUT)))
+
+
+COMM_WORLD = Comm(1)
+
+FAKE_MPI = _types.SimpleNamespace(
+    Comm=Comm,
+    Request=Request,
+    IN_PLACE=IN_PLACE,
+    REQUEST_NULL=REQUEST_NULL,
+    COMM_WORLD=COMM_WORLD,
+    Get_processor_name=Get_processor_name,
+)
+
+
+def run_parallel(size, fn, hostnames=None):
+    comm = Comm(size)
+    results, errors = [None] * size, [None] * size
+
+    def worker(r):
+        _tls.rank = r
+        _tls.hostname = hostnames[r] if hostnames is not None else f"node{r}"
+        try:
+            results[r] = fn(comm, r)
+        except BaseException as exc:
+            errors[r] = (exc, _traceback.format_exc())
+            comm.abort_barrier()
+
+    threads = [_threading.Thread(target=worker, args=(r,), name=f"rank{r}") for r in range(size)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    for r, e in enumerate(errors):
+        if e is not None:
+            raise AssertionError(f"rank {r} raised:\n{e[1]}") from e[0]
+    return comm, results

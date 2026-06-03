@@ -170,13 +170,13 @@ def execute_dga_routine():
             logger.info(f"Starting local Schwinger-Dyson equation (SDE) for atom {ineq}.")
 
             if comm.rank == 0:
-                (gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc) = (
+                gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc = (
                     local_sde.perform_local_schwinger_dyson(
                         g_dmft_per_ineq[ineq - 1], g2_dens_per_ineq[ineq - 1], g2_magn_per_ineq[ineq - 1], u_loc_ineq
                     )
                 )
             else:
-                (gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc) = (None,) * 11
+                gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc = (None,) * 11
 
             gamma_d_per_ineq.append(gamma_d)
             gamma_m_per_ineq.append(gamma_m)
