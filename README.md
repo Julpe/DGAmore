@@ -79,16 +79,16 @@ issues with the installation.
 
 The main entry point to the program is the file [DGAmore.py](dgamore/DGAmore.py), which can be started with either
 ```bash
-python DGAmore.py
+DGAmore.py
 ```
 for single-core execution (mostly used for testing purposes) or
 ```bash
-mpiexec -np <n_proc> python DGAmore.py
+mpiexec -np <n_proc> DGAmore.py
 ```
-for multi-core processing with MPI. The entry point is added as an executable to the python environment and does not
-need the full path specified to run. Instead of `mpiexec`, one can also use `mpirun` or `srun` (if you are using a 
-slurm-based cluster). The number of processes, `<n_proc>`, should be chosen according to the size of the problem and the
-available computational resources.
+for multi-core processing with MPI. The entry file [DGAmore.py](dgamore/DGAmore.py) is added as a Python executable to 
+the python environment and does not need the full path specified to run. Instead of `mpiexec`, one can also use 
+`mpirun` or `srun` (if you are using a slurm-based cluster). The number of processes, `<n_proc>`, should be chosen 
+according to the size of the problem and the available computational resources.
 
 There are two additional command line parameters available
 - `-p`: This is used to specify the path to the configuration file, which contains all run-specific parameters. 
@@ -100,7 +100,7 @@ As an example, the following shell command runs the code using 8 MPI processes a
 `my_config.yaml` from the path `/configs/`:
 
 ```bash
-mpiexec -np 8 python DGAmore.py -p /configs/ -c my_config.yaml
+mpiexec -np 8 DGAmore.py -p /configs/ -c my_config.yaml
 ```
 
 The following code snippet shows the content of an exemplary job submit script for a slurm-based cluster:
@@ -125,10 +125,10 @@ source <path to miniconda>/miniconda3/bin/activate <your conda env>
 export OMP_NUM_THREADS=1
 
 # Run the code with MPI, in this case with srun, which is the recommended way to run MPI jobs on a slurm-based cluster:
-srun python -u <path to code>/DGAmore.py -p "<path to config>" -c "<name of config>.yaml"
+srun DGAmore.py -p "<path to config>" -c "<name of config>.yaml"
 
 # If you want to use mpirun or mpiexec instead of srun, you can use the following command:
-mpirun/mpiexec -np $SLURM_NTASKS python -u <path to code>/DGAmore.py -p "<path to config>" -c "<name of config>.yaml"
+mpirun/mpiexec -np $SLURM_NTASKS DGAmore.py -p "<path to config>" -c "<name of config>.yaml"
 ```
 
 The `#SBATCH` options `-o` and `-e` denote the file where the job output and errors, respectively, will be written. In
