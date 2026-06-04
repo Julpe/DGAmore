@@ -752,8 +752,10 @@ def calculate_self_energy_q(
     )
 
     niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
+    sigma_dmft_full = deepcopy(sigma_dmft)
 
     if comm.rank == 0:
+        sigma_old = sigma_old.concatenate_self_energies(sigma_dmft_full)
         giwk_full = GreensFunction.get_g_full(sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek())
         config.sys.n, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
         giwk_full.cut_niv(niv_cut)
@@ -764,7 +766,6 @@ def calculate_self_energy_q(
         (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
     )
 
-    sigma_dmft_full = deepcopy(sigma_dmft)
     sigma_old = sigma_old.cut_niv(niv_cut)
     sigma_dmft = sigma_dmft.cut_niv(niv_cut)
 
