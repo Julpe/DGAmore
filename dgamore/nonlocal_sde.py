@@ -752,6 +752,7 @@ def calculate_self_energy_q(
     )
 
     niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
+
     if comm.rank == 0:
         giwk_full = GreensFunction.get_g_full(sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek())
         config.sys.n, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
@@ -763,6 +764,7 @@ def calculate_self_energy_q(
         (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
     )
 
+    sigma_dmft_full = deepcopy(sigma_dmft)
     sigma_old = sigma_old.cut_niv(niv_cut)
     sigma_dmft = sigma_dmft.cut_niv(niv_cut)
 
@@ -781,7 +783,6 @@ def calculate_self_energy_q(
         logger.info("Calculated Hartree and Fock terms.")
 
         giwk_full = GreensFunction.get_g_full(sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek())
-        _, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()  # n should not change
 
         logger.log_memory_usage("giwk", giwk_full, comm.size)
         if config.memory.save_memory_for_chi0q:
@@ -898,11 +899,22 @@ def calculate_self_energy_q(
                 mu_finding_failed = True
 
             # will not be changed if mu finding failed
-            config.sys.mu = config.self_consistency.mixing * new_mu + (1 - config.self_consistency.mixing) * old_mu
+            if not mu_finding_failed:
+                config.sys.mu = config.self_consistency.mixing * new_mu + (1 - config.self_consistency.mixing) * old_mu
 
         config.sys.mu = comm.bcast(config.sys.mu)
         mu_history.append(config.sys.mu)
         logger.info(f"Updated mu from {old_mu} to {config.sys.mu}.")
+
+        if comm.rank == 0:
+            sigma_occ = deepcopy(sigma_new).concatenate_self_energies(sigma_dmft_full)
+            giwk_occ = giwk_full.get_g_full(sigma_occ, config.sys.mu, config.lattice.hamiltonian.get_ek())
+            # calculate new occupation matrix from new Green's function (outside asympt region it is the DMFT
+            # lattice Green's function)
+            _, config.sys.occ, config.sys.occ_k = giwk_occ.get_fill_nonlocal()  # n should not change
+        config.sys.occ, config.sys.occ_k = comm.bcast((config.sys.occ, config.sys.occ_k), root=0)
+        if config.self_consistency.max_iter > 1:
+            logger.info("Updated occupation matrix with new Green's function.")
 
         logger.info("Applying mixing strategy to the self-energy.")
         sigma_new = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter)
