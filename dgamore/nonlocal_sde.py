@@ -889,6 +889,9 @@ def calculate_self_energy_q(
         sigma_new += delta_sigma
         sigma_new = sigma_new.concatenate_self_energies(sigma_dmft)
 
+        logger.info("Applying mixing strategy to the self-energy.")
+        sigma_new = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter)
+
         old_mu = mu_history[-1]
         if comm.rank == 0:
             mu_finding_failed = False
@@ -916,9 +919,6 @@ def calculate_self_energy_q(
         config.sys.occ, config.sys.occ_k = comm.bcast((config.sys.occ, config.sys.occ_k), root=0)
         if config.self_consistency.max_iter > 1:
             logger.info("Updated occupation matrix with new Green's function.")
-
-        logger.info("Applying mixing strategy to the self-energy.")
-        sigma_new = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter)
 
         if comm.rank == 0:
             sigma_new.save(name=f"sigma_dga_iteration_{current_iter}", output_dir=config.output.output_path)
@@ -1028,20 +1028,32 @@ def apply_mixing_strategy(
         iter_diff = get_result(-1) - get_proposal(-1)
         f_i[:n_total] = iter_diff.real
         f_i[n_total:] = iter_diff.imag
+        norm_f = np.linalg.norm(f_i)
+        norm_x = np.linalg.norm(get_proposal(-1))
+        rel_res = norm_f / norm_x if norm_x > 0 else np.inf
 
-        # Solve min||F @ c - f_i|| via least squares (more stable than explicit inverse)
-        coeffs, _, _, _ = np.linalg.lstsq(f_matrix, f_i, rcond=None)
+        # Solve min||F @ c - f_i|| via truncated-SVD pseudoinverse (drops collinear directions)
+        u, s, vh = np.linalg.svd(f_matrix, full_matrices=False)
+        cutoff = 1e-5 * (s[0] if s.size else 1.0)
+        mask = s > cutoff
+        if not np.any(mask):
+            logger.warning("Pulay SVD ill-conditioned - falling back to linear mixing.")
+            return alpha * sigma_new + (1 - alpha) * sigma_old
+        coeffs = vh[mask].T @ ((u[:, mask].T @ f_i) / s[mask])
 
         # Pulay update: x_{n+1} = x_n + alpha*f_i - (R + alpha*F) @ c
         update = alpha * f_i - (r_matrix + alpha * f_matrix) @ coeffs
+        norm_u = np.linalg.norm(update)
+        if norm_f > 0 and norm_u > 10.0 * norm_f:
+            update *= 10.0 * norm_f / norm_u
+            logger.warning(f"Pulay step clamped (norm_u={norm_u:.3e}, norm_f={norm_f:.3e}).")
         update = update[:n_total] + 1j * update[n_total:]
 
         # Update the new self energy
         sigma_new.mat[..., niv - niv_core : niv + niv_core] = get_proposal(-1).reshape(shape) + update.reshape(shape)
 
         logger.info(
-            f"Pulay mixing applied with {n_hist} previous iterations and "
-            f"a mixing parameter of {config.self_consistency.mixing}."
+            f"Pulay mixing applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}, rel_res={rel_res:.3e})."
         )
 
         return sigma_new
@@ -1069,6 +1081,9 @@ def apply_mixing_strategy(
         f_curr = flat(last_results[-1]) - flat(last_proposals[-1])
         f_vec = np.concatenate([f_curr.real, f_curr.imag])
         norm_f = np.linalg.norm(f_vec)
+        x_curr = flat(last_proposals[-1])
+        norm_x = np.linalg.norm(np.concatenate([x_curr.real, x_curr.imag]))
+        rel_res = norm_f / norm_x if norm_x > 0 else np.inf
 
         # Build dX and dF matrices (n_hist columns)
         # dX[:,i] = x_{n-i} - x_{n-i-1}  (proposal differences)
@@ -1102,7 +1117,7 @@ def apply_mixing_strategy(
             coeffs = vh[mask].T @ (s_reg * (u[:, mask].T @ f_vec))
 
         except np.linalg.LinAlgError:
-            logger.warning("Anderson SVD failed — falling back to linear mixing.")
+            logger.warning("Anderson SVD failed - falling back to linear mixing.")
             return alpha * sigma_new + (1 - alpha) * sigma_old
 
         # Undamped Anderson proposal: x_n + f_n - (dX + dF) @ c
@@ -1123,7 +1138,9 @@ def apply_mixing_strategy(
 
         sigma_new.mat[..., sl] = candidate.reshape(shape)
 
-        logger.info(f"Anderson acceleration applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}).")
+        logger.info(
+            f"Anderson acceleration applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}, rel_res={rel_res:.3e})."
+        )
 
         return sigma_new
 
