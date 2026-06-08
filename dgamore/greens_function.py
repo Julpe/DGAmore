@@ -39,7 +39,11 @@ def get_total_fill(mu: float, ek: np.ndarray, sigma_mat: np.ndarray, beta: float
     g_loc_mat = np.mean(g_full_mat, axis=0)
 
     eigenvals, eigenvecs = np.linalg.eig(beta * (hloc.real + smom0 - mu_bands))
-    rho_diag = np.where(eigenvals > 0, np.exp(-eigenvals) / (1 + np.exp(-eigenvals)), 1 / (1 + np.exp(eigenvals)))
+
+    rho_diag = np.empty_like(eigenvals)
+    mask = eigenvals > 0
+    rho_diag[mask] = np.exp(-eigenvals[mask]) / (1 + np.exp(-eigenvals[mask]))
+    rho_diag[~mask] = 1 / (1 + np.exp(eigenvals[~mask]))
     rho_diag = np.einsum("...i,ij->...ij", rho_diag, np.eye(n_bands))
 
     rho_loc = eigenvecs @ rho_diag @ np.linalg.inv(eigenvecs)
