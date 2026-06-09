@@ -774,13 +774,9 @@ def calculate_self_energy_q(
     v_nonloc_full = deepcopy(v_nonloc)
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
 
-    # old_mixing_history_length = config.self_consistency.mixing_history_length
-    # config.self_consistency.mixing_history_length = -1
+    prev_residual = np.inf
 
     for current_iter in range(starting_iter + 1, starting_iter + config.self_consistency.max_iter + 1):
-        # if config.self_consistency.mixing_history_length < old_mixing_history_length:
-        # config.self_consistency.mixing_history_length += 1
-
         logger.info("----------------------------------------")
         logger.info(f"Starting iteration {current_iter}.")
         logger.info("----------------------------------------")
@@ -896,7 +892,7 @@ def calculate_self_energy_q(
         sigma_new = sigma_new.concatenate_self_energies(sigma_dmft)
 
         logger.info("Applying mixing strategy to the self-energy.")
-        sigma_new = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter)
+        sigma_new, sigma_residual = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter)
 
         old_mu = mu_history[-1]
         if comm.rank == 0:
@@ -923,10 +919,10 @@ def calculate_self_energy_q(
             # lattice Green's function)
             _, config.sys.occ, config.sys.occ_k = giwk_occ.get_fill_nonlocal()  # n should not change
 
-            ekin = giwk_occ.get_ekin_total()
+            ekin = giwk_occ.get_ekin()
             logger.info(f"Kinetic energy: {ekin:.4f} [t or eV].")
 
-            epot = giwk_occ.get_epot_total()
+            epot = giwk_occ.get_epot()
             logger.info(f"Potential energy: {epot:.4f} [t or eV].")
             logger.info(f"Total energy: {(ekin + epot):.4f} [t or eV].")
         config.sys.occ, config.sys.occ_k = comm.bcast((config.sys.occ, config.sys.occ_k), root=0)
@@ -949,15 +945,15 @@ def calculate_self_energy_q(
 
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
-            niv_start = sigma_new.niv
-            niv_end = niv_start + int(np.ceil(config.box.niv_core / 5))
-
-            sigma_converged = np.allclose(
-                sigma_old.compress_q_dimension()[..., niv_start:niv_end],
-                sigma_new.compress_q_dimension()[..., niv_start:niv_end],
-                atol=config.self_consistency.epsilon,
+            residual_change = (
+                abs(sigma_residual - prev_residual) / abs(sigma_residual) if sigma_residual != 0 else np.inf
             )
-            logger.info(f"Self-energy convergence: {sigma_converged}.")
+            sigma_converged = residual_change < config.self_consistency.epsilon
+            logger.info(
+                f"Self-energy convergence: {sigma_converged} "
+                f"(residual_change={residual_change:.3e}, rel_res={sigma_residual:.3e}, "
+                f"epsilon={config.self_consistency.epsilon:.3e})."
+            )
 
             mu_converged = (
                 abs(mu_history[-1] - mu_history[-2]) < np.pi / (10 * config.sys.beta)
@@ -968,6 +964,7 @@ def calculate_self_energy_q(
         else:
             converged = False
         converged = comm.bcast(converged)
+        prev_residual = sigma_residual
 
         sigma_old = sigma_new
         if converged:
@@ -992,7 +989,7 @@ def calculate_self_energy_q(
 
 def apply_mixing_strategy(
     sigma_new: SelfEnergy, sigma_old: SelfEnergy, sigma_dmft: SelfEnergy, current_iter: int
-) -> SelfEnergy:
+) -> tuple[SelfEnergy, float]:
     """
     Applies the mixing strategy for the self-consistency loop. The mixing strategy is defined in the config file and
     is either 'linear' or 'pulay'.
@@ -1052,7 +1049,7 @@ def apply_mixing_strategy(
         mask = s > cutoff
         if not np.any(mask):
             logger.warning("Pulay SVD ill-conditioned - falling back to linear mixing.")
-            return alpha * sigma_new + (1 - alpha) * sigma_old
+            return alpha * sigma_new + (1 - alpha) * sigma_old, rel_res
         coeffs = vh[mask].T @ ((u[:, mask].T @ f_i) / s[mask])
 
         # Pulay update: x_{n+1} = x_n + alpha*f_i - (R + alpha*F) @ c
@@ -1070,7 +1067,7 @@ def apply_mixing_strategy(
             f"Pulay mixing applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}, rel_res={rel_res:.3e})."
         )
 
-        return sigma_new
+        return sigma_new, rel_res
     if config.self_consistency.mixing_strategy.lower() == "anderson" and current_iter > n_hist:
         last_sigmas = read_last_n_sigmas_from_files(
             n_hist, config.output.output_path, config.self_consistency.previous_sc_path
@@ -1132,7 +1129,7 @@ def apply_mixing_strategy(
 
         except np.linalg.LinAlgError:
             logger.warning("Anderson SVD failed - falling back to linear mixing.")
-            return alpha * sigma_new + (1 - alpha) * sigma_old
+            return alpha * sigma_new + (1 - alpha) * sigma_old, rel_res
 
         # Undamped Anderson proposal: x_n + f_n - (dX + dF) @ c
         x_n = flat(last_proposals[-1])
@@ -1156,10 +1153,21 @@ def apply_mixing_strategy(
             f"Anderson acceleration applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}, rel_res={rel_res:.3e})."
         )
 
-        return sigma_new
+        return sigma_new, rel_res
+
+    niv = sigma_new.current_shape[-1] // 2
+    niv_core = config.box.niv_core
+    sl = slice(niv - niv_core, niv + niv_core)
+    f_lin = (sigma_new.mat[..., sl] - sigma_old.mat[..., sl]).flatten()
+    f_vec = np.concatenate([f_lin.real, f_lin.imag])
+    norm_f = np.linalg.norm(f_vec)
+    x_lin = sigma_old.mat[..., sl].flatten()
+    norm_x = np.linalg.norm(np.concatenate([x_lin.real, x_lin.imag]))
+    rel_res = norm_f / norm_x if norm_x > 0 else np.inf
 
     sigma_new = config.self_consistency.mixing * sigma_new + (1 - config.self_consistency.mixing) * sigma_old
     logger.info(
-        f"Sigma linearly mixed with previous iteration using a mixing parameter of {config.self_consistency.mixing}."
+        f"Sigma linearly mixed with previous iteration using a mixing parameter of "
+        f"{config.self_consistency.mixing} (norm_f={norm_f:.3e}, rel_res={rel_res:.3e})."
     )
-    return sigma_new
+    return sigma_new, rel_res
