@@ -760,7 +760,7 @@ def calculate_self_energy_q(
         config.sys.n, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
         giwk_full.cut_niv(niv_cut)
 
-        if sigma_old is sigma_dmft:
+        if np.allclose(sigma_old.cut_niv(config.box.niv_core).mat, sigma_dmft.cut_niv(config.box.niv_core).mat):
             giwk_full.save(output_dir=config.output.output_path, name="g_latt_dmft")
     config.sys.n, config.sys.occ, config.sys.occ_k = comm.bcast(
         (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
@@ -774,7 +774,13 @@ def calculate_self_energy_q(
     v_nonloc_full = deepcopy(v_nonloc)
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
 
+    # old_mixing_history_length = config.self_consistency.mixing_history_length
+    # config.self_consistency.mixing_history_length = -1
+
     for current_iter in range(starting_iter + 1, starting_iter + config.self_consistency.max_iter + 1):
+        # if config.self_consistency.mixing_history_length < old_mixing_history_length:
+        # config.self_consistency.mixing_history_length += 1
+
         logger.info("----------------------------------------")
         logger.info(f"Starting iteration {current_iter}.")
         logger.info("----------------------------------------")
@@ -916,9 +922,17 @@ def calculate_self_energy_q(
             # calculate new occupation matrix from new Green's function (outside asympt region it is the DMFT
             # lattice Green's function)
             _, config.sys.occ, config.sys.occ_k = giwk_occ.get_fill_nonlocal()  # n should not change
+
+            ekin = giwk_occ.get_ekin_total()
+            logger.info(f"Kinetic energy: {ekin:.4f} [t or eV].")
+
+            epot = giwk_occ.get_epot_total()
+            logger.info(f"Potential energy: {epot:.4f} [t or eV].")
+            logger.info(f"Total energy: {(ekin + epot):.4f} [t or eV].")
         config.sys.occ, config.sys.occ_k = comm.bcast((config.sys.occ, config.sys.occ_k), root=0)
+
         if config.self_consistency.max_iter > 1:
-            logger.info("Updated occupation matrix with new Green's function.")
+            logger.info("Updated occupation matrix from new Green's function.")
 
         if comm.rank == 0:
             sigma_new.save(name=f"sigma_dga_iteration_{current_iter}", output_dir=config.output.output_path)

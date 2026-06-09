@@ -133,7 +133,6 @@ mpirun/mpiexec -np $SLURM_NTASKS DGAmore.py -p "<path to config>" -c "<name of c
 
 The `#SBATCH` options `-o` and `-e` denote the file where the job output and errors, respectively, will be written. In
 this case both will be written into the same file, however, it is possible to use separate files.
-The Python option `-u` tells the program to flush `stdout` and `stderr` in real time.
 
 ---
 
@@ -142,11 +141,11 @@ The Python option `-u` tells the program to flush `stdout` and `stderr` in real 
 To configure run parameters, one has to create or modify the existing configuration file, which is a YAML file. The 
 default configuration file is [dga_config.yaml](dgamore/dga_config.yaml), which can be found in the repository directory. 
 Each entry in the configuration file is explained in detail in the file itself, so please refer to the file for more 
-information on how to configure the code. Please note that each section in the configuration file is required, and the 
-code will not run if any section is missing. The default values in the configuration file are set to reasonable 
+information on how to configure the code. The default values in the configuration file are set to reasonable 
 defaults, so if you are unsure about any of the parameters, you can simply use the default values (except for the file 
-paths to the input). If you are unsure about any of the parameters, please refer to the documentation in the 
-configuration file, my [Master's thesis](https://doi.org/10.34726/hss.2025.130528) or contact me via [E-Mail](mailto:julian.peil@tuwien.ac.at).
+paths to the input). If a setting or if a whole section is missing from the file, the code will use the default values. 
+If you are unsure about any of the parameters, please refer to the documentation in the configuration file, my 
+[Master's thesis](https://doi.org/10.34726/hss.2025.130528) or contact me via [E-Mail](mailto:julian.peil@tuwien.ac.at).
 
 --- 
 

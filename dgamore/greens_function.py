@@ -106,16 +106,6 @@ class GreensFunction(IAmNonLocal, LocalNPoint):
             config.sys.n, config.sys.occ, config.sys.occ_k = self.get_fill_nonlocal()
 
     @property
-    def e_kin(self):
-        """
-        Returns the kinetic energy of the system, see Eq (22) in G. Rohringer & A. Toschi
-        PHYSICAL REVIEW B 94, 125144 (2016).
-        """
-        ekin = 2 / config.sys.beta * np.sum(np.mean(self._ek[..., None] * self.mat, axis=(0, 1, 2)))
-        assert np.abs(ekin.imag) < 1e-8, "Kinetic energy must be real."
-        return ekin.real
-
-    @property
     def ek(self) -> np.ndarray:
         """
         Returns the band dispersion as a numpy array.
@@ -198,7 +188,7 @@ class GreensFunction(IAmNonLocal, LocalNPoint):
 
     def transpose_orbitals(self):
         r"""
-        Transposes the orbitals of the Green's function object like :math:`G_{ab}^k -> G_{ba}^k.
+        Transposes the orbitals of the Green's function object like :math:`G_{ab}^k -> G_{ba}^k`.
         """
         return self.permute_orbitals("ab->ba")
 
@@ -238,6 +228,26 @@ class GreensFunction(IAmNonLocal, LocalNPoint):
         occ_mean.real[np.abs(occ_mean) < 1e-12] = 0.0
         n_el = 2.0 * np.trace(occ_mean).real
         return n_el, occ_mean, occ_k
+
+    def get_ekin_total(self) -> float:
+        r"""
+        Returns the kinetic energy calculated from the Green's function and the k-dependent occupation.
+        :math:`E_{kin} = \sum_{\sigma\vec{k}ab} \varepsilon(\vec{k})_{ab} n(\vec{k})_{ba}`.
+        """
+        return 2 * np.sum(self._ek * config.sys.occ_k.swapaxes(-1, -2)).real / config.lattice.k_grid.nk_tot
+
+    def get_epot_total(self) -> float:
+        r"""
+        Returns the potential energy calculated from the Green's function and the self-energy.
+        :math:`E_{pot} = 1/(2\beta) \sum_{\sigma\vec{k}\nu ab} \Sigma(\vec{k},\nu)_{ab} G(\vec{k},\nu)_{ba}`.
+        """
+        return (
+            (self._sigma.decompress_q_dimension().mat * self.decompress_q_dimension().transpose_orbitals().mat)
+            .sum()
+            .real
+            / config.sys.beta
+            / config.lattice.k_grid.nk_tot
+        )
 
     def _get_gfull_mat(self) -> np.ndarray:
         """
