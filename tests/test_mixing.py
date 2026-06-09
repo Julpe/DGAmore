@@ -14,7 +14,6 @@ import dgamore.config as real_config
 from dgamore.self_energy import SelfEnergy
 from dgamore.nonlocal_sde import apply_mixing_strategy
 
-
 BETA = 10.0
 NB = 1
 NK = (1, 1, 1)
@@ -86,7 +85,7 @@ def run_pulay(
         patch_config(strategy="pulay", mixing=mixing, n_hist=n_hist, niv_core=niv_core, nk_tot=nk_tot),
         patch("dgamore.nonlocal_sde.read_last_n_sigmas_from_files", return_value=file_sigmas),
     ):
-        return apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=current_iter)
+        return apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=current_iter)[0]
 
 
 def run_anderson(
@@ -104,7 +103,7 @@ def run_anderson(
         patch_config(strategy="anderson", mixing=mixing, n_hist=n_hist, niv_core=niv_core, nk_tot=nk_tot),
         patch("dgamore.nonlocal_sde.read_last_n_sigmas_from_files", return_value=file_sigmas),
     ):
-        return apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=current_iter)
+        return apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=current_iter)[0]
 
 
 def test_linear_mixing_basic():
@@ -114,7 +113,7 @@ def test_linear_mixing_basic():
     sigma_dmft = make_sigma(0.0)
 
     with patch_config(strategy="linear", mixing=0.5):
-        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)
+        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)[0]
 
     np.testing.assert_allclose(result.mat, 1.0, atol=1e-5)
 
@@ -126,7 +125,7 @@ def test_linear_mixing_alpha_zero():
     sigma_dmft = make_sigma(0.0)
 
     with patch_config(strategy="linear", mixing=0.0):
-        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)
+        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)[0]
 
     np.testing.assert_allclose(result.mat, 1.0, atol=1e-5)
 
@@ -138,7 +137,7 @@ def test_linear_mixing_alpha_one():
     sigma_dmft = make_sigma(0.0)
 
     with patch_config(strategy="linear", mixing=1.0):
-        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)
+        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)[0]
 
     np.testing.assert_allclose(result.mat, 5.0, atol=1e-5)
 
@@ -150,7 +149,7 @@ def test_linear_mixing_complex():
     sigma_dmft = make_sigma(0.0)
 
     with patch_config(strategy="linear", mixing=0.5):
-        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)
+        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)[0]
 
     np.testing.assert_allclose(result.mat, 1.0 + 1.0j, atol=1e-5)
 
@@ -162,7 +161,7 @@ def test_linear_mixing_returns_self_energy_instance():
     sigma_dmft = make_sigma(0.0)
 
     with patch_config(strategy="linear", mixing=0.5):
-        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)
+        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)[0]
 
     assert isinstance(result, SelfEnergy)
 
@@ -174,7 +173,7 @@ def test_pulay_falls_back_to_linear_when_iter_too_small():
     sigma_dmft = make_sigma(0.0)
 
     with patch_config(strategy="pulay", mixing=0.5, n_hist=5):
-        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=3)
+        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=3)[0]
 
     np.testing.assert_allclose(result.mat, 1.0, atol=1e-5)
 
@@ -281,7 +280,7 @@ def test_anderson_falls_back_to_linear_when_iter_too_small():
     sigma_dmft = make_sigma(0.0)
 
     with patch_config(strategy="anderson", mixing=0.5, n_hist=5):
-        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=3)
+        result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=3)[0]
 
     np.testing.assert_allclose(result.mat, 1.0, atol=1e-5)
 
