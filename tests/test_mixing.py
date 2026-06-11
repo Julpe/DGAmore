@@ -14,7 +14,6 @@ import dgamore.config as real_config
 from dgamore.self_energy import SelfEnergy
 from dgamore.nonlocal_sde import apply_mixing_strategy
 
-
 BETA = 10.0
 NB = 1
 NK = (1, 1, 1)

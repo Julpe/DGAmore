@@ -257,6 +257,7 @@ def execute_dga_routine():
     if config.lambda_correction.perform_lambda_correction and comm.rank == 0:
         chi_d_full.save(name="chi_dens_loc", output_dir=config.output.output_path)
         chi_m_full.save(name="chi_magn_loc", output_dir=config.output.output_path)
+        del chi_d, chi_m
 
     if comm.rank == 0:
         g2_dens_full.save(name="g2_dens_loc", output_dir=config.output.output_path)
@@ -296,19 +297,6 @@ def execute_dga_routine():
         plotting.plot_nu_nup(gamma_magn_plot, omega=-10, name="Gamma_magn", output_dir=config.output.plotting_path)
         logger.info("Plotted gamma (magn).")
         del gamma_magn_plot, gamma_m_full
-
-        g_dmft_full._ek = ek
-        plotting.chi_checks(
-            [chi_d_full.mat],
-            [chi_m_full.mat],
-            config.sys.beta,
-            ["Loc-tilde"],
-            g_dmft_full.e_kin,
-            name="loc",
-            output_dir=config.output.plotting_path,
-        )
-        del chi_d, chi_m
-        logger.info("Plotted checks of the susceptibility.")
 
         sigma_list = []
         sigma_names = []

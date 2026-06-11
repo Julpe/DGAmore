@@ -760,7 +760,7 @@ def calculate_self_energy_q(
         config.sys.n, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
         giwk_full.cut_niv(niv_cut)
 
-        if sigma_old is sigma_dmft:
+        if np.allclose(sigma_old.cut_niv(config.box.niv_core).mat, sigma_dmft.cut_niv(config.box.niv_core).mat):
             giwk_full.save(output_dir=config.output.output_path, name="g_latt_dmft")
     config.sys.n, config.sys.occ, config.sys.occ_k = comm.bcast(
         (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
@@ -888,9 +888,20 @@ def calculate_self_energy_q(
         # calculated in this code and add the smooth dmft self-energy
         sigma_new += delta_sigma
         sigma_new = sigma_new.concatenate_self_energies(sigma_dmft)
+        delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
 
         logger.info("Applying mixing strategy to the self-energy.")
         sigma_new = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter)
+
+        # Canonical self-consistency residual. This is the relative (L2) residual used for the convergence check
+        sigma_new = sigma_new.compress_q_dimension()
+        sigma_old = sigma_old.compress_q_dimension()
+
+        sigma_new_test = sigma_new.mat[..., sigma_new.niv : sigma_new.niv + config.box.niv_core]
+        sigma_old_test = sigma_old.mat[..., sigma_new.niv : sigma_old.niv + config.box.niv_core]
+        diff = (sigma_new_test - sigma_old_test).ravel()
+        norm_x = np.linalg.norm(np.concatenate([sigma_old_test.real.ravel(), sigma_old_test.imag.ravel()]))
+        relative_residual = np.linalg.norm(np.concatenate([diff.real, diff.imag])) / norm_x
 
         old_mu = mu_history[-1]
         if comm.rank == 0:
@@ -916,9 +927,17 @@ def calculate_self_energy_q(
             # calculate new occupation matrix from new Green's function (outside asympt region it is the DMFT
             # lattice Green's function)
             _, config.sys.occ, config.sys.occ_k = giwk_occ.get_fill_nonlocal()  # n should not change
+
+            ekin = giwk_occ.get_ekin()
+            logger.info(f"Kinetic energy: {ekin:.4f} [t or eV].")
+
+            epot = giwk_occ.get_epot()
+            logger.info(f"Potential energy: {epot:.4f} [t or eV].")
+            logger.info(f"Total energy: {(ekin + epot):.4f} [t or eV].")
         config.sys.occ, config.sys.occ_k = comm.bcast((config.sys.occ, config.sys.occ_k), root=0)
+
         if config.self_consistency.max_iter > 1:
-            logger.info("Updated occupation matrix with new Green's function.")
+            logger.info("Updated occupation matrix from new Green's function.")
 
         if comm.rank == 0:
             sigma_new.save(name=f"sigma_dga_iteration_{current_iter}", output_dir=config.output.output_path)
@@ -935,15 +954,11 @@ def calculate_self_energy_q(
 
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
-            niv_start = sigma_new.niv
-            niv_end = niv_start + int(np.ceil(config.box.niv_core / 5))
-
-            sigma_converged = np.allclose(
-                sigma_old.compress_q_dimension()[..., niv_start:niv_end],
-                sigma_new.compress_q_dimension()[..., niv_start:niv_end],
-                atol=config.self_consistency.epsilon,
+            sigma_converged = abs(relative_residual) < config.self_consistency.epsilon
+            logger.info(
+                f"Self-energy convergence: {sigma_converged} "
+                f"(relative residual={relative_residual:.3e}, epsilon={config.self_consistency.epsilon:.3e})."
             )
-            logger.info(f"Self-energy convergence: {sigma_converged}.")
 
             mu_converged = (
                 abs(mu_history[-1] - mu_history[-2]) < np.pi / (10 * config.sys.beta)
@@ -1029,8 +1044,6 @@ def apply_mixing_strategy(
         f_i[:n_total] = iter_diff.real
         f_i[n_total:] = iter_diff.imag
         norm_f = np.linalg.norm(f_i)
-        norm_x = np.linalg.norm(get_proposal(-1))
-        rel_res = norm_f / norm_x if norm_x > 0 else np.inf
 
         # Solve min||F @ c - f_i|| via truncated-SVD pseudoinverse (drops collinear directions)
         u, s, vh = np.linalg.svd(f_matrix, full_matrices=False)
@@ -1052,9 +1065,7 @@ def apply_mixing_strategy(
         # Update the new self energy
         sigma_new.mat[..., niv - niv_core : niv + niv_core] = get_proposal(-1).reshape(shape) + update.reshape(shape)
 
-        logger.info(
-            f"Pulay mixing applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}, rel_res={rel_res:.3e})."
-        )
+        logger.info(f"Pulay mixing applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}).")
 
         return sigma_new
     if config.self_consistency.mixing_strategy.lower() == "anderson" and current_iter > n_hist:
@@ -1081,9 +1092,6 @@ def apply_mixing_strategy(
         f_curr = flat(last_results[-1]) - flat(last_proposals[-1])
         f_vec = np.concatenate([f_curr.real, f_curr.imag])
         norm_f = np.linalg.norm(f_vec)
-        x_curr = flat(last_proposals[-1])
-        norm_x = np.linalg.norm(np.concatenate([x_curr.real, x_curr.imag]))
-        rel_res = norm_f / norm_x if norm_x > 0 else np.inf
 
         # Build dX and dF matrices (n_hist columns)
         # dX[:,i] = x_{n-i} - x_{n-i-1}  (proposal differences)
@@ -1138,14 +1146,10 @@ def apply_mixing_strategy(
 
         sigma_new.mat[..., sl] = candidate.reshape(shape)
 
-        logger.info(
-            f"Anderson acceleration applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}, rel_res={rel_res:.3e})."
-        )
+        logger.info(f"Anderson acceleration applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}).")
 
         return sigma_new
 
-    sigma_new = config.self_consistency.mixing * sigma_new + (1 - config.self_consistency.mixing) * sigma_old
-    logger.info(
-        f"Sigma linearly mixed with previous iteration using a mixing parameter of {config.self_consistency.mixing}."
-    )
+    sigma_new = alpha * sigma_new + (1 - alpha) * sigma_old
+    logger.info(f"Sigma linearly mixed (m=1, alpha={alpha}).")
     return sigma_new

@@ -312,12 +312,13 @@ def create_local_ud_diagrams_pp_w0(g_dmft: GreensFunction) -> Tuple[LocalFourPoi
     gchi0_loc_pp_w0 = (
         BubbleGenerator.create_generalized_chi0_pp_w0(g_dmft, gchi_ud_loc_pp_w0.niv, config.sys.beta)
         .extend_vn_to_diagonal()
+        .permute_orbitals("abcd->acbd")
         .flip_frequency_axis(-1, False)
     )
 
     gamma_ud_loc_pp_w0 = config.sys.beta**2 * (
         (gchi_ud_loc_pp_w0 - gchi0_loc_pp_w0).invert() + gchi0_loc_pp_w0.invert()
-    )
+    ).permute_orbitals("abcd->acbd")
 
     gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
 

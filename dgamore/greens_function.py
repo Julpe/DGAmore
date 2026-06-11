@@ -106,16 +106,6 @@ class GreensFunction(IAmNonLocal, LocalNPoint):
             config.sys.n, config.sys.occ, config.sys.occ_k = self.get_fill_nonlocal()
 
     @property
-    def e_kin(self):
-        """
-        Returns the kinetic energy of the system, see Eq (22) in G. Rohringer & A. Toschi
-        PHYSICAL REVIEW B 94, 125144 (2016).
-        """
-        ekin = 2 / config.sys.beta * np.sum(np.mean(self._ek[..., None] * self.mat, axis=(0, 1, 2)))
-        assert np.abs(ekin.imag) < 1e-8, "Kinetic energy must be real."
-        return ekin.real
-
-    @property
     def ek(self) -> np.ndarray:
         """
         Returns the band dispersion as a numpy array.
@@ -198,7 +188,7 @@ class GreensFunction(IAmNonLocal, LocalNPoint):
 
     def transpose_orbitals(self):
         r"""
-        Transposes the orbitals of the Green's function object like :math:`G_{ab}^k -> G_{ba}^k.
+        Transposes the orbitals of the Green's function object like :math:`G_{ab}^k -> G_{ba}^k`.
         """
         return self.permute_orbitals("ab->ba")
 
@@ -238,6 +228,57 @@ class GreensFunction(IAmNonLocal, LocalNPoint):
         occ_mean.real[np.abs(occ_mean) < 1e-12] = 0.0
         n_el = 2.0 * np.trace(occ_mean).real
         return n_el, occ_mean, occ_k
+
+    def get_ekin(self) -> float:
+        r"""
+        Returns the kinetic energy calculated from the Green's function and the k-dependent occupation.
+        :math:`E_{kin} = \sum_{\sigma\vec{k}ab} \varepsilon(\vec{k})_{ab} n(\vec{k})_{ba}`.
+        """
+        return 2 * np.sum(self._ek * config.sys.occ_k.swapaxes(-1, -2)).real / config.lattice.k_grid.nk_tot
+
+    def get_epot(self, niv_asympt: int = 50000) -> float:
+        r"""
+        Galitskii-Migdal potential energy, moment-corrected.
+
+        E_pot = sum_k Tr[Sigma_inf rho_k]                                  # Hartree (exact, conv. factor)
+              + 1/beta sum_{k,v} Tr[(Sigma - Sigma_inf) G]                 # in-box correlation part
+              + 1/beta [ sum_big - sum_box ] Tr[(Sigma_mod - Sigma_inf) G_mod]   # analytic 1/v^2 tail
+
+        with Sigma_mod - Sigma_inf = -smom1/(iv) and G_mod = [iv + mu - e_k - Sigma_inf]^-1.
+        The model subtraction cancels the 1/v^2 tail of the correlation sum (remainder ~1/v^4),
+        while sum_big supplies the part beyond the stored box.
+        """
+        smom0, smom1 = self._sigma.smom  # Sigma_inf, first tail coeff; both [o1, o2]
+
+        # 1) Hartree: physical (tail-corrected) occupation, convergence factor exact.
+        e_hartree = np.sum(smom0[None, None, None] * config.sys.occ_k.swapaxes(-1, -2)).real
+
+        # 2) In-box correlation part: Tr[(Sigma - Sigma_inf) G], Sigma_inf already counted above.
+        dsigma = self._sigma.decompress_q_dimension().mat - smom0[..., None]
+        g_ba = self.decompress_q_dimension().transpose_orbitals().mat
+        e_corr = (dsigma * g_ba).sum().real / config.sys.beta
+
+        # 3) Analytic 1/v^2 model tail: replace the truncated box value by the large-box one.
+        e_tail = self._model_epot(smom0, smom1, niv_asympt, config.sys.beta) - self._model_epot(
+            smom0, smom1, self.niv, config.sys.beta
+        )
+
+        return (e_hartree + e_corr + e_tail) / config.lattice.k_grid.nk_tot
+
+    def _model_epot(self, smom0, smom1, niv, beta):
+        """
+        Analytic 1/v^2 model tail
+        """
+        h = (self._ek + smom0[None, None, None]).reshape(self.nq_tot, self.n_bands, self.n_bands)
+        lam, u = np.linalg.eig(h)  # once per k
+        u_inv = np.linalg.inv(u)
+        smom1_rot = u_inv @ smom1 @ u  # rotate tail coeff into eigenbasis
+
+        iv = 1j * MFHelper.vn(niv, beta)
+        g_diag = 1.0 / (iv[None, :] + config.sys.mu - lam[:, :, None])  # [k, band, v]
+        # Tr[(-smom1/iv) G_mod] = -sum_i (smom1_rot)_ii * g_diag_i / iv
+        integrand = -np.einsum("kii,kiv->kv", smom1_rot, g_diag) / iv[None, :]
+        return integrand.sum().real / beta
 
     def _get_gfull_mat(self) -> np.ndarray:
         """
