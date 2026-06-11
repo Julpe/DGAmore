@@ -774,8 +774,6 @@ def calculate_self_energy_q(
     v_nonloc_full = deepcopy(v_nonloc)
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
 
-    prev_residual = np.inf
-
     for current_iter in range(starting_iter + 1, starting_iter + config.self_consistency.max_iter + 1):
         logger.info("----------------------------------------")
         logger.info(f"Starting iteration {current_iter}.")
@@ -890,9 +888,20 @@ def calculate_self_energy_q(
         # calculated in this code and add the smooth dmft self-energy
         sigma_new += delta_sigma
         sigma_new = sigma_new.concatenate_self_energies(sigma_dmft)
+        delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
 
         logger.info("Applying mixing strategy to the self-energy.")
-        sigma_new, sigma_residual = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter)
+        sigma_new = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter)
+
+        # Canonical self-consistency residual. This is the relative (L2) residual used for the convergence check
+        sigma_new = sigma_new.compress_q_dimension()
+        sigma_old = sigma_old.compress_q_dimension()
+
+        sigma_new_test = sigma_new.mat[..., sigma_new.niv : sigma_new.niv + config.box.niv_core]
+        sigma_old_test = sigma_old.mat[..., sigma_new.niv : sigma_old.niv + config.box.niv_core]
+        diff = (sigma_new_test - sigma_old_test).ravel()
+        norm_x = np.linalg.norm(np.concatenate([sigma_old_test.real.ravel(), sigma_old_test.imag.ravel()]))
+        relative_residual = np.linalg.norm(np.concatenate([diff.real, diff.imag])) / norm_x
 
         old_mu = mu_history[-1]
         if comm.rank == 0:
@@ -945,14 +954,10 @@ def calculate_self_energy_q(
 
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
-            residual_change = (
-                abs(sigma_residual - prev_residual) / abs(sigma_residual) if sigma_residual != 0 else np.inf
-            )
-            sigma_converged = residual_change < config.self_consistency.epsilon
+            sigma_converged = abs(relative_residual) < config.self_consistency.epsilon
             logger.info(
                 f"Self-energy convergence: {sigma_converged} "
-                f"(residual_change={residual_change:.3e}, rel_res={sigma_residual:.3e}, "
-                f"epsilon={config.self_consistency.epsilon:.3e})."
+                f"(relative residual={relative_residual:.3e}, epsilon={config.self_consistency.epsilon:.3e})."
             )
 
             mu_converged = (
@@ -964,7 +969,6 @@ def calculate_self_energy_q(
         else:
             converged = False
         converged = comm.bcast(converged)
-        prev_residual = sigma_residual
 
         sigma_old = sigma_new
         if converged:
@@ -989,7 +993,7 @@ def calculate_self_energy_q(
 
 def apply_mixing_strategy(
     sigma_new: SelfEnergy, sigma_old: SelfEnergy, sigma_dmft: SelfEnergy, current_iter: int
-) -> tuple[SelfEnergy, float]:
+) -> SelfEnergy:
     """
     Applies the mixing strategy for the self-consistency loop. The mixing strategy is defined in the config file and
     is either 'linear' or 'pulay'.
@@ -1040,8 +1044,6 @@ def apply_mixing_strategy(
         f_i[:n_total] = iter_diff.real
         f_i[n_total:] = iter_diff.imag
         norm_f = np.linalg.norm(f_i)
-        norm_x = np.linalg.norm(get_proposal(-1))
-        rel_res = norm_f / norm_x if norm_x > 0 else np.inf
 
         # Solve min||F @ c - f_i|| via truncated-SVD pseudoinverse (drops collinear directions)
         u, s, vh = np.linalg.svd(f_matrix, full_matrices=False)
@@ -1049,7 +1051,7 @@ def apply_mixing_strategy(
         mask = s > cutoff
         if not np.any(mask):
             logger.warning("Pulay SVD ill-conditioned - falling back to linear mixing.")
-            return alpha * sigma_new + (1 - alpha) * sigma_old, rel_res
+            return alpha * sigma_new + (1 - alpha) * sigma_old
         coeffs = vh[mask].T @ ((u[:, mask].T @ f_i) / s[mask])
 
         # Pulay update: x_{n+1} = x_n + alpha*f_i - (R + alpha*F) @ c
@@ -1063,11 +1065,9 @@ def apply_mixing_strategy(
         # Update the new self energy
         sigma_new.mat[..., niv - niv_core : niv + niv_core] = get_proposal(-1).reshape(shape) + update.reshape(shape)
 
-        logger.info(
-            f"Pulay mixing applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}, rel_res={rel_res:.3e})."
-        )
+        logger.info(f"Pulay mixing applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}).")
 
-        return sigma_new, rel_res
+        return sigma_new
     if config.self_consistency.mixing_strategy.lower() == "anderson" and current_iter > n_hist:
         last_sigmas = read_last_n_sigmas_from_files(
             n_hist, config.output.output_path, config.self_consistency.previous_sc_path
@@ -1092,9 +1092,6 @@ def apply_mixing_strategy(
         f_curr = flat(last_results[-1]) - flat(last_proposals[-1])
         f_vec = np.concatenate([f_curr.real, f_curr.imag])
         norm_f = np.linalg.norm(f_vec)
-        x_curr = flat(last_proposals[-1])
-        norm_x = np.linalg.norm(np.concatenate([x_curr.real, x_curr.imag]))
-        rel_res = norm_f / norm_x if norm_x > 0 else np.inf
 
         # Build dX and dF matrices (n_hist columns)
         # dX[:,i] = x_{n-i} - x_{n-i-1}  (proposal differences)
@@ -1129,7 +1126,7 @@ def apply_mixing_strategy(
 
         except np.linalg.LinAlgError:
             logger.warning("Anderson SVD failed - falling back to linear mixing.")
-            return alpha * sigma_new + (1 - alpha) * sigma_old, rel_res
+            return alpha * sigma_new + (1 - alpha) * sigma_old
 
         # Undamped Anderson proposal: x_n + f_n - (dX + dF) @ c
         x_n = flat(last_proposals[-1])
@@ -1149,25 +1146,10 @@ def apply_mixing_strategy(
 
         sigma_new.mat[..., sl] = candidate.reshape(shape)
 
-        logger.info(
-            f"Anderson acceleration applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}, rel_res={rel_res:.3e})."
-        )
+        logger.info(f"Anderson acceleration applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}).")
 
-        return sigma_new, rel_res
+        return sigma_new
 
-    niv = sigma_new.current_shape[-1] // 2
-    niv_core = config.box.niv_core
-    sl = slice(niv - niv_core, niv + niv_core)
-    f_lin = (sigma_new.mat[..., sl] - sigma_old.mat[..., sl]).flatten()
-    f_vec = np.concatenate([f_lin.real, f_lin.imag])
-    norm_f = np.linalg.norm(f_vec)
-    x_lin = sigma_old.mat[..., sl].flatten()
-    norm_x = np.linalg.norm(np.concatenate([x_lin.real, x_lin.imag]))
-    rel_res = norm_f / norm_x if norm_x > 0 else np.inf
-
-    sigma_new = config.self_consistency.mixing * sigma_new + (1 - config.self_consistency.mixing) * sigma_old
-    logger.info(
-        f"Sigma linearly mixed with previous iteration using a mixing parameter of "
-        f"{config.self_consistency.mixing} (norm_f={norm_f:.3e}, rel_res={rel_res:.3e})."
-    )
-    return sigma_new, rel_res
+    sigma_new = alpha * sigma_new + (1 - alpha) * sigma_old
+    logger.info(f"Sigma linearly mixed (m=1, alpha={alpha}).")
+    return sigma_new

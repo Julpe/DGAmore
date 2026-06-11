@@ -440,13 +440,26 @@ class IAmNonLocal(IHaveMat, ABC):
     def filter_q_index(self, index: int = 0):
         r"""
         Filters the object to the given index of the momentum dimension and returns a copy. Acts like a filter.
-        Makes it possible to use e.g. only the first component of a non-local object.
+        Makes it possible to use e.g. only the n-th q-component of a non-local object.
         """
         if not self.has_compressed_q_dimension:
             self.compress_q_dimension()
 
         copy = deepcopy(self)
         copy.mat = copy.mat[index][None, ...]
+        copy.update_original_shape()
+        copy._nq = (1, 1, 1)
+        return copy
+
+    def q_mean(self):
+        r"""
+        Averages over the momentum dimension and returns a copy of the object with nq = (1,1,1).
+        """
+        copy = deepcopy(self)
+        if self.has_compressed_q_dimension:
+            copy.mat = np.mean(copy.mat, axis=0)[None, ...]
+        else:
+            copy.mat = np.mean(copy.mat, axis=(0, 1, 2))[None, None, None, ...]
         copy.update_original_shape()
         copy._nq = (1, 1, 1)
         return copy
