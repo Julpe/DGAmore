@@ -3,11 +3,20 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+"""
+Base class for all local (momentum-independent) N-point quantities. :class:`LocalNPoint` adds the orbital and
+frequency-axis bookkeeping (number of orbital/bosonic/fermionic axes, full vs. half frequency ranges) and the
+shared frequency transformations (cut, diagonal extension, full/half range conversion, orbital symmetrization)
+on top of :class:`IHaveMat`.
+"""
 
 import itertools
 import os
+from copy import deepcopy
 
-from dgamore.n_point_base import *
+import numpy as np
+
+from dgamore.n_point_base import IHaveMat
 
 
 class LocalNPoint(IHaveMat):
@@ -26,6 +35,16 @@ class LocalNPoint(IHaveMat):
         full_niw_range: bool = True,
         full_niv_range: bool = True,
     ):
+        r"""
+        Stores the array together with its orbital- and frequency-axis bookkeeping.
+
+        :param mat: The underlying numpy array laid out as ``[orbitals..., (w), (v), (v')]``.
+        :param num_orbital_dimensions: Number of orbital axes; 2 (two-point) or 4 (three-/four-leg vertex).
+        :param num_wn_dimensions: Number of bosonic frequency axes (0 or 1).
+        :param num_vn_dimensions: Number of fermionic frequency axes (0, 1 or 2).
+        :param full_niw_range: Whether the bosonic axis spans the full (signed) range or only :math:`\omega \geq 0`.
+        :param full_niv_range: Whether the fermionic axes span the full (signed) range or only :math:`\nu \geq 0`.
+        """
         IHaveMat.__init__(self, mat)
 
         assert num_orbital_dimensions in (2, 4), "2 or 4 orbital dimensions are supported."
@@ -45,6 +64,8 @@ class LocalNPoint(IHaveMat):
         """
         Returns the number of bands. Since these objects are momentum-independent, the orbital dimension is always
         in the first dimension.
+
+        :return: The number of bands (orbitals).
         """
         return self.original_shape[0]
 
@@ -53,6 +74,8 @@ class LocalNPoint(IHaveMat):
         """
         Returns the number of orbital dimensions; two (for a two-point object) or four
         (for a three-leg or four-leg vertex) are allowed.
+
+        :return: The number of orbital axes (2 or 4).
         """
         return self._num_orbital_dimensions
 
@@ -60,6 +83,8 @@ class LocalNPoint(IHaveMat):
     def num_wn_dimensions(self) -> int:
         """
         Returns the number of bosonic frequency dimensions; none or one are allowed.
+
+        :return: The number of bosonic frequency axes (0 or 1).
         """
         return self._num_wn_dimensions
 
@@ -67,6 +92,8 @@ class LocalNPoint(IHaveMat):
     def num_vn_dimensions(self) -> int:
         """
         Returns the number of fermionic frequency dimensions; none, one or two are allowed.
+
+        :return: The number of fermionic frequency axes (0, 1 or 2).
         """
         return self._num_vn_dimensions
 
@@ -74,6 +101,8 @@ class LocalNPoint(IHaveMat):
     def niw(self) -> int:
         """
         Returns the number of bosonic frequencies in the object.
+
+        :return: The half-width of the bosonic frequency box (0 if there is no bosonic axis).
         """
         if self.num_wn_dimensions == 0:
             return 0
@@ -84,6 +113,8 @@ class LocalNPoint(IHaveMat):
     def niv(self) -> int:
         """
         Returns the number of fermionic frequencies in the object.
+
+        :return: The half-width of the fermionic frequency box (0 if there is no fermionic axis).
         """
         if self.num_vn_dimensions == 0:
             return 0
@@ -96,6 +127,8 @@ class LocalNPoint(IHaveMat):
         only a subset of it (only :math:`\omega \geq 0`). All vertices fulfill a certain symmetry against the sign change
         of :math:`\omega\to-\omega`, which can be taken advantage of. By exploiting this symmetry it allows us to almost
         half their memory usage.
+
+        :return: True if the bosonic axis spans the full (signed) range.
         """
         return self._full_niw_range
 
@@ -104,12 +137,22 @@ class LocalNPoint(IHaveMat):
         r"""
         Specifies whether the object is stored in the full fermionic frequency range or
         only a subset of it (only :math:`\nu\geq0`). Same reasoning as already discussed in `full_niw_range`.
+
+        :return: True if the fermionic axes span the full (signed) range.
         """
         return self._full_niv_range
 
-    def cut_niw(self, niw_cut: int):
+    def cut_niw(self, niw_cut: int, copy: bool = True):
         """
-        Allows to place a cutoff on the number of bosonic frequencies of the object. Returns a copy of the object.
+        Allows to place a cutoff on the number of bosonic frequencies of the object. Returns a copy if ``copy`` is
+        True, otherwise modifies and returns ``self`` in place. If the requested cutoff is not smaller than the
+        available range this is a no-op and returns ``self`` (not a copy) regardless of ``copy`` -- do not mutate the
+        result expecting the original to be unaffected.
+
+        :param niw_cut: Number of bosonic frequencies to keep (per sign).
+        :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
+        :return: The cut object (a copy, ``self``, or ``self`` unchanged for the no-op case).
+        :raises ValueError: If the object has no bosonic frequency dimension.
         """
         if self.num_wn_dimensions == 0:
             raise ValueError("Cannot cut bosonic frequencies if there are none.")
@@ -117,23 +160,31 @@ class LocalNPoint(IHaveMat):
         if niw_cut > self.niw:
             return self
 
-        copy = deepcopy(self)
+        obj = deepcopy(self) if copy else self
 
-        niw_slice = slice(copy.niw - niw_cut, copy.niw + niw_cut + 1) if copy.full_niw_range else slice(0, niw_cut + 1)
+        niw_slice = slice(obj.niw - niw_cut, obj.niw + niw_cut + 1) if obj.full_niw_range else slice(0, niw_cut + 1)
 
-        if copy.num_vn_dimensions == 2:
-            copy.mat = copy.mat[..., niw_slice, :, :]
-        elif copy.num_vn_dimensions == 1:
-            copy.mat = copy.mat[..., niw_slice, :]
-        else:  # copy.num_vn_dimensions == 0
-            copy.mat = copy.mat[..., niw_slice]
+        if obj.num_vn_dimensions == 2:
+            obj.mat = obj.mat[..., niw_slice, :, :]
+        elif obj.num_vn_dimensions == 1:
+            obj.mat = obj.mat[..., niw_slice, :]
+        else:  # obj.num_vn_dimensions == 0
+            obj.mat = obj.mat[..., niw_slice]
 
-        copy.update_original_shape()
-        return copy
+        obj.update_original_shape()
+        return obj
 
-    def cut_niv(self, niv_cut: int):
+    def cut_niv(self, niv_cut: int, copy: bool = True):
         """
-        Allows to place a cutoff on the number of fermionic frequencies of the object. Returns a copy of the object.
+        Allows to place a cutoff on the number of fermionic frequencies of the object. Returns a copy if ``copy`` is
+        True, otherwise modifies and returns ``self`` in place. If the requested cutoff is not smaller than the
+        available range this is a no-op and returns ``self`` (not a copy) regardless of ``copy`` -- do not mutate the
+        result expecting the original to be unaffected.
+
+        :param niv_cut: Number of fermionic frequencies to keep (per sign).
+        :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
+        :return: The cut object (a copy, ``self``, or ``self`` unchanged for the no-op case).
+        :raises ValueError: If the object has no fermionic frequency dimension.
         """
         if self.num_vn_dimensions == 0:
             raise ValueError("Cannot cut fermionic frequencies if there are none.")
@@ -141,35 +192,45 @@ class LocalNPoint(IHaveMat):
         if niv_cut > self.niv:
             return self
 
-        copy = deepcopy(self)
+        obj = deepcopy(self) if copy else self
 
-        niv_slice = slice(copy.niv - niv_cut, copy.niv + niv_cut) if copy.full_niv_range else slice(0, niv_cut)
+        niv_slice = slice(obj.niv - niv_cut, obj.niv + niv_cut) if obj.full_niv_range else slice(0, niv_cut)
 
-        if copy.num_vn_dimensions == 2:
-            copy.mat = copy.mat[..., niv_slice, niv_slice]
-        elif copy.num_vn_dimensions == 1:
-            copy.mat = copy.mat[..., niv_slice]
+        if obj.num_vn_dimensions == 2:
+            obj.mat = obj.mat[..., niv_slice, niv_slice]
+        elif obj.num_vn_dimensions == 1:
+            obj.mat = obj.mat[..., niv_slice]
 
-        copy.update_original_shape()
-        return copy
+        obj.update_original_shape()
+        return obj
 
-    def cut_niw_and_niv(self, niw_cut: int, niv_cut: int):
+    def cut_niw_and_niv(self, niw_cut: int, niv_cut: int, copy: bool = True):
         """
-        Allows to place a cutoff on the number of bosonic and fermionic frequencies of the object. Returns a copy of
-        the object.
+        Allows to place a cutoff on the number of bosonic and fermionic frequencies of the object. Returns a copy if
+        ``copy`` is True, otherwise modifies and returns ``self`` in place.
+
+        :param niw_cut: Number of bosonic frequencies to keep (per sign).
+        :param niv_cut: Number of fermionic frequencies to keep (per sign).
+        :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
+        :return: The cut object; see :meth:`cut_niw` and :meth:`cut_niv`.
         """
-        return self.cut_niw(niw_cut).cut_niv(niv_cut)
+        return self.cut_niw(niw_cut, copy).cut_niv(niv_cut, copy)
 
     def extend_vn_to_diagonal(self):
         """
         Extends an object [...,w,v] to [...,w,v,v] by making a diagonal from the last dimension if the number of fermionic
         frequency dimensions is one. Returns the original object.
+
+        :return: ``self`` with two fermionic frequency axes (a no-op if it already has two).
+        :raises ValueError: If the object has no fermionic frequency dimension.
         """
         if self.num_vn_dimensions == 0:
             raise ValueError("No fermionic frequency dimensions available for extension.")
         if self.num_vn_dimensions == 2:
             return self
-        self.mat = np.einsum("...i,ij->...ij", self.mat, np.eye(self.current_shape[-1]), optimize=True)
+        self.mat = np.einsum(
+            "...i,ij->...ij", self.mat, np.eye(self.current_shape[-1], dtype=self.mat.dtype), optimize=True
+        )
         self._num_vn_dimensions = 2
         self.update_original_shape()
         return self
@@ -178,6 +239,9 @@ class LocalNPoint(IHaveMat):
         """
         Compresses an object [...w,v,v] to [...,w,v] by taking the diagonal of the last two dimensions and returns the
         original object.
+
+        :return: ``self`` with one fermionic frequency axis (a no-op if it already has one).
+        :raises ValueError: If the object has no fermionic frequency dimension.
         """
         if self.num_vn_dimensions == 0:
             raise ValueError("No fermionic frequency dimensions available for compression.")
@@ -193,6 +257,8 @@ class LocalNPoint(IHaveMat):
         Converts the object to the full bosonic frequency range and returns the original object. For details, we refer
         to Eq. (2.39) and the associated text in Georg Rohringer's PhD thesis. This corresponds to time-reversal
         symmetry.
+
+        :return: ``self`` over the full (signed) bosonic range (a no-op if there is no bosonic axis or it is already full).
         """
         if self.num_wn_dimensions == 0 or self.full_niw_range:
             return self
@@ -228,6 +294,8 @@ class LocalNPoint(IHaveMat):
         r"""
         Converts the object to the half bosonic frequency range by taking
         :math:`F^{\omega\nu\nu'}_{abcd}\to F^{\omega\geq0;\nu\nu'}_{abcd}`. Returns the original object.
+
+        :return: ``self`` over the half bosonic range (a no-op if there is no bosonic axis or it is already half).
         """
         if self.num_wn_dimensions == 0 or not self.full_niw_range:
             return self
@@ -243,6 +311,8 @@ class LocalNPoint(IHaveMat):
         r"""
         Converts the object to the half fermionic frequency range by taking
         :math:`F^{\omega\nu\nu'}_{abcd}\to F^{\omega;\nu\geq0,\nu'\geq0}_{abcd}`. Returns the original object.
+
+        :return: ``self`` over the half fermionic range (a no-op if there is no fermionic axis or it is already half).
         """
         if self.num_vn_dimensions == 0 or not self.full_niv_range:
             return self
@@ -259,6 +329,11 @@ class LocalNPoint(IHaveMat):
     def flip_frequency_axis(self, axis: tuple | int, copy: bool = True):
         """
         Flips the matrix along the specified frequency axis and returns a copy if specified.
+
+        :param axis: The frequency axis or axes to flip (negative indices into the trailing frequency axes).
+        :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
+        :return: The flipped object.
+        :raises ValueError: If the object has no frequency axes, or ``axis`` is not a valid frequency axis.
         """
         if self.num_wn_dimensions + self.num_vn_dimensions == 0:
             raise ValueError("Cannot flip the matrix if there are no frequency dimensions.")
@@ -271,9 +346,7 @@ class LocalNPoint(IHaveMat):
             raise ValueError(f"Invalid axis {axis}. Possible axes are {axis_possible}.")
 
         if copy:
-            copy = deepcopy(self)
-            copy.mat = np.flip(copy.mat, axis=axis)
-            return copy
+            return deepcopy(self).flip_frequency_axis(axis, copy=False)
 
         self.mat = np.flip(self.mat, axis=axis)
         return self
@@ -281,14 +354,16 @@ class LocalNPoint(IHaveMat):
     def swap_fermionic_frequency_axes(self, copy: bool = True):
         """
         Swaps two frequency axes of the matrix and returns a copy if specified.
+
+        :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
+        :return: The object with its two fermionic frequency axes swapped.
+        :raises ValueError: If the object has fewer than two fermionic frequency dimensions.
         """
         if self.num_vn_dimensions < 2:
             raise ValueError("Cannot swap axes if there are less than two fermionic frequency dimensions.")
 
         if copy:
-            copy = deepcopy(self)
-            copy.mat = np.swapaxes(copy.mat, -1, -2)
-            return copy
+            return deepcopy(self).swap_fermionic_frequency_axes(copy=False)
 
         self.mat = np.swapaxes(self.mat, -1, -2)
         return self
@@ -296,6 +371,10 @@ class LocalNPoint(IHaveMat):
     def save(self, output_dir: str = "./", name: str = "please_give_me_a_name") -> None:
         """
         Saves the content of the matrix to a numpy file. Always saves it in half the niw range to save storage space.
+
+        :param output_dir: Directory to write the ``.npy`` file to.
+        :param name: File name (without extension).
+        :return: None.
         """
         is_self_full_niw_range = self.full_niw_range
         np.save(os.path.join(output_dir, f"{name}.npy"), self.to_half_niw_range().mat, allow_pickle=False)
@@ -312,6 +391,12 @@ class LocalNPoint(IHaveMat):
             3) [i,j,j,i]
             4) [i,j,i,j]
             5) 3–1 patterns [i,j,j,j]
+
+        :param orbitals: A group (list of 1-based orbital indices) or a list of such groups to make degenerate.
+        :param orbital_axes: The axes of ``mat`` that carry the orbital indices (length 2 or 4).
+        :return: ``self`` with the requested orbital groups averaged (in place).
+        :raises ValueError: If an orbital index is out of range, a pattern length mismatches, or the number of
+            orbital axes is neither 2 nor 4.
         """
         nb = self.current_shape[orbital_axes[0]]
         mat_orig = self.mat.copy()
@@ -331,6 +416,14 @@ class LocalNPoint(IHaveMat):
             group -= 1  # zero-based
 
             def average_patterns(patterns):
+                """
+                Averages the object over a set of equivalent orbital-index patterns and writes the average back to
+                every member pattern (the in-place symmetrization step).
+
+                :param patterns: List of orbital-index tuples (one entry per orbital axis) to average together.
+                :return: None.
+                :raises ValueError: If a pattern's length does not match the number of orbital axes.
+                """
                 if not patterns:
                     return
 
@@ -403,6 +496,12 @@ class LocalNPoint(IHaveMat):
             3) [i,j,j,i]
             4) [i,j,i,j]
             5) 3–1 patterns [i,j,j,j]
+
+        :param orbitals: A group (list of 1-based orbital indices) or a list of such groups to check.
+        :param orbital_axes: The axes of ``mat`` that carry the orbital indices (length 2 or 4).
+        :return: True if all required orbital patterns are already degenerate.
+        :raises ValueError: If an orbital index is out of range, a pattern length mismatches, or the number of
+            orbital axes is neither 2 nor 4.
         """
         nb = self.current_shape[orbital_axes[0]]
 
@@ -420,6 +519,14 @@ class LocalNPoint(IHaveMat):
             group -= 1  # zero-based
 
             def check_patterns(patterns):
+                """
+                Checks whether the object already has identical values across a set of equivalent orbital-index
+                patterns (the test used to short-circuit symmetrization).
+
+                :param patterns: List of orbital-index tuples (one entry per orbital axis) to compare.
+                :return: True if all patterns hold equal values (or the list is empty).
+                :raises ValueError: If a pattern's length does not match the number of orbital axes.
+                """
                 if not patterns:
                     return True
 
@@ -489,6 +596,10 @@ class LocalNPoint(IHaveMat):
     def _align_frequency_dimensions_for_operation(self, other: "LocalNPoint"):
         """
         Adapts the frequency dimensions of two (Local)NPoint objects to fit each other for addition or multiplication.
+
+        :param other: The other object to align with ``self``.
+        :return: A tuple ``(other, self_extended, other_extended)`` where the booleans record whether ``self`` or
+            ``other`` had a fermionic axis diagonally extended (so the caller can revert it afterwards).
         """
         self_extended = False
         other_extended = False

@@ -61,14 +61,31 @@ class Labels(Enum):
 
     @property
     def key(self):
+        """
+        The lowercase lookup key of the label.
+
+        :return: The lowercase string key of the label (first tuple element).
+        """
         return self.value[0]
 
     @property
     def latex(self):
+        """
+        The LaTeX/plot string of the label.
+
+        :return: The LaTeX/plot label string (second tuple element).
+        """
         return self.value[1]
 
     @staticmethod
     def from_string(s: str):
+        """
+        Looks up a :class:`Labels` member by its string key (case-insensitive).
+
+        :param s: The label key to look up.
+        :return: The matching :class:`Labels` member.
+        :raises ValueError: If no label matches ``s``.
+        """
         s = s.strip().lower()
         for label in Labels:
             if s == label.key:
@@ -78,14 +95,18 @@ class Labels(Enum):
 
 def two_dimensional_square_symmetries() -> list[KnownSymmetries]:
     """
-    Two-dimensional square lattice symmetries.
+    Returns the standard symmetry set of a two-dimensional square lattice.
+
+    :return: The lattice symmetries of a two-dimensional square lattice.
     """
     return [KnownSymmetries.X_INV, KnownSymmetries.Y_INV, KnownSymmetries.X_Y_SYM]
 
 
 def three_dimensional_cubic_symmetries() -> list[KnownSymmetries]:
     """
-    Three-dimensional cubic lattice symmetries.
+    Returns the standard symmetry set of a three-dimensional cubic lattice.
+
+    :return: The lattice symmetries of a three-dimensional cubic lattice.
     """
     return [
         KnownSymmetries.X_INV,
@@ -99,36 +120,48 @@ def three_dimensional_cubic_symmetries() -> list[KnownSymmetries]:
 
 def two_dimensional_nematic_symmetries() -> list[KnownSymmetries]:
     """
-    Two-dimensional nematic lattice symmetries.
+    Returns the standard symmetry set of a two-dimensional nematic lattice.
+
+    :return: The lattice symmetries of a two-dimensional nematic lattice.
     """
     return [KnownSymmetries.X_INV, KnownSymmetries.Y_INV]
 
 
 def quasi_two_dimensional_square_symmetries() -> list[KnownSymmetries]:
     """
-    Quasi-two-dimensional square lattice symmetries.
+    Returns the standard symmetry set of a quasi-two-dimensional square lattice.
+
+    :return: The lattice symmetries of a quasi-two-dimensional square lattice.
     """
     return [KnownSymmetries.X_INV, KnownSymmetries.Y_INV, KnownSymmetries.Z_INV, KnownSymmetries.X_Y_SYM]
 
 
 def quasi_one_dimensional_square_symmetries() -> list[KnownSymmetries]:
     """
-    Quasi-one-dimensional square lattice symmetries.
+    Returns the standard symmetry set of a quasi-one-dimensional square lattice.
+
+    :return: The lattice symmetries of a quasi-one-dimensional square lattice.
     """
     return [KnownSymmetries.X_INV, KnownSymmetries.Y_INV]
 
 
 def simultaneous_x_y_inversion() -> list[KnownSymmetries]:
     """
-    Simultaneous inversion in x and y direction.
+    Returns the symmetry set for a simultaneous x-and-y inversion.
+
+    :return: The symmetry list for a simultaneous inversion in the x and y directions.
     """
     return [KnownSymmetries.X_Y_INV]
 
 
 def inv_sym(mat: np.ndarray, axis) -> None:
     """
-    In-place inversion symmetry applied to mat along dimension axis
-    assumes that the grid is from [0,2pi), hence 0 does not map.
+    Applies an inversion symmetry along ``axis`` to ``mat`` in place, assuming the grid runs over :math:`[0, 2\\pi)`
+    so that the zero point does not map.
+
+    :param mat: The (at least 3D) array to symmetrize in place; the leading three axes are the momentum axes.
+    :param axis: The momentum axis (0, 1 or 2) to invert.
+    :return: None.
     """
     assert axis in [0, 1, 2], f"axis = {axis} but must be in [0,1,2]"
     assert len(np.shape(mat)) >= 3, f"dim(mat) = {len(np.shape(mat))} but must be at least 3 dimensional"
@@ -144,28 +177,44 @@ def inv_sym(mat: np.ndarray, axis) -> None:
 
 def x_y_sym(mat: np.ndarray) -> None:
     """
-    In-place x-y symmetry applied to matrix.
+    Applies the x-y reflection symmetry to ``mat`` in place (see :func:`_pairwise_sym`).
+
+    :param mat: The (at least 3D) array to symmetrize in place.
+    :return: None.
     """
     _pairwise_sym(mat, 0, 1)
 
 
 def x_z_sym(mat: np.ndarray) -> None:
     """
-    In-place x-z symmetry applied to matrix.
+    Applies the x-z reflection symmetry to ``mat`` in place (see :func:`_pairwise_sym`).
+
+    :param mat: The (at least 3D) array to symmetrize in place.
+    :return: None.
     """
     _pairwise_sym(mat, 0, 2)
 
 
 def y_z_sym(mat: np.ndarray) -> None:
     """
-    In-place y-z symmetry applied to matrix.
+    Applies the y-z reflection symmetry to ``mat`` in place (see :func:`_pairwise_sym`).
+
+    :param mat: The (at least 3D) array to symmetrize in place.
+    :return: None.
     """
     _pairwise_sym(mat, 1, 2)
 
 
 def _pairwise_sym(mat: np.ndarray, axis_a: int, axis_b: int) -> None:
     """
-    In-place symmetry swapping axis_a and axis_b applied to matrix.
+    Symmetrizes ``mat`` in place under the swap of two momentum axes by taking the element-wise minimum of the array
+    and its axis-swapped version (used to collapse equivalent points to a single representative index). Does nothing
+    (with a warning) if the two axes have different lengths.
+
+    :param mat: The (at least 3D) array to symmetrize in place.
+    :param axis_a: First momentum axis to swap.
+    :param axis_b: Second momentum axis to swap.
+    :return: None.
     """
     assert axis_a in [0, 1, 2] and axis_b in [0, 1, 2]
     assert mat.ndim >= 3
@@ -178,7 +227,10 @@ def _pairwise_sym(mat: np.ndarray, axis_a: int, axis_b: int) -> None:
 
 def x_y_inv(mat: np.ndarray) -> None:
     """
-    Simultaneous inversion in x and y direction.
+    Applies the simultaneous x-and-y inversion symmetry to ``mat`` in place.
+
+    :param mat: The (at least 3D) array to symmetrize in place.
+    :return: None.
     """
     assert mat.ndim >= 3, f"dim(mat) = {mat.ndim} but must be at least 3 dimensional"
     len_ax_x = mat.shape[0] // 2
@@ -188,7 +240,11 @@ def x_y_inv(mat: np.ndarray) -> None:
 
 def apply_symmetry(mat: np.ndarray, sym: KnownSymmetries) -> None:
     """
-    Applies a single symmetry to matrix.
+    Applies a single known lattice symmetry to ``mat`` in place.
+
+    :param mat: The (at least 3D) array to symmetrize in place.
+    :param sym: The :class:`KnownSymmetries` operation to apply.
+    :return: None.
     """
     assert sym in KnownSymmetries, f"sym = {sym} not in known symmetries {KnownSymmetries}."
     if sym == KnownSymmetries.X_INV:
@@ -209,7 +265,11 @@ def apply_symmetry(mat: np.ndarray, sym: KnownSymmetries) -> None:
 
 def apply_symmetries(mat: np.ndarray, symmetries: list[KnownSymmetries]) -> None:
     """
-    Applies symmetries to matrix in-place.
+    Applies a sequence of lattice symmetries to ``mat`` in place (see :func:`apply_symmetry`).
+
+    :param mat: The (at least 3D) array to symmetrize in place.
+    :param symmetries: The list of :class:`KnownSymmetries` to apply in order (empty/None is a no-op).
+    :return: None.
     """
     assert mat.ndim >= 3, f"dim(mat) = {mat.ndim} but must at least 3 dimensional"
     if not symmetries:
@@ -226,6 +286,12 @@ def get_lattice_symmetries_from_string(symmetry_string: str | tuple | list) -> l
     from a Hamiltonian H(k) at runtime via KGrid.specify_auto_symmetries(hk).
     In that case an empty list is returned here, but a marker is set so that
     the KGrid defers building fbz2irrk until specify_auto_symmetries is called.
+
+    :param symmetry_string: A named preset (e.g. ``"two_dimensional_square"``), the special ``"auto"``, an empty
+        string/``"none"``, or a list/tuple (or its string repr) of :class:`KnownSymmetries` values.
+    :return: The corresponding list of :class:`KnownSymmetries`, an empty list, or the :data:`AUTO_SYMMETRIES_SENTINEL`.
+    :raises ValueError: If the string cannot be parsed as a known preset or a Python literal.
+    :raises NotImplementedError: If a listed symmetry is not a known symmetry.
     """
     if not symmetry_string:
         return []
@@ -301,7 +367,12 @@ AUTO_SYMMETRIES_SENTINEL = _AutoSymmetriesSentinel()
 
 
 def is_auto_symmetries(symmetries) -> bool:
-    """Returns True if the given symmetries value is the auto sentinel."""
+    """
+    Tests whether a symmetries value requests auto-detection.
+
+    :param symmetries: A symmetries value (list, sentinel, etc.).
+    :return: True if ``symmetries`` is the :data:`AUTO_SYMMETRIES_SENTINEL`.
+    """
     return symmetries is AUTO_SYMMETRIES_SENTINEL
 
 
@@ -319,6 +390,13 @@ class KGrid:
     """
 
     def __init__(self, nk: tuple = None, symmetries: list[KnownSymmetries] = None):
+        """
+        Builds the k-axes and the irreducible-BZ maps from the grid size and symmetries.
+
+        :param nk: Number of k-points per spatial direction, as a tuple ``(nx, ny, nz)``.
+        :param symmetries: A list of :class:`KnownSymmetries` defining the irreducible BZ, or the
+            :data:`AUTO_SYMMETRIES_SENTINEL` to defer symmetry discovery to :meth:`specify_auto_symmetries`.
+        """
         self.kx = None  # kx-grid
         self.ky = None  # ky-grid
         self.kz = None  # kz-grid
@@ -348,14 +426,19 @@ class KGrid:
 
     def set_fbz2irrk(self) -> None:
         """
-        Set the mapping from the full BZ to the irreducible one by applying the lattice symmetries.
+        Builds the full-BZ-to-irreducible-BZ index field by applying the lattice symmetries to the flat index grid.
+
+        :return: None.
         """
         self.fbz2irrk = np.reshape(np.arange(0, np.prod(self.nk)), self.nk)
         apply_symmetries(self.fbz2irrk, self.symmetries)
 
     def set_irrk_maps(self) -> None:
         """
-        Set the mapping from the irreducible BZ to the full one, the inverse, and the symmetry map.
+        Derives the irreducible-BZ index list, the inverse map back to the full BZ, the multiplicities, and the
+        per-point symmetry map from ``fbz2irrk``.
+
+        :return: None.
         """
         _, self.irrk_ind, self.irrk_inv, self.irrk_count = np.unique(
             self.fbz2irrk, return_index=True, return_inverse=True, return_counts=True
@@ -381,26 +464,19 @@ class KGrid:
         ``_map_to_full_bz`` to apply the orbital transformation when expanding
         IBZ -> FBZ.
 
-        Parameters
-        ----------
-        hk:
-            Complex Hermitian Hamiltonian of shape
-            ``(nk[0], nk[1], nk[2], nb, nb)`` indexed on the same grid as this
-            KGrid, with axes corresponding to the primitive reciprocal-lattice
-            basis (i.e. each axis is a fractional coordinate along ``b_i``).
-        atol:
-            Absolute tolerance for symmetry validation.
-        verbose:
-            If True, print diagnostics about the discovered group.
-        include_antiunitary:
-            If False (default), anti-unitary symmetries (operations with
-            ``conj=True``, i.e. ``H(k) = H(k)*``-style time-reversal) are
-            dropped after discovery. These are valid symmetries of H itself
-            but, for frequency-dependent quantities (Green's functions,
-            vertices), they additionally require a Matsubara-frequency flip
-            that ``_map_to_full_bz`` does not perform. Keeping ``False`` makes
-            the IBZ-to-FBZ expansion safe for any object with the same lattice
-            symmetry as H, at the cost of a possibly larger IBZ.
+        :param hk: Complex Hermitian Hamiltonian of shape ``(nk[0], nk[1], nk[2], nb, nb)`` indexed on the same grid
+            as this KGrid, with axes along the primitive reciprocal-lattice basis (fractional coordinate along
+            :math:`b_i`).
+        :param atol: Absolute tolerance for symmetry validation.
+        :param verbose: If True, print diagnostics about the discovered group.
+        :param include_antiunitary: If False (default), anti-unitary symmetries (``conj=True``, i.e.
+            :math:`H(k) = H(k)^*`-style time-reversal) are dropped after discovery. They are valid symmetries of H
+            but, for frequency-dependent quantities, additionally require a Matsubara-frequency flip that
+            ``_map_to_full_bz`` does not perform; keeping ``False`` makes the IBZ-to-FBZ expansion safe for any object
+            with the same lattice symmetry as H, at the cost of a possibly larger IBZ.
+        :return: None.
+        :raises RuntimeError: If the grid was not constructed in auto mode.
+        :raises ValueError: If ``hk``'s shape does not match the grid or is not ``(nx, ny, nz, nb, nb)``.
         """
         if not self._auto_mode:
             raise RuntimeError(
@@ -444,14 +520,20 @@ class KGrid:
 
     @property
     def is_auto(self) -> bool:
-        """Returns True if this KGrid is in auto-discovered symmetry mode and
-        :meth:`specify_auto_symmetries` has populated the transformation data."""
+        """
+        Whether auto-discovered symmetry data is available on this grid.
+
+        :return: True if this KGrid is in auto-discovered symmetry mode and :meth:`specify_auto_symmetries` has
+            populated the transformation data.
+        """
         return self._auto_mode and self._auto_us is not None
 
     def _build_fbz2sym(self) -> np.ndarray:
         """
-        For each FBZ point, record the index (+1) of the first symmetry operation
-        that maps it away from its original index. 0 = identity.
+        For each full-BZ point, records the index (+1) of the first symmetry operation that moves it away from its
+        own index (0 means identity / no operation moved it).
+
+        :return: The per-point symmetry-operation index array, flattened over the full BZ.
         """
         fbz2sym = np.zeros(np.prod(self.nk), dtype=int)
 
@@ -468,7 +550,9 @@ class KGrid:
 
     def set_irrk_mesh(self) -> None:
         """
-        Set the k-meshgrid of the irreducible BZ.
+        Builds and stores the k-mesh restricted to the irreducible BZ.
+
+        :return: None.
         """
         self.irr_kmesh = np.array([self.kmesh[ax].flatten()[self.irrk_ind] for ax in range(len(self.nk))])
 
@@ -517,36 +601,45 @@ class KGrid:
     @property
     def grid(self) -> tuple:
         """
-        Returns the k-grid as a tuple of arrays.
+        The three k-axis arrays of the grid.
+
+        :return: The k-grid as the tuple of axis arrays ``(kx, ky, kz)``.
         """
         return self.kx, self.ky, self.kz
 
     @property
     def nk_tot(self):
         """
-        Returns the total number of k-points in the full BZ.
+        The total number of full-BZ k-points.
+
+        :return: The total number of k-points in the full BZ.
         """
         return np.prod(self.nk)
 
     @property
     def nk_irr(self) -> int:
         """
-        Returns the number of k-points in the irreducible BZ.
+        The number of irreducible-BZ k-points.
+
+        :return: The number of k-points in the irreducible BZ.
         """
         return np.size(self.irrk_ind)
 
     @property
     def kmesh(self) -> np.ndarray:
         """
-        Meshgrid of {kx,ky,kz}.
+        The momentum meshgrid over the full BZ.
+
+        :return: The meshgrid of ``{kx, ky, kz}`` (shape ``[3, nx, ny, nz]``, ``"ij"`` indexing).
         """
         return np.array(np.meshgrid(self.kx, self.ky, self.kz, indexing="ij"))
 
     @property
     def kmesh_ind(self) -> np.ndarray:
         r"""
-        Indices of {kx,ky,kz}.
-        Only works for meshes that go from 0 to :math:`2\pi`.
+        The integer index meshgrid over the full BZ.
+
+        :return: The integer index meshgrid of ``{kx, ky, kz}``. Only valid for meshes spanning :math:`[0, 2\pi)`.
         """
         ind_x = np.arange(0, self.nk[0])
         ind_y = np.arange(0, self.nk[1])
@@ -556,13 +649,17 @@ class KGrid:
     @property
     def kmesh_list(self):
         """
-        List of {kx,ky,kz}.
+        The flattened momentum meshgrid.
+
+        :return: The k-meshgrid flattened to shape ``[3, nk_tot]``.
         """
         return self.kmesh.reshape((3, -1))
 
     def set_k_axes(self) -> None:
         """
-        Set the k-axes for the full BZ.
+        Builds the three k-axis arrays spanning :math:`[0, 2\\pi)` for the full BZ.
+
+        :return: None.
         """
         self.kx = np.linspace(0, 2 * np.pi, self.nk[0], endpoint=False)
         self.ky = np.linspace(0, 2 * np.pi, self.nk[1], endpoint=False)
@@ -570,13 +667,17 @@ class KGrid:
 
     def get_q_list(self) -> np.ndarray:
         """
-        Return list of all q-point indices in the BZ.
+        Lists the integer index triplets of all full-BZ q-points.
+
+        :return: The integer index triplets of all q-points in the full BZ, shape ``[nk_tot, 3]``.
         """
         return np.array([self.kmesh_ind[i].flatten() for i in range(3)]).T
 
     def get_irrq_list(self) -> np.ndarray:
         """
-        Return list of all q-point indices in the irreducible BZ.
+        Lists the integer index triplets of all irreducible-BZ q-points.
+
+        :return: The integer index triplets of all q-points in the irreducible BZ, shape ``[nk_irr, 3]``.
         """
         return np.array([self.kmesh_ind[i].flatten()[self.irrk_ind] for i in range(3)]).T
 
@@ -589,8 +690,14 @@ class KPath:
 
     def __init__(self, nk, path, kx=None, ky=None, kz=None, path_deliminator="-"):
         """
-        nk: number of points in each dimension (tuple)
-        path: desired path in the Brillouin zone (string)
+        Builds the k-axes and the discretized path (and its k-points) from the path string.
+
+        :param nk: Number of k-points per spatial direction, as a tuple ``(nx, ny, nz)``.
+        :param path: The desired path through the BZ as a delimiter-separated string of corner-point labels.
+        :param kx: Optional explicit kx-axis array; a :math:`[0, 2\\pi)` grid is built if None.
+        :param ky: Optional explicit ky-axis array; a :math:`[0, 2\\pi)` grid is built if None.
+        :param kz: Optional explicit kz-axis array; a :math:`[0, 2\\pi)` grid is built if None.
+        :param path_deliminator: The delimiter separating corner-point labels in ``path``.
         """
         self.path_deliminator = path_deliminator
         self.path = path
@@ -608,10 +715,22 @@ class KPath:
         self.k_points = self.get_kpoints()
 
     def get_kpath_val(self):
+        """
+        Maps the path indices to their k-axis values.
+
+        :return: The k-axis values along the path as a list ``[kx_vals, ky_vals, kz_vals]``.
+        """
         k = [self.kx[self.kpts[:, 0]], self.kx[self.kpts[:, 1]], self.kx[self.kpts[:, 2]]]
         return k
 
     def set_kgrid(self, k_in, nk):
+        """
+        Returns an explicit k-axis if given, otherwise builds a :math:`[0, 2\\pi)` grid of ``nk`` points.
+
+        :param k_in: Explicit k-axis array, or None to build a default grid.
+        :param nk: Number of points in the default grid.
+        :return: The k-axis array.
+        """
         if k_in is None:
             k = np.linspace(0, np.pi * 2, nk, endpoint=False)
         else:
@@ -620,12 +739,20 @@ class KPath:
 
     @property
     def ckps(self):
-        """Corner k-point strings"""
+        """
+        The corner-point label strings of the path.
+
+        :return: The list of corner-point label strings obtained by splitting ``path``.
+        """
         return self.path.split(self.path_deliminator)
 
     @property
     def labels(self):
-        """Labels of the k-points for plotting"""
+        """
+        The plot labels for the path corner points.
+
+        :return: The plot labels (LaTeX where known) for the corner points along the path.
+        """
         label_map = {l.key: l.latex for l in Labels}
         count = 0
         labels = []
@@ -640,27 +767,56 @@ class KPath:
 
     @property
     def x_ticks(self):
-        """Return ticks values for plotting"""
+        """
+        The x-axis tick positions at the path corner points.
+
+        :return: The x-axis tick positions (at the corner points) for plotting along the path.
+        """
         return self.k_axis[self.cind]
 
     @property
     def cind(self):
+        """
+        The corner-point indices within the concatenated path.
+
+        :return: The indices of the corner points within the concatenated path.
+        """
         return np.concatenate(([0], np.cumsum(self.nkp) - 1))
 
     @property
     def ikx(self):
+        """
+        The kx index of each path point.
+
+        :return: The integer kx index of each point along the path.
+        """
         return self.kpts[:, 0]
 
     @property
     def iky(self):
+        """
+        The ky index of each path point.
+
+        :return: The integer ky index of each point along the path.
+        """
         return self.kpts[:, 1]
 
     @property
     def ikz(self):
+        """
+        The kz index of each path point.
+
+        :return: The integer kz index of each point along the path.
+        """
         return self.kpts[:, 2]
 
     @property
     def k_axis(self):
+        """
+        The normalized arc-length coordinate along the path.
+
+        :return: The cumulative arc-length coordinate of each path point, normalized to ``[0, 1]`` (for plotting).
+        """
         k_axis_pos = np.zeros(np.sum(self.nkp))
         ds = np.linalg.norm(self.kpts[1:] - self.kpts[:-1], ord=2, axis=1)
         k_axis_pos[1:] = np.cumsum(ds)
@@ -668,16 +824,37 @@ class KPath:
 
     @property
     def nk_tot(self):
+        """
+        The total number of path points.
+
+        :return: The total number of points along the path.
+        """
         return np.sum(self.nkp)
 
     @property
     def nk_seg(self):
+        """
+        The number of points per path segment.
+
+        :return: The number of points in each path segment between corner points.
+        """
         return np.diff(self.cind)
 
     def get_kpoints(self):
+        """
+        Stacks the path k-axis values into a coordinate array.
+
+        :return: The path k-points as an array of shape ``[nk_tot, 3]``.
+        """
         return np.array(self.k_val).T
 
     def corner_k_points(self):
+        """
+        Resolves the corner-point labels of the path to their fractional k-coordinates (known labels via
+        :class:`KnownKPoints`, otherwise parsed from the string).
+
+        :return: The corner k-points as an array of shape ``[n_corners, 3]``.
+        """
         ckp = np.zeros((len(self.ckps), 3))
         label_values = {l.key for l in Labels}
         kpoint_map = {k.name.lower(): np.array(k.value) for k in KnownKPoints}
@@ -690,10 +867,20 @@ class KPath:
         return ckp
 
     def map_to_kpath(self, mat):
-        """Map mat [kx,ky,kz,...] onto the k-path"""
+        """
+        Selects the values of a BZ-gridded array along the k-path.
+
+        :param mat: Array indexed as ``[kx, ky, kz, ...]`` over the full BZ.
+        :return: The array restricted to the path points (leading axis runs along the path).
+        """
         return mat[self.ikx, self.iky, self.ikz, ...]
 
     def build_k_path(self):
+        """
+        Builds the discretized k-path by concatenating the segments between consecutive corner points.
+
+        :return: A tuple ``(k_path, nkp)`` of the integer path-index array and the per-segment point counts.
+        """
         k_path = []
         nkp = []
         nckp = np.shape(self.ckp)[0]
@@ -707,7 +894,12 @@ class KPath:
         return k_path, nkp
 
     def get_bands(self, ek):
-        """Return the bands along the k-path"""
+        """
+        Diagonalizes the band dispersion at each path point to obtain the (sorted, real) band energies.
+
+        :param ek: The band dispersion indexed as ``[kx, ky, kz, o1, o2]``.
+        :return: The band energies along the path, shape ``[nk_path, n_bands]``.
+        """
         ek_kpath = self.map_to_kpath(ek)
         bands = np.zeros((ek_kpath.current_shape[:-1]))
         for i, eki in enumerate(ek_kpath):
@@ -717,6 +909,15 @@ class KPath:
 
 
 def kpath_segment(k_start, k_end, nk):
+    """
+    Builds the integer k-index points of a straight segment between two fractional corner points, wrapping indices
+    back into the grid.
+
+    :param k_start: Fractional coordinates of the segment start point.
+    :param k_end: Fractional coordinates of the segment end point.
+    :param nk: Number of k-points per spatial direction.
+    :return: A tuple ``(k_segment, nkp)`` of the integer index array along the segment and the number of points.
+    """
     nkp = int(np.round(np.linalg.norm(k_start * nk - k_end * nk, ord=np.inf)))
     k_segment = (
         k_start[None, :] * nk + np.linspace(0, 1, nkp, endpoint=False)[:, None] * ((k_end - k_start) * nk)[None, :]
@@ -729,6 +930,12 @@ def kpath_segment(k_start, k_end, nk):
 
 
 def get_k_point_from_string(string):
+    """
+    Parses a whitespace-separated coordinate string into a fractional k-point.
+
+    :param string: A string of space-separated floats, e.g. ``"0.5 0.5 0.0"``.
+    :return: The parsed coordinates as a numpy array.
+    """
     scoords = string.split(" ")
     coords = np.array([float(sc) for sc in scoords])
     return coords

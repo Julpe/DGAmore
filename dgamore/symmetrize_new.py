@@ -4,6 +4,14 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+r"""
+Standalone preprocessing script (a second installed console script) that converts a w2dynamics worm-sampled
+two-particle vertex file into the symmetrized density/magnetic two-particle Green's function file consumed by the
+main DGA routine. It provides the band/spin compound-index bookkeeping for the worm components, extracts the
+required spin combinations, builds :math:`G^{(2)}_{\mathrm{dens}}` and :math:`G^{(2)}_{\mathrm{magn}}` assuming
+SU(2) symmetry, and writes them to an HDF5 output file. Running the module interactively prompts for the input and
+output filenames.
+"""
 
 import gc
 import glob
@@ -19,7 +27,12 @@ import numpy as np
 
 def index2component_general(num_bands: int, n_dims: int, ind: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Returns the band and spin components corresponding to a compound index for four-legged objects.
+    Decodes a compound index into its per-leg band and spin components for an ``n_dims``-legged object.
+
+    :param num_bands: Number of bands.
+    :param n_dims: Number of legs (orbital/spin index positions).
+    :param ind: The 1-based compound index.
+    :return: The tuple ``(bandspin, band, spin)`` of per-leg combined, band and spin index arrays.
     """
     bandspin = np.zeros(n_dims, dtype=np.int_)
     spin = np.zeros(n_dims, dtype=np.int_)
@@ -38,21 +51,38 @@ def index2component_general(num_bands: int, n_dims: int, ind: int) -> tuple[np.n
 
 def index2component_general_2dims(num_bands: int, ind: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Returns the band and spin components corresponding to a compound index for two-legged objects.
+    Decodes a compound index into band and spin components for a two-legged object (see
+    :func:`index2component_general`).
+
+    :param num_bands: Number of bands.
+    :param ind: The 1-based compound index.
+    :return: The tuple ``(bandspin, band, spin)`` of per-leg combined, band and spin index arrays.
     """
     return index2component_general(num_bands, 2, ind)
 
 
 def index2component_general_4dims(num_bands: int, ind: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Returns the band and spin components corresponding to a compound index for four-legged objects.
+    Decodes a compound index into band and spin components for a four-legged object (see
+    :func:`index2component_general`).
+
+    :param num_bands: Number of bands.
+    :param ind: The 1-based compound index.
+    :return: The tuple ``(bandspin, band, spin)`` of per-leg combined, band and spin index arrays.
     """
     return index2component_general(num_bands, 4, ind)
 
 
 def component2index_general(num_bands: int, n_dims: int, bands: list, spins: list) -> int:
     """
-    Computes a compound index from band and spin indices for a n_dims-legged object.
+    Encodes per-leg band and spin indices into a compound index for an ``n_dims``-legged object.
+
+    :param num_bands: Number of bands.
+    :param n_dims: Number of legs (orbital/spin index positions).
+    :param bands: The per-leg band indices.
+    :param spins: The per-leg spin indices.
+    :return: The 1-based compound index.
+    :raises AssertionError: If ``num_bands`` is not a positive integer.
     """
     assert num_bands > 0, "Number of bands has to be set to non-zero positive integers."
 
@@ -66,21 +96,38 @@ def component2index_general(num_bands: int, n_dims: int, bands: list, spins: lis
 
 def component2index_general_2dims(num_bands: int, bands: list, spins: list) -> int:
     """
-    Computes a compound index from band and spin indices for a two-legged object.
+    Encodes per-leg band and spin indices into a compound index for a two-legged object (see
+    :func:`component2index_general`).
+
+    :param num_bands: Number of bands.
+    :param bands: The per-leg band indices.
+    :param spins: The per-leg spin indices.
+    :return: The 1-based compound index.
     """
     return component2index_general(num_bands, 2, bands, spins)
 
 
 def component2index_general_4dims(num_bands: int, bands: list, spins: list) -> int:
     """
-    Computes a compound index from band and spin indices for a four-legged object.
+    Encodes per-leg band and spin indices into a compound index for a four-legged object (see
+    :func:`component2index_general`).
+
+    :param num_bands: Number of bands.
+    :param bands: The per-leg band indices.
+    :param spins: The per-leg spin indices.
+    :return: The 1-based compound index.
     """
     return component2index_general(num_bands, 4, bands, spins)
 
 
 def index2component_band(num_bands: int, n_dims: int, ind: int) -> list:
     """
-    Computes only orbital indices from a compound index for four-legged objects.
+    Decodes a compound (orbital-only) index into its per-leg orbital indices.
+
+    :param num_bands: Number of bands.
+    :param n_dims: Number of legs.
+    :param ind: The 1-based compound orbital index.
+    :return: The list of per-leg orbital indices.
     """
     b = []
     ind_tmp = ind - 1
@@ -92,7 +139,12 @@ def index2component_band(num_bands: int, n_dims: int, ind: int) -> list:
 
 def component2index_band(num_bands: int, n_dims: int, b: list) -> int:
     """
-    Computes a compound index from only orbital indices for four-legged objects.
+    Encodes per-leg orbital indices into a compound (orbital-only) index.
+
+    :param num_bands: Number of bands.
+    :param n_dims: Number of legs.
+    :param b: The per-leg orbital indices.
+    :return: The 1-based compound orbital index.
     """
     ind = 1
     for i in range(n_dims):
@@ -102,7 +154,11 @@ def component2index_band(num_bands: int, n_dims: int, b: list) -> int:
 
 def get_worm_components_2dims(num_bands: int, orbs: list[list[int]]) -> list[int]:
     """
-    Returns the worm components for two-legged objects.
+    Lists the worm component indices for the given two-leg orbital combinations (both equal-spin sectors).
+
+    :param num_bands: Number of bands.
+    :param orbs: The list of two-orbital combinations to include.
+    :return: The sorted list of worm component indices.
     """
     spins = [0, 0], [1, 1]
     component_indices = []
@@ -114,9 +170,11 @@ def get_worm_components_2dims(num_bands: int, orbs: list[list[int]]) -> list[int
 
 def get_worm_components_all_2dims(num_bands: int) -> list[int]:
     """
-    Returns the list of worm components for a given number of bands for two-legged objects,
-    where only relevant spin combinations for the
-    density and magnetic channels in the case of SU(2) symmetry are picked.
+    Lists the worm component indices over all two-orbital combinations, keeping only the spin combinations relevant
+    for the density and magnetic channels under SU(2) symmetry.
+
+    :param num_bands: Number of bands.
+    :return: The sorted list of worm component indices.
     """
     orbs = [list(orb) for orb in it.product(range(num_bands), repeat=2)]
     return get_worm_components_2dims(num_bands, orbs)
@@ -124,10 +182,11 @@ def get_worm_components_all_2dims(num_bands: int) -> list[int]:
 
 def get_worm_components_partial_2dims(num_bands: int) -> list[int]:
     """
-    Returns the list of worm components for a given number of bands for two-legged objects,
-    where only relevant spin combinations for the
-    density and magnetic channels in the case of SU(2) symmetry are picked.
-    It only lists orbital-diagonal components.
+    Lists the worm component indices over the orbital-diagonal two-orbital combinations only, keeping the spin
+    combinations relevant for the density and magnetic channels under SU(2) symmetry.
+
+    :param num_bands: Number of bands.
+    :return: The sorted list of orbital-diagonal worm component indices.
     """
     orbs = [[orb, orb] for orb in range(num_bands)]
     return get_worm_components_2dims(num_bands, orbs)
@@ -135,7 +194,12 @@ def get_worm_components_partial_2dims(num_bands: int) -> list[int]:
 
 def get_worm_components_4dims(num_bands: int, orbs: list[list[int]]) -> list[int]:
     """
-    Returns the worm components for 4-legged objects.
+    Lists the worm component indices for the given four-leg orbital combinations, over the spin sectors relevant
+    under SU(2) symmetry.
+
+    :param num_bands: Number of bands.
+    :param orbs: The list of four-orbital combinations to include.
+    :return: The sorted list of worm component indices.
     """
     spins = [0, 0, 0, 0], [1, 1, 1, 1], [0, 0, 1, 1], [1, 1, 0, 0], [1, 0, 0, 1], [0, 1, 1, 0]
     component_indices = []
@@ -147,9 +211,11 @@ def get_worm_components_4dims(num_bands: int, orbs: list[list[int]]) -> list[int
 
 def get_worm_components_all_4dims(num_bands: int) -> list[int]:
     """
-    Returns the list of worm components for a given number of bands for four-legged objecst,
-    where only relevant spin combinations for the
-    density and magnetic channels in the case of SU(2) symmetry are picked.
+    Lists the worm component indices over all four-orbital combinations, keeping only the spin combinations relevant
+    for the density and magnetic channels under SU(2) symmetry.
+
+    :param num_bands: Number of bands.
+    :return: The sorted list of worm component indices.
     """
     orbs = [list(orb) for orb in it.product(range(num_bands), repeat=4)]
     return get_worm_components_4dims(num_bands, orbs)
@@ -157,10 +223,12 @@ def get_worm_components_all_4dims(num_bands: int) -> list[int]:
 
 def get_worm_components_partial_4dims(num_bands: int) -> list[int]:
     """
-    Returns the list of worm components for a given number of bands for four-legged objects,
-    where only relevant spin combinations for the
-    density and magnetic channels in the case of SU(2) symmetry are picked.
-    It only lists worm components where the orbitals are not of type ijjj, jijj, jjij or jjji.
+    Lists the worm component indices over the four-orbital combinations excluding the ``ijjj``/``jijj``/``jjij``/
+    ``jjji`` patterns, keeping the spin combinations relevant for the density and magnetic channels under SU(2)
+    symmetry.
+
+    :param num_bands: Number of bands.
+    :return: The sorted list of worm component indices.
     """
     orbs = [
         list(orb)
@@ -181,6 +249,13 @@ def extract_g2_general(group_string: str, indices: list, file: h5py.File, niw: i
     Returns the components :math:`G2_{\uparrow\uparrow\uparrow\uparrow}, G2_{\downarrow\downarrow\downarrow\downarrow}`,
     :math:`G2_{\downarrow\downarrow\uparrow\uparrow}, G2_{\uparrow\uparrow\downarrow\downarrow}`,
     :math:`G2_{\uparrow\downarrow\downarrow\uparrow}` and :math:`G2_{\downarrow\uparrow\uparrow\downarrow}`.
+
+    :param group_string: The HDF5 group path holding the worm components.
+    :param indices: The component indices to read.
+    :param file: The open input vertex :class:`h5py.File`.
+    :param niw: Number of positive bosonic frequencies.
+    :param niv: Number of positive fermionic frequencies.
+    :return: The six spin-component arrays ``(g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud)``.
     """
     print(f"Nonzero number of elements of G2 in dataset: {len(indices)} / {n_bands ** 4 * 2**4}")
 
@@ -197,7 +272,7 @@ def extract_g2_general(group_string: str, indices: list, file: h5py.File, niw: i
     # since we are SU(2) symmetric, we only have to pick out the elements where the spin is either
     # [0,0,0,0] or [1,1,1,1] for uu component, [0,0,1,1] or [1,1,0,0] for ud component and [0,1,1,0] or [1,0,0,1] for ud_bar component
     g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud = (
-        np.zeros((n_bands, n_bands, n_bands, n_bands, 2 * niw + 1, 2 * niv, 2 * niv), dtype=np.complex64)
+        np.zeros((n_bands, n_bands, n_bands, n_bands, 2 * niw + 1, 2 * niv, 2 * niv), dtype=np.complex128)
         for _ in range(6)
     )
 
@@ -235,7 +310,16 @@ def extract_g2_general(group_string: str, indices: list, file: h5py.File, niw: i
 
 def save_to_file(g2_list: list[np.ndarray], names: list[str], niw: int, nb: int, ineq: int):
     """
-    Saves the given g2 to the output file.
+    Writes the given two-particle Green's functions to the (module-level) output HDF5 file in the per-bosonic-
+    frequency, per-orbital-component layout expected by the DGA input reader.
+
+    :param g2_list: The two-particle Green's function arrays to write.
+    :param names: The channel names (one per array, e.g. ``["dens", "magn"]``).
+    :param niw: Number of positive bosonic frequencies.
+    :param nb: Number of bands.
+    :param ineq: The inequivalent-atom index used in the output group path.
+    :return: None.
+    :raises AssertionError: If ``g2_list`` and ``names`` have different lengths.
     """
     assert len(g2_list) == len(names)
     for wn in range(2 * niw + 1):
@@ -247,7 +331,13 @@ def save_to_file(g2_list: list[np.ndarray], names: list[str], niw: int, nb: int,
 
 def get_niw_niv(vertex_file, g4iw_groupstring, indices):
     """
-    Determines niw and niv from the shape of the first element in the vertex file.
+    Determines the bosonic and fermionic frequency counts from the shape of the first stored vertex element.
+
+    :param vertex_file: The open input vertex :class:`h5py.File`.
+    :param g4iw_groupstring: The HDF5 group path of the worm-sampled vertex.
+    :param indices: The component indices (the first is used to read the shape).
+    :return: The tuple ``(niw, niv)`` of positive bosonic and fermionic frequency counts.
+    :raises AssertionError: If the stored shape has an odd fermionic or even bosonic frequency count.
     """
     first_element_shape = vertex_file[f"{g4iw_groupstring}/{indices[0]}/value"].shape
     assert first_element_shape[0] % 2 == 0, "The number of fermionic frequencies has to be even."
@@ -256,6 +346,13 @@ def get_niw_niv(vertex_file, g4iw_groupstring, indices):
 
 
 def complete(text, state):
+    """
+    Readline tab-completion callback for filesystem paths (used for the interactive filename prompts).
+
+    :param text: The current text being completed.
+    :param state: The index of the match requested by readline.
+    :return: The ``state``-th matching path (directories suffixed with ``/``), or None if there are no more matches.
+    """
     expanded = os.path.expanduser(text)
     matches = [m + "/" if os.path.isdir(m) else m for m in glob.glob(expanded + "*")]
 

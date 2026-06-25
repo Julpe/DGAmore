@@ -3,9 +3,17 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+r"""
+Linearized Eliashberg equation solver. Starting from the ladder-DGA full vertex (saved per channel by the
+non-local SDE step), this module assembles the particle-particle pairing vertex in the singlet/triplet channels at
+:math:`\omega = 0`, optionally adds the local reducible diagrams, and power-iterates the linearized gap equation
+:math:`\lambda \Delta = -\frac{1}{\beta N_q}\, \Gamma^{pp}\, \chi_0^{pp}\, \Delta` via an ARPACK/Lanczos
+eigensolver (two variants: an in-memory one and a memory-frugal frequency-distributed one). The leading
+eigenvalue :math:`\lambda` signals the pairing instability and the eigenvector is the gap function
+:math:`\Delta(k, \nu)`. Requires ``nq == nk``. Equation numbers refer to the author's master's thesis (Chapter 4).
+"""
 
 import os
-from typing import Tuple
 
 import mpi4py.MPI as MPI
 import numpy as np
@@ -21,13 +29,18 @@ from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore.mpi_distributor import MpiDistributor
-from dgamore.n_point_base import SpinChannel, FrequencyNotation
+from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE
 
 
 def delete_files(filepath: str, *args) -> None:
     """
-    Deletes files in the given directory. If the file is not found, it will be ignored. The files that are deleted
-    are usually temporary files that are not needed anymore after the calculation is done.
+    Deletes files in the given directory. If a file is not found, it is ignored. The deleted files are usually
+    temporary files that are no longer needed after the calculation is done.
+
+    :param filepath: Directory containing the files.
+    :param args: One or more file names (relative to ``filepath``) to delete.
+    :return: None.
+    :raises TypeError: If any of the given names is not a string.
     """
     for name in args:
         if not isinstance(name, str):
@@ -42,9 +55,14 @@ def delete_files(filepath: str, *args) -> None:
 
 # --- Frequency transform helpers (PH -> PP w0) ---
 def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp: int) -> np.ndarray:
-    """
-    Transforms the vertex function from particle-hole notation to particle-particle notation based on Motoharu Kitatani's
-    frequency convention. This flips the fermionic frequency and maps w = v - v'.
+    r"""
+    Transforms a vertex from particle-hole to particle-particle notation at :math:`\omega' = 0`, following Motoharu
+    Kitatani's frequency convention: the fermionic frequency is flipped and the bosonic index is remapped via
+    :math:`\omega = \nu - \nu'`.
+
+    :param vertex: The vertex to transform (:class:`LocalFourPoint` or :class:`FourPoint`) in ph notation.
+    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
+    :return: The transformed vertex as a raw numpy array with two fermionic axes ``[..., 2*niv_pp, 2*niv_pp]``.
     """
     vn = MFHelper.vn(niv_pp)
     wn = MFHelper.wn(config.box.niw_core)
@@ -60,7 +78,12 @@ def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp:
 
 def transform_vertex_loc_frequencies_w0(f_r_loc: LocalFourPoint, niv_pp: int) -> LocalFourPoint:
     """
-    Transforms the vertex function from particle-hole notation to a modified particle-particle notation.
+    Transforms a local vertex from particle-hole to the modified particle-particle notation at :math:`\\omega' = 0`
+    (see :func:`_transform_vertex_frequencies_w0`).
+
+    :param f_r_loc: The local vertex :math:`F` in ph notation.
+    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
+    :return: The transformed vertex as a :class:`LocalFourPoint` (channel UD, pp notation, no bosonic axis).
     """
     mat = _transform_vertex_frequencies_w0(f_r_loc, niv_pp)
     return LocalFourPoint(mat, SpinChannel.UD, 0, 2, True, True, FrequencyNotation.PP)
@@ -68,7 +91,12 @@ def transform_vertex_loc_frequencies_w0(f_r_loc: LocalFourPoint, niv_pp: int) ->
 
 def transform_vertex_q_frequencies_w0(f_q_r: FourPoint, niv_pp: int) -> FourPoint:
     """
-    Transforms the vertex function from particle-hole notation to a modified particle-particle notation.
+    Transforms a momentum-dependent vertex from particle-hole to the modified particle-particle notation at
+    :math:`\\omega' = 0` (see :func:`_transform_vertex_frequencies_w0`).
+
+    :param f_q_r: The momentum-dependent vertex :math:`F^{q}` in ph notation.
+    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
+    :return: The transformed vertex as a :class:`FourPoint` (pp notation, no bosonic axis, compressed q).
     """
     mat = _transform_vertex_frequencies_w0(f_q_r, niv_pp)
     return FourPoint(mat, f_q_r.channel, config.lattice.q_grid.nk, 0, 2, True, True, True, FrequencyNotation.PP)
@@ -79,7 +107,16 @@ def create_full_vertex_q_r(
     u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist: MpiDistributor
 ) -> FourPoint:
     """
-    Calculates the full vertex in the given channel (either density or magnetic).
+    Calculates the momentum-dependent full ladder vertex in the given channel (density or magnetic) from the saved
+    intermediates (inverse bubble, three-leg vertex, summed auxiliary susceptibility), and transforms it to pp
+    notation unless ``save_fq`` requests keeping the ph form. Deletes the consumed intermediate files afterwards.
+
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param gamma_r: The local irreducible vertex :math:`\\Gamma_{r}` for this channel.
+    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
+    :param mpi_dist: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :return: The full ladder vertex :math:`F^{q}_{r}` as a :class:`FourPoint`.
     """
     logger = config.logger
     logger.info(f"Starting to calculate the full {gamma_r.channel.value} vertex.")
@@ -151,7 +188,15 @@ def create_full_vertex_q_r_pp_w0(
     u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist_irrk: MpiDistributor
 ):
     """
-    Calculates the full vertex in PH notation and transforms it to PP notation for the density or magnetic channel.
+    Builds the full ladder vertex (see :func:`create_full_vertex_q_r`), optionally gathers and saves it in ph
+    notation in the irreducible BZ, and returns it transformed to pp notation at :math:`\\omega' = 0`.
+
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param gamma_r: The local irreducible vertex :math:`\\Gamma_{r}` for this channel.
+    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :return: The full ladder vertex :math:`F^{q}_{r}` in pp notation as a :class:`FourPoint`.
     """
     logger = config.logger
 
@@ -183,7 +228,18 @@ def create_full_vertex_q_r_v2(
     q_index: int,
 ) -> FourPoint:
     """
-    Calculates the full vertex in the given channel (either density or magnetic).
+    Calculates the full ladder vertex for a single q-point (memory-frugal per-q variant of
+    :func:`create_full_vertex_q_r`), transforming it to pp notation unless ``save_fq`` keeps the ph form.
+
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param gamma_r: The local irreducible vertex :math:`\\Gamma_{r}` for this channel.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\\chi_0^q)^{-1}` over all rank-local q-points.
+    :param vrg_q_r: The momentum-dependent three-leg vertex :math:`\\gamma^q_{r}`.
+    :param gchi_aux_q_r_sum: The summed auxiliary susceptibility :math:`\\sum_{\\nu'}\\chi^{*;q}_{r}`.
+    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
+    :param q_index: Index of the q-point (into the rank-local list) to compute.
+    :return: The full ladder vertex :math:`F^{q}_{r}` for that q-point as a :class:`FourPoint`.
     """
     gchi0_q_inv_idx = gchi0_q_inv.filter_q_index(q_index)
     vrg_q_r_idx = vrg_q_r.filter_q_index(q_index)
@@ -213,7 +269,16 @@ def create_full_vertex_q_r_pp_w0_v2(
     u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist_irrk: MpiDistributor
 ):
     """
-    Calculates the full vertex in PH notation and transforms it to PP notation for the density or magnetic channel.
+    Memory-frugal variant of :func:`create_full_vertex_q_r_pp_w0`: loops over the rank-local q-points (see
+    :func:`create_full_vertex_q_r_v2`), assembles the full ladder vertex, optionally saves it in ph notation, and
+    returns it in pp notation at :math:`\\omega' = 0`.
+
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param gamma_r: The local irreducible vertex :math:`\\Gamma_{r}` for this channel.
+    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :return: The full ladder vertex :math:`F^{q}_{r}` in pp notation as a :class:`FourPoint`.
     """
     logger = config.logger
 
@@ -299,14 +364,21 @@ def create_full_vertex_q_r_pp_w0_v2(
 
 
 # --- Local particle-particle reducible diagrams (w=0) ---
-def create_local_ud_diagrams_pp_w0(g_dmft: GreensFunction) -> Tuple[LocalFourPoint, LocalFourPoint, LocalFourPoint]:
+def create_local_ud_diagrams_pp_w0(g_dmft: GreensFunction) -> tuple[LocalFourPoint, LocalFourPoint, LocalFourPoint]:
     r"""
-    Creates the local particle-particle reducible diagrams for :math:`\omega=0`.
+    Builds the local particle-particle reducible diagrams at :math:`\omega = 0` in the up-down channel: the full
+    vertex :math:`F^{ud}`, the irreducible vertex :math:`\Gamma^{ud}`, and the reducible part
+    :math:`\Phi^{ud} = F^{ud} - \Gamma^{ud}`. These are the local diagrams subtracted/added when
+    ``include_local_part`` is enabled, to avoid double counting the local pairing contribution.
+
+    :param g_dmft: The local (DMFT) :class:`GreensFunction`.
+    :return: The tuple ``(f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0)`` of local pp diagrams at
+        :math:`\omega = 0`.
     """
     gchi_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"gchi_dens_loc.npy"), SpinChannel.DENS)
     gchi_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"gchi_magn_loc.npy"), SpinChannel.MAGN)
     gchi_ud_loc = 0.5 * (gchi_dens_loc - gchi_magn_loc).set_channel(SpinChannel.UD)
-    gchi_ud_loc_pp_w0 = gchi_ud_loc.permute_orbitals("abcd->acbd").change_frequency_notation_ph_to_pp_w0()
+    gchi_ud_loc_pp_w0 = gchi_ud_loc.change_frequency_notation_ph_to_pp_w0()
     del gchi_dens_loc, gchi_magn_loc, gchi_ud_loc
 
     gchi0_loc_pp_w0 = (
@@ -338,12 +410,19 @@ def create_local_ud_diagrams_pp_w0(g_dmft: GreensFunction) -> Tuple[LocalFourPoi
 # --- Gap initialisation ---
 def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
     """
-    Generates the initial gap function based on the specified shape, spin channel and symmetry settings.
+    Generates the initial gap-function guess for the power iteration, seeded with the configured momentum symmetry
+    (d-wave / p-wave-x / p-wave-y) and the corresponding frequency parity for the singlet/triplet channel; falls back
+    to a random guess if no symmetry is configured or recognized.
+
+    :param shape: Target array shape ``[kx, ky, kz, o1, o2, v]`` of the gap function.
+    :param channel: Pairing channel, either :attr:`SpinChannel.SING` or :attr:`SpinChannel.TRIP`.
+    :return: The initial gap-function array.
+    :raises ValueError: If ``channel`` is neither SING nor TRIP.
     """
     if channel not in {SpinChannel.SING, SpinChannel.TRIP}:
         raise ValueError("Channel must be either SING or TRIP.")
 
-    gap0 = np.zeros(shape, dtype=np.complex64)
+    gap0 = np.zeros(shape, dtype=DTYPE)
     niv = shape[-1] // 2
     k_grid = config.lattice.k_grid.grid
 
@@ -376,9 +455,15 @@ def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
 def solve_eliashberg_lanczos(
     gamma_r_pp: FourPoint, gchi0_q0_pp: FourPoint, ranks: tuple[int, int]
 ) -> tuple[list[float], list[GapFunction]]:
-    """
-    Solves the Eliashberg equation for the superconducting eigenvalue and gap function using ARPACK.
-    Returns (lambdas, gaps).
+    r"""
+    Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using
+    an ARPACK/Lanczos eigensolver, with the pairing kernel applied matrix-free via FFTs over the BZ. This in-memory
+    variant holds the full-BZ pairing vertex on the solving rank.
+
+    :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (irreducible BZ, pp notation) for one channel.
+    :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{pp}` at :math:`\omega = 0`.
+    :param ranks: The ``(rank_sing, rank_trip)`` pair used for logging.
+    :return: A tuple ``(lambdas, gaps)`` of the leading eigenvalues and the corresponding :class:`GapFunction` objects.
     """
     logger = config.logger
 
@@ -418,6 +503,14 @@ def solve_eliashberg_lanczos(
     norm = 0.5 / config.lattice.q_grid.nk_tot / config.sys.beta
 
     def mv(gap: np.ndarray):
+        r"""
+        Applies the pairing kernel to a flattened gap vector (the matrix-vector product for the eigensolver):
+        multiplies by :math:`\chi_0^{pp}`, FFTs to real space, contracts with the pairing vertex (direct plus
+        sign-weighted momentum-/frequency-flipped term), and transforms back.
+
+        :param gap: The flattened gap vector.
+        :return: The flattened result of applying the pairing kernel to ``gap``.
+        """
         gap_gg = np.fft.fftn(
             np.einsum(einsum_str1, gchi0_q0_pp.mat, gap.reshape(gap_shape), optimize=path1), axes=(0, 1, 2)
         )
@@ -475,10 +568,17 @@ def solve_eliashberg_lanczos(
 def solve_eliashberg_lanczos_v2(
     gamma_r_pp: FourPoint, gchi0_q0_pp: FourPoint, mpi_dist_v: MpiDistributor, active_ranks: list
 ) -> tuple[list[float], list[GapFunction]]:
-    """
-    Solves the Eliashberg equation for the superconducting eigenvalue and gap function using ARPACK.
-    More memory-efficient but slower variant than the other method.
-    Returns (lambdas, gaps).
+    r"""
+    Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using
+    an ARPACK/Lanczos eigensolver. This variant distributes the gap function along the fermionic frequency axis across
+    ranks (and performs the :math:`\chi_0^{pp}` multiplication only on the root rank), so it is more memory-efficient
+    but slower than :func:`solve_eliashberg_lanczos`.
+
+    :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (frequency-distributed) for one channel.
+    :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{pp}` at :math:`\omega = 0` (held on the root rank).
+    :param mpi_dist_v: MPI distributor over the fermionic frequency axis (see :class:`MpiDistributor`).
+    :param active_ranks: The ranks participating in this solve; the first is used as root.
+    :return: A tuple ``(lambdas, gaps)`` of the leading eigenvalues and the corresponding :class:`GapFunction` objects.
     """
     logger = config.logger
     root = active_ranks[0]
@@ -516,6 +616,14 @@ def solve_eliashberg_lanczos_v2(
     norm = 0.5 / config.lattice.q_grid.nk_tot / config.sys.beta
 
     def mv(gap: np.ndarray):
+        r"""
+        Applies the pairing kernel to a flattened gap vector in the frequency-distributed scheme: the root rank
+        multiplies by :math:`\chi_0^{pp}` and broadcasts, all ranks FFT and contract with their frequency slice of the
+        pairing vertex, then the result is reassembled across the frequency axis via all-gather.
+
+        :param gap: The flattened gap vector (full on root, sliced elsewhere).
+        :return: The flattened result of applying the pairing kernel to ``gap``.
+        """
         # 1. multiply chi0 * gap for the full BZ (only done by one rank, since memory would be an issue)
         gap_gg = None
         if mpi_dist_v.comm.rank == root:
@@ -585,7 +693,18 @@ def solve(
     giwk_dga: GreensFunction, g_dmft: GreensFunction, u_loc: LocalInteraction, v_nonloc: Interaction, comm: MPI.Comm
 ):
     """
-    Solves the Eliashberg equation for largest the superconducting eigenvalues and corresponding gap functions.
+    Top-level driver of the Eliashberg step: assembles the singlet and triplet pairing vertices from the saved
+    ladder-DGA full vertices (optionally adding the local reducible diagrams), then solves the linearized gap equation
+    for each channel and returns the leading eigenvalues and gap functions. Dispatches between the in-memory and the
+    memory-frugal Lanczos solvers depending on the memory configuration.
+
+    :param giwk_dga: The converged momentum-dependent DGA :class:`GreensFunction`.
+    :param g_dmft: The local (DMFT) :class:`GreensFunction` (used for the local diagrams).
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param comm: The MPI communicator.
+    :return: A tuple ``(lambdas_sing, lambdas_trip, gaps_sing, gaps_trip)`` of the singlet/triplet eigenvalues and
+        :class:`GapFunction` lists.
     """
     logger = config.logger
 
@@ -598,6 +717,17 @@ def solve(
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
 
     def dispatch_full_vertex_calculation(channel, u, v, niv, mpi_dist) -> FourPoint:
+        """
+        Loads the local irreducible vertex for ``channel`` and builds the full ladder pp vertex, dispatching between
+        the memory-frugal and the regular construction routine based on the memory configuration.
+
+        :param channel: The spin channel (density or magnetic).
+        :param u: The bare local interaction :math:`U`.
+        :param v: The non-local interaction :math:`V^{q}`.
+        :param niv: Number of positive fermionic frequencies of the pp vertex.
+        :param mpi_dist: MPI distributor over the irreducible BZ q-points.
+        :return: The full ladder pp vertex :math:`F^{q}_{r}` as a :class:`FourPoint`.
+        """
         gamma_r = LocalFourPoint.load(
             os.path.join(config.output.output_path, f"gamma_{channel.value}_loc.npy"), channel
         )
@@ -754,8 +884,11 @@ def solve(
 
 def get_ranks_for_lanczos(comm: MPI.Comm) -> tuple[int, int]:
     """
-    Returns two ranks that are on different SLURM-cluster-nodes if possible, to run the Lanczos eigensolver
-    for the singlet and triplet channel separately.
+    Picks two MPI ranks on different cluster nodes (if available) so the singlet and triplet Lanczos solves can run
+    concurrently on separate nodes; falls back to two ranks on the same node otherwise.
+
+    :param comm: The MPI communicator.
+    :return: The tuple ``(rank_for_singlet, rank_for_triplet)``.
     """
     import socket
 

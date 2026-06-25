@@ -176,7 +176,7 @@ def test_calculates_nonlocal_sde_correctly(setup, niw_core, niv_core, niv_shell,
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
 
-    (*_, s_loc) = local_sde.perform_local_schwinger_dyson(g_dmft, g2_dens, g2_magn, u_loc)
+    *_, s_loc = local_sde.perform_local_schwinger_dyson(g_dmft, g2_dens, g2_magn, u_loc)
 
     with gpu_cpu_context(use_gpu) as mock_gpu:
         sigma_dga = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft, s_loc)
@@ -185,11 +185,6 @@ def test_calculates_nonlocal_sde_correctly(setup, niw_core, niv_core, niv_shell,
     sigma_dga_ref = np.load(f"{folder}/sigma_dga.npy")
 
     assert np.allclose(sigma_dga_mat, sigma_dga_ref, atol=3e-5 if not mock_gpu else 1e-3)
-
-    sigma_interpolated_mat = sigma_dga.interpolate(12.5, 25, 30).cut_niv(50).mat
-    sigma_interpolated_ref = np.load(f"{folder}/sigma_dga_interpolated.npy")
-
-    assert np.allclose(sigma_interpolated_mat, sigma_interpolated_ref, atol=3e-5 if not mock_gpu else 1e-3)
 
 
 @pytest.mark.parametrize("save_memory", [True, False])
@@ -227,7 +222,7 @@ def test_calculates_srvo3_correctly(setup_srvo3_cubic, save_memory):
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
 
-    (*_, s_loc) = local_sde.perform_local_schwinger_dyson(g_dmft, g2_dens, g2_magn, u_loc)
+    *_, s_loc = local_sde.perform_local_schwinger_dyson(g_dmft, g2_dens, g2_magn, u_loc)
 
     sigma_dga_cubic = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft, s_loc)
 

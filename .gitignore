@@ -17,6 +17,8 @@ tests/**/*.hdf5
 # IDE folders
 .idea/
 .vscode/
+.claude/
+.superpowers/
 
 # other
 *.html
@@ -90,6 +92,7 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+docs/generated/
 
 # PyBuilder
 .pybuilder/

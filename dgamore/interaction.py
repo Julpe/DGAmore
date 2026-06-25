@@ -3,6 +3,12 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+"""
+Interaction tensors. :class:`LocalInteraction` wraps the momentum-independent (Hubbard/Kanamori) interaction
+:math:`U_{abcd}`; :class:`Interaction` adds a momentum dimension for the non-local interaction :math:`V_{abcd}^q`.
+Both provide the channel projections (density/magnetic/singlet/triplet) and the algebra used in the ladder
+equations.
+"""
 
 from copy import deepcopy
 
@@ -17,19 +23,32 @@ class LocalInteraction(IHaveMat, IHaveChannel):
     """
 
     def __init__(self, mat: np.ndarray, channel: SpinChannel = SpinChannel.NONE):
+        r"""
+        Initializes the local interaction tensor in the given spin channel.
+
+        :param mat: Interaction tensor :math:`U_{abcd}` with four orbital axes ``[o1, o2, o3, o4]``.
+        :param channel: Spin channel the tensor is expressed in (see :class:`SpinChannel`); ``NONE`` for the
+            bare, not-yet-projected interaction.
+        """
         IHaveMat.__init__(self, mat)
         IHaveChannel.__init__(self, channel)
 
     @property
     def n_bands(self) -> int:
         """
-        Returns the number of bands.
+        Returns the number of bands (orbitals).
+
+        :return: Number of bands, i.e. the size of the first orbital axis.
         """
         return self.original_shape[0]
 
     def permute_orbitals(self, permutation: str = "abcd->abcd") -> "LocalInteraction":
         """
-        Permutes the orbitals of the object. The permutation string must be given in the einsum notation.
+        Permutes the four orbital axes according to an einsum-style permutation string.
+
+        :param permutation: einsum permutation of the four orbital labels, e.g. ``"abcd->adcb"``.
+        :return: A new :class:`LocalInteraction` with permuted orbitals (a deep copy for the identity permutation).
+        :raises ValueError: If the permutation string is not a valid four-orbital permutation.
         """
         split = permutation.split("->")
         if len(split) != 2 or len(split[0]) != 4 or len(split[1]) != 4:
@@ -41,8 +60,14 @@ class LocalInteraction(IHaveMat, IHaveChannel):
         return LocalInteraction(np.einsum(permutation, self.mat, optimize=True), self.channel)
 
     def as_channel(self, channel: SpinChannel) -> "LocalInteraction":
-        """
-        Returns the spin combination for a given channel.
+        r"""
+        Projects the bare interaction onto a given spin channel. With the crossing-permuted tensor
+        :math:`\tilde U_{abcd} = U_{adcb}` the projections are
+        :math:`U_d = 2U - \tilde U`, :math:`U_m = -\tilde U`, :math:`U_s = U + \tilde U`, :math:`U_t = U - \tilde U`.
+
+        :param channel: Target spin channel (density, magnetic, singlet or triplet).
+        :return: A new :class:`LocalInteraction` in the requested channel.
+        :raises ValueError: If the object is already in a (non-``NONE``) channel, or the target channel is unsupported.
         """
         copy = deepcopy(self)
 
@@ -66,13 +91,17 @@ class LocalInteraction(IHaveMat, IHaveChannel):
 
     def add(self, other) -> "LocalInteraction":
         """
-        Allows for the addition of a LocalInteraction object and another LocalInteraction object or numpy array.
+        Adds another interaction or a raw numpy array elementwise.
+
+        :param other: A :class:`LocalInteraction` or a numpy array broadcastable to ``mat``.
+        :return: A new :class:`LocalInteraction` holding the sum (inheriting the non-``NONE`` channel of the operands).
+        :raises ValueError: If ``other`` is neither a :class:`LocalInteraction` nor a numpy array.
         """
         if not isinstance(other, (LocalInteraction, np.ndarray)):
             raise ValueError(f"Operation {type(self)} +/- {type(other)} not supported.")
 
         if isinstance(other, np.ndarray):
-            return Interaction(self.mat + other, self.channel)
+            return LocalInteraction(self.mat + other, self.channel)
 
         return LocalInteraction(
             self.mat + other.mat, self.channel if self.channel != SpinChannel.NONE else other.channel
@@ -80,13 +109,21 @@ class LocalInteraction(IHaveMat, IHaveChannel):
 
     def sub(self, other) -> "LocalInteraction":
         """
-        Allows for the subtraction of a LocalInteraction object or numpy array from a LocalInteraction object.
+        Subtracts another interaction or a raw numpy array elementwise.
+
+        :param other: A :class:`LocalInteraction` or a numpy array broadcastable to ``mat``.
+        :return: A new :class:`LocalInteraction` holding the difference ``self - other``.
         """
         return self.add(-other)
 
     def pow(self, power) -> "LocalInteraction":
-        """
-        Exponentiates the LocalInteraction object. Only works for powers >= 0.
+        r"""
+        Raises the interaction to an integer power via repeated orbital contraction
+        :math:`U^{(n)}_{abef} = U_{abcd} U^{(n-1)}_{dcef}`.
+
+        :param power: Positive integer exponent (must be greater than zero).
+        :return: A new :class:`LocalInteraction` equal to ``self`` contracted with itself ``power`` times.
+        :raises ValueError: If ``power`` is not a positive integer greater than zero.
         """
         if power <= 0:
             raise ValueError("Exponentiation of Interaction objects only supports positive powers greater than zero.")
@@ -97,31 +134,47 @@ class LocalInteraction(IHaveMat, IHaveChannel):
 
     def __add__(self, other) -> "LocalInteraction":
         """
-        Adds two local interactions and allows for A + B = C.
+        Operator overload for ``self + other``; see :meth:`add`.
+
+        :param other: A :class:`LocalInteraction` or a numpy array.
+        :return: The sum as a new :class:`LocalInteraction`.
         """
         return self.add(other)
 
     def __radd__(self, other) -> "LocalInteraction":
         """
-        Adds two local interactions and allows for A + B = C.
+        Reflected operator overload for ``other + self``; see :meth:`add` (addition commutes).
+
+        :param other: A :class:`LocalInteraction` or a numpy array.
+        :return: The sum as a new :class:`LocalInteraction`.
         """
         return self.add(other)
 
     def __sub__(self, other) -> "LocalInteraction":
         """
-        Subtracts two local interactions and allows for A - B = C.
+        Operator overload for ``self - other``; see :meth:`sub`.
+
+        :param other: A :class:`LocalInteraction` or a numpy array.
+        :return: The difference ``self - other`` as a new :class:`LocalInteraction`.
         """
         return self.sub(other)
 
     def __rsub__(self, other) -> "LocalInteraction":
         """
-        Subtracts two local interactions and allows for A - B = C.
+        Reflected operator overload for ``other - self`` (returns ``-(self - other)``).
+
+        :param other: A :class:`LocalInteraction` or a numpy array on the left-hand side.
+        :return: The difference ``other - self`` as a new :class:`LocalInteraction`.
         """
-        return self.sub(other)
+        return -self.sub(other)
 
     def __pow__(self, power, modulo=None) -> "LocalInteraction":
         """
-        Exponentiation of Interaction objects and allows for A ** n = C, where n is an integer.
+        Operator overload for ``self ** power``; see :meth:`pow`.
+
+        :param power: Positive integer exponent.
+        :param modulo: Unused (present for the ``__pow__`` protocol).
+        :return: ``self`` raised to ``power`` as a new :class:`LocalInteraction`.
         """
         return self.pow(power)
 
@@ -138,12 +191,25 @@ class Interaction(IAmNonLocal, LocalInteraction):
         nq: tuple[int, int, int] = (1, 1, 1),
         has_compressed_q_dimension: bool = False,
     ):
+        r"""
+        Initializes the non-local interaction tensor in the given spin channel and momentum layout.
+
+        :param mat: Interaction tensor :math:`V_{abcd}^q` with one momentum dimension and four orbital axes.
+        :param channel: Spin channel the tensor is expressed in (see :class:`SpinChannel`).
+        :param nq: Number of momenta per spatial direction ``(nqx, nqy, nqz)``.
+        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
+            (True) or as three separate axes ``[qx, qy, qz, ...]`` (False).
+        """
         LocalInteraction.__init__(self, mat, channel)
         IAmNonLocal.__init__(self, mat, nq, has_compressed_q_dimension)
 
     def permute_orbitals(self, permutation: str = "abcd->abcd") -> "Interaction":
         """
-        Permutes the orbitals of the object. The permutation string must be given in the einsum notation.
+        Permutes the four orbital axes (leaving the momentum axis untouched).
+
+        :param permutation: einsum permutation of the four orbital labels, e.g. ``"abcd->adcb"``.
+        :return: A new :class:`Interaction` with permuted orbitals (a deep copy for the identity permutation).
+        :raises ValueError: If the permutation string is not a valid four-orbital permutation.
         """
         split = permutation.split("->")
         if len(split) != 2 or len(split[0]) != 4 or len(split[1]) != 4:
@@ -158,9 +224,14 @@ class Interaction(IAmNonLocal, LocalInteraction):
         )
 
     def as_channel(self, channel: SpinChannel) -> "Interaction":
-        """
-        Returns the spin combination for a given channel. Note that we only have the non-local ph contribution
-        in the ladder DGA equations and the phbar contribution to the spin channels vanishes.
+        r"""
+        Projects the bare non-local interaction onto a given spin channel. Only the non-local particle-hole
+        contribution enters the ladder DGA equations and the ph-bar contribution to the spin channels vanishes,
+        so the projections reduce to :math:`V_d = 2V`, :math:`V_m = 0`, :math:`V_s = V_t = V`.
+
+        :param channel: Target spin channel (density, magnetic, singlet or triplet).
+        :return: A new :class:`Interaction` in the requested channel.
+        :raises ValueError: If the object is already in a (non-``NONE``) channel, or the target channel is unsupported.
         """
         copy = deepcopy(self)
 
@@ -183,14 +254,18 @@ class Interaction(IAmNonLocal, LocalInteraction):
 
     def add(self, other) -> "Interaction":
         """
-        Allows for the addition of a non-local Interaction object with another (non-)local Interaction object or a
-        numpy array.
+        Adds another (non-)local interaction or a raw numpy array. A local operand is broadcast over the
+        momentum axis.
+
+        :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array.
+        :return: A new :class:`Interaction` holding the sum (inheriting the non-``NONE`` channel of the operands).
+        :raises ValueError: If ``other`` is not one of the supported types.
         """
         if not isinstance(other, (LocalInteraction, Interaction, np.ndarray)):
             raise ValueError(f"Operation {type(self)} +/- {type(other)} not supported.")
 
         if isinstance(other, np.ndarray):
-            return Interaction(self.mat + other, self.channel, self.nq)
+            return Interaction(self.mat + other, self.channel, self.nq, self.has_compressed_q_dimension)
 
         if not isinstance(other, Interaction):
             other_mat = other.mat[None, ...] if self.has_compressed_q_dimension else other.mat[None, None, None, ...]
@@ -206,14 +281,21 @@ class Interaction(IAmNonLocal, LocalInteraction):
 
     def sub(self, other) -> "Interaction":
         """
-        Allows for the subtraction of a (non-)local Interaction object or a numpy array from a non-local
-        Interaction object.
+        Subtracts another (non-)local interaction or a raw numpy array.
+
+        :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array.
+        :return: A new :class:`Interaction` holding the difference ``self - other``.
         """
         return self.add(-other)
 
     def pow(self, power) -> "Interaction":
-        """
-        Exponentiates the Interaction object. Only works for powers >= 0.
+        r"""
+        Raises the interaction to an integer power via repeated momentum-diagonal orbital contraction
+        :math:`V^{(n);q}_{abef} = V^{q}_{abcd} V^{(n-1);q}_{dcef}`.
+
+        :param power: Positive integer exponent (must be greater than zero).
+        :return: A new :class:`Interaction` in the same momentum-compression state as ``self``.
+        :raises ValueError: If ``power`` is not a positive integer greater than zero.
         """
         if power <= 0:
             raise ValueError("Exponentiation of Interaction objects only supports positive powers greater than zero.")
@@ -225,30 +307,46 @@ class Interaction(IAmNonLocal, LocalInteraction):
 
     def __add__(self, other) -> "Interaction":
         """
-        Adds two (non-)local interactions and allows for A + B = C.
+        Operator overload for ``self + other``; see :meth:`add`.
+
+        :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array.
+        :return: The sum as a new :class:`Interaction`.
         """
         return self.add(other)
 
     def __radd__(self, other) -> "Interaction":
         """
-        Adds two (non-)local interactions and allows for A + B = C.
+        Reflected operator overload for ``other + self``; see :meth:`add` (addition commutes).
+
+        :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array.
+        :return: The sum as a new :class:`Interaction`.
         """
         return self.add(other)
 
     def __sub__(self, other) -> "Interaction":
         """
-        Subtracts two (non-)local interactions and allows for A - B = C.
+        Operator overload for ``self - other``; see :meth:`sub`.
+
+        :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array.
+        :return: The difference ``self - other`` as a new :class:`Interaction`.
         """
         return self.sub(other)
 
     def __rsub__(self, other) -> "Interaction":
         """
-        Subtracts two (non-)local interactions and allows for A - B = C.
+        Reflected operator overload for ``other - self`` (returns ``-(self - other)``).
+
+        :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array on the left-hand side.
+        :return: The difference ``other - self`` as a new :class:`Interaction`.
         """
-        return self.sub(other)
+        return -self.sub(other)
 
     def __pow__(self, power, modulo=None) -> "Interaction":
         """
-        Exponentiation of Interaction objects and allows for A ** n = C, where n is an integer.
+        Operator overload for ``self ** power``; see :meth:`pow`.
+
+        :param power: Positive integer exponent.
+        :param modulo: Unused (present for the ``__pow__`` protocol).
+        :return: ``self`` raised to ``power`` as a new :class:`Interaction`.
         """
         return self.pow(power)

@@ -99,7 +99,7 @@ def test_symmetrizes_random_matrix_correctly():
     mat = np.random.rand(2, 2, 2, 2, 5, 3, 3)
     obj = LocalFourPoint(mat)
     result = obj.symmetrize_v_vp()
-    expected = 0.5 * (mat + mat.swapaxes(0, 2).swapaxes(1, 3).swapaxes(-1, -2))
+    expected = 0.5 * (mat + mat.swapaxes(0, 3).swapaxes(1, 2).swapaxes(-1, -2))
     assert np.allclose(result.mat, expected, rtol=1e-4)
 
 
@@ -1104,3 +1104,36 @@ def test_symmetrize_orbitals_empty_list():
 
     assert result is obj
     obj._symmetrize_orbitals.assert_not_called()
+
+
+# --- B3: from_constant builds complex64 directly (no float64 temporary) ---
+def test_from_constant_passes_complex64_dtype_to_np_full(monkeypatch):
+    seen = {"dtype": None}
+    real_full = np.full
+
+    def spy_full(shape, value, *args, **kwargs):
+        seen["dtype"] = kwargs.get("dtype", args[0] if args else None)
+        return real_full(shape, value, *args, **kwargs)
+
+    monkeypatch.setattr(np, "full", spy_full)
+    fp = LocalFourPoint.from_constant(1, 1, 2, value=1.0)
+    assert fp.mat.dtype == np.complex64
+    assert seen["dtype"] == np.complex64
+
+
+def test_local_four_point_identity_is_valid_and_complex64():
+    ident = LocalFourPoint.identity(1, 1, 2, num_vn_dimensions=2)
+    assert ident.mat.dtype == np.complex64
+    # in compound-index space each bosonic-frequency slice must be the unit matrix
+    compound = ident.to_compound_indices().mat
+    n = compound.shape[-1]
+    for w_slice in compound:
+        assert np.allclose(w_slice, np.eye(n), atol=1e-5)
+
+
+# --- E6: identity_like uses its own operand's shape ---
+def test_identity_like_matches_its_own_operand_shape():
+    magn = LocalFourPoint.from_constant(1, 1, 3, num_vn_dimensions=2, channel=SpinChannel.MAGN, value=1.0)
+    ident = LocalFourPoint.identity_like(magn)
+    result = ident + magn  # must not raise on shape mismatch
+    assert result.niv == magn.niv

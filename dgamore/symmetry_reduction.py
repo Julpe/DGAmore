@@ -65,9 +65,12 @@ import string
 
 
 def _enumerate_integer_matrices():
-    """All 3x3 integer matrices with entries in {-1, 0, +1} and det in {-1, +1}.
-    Returns 6960 matrices (one of the standard small generating sets for
-    finite subgroups of GL(3, Z))."""
+    """
+    Enumerates all 3x3 integer matrices with entries in ``{-1, 0, +1}`` and determinant ``+/-1`` (6960 of them), a
+    standard generating set for the finite subgroups of GL(3, Z).
+
+    :return: A list of the candidate 3x3 integer matrices.
+    """
     mats = []
     for entries in itertools.product([-1, 0, 1], repeat=9):
         M = np.array(entries, dtype=np.int64).reshape(3, 3)
@@ -78,8 +81,15 @@ def _enumerate_integer_matrices():
 
 
 def _M_preserves_grid(M, nk):
-    """For non-cubic grids, M[i,j] != 0 only if N_j divides N_i (so the
-    k-index action k_i -> sum_j M[i,j] k_j is well-defined modulo N_i)."""
+    """
+    Checks whether the integer matrix ``M`` is compatible with the (possibly non-cubic) grid: ``M[i,j] != 0`` is
+    allowed only if ``N_j`` divides ``N_i``, so the k-index action ``k_i -> sum_j M[i,j] k_j`` is well-defined modulo
+    ``N_i``.
+
+    :param M: The candidate 3x3 integer matrix.
+    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :return: True if ``M`` preserves the grid.
+    """
     Ns = list(nk)
     for i in range(3):
         for j in range(3):
@@ -89,7 +99,14 @@ def _M_preserves_grid(M, nk):
 
 
 def _apply_M_to_kgrid_indices(M, nk):
-    """Flat-index map idx[k_flat] = (M @ k) mod N, with grid-size scaling."""
+    """
+    Builds the flat-index map ``idx[k_flat] = (M @ k) mod N`` for the action of ``M`` on the k-grid (with grid-size
+    scaling for non-cubic grids).
+
+    :param M: The 3x3 integer matrix acting on k-indices.
+    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :return: The flat-index permutation array of length ``nx*ny*nz``.
+    """
     nx, ny, nz = nk
     Ns = np.array([nx, ny, nz], dtype=np.int64)
     ix, iy, iz = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
@@ -106,7 +123,14 @@ def _apply_M_to_kgrid_indices(M, nk):
 
 
 def _translate_kgrid(idx_map, q, nk):
-    """Compose a flat-index map with an integer translation q."""
+    """
+    Composes a flat-index map with an integer grid translation ``q``.
+
+    :param idx_map: An existing flat-index map over the k-grid.
+    :param q: The integer translation vector ``(qx, qy, qz)``.
+    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :return: The translated flat-index map.
+    """
     nx, ny, nz = nk
     qx, qy, qz = q
     iz = idx_map % nz
@@ -119,7 +143,15 @@ def _translate_kgrid(idx_map, q, nk):
 
 
 def _apply_M_to_ev_field(M, ev, nk):
-    """Return A[k] = ev[M k mod N]. Used for the eigenvalue pre-screen."""
+    """
+    Pulls back an eigenvalue field by the action of ``M``, returning ``A[k] = ev[M k mod N]``. Used for the
+    eigenvalue pre-screen in symmetry discovery.
+
+    :param M: The 3x3 integer matrix acting on k-indices.
+    :param ev: The eigenvalue field of shape ``(nx, ny, nz, n_orb)``.
+    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :return: The transformed eigenvalue field, same shape as ``ev``.
+    """
     nx, ny, nz = nk
     Ns = np.array([nx, ny, nz], dtype=np.int64)
     ix, iy, iz = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
@@ -141,11 +173,14 @@ def _apply_M_to_ev_field(M, ev, nk):
 
 
 def _fft_find_matching_q(A, B, atol):
-    """Find all integer translations q such that A[k] = B[k + q] for all k,
-    where A, B are real fields of shape (Nx, Ny, Nz, n_orb_evals).
+    r"""
+    Finds all integer translations ``q`` such that ``A[k] = B[k + q]`` for all ``k``, via a 3D FFT cross-correlation
+    of the (real) eigenvalue fields, i.e. minimizing :math:`D(q) = \sum_{k,e} (A - B(\cdot+q))^2`.
 
-    Uses 3D cross-correlation: D(q) = sum_{k, e} (A - B(.+q))^2.
-    Returns a list of q tuples for which D(q) is below tolerance.
+    :param A: First real field of shape ``(Nx, Ny, Nz, n_orb_evals)``.
+    :param B: Second real field of the same shape.
+    :param atol: Absolute tolerance for accepting a translation.
+    :return: A list of ``q`` index tuples for which the mismatch is below tolerance.
     """
     A2 = (A * A).sum()
     B2 = (B * B).sum()
@@ -164,6 +199,13 @@ def _fft_find_matching_q(A, B, atol):
 
 
 def _cluster_eigvals(d, tol):
+    """
+    Groups consecutive (sorted) eigenvalues that lie within ``tol`` of each other into degenerate clusters.
+
+    :param d: The sorted eigenvalues.
+    :param tol: The degeneracy tolerance.
+    :return: A list of index lists, one per (near-)degenerate cluster.
+    """
     clusters = []
     cur = [0]
     for i in range(1, len(d)):
@@ -201,6 +243,12 @@ def _canonicalize_sign_gauge(U, Hk_eff, Hg, atol):
     Us match the conventional unsigned-permutation form whenever that is consistent
     with the H equation, which is the form users expect for cubic-style symmetries
     in the t2g/eg basis.
+
+    :param U: The candidate unitary to canonicalize.
+    :param Hk_eff: The (effective) source Hamiltonian field the unitary acts on.
+    :param Hg: The target Hamiltonian field the relation must reproduce.
+    :param atol: Absolute tolerance for validating the sign-fixed unitary.
+    :return: The canonicalized unitary ``D U`` (or ``U`` unchanged if no valid improvement is found).
     """
     norb = U.shape[0]
     if norb > 6:
@@ -244,6 +292,11 @@ def _solve_U_for_op(Hg, Hk_eff, atol):
     returned. This makes the output independent of any global-sign choice the
     inner gauge-fixing routine happens to make and matches the conventional
     unsigned-permutation form whenever it is consistent with the H equation.
+
+    :param Hg: The target Hamiltonian field of shape ``(nx, ny, nz, norb, norb)``.
+    :param Hk_eff: The (effective) source Hamiltonian field of the same shape.
+    :param atol: Absolute tolerance for validating the relation.
+    :return: A canonicalized unitary ``U`` solving the relation, or None if none exists.
     """
     norb = Hg.shape[-1]
     ev_k = np.linalg.eigvalsh(Hk_eff)
@@ -293,9 +346,19 @@ def _solve_U_for_op(Hg, Hk_eff, atol):
 
 
 def _fix_phases_nondegenerate(V, W, Hk_eff, Hg, k0, atol):
-    """Determine phases phi so that U = W @ diag(phi) @ V^dag works globally.
-    Constraint at any k1: diag(phi) A diag(phi*) = B, with
-    A = V^dag Hk_eff[k1] V, B = W^dag Hg[k1] W."""
+    r"""
+    Determines the eigenvector phases :math:`\phi` so that :math:`U = W \mathrm{diag}(\phi) V^\dagger` solves the
+    symmetry relation globally, for the non-degenerate-spectrum case (constraint at any ``k1``:
+    :math:`\mathrm{diag}(\phi) A \mathrm{diag}(\phi^*) = B` with ``A = V^dag Hk_eff[k1] V``, ``B = W^dag Hg[k1] W``).
+
+    :param V: Eigenvectors of ``Hk_eff`` at the reference point.
+    :param W: Eigenvectors of ``Hg`` at the reference point.
+    :param Hk_eff: The (effective) source Hamiltonian field.
+    :param Hg: The target Hamiltonian field.
+    :param k0: The reference k-point index triplet (excluded when sampling test points).
+    :param atol: Absolute tolerance for validating the relation.
+    :return: The solving unitary ``U``, or None if no consistent phase set is found.
+    """
     norb = V.shape[0]
     nx, ny, nz = Hk_eff.shape[:3]
     rng = np.random.default_rng(42)
@@ -333,8 +396,19 @@ def _fix_phases_nondegenerate(V, W, Hk_eff, Hg, k0, atol):
 
 
 def _fix_gauge_degenerate(V, W, clusters, Hk_eff, Hg, atol):
-    """Solve for the block-diagonal unitary R such that U = W @ R @ V^dag works.
-    Builds linear constraints (A R = R B) at several k-points and solves."""
+    r"""
+    Solves for the block-diagonal unitary ``R`` (one block per degenerate cluster) such that
+    :math:`U = W R V^\dagger` solves the symmetry relation, by assembling linear constraints ``A R = R B`` at several
+    sampled k-points and taking the null-space solution.
+
+    :param V: Eigenvectors of ``Hk_eff`` at the reference point.
+    :param W: Eigenvectors of ``Hg`` at the reference point.
+    :param clusters: The degenerate-eigenvalue clusters (see :func:`_cluster_eigvals`).
+    :param Hk_eff: The (effective) source Hamiltonian field.
+    :param Hg: The target Hamiltonian field.
+    :param atol: Absolute tolerance (unused directly; kept for signature consistency).
+    :return: The solving unitary ``U``, or None if the constraints have no consistent solution.
+    """
     norb = V.shape[0]
     nx, ny, nz = Hk_eff.shape[:3]
     rng = np.random.default_rng(123)
@@ -385,8 +459,16 @@ def _fix_gauge_degenerate(V, W, clusters, Hk_eff, Hg, atol):
 
 
 def _discover_symmetries(H, atol, verbose=False):
-    """Discover all (M, q, U, sigma, conj) that are symmetries of H.
-    Deduplicates by the *action* (grid index map + sigma + conj + U up to phase)."""
+    """
+    Discovers all symmetry operations ``(M, q, U, sigma, conj)`` of the Hamiltonian ``H``, deduplicated by their
+    action (grid index map + sigma + conj + U up to phase). Uses the integer-matrix enumeration, the FFT eigenvalue
+    pre-screen for translations, and the U-solver for the orbital part.
+
+    :param H: The Hamiltonian field of shape ``(nx, ny, nz, norb, norb)``.
+    :param atol: Absolute tolerance for symmetry validation.
+    :param verbose: If True, print discovery diagnostics.
+    :return: A tuple ``(ops, n_ops)`` of the list of discovered operation dicts and their count.
+    """
     nx, ny, nz, norb, _ = H.shape
     nk = (nx, ny, nz)
 
@@ -429,6 +511,15 @@ def _discover_symmetries(H, atol, verbose=False):
     B_minus_sq = (ev_neg * ev_neg).sum()
 
     def _fft_q_scan_cached(A, FB, B_sq, atol):
+        """
+        FFT translation scan against a precomputed reference FFT (faster variant of :func:`_fft_find_matching_q`).
+
+        :param A: The pulled-back eigenvalue field to match.
+        :param FB: The precomputed FFT of the reference eigenvalue field.
+        :param B_sq: The precomputed squared norm of the reference field.
+        :param atol: Absolute tolerance for accepting a translation.
+        :return: A list of matching ``q`` index tuples.
+        """
         A2 = (A * A).sum()
         FA = np.fft.fftn(A, axes=(0, 1, 2))
         cross = np.fft.ifftn(np.conj(FA) * FB, axes=(0, 1, 2)).real.sum(axis=-1)
@@ -440,6 +531,12 @@ def _discover_symmetries(H, atol, verbose=False):
     seen_actions = set()
 
     def _canon_U_bytes(U):
+        """
+        Produces a canonical (global-phase-fixed, rounded) byte representation of a unitary for deduplication.
+
+        :param U: The unitary matrix to canonicalize.
+        :return: The canonical byte string identifying ``U`` up to a global phase.
+        """
         flat = U.ravel()
         mags = np.abs(flat)
         candidates_idx = np.where(mags > mags.max() - 1e-4)[0]
@@ -501,8 +598,14 @@ _grid_action_cache = {}
 
 
 def _grid_action_bytes(M, q, nk):
-    """Return canonical bytes encoding the action of (M, q) on the k-grid.
-    Cached by (M, q, nk) — these are integer arrays so caching is safe."""
+    """
+    Returns canonical bytes encoding the combined action of ``(M, q)`` on the k-grid, cached by ``(M, q, nk)``.
+
+    :param M: The 3x3 integer matrix.
+    :param q: The integer translation vector.
+    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :return: The byte string encoding the resulting flat-index map.
+    """
     key = (M.tobytes(), q.tobytes(), tuple(nk))
     cached = _grid_action_cache.get(key)
     if cached is not None:
@@ -518,13 +621,34 @@ def _grid_action_bytes(M, q, nk):
 
 
 def _clear_grid_action_cache():
+    """
+    Clears the module-level grid-action byte cache.
+
+    :return: None.
+    """
     _grid_action_cache.clear()
 
 
 class _GroupElement:
+    """
+    A single discovered symmetry operation ``(M, q, U, sigma, conj)`` acting on the k-grid and orbital space, with
+    hashing/equality based on its canonical grid action and (phase-fixed) orbital unitary so that operations with the
+    same effect compare equal.
+    """
+
     __slots__ = ("M", "q", "U", "sigma", "conj", "nk", "_key")
 
     def __init__(self, M, q, U, sigma, conj, nk):
+        """
+        Stores the operation and precomputes its canonical action key for hashing/equality.
+
+        :param M: The 3x3 integer matrix acting on k-indices.
+        :param q: The integer translation vector.
+        :param U: The orbital-space unitary (canonicalized up to a global phase).
+        :param sigma: The antisymmetry sign (``+1`` or ``-1``).
+        :param conj: Whether the operation is anti-unitary (complex conjugation).
+        :param nk: The grid sizes ``(nx, ny, nz)``.
+        """
         self.M = np.asarray(M, dtype=np.int64)
         self.q = np.asarray(q, dtype=np.int64)
         self.nk = tuple(int(x) for x in nk)
@@ -551,20 +675,40 @@ class _GroupElement:
         self._key = (grid_key, self.sigma, self.conj, Ur.tobytes())
 
     def __eq__(self, other):
+        """
+        Equality based on the canonical action key (grid action, sigma, conj, phase-fixed U). See :meth:`__init__`.
+        """
         return isinstance(other, _GroupElement) and self._key == other._key
 
     def __hash__(self):
+        """
+        Hash of the canonical action key (consistent with :meth:`__eq__`).
+        """
         return hash(self._key)
 
     @staticmethod
     def identity(norb, nk):
+        """
+        Builds the identity group element (identity matrix, zero translation, identity unitary, ``sigma=+1``).
+
+        :param norb: Number of orbitals.
+        :param nk: The grid sizes ``(nx, ny, nz)``.
+        :return: The identity :class:`_GroupElement`.
+        """
         return _GroupElement(
             np.eye(3, dtype=np.int64), np.zeros(3, dtype=np.int64), np.eye(norb, dtype=complex), +1, False, nk
         )
 
 
 def _compose(ga, gb, nk):
-    """g = ga . gb (apply gb first, then ga)."""
+    """
+    Composes two group elements, ``g = ga . gb`` (apply ``gb`` first, then ``ga``).
+
+    :param ga: The outer group element.
+    :param gb: The inner group element.
+    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :return: The composed :class:`_GroupElement`.
+    """
     Ns = np.array(nk, dtype=np.int64)
     M = ga.M @ gb.M
     q = (ga.M @ gb.q + ga.q) % Ns
@@ -576,6 +720,13 @@ def _compose(ga, gb, nk):
 
 
 def _inverse(g, nk):
+    """
+    Computes the inverse of a group element.
+
+    :param g: The group element to invert.
+    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :return: The inverse :class:`_GroupElement`.
+    """
     Ns = np.array(nk, dtype=np.int64)
     M_inv = np.linalg.inv(g.M.astype(float))
     M_inv = np.round(M_inv).astype(np.int64)
@@ -585,6 +736,16 @@ def _inverse(g, nk):
 
 
 def _close_group(ops_raw, norb, nk, max_size=10000):
+    """
+    Closes the discovered raw operations under composition (including the identity) to form the full symmetry group,
+    up to a maximum size safeguard.
+
+    :param ops_raw: The list of discovered operation dicts.
+    :param norb: Number of orbitals.
+    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :param max_size: Maximum allowed group size before bailing out.
+    :return: The closed set of :class:`_GroupElement`.
+    """
     group = {_GroupElement.identity(norb, nk)}
     for o in ops_raw:
         group.add(_GroupElement(o["M"], o["q"], o["U"], o["sigma"], o["conj"], nk))
@@ -609,11 +770,27 @@ def _close_group(ops_raw, norb, nk, max_size=10000):
 
 
 def _g_action_on_kgrid(g, nk):
+    """
+    Returns the flat-index map of a group element's combined ``(M, q)`` action on the k-grid.
+
+    :param g: The group element.
+    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :return: The flat-index permutation array.
+    """
     idx = _apply_M_to_kgrid_indices(g.M, nk)
     return _translate_kgrid(idx, tuple(g.q), nk)
 
 
 def _orbit_collapse(H, group):
+    """
+    Collapses the k-grid into symmetry orbits under the closed group, choosing the smallest flat index as each
+    orbit's representative, and records the group element mapping each k back to its representative.
+
+    :param H: The Hamiltonian field of shape ``(nx, ny, nz, norb, norb)``.
+    :param group: The closed symmetry group (iterable of :class:`_GroupElement`).
+    :return: A tuple ``(orbit_min, trans)`` of the per-k representative flat-index field and the per-k inverse
+        transformation elements.
+    """
     nx, ny, nz, norb, _ = H.shape
     nk = (nx, ny, nz)
     nktot = nx * ny * nz
@@ -632,44 +809,23 @@ def _orbit_collapse(H, group):
 
 
 def get_symmetry_reduction(H, atol=1e-8, verbose=False, include_antiunitary=False):
-    """Discover symmetries of H[kx, ky, kz, o1, o2] (lattice-basis grid) and
-       produce an IBZ reduction with reconstruction callables.
+    r"""
+    Discovers the symmetries of ``H[kx, ky, kz, o1, o2]`` (on the primitive reciprocal-lattice grid) and produces an
+    irreducible-BZ reduction together with reconstruction callables.
 
-    Parameters
-    ----------
-    H : np.ndarray
-        Hamiltonian of shape (nx, ny, nz, norb, norb), in primitive reciprocal
-        lattice basis.
-    atol : float
-        Absolute tolerance for symmetry validation.
-    verbose : bool
-        Print diagnostic info about discovery and group closure.
-    include_antiunitary : bool
-        If False (default), anti-unitary symmetries (operations with ``conj=True``,
-        such as time-reversal-like H(k) = H(k)*) are discarded after discovery.
-        Anti-unitary operations are valid symmetries of H, but for frequency-
-        dependent objects (Green's functions, vertices) they additionally require
-        a Matsubara-frequency flip ``i omega -> -i omega`` which the FBZ-mapping
-        path does NOT perform. Applying conj-only at FBZ-expansion time therefore
-        produces wrong values for frequency-dependent kernels at the conj-mapped
-        k-points. Keep the default ``False`` unless you are reducing a strictly
-        static / frequency-independent quantity (such as H itself or a band
-        structure) and want the larger IBZ reduction that anti-unitary symmetries
-        provide.
-
-    Returns
-    -------
-    A dict with:
-      'group':         list of _GroupElement (the discovered symmetry group)
-      'irrk_ind':      flat indices into (nx*ny*nz) of IBZ representatives
-      'fbz2irrk':      (nx,ny,nz) integer field: representative of each k
-      'expand':        callable expand(H_ibz) -> H_full
-                       H_ibz of shape (n_ibz, norb, norb), ordered so
-                       H_ibz[i] = H_full.reshape(-1, norb, norb)[irrk_ind[i]].
-      'expand_tensor': callable for arbitrary-rank tensors T[k, o_1, ..., o_r]
-                       with per-axis ket ('k') / bra ('b') character.
-      'generators':    raw discovered ops (list of dicts)
-      'n_ibz', 'n_fbz'
+    :param H: Hamiltonian of shape ``(nx, ny, nz, norb, norb)`` in the primitive reciprocal-lattice basis.
+    :param atol: Absolute tolerance for symmetry validation.
+    :param verbose: If True, print diagnostics about discovery and group closure.
+    :param include_antiunitary: If False (default), anti-unitary symmetries (``conj=True``, e.g. time-reversal-like
+        :math:`H(k) = H(k)^*`) are discarded after discovery. They are valid symmetries of H, but for
+        frequency-dependent objects they additionally require a Matsubara-frequency flip
+        :math:`\imath\omega \to -\imath\omega` that the FBZ-mapping path does not perform; keep the default unless
+        reducing a strictly static quantity (such as H itself or a band structure).
+    :return: A dict with keys ``'group'`` (the discovered :class:`_GroupElement` list), ``'irrk_ind'`` (flat IBZ
+        representative indices), ``'fbz2irrk'`` (per-k representative field), ``'expand'`` (callable mapping IBZ
+        Hamiltonian values to the full BZ), ``'expand_tensor'`` (callable for arbitrary-rank tensors with per-axis
+        ket/bra character), ``'generators'`` (raw discovered ops), ``'n_ibz'``, ``'n_fbz'``, and the per-k transform
+        data ``'pos_in_irrk'``, ``'Us'``, ``'sigmas'``, ``'conjs'``.
     """
     # Reset the grid-action cache (in case nk changes between calls).
     _clear_grid_action_cache()
@@ -705,6 +861,13 @@ def get_symmetry_reduction(H, atol=1e-8, verbose=False, include_antiunitary=Fals
     Us = np.stack([t.U for t in trans]).reshape(nx, ny, nz, norb, norb)
 
     def expand(H_ibz):
+        """
+        Reconstructs the full-BZ Hamiltonian from its IBZ values by applying the per-k transformation
+        ``(sigma_k, U_k, conj_k)``.
+
+        :param H_ibz: IBZ Hamiltonian values of shape ``(n_ibz, norb, norb)``, ordered to match ``irrk_ind``.
+        :return: The full-BZ Hamiltonian of shape ``(nx, ny, nz, norb, norb)``.
+        """
         H_parents = H_ibz[pos_in_irrk].reshape(nx, ny, nz, norb, norb)
         H_eff = np.where(conjs[..., None, None], H_parents.conj(), H_parents)
         Udag = Us.conj().transpose(0, 1, 2, 4, 3)
@@ -713,7 +876,7 @@ def get_symmetry_reduction(H, atol=1e-8, verbose=False, include_antiunitary=Fals
         return out
 
     def expand_tensor(T_ibz, kind="kb", sigma_power=1):
-        """T_ibz: shape (n_ibz, norb, ..., norb) with len(kind) orbital axes.
+        r"""T_ibz: shape (n_ibz, norb, ..., norb) with len(kind) orbital axes.
         kind: string of 'k' (ket: U-contracted) and 'b' (bra: U^dag-contracted)
               per orbital axis. Shortcuts:
                 'ket-bra' = 'kb'  (Hamiltonian / Green's function)
@@ -732,8 +895,16 @@ def get_symmetry_reduction(H, atol=1e-8, verbose=False, include_antiunitary=Fals
         Shortcut conventions (alphabetical orbital index order a, b, c, d):
             'ket-bra' / 'kb'     :  1-particle propagator G_ab (a annihilation, b creation)
             'vertex'  / 'rank4'  :  2-particle Green's function G_abcd with operator
-                                    ordering <c_a c^dag_b c_c c^dag_d> -> alternating
-                                    annihilation/creation -> 'kbkb'.
+                                    ordering :math:`\langle c_a c^\dagger_b c_c c^\dagger_d\rangle` ->
+                                    alternating annihilation/creation -> 'kbkb'.
+
+        :param T_ibz: IBZ tensor values of shape ``(n_ibz, norb, ..., norb)`` with ``len(kind)`` orbital axes.
+        :param kind: Per-axis character string of ``'k'`` (ket) / ``'b'`` (bra), or a shortcut (``"ket-bra"``,
+            ``"vertex"``, ``"rank4"``).
+        :param sigma_power: Power of ``sigma`` multiplying the result (1 for H itself, effectively 0 for quantities
+            built from two H's/G's).
+        :return: The full-BZ tensor with leading momentum axes ``(nx, ny, nz)`` followed by the transformed orbitals.
+        :raises ValueError: If ``kind`` is invalid or ``T_ibz``'s rank/orbital sizes do not match it.
         """
         shortcuts = {"ket-bra": "kb", "vertex": "kbkb", "rank4": "kbkb"}
         if isinstance(kind, str) and kind in shortcuts:
@@ -795,42 +966,33 @@ def apply_auto_orbital_transform(
     conjs: np.ndarray,
     num_orbital_dimensions: int,
 ) -> np.ndarray:
-    """
-    Apply the auto-discovered per-k orbital transformation ``(sigma_k, U_k, conj_k)``
-    to a tensor whose leading axis enumerates k-points (or a contiguous slice thereof).
+    r"""
+    Applies the auto-discovered per-k orbital transformation ``(sigma_k, U_k, conj_k)`` to a tensor whose leading
+    axis enumerates k-points (or a contiguous slice thereof).
 
-    The transformation follows the operator ordering G_abcd := <T[c_a c†_b c_c c†_d]>,
-    with annihilation indices (positions 1, 3) transforming with U and creation indices
-    (positions 2, 4) with U^dagger, combined with sigma and conjugation:
+    The transformation follows the operator ordering
+    :math:`G_{abcd} := \langle T[c_a c^\dagger_b c_c c^\dagger_d]\rangle`, with annihilation indices (positions 1, 3)
+    transforming with :math:`U` and creation indices (positions 2, 4) with :math:`U^\dagger`, combined with
+    :math:`\sigma` and conjugation:
 
-        2-index : M_ab(k)   = sigma_k     * U_aa' [M_a'b'(k_rep)]^{[*conj_k]} U^dag_b'b
-        4-index : M_abcd(k) = sigma_k^2 * U_aa' [M_a'b'c'd'(k_rep)]^{[*conj_k]} U^dag_b'b U_cc' U^dag_d'd
+    .. math::
 
-    Since ``sigma_k`` is +/- 1, ``sigma_k^2 == 1``; the 4-index case effectively has no
-    sign factor, which is the correct physics for vertex quantities under particle-hole-
-    like antisymmetries.
+        M_{ab}(k)   &= \sigma_k\, U_{aa'} [M_{a'b'}(k_{\mathrm{rep}})]^{[*\mathrm{conj}_k]} U^\dagger_{b'b} \\
+        M_{abcd}(k) &= \sigma_k^2\, U_{aa'} [M_{a'b'c'd'}(k_{\mathrm{rep}})]^{[*\mathrm{conj}_k]} U^\dagger_{b'b}
+                       U_{cc'} U^\dagger_{d'd}
 
-    Parameters
-    ----------
-    mat:
-        Input tensor of shape ``(k_local, nb, [nb, nb,] nb, ...)``. The leading axis can
-        be the full FBZ or any contiguous slice of it; ``Us``, ``sigmas``, ``conjs`` must
-        be sliced consistently.
-    us:
-        Per-k unitary matrices of shape ``(k_local, nb, nb)``, complex.
-    sigmas:
-        Per-k antisymmetry signs of shape ``(k_local,)``, values in ``{+1, -1}``.
-    conjs:
-        Per-k anti-unitary flags of shape ``(k_local,)``, dtype bool.
-    num_orbital_dimensions:
-        2 (single-particle, e.g. H, G) or 4 (two-particle vertex). Determines both the
+    Since :math:`\sigma_k = \pm 1`, :math:`\sigma_k^2 = 1`; the 4-index case effectively has no sign factor, which is
+    the correct physics for vertex quantities under particle-hole-like antisymmetries.
+
+    :param mat: Input tensor of shape ``(k_local, nb, [nb, nb,] nb, ...)``. The leading axis may be the full FBZ or a
+        contiguous slice of it; ``us``, ``sigmas`` and ``conjs`` must be sliced consistently.
+    :param us: Per-k unitary matrices of shape ``(k_local, nb, nb)``, complex.
+    :param sigmas: Per-k antisymmetry signs of shape ``(k_local,)``, values in ``{+1, -1}``.
+    :param conjs: Per-k anti-unitary flags of shape ``(k_local,)``, dtype bool.
+    :param num_orbital_dimensions: 2 (single-particle, e.g. H, G) or 4 (two-particle vertex); determines both the
         einsum pattern and the effective power of ``sigma_k``.
-
-    Returns
-    -------
-    Transformed tensor with the same shape as ``mat``. Operates out-of-place on the
-    affected k-groups but returns the same backing array where the rows are
-    untouched (identity transform).
+    :return: The transformed tensor with the same shape as ``mat`` (the same backing array, with identity rows left
+        untouched).
     """
     assert num_orbital_dimensions in (2, 4), "num_orbital_dimensions must be 2 or 4."
     k_local = mat.shape[0]

@@ -3,13 +3,38 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+r"""
+Analytic continuation of imaginary-frequency quantities to the real axis via the maximum-entropy method. This
+module wraps the (vendored) :mod:`dgamore.ana_cont` solver to continue the momentum-dependent DGA Green's function
+and the local DMFT Green's function to real frequencies, yielding the spectral function
+:math:`A(\mathbf{k}, \omega)`. The momentum-resolved continuation is distributed over MPI ranks across the
+irreducible BZ.
+"""
 
+import gc
+import os
+
+import numpy as np
+from mpi4py import MPI
+
+import dgamore.config as config
 from dgamore.ana_cont import AnalyticContinuationProblem, RealFreqTwoPoint
-from dgamore.greens_function import *
-from dgamore.mpi_distributor import *
+from dgamore.greens_function import GreensFunction
+from dgamore.mpi_distributor import MpiDistributor
+from dgamore.n_point_base import DTYPE
+from dgamore.self_energy import SelfEnergy
 
 
 def orbital_to_band_basis(hk: np.ndarray, data: np.ndarray) -> np.ndarray:
+    """
+    Rotates a momentum-dependent quantity from the orbital basis into the band (eigen) basis of the Hamiltonian,
+    per k-point.
+
+    :param hk: The Hamiltonian :math:`H(k)` of shape ``[kx, ky, kz, n_orb, n_orb]``.
+    :param data: The quantity to rotate, of the same shape as ``hk`` (rotated in place and returned).
+    :return: The quantity in the band basis.
+    :raises AssertionError: If ``hk`` and ``data`` do not have the same shape.
+    """
     assert hk.shape == data.shape, "Shape mismatch!"
 
     nkx, nky, nkz, n_orb, _ = hk.shape
@@ -22,6 +47,16 @@ def orbital_to_band_basis(hk: np.ndarray, data: np.ndarray) -> np.ndarray:
 
 
 def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
+    r"""
+    Analytically continues the momentum-dependent Green's function to the real axis via maximum entropy, per
+    band and per irreducible-BZ k-point, and assembles the spectral function over the full BZ on rank 0. The
+    k-points are distributed across MPI ranks; failed continuations are set to zero.
+
+    :param giwk: The momentum-dependent :class:`GreensFunction` to continue.
+    :param name: Label used in log messages (e.g. ``"DGA"``).
+    :param comm: The MPI communicator.
+    :return: The spectral function :math:`A(\mathbf{k}, \omega)` of shape ``[k, n_bands, w]`` (full BZ on rank 0).
+    """
     logger = config.logger
 
     logger.info(f"Starting analytic continuation of the {name} Green's function using the maximum entropy method.")
@@ -77,6 +112,15 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
 
 
 def perform_maxent_dmft(sigma_dmft: SelfEnergy, hk: np.ndarray) -> np.ndarray:
+    r"""
+    Analytically continues the local DMFT self-energy to the real axis via maximum entropy (per band, with the
+    Hartree shift removed and restored through a Kramers-Kronig transform), then builds the real-frequency lattice
+    Green's function and its spectral function.
+
+    :param sigma_dmft: The local DMFT :class:`SelfEnergy`.
+    :param hk: The Hamiltonian :math:`H(k)` of shape ``[kx, ky, kz, n_orb, n_orb]``.
+    :return: The spectral function :math:`A(\mathbf{k}, \omega)` of shape ``[kx, ky, kz, n_bands, w]``.
+    """
     logger = config.logger
 
     logger.info(f"Starting analytic continuation of the DMFT Green's function using the maximum entropy method.")
@@ -93,7 +137,7 @@ def perform_maxent_dmft(sigma_dmft: SelfEnergy, hk: np.ndarray) -> np.ndarray:
     model /= np.trapezoid(model)
     stdev = np.array([0.0001 for _ in range(sigma_maxent.shape[-1])])
 
-    siw_cont = np.zeros((config.sys.n_bands, config.sys.n_bands, len(w)), dtype=np.complex64)
+    siw_cont = np.zeros((config.sys.n_bands, config.sys.n_bands, len(w)), dtype=DTYPE)
 
     for band in range(config.sys.n_bands):
         logger.info(f"Processing analytic continuation of band {band+1}.")

@@ -3,6 +3,17 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+r"""
+Non-local ladder DGA step — the parallel-heavy core of the code. Starting from the local irreducible vertex
+:math:`\Gamma_{r}` and the bare interaction, the functions here build, per momentum :math:`q` and spin channel,
+the bubble :math:`\chi_0^q`, the auxiliary susceptibility :math:`\chi^{*;q}_{r}`, the three-leg vertex
+:math:`\gamma^q_{r}`, the physical susceptibility :math:`\chi^q_{r}` (with shell and optional
+:math:`\lambda`-correction) and the self-energy kernel, then contract the kernel with the Green's function to get
+the momentum-dependent self-energy :math:`\Sigma(k, \nu)`. Several CPU/GPU/FFT variants of the heavy contractions
+are provided, distributed over MPI ranks. The whole thing is wrapped in a self-consistency loop with chemical-
+potential adjustment and self-energy mixing (linear / Pulay / Anderson). Equation numbers refer to the author's
+master's thesis (Chapter 4).
+"""
 
 import glob
 import os
@@ -40,6 +51,11 @@ def get_hartree_fock(
     :math:`\Sigma_{F}^k = - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}`.
     Processes the Fock-Term for each individual orbital to save memory, as for high momentum grids,
     the occ_qk property can become large.
+
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}` (see :class:`Interaction`).
+    :param q_list: Array of integer q-point index triplets handled by this rank.
+    :return: The tuple ``(hartree, fock)`` of self-energy contributions, broadcastable to ``[k, o1, o2, v]``.
     """
     v_q0 = v_nonloc.find_q((0, 0, 0))
     hartree = 2 * (u_loc + v_q0).times("qabcd,dc->ab", config.sys.occ)
@@ -73,8 +89,15 @@ def create_auxiliary_chi_r_q(
     gamma_r: LocalFourPoint, gchi0_q_inv: FourPoint, u_loc: LocalInteraction, v_nonloc: Interaction
 ) -> FourPoint:
     r"""
-    Returns the auxiliary susceptibility, see Eq. (3.60) in my master's thesis.
-    .. math:: \chi^{*;qvv'}_{r;abcd} = ((\chi_{0;abcd}^{qv})^{-1} + (\Gamma_{r;abcd}^{wvv'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}
+    Returns the auxiliary susceptibility, see Eq. (3.60) in my master's thesis,
+
+    .. math:: \chi^{*;q\nu\nu'}_{r;abcd} = ((\chi_{0;abcd}^{q\nu})^{-1} + (\Gamma_{r;abcd}^{\omega\nu\nu'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}.
+
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :return: The momentum-dependent auxiliary susceptibility :math:`\chi^{*;q}_{r}` as a :class:`FourPoint`.
     """
     return (
         (gchi0_q_inv + 1.0 / config.sys.beta**2 * gamma_r)
@@ -86,9 +109,17 @@ def create_auxiliary_chi_r_q_sum_v1(
     gamma_r: LocalFourPoint, gchi0_q_inv: FourPoint, u_loc: LocalInteraction, v_nonloc: Interaction
 ) -> FourPoint:
     r"""
-    Returns the auxiliary susceptibility, see Eq. (3.60) in my master's thesis.
-    .. math:: \chi^{*;qvv'}_{r;abcd} = ((\chi_{0;abcd}^{qv})^{-1} +
-    (\Gamma_{r;abcd}^{wvv'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}
+    Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis. This variant inverts
+    and sums over the last fermionic frequency in one fused step (see
+    :meth:`FourPoint.invert_and_sum_over_last_vn`),
+
+    .. math:: \sum_{\nu'}\chi^{*;q\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi_{0;abcd}^{q\nu})^{-1} + (\Gamma_{r;abcd}^{\omega\nu\nu'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}.
+
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q}_{r}` as a :class:`FourPoint`.
     """
     return (
         (gchi0_q_inv + 1.0 / config.sys.beta**2 * gamma_r)
@@ -104,9 +135,18 @@ def create_auxiliary_chi_r_q_sum_v2(
     mpi_dist_irrq: MpiDistributor,
 ) -> FourPoint:
     r"""
-    Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis.
-    .. math:: \sum_{v'}\chi^{*;qvv'}_{r;abcd} = \sum_{v'}((\chi_{0;abcd}^{qv})^{-1} +
-    (\Gamma_{r;abcd}^{wvv'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}
+    Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis. This variant loops over
+    the rank-local q-points (capping peak memory to one q at a time) and uses the standard fused invert-and-sum per
+    q (see :meth:`FourPoint.invert_and_sum_over_last_vn`),
+
+    .. math:: \sum_{\nu'}\chi^{*;q\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi_{0;abcd}^{q\nu})^{-1} + (\Gamma_{r;abcd}^{\omega\nu\nu'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}.
+
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q}_{r}` as a :class:`FourPoint`.
     """
     irrk_q_list = config.lattice.q_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrq.my_slice]
@@ -134,9 +174,18 @@ def create_auxiliary_chi_r_q_sum_v3(
     mpi_dist_irrq: MpiDistributor,
 ) -> FourPoint:
     r"""
-    Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis.
-    .. math:: \sum_{v'}\chi^{*;qvv'}_{r;abcd} = \sum_{v'}((\chi_{0;abcd}^{qv})^{-1} +
-    (\Gamma_{r;abcd}^{wvv'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}
+    Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis. This is the most
+    memory-frugal variant: it loops over the rank-local q-points and uses the highly memory-efficient
+    linear-solver-based fused invert-and-sum per q (see :meth:`FourPoint.invert_and_sum_over_last_vn_v2`),
+
+    .. math:: \sum_{\nu'}\chi^{*;q\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi_{0;abcd}^{q\nu})^{-1} + (\Gamma_{r;abcd}^{\omega\nu\nu'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}.
+
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q}_{r}` as a :class:`FourPoint`.
     """
     irrk_q_list = config.lattice.q_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrq.my_slice]
@@ -158,8 +207,12 @@ def create_auxiliary_chi_r_q_sum_v3(
 
 def create_vrg_r_q(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint) -> FourPoint:
     r"""
-    Returns the three-leg vertex, see Eq. (3.63) in my master's thesis.
-    .. math:: \gamma_{r;abcd}^{qv} = \beta * (\chi^{qvv}_{0;ablm})^{-1} * (\sum_{v'} \chi^{*;qvv'}_{r;mlcd}).
+    Returns the momentum-dependent three-leg vertex, see Eq. (3.63) in my master's thesis,
+    :math:`\gamma_{r;abcd}^{q\nu} = \beta (\chi^{q\nu\nu}_{0;ablm})^{-1} (\sum_{\nu'} \chi^{*;q\nu\nu'}_{r;mlcd})`.
+
+    :param gchi_aux_q_r_sum: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q}_{r}`.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :return: The three-leg vertex :math:`\gamma^q_{r}` (``vrg``) as a :class:`FourPoint`.
     """
     return config.sys.beta * (gchi0_q_inv @ gchi_aux_q_r_sum)
 
@@ -175,6 +228,13 @@ def create_generalized_chi_q_with_shell_correction(
     Calculates the generalized susceptibility with the shell correction as described by
     Motoharu Kitatani et al. 2022 J. Phys. Mater. 5 034005; DOI 10.1088/2515-7639/ac7e6d. Eq. A.15. See also Sec. 3.7.2
     in my master's thesis for details.
+
+    :param gchi_aux_q_sum: The frequency-summed auxiliary susceptibility :math:`\\sum_{\\nu\\nu'}\\chi^{*;q}_{r}`.
+    :param gchi0_q_full_sum: The frequency-summed bare bubble over the full box.
+    :param gchi0_q_core_sum: The frequency-summed bare bubble over the core box.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :return: The shell-corrected physical susceptibility :math:`\\chi^{q}_{r}` as a :class:`FourPoint`.
     """
     return (
         (gchi_aux_q_sum + gchi0_q_full_sum - gchi0_q_core_sum).invert()
@@ -184,8 +244,13 @@ def create_generalized_chi_q_with_shell_correction(
 
 def calculate_sigma_dc_kernel(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, u_loc: LocalInteraction) -> FourPoint:
     """
-    Returns the double-counting kernel for the self-energy calculation. For details, see Eq. (4.28) in my
-    master's thesis.
+    Returns the double-counting kernel for the self-energy calculation, contracting the local full vertex with the
+    momentum-dependent bubble per q-point. For details, see Eq. (4.28) in my master's thesis.
+
+    :param f_dc_loc: The local full vertex :math:`F` used for the double-counting correction.
+    :param gchi0_q: The momentum-dependent bare bubble :math:`\\chi_0^q`.
+    :param u_loc: The bare local interaction :math:`U`.
+    :return: The double-counting kernel as a :class:`FourPoint`, cut to the core fermionic box.
     """
     kernel = 1.0 / config.sys.beta**2 * u_loc.permute_orbitals("abcd->adcb") @ gchi0_q
 
@@ -203,8 +268,15 @@ def calculate_kernel_r_q(
 ) -> FourPoint:
     r"""
     Returns the kernel for the self-energy calculation minus 2/3 times the identity if the channel is the magnetic
-    channel (due to the extra factor of :math:`U_{ah21}` in Eq. (4.29) in my master's thesis).
-    .. math:: K = \gamma_{r;abcd}^{qv} - \gamma_{r;abef}^{qv} U^{q}_{r;fehg} \chi_{r;ghcd}^{q}
+    channel (due to the extra factor of :math:`U_{ah21}` in Eq. (4.29) in my master's thesis),
+
+    .. math:: K = \gamma_{r;abcd}^{q\nu} - \gamma_{r;abef}^{q\nu} U^{q}_{r;fehg} \chi_{r;ghcd}^{q}.
+
+    :param vrg_q_r: The momentum-dependent three-leg vertex :math:`\gamma^q_{r}`.
+    :param gchi_aux_q_r_sum: The (shell-corrected) physical susceptibility :math:`\chi^{q}_{r}`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param u_loc: The bare local interaction :math:`U`.
+    :return: The self-energy kernel :math:`U_r K` as a :class:`FourPoint`.
     """
     u_r = v_nonloc.as_channel(vrg_q_r.channel) + u_loc.as_channel(vrg_q_r.channel)
     kernel = vrg_q_r - vrg_q_r @ u_r @ gchi_aux_q_r_sum
@@ -216,7 +288,25 @@ def calculate_kernel_r_q(
 
 
 def perform_ornstein_zernicke_fit(chi_phys_q_r: FourPoint) -> None:
+    r"""
+    Fits the static (:math:`\omega = 0`) physical susceptibility to an Ornstein–Zernike form
+    :math:`\chi(q) = A / (\xi^{-2} + (q - q_0)^2)` around the antiferromagnetic wave vector
+    :math:`q_0 = (\pi, \pi, 0)`, per orbital combination, and writes the amplitude :math:`A` and correlation length
+    :math:`\xi` to ``oz_coeff.txt``. Non-converging fits are flagged with ``[-1, -1]``.
+
+    :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{q}_{r}` (irreducible BZ).
+    :return: None.
+    """
+
     def oz_spin_w0(q_grid: KGrid, a: float, xi: float):
+        """
+        Evaluates the Ornstein–Zernike model on the full BZ grid, flattened to match the fit data.
+
+        :param q_grid: The :class:`KGrid` providing the momentum coordinates.
+        :param a: The amplitude :math:`A`.
+        :param xi: The correlation length :math:`\\xi`.
+        :return: The flattened model susceptibility over the BZ grid.
+        """
         qx = qy = np.pi
         qz = 0
         oz = a / (
@@ -228,6 +318,13 @@ def perform_ornstein_zernicke_fit(chi_phys_q_r: FourPoint) -> None:
         return oz.flatten()
 
     def fit_oz_spin(q_grid: KGrid, mat: np.ndarray):
+        """
+        Least-squares fits the Ornstein–Zernike model to one orbital slice of the susceptibility.
+
+        :param q_grid: The :class:`KGrid` providing the momentum coordinates.
+        :param mat: The flattened susceptibility slice to fit.
+        :return: The fitted ``(A, xi)`` coefficients.
+        """
         initial_guess = (mat.max(), 2.0)
         return opt.curve_fit(oz_spin_w0, q_grid, mat, p0=initial_guess)[0]
 
@@ -254,6 +351,32 @@ def perform_ornstein_zernicke_fit(chi_phys_q_r: FourPoint) -> None:
     np.savetxt(path, data_to_save, delimiter=",", fmt="%d %d %d %d %.9f %.9f", header="o1 o2 o3 o4 A xi")
 
 
+def calculate_and_save_chi_q_r_rpa(
+    gchi0_q_core_inv: FourPoint, u_loc: LocalInteraction, v_nonloc: Interaction, mpi_dist_irrk: MpiDistributor
+):
+    r"""
+    Calculates and saves the RPA susceptibility (for both density and magnetic channels) from the DMFT Green's
+    functions, :math:`\chi_{d/m;\mathrm{RPA}} = \chi_0 (1 + U_{d/m}\chi_0)^{-1} = (\chi_0^{-1} + U_{d/m})^{-1}`. The
+    result is gathered to rank 0 and written to file.
+
+    :param gchi0_q_core_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :return: None.
+    """
+    for channel in [SpinChannel.DENS, SpinChannel.MAGN]:
+        u_r = u_loc.as_channel(channel) + v_nonloc.as_channel(channel)
+        chi_rpa_q_r = (gchi0_q_core_inv + u_r).invert(False).sum_over_all_vn(config.sys.beta)
+        chi_rpa_q_r.mat = mpi_dist_irrk.gather(chi_rpa_q_r.mat)
+
+        if mpi_dist_irrk.my_rank == 0:
+            chi_rpa_q_r.save(name=f"chi_rpa_q_{channel.value}", output_dir=config.output.output_path)
+
+        chi_rpa_q_r.free()
+        config.logger.info(f"Calculated RPA susceptibility ({channel.value}).")
+
+
 def calculate_sigma_kernel_r_q(
     gamma_r: LocalFourPoint,
     gchi0_q_inv: FourPoint,
@@ -267,6 +390,16 @@ def calculate_sigma_kernel_r_q(
     Returns the kernel for the self-energy calculation in a specific spin channel. Calculates the auxiliary
     susceptibility, the three-leg vertex and the physical susceptibility with shell correction. Also performs a
     :math:`\lambda`-correction on the physical susceptibility if specified in the config for single-band input.
+    Saves the physical susceptibility (and, if Eliashberg is enabled, the intermediate vertices) to file.
+
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :param gchi0_q_full_sum: The frequency-summed bare bubble over the full box.
+    :param gchi0_q_core_sum: The frequency-summed bare bubble over the core box.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :return: The self-energy kernel for this channel as a :class:`FourPoint`.
     """
     logger = config.logger
 
@@ -340,7 +473,13 @@ def perform_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
     r"""
     Performs the :math:`\lambda`-correction on the physical susceptibility. If 'spch' is specified, the lambda
     correction will be performed on both the density and magnetic channel whereas only the magnetic channel will be
-    corrected if 'sp' is specified as :math:`\lambda`-correction type in the corresponding config.
+    corrected if 'sp' is specified as :math:`\lambda`-correction type in the corresponding config. The local
+    susceptibility sum-rule target is read from the saved local susceptibilities, and the determined :math:`\lambda`
+    is appended to a text file.
+
+    :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{q}_{r}` to correct.
+    :return: The :math:`\lambda`-corrected physical susceptibility (unchanged for the 'sp' type in non-magnetic channels).
+    :raises ValueError: If the configured lambda-correction type is neither 'spch' nor 'sp'.
     """
     logger = config.logger
 
@@ -403,9 +542,14 @@ def perform_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
 
 def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full_q_list: np.ndarray) -> SelfEnergy:
     r"""
-    Returns :math:`\Sigma_{ij}^{k} = -1/2 * 1/\beta * 1/N_q \sum_q [ U^q_{r;aibc} * K_{r;cbjd}^{qv} * G_{ad}^{w-v} ]`.
+    Returns :math:`\Sigma_{ij}^{k} = -\frac{1}{2\beta N_q} \sum_q U^q_{r;aibc} K_{r;cbjd}^{q\nu} G_{ad}^{\omega-\nu}`.
     For very large momentum grids, this function is the slowest part compared to the rest of the code due to the
     repeated loops. Potential speed-ups could be achieved by batching the q-points or using numba.
+
+    :param kernel: The self-energy kernel :math:`K` (full BZ, scattered across ranks).
+    :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :param my_full_q_list: Array of integer q-point index triplets handled by this rank.
+    :return: The rank-local contribution to the non-local :class:`SelfEnergy` (compressed q, full niv range).
     """
     mat = np.zeros(
         (*config.lattice.k_grid.nk, config.sys.n_bands, config.sys.n_bands, config.box.niv_core),
@@ -433,9 +577,15 @@ def calculate_sigma_from_kernel_cpu(
     my_full_q_list: np.ndarray,
 ) -> SelfEnergy:
     r"""
-    Returns :math:`\Sigma_{ij}^{k} = -1/2 * 1/\beta * 1/N_q \sum_q [ U^q_{r;aibc} * K_{r;cbjd}^{qv} * G_{ad}^{w-v} ]`.
+    Returns :math:`\Sigma_{ij}^{k} = -\frac{1}{2\beta N_q} \sum_q U^q_{r;aibc} K_{r;cbjd}^{q\nu} G_{ad}^{\omega-\nu}`.
     For very large momentum grids, this function is the slowest part compared to the rest of the code due to the
     repeated loops. There is no real way to speed it up further without leveraging GPUs or other hardware accelerators.
+    This is the CPU implementation (Fortran-ordered buffers, preallocated accumulator).
+
+    :param kernel: The self-energy kernel :math:`K` (full BZ, scattered across ranks).
+    :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :param my_full_q_list: Array of integer q-point index triplets handled by this rank.
+    :return: The rank-local contribution to the non-local :class:`SelfEnergy` (compressed q, full niv range).
     """
     nkx, nky, nkz = config.lattice.k_grid.nk
     nb = config.sys.n_bands
@@ -475,9 +625,14 @@ def calculate_sigma_from_kernel_gpu(
     my_full_q_list: np.ndarray,
 ) -> SelfEnergy:
     r"""
-    Returns :math:`\Sigma_{ij}^{k} = -1/2 * 1/\beta * 1/N_q \sum_q [ U^q_{r;aibc} * K_{r;cbjd}^{qv} * G_{ad}^{w-v} ]`.
+    Returns :math:`\Sigma_{ij}^{k} = -\frac{1}{2\beta N_q} \sum_q U^q_{r;aibc} K_{r;cbjd}^{q\nu} G_{ad}^{\omega-\nu}`.
     For very large momentum grids, this function is the slowest part compared to the rest of the code due to the
-    repeated loops. This function tries to execute it on the GPU using CuPy.
+    repeated loops. This is the GPU implementation using CuPy.
+
+    :param kernel: The self-energy kernel :math:`K` (full BZ, scattered across ranks).
+    :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :param my_full_q_list: Array of integer q-point index triplets handled by this rank.
+    :return: The rank-local contribution to the non-local :class:`SelfEnergy` (compressed q, full niv range).
     """
     import cupy as cp
 
@@ -518,25 +673,37 @@ def calculate_sigma_from_kernel_auto(
     mpi_distributor: MpiDistributor, kernel: FourPoint, giwk: GreensFunction, my_full_q_list: np.ndarray
 ) -> SelfEnergy:
     """
-    Automatically tries to calculate the self-energy from the kernel on the GPU using CuPy. If CuPy is not installed
-    or no GPU is available, it falls back to the CPU implementation.
+    Dispatches the q-loop self-energy contraction to the GPU (:func:`calculate_sigma_from_kernel_gpu`) when CuPy and
+    a usable CUDA device are available (one GPU per MPI rank, round-robin), otherwise falls back to the CPU
+    implementation (:func:`calculate_sigma_from_kernel_cpu`).
+
+    :param mpi_distributor: MPI distributor used to choose the per-rank GPU (see :class:`MpiDistributor`).
+    :param kernel: The self-energy kernel :math:`K` (full BZ, scattered across ranks).
+    :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :param my_full_q_list: Array of integer q-point index triplets handled by this rank.
+    :return: The rank-local contribution to the non-local :class:`SelfEnergy`.
     """
     logger = config.logger
 
+    cp = None
     try:
         import cupy as cp
+    except ImportError:
+        pass  # CuPy not installed -> CPU
 
-        n_gpus = cp.cuda.runtime.getDeviceCount()
+    n_gpus = 0
+    if cp is not None:
+        try:
+            n_gpus = cp.cuda.runtime.getDeviceCount()
+        except cp.cuda.runtime.CUDARuntimeError:
+            n_gpus = 0  # no usable CUDA driver/device -> CPU
 
-        if cp.cuda.is_available() and n_gpus > 0:
-            logger.info(f"CuPy detected {n_gpus} GPU(s). Using GPU acceleration for self-energy calculation.")
+    if n_gpus > 0 and cp.cuda.is_available():
+        logger.info(f"CuPy detected {n_gpus} GPU(s). Using GPU acceleration for self-energy calculation.")
 
-            gpu_id = mpi_distributor.my_rank % n_gpus
-            cp.cuda.Device(gpu_id).use()
-            return calculate_sigma_from_kernel_gpu(kernel, giwk, my_full_q_list)
-    except:
-        # CuPy not installed or device could not be found
-        pass
+        gpu_id = mpi_distributor.my_rank % n_gpus
+        cp.cuda.Device(gpu_id).use()
+        return calculate_sigma_from_kernel_gpu(kernel, giwk, my_full_q_list)
 
     return calculate_sigma_from_kernel_cpu(kernel, giwk, my_full_q_list)
 
@@ -544,11 +711,17 @@ def calculate_sigma_from_kernel_auto(
 def calculate_sigma_from_kernel_fft_cpu(
     mpi_dist: MpiDistributor, kernel: FourPoint, giwk: GreensFunction
 ) -> SelfEnergy:
-    """
-    Optimized Sigma calculation using Distributed FFTs.
-    Replaces the iq-loop with a real-space pointwise multiplication.
-    Returns Sigma in R-space, positive-v half only; caller must ifft over (kx,ky,kz)
-    and then call .to_full_niv_range() before using.
+    r"""
+    Optimized self-energy calculation using distributed FFTs (CPU). Replaces the q-loop with a real-space pointwise
+    multiplication: both the Green's function and the kernel are FFT'd to real space (the kernel to :math:`-R` via the
+    conjugate trick), contracted pointwise per rank-local R-slice, and accumulated. Returns :math:`\Sigma` in R-space,
+    positive-:math:`\nu` half only; the caller must ifft over :math:`(k_x, k_y, k_z)` and then call
+    :meth:`SelfEnergy.to_full_niv_range` before use.
+
+    :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
+    :param kernel: The self-energy kernel :math:`K` (irreducible BZ).
+    :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :return: The rank-local R-space :class:`SelfEnergy` (compressed q, half niv range, moments not fitted).
     """
     comm = mpi_dist.comm
     rank = comm.Get_rank()
@@ -597,11 +770,15 @@ def calculate_sigma_from_kernel_fft_cpu(
 def calculate_sigma_from_kernel_fft_gpu(
     mpi_dist: MpiDistributor, kernel: FourPoint, giwk: GreensFunction
 ) -> SelfEnergy:
-    """
-    Optimized Sigma calculation using Distributed FFTs, running on GPUs.
-    Replaces the iq-loop with a real-space pointwise multiplication.
-    Returns Sigma in R-space, positive-v half only; caller must ifft over (kx,ky,kz)
-    and then call .to_full_niv_range() before using.
+    r"""
+    Optimized self-energy calculation using distributed FFTs, running on the GPU (CuPy). Same algorithm as
+    :func:`calculate_sigma_from_kernel_fft_cpu`. Returns :math:`\Sigma` in R-space, positive-:math:`\nu` half only;
+    the caller must ifft over :math:`(k_x, k_y, k_z)` and then call :meth:`SelfEnergy.to_full_niv_range` before use.
+
+    :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
+    :param kernel: The self-energy kernel :math:`K` (irreducible BZ).
+    :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :return: The rank-local R-space :class:`SelfEnergy` (compressed q, half niv range, moments not fitted).
     """
     import cupy as cp
 
@@ -651,69 +828,132 @@ def calculate_sigma_from_kernel_fft_auto(
     mpi_distributor: MpiDistributor, kernel: FourPoint, giwk: GreensFunction
 ) -> SelfEnergy:
     """
-    Automatically tries to calculate the self-energy from the kernel on the GPU using CuPy. If CuPy is not installed
-    or no GPU is available, it falls back to the CPU implementation.
+    Dispatches the FFT-based self-energy calculation to the GPU (:func:`calculate_sigma_from_kernel_fft_gpu`) when
+    CuPy and a usable CUDA device are available (one GPU per MPI rank, round-robin), otherwise falls back to the CPU
+    implementation (:func:`calculate_sigma_from_kernel_fft_cpu`).
+
+    :param mpi_distributor: MPI distributor providing the communicator, pencil decomposition and per-rank GPU choice.
+    :param kernel: The self-energy kernel :math:`K` (irreducible BZ).
+    :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :return: The rank-local R-space :class:`SelfEnergy`.
     """
     logger = config.logger
 
+    cp = None
     try:
         import cupy as cp
+    except ImportError:
+        pass  # CuPy not installed -> CPU
 
-        n_gpus = cp.cuda.runtime.getDeviceCount()
+    n_gpus = 0
+    if cp is not None:
+        try:
+            n_gpus = cp.cuda.runtime.getDeviceCount()
+        except cp.cuda.runtime.CUDARuntimeError:
+            n_gpus = 0  # no usable CUDA driver/device -> CPU
 
-        if cp.cuda.is_available() and n_gpus > 0:
-            logger.info(f"CuPy detected {n_gpus} GPU(s). Using GPU acceleration for self-energy calculation.")
+    if n_gpus > 0 and cp.cuda.is_available():
+        logger.info(f"CuPy detected {n_gpus} GPU(s). Using GPU acceleration for self-energy calculation.")
 
-            gpu_id = mpi_distributor.my_rank % n_gpus
-            cp.cuda.Device(gpu_id).use()
-            return calculate_sigma_from_kernel_fft_gpu(mpi_distributor, kernel, giwk)
-    except:
-        # CuPy not installed or device could not be found
-        pass
+        gpu_id = mpi_distributor.my_rank % n_gpus
+        cp.cuda.Device(gpu_id).use()
+        return calculate_sigma_from_kernel_fft_gpu(mpi_distributor, kernel, giwk)
 
     return calculate_sigma_from_kernel_fft_cpu(mpi_distributor, kernel, giwk)
 
 
-def get_starting_sigma(output_path: str, default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
+def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
     """
-    If the output directory is specified to be the same directory as was used by a previous calculation, we try to
-    retrieve the last calculated self-energy as a starting point for the next calculation. If no sigma_dga_N.npy file
-    is found, we return the dmft self-energy as a starting point.
+    If one continues from a previous self-consistency calculation, we try to retrieve the last calculated self-energy as
+    a starting point for the next calculation. Whether the normal or interpolated sigma is chosen depends on the
+    setting. If no ``sigma_dga_*_N.npy`` file is found, we use the DMFT self-energy as a starting point.
+
+    :param default_sigma: The fallback (DMFT) :class:`SelfEnergy` used when no previous result is found.
+    :return: A tuple of the starting :class:`SelfEnergy` (cut to the core box and interpolated onto the k-grid) and
+        the iteration number it was taken from (0 if none found).
     """
-    if output_path == "" or output_path is None or not os.path.exists(output_path):
+    previous_sc_path = config.self_consistency.previous_sc_path
+
+    if previous_sc_path is None or previous_sc_path == "" or not os.path.exists(previous_sc_path):
         return default_sigma, 0
 
-    files = glob.glob(os.path.join(output_path, "sigma_dga_iteration_*.npy"))
-    if not files:
-        return default_sigma, 0
+    if config.self_consistency.use_interpolated_sigma:
+        glob_pattern = "sigma_dga_interpolated_*_iteration_*.npy"
+        iteration_regex = re.compile(r"sigma_dga_interpolated_.+_iteration_(\d+)\.npy$")
+    else:
+        glob_pattern = "sigma_dga_iteration_*.npy"
+        iteration_regex = re.compile(r"sigma_dga_iteration_(\d+)\.npy$")
 
-    iterations = [int(match.group(1)) for f in files if (match := re.search(r"sigma_dga_iteration_(\d+)\.npy$", f))]
-    if not iterations:
-        return default_sigma, 0
+    files = glob.glob(os.path.join(previous_sc_path, glob_pattern))
 
-    max_iter = max(iterations)
-    mat = np.load(os.path.join(output_path, f"sigma_dga_iteration_{max_iter}.npy"))
-    return SelfEnergy(mat, config.lattice.nk, True, True, False), max_iter
+    if not files or len(files) == 0:
+        return default_sigma, 0
+    iterations = [(int(match.group(1)), f) for f in files if (match := iteration_regex.search(f))]
+
+    if not iterations or len(iterations) == 0:
+        return default_sigma, 0
+    max_iter, max_file = max(iterations, key=lambda x: x[0])
+
+    mat = np.load(max_file)
+    return (
+        SelfEnergy(mat, mat.shape[:3], True, False)
+        .cut_niv(config.box.niv_core)
+        .interpolate_q_grid(config.lattice.k_grid.nk, False),
+        max_iter,
+    )
 
 
 def read_last_n_sigmas_from_files(n: int, output_path: str = "./", previous_sc_path: str = "./") -> list[np.ndarray]:
     """
-    Reads the last n total self-energies from the output directory and - if specified - the previous self-consistency
-    path. This is used for the predictive Pulay-mixing scheme. If one has a history of self-energies from a previous
-    calculation, these will be used as well.
-    """
-    files_output_dir = glob.glob(os.path.join(output_path, "sigma_dga_iteration_*.npy"))
-    if previous_sc_path != "" and previous_sc_path is not None and os.path.exists(previous_sc_path):
-        files_prev_sc_dir = glob.glob(os.path.join(previous_sc_path, "sigma_dga_iteration_*.npy"))
-    else:
-        files_prev_sc_dir = []
-    files = files_output_dir + files_prev_sc_dir
+    Reads the last ``n`` total self-energies from the output directory and - if specified - the previous
+    self-consistency path. This is used for the Pulay/Anderson mixing schemes. If one has a history of self-energies
+    from a previous calculation, these will be used as well.
 
-    last_iterations = sorted(
-        [(int(match.group(1)), f) for f in files if (match := re.search(r"sigma_dga_iteration_(\d+)\.npy$", f))],
-        key=lambda x: x[0],
-    )[-n:]
-    return [np.load(file) for _, file in last_iterations]
+    :param n: Number of most recent self-energies to read.
+    :param output_path: Directory holding the current run's ``sigma_dga_iteration_*.npy`` files.
+    :param previous_sc_path: Directory of a previous self-consistency run to prepend to the history (if set).
+    :return: A list of self-energy arrays (cut to the core box and interpolated onto the k-grid), oldest first.
+    """
+
+    def _get_top_n_files(path: str, pattern: str, regex: re.Pattern) -> list[tuple[int, str]]:
+        """
+        Finds the ``n`` highest-iteration files in ``path`` matching ``pattern``/``regex``.
+
+        :param path: Directory to search.
+        :param pattern: Glob pattern selecting candidate files.
+        :param regex: Regex whose first group captures the iteration number.
+        :return: A list of ``(iteration, filepath)`` tuples, sorted ascending, truncated to the last ``n``.
+        """
+        files = glob.glob(os.path.join(path, pattern))
+        matched = [(int(match.group(1)), f) for f in files if (match := regex.search(f))]
+        return sorted(matched, key=lambda x: x[0])[-n:]
+
+    interp_pattern = "sigma_dga_interpolated_*_iteration_*.npy"
+    interp_regex = re.compile(r"sigma_dga_interpolated_.+_iteration_(\d+)\.npy$")
+
+    normal_pattern = "sigma_dga_iteration_*.npy"
+    normal_regex = re.compile(r"sigma_dga_iteration_(\d+)\.npy$")
+
+    last_iterations_previous_dir = []
+    if previous_sc_path and previous_sc_path.strip():
+        if config.self_consistency.use_interpolated_sigma:
+            last_iterations_previous_dir = _get_top_n_files(previous_sc_path, interp_pattern, interp_regex)
+        else:
+            last_iterations_previous_dir = _get_top_n_files(previous_sc_path, normal_pattern, normal_regex)
+
+    last_iterations_current_dir = _get_top_n_files(output_path, normal_pattern, normal_regex)
+    last_iterations = (last_iterations_previous_dir + last_iterations_current_dir)[-n:]
+
+    sigmas = []
+    for _, file in last_iterations:
+        sigma_mat = np.load(file)
+        sigmas.append(
+            SelfEnergy(sigma_mat, sigma_mat.shape[:3], True, False, False, False)
+            .cut_niv(config.box.niv_core)
+            .interpolate_q_grid(config.lattice.k_grid.nk, False)
+            .mat
+        )
+    return sigmas
 
 
 def calculate_self_energy_q(
@@ -724,6 +964,13 @@ def calculate_self_energy_q(
     the double-counting correction and the kernel in the density and magnetic channel. Finally, calculates the
     non-local self-energy from the kernel and the Green's function. Also takes care of the self-consistency loop and
     the chemical potential adjustment as well as the self-energy mixing, etc.
+
+    :param comm: The MPI communicator.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param sigma_dmft: The DMFT self-energy (used as the starting point and for the shell/tail correction).
+    :param sigma_local: The locally recomputed self-energy (used for the double-counting :math:`\\Delta\\Sigma`).
+    :return: The converged (or last-iteration) momentum-dependent DGA :class:`SelfEnergy`.
     """
     logger = config.logger
 
@@ -739,7 +986,7 @@ def calculate_self_energy_q(
     mpi_dist_fullbz = MpiDistributor.create_distributor(ntasks=config.lattice.q_grid.nk_tot, comm=comm, name="FBZ")
     my_full_q_list = full_q_list[mpi_dist_fullbz.my_slice]
 
-    sigma_old, starting_iter = get_starting_sigma(config.self_consistency.previous_sc_path, sigma_dmft)
+    sigma_old, starting_iter = get_starting_sigma(sigma_dmft)
     if starting_iter > 0:
         logger.info(
             f"Using previous calculation and starting the self-consistency loop at iteration {starting_iter + 1}."
@@ -760,7 +1007,7 @@ def calculate_self_energy_q(
         config.sys.n, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
         giwk_full.cut_niv(niv_cut)
 
-        if sigma_old is sigma_dmft:
+        if np.allclose(sigma_old.cut_niv(config.box.niv_core).mat, sigma_dmft.cut_niv(config.box.niv_core).mat):
             giwk_full.save(output_dir=config.output.output_path, name="g_latt_dmft")
     config.sys.n, config.sys.occ, config.sys.occ_k = comm.bcast(
         (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
@@ -768,6 +1015,9 @@ def calculate_self_energy_q(
 
     sigma_old = sigma_old.cut_niv(niv_cut)
     sigma_dmft = sigma_dmft.cut_niv(niv_cut)
+
+    if sigma_old.niv < niv_cut:
+        sigma_old = sigma_old.concatenate_self_energies(sigma_dmft)
 
     delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_local.cut_niv(config.box.niv_core)
 
@@ -829,6 +1079,9 @@ def calculate_self_energy_q(
         gchi0_q_core_inv = deepcopy(gchi0_q_core).invert(False)
         logger.log_memory_usage("Gchi0_q_inv", gchi0_q_core_inv, comm.size)
 
+        if current_iter == 1:
+            calculate_and_save_chi_q_r_rpa(gchi0_q_core_inv, u_loc, v_nonloc, mpi_dist_irrk)
+
         if config.eliashberg.perform_eliashberg:
             gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
 
@@ -888,23 +1141,26 @@ def calculate_self_energy_q(
         # calculated in this code and add the smooth dmft self-energy
         sigma_new += delta_sigma
         sigma_new = sigma_new.concatenate_self_energies(sigma_dmft)
+        # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
 
         logger.info("Applying mixing strategy to the self-energy.")
         sigma_new = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter)
 
+        sigma_new = sigma_new.compress_q_dimension()
+        sigma_old = sigma_old.compress_q_dimension()
+
+        # Canonical self-consistency residual. This is the relative (L2) residual used for the convergence check
+        sigma_new_test = sigma_new.mat[..., sigma_new.niv : sigma_new.niv + config.box.niv_core]
+        sigma_old_test = sigma_old.mat[..., sigma_new.niv : sigma_old.niv + config.box.niv_core]
+        diff = (sigma_new_test - sigma_old_test).ravel()
+        norm_x = np.linalg.norm(np.concatenate([sigma_old_test.real.ravel(), sigma_old_test.imag.ravel()]))
+        relative_residual = np.linalg.norm(np.concatenate([diff.real, diff.imag])) / norm_x
+
         old_mu = mu_history[-1]
         if comm.rank == 0:
-            mu_finding_failed = False
-            new_mu = update_mu(
+            config.sys.mu = update_mu(
                 old_mu, config.sys.n, giwk_full.ek, sigma_new.mat, config.sys.beta, sigma_new.fit_smom()[0]
             )
-
-            if new_mu is np.nan:
-                mu_finding_failed = True
-
-            # will not be changed if mu finding failed
-            if not mu_finding_failed:
-                config.sys.mu = config.self_consistency.mixing * new_mu + (1 - config.self_consistency.mixing) * old_mu
 
         config.sys.mu = comm.bcast(config.sys.mu)
         mu_history.append(config.sys.mu)
@@ -916,38 +1172,45 @@ def calculate_self_energy_q(
             # calculate new occupation matrix from new Green's function (outside asympt region it is the DMFT
             # lattice Green's function)
             _, config.sys.occ, config.sys.occ_k = giwk_occ.get_fill_nonlocal()  # n should not change
+
+            ekin = giwk_occ.get_ekin()
+            logger.info(f"Kinetic energy: {ekin:.4f} [t or eV].")
+
+            epot = giwk_occ.get_epot()
+            logger.info(f"Potential energy: {epot:.4f} [t or eV].")
+            logger.info(f"Total energy: {(ekin + epot):.4f} [t or eV].")
         config.sys.occ, config.sys.occ_k = comm.bcast((config.sys.occ, config.sys.occ_k), root=0)
+
         if config.self_consistency.max_iter > 1:
-            logger.info("Updated occupation matrix with new Green's function.")
+            logger.info("Updated occupation matrix from new Green's function.")
 
         if comm.rank == 0:
-            sigma_new.save(name=f"sigma_dga_iteration_{current_iter}", output_dir=config.output.output_path)
-            logger.info(f"Saved sigma for iteration {current_iter} as numpy array.")
+            sigma_new.decompress_q_dimension().save(
+                name=f"sigma_dga_iteration_{current_iter}", output_dir=config.output.output_path
+            )
+            logger.info(f"Saved sigma for iteration {current_iter}.")
 
             if config.self_energy_interpolation.do_interpolation:
                 beta_target = config.self_energy_interpolation.beta_target
                 niv_target = config.self_energy_interpolation.niv_target
                 beta_source = config.sys.beta
-                sigma_new.interpolate(beta_source, beta_target, niv_target).save(
+                sigma_new.decompress_q_dimension().interpolate(beta_source, beta_target, niv_target).save(
                     name=f"sigma_dga_interpolated_beta{beta_target}_niv{niv_target}_iteration_{current_iter}",
                     output_dir=config.output.output_path,
+                )
+                logger.info(
+                    f"Interpolated sigma for iteration {current_iter} to beta={beta_target} and niv={niv_target}."
                 )
 
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
-            niv_start = sigma_new.niv
-            niv_end = niv_start + int(np.ceil(config.box.niv_core / 5))
-
-            sigma_converged = np.allclose(
-                sigma_old.compress_q_dimension()[..., niv_start:niv_end],
-                sigma_new.compress_q_dimension()[..., niv_start:niv_end],
-                atol=config.self_consistency.epsilon,
+            sigma_converged = abs(relative_residual) < config.self_consistency.epsilon
+            logger.info(
+                f"Self-energy convergence: {sigma_converged} "
+                f"(relative residual={relative_residual:.3e}, epsilon={config.self_consistency.epsilon:.3e})."
             )
-            logger.info(f"Self-energy convergence: {sigma_converged}.")
 
-            mu_converged = (
-                abs(mu_history[-1] - mu_history[-2]) < np.pi / (10 * config.sys.beta)
-            ) and not mu_finding_failed
+            mu_converged = abs(mu_history[-1] - mu_history[-2]) < np.pi / (10 * config.sys.beta)
             logger.info(f"Chemical potential convergence: {mu_converged}.")
 
             converged = mu_converged and sigma_converged
@@ -980,27 +1243,38 @@ def apply_mixing_strategy(
     sigma_new: SelfEnergy, sigma_old: SelfEnergy, sigma_dmft: SelfEnergy, current_iter: int
 ) -> SelfEnergy:
     """
-    Applies the mixing strategy for the self-consistency loop. The mixing strategy is defined in the config file and
-    is either 'linear' or 'pulay'.
+    Applies the self-energy mixing strategy for the self-consistency loop. Supports linear mixing as well as the
+    accelerated Pulay (DIIS) and Anderson schemes (which use the self-energy history read from file); the accelerated
+    schemes fall back to linear mixing when their least-squares problem is ill-conditioned or the history is too short.
+    The mixing strategy and parameters are taken from the config.
+
+    :param sigma_new: The freshly computed self-energy proposal.
+    :param sigma_old: The previous iteration's self-energy.
+    :param sigma_dmft: The DMFT self-energy (used to seed the proposal history for the accelerated schemes).
+    :param current_iter: The current self-consistency iteration number.
+    :return: The mixed :class:`SelfEnergy` for the next iteration.
     """
     logger = config.logger
     n_hist = config.self_consistency.mixing_history_length
     alpha = config.self_consistency.mixing
 
-    if config.self_consistency.mixing_strategy.lower() == "pulay" and current_iter > n_hist:
+    last_results, last_proposals = [], []
+    if config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson"):
         last_results = read_last_n_sigmas_from_files(
             n_hist, config.output.output_path, config.self_consistency.previous_sc_path
         )
-        sigma_dmft_stacked = np.tile(sigma_dmft.mat, (config.lattice.k_grid.nk_tot, 1, 1, 1))
-        last_proposals = [sigma_dmft_stacked] + last_results
-        last_results = last_results + [sigma_new.mat]
+        sigma_dmft_stacked = np.tile(
+            sigma_dmft.cut_niv(config.box.niv_core).mat, (config.lattice.k_grid.nk_tot, 1, 1, 1)
+        )
 
-        niv = sigma_new.current_shape[-1] // 2
-        niv_core = config.box.niv_core
-        last_proposals = [sigma[..., niv - niv_core : niv + niv_core] for sigma in last_proposals]
-        last_results = [sigma[..., niv - niv_core : niv + niv_core] for sigma in last_results]
+        last_proposals = [sigma_dmft_stacked] + last_results  # [dmft, s1, ..., s_{n-1}]
+        last_results = last_results + [sigma_new.cut_niv(config.box.niv_core).mat]  # [s1,  s2, ..., s_n]
+
         logger.info(f"Loaded last {n_hist} self-energies from files.")
 
+    accelerated_mixing_condition = current_iter > n_hist and len(last_results) > n_hist and len(last_proposals) > n_hist
+
+    if config.self_consistency.mixing_strategy.lower() == "pulay" and accelerated_mixing_condition:
         shape = last_results[-1].shape
         n_total = int(np.prod(shape))
         r_matrix = np.zeros((2 * n_total, n_hist), dtype=np.float64)
@@ -1008,9 +1282,21 @@ def apply_mixing_strategy(
         f_i = np.zeros((2 * n_total), dtype=np.float64)
 
         def get_proposal(idx: int):
+            """
+            Fetches a flattened proposal self-energy from the history.
+
+            :param idx: Index into the proposal history.
+            :return: The flattened proposal self-energy at ``idx``.
+            """
             return last_proposals[idx].flatten()
 
         def get_result(idx: int):
+            """
+            Fetches a flattened result self-energy from the history.
+
+            :param idx: Index into the result history.
+            :return: The flattened result self-energy at ``idx``.
+            """
             return last_results[idx].flatten()
 
         for i in range(n_hist):
@@ -1029,8 +1315,6 @@ def apply_mixing_strategy(
         f_i[:n_total] = iter_diff.real
         f_i[n_total:] = iter_diff.imag
         norm_f = np.linalg.norm(f_i)
-        norm_x = np.linalg.norm(get_proposal(-1))
-        rel_res = norm_f / norm_x if norm_x > 0 else np.inf
 
         # Solve min||F @ c - f_i|| via truncated-SVD pseudoinverse (drops collinear directions)
         u, s, vh = np.linalg.svd(f_matrix, full_matrices=False)
@@ -1050,29 +1334,14 @@ def apply_mixing_strategy(
         update = update[:n_total] + 1j * update[n_total:]
 
         # Update the new self energy
+        niv = sigma_new.niv
+        niv_core = config.box.niv_core
         sigma_new.mat[..., niv - niv_core : niv + niv_core] = get_proposal(-1).reshape(shape) + update.reshape(shape)
 
-        logger.info(
-            f"Pulay mixing applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}, rel_res={rel_res:.3e})."
-        )
+        logger.info(f"Pulay mixing applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}).")
 
         return sigma_new
-    if config.self_consistency.mixing_strategy.lower() == "anderson" and current_iter > n_hist:
-        last_sigmas = read_last_n_sigmas_from_files(
-            n_hist, config.output.output_path, config.self_consistency.previous_sc_path
-        )
-
-        niv = sigma_new.current_shape[-1] // 2
-        niv_core = config.box.niv_core
-        sl = slice(niv - niv_core, niv + niv_core)
-
-        sigma_dmft_stacked = np.tile(sigma_dmft.mat, (config.lattice.k_grid.nk_tot, 1, 1, 1))
-
-        last_proposals = [sigma_dmft_stacked] + last_sigmas  # [dmft, s1, ..., s_{n-1}]
-        last_results = last_sigmas + [sigma_new.mat]  # [s1,  s2, ..., s_new]
-        last_proposals = [s[..., sl] for s in last_proposals]
-        last_results = [s[..., sl] for s in last_results]
-
+    if config.self_consistency.mixing_strategy.lower() == "anderson" and accelerated_mixing_condition:
         shape = last_results[-1].shape
         n_total = int(np.prod(shape))
         flat = lambda x: x.reshape(-1)
@@ -1081,9 +1350,6 @@ def apply_mixing_strategy(
         f_curr = flat(last_results[-1]) - flat(last_proposals[-1])
         f_vec = np.concatenate([f_curr.real, f_curr.imag])
         norm_f = np.linalg.norm(f_vec)
-        x_curr = flat(last_proposals[-1])
-        norm_x = np.linalg.norm(np.concatenate([x_curr.real, x_curr.imag]))
-        rel_res = norm_f / norm_x if norm_x > 0 else np.inf
 
         # Build dX and dF matrices (n_hist columns)
         # dX[:,i] = x_{n-i} - x_{n-i-1}  (proposal differences)
@@ -1136,16 +1402,15 @@ def apply_mixing_strategy(
             candidate = x_n_complex + update * (3.0 * norm_f / norm_u)
             logger.warning(f"Anderson step clamped (norm_u={norm_u:.3e}, norm_f={norm_f:.3e}).")
 
-        sigma_new.mat[..., sl] = candidate.reshape(shape)
+        # Update the new self energy
+        niv = sigma_new.niv
+        niv_core = config.box.niv_core
+        sigma_new.mat[..., niv - niv_core : niv + niv_core] = candidate.reshape(shape)
 
-        logger.info(
-            f"Anderson acceleration applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}, rel_res={rel_res:.3e})."
-        )
+        logger.info(f"Anderson acceleration applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}).")
 
         return sigma_new
 
-    sigma_new = config.self_consistency.mixing * sigma_new + (1 - config.self_consistency.mixing) * sigma_old
-    logger.info(
-        f"Sigma linearly mixed with previous iteration using a mixing parameter of {config.self_consistency.mixing}."
-    )
+    sigma_new = alpha * sigma_new + (1 - alpha) * sigma_old
+    logger.info(f"Sigma linearly mixed (m=1, alpha={alpha}).")
     return sigma_new

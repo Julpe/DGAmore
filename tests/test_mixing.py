@@ -14,7 +14,6 @@ import dgamore.config as real_config
 from dgamore.self_energy import SelfEnergy
 from dgamore.nonlocal_sde import apply_mixing_strategy
 
-
 BETA = 10.0
 NB = 1
 NK = (1, 1, 1)
@@ -31,16 +30,15 @@ def set_beta():
     real_config.sys.beta = original
 
 
-def make_sigma(value: complex, nk: tuple = NK, nb: int = NB, niv: int = NIV) -> SelfEnergy:
+def make_sigma(value: complex, nk: tuple[int, int, int] = NK, nb: int = NB, niv: int = NIV_CORE) -> SelfEnergy:
     """Creates a SelfEnergy with constant complex fill value."""
     mat = np.full((*nk, nb, nb, 2 * niv), value, dtype=np.complex64)
-    return SelfEnergy(mat, nk, full_niv_range=True, has_compressed_q_dimension=True)
+    return SelfEnergy(mat, nk)
 
 
-def make_sigma_mat(value: complex, nk: tuple = NK, nb: int = NB, niv: int = NIV) -> np.ndarray:
+def make_sigma_mat(value: complex, nk: tuple[int, int, int] = NK, nb: int = NB, niv: int = NIV_CORE) -> np.ndarray:
     """Returns a raw numpy array with the given fill value in the expected shape."""
-    nk_tot = int(np.prod(nk))
-    return np.full((nk_tot, nb, nb, 2 * niv), value, dtype=np.complex64)
+    return np.full((*nk, nb, nb, 2 * niv), value, dtype=np.complex64)
 
 
 def make_config_mock(

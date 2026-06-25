@@ -753,3 +753,44 @@ def test_symmetrize_two_orbital_axes_multiple_groups(orbital_groups):
             sym_mat[g1, g1],
             sym_mat[g2, g2],
         )
+
+
+# --- B2: extend_vn_to_diagonal stays native dtype (no complex128 temporary) ---
+def test_extend_vn_to_diagonal_stays_native_dtype_without_c128_temporary(monkeypatch):
+    seen = {"c128": False}
+    real_einsum = np.einsum
+
+    def spy_einsum(subscripts, *operands, **kwargs):
+        out = real_einsum(subscripts, *operands, **kwargs)
+        if hasattr(out, "dtype") and out.dtype == np.complex128:
+            seen["c128"] = True
+        return out
+
+    monkeypatch.setattr(np, "einsum", spy_einsum)
+    obj = LocalNPoint(np.ones((1, 1, 3, 4), dtype=np.complex64), 2, 1, 1)  # [o1, o2, w, v]
+    obj.extend_vn_to_diagonal()
+    assert obj.num_vn_dimensions == 2
+    assert seen["c128"] is False
+
+
+# --- R4: cut_niv / cut_niw copy parameter (in-place vs copy branch) ---
+def test_cut_niv_copy_false_mutates_self_in_place():
+    obj = LocalNPoint(np.arange(2 * 2 * 4).reshape(2, 2, 4).astype(complex), 2, 0, 1)  # [o1,o2,v], niv=2
+    returned = obj.cut_niv(1, copy=False)
+    assert returned is obj
+    assert obj.niv == 1
+
+
+def test_cut_niv_copy_true_leaves_original_untouched():
+    obj = LocalNPoint(np.arange(2 * 2 * 4).reshape(2, 2, 4).astype(complex), 2, 0, 1)
+    cut = obj.cut_niv(1, copy=True)
+    assert cut is not obj
+    assert obj.niv == 2
+    assert cut.niv == 1
+
+
+def test_cut_niw_copy_false_mutates_self_in_place():
+    obj = LocalNPoint(np.arange(2 * 2 * 5).reshape(2, 2, 5).astype(complex), 2, 1, 0)  # [o1,o2,w], niw=2
+    returned = obj.cut_niw(1, copy=False)
+    assert returned is obj
+    assert obj.niw == 1
