@@ -3,6 +3,13 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+"""
+All matplotlib plotting helpers. These functions produce the diagnostic and result figures of a run — local
+self-energy / susceptibility checks, frequency-resolved four-point maps, momentum-space two-point maps (with
+optional Fermi-surface markers), the superconducting gap function, and the analytically continued spectral
+function along a high-symmetry path. Each routine saves and/or shows its figure. All plotting is gated behind
+``config.output.do_plotting`` and ``comm.rank == 0`` by the callers.
+"""
 
 import os
 
@@ -22,7 +29,15 @@ from dgamore.n_point_base import IAmNonLocal
 
 def add_afzb(ax=None, kx=None, ky=None, lw=1.0, marker=""):
     """
-    Add visual lines to mark the antiferromagnetic zone-boundary to existing axis.
+    Draws the antiferromagnetic zone-boundary lines (and the BZ axes) onto an existing axis, and sets its limits and
+    labels.
+
+    :param ax: The matplotlib axis to draw on.
+    :param kx: The kx grid values.
+    :param ky: The ky grid values.
+    :param lw: Line width of the drawn lines.
+    :param marker: Marker style for the drawn lines.
+    :return: None.
     """
     if np.any(kx < 0):
         ax.plot(np.linspace(-np.pi, 0, 101), np.linspace(0, np.pi, 101), "--k", lw=lw, marker=marker)
@@ -47,7 +62,10 @@ def add_afzb(ax=None, kx=None, ky=None, lw=1.0, marker=""):
 
 def find_zeros(mat: np.ndarray) -> np.ndarray:
     """
-    Finds the zero crossings of a 2D matrix.
+    Finds the zero crossings (zero contour) of a real 2D field via a matplotlib contour at level 0.
+
+    :param mat: The 2D array whose zero contour is sought (the real part is used).
+    :return: The integer index coordinates of the zero-contour vertices.
     """
     ind_x = np.arange(mat.shape[0])
     ind_y = np.arange(mat.shape[1])
@@ -72,8 +90,19 @@ def sigma_loc_checks(
     name: str = "",
     xmax: float = 0,
 ) -> None:
-    """
-    siw_arr: list of local self-energies for routine plots.
+    r"""
+    Produces the routine local self-energy diagnostic plots (real/imaginary part, linear and log-log) for a set of
+    self-energies.
+
+    :param siw_arr: List of local self-energy arrays (one fermionic frequency axis each).
+    :param labels: Plot labels, one per self-energy.
+    :param beta: Inverse temperature :math:`\beta` (sets the default x-axis range).
+    :param output_dir: Directory to save the figure to.
+    :param show: Whether to display the figure.
+    :param save: Whether to save the figure.
+    :param name: Name tag used in the output filename.
+    :param xmax: Maximum frequency on the x-axis (defaults to ``5 + 2*beta`` if 0).
+    :return: None.
     """
     if xmax == 0:
         xmax = 5 + 2 * beta
@@ -122,8 +151,21 @@ def chi_checks(
     save: bool = True,
     name: str = "",
 ):
-    """
-    Routine plots to inspect chi_dens and chi_magn
+    r"""
+    Produces the routine diagnostic plots for the density and magnetic susceptibilities (linear and log-log, with the
+    :math:`1/\omega^2` kinetic-energy asymptote overlaid).
+
+    :param chi_dens_list: List of density susceptibility arrays.
+    :param chi_magn_list: List of magnetic susceptibility arrays.
+    :param beta: Inverse temperature :math:`\beta`.
+    :param labels: Plot labels, one per susceptibility.
+    :param e_kin: Kinetic energy, used to draw the high-frequency asymptote.
+    :param output_dir: Directory to save the figure to.
+    :param orbs: The four orbital indices to plot.
+    :param show: Whether to display the figure.
+    :param save: Whether to save the figure.
+    :param name: Name tag used in the output filename.
+    :return: None.
     """
     fig, axes = plt.subplots(ncols=2, nrows=2, figsize=(8, 5), dpi=500)
     axes = axes.flatten()
@@ -183,8 +225,20 @@ def plot_nu_nup(
     colormap: str = "RdBu",
     show: bool = False,
 ) -> None:
-    """
-    Plots the four-point object for a given set of orbitals and a given bosonic frequency.
+    r"""
+    Plots the real and imaginary parts of a local four-point object in the :math:`(\nu, \nu')` plane for fixed
+    orbitals and bosonic frequency :math:`\omega`.
+
+    :param obj: The :class:`LocalFourPoint` to plot.
+    :param orbs: The four orbital indices to select.
+    :param omega: The bosonic frequency index to plot.
+    :param do_save: Whether to save the figure.
+    :param output_dir: Directory to save the figure to.
+    :param name: Figure title and output filename tag.
+    :param colormap: The matplotlib colormap.
+    :param show: Whether to display the figure.
+    :return: None.
+    :raises ValueError: If ``omega`` is out of range or ``orbs`` does not have four entries.
     """
     if np.abs(omega) > obj.niw:
         raise ValueError(f"Omega {omega} out of range.")
@@ -232,7 +286,24 @@ def plot_two_point_kx_ky(
     show: bool = False,
 ):
     """
-    Used to plot a two-point function in kx, ky space for given orbitals.
+    Plots the real and imaginary parts of a two-point function in the :math:`(k_x, k_y)` plane (at :math:`k_z = 0`
+    and the first positive Matsubara frequency) for fixed orbitals, with the antiferromagnetic zone boundary and
+    optional scatter points overlaid.
+
+    :param obj: The two-point object to plot (a :class:`LocalNPoint` / :class:`IAmNonLocal`).
+    :param kx: The kx grid values for the plot axes.
+    :param ky: The ky grid values for the plot axes.
+    :param pi_shift: Whether to shift the momentum grid by :math:`\\pi` before plotting.
+    :param title: Title suffix for the subplots.
+    :param name: Output filename tag.
+    :param orbs: The two orbital indices to select.
+    :param output_dir: Directory to save the figure to.
+    :param cmap: The matplotlib colormap.
+    :param scatter: Optional ``[N, 2]`` array of points to scatter on the plot (e.g. Fermi-surface points).
+    :param save: Whether to save the figure.
+    :param show: Whether to display the figure.
+    :return: None.
+    :raises ValueError: If ``orbs`` does not have two entries.
     """
     if len(orbs) != 2:
         raise ValueError("'orbs' needs to be of size 2.")
@@ -309,8 +380,22 @@ def plot_two_point_kx_ky_real_and_imag(
     show: bool = False,
 ):
     """
-    Used to plot a two-point function in kx, ky space for given orbitals in two separate files for the real part and
-    imaginary part, respectively.
+    Plots a two-point function in the :math:`(k_x, k_y)` plane for fixed orbitals, writing the real and imaginary
+    parts to two separate files.
+
+    :param obj: The two-point object to plot (a :class:`LocalNPoint` / :class:`IAmNonLocal`).
+    :param kx: The kx grid values for the plot axes.
+    :param ky: The ky grid values for the plot axes.
+    :param pi_shift: Whether to shift the momentum grid by :math:`\\pi` before plotting.
+    :param title: Title (rendered inside the math mode of the subplot titles).
+    :param name: Output filename tag (``_real``/``_imag`` is appended).
+    :param orbs: The two orbital indices to select.
+    :param output_dir: Directory to save the figures to.
+    :param cmap: The matplotlib colormap.
+    :param save: Whether to save the figures.
+    :param show: Whether to display the figures.
+    :return: None.
+    :raises ValueError: If ``orbs`` does not have two entries.
     """
     cm = 1.0 / 2.54
     if len(orbs) != 2:
@@ -374,7 +459,22 @@ def plot_two_point_kx_ky_with_fs_points(
     show: bool = False,
 ):
     """
-    Used to plot a two-point function in kx, ky space for given orbitals including Fermi surface points.
+    Plots a two-point function in the :math:`(k_x, k_y)` plane for fixed orbitals, with the Fermi-surface points
+    (zero crossings of the quantity in the reduced BZ quadrant) scattered on top (see :func:`plot_two_point_kx_ky`).
+
+    :param obj: The two-point object to plot (a :class:`LocalNPoint` / :class:`IAmNonLocal`).
+    :param k_grid: The :class:`KGrid` providing the k-axis values for the Fermi-surface points.
+    :param kx: The kx grid values for the plot axes.
+    :param ky: The ky grid values for the plot axes.
+    :param pi_shift: Whether to shift the momentum grid by :math:`\\pi` before plotting.
+    :param title: Title suffix for the subplots.
+    :param name: Output filename tag.
+    :param orbs: The two orbital indices to select.
+    :param output_dir: Directory to save the figure to.
+    :param cmap: The matplotlib colormap.
+    :param do_save: Whether to save the figure.
+    :param show: Whether to display the figure.
+    :return: None.
     """
     mat = obj.mat[..., 0, orbs[0], orbs[1], obj.niv][: obj.nq[0] // 2, : obj.nq[1] // 2]
     fs_ind = find_zeros(mat)
@@ -396,10 +496,23 @@ def plot_gap_function(
     do_save: bool = True,
     show: bool = False,
 ):
-    """
-    Used to plot the gap function in kx, ky space for given orbitals. Here, not the real and imaginary parts are plotted,
-    but rather the two values at the two lowest positive and smallest negative Matsubara frequency, respectively. This
-    helps investigating the symmetry of the gap function.
+    r"""
+    Plots the gap function in the :math:`(k_x, k_y)` plane for fixed orbitals. Rather than the real/imaginary parts,
+    it shows the values at the smallest positive and smallest negative fermionic Matsubara frequency, which makes the
+    frequency parity (and hence the gap symmetry) visible.
+
+    :param obj: The :class:`GapFunction` to plot.
+    :param kx: The kx grid values for the plot axes.
+    :param ky: The ky grid values for the plot axes.
+    :param name: Output filename tag.
+    :param orbs: The two orbital indices to select.
+    :param output_dir: Directory to save the figure to.
+    :param cmap: The matplotlib colormap.
+    :param scatter: Optional ``[N, 2]`` array of points to scatter on the plot.
+    :param do_save: Whether to save the figure.
+    :param show: Whether to display the figure.
+    :return: None.
+    :raises ValueError: If ``orbs`` does not have two entries.
     """
     if len(orbs) != 2:
         raise ValueError("'orbs' needs to be of size 2.")
@@ -473,9 +586,25 @@ def plot_spectrum(
     do_save: bool = True,
     show: bool = False,
 ):
-    """
-    Plots the total (band-summed) spectral function along a high-symmetry path. A(k,w) is
-    expected to be in band-diagonal space already.
+    r"""
+    Plots the total (band-summed) spectral function :math:`A(\mathbf{k}, \omega)` along a high-symmetry k-path,
+    interpolating the BZ-gridded data onto the path. The spectral function is expected in the band-diagonal basis.
+
+    :param a_w: The spectral function of shape ``[kx, ky, kz, n_bands, w]``.
+    :param kx: The kx grid values.
+    :param ky: The ky grid values.
+    :param kz: The kz grid values.
+    :param high_sym_points: The path corner points as ``(kx, ky, kz, label)`` tuples (fractional coordinates).
+    :param energy_window: The real-frequency window ``(w_min, w_max)`` for the y-axis.
+    :param beta: Inverse temperature :math:`\beta` (sets the real-frequency axis mapping).
+    :param title: The plot title.
+    :param fermi_energy: Energy offset subtracted so the Fermi level sits at zero.
+    :param output_dir: Directory to save the figure to.
+    :param name: Output filename tag.
+    :param cmap: The matplotlib colormap.
+    :param do_save: Whether to save the figure.
+    :param show: Whether to display the figure.
+    :return: None.
     """
     n_per_seg = 200
     # Determine Grid Properties for wrapping

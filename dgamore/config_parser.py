@@ -3,6 +3,12 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+"""
+YAML configuration parsing. :class:`ConfigParser` reads the run's YAML config (rank 0), broadcasts it to all MPI
+ranks, and populates the global :mod:`dgamore.config` singletons section by section, falling back to the
+``*Config`` defaults for any missing key/section. The config file location is taken from the ``-p``/``-c``
+command-line arguments.
+"""
 
 import argparse
 import os
@@ -23,13 +29,20 @@ class ConfigParser:
     """
 
     def __init__(self):
+        """
+        Initializes an empty parser; the YAML content is loaded later by :meth:`parse_config`.
+        """
         self._config_file = None
 
     def parse_config(self, comm: MPI.Comm = None, path: str = "./", name: str = "dga_config.yaml"):
         """
-        Parses the config file and builds the DgaConfig singleton class. Broadcasts the configuration to all
-        processes. The config file location can be specified with the path and/or name arguments when executing the
-        main Python file. If the config file is not found, it will raise an error.
+        Parses the config file on rank 0, broadcasts it to all ranks, and populates the global config singletons. The
+        ``-c``/``-p`` command-line arguments override the ``name``/``path`` defaults.
+
+        :param comm: The MPI communicator (rank 0 reads the file and broadcasts it).
+        :param path: Default directory of the config file.
+        :param name: Default config file name.
+        :return: ``self`` (for chaining).
         """
         parser = argparse.ArgumentParser(
             prog="DGApy", description="Multi-orbital dynamical vertex approximation solver."
@@ -50,15 +63,21 @@ class ConfigParser:
 
     def save_config_file(self, path: str = "./", name: str = "dga_config.yaml") -> None:
         """
-        Provides a way to dump the current config file to a separate location. Usually, the current configuration file
-        is saved to the output folder to keep track of the used parameters.
+        Dumps the loaded config back to a YAML file (typically into the output folder to record the used parameters).
+
+        :param path: Directory to write the config file to.
+        :param name: File name to write.
+        :return: None.
         """
         with open(os.path.join(path, name), "w+") as file:
             YAML().dump(self._config_file, file)
 
     def _build_config_from_file(self, config_file):
         """
-        Builds the full DgaConfig from the config file.
+        Populates every global config singleton from the parsed YAML content.
+
+        :param config_file: The parsed YAML mapping.
+        :return: None.
         """
         config.dmft = self._build_dmft_config(config_file)
         config.output = self._build_output_config(config_file)
@@ -74,7 +93,11 @@ class ConfigParser:
 
     def _build_box_config(self, config_file) -> BoxConfig:
         """
-        Builds the box config from the config file. Mainly concerned with the frequency boxes.
+        Builds the frequency-box config from the ``box_sizes`` section (defaults if absent), deriving ``niv_full``
+        from the core and shell sizes.
+
+        :param config_file: The parsed YAML mapping.
+        :return: The populated :class:`BoxConfig`.
         """
         conf = BoxConfig()
         try:
@@ -95,7 +118,11 @@ class ConfigParser:
 
     def _build_lattice_config(self, config_file) -> LatticeConfig:
         """
-        Builds the lattice config from the config file. Mainly concerned with the lattice and interaction input.
+        Builds the lattice config from the ``lattice`` section (defaults if absent): grid sizes, symmetries, k/q grids,
+        and the lattice/interaction input.
+
+        :param config_file: The parsed YAML mapping.
+        :return: The populated :class:`LatticeConfig`.
         """
         conf = LatticeConfig()
         try:
@@ -128,7 +155,10 @@ class ConfigParser:
 
     def _build_dmft_config(self, config_file) -> DmftConfig:
         """
-        Builds the DMFT config from the config file. Mainly concerned with input data.
+        Builds the DMFT input config from the ``dmft_input`` section (defaults if absent).
+
+        :param config_file: The parsed YAML mapping.
+        :return: The populated :class:`DmftConfig`.
         """
         conf = DmftConfig()
         try:
@@ -150,13 +180,20 @@ class ConfigParser:
 
     def _build_system_config(self, _) -> SystemConfig:
         """
-        Builds the system config. This will be filled from the outside by the main routine.
+        Returns an empty system config; its fields are filled later by the main routine from the DMFT input.
+
+        :param _: Unused (the parsed YAML mapping).
+        :return: A default :class:`SystemConfig`.
         """
         return SystemConfig()
 
     def _build_output_config(self, config_file) -> OutputConfig:
         """
-        Builds the output config from the config file. Mainly concerned with plotting and saving quantities.
+        Builds the output config from the ``output`` section (defaults if absent), defaulting ``output_path`` to the
+        DMFT input path when unset.
+
+        :param config_file: The parsed YAML mapping.
+        :return: The populated :class:`OutputConfig`.
         """
         conf = OutputConfig()
         try:
@@ -177,7 +214,10 @@ class ConfigParser:
 
     def _build_self_consistency_config(self, config_file) -> SelfConsistencyConfig:
         """
-        Builds the self-consistency config from the config file. Mainly concerned with the self-consistency loop.
+        Builds the self-consistency config from the ``self_consistency`` section (defaults if absent).
+
+        :param config_file: The parsed YAML mapping.
+        :return: The populated :class:`SelfConsistencyConfig`.
         """
         conf = SelfConsistencyConfig()
         try:
@@ -192,6 +232,7 @@ class ConfigParser:
         conf.mixing_strategy = self._try_parse(section, "mixing_strategy", conf.mixing_strategy)
         conf.mixing_history_length = self._try_parse(section, "mixing_history_length", conf.mixing_history_length)
         conf.previous_sc_path = self._try_parse(section, "previous_sc_path", conf.previous_sc_path)
+        conf.use_interpolated_sigma = self._try_parse(section, "use_interpolated_sigma", conf.use_interpolated_sigma)
         conf.use_lambda_correction = self._try_parse(section, "use_lambda_correction", conf.use_lambda_correction)
         conf.restrict_chi_phys = self._try_parse(section, "restrict_chi_phys", conf.restrict_chi_phys)
 
@@ -199,7 +240,10 @@ class ConfigParser:
 
     def _build_eliashberg_config(self, config_file) -> EliashbergConfig:
         """
-        Builds the Eliashberg config from the config file. Mainly concerned with the Eliashberg equation.
+        Builds the Eliashberg config from the ``eliashberg`` section (defaults if absent).
+
+        :param config_file: The parsed YAML mapping.
+        :return: The populated :class:`EliashbergConfig`.
         """
         conf = EliashbergConfig()
         try:
@@ -221,6 +265,12 @@ class ConfigParser:
         return conf
 
     def _build_lambda_correction_config(self, config_file):
+        """
+        Builds the lambda-correction config from the ``lambda_correction`` section (defaults if absent).
+
+        :param config_file: The parsed YAML mapping.
+        :return: The populated :class:`LambdaCorrectionConfig`.
+        """
         conf = LambdaCorrectionConfig()
         try:
             section = config_file["lambda_correction"]
@@ -237,7 +287,10 @@ class ConfigParser:
 
     def _build_self_energy_interpolation_config(self, config_file):
         """
-        Builds the self-energy interpolation config from the config file.
+        Builds the self-energy interpolation config from the ``self_energy_interpolation`` section (defaults if absent).
+
+        :param config_file: The parsed YAML mapping.
+        :return: The populated :class:`SelfEnergyInterpolationConfig`.
         """
         conf = SelfEnergyInterpolationConfig()
         try:
@@ -254,7 +307,10 @@ class ConfigParser:
 
     def _build_memory_config(self, config_file):
         """
-        Builds the memory config from the config file.
+        Builds the memory config from the ``memory`` section (defaults if absent).
+
+        :param config_file: The parsed YAML mapping.
+        :return: The populated :class:`MemoryConfig`.
         """
         conf = MemoryConfig()
         try:
@@ -275,7 +331,10 @@ class ConfigParser:
 
     def _build_ana_cont_config(self, config_file):
         """
-        Builds the analytic continuation config from the config file.
+        Builds the analytic-continuation config from the ``ana_cont`` section (defaults if absent).
+
+        :param config_file: The parsed YAML mapping.
+        :return: The populated :class:`AnaContConfig`.
         """
         conf = AnaContConfig()
         try:
@@ -295,8 +354,13 @@ class ConfigParser:
 
     def _try_parse(self, config_section, key: str, default_value):
         """
-        Tries to parse the value for the key in the config_section. If it fails, the default_value is returned. Parses
-        the value to the type of the param default_value.
+        Reads ``key`` from a config section and coerces it to the type of ``default_value``, returning the default if
+        the key is missing or cannot be coerced.
+
+        :param config_section: The YAML sub-mapping to read from.
+        :param key: The key to look up.
+        :param default_value: The fallback value (its type also determines the coercion target).
+        :return: The parsed value, or ``default_value`` on a missing key or coercion failure.
         """
         if key not in config_section:
             return default_value

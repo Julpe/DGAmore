@@ -398,3 +398,22 @@ def test_create_distributor_defaults_to_comm_world():
     d = MpiDistributor.create_distributor(ntasks=2, comm=None)
     assert d.comm is MPI.COMM_WORLD
     assert d.mpi_size == 1
+
+
+# --- R3: file ops swallow only OSError; programming errors propagate ---
+def test_close_file_propagates_non_os_errors():
+    import pytest
+    import dgamore.mpi_distributor as md
+
+    dist = md.MpiDistributor.__new__(md.MpiDistributor)
+
+    class Boom:
+        def close(self):
+            raise ValueError("not an OSError")
+
+    dist._file = Boom()
+    try:
+        with pytest.raises(ValueError):
+            dist.close_file()
+    finally:
+        dist._file = None  # avoid Boom.close() raising again during __del__ on GC

@@ -12,7 +12,7 @@ lattice:
   # calculation. If 'custom', please specify the full path to a file in 'interaction_input' containing orbital and spacial entries for the interaction matrix
   # (similar to how a wannier_hr.dat file is structured, but with 4 orbital indices).
   interaction_input: "" # Full path to the interaction file if interaction_type is 'custom', otherwise the interaction data will be taken from DMFT
-  nk: [ 32, 32, 1 ] # Number of k-points in x, y and z-direction. Default: [ 16, 16, 1 ]
+  nk: [ 16, 16, 1 ] # Number of k-points in x, y and z-direction. Default: [ 16, 16, 1 ]
   #nq: [ 16, 16, 1 ] # Number of q-points in x, y and z-direction. Default: [ 16, 16, 1 ]. If left empty, nq is set to nk
 
 self_consistency:
@@ -24,6 +24,7 @@ self_consistency:
   mixing_history_length: 3 # Number of previous iterations used for Pulay mixing. Default: 3
   previous_sc_path: "" # Path to the previous self-consistency folder. If not specified, the code will start a new calculation from scratch. If specified,
   # the code will start from the last iteration of the previous calculation and does max_iter steps on top
+  use_interpolated_sigma: False # If True, the code will use the interpolated self-energy from the previous iteration
   use_lambda_correction: False # If True, the code will perform a lambda correction for each iteration, and it will automatically set perform_lambda_correction in the settings below to True.
   restrict_chi_phys: False # If True, the physical susceptibilities will be restricted to positive values during the self-consistency cycle.
 
@@ -32,10 +33,10 @@ lambda_correction:
   type: "spch" # available types of lambda correction: 'spch' (both density and magnetic channel) or 'sp' (magnetic channel only)
 
 dmft_input:
-  type: "w2dyn" # Input format. Available is 'w2dyn'
-  input_path: "./" # Folder containing the input files. Default: current directory
-  fname_1p: "1p-data.hdf5" # Filename of the one-particle DMFT calculation; default: 1p-data.hdf5
-  fname_2p: "g4iw_sym.hdf5" # Name of the two-particle DMFT calculation; default: g4iw_sym.hdf5
+  type: "w2dyn" # Input format. Currently available is 'w2dyn'
+  input_path: "./" # Folder containing the input files
+  fname_1p: "1p-data.hdf5" # Filename of the one-particle DMFT calculation
+  fname_2p: "g4iw_sym.hdf5" # Filename of the two-particle DMFT calculation
   do_sym_v_vp: True # If True, the code will symmetrize G2 from DMFT in the v and vp indices
   symmetrize_orbitals: [] # List of orbitals that will be symmetrized, starting from 1 (first orbital is 1, second orbital is 2, etc.).
   # If left empty, no symmetrization will be performed in the orbital indices. This is only relevant for multi-orbital systems.
@@ -61,7 +62,7 @@ eliashberg:
 self_energy_interpolation:
   do_interpolation: False # If True, the code will interpolate the self-energy to a different frequency and beta in each iteration
   target_beta: 1.0 # Target inverse temperature for the interpolation
-  target_niv: 10 # Target number of fermionic frequencies for the interpolation
+  target_niv: 10 # Target number of positive fermionic frequencies for the interpolation
 
 output:
   output_path: "" # Path, where the DGA output folders are created. If not specified, the output is created in the input folder directory of the DMFT files

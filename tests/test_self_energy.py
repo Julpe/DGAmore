@@ -211,6 +211,50 @@ def test_subtracts_self_energy_and_numpy_array_correctly():
     assert np.allclose(result.mat, self_energy.mat - array)
 
 
+def test_interpolate_returns_same_values_when_beta_and_grid_are_unchanged():
+    beta = 1.0
+    self_energy = _build_linear_self_energy(niv_value=4, beta_value=beta, has_compressed_q_dimension=False)
+
+    result = self_energy.interpolate(beta_source=beta, beta_target=beta, niv_target=self_energy.niv)
+
+    assert result.mat.shape == self_energy.mat.shape
+    assert np.allclose(result.mat, self_energy.mat, rtol=1e-6, atol=1e-6)
+
+
+def test_interpolate_reproduces_linear_frequency_dependence_on_a_new_grid():
+    beta_source = 2.0
+    beta_target = 0.5
+    source_niv = 3
+    target_niv = 5
+
+    self_energy = _build_linear_self_energy(source_niv, beta_source, False)
+    result = self_energy.interpolate(
+        beta_source=beta_source,
+        beta_target=beta_target,
+        niv_target=target_niv,
+        niv_linear=10,
+    )
+
+    target_vn = MFHelper.vn(target_niv, beta_target)
+    expected_signal = (2.5 + 0.125 * target_vn) + 1j * (-1.5 + 0.25 * target_vn)
+    expected = np.broadcast_to(expected_signal, result.mat.shape).copy()
+
+    assert result.mat.shape == expected.shape
+    assert np.allclose(result.mat, expected, rtol=1e-4, atol=1e-4)
+
+
+def _build_linear_self_energy(niv_value: int, beta_value: float, has_compressed_q_dimension: bool) -> SelfEnergy:
+    vn = MFHelper.vn(niv_value, beta_value)
+    signal = (2.5 + 0.125 * vn) + 1j * (-1.5 + 0.25 * vn)
+
+    if has_compressed_q_dimension:
+        mat = np.broadcast_to(signal, (1, 2, 2, signal.size)).copy()
+    else:
+        mat = np.broadcast_to(signal, (1, 1, 1, 2, 2, signal.size)).copy()
+
+    return SelfEnergy(mat, nk=(1, 1, 1), has_compressed_q_dimension=has_compressed_q_dimension)
+
+
 @pytest.mark.parametrize(
     "has_compressed_q_dimension_1,has_compressed_q_dimension_2",
     [(True, True), (True, False), (False, True), (False, False)],

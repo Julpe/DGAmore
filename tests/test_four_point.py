@@ -530,3 +530,19 @@ def test_invert_and_sum_matches_manual_small_case():
     assert np.allclose(computed.mat, computed_v1.mat)
     assert np.allclose(computed.mat, computed_v2.mat)
     assert computed._num_vn_dimensions == 1
+
+
+# --- A2: correct compression flag in _to_full_indices_ph (num_vn_dimensions == 0) ---
+def test_to_full_indices_sets_real_compression_flag_no_vn():
+    nb, niw = 1, 1
+    mat = np.ones((2, 2, 1, nb, nb, nb, nb, 2 * niw + 1))
+    fp = FourPoint(mat, SpinChannel.DENS, (2, 2, 1), num_wn_dimensions=1, num_vn_dimensions=0)
+    fp.to_compound_indices().to_full_indices()
+    assert fp.has_compressed_q_dimension is True
+    assert not hasattr(fp, "_has_compressed_momentum_dimension")  # typo attribute must not exist
+
+
+# --- B3: identity is built directly in the storage dtype ---
+def test_four_point_identity_is_valid_and_complex64():
+    ident = FourPoint.identity(1, 1, 2, nq_tot=1, nq=(1, 1, 1), num_vn_dimensions=2)
+    assert ident.mat.dtype == np.complex64

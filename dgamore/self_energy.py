@@ -3,12 +3,19 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+r"""
+Single-particle self-energy. :class:`SelfEnergy` wraps the (possibly momentum-dependent) self-energy
+:math:`\Sigma_{ab}(k, \nu)` and provides its high-frequency moments (:math:`\Sigma_\infty` and the
+:math:`1/\imath\nu` coefficient), tools to estimate the core frequency box, to append the analytic asymptotic
+tail beyond the core, to polynomial-fit the tail, and to interpolate the self-energy between temperatures. The
+moments are obtained by fitting the highest available Matsubara frequencies.
+"""
 
 import itertools as it
 from copy import deepcopy
 
 import numpy as np
-from scipy.interpolate import interp1d
+from scipy.interpolate import PchipInterpolator, interp1d
 
 import dgamore.config as config
 from dgamore.brillouin_zone import KGrid
@@ -32,6 +39,19 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
         estimate_niv_core: bool = False,
         calc_smom: bool = True,
     ):
+        r"""
+        Initializes the self-energy and, unless disabled, fits its high-frequency moments and estimates the core box.
+
+        :param mat: Underlying self-energy array (two orbital axes and one fermionic frequency axis, optionally
+            preceded by momentum axes).
+        :param nk: Number of momenta per spatial direction.
+        :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
+        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis (True) or as
+            ``[kx, ky, kz, ...]`` (False).
+        :param estimate_niv_core: If True, estimate the core frequency box from the deviation to the asymptotic tail;
+            otherwise the core extends over the full stored box.
+        :param calc_smom: If True, fit the high-frequency moments :math:`(\Sigma_\infty, \Sigma_1)` on construction.
+        """
         LocalNPoint.__init__(self, mat, 2, 0, 1, full_niv_range=full_niv_range)
         IAmNonLocal.__init__(self, mat, nk, has_compressed_q_dimension=has_compressed_q_dimension)
         # TODO: check if this is a reasonable value. I'd suggest it depends on the input data size.
@@ -43,14 +63,21 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
 
     @property
     def smom(self) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Returns the first two local momenta of the self-energy.
+        r"""
+        The fitted high-frequency moments of the self-energy.
+
+        :return: The first two high-frequency moments :math:`(\Sigma_\infty, \Sigma_1)` of the self-energy, each of
+            shape ``[o1, o2]``.
         """
         return self._smom0, self._smom1
 
     def fit_smom(self):
-        """
-        Fits the first two local momenta of the self-energy.
+        r"""
+        Fits the first two high-frequency moments of the (k-averaged) self-energy from the highest stored Matsubara
+        frequencies: the constant Hartree shift :math:`\Sigma_\infty` (real part) and the :math:`1/\imath\nu`
+        coefficient :math:`\Sigma_1` (from the imaginary part). At least four frequencies are used for the fit.
+
+        :return: The tuple ``(mom0, mom1)`` of moments, each of shape ``[o1, o2]``.
         """
         compress = False
         if self.has_compressed_q_dimension:
@@ -76,8 +103,11 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
 
     def create_with_asympt_up_to_core(self) -> "SelfEnergy":
         """
-        Concatenates the core and the asymptotic tail of the self-energy from the 'estimated' core region to the actual
-        specified core region (in settings).
+        Returns a copy whose data inside the estimated core box is kept and whose shell (up to the full stored box) is
+        replaced by the analytic asymptotic tail. A no-op (returns a copy) if the core already spans the full box or
+        the tail is empty.
+
+        :return: A copy of the self-energy with the asymptotic tail outside the core region.
         """
         copy = deepcopy(self)
         asympt = copy._get_asympt(niv=copy.niv)
@@ -95,7 +125,11 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
 
     def append_asympt(self, niv: int):
         """
-        Adds the asymptotic tail to the self-energy up to niv.
+        Returns a copy with the analytic asymptotic tail appended on both ends so that the frequency box extends to
+        ``niv``. A no-op (returns a copy) if ``niv <= self.niv``.
+
+        :param niv: Target number of positive fermionic frequencies.
+        :return: A copy of the self-energy extended to ``niv``.
         """
         copy = deepcopy(self)
         asympt = copy._get_asympt(niv)
@@ -107,9 +141,11 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
         return copy
 
     def to_full_niv_range(self):
-        """
-        Converts the object to the full fermionic frequency range in-place. Works only on objects
-        with a single fermionic frequency dimension.
+        r"""
+        Extends the object to the full (signed) fermionic frequency range in place, using
+        :math:`\Sigma(-\nu) = \Sigma(\nu)^*`. A no-op if there is no fermionic axis or the object is already full.
+
+        :return: ``self`` in the full fermionic frequency range.
         """
         if self.num_vn_dimensions == 0 or self.full_niv_range:
             return self
@@ -121,19 +157,23 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
 
     def __add__(self, other):
         """
-        Adds two SelfEnergy objects.
+        Operator form of :meth:`add` (``A + B``). See :meth:`add`.
         """
         return self.add(other)
 
     def __sub__(self, other):
         """
-        Subtracts two SelfEnergy objects.
+        Operator form of :meth:`sub` (``A - B``). See :meth:`sub`.
         """
         return self.sub(other)
 
     def add(self, other) -> "SelfEnergy":
         """
-        Adds two SelfEnergy objects.
+        Adds another :class:`SelfEnergy` (momentum dimensions are aligned first) or a numpy array.
+
+        :param other: A :class:`SelfEnergy` or numpy array.
+        :return: A new :class:`SelfEnergy` holding the sum (moments not recomputed).
+        :raises ValueError: If ``other`` is neither a :class:`SelfEnergy` nor a numpy array.
         """
         if not isinstance(other, (SelfEnergy, np.ndarray)):
             raise ValueError(f"Can not add {type(other)} to {type(self)}.")
@@ -146,13 +186,21 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
 
     def sub(self, other) -> "SelfEnergy":
         """
-        Subtracts two SelfEnergy objects.
+        Subtracts another :class:`SelfEnergy` or numpy array, implemented as ``self.add(-other)`` (see :meth:`add`).
+
+        :param other: A :class:`SelfEnergy` or numpy array.
+        :return: A new :class:`SelfEnergy` holding the difference.
         """
         return self.add(-other)
 
     def concatenate_self_energies(self, other: "SelfEnergy") -> "SelfEnergy":
         """
-        Concats the self-energy with the other self-energy up to other.niv.
+        Builds a self-energy that keeps ``self`` inside its core box and uses ``other`` for the shell, up to
+        ``other.niv``.
+
+        :param other: The self-energy supplying the shell frequencies; must have at least as many frequencies as ``self``.
+        :return: A new :class:`SelfEnergy` spanning ``other``'s frequency box.
+        :raises ValueError: If ``other`` has fewer frequencies than ``self``.
         """
         if self.niv > other.niv:
             raise ValueError("Can not concatenate with a self-energy that has less frequencies.")
@@ -169,7 +217,15 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
 
     def fit_polynomial(self, n_fit: int = 4, degree: int = 3, niv_core: int = 0) -> "SelfEnergy":
         """
-        Fits a polynomial of a given degree to the self-energy.
+        Replaces the self-energy by a per-(momentum, orbital) polynomial fit of the positive-frequency data,
+        evaluated on the full positive frequency grid, then mirrored to the full range. A no-op (returns a copy) if
+        ``n_fit == 0``.
+
+        :param n_fit: Number of positive frequencies used for the fit; if 0 the object is returned unchanged, and if
+            larger than ``self.niv`` (or negative) it falls back to ``niv_core + 200``.
+        :param degree: Degree of the fitted polynomial.
+        :param niv_core: Core frequency count used for the fallback ``n_fit`` when ``n_fit`` is out of range.
+        :return: A new :class:`SelfEnergy` holding the polynomial fit, in the full fermionic frequency range.
         """
         copy = deepcopy(self)
 
@@ -196,11 +252,13 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
         ).to_full_niv_range()
 
     def symmetrize_orbitals(self, orbitals: list | np.ndarray) -> "SelfEnergy":
-        r"""
-        Symmetrizes the LocalNPoint object with respect to the orbitals given in the list. The minimum value that
-        should be entered inside "orbs_list" is 1. and the max is the number of bands. For example, if the object has
-        3 bands and we want to symmetrize with respect to the first and third orbital, we can enter "orbitals=[1,3]".
-        The symmetrization is done by permuting the orbitals in all possible ways and averaging over the results.
+        """
+        Symmetrizes the object with respect to the given (equivalent) orbitals by averaging over all permutations of
+        those orbitals applied to the two orbital axes. The orbital labels are 1-based, ranging from 1 to the number
+        of bands; e.g. for a 3-band object ``orbitals=[1, 3]`` symmetrizes the first and third orbital.
+
+        :param orbitals: 1-based orbital indices to treat as equivalent.
+        :return: The symmetrized :class:`SelfEnergy` (``self`` unchanged if already symmetrized).
         """
         orbital_axes = self._get_orbital_axes()
         if self.is_orbitally_symmetrized(orbitals):
@@ -209,32 +267,58 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
 
     def is_orbitally_symmetrized(self, orbitals: list | np.ndarray) -> bool:
         """
-        Check whether the LocalFourPoint object is orbitally symmetrized with respect to the orbitals given.
+        Checks whether the object is already symmetric under all permutations of the given orbitals.
+
+        :param orbitals: 1-based orbital indices to test for equivalence.
+        :return: True if the object is invariant under permutations of those orbitals.
         """
         orbital_axes = self._get_orbital_axes()
         return self._is_orbitally_symmetrized(orbitals, orbital_axes)
 
     def map_to_full_bz(self, k_grid: KGrid, nq: tuple = None):
+        """
+        Unfolds the object from the irreducible BZ to the full BZ using the grid's symmetry index map (see
+        :meth:`IAmNonLocal._map_to_full_bz`), with two orbital dimensions.
+
+        :param k_grid: The :class:`KGrid` providing the irreducible-to-full BZ index mapping.
+        :param nq: Optional number of momenta per direction for the unfolded grid; defaults to the object's ``nq``.
+        :return: ``self`` defined on the full BZ.
+        """
         return self._map_to_full_bz(k_grid, 2, nq)
 
-    def interpolate(self, beta_source: float, beta_target: float, niv_target: int) -> "SelfEnergy":
+    def interpolate(self, beta_source: float, beta_target: float, niv_target: int, niv_linear: int = 4) -> "SelfEnergy":
+        r"""
+        Re-grid the self-energy from beta_source to beta_target. Only the last
+        (frequency) axis is interpolated.
+
+        The innermost niv_linear source frequencies are interpolated linearly
+        (no curvature assumption where the grid is sparsest); everything above is
+        interpolated with shape-preserving (PCHIP) splines. Re/Im are handled
+        separately on the full signed grid. All target frequencies are returned.
+
+        :param beta_source: Inverse temperature :math:`\beta` of the source grid.
+        :param beta_target: Inverse temperature :math:`\beta` of the target grid.
+        :param niv_target: Number of positive fermionic frequencies of the target grid.
+        :param niv_linear: Number of innermost positive source frequencies interpolated linearly (PCHIP above).
+        :return: A new :class:`SelfEnergy` on the target frequency grid (half niv range flag set to full on output).
         """
-        Linearly interpolate the self-energy from beta_source to beta_target,
-        using positive Matsubara data and explicit v=0 anchoring.
-        """
-        vn_in = MFHelper.vn(self.niv, float(beta_source), return_only_positive=True)
-        vn_out = MFHelper.vn(niv_target, float(beta_target), return_only_positive=True)
+        vn_in = MFHelper.vn(self.niv, float(beta_source))
+        vn_out = MFHelper.vn(niv_target, float(beta_target))
 
-        fit_mat = self.mat[..., self.niv :]
-        sigma_zero = 0.5 * (self.mat[..., self.niv - 1] + self.mat[..., self.niv])
-
-        # Augment grid with v=0
-        vn_aug = np.concatenate(([0.0], vn_in))
-        sigma_aug = np.concatenate((sigma_zero[..., None], fit_mat), axis=-1)
-
-        interp = interp1d(
-            vn_aug,
-            sigma_aug,
+        pchip_re = PchipInterpolator(vn_in, self.mat.real, axis=-1, extrapolate=True)
+        pchip_im = PchipInterpolator(vn_in, self.mat.imag, axis=-1, extrapolate=True)
+        lin_re = interp1d(
+            vn_in,
+            self.mat.real,
+            kind="linear",
+            axis=-1,
+            bounds_error=False,
+            fill_value="extrapolate",
+            assume_sorted=True,
+        )
+        lin_im = interp1d(
+            vn_in,
+            self.mat.imag,
             kind="linear",
             axis=-1,
             bounds_error=False,
@@ -242,11 +326,24 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
             assume_sorted=True,
         )
 
-        return SelfEnergy(interp(vn_out), self.nq, False, self.has_compressed_q_dimension, False).to_full_niv_range()
+        # linear for |nu| at or below the niv_linear-th positive source frequency, PCHIP above
+        nu_cut = np.abs(vn_in[self.niv : self.niv + niv_linear]).max()
+        use_lin = np.abs(vn_out) <= nu_cut
+
+        re = np.where(use_lin, lin_re(vn_out), pchip_re(vn_out))
+        im = np.where(use_lin, lin_im(vn_out), pchip_im(vn_out))
+        sigma_out = re + 1j * im
+
+        return SelfEnergy(sigma_out, self.nq, False, self.has_compressed_q_dimension, True)
 
     def _estimate_niv_core(self, err: float = 1e-5):
         """
-        Check when the real and the imaginary part are within an error margin of the asymptotic.
+        Estimates the core frequency box as the smallest frequency beyond which the k-averaged self-energy (real and
+        imaginary parts, over all orbital pairs) lies within ``err`` of its analytic asymptotic tail. The result is
+        clamped from below by ``self._niv_core_min``.
+
+        :param err: Absolute tolerance for the deviation between the self-energy and its asymptotic tail.
+        :return: The estimated number of positive core frequencies.
         """
         asympt = self._get_asympt(niv=self.niv, n_min=0)
 
@@ -268,9 +365,13 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
         return niv_core
 
     def _get_asympt(self, niv: int, n_min: int = None) -> "SelfEnergy":
-        """
-        Returns purely the asymptotic behaviour of the self-energy for the given frequency range.
-        Not intended to be used as its own but intended to be padded to the self-energy as an asymptotic tail.
+        r"""
+        Builds the analytic high-frequency tail :math:`\Sigma_\infty - \Sigma_1/(\imath\nu)` from the fitted moments
+        over the requested frequency range. Intended to be padded onto the self-energy as a shell, not used on its own.
+
+        :param niv: Number of positive fermionic frequencies in the returned tail.
+        :param n_min: Frequency-index offset (shift) of the first returned frequency; defaults to ``self.niv``.
+        :return: A :class:`SelfEnergy` containing only the asymptotic tail.
         """
         if n_min is None:
             n_min = self.niv
@@ -282,7 +383,11 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
 
     def _get_orbital_axes(self) -> tuple[int, int]:
         """
-        Get the axes corresponding to the orbitals.
+        Determines the axes carrying the two orbital indices for the current layout (local, compressed-q, or
+        decompressed-q).
+
+        :return: The tuple of the two orbital axis indices.
+        :raises ValueError: If the object does not have 3, 4, or 6 dimensions.
         """
         if len(self.current_shape) == 3:  # [o1,o2,v]
             orbital_axes = (0, 1)

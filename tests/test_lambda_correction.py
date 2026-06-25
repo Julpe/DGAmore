@@ -126,3 +126,19 @@ def test_lambda_correction_in_sde_sp(lc_type):
 
         if lc_type == "sp":
             assert np.allclose(chi_dens_corrected.mat, chi_dens_q_before_lambda.mat)
+
+
+# --- R2: find_lambda warns on non-convergence and returns a finite value ---
+def test_find_lambda_warns_on_non_convergence():
+    from unittest.mock import MagicMock
+
+    config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    config.sys.beta = 12.5
+    config.logger = MagicMock()
+
+    n_irrk = config.lattice.q_grid.irrk_count.shape[0]
+    chi = np.full((n_irrk, 5), 0.5, dtype=np.complex64)  # [irrk, w], finite -> lambda_start finite
+    result = lc.find_lambda(chi, 1e6 + 0j, maxiter=1)  # unreachable target in one iteration
+
+    assert np.isfinite(result)
+    assert config.logger.warning.called

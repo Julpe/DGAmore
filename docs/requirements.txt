@@ -1,0 +1,14 @@
+# Dependencies to build the Sphinx documentation.
+# mpi4py and cupy are intentionally omitted: they are mocked in conf.py
+# (autodoc_mock_imports), so the docs build needs neither MPI nor CUDA.
+sphinx
+pydata-sphinx-theme
+
+# Runtime imports that autodoc must resolve while importing the package.
+numpy~=2.2
+scipy~=1.15
+h5py~=3.13
+pandas~=2.2
+matplotlib~=3.10
+multimethod~=2.0
+ruamel.yaml~=0.18

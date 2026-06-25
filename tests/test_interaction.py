@@ -314,3 +314,19 @@ def test_raises_error_when_exponentiating_with_invalid_power():
     interaction = Interaction(mat)
     with pytest.raises(ValueError, match="Exponentiation of Interaction objects only supports positive powers"):
         interaction**0
+
+
+def test_localinteraction_rsub_has_correct_sign():
+    mat = np.ones((2, 2, 2, 2)) * 2.0
+    u = LocalInteraction(mat)
+    other = np.zeros_like(mat)
+    result = u.__rsub__(other)  # directly call __rsub__ to test B - A = C
+    assert np.allclose(result.mat, -mat, rtol=1e-2)
+
+
+def test_nonlocal_interaction_rsub_has_correct_sign():
+    mat = np.ones((1, 2, 2, 2, 2)) * 3.0
+    v = Interaction(mat, SpinChannel.NONE, (1, 1, 1), has_compressed_q_dimension=True)
+    other = np.zeros_like(mat)
+    result = v.__rsub__(other)  # directly call __rsub__ to test B - A = C
+    assert np.allclose(result.mat, -mat, rtol=1e-2)

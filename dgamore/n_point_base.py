@@ -3,6 +3,13 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+"""
+Foundational mixins for every physical quantity in the code. :class:`IHaveMat` owns the underlying numpy array
+(stored in the global precision :data:`DTYPE`) and the memory-management/arithmetic helpers; :class:`IHaveChannel`
+adds the spin channel and frequency notation; :class:`IAmNonLocal` adds a single momentum dimension with the
+compressed/decompressed and irreducible/full-BZ bookkeeping. Concrete classes (Green's function, self-energy,
+vertices, interaction, gap function) compose these mixins.
+"""
 
 import gc
 from abc import ABC
@@ -12,8 +19,12 @@ from enum import Enum
 import numpy as np
 import scipy as sp
 
-from dgamore import symmetry_reduction
 from dgamore.brillouin_zone import KGrid
+
+# Global storage precision for all N-point quantities. Switch this single constant to np.complex128 for
+# double precision (at the cost of doubling the memory footprint). All objects deriving from IHaveMat store
+# their underlying matrix in this dtype; it is also exposed as the class attribute IHaveMat.DTYPE.
+DTYPE = np.complex64
 
 
 class SpinChannel(Enum):
@@ -50,7 +61,16 @@ class IHaveMat(ABC):
     _libc = None
     _malloc_trim_available = None
 
+    # Storage precision for the underlying matrix. Defaults to the module-level ``DTYPE`` (complex64).
+    # Override the module constant (or this attribute) to switch the whole code base to double precision.
+    DTYPE = DTYPE
+
     def __init__(self, mat: np.ndarray):
+        """
+        Stores the array and records its original shape.
+
+        :param mat: The underlying numpy array; it is coerced to the global storage precision :data:`DTYPE`.
+        """
         self.mat = mat
         self._original_shape = self.mat.shape
 
@@ -58,25 +78,37 @@ class IHaveMat(ABC):
     def mat(self) -> np.ndarray:
         """
         Returns the underlying matrix, i.e. the numpy array.
+
+        :return: The underlying numpy array (or None if it has been freed).
         """
         return self._mat
 
     @mat.setter
     def mat(self, value: np.ndarray) -> None:
         """
-        Sets the underlying matrix, i.e. the numpy array with a complex64 or complex128 type. If someone wants to use
-        higher precision, they can always change it to complex128 themselves. Per default, we use complex64 to save
-        memory.
+        Sets the underlying matrix, i.e. the numpy array, coerced to the global storage precision ``DTYPE``
+        (complex64 by default to save memory). To switch the whole code base to higher precision, change the
+        module-level ``DTYPE`` constant (or ``IHaveMat.DTYPE``) to e.g. np.complex128.
+
+        Aliasing contract: ``astype(..., copy=False)`` means an array that is already of dtype ``DTYPE`` is
+        stored **by reference, not copied**. Constructing an object from (or assigning) a view or an array that
+        is still referenced elsewhere therefore aliases it -- a subsequent in-place mutation (e.g. ``obj[...] =``,
+        ``filter_small_values``, a ``copy=False`` transformation) would affect the source. ``.copy()`` the input
+        first if the source must stay independent.
+
+        :param value: The new numpy array (or None to free the storage).
         """
         if value is None:
             self._mat = None
             return
-        self._mat = value.astype(np.complex64)
+        self._mat = value.astype(DTYPE, copy=False)
 
     @property
     def current_shape(self) -> tuple:
         """
         Keeps track of the current shape of the underlying numpy array.
+
+        :return: The current shape of ``mat``.
         """
         return self._mat.shape
 
@@ -85,6 +117,8 @@ class IHaveMat(ABC):
         """
         Keeps track of the previous shape of the underlying numpy array for any reshaping process.
         E.g., it is needed when reshaping it to compound indices where the original shape would have been lost otherwise.
+
+        :return: The stored original (pre-reshape) shape.
         """
         return self._original_shape
 
@@ -94,6 +128,8 @@ class IHaveMat(ABC):
         Sets the original shape of the matrix. Keeps track of the previous shape of the underlying numpy array for any
         reshaping process. E.g., it is needed when reshaping it to compound indices where the original shape would have
         been lost otherwise.
+
+        :param value: The shape tuple to store as the original shape.
         """
         self._original_shape = value
 
@@ -101,15 +137,21 @@ class IHaveMat(ABC):
     def memory_usage_in_gb(self) -> float:
         """
         Returns the memory usage of the numpy array in GigaBytes (GB).
+
+        :return: Memory footprint of ``mat`` in GB.
         """
         return self.mat.nbytes / (1024**3)
 
     def __mul__(self, other) -> "IHaveMat":
         """
-        Allows for the multiplication with a number. A * n = B
+        Multiplies the object by a scalar number, returning a new (deep-copied) object.
+
+        :param other: A scalar (int, float or complex) to multiply with.
+        :return: A new object holding ``self * other``.
+        :raises ValueError: If ``other`` is not a number.
         """
         if not isinstance(other, (int, float, complex)):
-            raise ValueError("Multiplication only supported with numbers or numpy arrays.")
+            raise ValueError("Multiplication only supported with numbers.")
 
         copy = deepcopy(self)
         copy.mat *= other
@@ -117,19 +159,28 @@ class IHaveMat(ABC):
 
     def __rmul__(self, other) -> "IHaveMat":
         """
-        Allows for the multiplication with a number. A * n = B
+        Reflected scalar multiplication ``other * self``; see :meth:`__mul__`.
+
+        :param other: A scalar to multiply with.
+        :return: A new object holding ``self * other``.
         """
         return self.__mul__(other)
 
     def __neg__(self) -> "IHaveMat":
         """
-        Negates the matrix.
+        Negates the matrix (``-self``); see :meth:`__mul__`.
+
+        :return: A new object holding ``-self``.
         """
         return self.__mul__(-1.0)
 
     def __truediv__(self, other) -> "IHaveMat":
         """
-        Allows for the division with a number. A / n = B
+        Divides the object by a scalar number; see :meth:`__mul__`.
+
+        :param other: A scalar (int, float or complex) to divide by.
+        :return: A new object holding ``self / other``.
+        :raises ValueError: If ``other`` is not a number.
         """
         if not isinstance(other, (int, float, complex)):
             raise ValueError("Division only supported with numbers.")
@@ -137,13 +188,19 @@ class IHaveMat(ABC):
 
     def __getitem__(self, item):
         """
-        Returns the value at position [item]. Allows for the use of obj[...] instead of obj.mat[...].
+        Indexing shortcut: ``obj[item]`` is equivalent to ``obj.mat[item]``.
+
+        :param item: Any numpy-compatible index.
+        :return: The indexed view/value of ``mat``.
         """
         return self.mat[item]
 
     def __setitem__(self, key, value):
         """
-        Sets the value at position [key]. Allows for the use of obj[...] = value instead of obj.mat[...] = value.
+        Assignment shortcut: ``obj[key] = value`` is equivalent to ``obj.mat[key] = value`` (in-place).
+
+        :param key: Any numpy-compatible index.
+        :param value: The value to assign.
         """
         self.mat[key] = value
 
@@ -161,13 +218,19 @@ class IHaveMat(ABC):
 
     def __enter__(self):
         """
-        Context manager for the object. Allows for the use of "with obj:" to automatically free memory after the block.
+        Context manager entry; see :meth:`__exit__`.
+
+        :return: ``self``.
         """
         return self
 
     def __exit__(self, exc_type, exc, tb):
         """
-        Context manager for the object. Allows for the use of "with obj:" to automatically free memory after the block.
+        Context manager exit: frees the underlying array (and trims heap memory) when leaving a ``with`` block.
+
+        :param exc_type: Exception type if one was raised inside the block, else None.
+        :param exc: Exception instance if one was raised, else None.
+        :param tb: Traceback if an exception was raised, else None.
         """
         self.free(True)
 
@@ -175,6 +238,8 @@ class IHaveMat(ABC):
         """
         Explicitly releases the underlying numpy array. If True and running on Linux, attempts to return freed heap
         memory back to the OS using malloc_trim.
+
+        :param trim: If True, additionally attempt to return freed heap memory to the OS (Linux only).
         """
         if self._mat is not None:
             self._mat = None
@@ -195,6 +260,11 @@ class IHaveMat(ABC):
         """
         Multiplies the matrices of multiple objects with the contraction specified and returns the result as a
         numpy array.
+
+        :param contraction: An einsum contraction string applied to ``self.mat`` and the operands in ``args``.
+        :param args: Further operands, each either an :class:`IHaveMat` or a numpy array.
+        :return: The contracted numpy array.
+        :raises ValueError: If any operand is neither an :class:`IHaveMat` nor a numpy array.
         """
         if not all(isinstance(obj, (IHaveMat, np.ndarray)) for obj in args):
             raise ValueError("Args has atleast one object with the wrong type. Allowed are [IHaveMat] or [np.ndarray].")
@@ -206,6 +276,9 @@ class IHaveMat(ABC):
         """
         Sets all values in the underlying matrix to zero which are smaller than the given threshold in absolute value.
         This can be used to save memory and speed up calculations by setting very small values to zero.
+
+        :param threshold: Values whose real and imaginary parts are both below this magnitude are zeroed (in place).
+        :return: ``self`` (for chaining).
         """
         self.mat[(np.abs(self.mat.real) < threshold) & (np.abs(self.mat.imag) < threshold)] = 0.0
         return self
@@ -213,8 +286,8 @@ class IHaveMat(ABC):
     @classmethod
     def _malloc_trim(cls):
         """
-        Returns unused heap memory to the OS using glibc malloc_trim.
-        Only available on Linux systems.
+        Returns unused heap memory to the OS using glibc malloc_trim. Only available on Linux systems; a no-op
+        elsewhere. The availability is detected once and cached on the class.
         """
         import os
 
@@ -250,6 +323,12 @@ class IHaveChannel(ABC):
     def __init__(
         self, channel: SpinChannel = SpinChannel.NONE, frequency_notation: FrequencyNotation = FrequencyNotation.PH
     ):
+        """
+        Stores the spin channel and frequency notation of the object.
+
+        :param channel: Spin channel of the object (see :class:`SpinChannel`).
+        :param frequency_notation: Frequency notation of the object (see :class:`FrequencyNotation`).
+        """
         self._channel = channel
         self._frequency_notation = frequency_notation
 
@@ -257,6 +336,8 @@ class IHaveChannel(ABC):
     def channel(self) -> SpinChannel:
         """
         Returns the spin channel of the object. For a set of available channels, see the enum `SpinChannel`.
+
+        :return: The current spin channel.
         """
         return self._channel
 
@@ -264,6 +345,9 @@ class IHaveChannel(ABC):
     def channel(self, value: SpinChannel) -> None:
         """
         Sets the spin channel of the object. For a set of available channels, see the enum `SpinChannel`.
+
+        :param value: The spin channel to set.
+        :raises ValueError: If ``value`` is not a :class:`SpinChannel`.
         """
         if not isinstance(value, SpinChannel):
             raise ValueError("Channel must be of type SpinChannel.")
@@ -271,7 +355,10 @@ class IHaveChannel(ABC):
 
     def set_channel(self, channel: SpinChannel):
         """
-        Sets the spin channel of the object. For a set of available channels, see the enum `SpinChannel`.
+        Sets the spin channel of the object (chainable). For a set of available channels, see the enum `SpinChannel`.
+
+        :param channel: The spin channel to set.
+        :return: ``self`` (for chaining).
         """
         self.channel = channel
         return self
@@ -281,6 +368,8 @@ class IHaveChannel(ABC):
         """
         Returns the frequency notation (not the channel reducibility) of the object.
         For a set of available frequency notations, see the enum `FrequencyNotation`.
+
+        :return: The current frequency notation.
         """
         return self._frequency_notation
 
@@ -289,6 +378,9 @@ class IHaveChannel(ABC):
         """
         Sets the frequency notation of the object. For a set of available frequency notations,
         see the enum `FrequencyNotation`.
+
+        :param value: The frequency notation to set.
+        :raises ValueError: If ``value`` is not a :class:`FrequencyNotation`.
         """
         if not isinstance(value, FrequencyNotation):
             raise ValueError("Frequency notation must be of type FrequencyNotation.")
@@ -296,8 +388,11 @@ class IHaveChannel(ABC):
 
     def set_frequency_notation(self, value: FrequencyNotation):
         """
-        Sets the frequency notation of the object. For a set of available frequency notations,
+        Sets the frequency notation of the object (chainable). For a set of available frequency notations,
         see the enum `FrequencyNotation`.
+
+        :param value: The frequency notation to set.
+        :return: ``self`` (for chaining).
         """
         self.frequency_notation = value
         return self
@@ -310,6 +405,14 @@ class IAmNonLocal(IHaveMat, ABC):
     """
 
     def __init__(self, mat: np.ndarray, nq: tuple[int, int, int], has_compressed_q_dimension: bool = False):
+        """
+        Stores the array, the momentum-grid size and the momentum-layout flag.
+
+        :param mat: The underlying numpy array with one (compressed) or three (decompressed) leading momentum axes.
+        :param nq: Number of momenta per spatial direction ``(nqx, nqy, nqz)``.
+        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
+            (True) or as three separate axes ``[qx, qy, qz, ...]`` (False).
+        """
         IHaveMat.__init__(self, mat)
         self._nq = nq
         self._has_compressed_q_dimension = has_compressed_q_dimension
@@ -318,6 +421,8 @@ class IAmNonLocal(IHaveMat, ABC):
     def nq(self) -> tuple[int, int, int]:
         """
         Returns the number of momenta in the object. This should always be equal to the k- or q-point grid of the lattice.
+
+        :return: The number of momenta per spatial direction ``(nqx, nqy, nqz)``.
         """
         return self._nq
 
@@ -326,6 +431,8 @@ class IAmNonLocal(IHaveMat, ABC):
         """
         Returns the total number of momenta in the object. This might be lower than np.prod(self.nq) if the object is
         currently saved in the irreducible Brillouin zone.
+
+        :return: The total number of stored momenta.
         """
         return np.prod(self.nq).astype(int) if not self.has_compressed_q_dimension else self.original_shape[0]
 
@@ -333,6 +440,8 @@ class IAmNonLocal(IHaveMat, ABC):
     def has_compressed_q_dimension(self) -> bool:
         """
         Returns whether the underlying matrix has a compressed momentum dimension [q,...] or not [qx,qy,qz,...].
+
+        :return: True if the momentum is stored as a single compressed axis.
         """
         return self._has_compressed_q_dimension
 
@@ -341,12 +450,17 @@ class IAmNonLocal(IHaveMat, ABC):
         """
         Returns the number of bands in the nonlocal two- or four-point object. If the object has a compressed momentum
         dimension, the array has dimension [q, o1, o2, ... ], otherwise it has dimension [qx, qy, qz, o1, o2, ... ].
+
+        :return: The number of bands (orbitals).
         """
         return self.original_shape[1] if self.has_compressed_q_dimension else self.original_shape[3]
 
     def shift_k_by_q(self, q: tuple | list[int] = (0, 0, 0)):
-        """
+        r"""
         Shifts all momenta by the given values and returns a copy of the object with a decompressed momentum dimension.
+
+        :param q: The momentum shift :math:`\vec{q}` as integer grid offsets ``(qx, qy, qz)``.
+        :return: A copy shifted by :math:`\vec{q}`, in the same momentum-compression state as ``self``.
         """
         copy = deepcopy(self)
 
@@ -364,6 +478,8 @@ class IAmNonLocal(IHaveMat, ABC):
     def shift_k_by_pi(self):
         r"""
         Shifts all momenta by :math:`\pi` and returns the object with a decompressed momentum dimension.
+
+        :return: A copy shifted by :math:`\pi` along every momentum axis, in the same compression state as ``self``.
         """
         copy = deepcopy(self)
 
@@ -382,6 +498,8 @@ class IAmNonLocal(IHaveMat, ABC):
     def compress_q_dimension(self):
         """
         Converts the object from [qx,qy,qz,...] to [q,...], where len(q) = qx*qy*qz.
+
+        :return: ``self`` with a compressed momentum dimension (a no-op if already compressed).
         """
         if self.has_compressed_q_dimension:
             return self
@@ -394,6 +512,8 @@ class IAmNonLocal(IHaveMat, ABC):
     def decompress_q_dimension(self):
         """
         Converts the object from [q,...] to [qx,qy,qz,...], where len(q) = qx*qy*qz.
+
+        :return: ``self`` with a decompressed momentum dimension (a no-op if already decompressed).
         """
         if not self.has_compressed_q_dimension:
             return self
@@ -408,6 +528,9 @@ class IAmNonLocal(IHaveMat, ABC):
         Reduces the object to the given list of momenta and returns a copy with a compressed momentum dimension. Acts
         like a filter. Makes it possible to use e.g. only the :math:`\vec{q}=0` component of a non-local object or
         filter the irreducible Brillouin zone from an object in the full Brillouin zone.
+
+        :param q_list: Array of momentum grid indices to keep, shape ``[3, n_q]`` (one column per momentum).
+        :return: A copy reduced to ``q_list``, with a compressed momentum dimension.
         """
         copy = deepcopy(self)
 
@@ -426,7 +549,10 @@ class IAmNonLocal(IHaveMat, ABC):
     def find_q(self, q: tuple[int, int, int] = (0, 0, 0)):
         r"""
         Find the matrix element for a single momentum :math:`\vec{q}` and returns a compressed copy.
-        Raises a ValueError if no element is found.
+
+        :param q: The momentum grid index ``(qx, qy, qz)`` to select.
+        :return: A compressed copy containing only the requested momentum (``nq = (1, 1, 1)``).
+        :raises ValueError: If no matrix element is found for the given momentum.
         """
         q_arr = np.atleast_2d(np.array(q, dtype=int))
         result = deepcopy(self).reduce_q(q_arr)
@@ -440,7 +566,10 @@ class IAmNonLocal(IHaveMat, ABC):
     def filter_q_index(self, index: int = 0):
         r"""
         Filters the object to the given index of the momentum dimension and returns a copy. Acts like a filter.
-        Makes it possible to use e.g. only the first component of a non-local object.
+        Makes it possible to use e.g. only the n-th q-component of a non-local object.
+
+        :param index: The position along the compressed momentum axis to keep.
+        :return: A compressed copy containing only that single momentum (``nq = (1, 1, 1)``).
         """
         if not self.has_compressed_q_dimension:
             self.compress_q_dimension()
@@ -451,16 +580,82 @@ class IAmNonLocal(IHaveMat, ABC):
         copy._nq = (1, 1, 1)
         return copy
 
-    def map_to_full_bz(self, k_grid: KGrid, nq: tuple = None):
+    def q_mean(self):
+        r"""
+        Averages over the momentum dimension and returns a copy of the object with nq = (1,1,1).
+
+        :return: A copy holding the momentum average (``nq = (1, 1, 1)``).
+        """
+        copy = deepcopy(self)
+        if self.has_compressed_q_dimension:
+            copy.mat = np.mean(copy.mat, axis=0)[None, ...]
+        else:
+            copy.mat = np.mean(copy.mat, axis=(0, 1, 2))[None, None, None, ...]
+        copy.update_original_shape()
+        copy._nq = (1, 1, 1)
+        return copy
+
+    def interpolate_q_grid(self, nq_new: tuple[int, int, int], copy: bool = True):
+        r"""
+        Re-samples the object onto a new Gamma-centered momentum grid (:math:`\Gamma` at index 0)
+        and returns a copy if specified. Up- and downsampling are both supported, per axis and in
+        any combination. Returns in the same momentum compression state as the input.
+
+        For each axis the method chooses automatically:
+          * if the target is a sub-lattice of the source (``n_new`` divides ``n_old``), the exact
+            :math:`\Sigma(\vec{q})` at the retained points is obtained by striding -- no band-limiting;
+          * otherwise (upsampling or incommensurate downsampling) a band-limited Fourier
+            interpolation (FFT -> pad/truncate spectrum -> iFFT, with symmetric Nyquist handling) is used.
+
+        Requires a full-BZ object. A compressed dimension that is not the full BZ (e.g. IBZ-reduced)
+        is rejected.
+
+        :param nq_new: Target number of momenta per spatial direction ``(nqx, nqy, nqz)``.
+        :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
+        :return: The re-gridded object in the same momentum-compression state as the input.
+        :raises ValueError: If a target size is not a positive integer, or the object is compressed but not full-BZ.
+        """
+        copy = deepcopy(self) if copy else self
+
+        nq_new = tuple(int(n) for n in nq_new)
+        if any(n < 1 for n in nq_new):
+            raise ValueError("Target grid sizes must be positive integers.")
+        if nq_new == copy.nq:
+            return copy
+
+        compress = False
+        if copy.has_compressed_q_dimension:
+            if copy.current_shape[0] != int(np.prod(copy.nq)):
+                raise ValueError("Re-gridding requires a full-BZ object.")
+            compress = True
+            copy.decompress_q_dimension()
+
+        for axis, n_new in enumerate(nq_new):
+            n_old = copy.current_shape[axis]
+            if n_new == n_old:
+                continue
+            if n_new < n_old and n_old % n_new == 0:
+                copy.mat = np.take(copy.mat, np.arange(0, n_old, n_old // n_new), axis=axis)
+            else:
+                copy.mat = sp.signal.resample(copy.mat, n_new, axis=axis)
+
+        copy._nq = nq_new
+        copy.update_original_shape()
+
+        return copy.compress_q_dimension() if compress else copy
+
+    def map_to_full_bz(self, k_grid: "KGrid", nq: tuple = None):
         """
         Maps to full BZ using k_grid's inverse map and precomputed orbital rotation tensors.
-        Call k_grid.set_orbital_rotations() before this if orbital mixing is needed,
-        otherwise identity is assumed for all k-points.
+
+        :param k_grid: The momentum grid carrying the irreducible-to-full-BZ map and per-k orbital rotations.
+        :param nq: Optional override for the number of momenta; if None the object's own ``nq`` is used.
+        :return: ``self`` expanded to the full BZ (four orbital dimensions transformed).
         """
         return self._map_to_full_bz(k_grid, 4, nq)
 
-    def _map_to_full_bz(self, k_grid: KGrid, num_orbital_dimensions: int, nq: tuple = None):
-        """
+    def _map_to_full_bz(self, k_grid: "KGrid", num_orbital_dimensions: int, nq: tuple = None):
+        r"""
         Maps the object from the irreducible to the full Brillouin zone.
 
         First expands the compressed IBZ momentum dimension to the full BZ by copying each IBZ
@@ -468,15 +663,21 @@ class IAmNonLocal(IHaveMat, ABC):
         per-k orbital transformation stored on ``k_grid`` by ``specify_auto_symmetries(hk)``.
 
         The orbital transformation follows the ket/bra convention of the operator ordering
-        G_abcd := <T[c_a c†_b c_c c†_d]> -- annihilation indices (positions 1, 3) transform with
-        U, creation indices (positions 2, 4) with U^dagger -- combined with a per-k antisymmetry
-        sign ``sigma_k`` and an optional complex conjugation ``conj_k``:
+        :math:`G_{abcd} := \langle T[c_a c^\dagger_b c_c c^\dagger_d]\rangle` -- annihilation indices
+        (positions 1, 3) transform with :math:`U`, creation indices (positions 2, 4) with :math:`U^\dagger` --
+        combined with a per-k antisymmetry sign :math:`\sigma_k` and an optional complex conjugation ``conj_k``:
 
-            2-index : M_ab(k)   = sigma_k     * U_aa' [M_a'b'(k_rep)]^{[*conj_k]} U^dag_b'b
-            4-index : M_abcd(k) = sigma_k^2 * U_aa' [M_a'b'c'd'(k_rep)]^{[*conj_k]} U^dag_b'b U_cc' U^dag_d'd
+            2-index : :math:`M_{ab}(k)   = \sigma_k     \, U_{aa'} [M_{a'b'}(k_{rep})]^{[*conj_k]} U^\dagger_{b'b}`
+            4-index : :math:`M_{abcd}(k) = \sigma_k^2 \, U_{aa'} [M_{a'b'c'd'}(k_{rep})]^{[*conj_k]} U^\dagger_{b'b} U_{cc'} U^\dagger_{d'd}`
 
         If ``k_grid`` is not yet in auto mode (``specify_auto_symmetries`` has not been called),
         only the momentum expansion is performed and orbital indices are left unchanged.
+
+        :param k_grid: The momentum grid carrying the irreducible-to-full-BZ map and per-k orbital rotations.
+        :param num_orbital_dimensions: Number of orbital axes to transform; must be 2 or 4.
+        :param nq: Optional override for the number of momenta; if None the object's own ``nq`` is used.
+        :return: ``self`` expanded to the full BZ.
+        :raises ValueError: If the object does not have a compressed momentum dimension.
         """
         if not self.has_compressed_q_dimension:
             raise ValueError("Mapping to full BZ only possible for compressed momentum dimension.")
@@ -495,6 +696,8 @@ class IAmNonLocal(IHaveMat, ABC):
 
         # Apply per-k orbital transformation if auto-mode data is present.
         if getattr(k_grid, "is_auto", False):
+            from dgamore import symmetry_reduction
+
             self.mat = symmetry_reduction.apply_auto_orbital_transform(
                 self.mat,
                 us=k_grid._auto_us.reshape(np.prod(k_grid.nk), *k_grid._auto_us.shape[3:]),
@@ -509,61 +712,46 @@ class IAmNonLocal(IHaveMat, ABC):
     def fft(self, copy: bool = True):
         """
         Performs a discrete forward Fourier transform over the momentum dimension and returns a copy if specified.
+
+        :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
+        :return: The Fourier-transformed object, in the same momentum-compression state as the input.
         """
         if copy:
-            copy = deepcopy(self)
-
-            compress = False
-            if copy.has_compressed_q_dimension:
-                compress = True
-                copy.decompress_q_dimension()
-
-            sp.fft.fftn(copy.mat, axes=(0, 1, 2), overwrite_x=True)
-            return copy.compress_q_dimension() if compress else copy
+            return deepcopy(self).fft(copy=False)
 
         compress = False
         if self.has_compressed_q_dimension:
             compress = True
             self.decompress_q_dimension()
-        sp.fft.fftn(self.mat, axes=(0, 1, 2), overwrite_x=True)
+        self.mat = sp.fft.fftn(self.mat, axes=(0, 1, 2), overwrite_x=True)
         return self.compress_q_dimension() if compress else self
 
     def ifft(self, copy: bool = True):
         """
         Performs a discrete inverse Fourier transform over the momentum dimension and returns a copy if specified.
+
+        :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
+        :return: The inverse-Fourier-transformed object, in the same momentum-compression state as the input.
         """
         if copy:
-            copy = deepcopy(self)
-
-            compress = False
-            if copy.has_compressed_q_dimension:
-                compress = True
-                copy.decompress_q_dimension()
-
-            sp.fft.ifftn(copy.mat, axes=(0, 1, 2), overwrite_x=True)
-            return copy.compress_q_dimension() if compress else copy
+            return deepcopy(self).ifft(copy=False)
 
         compress = False
         if self.has_compressed_q_dimension:
             compress = True
             self.decompress_q_dimension()
-        sp.fft.ifftn(self.mat, axes=(0, 1, 2), overwrite_x=True)
+        self.mat = sp.fft.ifftn(self.mat, axes=(0, 1, 2), overwrite_x=True)
         return self.compress_q_dimension() if compress else self
 
     def flip_momentum_axis(self, copy: bool = True):
         r"""
         Flips the momentum axis :math:`F^{q}\to F^{-q}` of the object and returns a copy if specified.
+
+        :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
+        :return: The momentum-flipped object, in the same momentum-compression state as the input.
         """
         if copy:
-            copy = deepcopy(self)
-
-            compress = False
-            if copy.has_compressed_q_dimension:
-                compress = True
-                copy.decompress_q_dimension()
-
-            copy.mat = np.roll(np.flip(copy.mat, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-            return copy.compress_q_dimension() if compress else copy
+            return deepcopy(self).flip_momentum_axis(copy=False)
 
         compress = False
         if self.has_compressed_q_dimension:
@@ -577,6 +765,9 @@ class IAmNonLocal(IHaveMat, ABC):
         """
         Helper method which adapts the frequency dimensions of two non-local objects to fit each other for
         addition or multiplication.
+
+        :param other: The other non-local object to align with ``self``.
+        :return: ``other``, compressed if necessary to match ``self``'s momentum layout.
         """
         if not self.has_compressed_q_dimension and other.has_compressed_q_dimension:
             self.compress_q_dimension()

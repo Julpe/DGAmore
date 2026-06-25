@@ -3,8 +3,16 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+"""
+High-level DMFT input loading and run setup. This module ties the DMFT interface, the global config and the lattice
+Hamiltonian together: it reads the 1- and 2-particle DMFT quantities (per inequivalent atom), updates the global
+config (temperature, chemical potential, interaction, frequency boxes, output paths), builds the kinetic and
+interaction Hamiltonian from the configured inputs, and applies the requested symmetrizations.
+"""
 
 import os
+
+import numpy as np
 
 import dgamore.brillouin_zone as bz
 import dgamore.config as config
@@ -12,14 +20,16 @@ from dgamore.dmft_interface import W2dynInterface, TriqsInterface
 from dgamore.greens_function import GreensFunction
 from dgamore.hamiltonian import Hamiltonian
 from dgamore.local_four_point import LocalFourPoint
-from dgamore.n_point_base import *
+from dgamore.n_point_base import SpinChannel
 from dgamore.self_energy import SelfEnergy
 
 
 def uniquify_path(path: str = None):
     """
-    :param path: Path to be checked for uniqueness
-    :return: Updated unique path
+    Appends an incrementing suffix to ``path`` until it does not collide with an existing file/directory.
+
+    :param path: The candidate path to make unique.
+    :return: A path that does not yet exist (``path`` itself if it was already free).
     """
     filename, extension = os.path.splitext(path)
     counter = 1
@@ -35,9 +45,14 @@ def load_from_dmft_file_and_update_config() -> (
     tuple[list[GreensFunction], list[SelfEnergy], list[LocalFourPoint], list[LocalFourPoint]]
 ):
     """
-    Loads data from the w2dyn file and updates the config file.
-    If combine_atoms_to_one_obj is True, we are doubling the orbital space and putting the data from the
-    (in)equivalent atoms into the diagonal blocks after we average over them.
+    Loads the per-inequivalent-atom DMFT quantities (1- and 2-particle) and updates the global config: inverse
+    temperature, interaction parameters, chemical potential, filling, frequency boxes, band count, Hamiltonian and
+    output paths. Also cuts the two-particle Green's functions to the core box and applies the requested orbital and
+    :math:`(\\nu, \\nu')` symmetrizations.
+
+    :return: A tuple of per-inequivalent-atom lists ``(g_per_ineq, sigma_per_ineq, g2_dens_per_ineq,
+        g2_magn_per_ineq)`` of Green's functions, self-energies and density/magnetic two-particle Green's functions.
+    :raises ValueError: If the configured DMFT input type is unsupported.
     """
     if config.dmft.type.lower() == "w2dyn":
         dmft_interface = W2dynInterface()
@@ -125,7 +140,13 @@ def load_from_dmft_file_and_update_config() -> (
 
 def update_frequency_boxes(niw: int, niv: int) -> None:
     """
-    Updates the frequency boxes based on the available frequencies in the DMFT four-point object.
+    Updates the global frequency-box sizes from the frequencies available in the DMFT four-point object: unset
+    (``-1``) boxes are filled with the available counts, and over-large requested boxes are clamped to what is
+    available. Recomputes ``niv_full``.
+
+    :param niw: Number of positive bosonic frequencies available in the DMFT input.
+    :param niv: Number of positive fermionic frequencies available in the DMFT input.
+    :return: None.
     """
     logger = config.logger
 
@@ -162,6 +183,14 @@ def set_hamiltonian(er_type: str, er_input: str | list, int_type: str, int_input
     1. By retrieving the data from the DMFT files. \n
     2. By providing the Kanamori interaction parameters [n_bands, U, J, (V)]. \n
     3. By providing the full path + filename to the U-matrix file. \n
+
+    :param er_type: The kinetic-input type (``"t_tp_tpp"``, ``"from_wannier90"`` or ``"from_wannierhk"``).
+    :param er_input: The kinetic input: the ``[t, tp, tpp]`` list, or a path to the hopping file.
+    :param int_type: The interaction type (``"one_band_from_dmft"``, ``"kanamori_from_dmft"`` or ``"custom"``).
+    :param int_input: The interaction input (path to the U-matrix file for the ``"custom"`` type).
+    :return: The constructed :class:`Hamiltonian` with kinetic and interaction terms.
+    :raises ValueError: If a kinetic/interaction input has the wrong type.
+    :raises NotImplementedError: If the kinetic or interaction type is unsupported.
     """
     ham = Hamiltonian()
     if er_type.lower() == "t_tp_tpp":

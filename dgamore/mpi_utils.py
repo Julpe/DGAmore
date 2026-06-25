@@ -3,6 +3,13 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+"""
+MPI helper routines for the non-local step. This module provides the data-movement primitives that complement
+:class:`MpiDistributor`: mapping objects between the irreducible-BZ and full-BZ rank distributions (both a simple
+gather/scatter version and a fully distributed peer-to-peer version that never assembles the full object on one
+rank), a node-aware frequency distribution, and a distributed 3D FFT over the BZ implemented via pencil
+redistributions. All transfers chunk messages to stay below the 2 GB MPI limit.
+"""
 
 import mpi4py.MPI as MPI
 import numpy as np
@@ -22,6 +29,11 @@ def _get_node_aware_v_dist(n_nu, comm):
 
     Uses inverse rank-lookup to be robust against inconsistent hostname strings
     returned by the OS in local or cluster environments.
+
+    :param n_nu: Total number of fermionic frequencies to distribute.
+    :param comm: The MPI communicator.
+    :return: The tuple ``(all_sizes, all_slices)`` of per-rank frequency counts and ``slice`` objects.
+    :raises RuntimeError: If a rank cannot locate itself in the host map.
     """
     rank = comm.Get_rank()
     size = comm.Get_size()
@@ -85,7 +97,13 @@ def _get_node_aware_v_dist(n_nu, comm):
 
 def _send_in_chunks(comm, arr, dest, base_tag=0):
     """
-    Sends a numpy array in chunks to a destination rank without a handshake.
+    Sends a numpy array to a destination rank in below-2 GB chunks along axis 0 (no handshake).
+
+    :param comm: The MPI communicator.
+    :param arr: The array to send.
+    :param dest: Destination rank.
+    :param base_tag: Base MPI tag; successive chunks add the chunk index.
+    :return: None.
     """
     arr = np.ascontiguousarray(arr)
     itemsize = arr.dtype.itemsize
@@ -103,7 +121,14 @@ def _send_in_chunks(comm, arr, dest, base_tag=0):
 
 def _recv_in_chunks(comm, shape, dtype, source, base_tag=0):
     """
-    Receives a numpy array in chunks from a source rank into a pre-allocated buffer.
+    Receives a numpy array from a source rank in below-2 GB chunks along axis 0 into a freshly allocated buffer.
+
+    :param comm: The MPI communicator.
+    :param shape: Shape of the array to receive.
+    :param dtype: Dtype of the array to receive.
+    :param source: Source rank.
+    :param base_tag: Base MPI tag; successive chunks add the chunk index.
+    :return: The received array.
     """
     out = np.empty(shape, dtype=dtype)
     itemsize = np.dtype(dtype).itemsize
@@ -122,7 +147,13 @@ def _recv_in_chunks(comm, shape, dtype, source, base_tag=0):
 
 def map_irrbz_fullbz(obj, mpi_dist_irrk, mpi_dist_fullbz):
     """
-    Regular way of mapping an object from the irreducible BZ to the full BZ. Processes all data on a single rank.
+    Maps an object from the irreducible-BZ rank distribution to the full-BZ distribution the simple way: gather to
+    rank 0, unfold to the full BZ there, then scatter back. Requires rank 0 to hold the full-BZ object transiently.
+
+    :param obj: The object distributed over the irreducible BZ (must support :meth:`map_to_full_bz`).
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ (source layout).
+    :param mpi_dist_fullbz: MPI distributor over the full BZ (target layout).
+    :return: The object distributed over the full BZ.
     """
     obj.mat = mpi_dist_irrk.gather(obj.mat)
     if mpi_dist_irrk.comm.rank == 0:
@@ -148,7 +179,7 @@ def exchange_and_map_irrbz_fullbz(
     ``(sigma_k, U_k, conj_k)`` is also applied locally on each rank, using only the
     transformation arrays sliced to that rank's FBZ range. No global gather is needed.
 
-    This is a distributed replacement for the pattern (see also 'map_irrbz_fullbz')
+    This is a distributed replacement for the pattern (see also :func:`map_irrbz_fullbz`)::
 
         obj.mat = mpi_dist_irrk.gather(obj.mat)
         if comm.rank == 0:
@@ -156,6 +187,11 @@ def exchange_and_map_irrbz_fullbz(
         obj.mat = mpi_dist_fullbz.scatter(obj.mat)
 
     which would require rank 0 to hold the entire full-BZ obj in memory.
+
+    :param obj: The :class:`FourPoint` distributed over the irreducible BZ.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ (source layout).
+    :param mpi_dist_fullbz: MPI distributor over the full BZ (target layout).
+    :return: The :class:`FourPoint` distributed over the full BZ (compressed q dimension).
     """
     comm = mpi_dist_irrk.comm
     rank = comm.rank
@@ -304,6 +340,17 @@ def exchange_and_map_irrbz_fullbz(
 def gather_full_ibz_for_vslice(
     gamma_r: FourPoint, mpi_dist_irrq: MpiDistributor, mpi_dist_v: MpiDistributor, q_grid: KGrid
 ) -> FourPoint:
+    """
+    Re-layouts a q-distributed pairing vertex into a fermionic-frequency-distributed one for the Eliashberg solver:
+    each rank ends up with the full BZ but only its node-aware slice of the (second) fermionic frequency. The
+    momentum is unfolded to the full BZ locally. Ranks with an empty frequency slice receive ``None``.
+
+    :param gamma_r: The :class:`FourPoint` pairing vertex distributed over the irreducible BZ.
+    :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (source layout).
+    :param mpi_dist_v: MPI distributor over the fermionic frequency axis (updated in place to the node-aware split).
+    :param q_grid: The :class:`KGrid` used to unfold to the full BZ.
+    :return: The full-BZ :class:`FourPoint` for this rank's frequency slice, or ``None`` if the slice is empty.
+    """
     # 1. Distribution Update (Node-Aware)
     sizes, slices = _get_node_aware_v_dist(mpi_dist_v.ntasks, mpi_dist_v.comm)
     mpi_dist_v._sizes, mpi_dist_v._slices = sizes, slices
@@ -376,11 +423,16 @@ def gather_full_ibz_for_vslice(
 
 def get_pencil_indices(rank: int, size: int, nq: tuple[int, int, int], layout: str) -> np.ndarray:
     """
-    Calculates which global q-indices (0 to n_tot-1) a rank owns
-    based on the decomposition layout.
+    Calculates which global flattened q-indices (0 to ``n_tot - 1``) a rank owns under a given decomposition layout.
+    The ``"flat"`` layout matches :meth:`MpiDistributor._distribute_tasks` (excess on the last ranks); the pencil
+    layouts assign whole lines along one axis so a subsequent 1D FFT along that axis is rank-local.
 
-    nq: tuple (nx, ny, nz)
-    layout: 'flat', 'z_pencil', 'y_pencil', 'x_pencil'
+    :param rank: The rank whose indices to compute.
+    :param size: Total number of ranks.
+    :param nq: The momentum grid sizes ``(nx, ny, nz)``.
+    :param layout: One of ``"flat"``, ``"z_pencil"``, ``"y_pencil"``, ``"x_pencil"``.
+    :return: The global flattened q-indices owned by ``rank``.
+    :raises ValueError: If ``layout`` is not one of the supported layouts.
     """
     nx, ny, nz = nq
     n_tot = nx * ny * nz
@@ -449,6 +501,17 @@ def get_pencil_indices(rank: int, size: int, nq: tuple[int, int, int], layout: s
 
 
 def _redistribute_p2p(mat, nq, comm, source_layout, target_layout):
+    """
+    Peer-to-peer redistributes the rows of ``mat`` (indexed by flattened q) from one pencil/flat layout to another,
+    exchanging only the rows each rank pair shares (in below-2 GB byte chunks).
+
+    :param mat: The local array slice, with the q-index on axis 0.
+    :param nq: The momentum grid sizes ``(nx, ny, nz)``.
+    :param comm: The MPI communicator.
+    :param source_layout: The current layout of ``mat`` (see :func:`get_pencil_indices`).
+    :param target_layout: The desired layout of the result.
+    :return: The local array slice in the target layout.
+    """
     size = comm.Get_size()
     rank = comm.Get_rank()
 
@@ -476,13 +539,13 @@ def _redistribute_p2p(mat, nq, comm, source_layout, target_layout):
         if len(to_send_g) > 0:
             send_l = [src_map[g] for g in to_send_g]
             send_buf = np.ascontiguousarray(mat[send_l])
-            send_view = send_buf.view(np.byte)
+            send_view = send_buf.view(np.byte).reshape(-1)
             for i in range(0, send_view.nbytes, MAX_MPI_BYTES):
                 reqs.append(comm.Isend(send_view[i : i + MAX_MPI_BYTES], dest=target_rank, tag=shift))
 
         if len(to_recv_g) > 0:
             recv_staging = np.empty((len(to_recv_g),) + mat.shape[1:], dtype=mat.dtype)
-            recv_view = recv_staging.view(np.byte)
+            recv_view = recv_staging.view(np.byte).reshape(-1)
             for i in range(0, recv_view.nbytes, MAX_MPI_BYTES):
                 reqs.append(comm.Irecv(recv_view[i : i + MAX_MPI_BYTES], source=source_rank, tag=shift))
 
@@ -505,6 +568,10 @@ def execute_distributed_fft(obj: FourPoint, comm: MPI.Comm) -> FourPoint:
     The final result is that obj.mat is transformed in-place to the Fourier space representation
     corresponding to the full BZ.
     Attention: modifies the object in-place!
+
+    :param obj: The :class:`FourPoint` distributed over the full BZ (``flat`` layout), transformed in place.
+    :param comm: The MPI communicator.
+    :return: The same :class:`FourPoint`, now holding the BZ Fourier transform (back in the ``flat`` layout).
     """
     nq = obj.nq
     nx, ny, nz = nq
@@ -517,7 +584,7 @@ def execute_distributed_fft(obj: FourPoint, comm: MPI.Comm) -> FourPoint:
     shape_z = obj.mat.shape
     # Reshape to (n_pencils, nz, orbitals..., frequencies...)
     obj.mat = obj.mat.reshape(-1, nz, *shape_z[1:])
-    fft.fftn(obj.mat, axes=(1,), overwrite_x=True)
+    obj.mat = fft.fftn(obj.mat, axes=(1,), overwrite_x=True)
     obj.mat = obj.mat.reshape(shape_z)
 
     # --- STEP 2: Y-FFT ---
@@ -525,7 +592,7 @@ def execute_distributed_fft(obj: FourPoint, comm: MPI.Comm) -> FourPoint:
 
     shape_y = obj.mat.shape
     obj.mat = obj.mat.reshape(-1, ny, *shape_y[1:])
-    fft.fftn(obj.mat, axes=(1,), overwrite_x=True)
+    obj.mat = fft.fftn(obj.mat, axes=(1,), overwrite_x=True)
     obj.mat = obj.mat.reshape(shape_y)
 
     # --- STEP 3: X-FFT ---
@@ -533,7 +600,7 @@ def execute_distributed_fft(obj: FourPoint, comm: MPI.Comm) -> FourPoint:
 
     shape_x = obj.mat.shape
     obj.mat = obj.mat.reshape(-1, nx, *shape_x[1:])
-    fft.fftn(obj.mat, axes=(1,), overwrite_x=True)
+    obj.mat = fft.fftn(obj.mat, axes=(1,), overwrite_x=True)
     obj.mat = obj.mat.reshape(shape_x)
 
     # --- STEP 4: BACK TO FLAT ---

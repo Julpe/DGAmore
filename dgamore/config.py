@@ -3,6 +3,15 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+"""
+Global configuration singleton. This module holds the process-wide mutable state of a DGAmore run as module-level
+instances of the ``*Config`` classes (``box``, ``lattice``, ``sys``, ``dmft``, ``eliashberg``,
+``lambda_correction``, ``self_consistency``, ``self_energy_interpolation``, ``output``, ``memory``, ``ana_cont``,
+and the ``logger``). :class:`ConfigParser` populates these from a YAML file on rank 0, after which they are
+broadcast to all MPI ranks; most modules read their parameters directly off this module rather than receiving them
+as arguments, so mutating a field changes behavior everywhere. Each ``*Config`` class documents its fields; the
+example YAML config is ``dgamore/dga_config.yaml``.
+"""
 
 import numpy as np
 
@@ -12,9 +21,20 @@ from dgamore.hamiltonian import Hamiltonian
 
 
 class InteractionConfig:
-    """
-    Class to store the interaction parameters. Currently, we only make use of udd, vdd, jdd for local and Kanamori-type
-    interactions. Other parameters are currently not used.
+    r"""
+    Stores the interaction parameters. Currently only ``udd``, ``vdd``, ``jdd`` are used (local and Kanamori-type
+    interactions); the remaining parameters are reserved for future use.
+
+    :ivar udd: Intra-orbital Hubbard interaction :math:`U_{dd}` on the d orbitals.
+    :ivar udp: d-p inter-orbital Hubbard interaction.
+    :ivar upp: Intra-orbital Hubbard interaction :math:`U_{pp}` on the p orbitals.
+    :ivar uppod: Off-diagonal p-p Hubbard interaction.
+    :ivar jdd: Hund's exchange :math:`J_{dd}` on the d orbitals.
+    :ivar jdp: d-p exchange.
+    :ivar jpp: Hund's exchange :math:`J_{pp}` on the p orbitals.
+    :ivar jppod: Off-diagonal p-p exchange.
+    :ivar vdd: Inter-orbital interaction :math:`V_{dd}` on the d orbitals.
+    :ivar vpp: Inter-orbital interaction :math:`V_{pp}` on the p orbitals.
     """
 
     def __init__(self):
@@ -31,10 +51,15 @@ class InteractionConfig:
 
 
 class BoxConfig:
-    """
-    Class to store the box sizes. The main quantities are available in the core region. Due to explicit asymptotics,
-    we can correct the core region by shell-region quantities. The full region is the sum of the core and shell regions
-    and the variable exists for convenience.
+    r"""
+    Stores the Matsubara frequency box sizes. The main quantities live in the core region; explicit asymptotics
+    correct it with shell-region quantities. The full region is the sum of core and shell and exists for convenience.
+
+    :ivar niw_core: Number of positive bosonic core frequencies :math:`\omega`.
+    :ivar niv_core: Number of positive fermionic core frequencies :math:`\nu`.
+    :ivar niv_shell: Number of positive fermionic shell frequencies (asymptotic correction region).
+    :ivar niv_full: Number of positive fermionic full-region frequencies (core + shell).
+    :ivar niv_dmft: Number of positive fermionic frequencies available in the DMFT 1-particle input.
     """
 
     def __init__(self):
@@ -47,10 +72,21 @@ class BoxConfig:
 
 class LatticeConfig:
     """
-    Class to store the lattice parameters. The lattice is defined by the symmetries, the type of lattice, the input
-    Hamiltonian and the input interaction. The k and q grids are defined by the number of k and q points and the
-    symmetries of the lattice. For more information, have a look at the file dga_config.yaml or check out my master's
-    thesis.
+    Stores the lattice parameters: the symmetries, lattice type, input Hamiltonian and input interaction. The k and
+    q grids are built from the number of k/q points and the lattice symmetries. See ``dga_config.yaml`` or the
+    author's master's thesis for details.
+
+    :ivar symmetries: The lattice symmetries (a list of :class:`KnownSymmetries` or the auto sentinel).
+    :ivar type: How the kinetic Hamiltonian is provided (e.g. ``"from_wannier90"``).
+    :ivar er_input: Path(s) to the hopping input.
+    :ivar interaction_type: How the interaction is provided (e.g. ``"one_band_from_dmft"``).
+    :ivar interaction_input: Path(s) to the interaction input.
+    :ivar nk: Number of k-points per spatial direction.
+    :ivar nq: Number of q-points per spatial direction (defaults to ``nk``).
+    :ivar interaction: The :class:`InteractionConfig`.
+    :ivar hamiltonian: The :class:`Hamiltonian` instance.
+    :ivar k_grid: The k-space :class:`KGrid`.
+    :ivar q_grid: The q-space :class:`KGrid`.
     """
 
     def __init__(self):
@@ -70,11 +106,20 @@ class LatticeConfig:
 
 class SelfConsistencyConfig:
     """
-    Class to store the self-consistency parameters. The self-consistency loop is controlled by the maximum number of
-    iterations, the convergence criterion epsilon, the mixing parameter and the option to save the quantities throughout
-    the self-consistency iteration. If previous_sc_path is set, the self-consistency will be started from the previous
-    self-consistency iteration found in this path. We also added the possibility to change the mixing scheme from "linear" to
-    (periodic) Pulay mixing, using a history of the last couple iterations if available.
+    Stores the self-consistency-loop parameters: the maximum iteration count, the convergence criterion, the mixing
+    parameter/scheme and continuation options. If ``previous_sc_path`` is set, the loop resumes from a previous run.
+    The mixing scheme can be ``"linear"``, ``"pulay"`` or ``"anderson"`` (the latter two use an iteration history).
+
+    :ivar max_iter: Maximum number of self-consistency iterations.
+    :ivar epsilon: Relative-residual convergence threshold on the self-energy.
+    :ivar mixing: The mixing parameter :math:`\\alpha`.
+    :ivar mixing_strategy: The mixing scheme (``"linear"``, ``"pulay"`` or ``"anderson"``).
+    :ivar mixing_history_length: Number of past iterations used by the accelerated mixing schemes.
+    :ivar previous_sc_path: Path to a previous self-consistency run to resume from (empty to start fresh).
+    :ivar use_interpolated_sigma: Whether to resume from the interpolated rather than the raw self-energy.
+    :ivar use_lambda_correction: Whether the self-consistency loop applies the lambda correction.
+    :ivar restrict_chi_phys: Whether to restrict the physical susceptibility to positive values.
+    :ivar anderson_prev_res: Cached previous Anderson residual (internal use).
     """
 
     def __init__(self):
@@ -84,6 +129,7 @@ class SelfConsistencyConfig:
         self.mixing_strategy: str = "linear"
         self.mixing_history_length: int = 3
         self.previous_sc_path: str = ""
+        self.use_interpolated_sigma: bool = False
         self.use_lambda_correction: bool = False
         self.restrict_chi_phys: bool = False
         self.anderson_prev_res: float | None = None
@@ -91,9 +137,18 @@ class SelfConsistencyConfig:
 
 class EliashbergConfig:
     """
-    Class to store the configuration for the Eliashberg equation. It is defined by the option to perform the Eliashberg
-    equation, the subfolder name, settings for the power iteration and the option to save the pairing vertex or
-    the full vertex in pp notation.
+    Stores the Eliashberg-step configuration: whether to run it, power-iteration settings, and saving options for the
+    pairing/full vertex in pp notation.
+
+    :ivar perform_eliashberg: Whether to solve the Eliashberg equation.
+    :ivar save_pairing_vertex: Whether to save the singlet/triplet pairing vertices.
+    :ivar save_fq: Whether to save the full ladder vertex (in ph notation) in the irreducible BZ.
+    :ivar construct_fq_cheap: Whether to build the full vertex on the smaller pp frequency box (cheaper).
+    :ivar n_eig: Number of leading eigenvalues/gap functions to compute per channel.
+    :ivar epsilon: Convergence tolerance for the Lanczos eigensolver.
+    :ivar symmetry: Initial gap-function symmetry (``"d-wave"``, ``"p-wave-x"``, ``"p-wave-y"``, or ``"random"``).
+    :ivar include_local_part: Whether to add the local reducible pp diagrams to the pairing vertex.
+    :ivar subfolder_name: Output subfolder name for Eliashberg results.
     """
 
     def __init__(self):
@@ -110,9 +165,10 @@ class EliashbergConfig:
 
 class LambdaCorrectionConfig:
     """
-    Class to store the configuration for the lambda correction. You can set the option to perform the lambda
-    correction and the type. Currently available are "sp" and "spch" for the magnetic channel and density + magnetic
-    channel, respectively.
+    Stores the lambda-correction configuration.
+
+    :ivar perform_lambda_correction: Whether to apply the Moriya lambda correction.
+    :ivar type: Correction type: ``"sp"`` (magnetic channel only) or ``"spch"`` (density and magnetic channels).
     """
 
     def __init__(self):
@@ -121,9 +177,19 @@ class LambdaCorrectionConfig:
 
 
 class DmftConfig:
-    """
-    Class to store the DMFT input file parameters. The DMFT section contains the input path, the filenames
-    for the 1-particle and 2-particle data and the option to symmetrize the 2-particle data with respect to v and v'.
+    r"""
+    Stores the DMFT input-file parameters: the input path, the 1- and 2-particle data filenames, symmetrization
+    options and the inequivalent-atom structure.
+
+    :ivar type: DMFT solver/format of the input (e.g. ``"w2dyn"``).
+    :ivar input_path: Directory containing the DMFT input files.
+    :ivar fname_1p: Filename of the 1-particle data.
+    :ivar fname_2p: Filename of the 2-particle data.
+    :ivar do_sym_v_vp: Whether to symmetrize the 2-particle data with respect to :math:`(\nu, \nu')`.
+    :ivar symmetrize_orbitals: 1-based orbital indices to symmetrize over (empty for none).
+    :ivar n_ineq: Number of inequivalent atoms.
+    :ivar ineq_ordering: Ordering of the inequivalent atoms.
+    :ivar n_bands_per_ineq: Number of bands per inequivalent atom.
     """
 
     def __init__(self):
@@ -139,10 +205,18 @@ class DmftConfig:
 
 
 class SystemConfig:
-    """
-    Class to store the system parameters. It contains the number of bands, the inverse temperature beta, the
-    chemical potential mu and the total filling n. The occupation numbers for the different bands are
-    stored in the occ array for the local case and occ_k for the k-dependent occupation.
+    r"""
+    Stores the physical system parameters and derived quantities updated during the run.
+
+    :ivar beta: Inverse temperature :math:`\beta`.
+    :ivar mu: Chemical potential :math:`\mu` (updated during self-consistency).
+    :ivar mu_dmft: Chemical potential of the DMFT input.
+    :ivar n: Total filling :math:`n`.
+    :ivar n_bands: Number of bands.
+    :ivar occ: Local (k-averaged) occupation matrix.
+    :ivar occ_k: k-resolved occupation matrix.
+    :ivar occ_dmft: Local occupation matrix from the DMFT input.
+    :ivar occ_dmft_per_ineq: DMFT occupation matrices per inequivalent atom.
     """
 
     def __init__(self):
@@ -158,8 +232,12 @@ class SystemConfig:
 
 
 class SelfEnergyInterpolationConfig:
-    """
-    Class to store the interpolation parameters for the self-energy, such as target beta and target niv.
+    r"""
+    Stores the self-energy interpolation parameters (re-gridding to a different temperature/frequency box).
+
+    :ivar do_interpolation: Whether to additionally save an interpolated self-energy each iteration.
+    :ivar beta_target: Target inverse temperature :math:`\beta` of the interpolation.
+    :ivar niv_target: Target number of positive fermionic frequencies of the interpolation.
     """
 
     def __init__(self):
@@ -170,9 +248,13 @@ class SelfEnergyInterpolationConfig:
 
 class OutputConfig:
     """
-    Class to store the output parameters. The output path is the path where the results are saved, the plotting path
-    is the path where the plots are saved, and the plotting subfolder name is the name of the subfolder in the plotting
-    path where the plots are saved to. The Eliashberg path is the absolute path where the Eliashberg results are saved.
+    Stores the output paths.
+
+    :ivar output_path: Directory where the main results are written.
+    :ivar do_plotting: Whether to produce plots (rank 0 only).
+    :ivar plotting_path: Directory where plots are written.
+    :ivar plotting_subfolder_name: Subfolder name (under ``plotting_path``) for the plots.
+    :ivar eliashberg_path: Directory where Eliashberg results are written.
     """
 
     def __init__(self):
@@ -185,8 +267,14 @@ class OutputConfig:
 
 class MemoryConfig:
     """
-    Class to store parameters that decide, whether the code should perform very fast (but memory-intensive) calculations
-    or less memory-intensive calculations that are substantially slower.
+    Stores the speed-vs-memory trade-off switches. Each flag, when True, selects a slower but more memory-frugal code
+    path for the corresponding quantity.
+
+    :ivar save_memory_for_chi0q: Use the per-q einsum bubble instead of the FFT bubble.
+    :ivar save_memory_for_chiq_aux: Use the per-q auxiliary-susceptibility path and per-rank BZ mapping.
+    :ivar save_memory_for_sde: Use the q-loop self-energy contraction instead of the FFT one.
+    :ivar save_memory_for_fq: Use the per-q full-vertex construction in the Eliashberg step.
+    :ivar save_memory_for_lanczos: Use the frequency-distributed Lanczos solver.
     """
 
     def __init__(self):
@@ -199,7 +287,14 @@ class MemoryConfig:
 
 class AnaContConfig:
     """
-    Class that takes care of the configuration for the analytic continuation using the maximum entropy method.
+    Stores the analytic-continuation (maximum-entropy) configuration.
+
+    :ivar do_ana_cont_green_dga: Whether to continue the DGA Green's function to real frequencies.
+    :ivar do_ana_cont_green_dmft: Whether to continue the DMFT Green's function to real frequencies.
+    :ivar w_count: Number of real-frequency points.
+    :ivar plot_spectrum: Whether to plot the resulting spectral function.
+    :ivar k_path: The k-path (list of ``(kx, ky, kz, label)`` tuples) for the spectral function.
+    :ivar energy_window: The real-frequency window ``(w_min, w_max)``.
     """
 
     def __init__(self):

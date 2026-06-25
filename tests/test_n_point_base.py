@@ -7,20 +7,24 @@
 import os
 import sys
 import types
+from unittest.mock import patch
 
 import numpy as np
 import pytest
+import scipy as sp
+from scipy.signal import resample
 
-from dgamore import brillouin_zone
+import dgamore.symmetry_reduction as sr
 from dgamore import brillouin_zone as bz
-from dgamore.n_point_base import IHaveChannel, IHaveMat, IAmNonLocal, SpinChannel, FrequencyNotation
+from dgamore.interaction import LocalInteraction, Interaction
+from dgamore.n_point_base import IHaveChannel, IHaveMat, IAmNonLocal, SpinChannel, FrequencyNotation, DTYPE
 
 
 # ----- Tests for IHaveMat -----
 def test_initializes_with_correct_matrix_and_shape():
     mat = np.array([[1, 2], [3, 4]])
     obj = IHaveMat(mat)
-    assert np.allclose(obj.mat, mat, rtol=1e-2)
+    assert np.allclose(obj.mat, mat, atol=1e-6)
     assert obj.original_shape == mat.shape
 
 
@@ -43,7 +47,7 @@ def test_multiplies_with_scalar_correctly():
     mat = np.array([[1, 2], [3, 4]])
     obj = IHaveMat(mat)
     result = obj * 2
-    assert np.allclose(result.mat, mat * 2, rtol=1e-2)
+    assert np.allclose(result.mat, mat * 2, atol=1e-6)
 
 
 def test_raises_error_when_multiplying_with_invalid_type():
@@ -57,21 +61,21 @@ def test_performs_right_multiplication_with_scalar_correctly():
     mat = np.array([[1, 2], [3, 4]])
     obj = IHaveMat(mat)
     result = 2 * obj
-    assert np.allclose(result.mat, mat * 2, rtol=1e-2)
+    assert np.allclose(result.mat, mat * 2, atol=1e-6)
 
 
 def test_negates_matrix_correctly():
     mat = np.array([[1, -2], [-3, 4]])
     obj = IHaveMat(mat)
     result = -obj
-    assert np.allclose(result.mat, -mat, rtol=1e-2)
+    assert np.allclose(result.mat, -mat, atol=1e-6)
 
 
 def test_divides_by_scalar_correctly():
     mat = np.array([[2, 4], [6, 8]])
     obj = IHaveMat(mat)
     result = obj / 2
-    assert np.allclose(result.mat, mat / 2, rtol=1e-2)
+    assert np.allclose(result.mat, mat / 2, atol=1e-6)
 
 
 def test_raises_error_when_dividing_by_invalid_type():
@@ -95,7 +99,7 @@ def test_performs_einsum_contraction_correctly():
     obj1 = IHaveMat(mat1)
     obj2 = IHaveMat(mat2)
     result = obj1.times("ij,jk->ik", obj2)
-    assert np.allclose(result, np.dot(mat1, mat2), rtol=1e-2)
+    assert np.allclose(result, np.dot(mat1, mat2), atol=1e-6)
 
 
 def test_performs_einsum_contraction_with_multiple_matrices():
@@ -106,7 +110,7 @@ def test_performs_einsum_contraction_with_multiple_matrices():
     obj2 = IHaveMat(mat2)
     obj3 = IHaveMat(mat3)
     result = obj1.times("ij,jk,kl->il", obj2, obj3)
-    assert np.allclose(result, np.dot(np.dot(mat1, mat2), mat3), rtol=1e-2)
+    assert np.allclose(result, np.dot(np.dot(mat1, mat2), mat3), atol=1e-6)
 
 
 def test_raises_error_when_contraction_argument_is_invalid():
@@ -130,7 +134,7 @@ def test_performs_einsum_contraction_with_numpy_array():
     mat2 = np.array([[5, 6], [7, 8]])
     obj = IHaveMat(mat1)
     result = obj.times("ij,jk->ik", mat2)
-    assert np.allclose(result, np.dot(mat1, mat2), rtol=1e-2)
+    assert np.allclose(result, np.dot(mat1, mat2), atol=1e-6)
 
 
 def test_raises_error_when_contraction_string_is_invalid():
@@ -218,7 +222,7 @@ def test_initializes_with_correct_matrix_and_momentum_dimensions():
     mat = np.zeros((4, 4, 4))
     nq = (4, 4, 4)
     obj = IAmNonLocal(mat, nq)
-    assert np.allclose(obj.mat, mat, rtol=1e-2)
+    assert np.allclose(obj.mat, mat, atol=1e-6)
     assert obj.nq == nq
     assert obj.has_compressed_q_dimension is False
 
@@ -227,7 +231,7 @@ def test_initializes_with_compressed_q_dimension():
     mat = np.zeros((64,))
     nq = (4, 4, 4)
     obj = IAmNonLocal(mat, nq, has_compressed_q_dimension=True)
-    assert np.allclose(obj.mat, mat, rtol=1e-2)
+    assert np.allclose(obj.mat, mat, atol=1e-6)
     assert obj.nq == nq
     assert obj.has_compressed_q_dimension is True
 
@@ -236,7 +240,7 @@ def test_shifts_momentum_by_zero_correctly():
     mat = np.zeros((4, 4, 4))
     obj = IAmNonLocal(mat, (4, 4, 4))
     shifted = obj.shift_k_by_q((0, 0, 0))
-    assert np.allclose(shifted.mat, mat, rtol=1e-2)
+    assert np.allclose(shifted.mat, mat, atol=1e-6)
 
 
 def test_shifts_momentum_by_positive_values_correctly():
@@ -244,7 +248,7 @@ def test_shifts_momentum_by_positive_values_correctly():
     obj = IAmNonLocal(mat, (4, 4, 4))
     shifted = obj.shift_k_by_q((1, 1, 1))
     expected = np.roll(mat, shift=(-1, -1, -1), axis=(0, 1, 2))
-    assert np.allclose(shifted.mat, expected, rtol=1e-2)
+    assert np.allclose(shifted.mat, expected, atol=1e-6)
 
 
 def test_shifts_momentum_by_negative_values_correctly():
@@ -252,7 +256,7 @@ def test_shifts_momentum_by_negative_values_correctly():
     obj = IAmNonLocal(mat, (4, 4, 4))
     shifted = obj.shift_k_by_q((-1, -1, -1))
     expected = np.roll(mat, shift=(1, 1, 1), axis=(0, 1, 2))
-    assert np.allclose(shifted.mat, expected, rtol=1e-2)
+    assert np.allclose(shifted.mat, expected, atol=1e-6)
 
 
 def test_shifts_momentum_with_compressed_q_dimension_correctly():
@@ -274,7 +278,7 @@ def test_shifts_momentum_by_pi_correctly():
     obj = IAmNonLocal(mat, (4, 4, 4))
     shifted = obj.shift_k_by_pi()
     expected = np.roll(mat, shift=(2, 2, 2), axis=(0, 1, 2))
-    assert np.allclose(shifted.mat, expected, rtol=1e-2)
+    assert np.allclose(shifted.mat, expected, atol=1e-6)
 
 
 def test_shifts_momentum_by_pi_with_compressed_q_dimension():
@@ -383,7 +387,7 @@ def test_reduces_q_dimension_to_specified_momenta_and_values():
     reduced = obj.reduce_q(q_list)
     expected_values = mat[1, 1, 1], mat[2, 2, 2]
     assert reduced.mat.shape == (2,)
-    assert np.allclose(reduced.mat, expected_values, rtol=1e-2)
+    assert np.allclose(reduced.mat, expected_values, atol=1e-6)
     assert reduced.has_compressed_q_dimension is True
 
 
@@ -428,7 +432,7 @@ def test_maps_to_full_bz_correctly_with_valid_inverse_map():
     nq = (4, 4, 4)
     np.array([0, 1, 2, 3, 4, 5, 6, 7])
     obj = IAmNonLocal(mat, nq, has_compressed_q_dimension=True)
-    grid = brillouin_zone.KGrid(nk=(2, 2, 2), symmetries=[])
+    grid = bz.KGrid(nk=(2, 2, 2), symmetries=[])
     obj.map_to_full_bz(grid, nq=(2, 2, 2))
     assert obj.mat.shape == (8,)
     assert obj.nq == (2, 2, 2)
@@ -447,7 +451,7 @@ def test_updates_nq_correctly_when_provided():
     mat = np.arange(64)
     nq = (4, 4, 4)
     obj = IAmNonLocal(mat, nq, has_compressed_q_dimension=True)
-    grid = brillouin_zone.KGrid(nk=(2, 2, 2), symmetries=[])
+    grid = bz.KGrid(nk=(2, 2, 2), symmetries=[])
     obj.map_to_full_bz(grid, nq=(2, 2, 2))
     assert obj.nq == (2, 2, 2)
 
@@ -455,7 +459,7 @@ def test_updates_nq_correctly_when_provided():
 def test_retains_original_nq_when_not_provided():
     mat = np.arange(64)
     nq = (4, 4, 4)
-    grid = brillouin_zone.KGrid(nk=nq, symmetries=[])
+    grid = bz.KGrid(nk=nq, symmetries=[])
     obj = IAmNonLocal(mat, nq, has_compressed_q_dimension=True)
     obj.map_to_full_bz(grid)
     assert obj.nq == (4, 4, 4)
@@ -466,8 +470,8 @@ def test_performs_fft_correctly_on_decompressed_matrix():
     nq = (4, 4, 4)
     obj = IAmNonLocal(mat, nq)
     result = obj.fft()
-    expected = np.fft.fftn(mat, axes=(0, 1, 2))
-    assert np.allclose(result.mat, expected, rtol=1e-2)
+    expected = sp.fft.fftn(mat, axes=(0, 1, 2))
+    assert np.allclose(result.mat, expected, atol=1e-6)
     assert result.has_compressed_q_dimension is False
 
 
@@ -477,8 +481,8 @@ def test_performs_fft_correctly_on_compressed_matrix():
     obj = IAmNonLocal(mat, nq, has_compressed_q_dimension=True)
     result = obj.fft()
     decompressed_mat = mat.reshape(nq)
-    expected = np.fft.fftn(decompressed_mat, axes=(0, 1, 2)).reshape(64)
-    assert np.allclose(result.mat, expected, rtol=1e-2)
+    expected = sp.fft.fftn(decompressed_mat, axes=(0, 1, 2)).reshape(64)
+    assert np.allclose(result.mat, expected, atol=1e-6)
     assert result.has_compressed_q_dimension is True
 
 
@@ -495,8 +499,8 @@ def test_performs_ifft_correctly_on_decompressed_matrix():
     nq = (4, 4, 4)
     obj = IAmNonLocal(mat, nq)
     result = obj.ifft()
-    expected = np.fft.ifftn(mat, axes=(0, 1, 2))
-    assert np.allclose(result.mat, expected, rtol=1e-2)
+    expected = sp.fft.ifftn(mat, axes=(0, 1, 2))
+    assert np.allclose(result.mat, expected, atol=1e-6)
     assert result.has_compressed_q_dimension is False
 
 
@@ -506,8 +510,8 @@ def test_performs_ifft_correctly_on_compressed_matrix():
     obj = IAmNonLocal(mat, nq, has_compressed_q_dimension=True)
     result = obj.ifft()
     decompressed_mat = mat.reshape(nq)
-    expected = np.fft.ifftn(decompressed_mat, axes=(0, 1, 2)).reshape(64)
-    assert np.allclose(result.mat, expected, rtol=1e-2)
+    expected = sp.fft.ifftn(decompressed_mat, axes=(0, 1, 2)).reshape(64)
+    assert np.allclose(result.mat, expected, atol=1e-6)
     assert result.has_compressed_q_dimension is True
 
 
@@ -525,7 +529,7 @@ def test_flips_momentum_axis_correctly_for_decompressed_matrix():
     obj = IAmNonLocal(mat, nq)
     flipped = obj.flip_momentum_axis()
     expected = np.roll(np.flip(mat, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-    assert np.allclose(flipped.mat, expected, rtol=1e-2)
+    assert np.allclose(flipped.mat, expected, atol=1e-6)
     assert flipped.has_compressed_q_dimension is False
 
 
@@ -536,7 +540,7 @@ def test_flips_momentum_axis_correctly_for_compressed_matrix():
     flipped = obj.flip_momentum_axis()
     decompressed_mat = mat.reshape(nq)
     expected = np.roll(np.flip(decompressed_mat, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2)).reshape(64)
-    assert np.allclose(flipped.mat, expected, rtol=1e-2)
+    assert np.allclose(flipped.mat, expected, atol=1e-6)
     assert flipped.has_compressed_q_dimension is True
 
 
@@ -819,7 +823,7 @@ def test_filter_q_index_returns_correct_index():
     obj = IAmNonLocal(mat, nq)
     result = obj.filter_q_index(5)
     assert result.mat.shape == (1, 2)
-    assert np.allclose(result.mat[0], mat.reshape(64, 2)[5], rtol=1e-2)
+    assert np.allclose(result.mat[0], mat.reshape(64, 2)[5], atol=1e-6)
 
 
 def test_filter_q_index_default_index_is_zero():
@@ -828,7 +832,7 @@ def test_filter_q_index_default_index_is_zero():
     obj = IAmNonLocal(mat, nq)
     result = obj.filter_q_index()
     assert result.mat.shape == (1, 2)
-    assert np.allclose(result.mat[0], mat.reshape(64, 2)[0], rtol=1e-2)
+    assert np.allclose(result.mat[0], mat.reshape(64, 2)[0], atol=1e-6)
 
 
 def test_filter_q_index_compresses_q_dimension_if_not_already_compressed():
@@ -846,7 +850,7 @@ def test_filter_q_index_does_not_modify_original_when_already_compressed():
     obj = IAmNonLocal(mat, nq, has_compressed_q_dimension=True)
     original_mat = obj.mat.copy()
     _ = obj.filter_q_index(3)
-    assert np.allclose(obj.mat, original_mat, rtol=1e-2)
+    assert np.allclose(obj.mat, original_mat, atol=1e-6)
 
 
 def test_filter_q_index_sets_nq_to_one():
@@ -879,7 +883,7 @@ def test_filter_q_index_returns_deep_copy():
     obj = IAmNonLocal(mat, nq)
     result = obj.filter_q_index(0)
     result.mat[0, 0] = 9999
-    assert not np.allclose(obj.mat.reshape(64, 2)[0, 0], 9999, rtol=1e-2)
+    assert not np.allclose(obj.mat.reshape(64, 2)[0, 0], 9999, atol=1e-6)
 
 
 def test_filter_q_index_last_index():
@@ -887,7 +891,7 @@ def test_filter_q_index_last_index():
     nq = (4, 4, 4)
     obj = IAmNonLocal(mat, nq)
     result = obj.filter_q_index(63)
-    assert np.allclose(result.mat[0], mat.reshape(64, 2)[63], rtol=1e-2)
+    assert np.allclose(result.mat[0], mat.reshape(64, 2)[63], atol=1e-6)
 
 
 def test_filter_q_index_raises_for_out_of_bounds_index():
@@ -898,12 +902,227 @@ def test_filter_q_index_raises_for_out_of_bounds_index():
         obj.filter_q_index(64)
 
 
-# =============================================================================
-# _map_to_full_bz: auto-mode branch
-# =============================================================================
-from unittest.mock import patch
+def test_q_mean_averages_full_momentum_grid_to_single_q_point():
+    mat = np.arange(64 * 2).reshape((4, 4, 4, 2))
+    nq = (4, 4, 4)
+    obj = IAmNonLocal(mat, nq)
 
-import dgamore.symmetry_reduction as _sr
+    result = obj.q_mean()
+
+    expected = np.mean(mat, axis=(0, 1, 2))[None, None, None, ...]
+    assert result.mat.shape == (1, 1, 1, 2)
+    assert np.allclose(result.mat, expected, atol=1e-6)
+    assert result.nq == (1, 1, 1)
+    assert result.original_shape == (1, 1, 1, 2)
+    assert np.allclose(obj.mat, mat, atol=1e-6)
+
+
+def test_q_mean_averages_compressed_momentum_grid_to_single_q_point():
+    mat = np.arange(64 * 2).reshape((64, 2))
+    nq = (4, 4, 4)
+    obj = IAmNonLocal(mat, nq, has_compressed_q_dimension=True)
+
+    result = obj.q_mean()
+
+    expected = np.mean(mat, axis=0)[None, ...]
+    assert result.mat.shape == (1, 2)
+    assert np.allclose(result.mat, expected, atol=1e-6)
+    assert result.nq == (1, 1, 1)
+    assert result.original_shape == (1, 2)
+    assert np.allclose(obj.mat, mat, atol=1e-6)
+
+
+def test_q_mean_preserves_values_for_single_momentum_point():
+    mat = np.array([[[[3.0, -2.0j]]]], dtype=complex)
+    nq = (1, 1, 1)
+    obj = IAmNonLocal(mat, nq)
+
+    result = obj.q_mean()
+
+    assert result.mat.shape == (1, 1, 1, 2)
+    assert np.allclose(result.mat[0, 0, 0], mat[0, 0, 0], atol=1e-6)
+    assert result.nq == (1, 1, 1)
+    assert np.allclose(obj.mat, mat, atol=1e-6)
+
+
+def _rng_payload(shape, seed=0):
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+
+
+def test_interpolate_q_grid_same_grid_returns_unchanged_copy():
+    mat = _rng_payload((4, 4, 4, 1, 1, 3))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    out = obj.interpolate_q_grid((4, 4, 4))
+    assert out is not obj
+    assert np.array_equal(out.mat, mat)
+    assert out.nq == (4, 4, 4)
+
+
+def test_interpolate_q_grid_same_grid_no_copy_returns_self():
+    mat = _rng_payload((4, 4, 4, 1, 1, 2))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    out = obj.interpolate_q_grid((4, 4, 4), copy=False)
+    assert out is obj
+
+
+def test_interpolate_q_grid_commensurate_downsample_is_exact_slice():
+    mat = _rng_payload((4, 4, 4, 2, 2, 3))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    out = obj.interpolate_q_grid((2, 2, 2))
+    assert out.current_shape == (2, 2, 2, 2, 2, 3)
+    assert np.array_equal(out.mat, mat[::2, ::2, ::2])
+    assert out.nq == (2, 2, 2)
+
+
+def test_interpolate_q_grid_collapse_z_takes_kz0_plane():
+    mat = _rng_payload((4, 4, 16, 1, 1, 2))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 16))
+    out = obj.interpolate_q_grid((4, 4, 1))
+    assert out.current_shape == (4, 4, 1, 1, 1, 2)
+    assert np.array_equal(out.mat, mat[:, :, 0:1])
+    assert out.nq == (4, 4, 1)
+
+
+def test_interpolate_q_grid_upsample_shape_and_nq():
+    mat = _rng_payload((4, 4, 4, 1, 1, 3))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    out = obj.interpolate_q_grid((8, 8, 8))
+    assert out.current_shape == (8, 8, 8, 1, 1, 3)
+    assert out.nq == (8, 8, 8)
+
+
+def test_interpolate_q_grid_upsample_preserves_values_at_shared_points():
+    mat = _rng_payload((4, 4, 4, 1, 1, 2))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    out = obj.interpolate_q_grid((8, 8, 8))
+    assert np.allclose(out.mat[::2, ::2, ::2], mat, atol=1e-10)
+
+
+def test_interpolate_q_grid_up_then_commensurate_down_round_trips():
+    mat = _rng_payload((4, 4, 4, 2, 2, 3))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    out = obj.interpolate_q_grid((8, 8, 8)).interpolate_q_grid((4, 4, 4))
+    assert np.allclose(out.mat, mat, atol=1e-10)
+    assert out.nq == (4, 4, 4)
+
+
+def test_interpolate_q_grid_incommensurate_matches_scipy_resample():
+    mat = _rng_payload((12, 12, 4, 1, 1, 2))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (12, 12, 4))
+    out = obj.interpolate_q_grid((8, 8, 4))
+    ref = resample(resample(mat, 8, axis=0), 8, axis=1)
+    assert out.current_shape == (8, 8, 4, 1, 1, 2)
+    assert np.allclose(out.mat, ref, atol=1e-10)
+
+
+def test_interpolate_q_grid_incommensurate_is_not_a_slice():
+    mat = _rng_payload((12, 4, 4, 1, 1, 1))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (12, 4, 4))
+    out = obj.interpolate_q_grid((8, 4, 4))
+    # no integer stride from 12 -> 8; the band-limited result must differ from a naive slice
+    assert not np.allclose(out.mat[:, 0, 0, 0, 0, 0], mat[:8, 0, 0, 0, 0, 0])
+
+
+def test_interpolate_q_grid_mixed_axes_slice_and_resample():
+    mat = _rng_payload((8, 6, 4, 1, 1, 2))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (8, 6, 4))
+    out = obj.interpolate_q_grid((4, 12, 4))
+    assert out.current_shape == (4, 12, 4, 1, 1, 2)
+    assert out.nq == (4, 12, 4)
+    # axis 0 is commensurate-down (exact slice), axis 1 is upsampled (Fourier)
+    ref = resample(mat[::2], 12, axis=1)
+    assert np.allclose(out.mat, ref, atol=1e-10)
+
+
+def test_interpolate_q_grid_compressed_in_compressed_out():
+    mat = _rng_payload((64, 2, 2, 3))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4), has_compressed_q_dimension=True)
+    out = obj.interpolate_q_grid((2, 2, 2))
+    assert out.has_compressed_q_dimension is True
+    assert out.current_shape == (8, 2, 2, 3)
+    assert out.nq == (2, 2, 2)
+
+
+def test_interpolate_q_grid_compressed_values_match_decompressed_path():
+    mat = _rng_payload((4, 4, 4, 1, 1, 2))
+    dec = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    comp = _DoublePrecisionNonLocal(mat.reshape(64, 1, 1, 2).copy(), (4, 4, 4), has_compressed_q_dimension=True)
+    out_dec = dec.interpolate_q_grid((2, 2, 2))
+    out_comp = comp.interpolate_q_grid((2, 2, 2))
+    assert np.array_equal(out_comp.mat, out_dec.mat.reshape(8, 1, 1, 2))
+
+
+def test_interpolate_q_grid_decompressed_in_decompressed_out():
+    mat = _rng_payload((4, 4, 4, 1, 1, 2))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    out = obj.interpolate_q_grid((2, 2, 2))
+    assert out.has_compressed_q_dimension is False
+
+
+def test_interpolate_q_grid_updates_original_shape():
+    mat = _rng_payload((4, 4, 4, 1, 1, 2))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    out = obj.interpolate_q_grid((2, 2, 2))
+    assert out.original_shape == out.current_shape == (2, 2, 2, 1, 1, 2)
+
+
+def test_interpolate_q_grid_leaves_trailing_axes_untouched():
+    mat = _rng_payload((4, 4, 4, 2, 3, 5))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    out = obj.interpolate_q_grid((8, 8, 8))
+    assert out.current_shape[3:] == (2, 3, 5)
+
+
+def test_interpolate_q_grid_copy_true_leaves_original_intact():
+    mat = _rng_payload((4, 4, 4, 1, 1, 2))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj.interpolate_q_grid((2, 2, 2))
+    assert obj.current_shape == (4, 4, 4, 1, 1, 2)
+    assert obj.nq == (4, 4, 4)
+
+
+def test_interpolate_q_grid_copy_false_mutates_self():
+    mat = _rng_payload((4, 4, 4, 1, 1, 2))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    out = obj.interpolate_q_grid((2, 2, 2), copy=False)
+    assert out is obj
+    assert obj.current_shape == (2, 2, 2, 1, 1, 2)
+    assert obj.nq == (2, 2, 2)
+
+
+def test_interpolate_q_grid_production_class_returns_complex64():
+    mat = _rng_payload((4, 4, 4, 1, 1, 2))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
+    out = obj.interpolate_q_grid((8, 8, 8))
+    assert out.mat.dtype == np.complex64
+
+
+def test_interpolate_q_grid_rejects_non_positive_sizes():
+    mat = _rng_payload((4, 4, 4, 1, 1, 2))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    with pytest.raises(ValueError):
+        obj.interpolate_q_grid((4, 4, 0))
+    with pytest.raises(ValueError):
+        obj.interpolate_q_grid((4, -2, 4))
+
+
+def test_interpolate_q_grid_rejects_ibz_reduced_input():
+    # compressed first dim (10) != prod(nq) = 64 -> IBZ-like, must be rejected
+    mat = _rng_payload((10, 1, 1, 2))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4), has_compressed_q_dimension=True)
+    with pytest.raises(ValueError, match="full-BZ"):
+        obj.interpolate_q_grid((2, 2, 2))
+
+
+def test_interpolate_q_grid_single_kpoint_axis_upsamples_constant():
+    # n_old = 1 -> resample replicates the constant along that axis
+    mat = _rng_payload((4, 4, 1, 1, 1, 2))
+    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 1))
+    out = obj.interpolate_q_grid((4, 4, 3))
+    assert out.current_shape == (4, 4, 3, 1, 1, 2)
+    assert np.allclose(out.mat[:, :, 0], out.mat[:, :, 1], atol=1e-10)
+    assert np.allclose(out.mat[:, :, 0], out.mat[:, :, 2], atol=1e-10)
 
 
 def _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1, hopping=1.0, include_antiunitary=False):
@@ -1042,7 +1261,7 @@ def test_map_to_full_bz_auto_delegates_to_apply_auto_orbital_transform():
     obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
 
     # Patch so we can assert it gets called with the right shapes and args
-    with patch.object(_sr, "apply_auto_orbital_transform", wraps=_sr.apply_auto_orbital_transform) as spy:
+    with patch.object(sr, "apply_auto_orbital_transform", wraps=sr.apply_auto_orbital_transform) as spy:
         obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     assert spy.call_count == 1
     _, kwargs = spy.call_args
@@ -1059,7 +1278,7 @@ def test_map_to_full_bz_auto_passes_num_orbital_dimensions_4_for_vertex():
     Gamma_full = np.einsum("...ab,...cd->...abcd", H, H)
     Gamma_ibz = Gamma_full.reshape(-1, nb, nb, nb, nb)[grid.irrk_ind].copy()
     obj = _DoublePrecisionNonLocal(mat=Gamma_ibz, nq=(3, 3, 3), has_compressed_q_dimension=True)
-    with patch.object(_sr, "apply_auto_orbital_transform", wraps=_sr.apply_auto_orbital_transform) as spy:
+    with patch.object(sr, "apply_auto_orbital_transform", wraps=sr.apply_auto_orbital_transform) as spy:
         obj._map_to_full_bz(grid, num_orbital_dimensions=4)
     _, kwargs = spy.call_args
     assert kwargs["num_orbital_dimensions"] == 4
@@ -1072,7 +1291,7 @@ def test_map_to_full_bz_legacy_kgrid_does_not_call_orbital_transform():
     nb = 1
     ibz_payload = np.arange(grid.nk_irr).astype(np.complex128).reshape(grid.nk_irr, nb, nb)
     obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
-    with patch.object(_sr, "apply_auto_orbital_transform", wraps=_sr.apply_auto_orbital_transform) as spy:
+    with patch.object(sr, "apply_auto_orbital_transform", wraps=sr.apply_auto_orbital_transform) as spy:
         obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     assert spy.call_count == 0
 
@@ -1172,3 +1391,65 @@ def test_map_to_full_bz_auto_irrk_inv_consistency_at_every_fbz_point():
             block = block.conj()
         expected = sigmas[k] * Us[k] @ block @ Us[k].conj().T
         assert np.allclose(H_rec[k], expected, atol=1e-12), f"mismatch at FBZ k={k}"
+
+
+# --- A4: accurate __mul__ error message ---
+def test_mul_rejects_ndarray_with_accurate_message():
+    u = LocalInteraction(np.ones((2, 2, 2, 2)))
+    with pytest.raises(ValueError, match=r"only supported with numbers\."):
+        u * np.ones((2, 2, 2, 2))
+
+
+# --- B1: mat setter is copy-free for the storage dtype, still casts other dtypes ---
+def test_mat_setter_does_not_copy_complex64():
+    u = LocalInteraction(np.ones((2, 2, 2, 2)))
+    arr = np.zeros((2, 2, 2, 2), dtype=np.complex64)
+    u.mat = arr
+    assert u.mat is arr  # no redundant copy for already-complex64 input
+
+
+def test_mat_setter_still_casts_other_dtypes():
+    u = LocalInteraction(np.ones((2, 2, 2, 2)))
+    arr = np.zeros((2, 2, 2, 2), dtype=np.float64)
+    u.mat = arr
+    assert u.mat.dtype == np.complex64
+    assert u.mat is not arr
+
+
+# --- A3: fft/ifft assign the transform result (do not rely on overwrite_x side effect) ---
+def test_fft_ifft_round_trip():
+    rng = np.random.default_rng(0)
+    mat = (rng.standard_normal((2, 2, 1, 1, 1, 1, 1)) + 1j * rng.standard_normal((2, 2, 1, 1, 1, 1, 1))).astype(
+        np.complex64
+    )
+    obj = Interaction(mat, SpinChannel.NONE, (2, 2, 1), has_compressed_q_dimension=False)
+    original = obj.mat.copy()
+    out = obj.fft(copy=True).ifft(copy=True)
+    assert np.allclose(out.mat, original, atol=1e-4)
+
+
+def test_fft_matches_reference_fftn():
+    rng = np.random.default_rng(1)
+    mat = (rng.standard_normal((3, 2, 1, 1, 1, 1, 1)) + 1j * rng.standard_normal((3, 2, 1, 1, 1, 1, 1))).astype(
+        np.complex64
+    )
+    obj = Interaction(mat.copy(), SpinChannel.NONE, (3, 2, 1), has_compressed_q_dimension=False)
+    out = obj.fft(copy=True)
+    assert np.allclose(out.mat, np.fft.fftn(mat, axes=(0, 1, 2)), atol=1e-3)
+
+
+# --- Global DTYPE: single switch point for storage precision ---
+def test_dtype_default_is_complex64():
+    assert DTYPE == np.complex64
+    assert IHaveMat.DTYPE == np.complex64
+
+
+def test_dtype_constant_drives_storage_precision(monkeypatch):
+    # The mat setter is the single enforcement point: every IHaveMat-derived object is coerced to the
+    # module-level DTYPE. (The canonical way to switch precision is editing the DTYPE constant in source,
+    # so all modules import the new value; here we patch the setter's global to verify the indirection.)
+    import dgamore.n_point_base as npb
+
+    monkeypatch.setattr(npb, "DTYPE", np.complex128)
+    u = LocalInteraction(np.ones((2, 2, 2, 2)))
+    assert u.mat.dtype == np.complex128

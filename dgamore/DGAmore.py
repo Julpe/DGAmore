@@ -4,6 +4,14 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+"""
+Main entry point and top-level driver of a DGAmore run (installed on the PATH as ``DGAmore.py``). The
+:func:`execute_dga_routine` orchestrates the full pipeline: parse the config, load the DMFT input, run the local
+Schwinger-Dyson step per inequivalent atom and assemble the full multi-band quantities, run the non-local ladder
+DGA self-energy, optionally analytically continue to real frequencies, and optionally solve the Eliashberg
+equation -- saving and plotting results along the way. Rank 0 owns the file I/O, local assembly and plotting; the
+configuration and the assembled local quantities are broadcast to the other MPI ranks.
+"""
 
 import itertools as it
 import logging
@@ -33,6 +41,14 @@ logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
 
 def execute_dga_routine():
+    """
+    Runs the complete DGA pipeline end to end: config parsing and folder setup, DMFT input loading, the local
+    Schwinger-Dyson step (per inequivalent atom, assembled into full multi-band quantities), the non-local
+    ladder-DGA self-energy and Green's function, optional analytic continuation, and the optional Eliashberg
+    solution -- saving and plotting results throughout. This is the console-script entry point.
+
+    :return: None.
+    """
     configure_matplotlib()
 
     comm = MPI.COMM_WORLD
@@ -166,7 +182,7 @@ def execute_dga_routine():
 
             config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[ineq - 1]
 
-            u_loc_ineq = LocalInteraction(u_loc.mat[n_start:n_end, n_start:n_end, n_start:n_end, n_start:n_end])
+            u_loc_ineq = LocalInteraction(u_loc.mat[n_start:n_end, n_start:n_end, n_start:n_end, n_start:n_end].copy())
 
             logger.info(f"Starting local Schwinger-Dyson equation (SDE) for atom {ineq}.")
 
@@ -194,6 +210,15 @@ def execute_dga_routine():
             logger.info(f"Local Schwinger-Dyson equation (SDE) for atom {ineq} done.")
 
         def write_to_full_4pt_quantity(obj_full, obj_ineq: LocalFourPoint, sl: slice):
+            """
+            Writes a single inequivalent atom's four-point quantity into the orbital-diagonal block of the assembled
+            full multi-band quantity (allocating the full object on the first call).
+
+            :param obj_full: The full multi-band object, or None to allocate it from ``obj_ineq``.
+            :param obj_ineq: The per-atom :class:`LocalFourPoint` to insert.
+            :param sl: The orbital slice (block) of this atom in the full object.
+            :return: The full object with this atom's block filled in.
+            """
             if obj_full is None:
                 obj_full = deepcopy(obj_ineq)
                 obj_full.mat = np.zeros(
@@ -206,6 +231,16 @@ def execute_dga_routine():
         def write_to_full_2pt_quantity(
             obj_full, obj_ineq: SelfEnergy | GreensFunction, sl: slice, has_momentum: bool = True
         ):
+            """
+            Writes a single inequivalent atom's two-point quantity into the orbital-diagonal block of the assembled
+            full multi-band quantity (allocating the full object on the first call), resetting the self-energy moments.
+
+            :param obj_full: The full multi-band object, or None to allocate it from ``obj_ineq``.
+            :param obj_ineq: The per-atom :class:`SelfEnergy` or :class:`GreensFunction` to insert.
+            :param sl: The orbital slice (block) of this atom in the full object.
+            :param has_momentum: Whether the object carries leading momentum axes ``[1, 1, 1, ...]``.
+            :return: The full object with this atom's block filled in.
+            """
             if obj_full is None:
                 obj_full = deepcopy(obj_ineq)
                 obj_full.mat = np.zeros(
@@ -223,6 +258,15 @@ def execute_dga_routine():
             return obj_full
 
         def write_smom(obj_full: SelfEnergy, obj_ineq: SelfEnergy, sl: slice):
+            """
+            Writes a single inequivalent atom's self-energy high-frequency moments into the orbital-diagonal block of
+            the assembled full self-energy.
+
+            :param obj_full: The full multi-band :class:`SelfEnergy`.
+            :param obj_ineq: The per-atom :class:`SelfEnergy` whose moments are copied.
+            :param sl: The orbital slice (block) of this atom in the full object.
+            :return: The full self-energy with this atom's moment block filled in.
+            """
             obj_full._smom0[sl, sl] = obj_ineq._smom0
             obj_full._smom1[sl, sl] = obj_ineq._smom1
             return obj_full
@@ -257,6 +301,7 @@ def execute_dga_routine():
     if config.lambda_correction.perform_lambda_correction and comm.rank == 0:
         chi_d_full.save(name="chi_dens_loc", output_dir=config.output.output_path)
         chi_m_full.save(name="chi_magn_loc", output_dir=config.output.output_path)
+        del chi_d, chi_m
 
     if comm.rank == 0:
         g2_dens_full.save(name="g2_dens_loc", output_dir=config.output.output_path)
@@ -296,19 +341,6 @@ def execute_dga_routine():
         plotting.plot_nu_nup(gamma_magn_plot, omega=-10, name="Gamma_magn", output_dir=config.output.plotting_path)
         logger.info("Plotted gamma (magn).")
         del gamma_magn_plot, gamma_m_full
-
-        g_dmft_full._ek = ek
-        plotting.chi_checks(
-            [chi_d_full.mat],
-            [chi_m_full.mat],
-            config.sys.beta,
-            ["Loc-tilde"],
-            g_dmft_full.e_kin,
-            name="loc",
-            output_dir=config.output.plotting_path,
-        )
-        del chi_d, chi_m
-        logger.info("Plotted checks of the susceptibility.")
 
         sigma_list = []
         sigma_names = []
@@ -497,6 +529,11 @@ def setup_lambda_correction_settings(comm: MPI.Comm) -> None:
     If the user has enabled the lambda correction in the lambda correction settings, but not in the self-consistency settings,
     the self-consistency will be set to a single iteration with full mixing. Will raise an error if the user tries to enable
     the lambda correction for multi-band systems.
+
+    :param comm: The MPI communicator (only rank 0 validates the multi-band restriction).
+    :return: None.
+    :raises ValueError: If lambda correction is requested for a multi-band system, or the lambda/self-consistency
+        settings are inconsistent.
     """
     if (
         comm.rank == 0
@@ -528,13 +565,15 @@ def setup_lambda_correction_settings(comm: MPI.Comm) -> None:
         config.logger.info("Performing one-shot DGA without lambda correction.")
         return
 
-    raise ValueError("Invalid configuration for lambda correction and self-consistency. Please check the config file.")
+    raise ValueError("Invalid configuration for lambda correction and self-consistency. Please review the config file.")
 
 
 def configure_matplotlib():
     """
     Configures matplotlib to use the Euler font for mathematical expressions if it is available on the system. This is
     done because The Euler font is the default math font in my thesis.
+
+    :return: None.
     """
     euler_font = [s for s in font_manager.findSystemFonts() if "euler" in s.lower()]
     if len(euler_font) == 0:
