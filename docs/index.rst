@@ -51,10 +51,11 @@ computation: :mod:`~dgamore.matsubara_frequencies` handles frequency-index arith
 figures.
 
 For the physics and the precise equations behind the implementation, see the accompanying paper and the author's
-Master's thesis, both linked on the :doc:`about` page. The pages below walk through installation, running a
-calculation, and contributing, while the :doc:`api` documents every module in detail.
+Master's thesis, both linked on the :doc:`about` page. The pages listed in the sidebar walk through installation,
+running a calculation, and contributing, while the :doc:`api` documents every module in detail.
 
 .. toctree::
+   :hidden:
    :maxdepth: 2
    :caption: Contents
 

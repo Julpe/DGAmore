@@ -1,0 +1,13 @@
+/* DGAmore documentation - small theme tweaks on top of pydata-sphinx-theme. */
+
+/* The navbar centre slot is intentionally empty (the section links live in the left sidebar instead, see
+   ``navbar_center: []`` in conf.py). Without that centre item the theme no longer pushes the end group - which
+   holds the search button, the light/dark switch and the icon links - to the right, so it ends up crammed against
+   the logo. Re-anchor it to the right edge and give the logo some breathing room. */
+.bd-header .navbar-header-items__end {
+  margin-left: auto;
+}
+
+.bd-header .navbar-brand {
+  margin-right: 1.5rem;
+}
