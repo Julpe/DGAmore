@@ -18,6 +18,11 @@ from multimethod import multimethod
 class FrequencyShift(Enum):
     """
     Enum for the direction of an asymptotic frequency shift (used when extending a quantity beyond its core box).
+
+    :cvar MINUS: Shift towards negative frequencies.
+    :cvar PLUS: Shift towards positive frequencies.
+    :cvar CENTER: Centered (symmetric) shift.
+    :cvar NONE: No shift.
     """
 
     MINUS: str = "minus"

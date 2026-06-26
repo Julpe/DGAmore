@@ -30,6 +30,15 @@ DTYPE = np.complex64
 class SpinChannel(Enum):
     """
     Enum for the different spin combinations.
+
+    :cvar DENS: Density (charge) channel.
+    :cvar MAGN: Magnetic (spin) channel.
+    :cvar SING: Singlet pairing channel.
+    :cvar TRIP: Triplet pairing channel.
+    :cvar UU: Up-up spin combination.
+    :cvar UD: Up-down spin combination.
+    :cvar UD_BAR: Crossed (transverse) up-down spin combination.
+    :cvar NONE: No / unspecified channel (e.g. a bare, not-yet-projected quantity).
     """
 
     DENS = "dens"
@@ -45,6 +54,10 @@ class SpinChannel(Enum):
 class FrequencyNotation(Enum):
     """
     Enum for the different frequency notations. Is interchangeable with the channel reducibility.
+
+    :cvar PH: Particle-hole notation.
+    :cvar PH_BAR: Transverse (crossed) particle-hole notation.
+    :cvar PP: Particle-particle notation.
     """
 
     PH = "ph"

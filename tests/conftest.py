@@ -237,6 +237,9 @@ class Comm:
     def Barrier(self):
         self._bw()
 
+    def barrier(self):
+        self._bw()
+
     def abort_barrier(self):
         if self._barrier is not None:
             self._barrier.abort()

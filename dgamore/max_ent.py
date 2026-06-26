@@ -26,23 +26,35 @@ from dgamore.self_energy import SelfEnergy
 
 
 def orbital_to_band_basis(hk: np.ndarray, data: np.ndarray) -> np.ndarray:
-    """
+    r"""
     Rotates a momentum-dependent quantity from the orbital basis into the band (eigen) basis of the Hamiltonian,
-    per k-point.
+    per k-point: :math:`O^{\mathrm{band}}(k) = U(k)^\dagger O(k) U(k)`, where the columns of :math:`U(k)` are the
+    (energy-ascending) eigenvectors of :math:`H(k)`. The Hamiltonian is diagonalized only once per k-point; if a
+    trailing fermionic-frequency axis is present, the same :math:`U(k)` is reused for every frequency.
+
+    Note that the band basis is defined by :math:`H(k)` alone, so for an interacting quantity whose self-energy is
+    not simultaneously diagonal with :math:`H(k)` the rotated object is not exactly diagonal -- the off-diagonal
+    band components are kept here and only discarded later when the band-diagonal is taken. Within a degenerate
+    eigenspace of :math:`H(k)` the individual band assignment is basis-dependent (the subspace trace is not).
 
     :param hk: The Hamiltonian :math:`H(k)` of shape ``[kx, ky, kz, n_orb, n_orb]``.
-    :param data: The quantity to rotate, of the same shape as ``hk`` (rotated in place and returned).
-    :return: The quantity in the band basis.
-    :raises AssertionError: If ``hk`` and ``data`` do not have the same shape.
+    :param data: The quantity to rotate, of shape ``[kx, ky, kz, n_orb, n_orb]`` or, with a trailing fermionic
+        frequency axis, ``[kx, ky, kz, n_orb, n_orb, n_v]`` (rotated in place and returned).
+    :return: The quantity in the band basis (same shape as ``data``).
+    :raises AssertionError: If the momentum/orbital axes of ``hk`` and ``data`` do not match.
     """
-    assert hk.shape == data.shape, "Shape mismatch!"
+    has_frequency_axis = data.ndim == hk.ndim + 1
+    assert data.shape[: hk.ndim] == hk.shape and (has_frequency_axis or data.shape == hk.shape), "Shape mismatch!"
 
     nkx, nky, nkz, n_orb, _ = hk.shape
     for ix in range(nkx):
         for iy in range(nky):
             for iz in range(nkz):
                 w, v = np.linalg.eigh(hk[ix, iy, iz])
-                data[ix, iy, iz] = v.conj().T @ data[ix, iy, iz] @ v
+                if has_frequency_axis:
+                    data[ix, iy, iz] = np.einsum("ai,abv,bj->ijv", v.conj(), data[ix, iy, iz], v, optimize=True)
+                else:
+                    data[ix, iy, iz] = v.conj().T @ data[ix, iy, iz] @ v
     return data
 
 
@@ -61,6 +73,15 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
 
     logger.info(f"Starting analytic continuation of the {name} Green's function using the maximum entropy method.")
     giwk_maxent = giwk.cut_niv(config.box.niv_core).to_half_niv_range()
+
+    # Rotate the Green's function into the band (H(k)-eigen) basis before the continuation, so that the
+    # band-diagonal taken below is the band-resolved spectral function rather than the orbital-diagonal one. This
+    # is also what makes the naive irrk_inv unfold to the full BZ correct: the band-diagonal spectrum is invariant
+    # under the lattice symmetries (eigenvalues of H(k) and H(k_rep) coincide). Done on the full BZ here so it
+    # matches the shape of H(k) from get_ek; the diagonalization is reused across all frequencies.
+    hk = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
+    giwk_maxent = giwk_maxent.decompress_q_dimension()
+    orbital_to_band_basis(hk, giwk_maxent.mat)
 
     irrq_list = config.lattice.k_grid.get_irrq_list()
 

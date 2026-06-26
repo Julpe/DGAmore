@@ -343,8 +343,8 @@ class ConfigParser:
             config.logger.info(f"'ana_cont' section not found. Using default values.")
             return conf
 
-        conf.do_ana_cont_green_dga = self._try_parse(section, "do_ana_cont_green_dga", conf.do_ana_cont_green_dga)
-        conf.do_ana_cont_green_dmft = self._try_parse(section, "do_ana_cont_green_dmft", conf.do_ana_cont_green_dmft)
+        conf.do_spectrum_dga = self._try_parse(section, "do_spectrum_dga", conf.do_spectrum_dga)
+        conf.do_spectrum_dmft = self._try_parse(section, "do_spectrum_dmft", conf.do_spectrum_dmft)
         conf.w_count = self._try_parse(section, "w_count", conf.w_count)
         conf.plot_spectrum = self._try_parse(section, "plot_spectrum", conf.plot_spectrum)
         conf.k_path = self._try_parse(section, "k_path", conf.k_path)

@@ -70,9 +70,9 @@ output:
   plotting_subfolder_name: "Plots" # name for the subfolder where the plots are saved
 
 ana_cont:
-  do_ana_cont_green_dga: False # If True, the code will perform an analytic continuation of the DGA Green's function
+  do_spectrum_dga: False # If True, the code will perform an analytic continuation of the DGA Green's function
   # using the maximum entropy method from the ana_cont package.
-  do_ana_cont_green_dmft: False # If True, the code will perform an analytic continuation of the DMFT Green's function
+  do_spectrum_dmft: False # If True, the code will perform an analytic continuation of the DMFT Green's function
   # and self-energy using the maximum entropy method from the ana_cont package.
   w_count: 1001 # Number of real-frequency points for the analytic continuation.
   plot_spectrum: True # If True, the code will plot the spectral function after the analytic continuation.
