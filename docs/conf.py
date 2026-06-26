@@ -50,9 +50,10 @@ templates_path = ["_templates"]
 exclude_patterns = []
 
 html_theme = "pydata_sphinx_theme"  # "alabaster"  # "furo"
-# Serve the logos directly from the repository's top-level ``logos/`` folder (copied into the build output only,
-# never duplicated in the docs tree).
-html_static_path = ["../logos"]
+# ``_static`` holds the docs' own assets (custom.css); ``../logos`` serves the logos directly from the repository's
+# top-level ``logos/`` folder. Both are merged into the build output's ``_static/`` directory.
+html_static_path = ["_static", "../logos"]
+html_css_files = ["custom.css"]
 html_title = "DGAmore"
 
 # Light/dark-aware navbar logo: the light-background logo is shown in light mode, the dark one in dark mode.
@@ -89,6 +90,22 @@ def _skip_class_data_attributes(app, what, name, obj, skip, options):
     return None
 
 
+def _keep_sidebar_on_root(app, pagename, templatename, context, doctree):
+    """Keep the navigation sidebar on the root/landing page.
+
+    The pydata theme strips the sidebar ``TocTree`` (and so collapses the primary sidebar, rendering the toctree
+    inline in the page body) whenever ``suppress_sidebar_toctree()`` is truthy. For the root document that helper
+    always returns ``True``, because the root page has no ancestor section to anchor a second-level TocTree on.
+    We override that single context callable for the root page only, so the full navigation - rendered from the
+    document root by the ``_templates/sidebar-nav-bs.html`` override (``startdepth=0``) - stays in the left sidebar
+    on the welcome page just like on every other page.
+    """
+    if pagename == app.config.root_doc:
+        context["suppress_sidebar_toctree"] = lambda *args, **kwargs: False
+
+
 def setup(app):
-    """Register the autodoc member filter (see :func:`_skip_class_data_attributes`)."""
+    """Register the autodoc member filter (see :func:`_skip_class_data_attributes`) and the root-page sidebar fix."""
     app.connect("autodoc-skip-member", _skip_class_data_attributes)
+    # Run after the theme's own ``add_toctree_functions`` (priority 500) so we override the context callable it sets.
+    app.connect("html-page-context", _keep_sidebar_on_root, priority=900)
