@@ -395,7 +395,7 @@ def execute_dga_routine():
 
     giwk_dga = GreensFunction.get_g_full(sigma_dga, config.sys.mu, ek)
 
-    if config.ana_cont.do_ana_cont_green_dga:
+    if config.ana_cont.do_spectrum_dga:
         spectrum = max_ent.perform_maxent_giwk(giwk_dga, "DGA", comm)
 
         if config.ana_cont.plot_spectrum and comm.rank == 0:
@@ -407,14 +407,14 @@ def execute_dga_routine():
                 config.ana_cont.k_path,
                 config.ana_cont.energy_window,
                 config.sys.beta,
-                r"$\mathrm{D}\Gamma\mathrm{A} Spectrum$",
+                r"$\mathrm{D}\Gamma\mathrm{A Spectrum}",
                 output_dir=config.output.output_path,
                 name="dga",
             )
             logger.info("Plotted DGA spectrum.")
         del spectrum
 
-    if config.ana_cont.do_ana_cont_green_dmft:
+    if config.ana_cont.do_spectrum_dmft:
         g_latt = None
         if comm.rank == 0:
             g_latt = GreensFunction(np.load(os.path.join(config.output.output_path, "g_latt_dmft.npy"))).cut_niv(
@@ -432,7 +432,7 @@ def execute_dga_routine():
                 config.ana_cont.k_path,
                 config.ana_cont.energy_window,
                 config.sys.beta,
-                r"$\mathrm{DMFT}$",
+                r"$\mathrm{DMFT Spectrum}$",
                 output_dir=config.output.output_path,
                 name="dmft",
             )

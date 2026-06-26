@@ -15,8 +15,16 @@ import numpy as np
 
 
 class KnownSymmetries(Enum):
-    """
+    r"""
     Known symmetries of the Brillouin zone.
+
+    :cvar X_INV: Inversion along :math:`k_x`.
+    :cvar Y_INV: Inversion along :math:`k_y`.
+    :cvar Z_INV: Inversion along :math:`k_z`.
+    :cvar X_Y_SYM: Exchange symmetry between :math:`k_x` and :math:`k_y`.
+    :cvar X_Z_SYM: Exchange symmetry between :math:`k_x` and :math:`k_z`.
+    :cvar Y_Z_SYM: Exchange symmetry between :math:`k_y` and :math:`k_z`.
+    :cvar X_Y_INV: Simultaneous inversion of :math:`k_x` and :math:`k_y`.
     """
 
     X_INV = "x-inv"
@@ -29,8 +37,18 @@ class KnownSymmetries(Enum):
 
 
 class KnownKPoints(Enum):
-    """
-    Known k-points in the Brillouin zone.
+    r"""
+    Known high-symmetry k-points in the Brillouin zone, as fractional coordinates.
+
+    :cvar GAMMA: Zone center :math:`\Gamma = (0, 0, 0)`.
+    :cvar X: :math:`(0.5, 0, 0)`.
+    :cvar Y: :math:`(0, 0.5, 0)`.
+    :cvar Z: :math:`(0, 0, 0.5)`.
+    :cvar M: :math:`(0.5, 0.5, 0)`.
+    :cvar M2: :math:`(0.25, 0.25, 0)`.
+    :cvar R: :math:`(0.5, 0, 0.5)`.
+    :cvar A: :math:`(0.5, 0.5, 0.5)`.
+    :cvar T: :math:`(0, 0.5, 0.5)`.
     """
 
     GAMMA = (0.0, 0.0, 0.0)
@@ -45,8 +63,18 @@ class KnownKPoints(Enum):
 
 
 class Labels(Enum):
-    """
-    Labels for the k-points in the Brillouin zone.
+    r"""
+    Plot labels for the high-symmetry k-points, each a ``(key, latex)`` pair (lookup key and rendered LaTeX label).
+
+    :cvar GAMMA: The :math:`\Gamma` point label.
+    :cvar X: The X point label.
+    :cvar Y: The Y point label.
+    :cvar Z: The Z point label.
+    :cvar M: The M point label.
+    :cvar M2: The M2 point label.
+    :cvar R: The R point label.
+    :cvar A: The A point label.
+    :cvar T: The T point label.
     """
 
     GAMMA = ("gamma", r"$\Gamma$")

@@ -1,0 +1,312 @@
+# SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
+# SPDX-License-Identifier: MIT
+#
+# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+#           Eliashberg Equation Solver for Strongly Correlated Electron Systems
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import numpy as np
+import pytest
+
+import dgamore.brillouin_zone as bz
+import dgamore.config as config
+import dgamore.max_ent as max_ent
+import dgamore.mpi_distributor as mpi_distributor
+from dgamore.greens_function import GreensFunction
+from dgamore.max_ent import orbital_to_band_basis
+from dgamore.self_energy import SelfEnergy
+from tests.conftest import FAKE_MPI, run_parallel
+
+
+def _hermitian_hk(eigvals: np.ndarray, u: np.ndarray) -> np.ndarray:
+    """Builds H = U diag(eigvals) U^dagger for a single k-point."""
+    return u @ np.diag(eigvals).astype(complex) @ u.conj().T
+
+
+def _random_unitary(n: int, seed: int) -> np.ndarray:
+    """Returns a Haar-ish random unitary via QR of a complex Gaussian matrix."""
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+    q, r = np.linalg.qr(z)
+    # Fix the phases so the decomposition is deterministic.
+    return q @ np.diag(np.exp(-1j * np.angle(np.diag(r))))
+
+
+def test_orbital_to_band_basis_no_frequency_recovers_band_diagonal():
+    # H(k) with distinct, ascending eigenvalues so eigh ordering is unambiguous.
+    eigvals = np.array([-1.0, 2.0])
+    u = _random_unitary(2, seed=1)
+    hk = _hermitian_hk(eigvals, u)[None, None, None]
+
+    g_band = np.diag(np.array([0.3 - 0.7j, -0.4 + 0.2j]))
+    g_orb = (u @ g_band @ u.conj().T)[None, None, None]
+
+    result = orbital_to_band_basis(hk.copy(), g_orb.copy())
+
+    assert np.allclose(result[0, 0, 0], g_band, atol=1e-10)
+
+
+def test_orbital_to_band_basis_with_frequency_axis_rotates_every_frequency():
+    eigvals = np.array([-0.5, 1.5])
+    u = _random_unitary(2, seed=2)
+    hk = _hermitian_hk(eigvals, u)[None, None, None]
+
+    niv = 4
+    # A different band-diagonal Green's function for each frequency.
+    g0 = np.linspace(0.1, 0.4, niv) - 1j * np.linspace(0.5, 0.8, niv)
+    g1 = -np.linspace(0.2, 0.6, niv) + 1j * np.linspace(0.1, 0.3, niv)
+    g_band = np.zeros((2, 2, niv), dtype=complex)
+    g_band[0, 0] = g0
+    g_band[1, 1] = g1
+
+    g_orb = np.einsum("ai,ijv,bj->abv", u, g_band, u.conj())[None, None, None]
+
+    result = orbital_to_band_basis(hk.copy(), g_orb.copy())
+
+    assert result.shape == (1, 1, 1, 2, 2, niv)
+    assert np.allclose(result[0, 0, 0], g_band, atol=1e-10)
+
+
+def test_orbital_to_band_basis_single_band_is_identity():
+    hk = np.array([[1.7]], dtype=complex)[None, None, None]
+    niv = 3
+    g = (np.arange(niv) - 1j * np.arange(niv)).reshape(1, 1, niv)
+    g_orb = g[None, None, None]
+
+    result = orbital_to_band_basis(hk.copy(), g_orb.copy())
+
+    assert np.allclose(result[0, 0, 0], g, atol=1e-12)
+
+
+def test_orbital_to_band_basis_band_diagonal_is_symmetry_invariant():
+    # Band-diagonal spectral content must be invariant when a symmetry operation
+    # U_g maps a representative k-point to an equivalent one: this is what makes
+    # the naive irrk_inv unfold of the band-resolved spectral function correct.
+    eigvals = np.array([-0.8, 1.1])
+    u_rep = _random_unitary(2, seed=3)
+    u_g = _random_unitary(2, seed=4)
+
+    hk_rep = _hermitian_hk(eigvals, u_rep)
+    hk_img = u_g @ hk_rep @ u_g.conj().T
+
+    niv = 5
+    rng = np.random.default_rng(5)
+    g_rep = rng.standard_normal((2, 2, niv)) + 1j * rng.standard_normal((2, 2, niv))
+    g_img = np.einsum("ai,ijv,jb->abv", u_g, g_rep, u_g.conj().T)
+
+    hk = np.stack([hk_rep, hk_img])[:, None, None]  # [2, 1, 1, 2, 2]
+    data = np.stack([g_rep, g_img])[:, None, None]  # [2, 1, 1, 2, 2, niv]
+
+    result = orbital_to_band_basis(hk.copy(), data.copy())
+
+    diag_rep = np.diagonal(result[0, 0, 0], axis1=0, axis2=1)  # [niv, band]
+    diag_img = np.diagonal(result[1, 0, 0], axis1=0, axis2=1)
+    assert np.allclose(diag_rep, diag_img, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# perform_maxent_giwk end-to-end (analytic continuation solver mocked out)
+# ---------------------------------------------------------------------------
+
+
+class _FakeResult:
+    def __init__(self, a_opt):
+        self.A_opt = a_opt
+
+
+class _FakeProblem:
+    """Stand-in for AnalyticContinuationProblem: encodes the first im-axis value of
+    the data it is handed into a constant real-frequency spectrum, so the continued
+    'spectral function' carries the band-diagonal Green's function it was fed."""
+
+    def __init__(self, im_axis, re_axis, im_data, beta):
+        self._a_opt = np.full(len(re_axis), float(np.imag(im_data[0])))
+
+    def solve(self, model=None, stdev=None):
+        return [_FakeResult(self._a_opt.copy())]
+
+
+def _build_hk(nk, n_bands, seed=0):
+    """Random Hermitian H(k) per k-point, with non-zero off-diagonal coupling so that
+    the band basis genuinely differs from the orbital basis."""
+    rng = np.random.default_rng(seed)
+    hk = np.zeros((*nk, n_bands, n_bands), dtype=complex)
+    for idx in np.ndindex(*nk):
+        a = rng.standard_normal((n_bands, n_bands)) + 1j * rng.standard_normal((n_bands, n_bands))
+        hk[idx] = a + a.conj().T
+    return hk
+
+
+def _build_giwk_mat(nk, n_bands, niv, seed=1):
+    rng = np.random.default_rng(seed)
+    shape = (*nk, n_bands, n_bands, 2 * niv)
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    return mat.astype(np.complex64)
+
+
+def _setup_maxent_config(tmp_path, nk, n_bands, niv_core=3, w_count=7, seed=0):
+    config.lattice.nk = nk
+    config.lattice.nq = nk
+    config.lattice.k_grid = bz.KGrid(nk, symmetries=bz.two_dimensional_square_symmetries())
+    config.lattice.q_grid = config.lattice.k_grid
+    config.box.niv_core = niv_core
+    config.sys.beta = 10.0
+    config.sys.n_bands = n_bands
+    config.ana_cont.w_count = w_count
+    config.output.output_path = str(tmp_path)
+    config.logger = MagicMock()
+    hk = _build_hk(nk, n_bands, seed=seed)
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda k_grid=None: hk)
+    return hk
+
+
+def _expected_band_spectrum(mat, hk, nk, n_bands, niv_core, k_grid):
+    """Independently reproduces the expected full-BZ band-resolved spectrum: rotate to
+    band basis, take the band-diagonal at the IBZ points, read the first frequency, and
+    unfold via irrk_inv. Returns shape [nk_tot, n_bands]."""
+    giwk = GreensFunction(mat.copy()).cut_niv(niv_core).to_half_niv_range()
+    rotated = orbital_to_band_basis(hk.copy(), giwk.mat.copy())
+    nk_tot = int(np.prod(nk))
+    rotated = rotated.reshape(nk_tot, n_bands, n_bands, -1)[k_grid.irrk_ind]  # [nk_irr, o, o, v]
+    band_diag = np.imag(np.einsum("knnv->knv", rotated)[..., 0])  # [nk_irr, n_bands]
+    return band_diag[k_grid.irrk_inv].reshape(nk_tot, n_bands)  # [nk_tot, n_bands]
+
+
+def _orbital_diag_spectrum(mat, nk, n_bands, niv_core, k_grid):
+    """Same as above but WITHOUT the band rotation (the old, orbital-diagonal behavior)."""
+    giwk = GreensFunction(mat.copy()).cut_niv(niv_core).to_half_niv_range()
+    nk_tot = int(np.prod(nk))
+    arr = giwk.mat.reshape(nk_tot, n_bands, n_bands, -1)[k_grid.irrk_ind]
+    orb_diag = np.imag(np.einsum("knnv->knv", arr)[..., 0])
+    return orb_diag[k_grid.irrk_inv].reshape(nk_tot, n_bands)
+
+
+@pytest.fixture
+def patch_maxent_mpi(monkeypatch):
+    monkeypatch.setattr(mpi_distributor, "MPI", FAKE_MPI)
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _FakeProblem)
+
+
+@pytest.mark.parametrize("size", [1, 2])
+def test_perform_maxent_giwk_continues_band_diagonal_and_unfolds(tmp_path, patch_maxent_mpi, size):
+    nk, n_bands, niv_core, w_count = (4, 4, 1), 2, 3, 7
+    hk = _setup_maxent_config(tmp_path, nk, n_bands, niv_core, w_count, seed=7)
+    mat = _build_giwk_mat(nk, n_bands, niv=4, seed=11)
+    k_grid = config.lattice.k_grid
+
+    def fn(comm, rank):
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy()), "TEST", comm)
+
+    _, results = run_parallel(size, fn)
+    nk_tot = int(np.prod(nk))
+    spectrum = results[0].reshape(nk_tot, n_bands, w_count)
+
+    expected = _expected_band_spectrum(mat, hk, nk, n_bands, niv_core, k_grid)
+    # The mock spreads the band-diagonal value across all real frequencies.
+    assert np.allclose(spectrum, expected[:, :, None], atol=1e-5)
+
+    # Discriminator: the result must NOT match the orbital-diagonal (old) behavior,
+    # since H(k) has off-diagonal coupling -- this proves the rotation is applied.
+    orbital = _orbital_diag_spectrum(mat, nk, n_bands, niv_core, k_grid)
+    assert not np.allclose(spectrum, orbital[:, :, None], atol=1e-5)
+
+
+def test_perform_maxent_giwk_unfolds_symmetry_equivalent_kpoints(tmp_path, patch_maxent_mpi):
+    nk, n_bands = (4, 4, 1), 2
+    _setup_maxent_config(tmp_path, nk, n_bands, seed=3)
+    mat = _build_giwk_mat(nk, n_bands, niv=4, seed=13)
+    k_grid = config.lattice.k_grid
+
+    def fn(comm, rank):
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy()), "TEST", comm)
+
+    _, results = run_parallel(1, fn)
+    nk_tot = int(np.prod(nk))
+    spectrum = results[0].reshape(nk_tot, n_bands, -1)
+
+    # Every full-BZ k-point must carry exactly its IBZ representative's spectrum.
+    flat_rep = k_grid.irrk_ind[k_grid.irrk_inv].reshape(-1)  # representative flat index per FBZ point
+    for k in range(nk_tot):
+        assert np.allclose(spectrum[k], spectrum[flat_rep[k]], atol=1e-6)
+
+
+def test_perform_maxent_giwk_failed_continuation_yields_zeros(tmp_path, monkeypatch):
+    nk, n_bands, w_count = (4, 4, 1), 2, 6
+    _setup_maxent_config(tmp_path, nk, n_bands, w_count=w_count, seed=4)
+    mat = _build_giwk_mat(nk, n_bands, niv=4, seed=19)
+
+    class _RaisingProblem:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("continuation failed")
+
+    monkeypatch.setattr(mpi_distributor, "MPI", FAKE_MPI)
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _RaisingProblem)
+
+    def fn(comm, rank):
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy()), "TEST", comm)
+
+    _, results = run_parallel(1, fn)
+    assert np.array_equal(results[0], np.zeros_like(results[0]))
+
+
+def test_perform_maxent_giwk_single_band(tmp_path, patch_maxent_mpi):
+    nk, n_bands, w_count = (4, 4, 1), 1, 5
+    hk = _setup_maxent_config(tmp_path, nk, n_bands, w_count=w_count, seed=2)
+    mat = _build_giwk_mat(nk, n_bands, niv=4, seed=17)
+    k_grid = config.lattice.k_grid
+
+    def fn(comm, rank):
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy()), "TEST", comm)
+
+    _, results = run_parallel(1, fn)
+    nk_tot = int(np.prod(nk))
+    spectrum = results[0].reshape(nk_tot, n_bands, w_count)
+
+    # For a single band the rotation is trivial: band-diagonal == orbital-diagonal.
+    expected = _expected_band_spectrum(mat, hk, nk, n_bands, config.box.niv_core, k_grid)
+    assert np.allclose(spectrum, expected[:, :, None], atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# perform_maxent_dmft (solver and Kramers-Kronig transform mocked out)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRealFreqTwoPoint:
+    """Stand-in for RealFreqTwoPoint whose kkt() returns a zero real part, so the
+    continued self-energy reduces to the (restored) Hartree shift."""
+
+    def __init__(self, spectrum=None, wgrid=None, kind=""):
+        self._n = len(wgrid)
+
+    def kkt(self):
+        return np.zeros(self._n)
+
+
+def test_perform_maxent_dmft_builds_full_bz_spectral_function(tmp_path, monkeypatch):
+    nk, n_bands, w_count, niv = (3, 3, 1), 2, 9, 4
+    config.sys.beta = 12.0
+    config.sys.mu = 0.4
+    config.sys.n_bands = n_bands
+    config.ana_cont.w_count = w_count
+    config.output.output_path = str(tmp_path)
+    config.logger = MagicMock()
+
+    hk = _build_hk(nk, n_bands, seed=21)
+
+    sig = np.zeros((1, 1, 1, n_bands, n_bands, 2 * niv), dtype=np.complex64)
+    for b in range(n_bands):
+        sig[0, 0, 0, b, b] = (0.2 * (b + 1)) - 0.1j * np.ones(2 * niv)
+    sigma_dmft = SelfEnergy(sig, nk=(1, 1, 1), full_niv_range=True, calc_smom=False)
+
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _FakeProblem)
+    monkeypatch.setattr(max_ent, "RealFreqTwoPoint", _FakeRealFreqTwoPoint)
+
+    spectrum = max_ent.perform_maxent_dmft(sigma_dmft, hk)
+
+    assert spectrum.shape == (*nk, n_bands, w_count)
+    # A spectral function is real and non-negative.
+    assert np.all(spectrum >= -1e-6)
+    assert np.isrealobj(spectrum)
