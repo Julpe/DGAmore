@@ -99,10 +99,9 @@ This section controls the self-consistency cycle.
 
 The ``max_iter`` field puts an upper limit on the number of iterations; if the self-energy has not converged by
 then, the loop stops and the program exits. The non-local self-energy is written to the output folder for every
-iteration. Convergence itself is judged by ``epsilon``: rather than comparing two successive self-energies
-directly, the code monitors the relative residual of the Schwinger-Dyson iteration, that is the norm of the change
-in the self-energy between consecutive iterations divided by the norm of the previous one, taken over the full
-momentum grid, all orbital combinations and the positive fermionic frequencies of the core box. The cycle is
+iteration. Convergence itself is judged by ``epsilon`` through the relative residual of the Schwinger-Dyson iteration: the
+norm of the change in the self-energy between consecutive iterations, divided by the norm of the previous one, taken
+over the full momentum grid, all orbital combinations and the positive fermionic frequencies of the core box. The cycle is
 considered converged once this residual drops below ``epsilon``; in addition, the chemical potential is required to
 change by less than a small temperature-dependent threshold between iterations.
 
@@ -116,14 +115,17 @@ iterations are available. Enabling ``use_interpolated_sigma`` makes the cycle st
 self-energy of the previous run, with the interpolation itself configured in the
 :ref:`self-energy interpolation section <self-energy-interpolation>`.
 
-It is furthermore possible to apply the lambda correction throughout the entire self-consistency cycle for
-single-band data, which can help stabilise convergence or reveal how a lambda-corrected cycle changes the results.
-The correction type is taken from the ``lambda_correction`` section, and ``perform_lambda_correction`` there must be
-set to ``True`` for it to take effect. Lastly, ``restrict_chi_phys`` clamps the inverse physical susceptibilities to
+Setting ``use_lambda_correction`` to ``True`` applies the lambda correction throughout the entire self-consistency
+cycle for single-band data, which can help stabilise convergence or reveal how a lambda-corrected cycle changes the
+results. The correction scheme is taken from the ``type`` field of the
+:ref:`lambda correction section <lambda-correction>`, and ``perform_lambda_correction`` is enabled automatically for
+every iteration. Lastly, ``restrict_chi_phys`` clamps the inverse physical susceptibilities to
 positive values, replacing any negative value by a small positive one. This sometimes stabilises early iterations
 but generally yields unphysical results, so once the self-energy converges with this option enabled and iterations
 remain, the option is switched off automatically and the cycle continues until convergence is reached again or
 ``max_iter`` is hit.
+
+.. _lambda-correction:
 
 Lambda correction
 ------------------
@@ -206,7 +208,7 @@ for datasets that push the memory limits.
 The equation is solved with a Lanczos algorithm based on the ARPACK routines, retrieving the ``n_eig`` largest
 eigenvalues and the corresponding gap functions to an accuracy of ``epsilon``. The ``symmetry`` field sets the
 starting vector of the iteration: entering ``"d-wave"``, for example, begins from a gap function with d-wave
-symmetry, but ``"random"`` is sufficient most of the time. The pairing vertex requires local reducible diagrams,
+symmetry, but ``"random"`` is sufficient most of the time. The pairing vertex includes local reducible diagrams by default,
 which can be skipped by setting ``include_local_part`` to ``False``; this is only advisable when s-wave symmetry is
 not expected, as these diagrams become relevant in that case. Finally, the results are written to a subfolder named
 according to ``subfolder_name``.
@@ -228,9 +230,9 @@ before entering the self-consistency cycle.
      target_niv: 10          # int
 
 The interpolation runs when ``do_interpolation`` is ``True``. It applies a linear inter- or extrapolation for the
-lowest frequencies and a PCHIP interpolation for the remaining ones, and writes the resulting self-energy for each
-iteration at the new inverse temperature ``target_beta`` and the new number of positive fermionic frequencies
-``target_niv`` to the output folder.
+lowest frequencies and a PCHIP interpolation for the remaining ones. The resulting self-energy, now at the new
+inverse temperature ``target_beta`` and the new number of positive fermionic frequencies ``target_niv``, is written
+to the output folder for each iteration.
 
 Output
 ------
@@ -290,7 +292,7 @@ equations. This section therefore exposes more memory-efficient algorithms for f
 These switches control, in turn, the construction of the bare bubble susceptibility, of the auxiliary
 susceptibility entering the Schwinger-Dyson equation, of the Schwinger-Dyson equation itself, of the full ladder
 vertices for the Eliashberg equation, and of the Lanczos algorithm. Enabling any of them increases the runtime
-substantially because of the additional Python and MPI communication. Under the hood, the bubble and the
+substantially because of the additional Python-level looping and MPI communication. Under the hood, the bubble and the
 Schwinger-Dyson steps use fast Fourier transforms when their switches are left at ``False``; this gives by far the
 largest speed-up while barely affecting the memory footprint, so it can be kept at the default in almost all cases.
 The largest memory savings come from the auxiliary-susceptibility and full-ladder-vertex switches, which shrink

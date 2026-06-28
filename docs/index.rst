@@ -17,7 +17,7 @@ Approximation and solves the Eliashberg equation for (strongly) correlated elect
 multi-band Hubbard model. Starting from the one- and two-particle output of a dynamical mean-field theory (DMFT)
 calculation, it assembles the local vertex functions, solves the momentum-dependent ladder equations to obtain the
 non-local self-energy, and, optionally, extracts the leading superconducting eigenvalues and gap functions in the
-singlet and triplet channels. It is built for usability and a minimal setup effort, is openly developed on GitHub
+singlet and triplet channels. It is built for usability and minimal setup effort, is openly developed on GitHub
 under the MIT license, and is extensively unit- and end-to-end tested on Linux and macOS.
 
 The code combines and extends two earlier approaches, the one-shot multi-orbital
@@ -36,19 +36,28 @@ The toolbox is organised as a pipeline of focused modules. A run is orchestrated
 populated from a YAML file by :mod:`~dgamore.config_parser`. Input handling lives in :mod:`~dgamore.dga_io` and
 :mod:`~dgamore.dmft_interface`, which read the one- and two-particle quantities from the DMFT output, while
 :mod:`~dgamore.hamiltonian` builds the kinetic dispersion and interaction tensors and :mod:`~dgamore.brillouin_zone`
-together with :mod:`~dgamore.symmetry_reduction` set up the irreducible momentum grid. The physical quantities
-themselves are thin wrappers around NumPy arrays defined in :mod:`~dgamore.n_point_base` and its descendants, among
-them :mod:`~dgamore.local_four_point`, :mod:`~dgamore.four_point`, :mod:`~dgamore.greens_function`,
-:mod:`~dgamore.self_energy`, :mod:`~dgamore.interaction` and :mod:`~dgamore.gap_function`, which carry the orbital,
-frequency and momentum bookkeeping. The local vertices and the local self-energy are assembled in
-:mod:`~dgamore.local_sde`, the bare bubble in :mod:`~dgamore.bubble_gen`, and the momentum-dependent ladder
-self-energy in :mod:`~dgamore.nonlocal_sde`, with an optional Moriya correction in
-:mod:`~dgamore.lambda_correction`. Pairing properties are obtained in :mod:`~dgamore.eliashberg_solver`, and an
-optional continuation to real frequencies is provided by :mod:`~dgamore.max_ent`. The remaining modules support the
-computation: :mod:`~dgamore.matsubara_frequencies` handles frequency-index arithmetic,
-:mod:`~dgamore.mpi_utils` manages the parallel work distribution (message chunking, the work distributor and the
-data-movement routines), :mod:`~dgamore.dga_logger` provides the structured logging, and
-:mod:`~dgamore.plotting` produces the diagnostic figures.
+together with :mod:`~dgamore.symmetry_reduction` set up the irreducible momentum grid.
+
+The physical quantities themselves are thin wrappers around NumPy arrays, assembled from the mixins in
+:mod:`~dgamore.n_point_base` that supply the array storage, the spin channel and the momentum axis. From these grows
+a compact class hierarchy: the local, momentum-independent objects descend from :mod:`~dgamore.local_n_point` through
+:mod:`~dgamore.local_two_point` and :mod:`~dgamore.local_four_point`, while their momentum-dependent counterparts
+:mod:`~dgamore.two_point` and :mod:`~dgamore.four_point` add the single momentum dimension on top. The concrete
+single-particle objects :mod:`~dgamore.greens_function`, :mod:`~dgamore.self_energy` and :mod:`~dgamore.gap_function`,
+together with the :mod:`~dgamore.interaction` tensors, build on this foundation and carry the orbital, frequency and
+momentum bookkeeping for the rest of the code.
+
+The local vertices and the local self-energy are assembled in :mod:`~dgamore.local_sde`, the bare bubble in
+:mod:`~dgamore.bubble_gen`, and the momentum-dependent ladder self-energy in :mod:`~dgamore.nonlocal_sde`, with an
+optional Moriya correction in :mod:`~dgamore.lambda_correction`. Pairing properties are obtained in
+:mod:`~dgamore.eliashberg_solver`, and an optional continuation to real frequencies is provided by
+:mod:`~dgamore.max_ent`. The remaining modules support the computation: :mod:`~dgamore.matsubara_frequencies`
+handles frequency-index arithmetic, :mod:`~dgamore.mpi_utils` manages the parallel work distribution (message
+chunking, the work distributor and the data-movement routines), :mod:`~dgamore.memory_estimator` predicts the peak
+host memory of the heavy steps so the driver can enable the memory-saving code paths automatically,
+:mod:`~dgamore.dga_logger` provides the structured logging, and :mod:`~dgamore.plotting` produces the diagnostic
+figures. A standalone companion console script, :mod:`~dgamore.symmetrize_new`, prepares the symmetrized
+two-particle DMFT input that a run consumes.
 
 For the physics and the precise equations behind the implementation, see the accompanying paper and the author's
 Master's thesis, both linked on the :doc:`about` page. The pages listed in the sidebar walk through installation,
