@@ -14,6 +14,7 @@ from dgamore.local_n_point import LocalNPoint
 
 
 def test_initializes_with_valid_parameters():
+    """LocalNPoint initializes with valid dimension parameters and full ranges."""
     mat = np.zeros((4, 4))
     obj = LocalNPoint(mat, 2, 1, 1)
     assert obj.num_orbital_dimensions == 2
@@ -24,24 +25,28 @@ def test_initializes_with_valid_parameters():
 
 
 def test_raises_error_for_invalid_orbital_dimensions():
+    """LocalNPoint rejects an invalid number of orbital dimensions."""
     mat = np.zeros((4, 4))
     with pytest.raises(AssertionError):
         LocalNPoint(mat, 3, 1, 1)
 
 
 def test_raises_error_for_invalid_fermionic_dimensions():
+    """LocalNPoint rejects an invalid number of fermionic dimensions."""
     mat = np.zeros((4, 4))
     with pytest.raises(AssertionError):
         LocalNPoint(mat, 2, 1, 3)
 
 
 def test_raises_error_for_invalid_bosonic_dimensions():
+    """LocalNPoint rejects an invalid number of bosonic dimensions."""
     mat = np.zeros((4, 4))
     with pytest.raises(AssertionError):
         LocalNPoint(mat, 2, 2, 1)
 
 
 def test_initializes_with_partial_frequency_ranges():
+    """LocalNPoint initializes with half bosonic and fermionic ranges."""
     mat = np.zeros((4, 4))
     obj = LocalNPoint(mat, 4, 0, 2, full_niw_range=False, full_niv_range=False)
     assert obj.full_niw_range is False
@@ -49,48 +54,56 @@ def test_initializes_with_partial_frequency_ranges():
 
 
 def test_returns_correct_number_of_bands_for_higher_dimensional_matrix():
+    """n_bands is read from the orbital axes of a higher-dimensional matrix."""
     mat = np.zeros((4, 4, 9, 10, 10))
     obj = LocalNPoint(mat, 2, 1, 2)
     assert obj.n_bands == 4
 
 
 def test_returns_zero_bosonic_frequencies_when_no_wn_dimensions():
+    """niw is zero when there are no bosonic-frequency dimensions."""
     mat = np.zeros((4, 4))
     obj = LocalNPoint(mat, 2, 0, 1)
     assert obj.niw == 0
 
 
 def test_calculates_correct_bosonic_frequencies_with_full_range():
+    """niw is computed correctly for a full bosonic range."""
     mat = np.zeros((4, 5, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=True)
     assert obj.niw == 2
 
 
 def test_calculates_correct_bosonic_frequencies_with_half_range():
+    """niw is computed correctly for a half bosonic range."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=False)
     assert obj.niw == 2
 
 
 def test_returns_zero_fermionic_frequencies_when_no_vn_dimensions():
+    """niv is zero when there are no fermionic-frequency dimensions."""
     mat = np.zeros((4, 4))
     obj = LocalNPoint(mat, 2, 1, 0)
     assert obj.niv == 0
 
 
 def test_calculates_correct_fermionic_frequencies_with_full_range():
+    """niv is computed correctly for a full fermionic range."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niv_range=True)
     assert obj.niv == 5
 
 
 def test_calculates_correct_fermionic_frequencies_with_half_range():
+    """niv is computed correctly for a half fermionic range."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niv_range=False)
     assert obj.niv == 5
 
 
 def test_raises_error_when_cutting_bosonic_frequencies_with_no_wn_dimensions():
+    """cut_niw raises when there are no bosonic-frequency dimensions."""
     mat = np.zeros((4, 4))
     obj = LocalNPoint(mat, 2, 0, 1)
     with pytest.raises(ValueError):
@@ -98,6 +111,7 @@ def test_raises_error_when_cutting_bosonic_frequencies_with_no_wn_dimensions():
 
 
 def test_does_not_raise_error_when_cutting_more_bosonic_frequencies_than_available():
+    """cut_niw is a no-op when asked to cut more bosonic frequencies than available."""
     mat = np.zeros((4, 4, 10, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
     res = obj.cut_niw(6)
@@ -105,6 +119,7 @@ def test_does_not_raise_error_when_cutting_more_bosonic_frequencies_than_availab
 
 
 def test_cuts_bosonic_frequencies_correctly_with_full_range():
+    """cut_niw trims the bosonic axis for a full range."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=True)
     result = obj.cut_niw(2)
@@ -112,6 +127,7 @@ def test_cuts_bosonic_frequencies_correctly_with_full_range():
 
 
 def test_cuts_bosonic_frequencies_correctly_with_half_range():
+    """cut_niw trims the bosonic axis for a half range."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=False)
     result = obj.cut_niw(2)
@@ -119,6 +135,7 @@ def test_cuts_bosonic_frequencies_correctly_with_half_range():
 
 
 def test_preserves_matrix_shape_when_cutting_with_no_vn_dimensions():
+    """cut_niw preserves the shape when there are no fermionic dimensions."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 0)
     result = obj.cut_niw(2)
@@ -126,6 +143,7 @@ def test_preserves_matrix_shape_when_cutting_with_no_vn_dimensions():
 
 
 def test_raises_error_when_cutting_fermionic_frequencies_with_no_vn_dimensions():
+    """cut_niv raises when there are no fermionic-frequency dimensions."""
     mat = np.zeros((4, 4))
     obj = LocalNPoint(mat, 2, 1, 0)
     with pytest.raises(ValueError):
@@ -133,6 +151,7 @@ def test_raises_error_when_cutting_fermionic_frequencies_with_no_vn_dimensions()
 
 
 def test_does_not_raise_error_when_cutting_more_fermionic_frequencies_than_available():
+    """cut_niv is a no-op when asked to cut more fermionic frequencies than available."""
     mat = np.zeros((4, 4, 10, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
     res = obj.cut_niv(6)
@@ -140,6 +159,7 @@ def test_does_not_raise_error_when_cutting_more_fermionic_frequencies_than_avail
 
 
 def test_cuts_fermionic_frequencies_correctly_with_full_range():
+    """cut_niv trims both fermionic axes for a full range."""
     mat = np.zeros((4, 4, 10, 10))
     obj = LocalNPoint(mat, 2, 1, 2, full_niv_range=True)
     result = obj.cut_niv(3)
@@ -148,6 +168,7 @@ def test_cuts_fermionic_frequencies_correctly_with_full_range():
 
 
 def test_cuts_fermionic_frequencies_correctly_with_half_range():
+    """cut_niv trims the fermionic axis for a half range."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niv_range=False)
     result = obj.cut_niv(3)
@@ -155,6 +176,7 @@ def test_cuts_fermionic_frequencies_correctly_with_half_range():
 
 
 def test_preserves_matrix_shape_when_cutting_with_no_wn_dimensions():
+    """cut_niv preserves the shape when there are no bosonic dimensions."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 0, 1)
     result = obj.cut_niv(2)
@@ -162,6 +184,7 @@ def test_preserves_matrix_shape_when_cutting_with_no_wn_dimensions():
 
 
 def test_does_not_raise_error_when_cutting_both_frequencies_with_invalid_bosonic_cut():
+    """cut_niw_and_niv ignores an over-large bosonic cut but applies the fermionic one."""
     mat = np.zeros((4, 4, 10, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
     res = obj.cut_niw_and_niv(6, 3)
@@ -170,6 +193,7 @@ def test_does_not_raise_error_when_cutting_both_frequencies_with_invalid_bosonic
 
 
 def test_does_not_raise_error_when_cutting_both_frequencies_with_invalid_fermionic_cut():
+    """cut_niw_and_niv ignores an over-large fermionic cut but applies the bosonic one."""
     mat = np.zeros((4, 4, 10, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
     res = obj.cut_niw_and_niv(3, 6)
@@ -178,6 +202,7 @@ def test_does_not_raise_error_when_cutting_both_frequencies_with_invalid_fermion
 
 
 def test_cuts_both_frequencies_correctly_with_full_ranges():
+    """cut_niw_and_niv trims both bosonic and fermionic axes for full ranges."""
     mat = np.zeros((4, 4, 10, 10))
     obj = LocalNPoint(mat, 2, 1, 2, full_niw_range=True, full_niv_range=True)
     result = obj.cut_niw_and_niv(2, 3)
@@ -187,6 +212,7 @@ def test_cuts_both_frequencies_correctly_with_full_ranges():
 
 
 def test_cuts_both_frequencies_correctly_with_half_ranges():
+    """cut_niw_and_niv trims both axes for half ranges."""
     mat = np.zeros((1, 1, 1, 1, 5, 10, 10))
     obj = LocalNPoint(mat, 2, 1, 2, full_niw_range=False, full_niv_range=False)
     result = obj.cut_niw_and_niv(2, 3)
@@ -196,6 +222,7 @@ def test_cuts_both_frequencies_correctly_with_half_ranges():
 
 
 def test_raises_error_when_extending_with_no_fermionic_dimensions():
+    """extend_vn_to_diagonal raises with no fermionic dimensions."""
     mat = np.zeros((4, 4))
     obj = LocalNPoint(mat, 2, 1, 0)
     with pytest.raises(ValueError):
@@ -203,6 +230,7 @@ def test_raises_error_when_extending_with_no_fermionic_dimensions():
 
 
 def test_returns_self_when_extending_with_two_fermionic_dimensions():
+    """extend_vn_to_diagonal returns self when already at two fermionic dimensions."""
     mat = np.zeros((4, 4, 4, 4, 4))
     obj = LocalNPoint(mat, 2, 1, 2)
     result = obj.extend_vn_to_diagonal()
@@ -211,6 +239,7 @@ def test_returns_self_when_extending_with_two_fermionic_dimensions():
 
 
 def test_extends_correctly_with_one_fermionic_dimension():
+    """extend_vn_to_diagonal places the single fermionic axis on the diagonal of a new one."""
     mat = np.zeros((4, 4, 4, 4))
     obj = LocalNPoint(mat, 2, 1, 1)
     result = obj.extend_vn_to_diagonal()
@@ -228,6 +257,7 @@ def test_extends_correctly_with_one_fermionic_dimension():
 
 
 def test_raises_error_when_taking_diagonal_with_no_fermionic_dimensions():
+    """take_vn_diagonal raises with no fermionic dimensions."""
     mat = np.zeros((4, 4))
     obj = LocalNPoint(mat, 2, 1, 0)
     with pytest.raises(ValueError):
@@ -235,6 +265,7 @@ def test_raises_error_when_taking_diagonal_with_no_fermionic_dimensions():
 
 
 def test_returns_self_when_taking_diagonal_with_one_fermionic_dimension():
+    """take_vn_diagonal returns self when already at one fermionic dimension."""
     mat = np.zeros((4, 4, 4, 4))
     obj = LocalNPoint(mat, 2, 1, 1)
     result = obj.take_vn_diagonal()
@@ -243,6 +274,7 @@ def test_returns_self_when_taking_diagonal_with_one_fermionic_dimension():
 
 
 def test_compresses_correctly_with_two_fermionic_dimensions():
+    """take_vn_diagonal collapses two fermionic axes to their diagonal."""
     mat = np.zeros((4, 4, 4, 4, 4))
     for i in range(4):
         mat[..., i, i] = i + 1
@@ -257,6 +289,7 @@ def test_compresses_correctly_with_two_fermionic_dimensions():
 
 
 def test_flips_matrix_along_valid_single_axis():
+    """flip_frequency_axis flips a single valid axis."""
     mat = np.zeros((4, 4, 9, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
     result = obj.flip_frequency_axis(axis=(-1,))
@@ -264,6 +297,7 @@ def test_flips_matrix_along_valid_single_axis():
 
 
 def test_flips_matrix_along_valid_multiple_axes():
+    """flip_frequency_axis flips multiple valid axes."""
     mat = np.zeros((4, 4, 9, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
     result = obj.flip_frequency_axis(axis=(-2, -1))
@@ -271,6 +305,7 @@ def test_flips_matrix_along_valid_multiple_axes():
 
 
 def test_raises_error_when_flipping_with_no_frequency_dimensions():
+    """flip_frequency_axis raises with no frequency dimensions."""
     mat = np.zeros((4, 4))
     obj = LocalNPoint(mat, 2, 0, 0)
     with pytest.raises(ValueError):
@@ -279,6 +314,7 @@ def test_raises_error_when_flipping_with_no_frequency_dimensions():
 
 
 def test_raises_error_for_invalid_axis_outside_possible_range():
+    """flip_frequency_axis raises for an axis outside the frequency range."""
     mat = np.zeros((4, 4, 9, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
     with pytest.raises(ValueError):
@@ -288,6 +324,7 @@ def test_raises_error_for_invalid_axis_outside_possible_range():
 
 
 def test_handles_single_axis_as_integer():
+    """flip_frequency_axis accepts a single axis given as an integer."""
     mat = np.zeros((4, 4, 9, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
     result = obj.flip_frequency_axis(axis=-1)
@@ -295,6 +332,7 @@ def test_handles_single_axis_as_integer():
 
 
 def test_aligns_frequency_dimensions_correctly_when_self_has_one_and_other_has_two_fermionic_dimensions():
+    """_align_frequency_dimensions_for_operation extends self when it has fewer fermionic dimensions."""
     mat_self = np.zeros((4, 4, 4, 4))
     mat_other = np.zeros((4, 4, 4, 4, 4))
     obj_self = LocalNPoint(mat_self, 2, 1, 1)
@@ -308,6 +346,7 @@ def test_aligns_frequency_dimensions_correctly_when_self_has_one_and_other_has_t
 
 
 def test_aligns_frequency_dimensions_correctly_when_self_has_two_and_other_has_one_fermionic_dimensions():
+    """_align_frequency_dimensions_for_operation extends the other when it has fewer fermionic dimensions."""
     mat_self = np.zeros((4, 4, 4, 4, 4))
     mat_other = np.zeros((4, 4, 4, 4))
     obj_self = LocalNPoint(mat_self, 2, 1, 2)
@@ -321,6 +360,7 @@ def test_aligns_frequency_dimensions_correctly_when_self_has_two_and_other_has_o
 
 
 def test_does_not_extend_frequency_dimensions_when_both_have_two_fermionic_dimensions():
+    """_align_frequency_dimensions_for_operation extends nothing when both have two fermionic dimensions."""
     mat_self = np.zeros((4, 4, 4, 4, 4))
     mat_other = np.zeros((4, 4, 4, 4, 4))
     obj_self = LocalNPoint(mat_self, 2, 1, 2)
@@ -333,6 +373,7 @@ def test_does_not_extend_frequency_dimensions_when_both_have_two_fermionic_dimen
 
 
 def test_does_not_extend_frequency_dimensions_when_both_have_one_fermionic_dimension():
+    """_align_frequency_dimensions_for_operation extends nothing when both have one fermionic dimension."""
     mat_self = np.zeros((4, 4, 4, 4))
     mat_other = np.zeros((4, 4, 4, 4))
     obj_self = LocalNPoint(mat_self, 2, 1, 1)
@@ -345,6 +386,7 @@ def test_does_not_extend_frequency_dimensions_when_both_have_one_fermionic_dimen
 
 
 def test_returns_self_when_already_in_full_bosonic_range():
+    """to_full_niw_range returns self when already in the full bosonic range."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=True)
     result = obj.to_full_niw_range()
@@ -353,6 +395,7 @@ def test_returns_self_when_already_in_full_bosonic_range():
 
 
 def test_converts_to_half_bosonic_range_correctly():
+    """to_half_niw_range keeps the positive bosonic half."""
     mat = np.random.rand(4, 4, 21, 20) + 1j * np.random.rand(4, 4, 21, 20)
     obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=True)
     result = obj.to_half_niw_range()
@@ -362,6 +405,7 @@ def test_converts_to_half_bosonic_range_correctly():
 
 
 def test_returns_self_when_already_in_half_bosonic_range():
+    """to_half_niw_range returns self when already in the half bosonic range."""
     mat = np.random.rand(4, 4, 11, 10)
     obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=False)
     result = obj.to_half_niw_range()
@@ -370,6 +414,7 @@ def test_returns_self_when_already_in_half_bosonic_range():
 
 
 def test_swaps_two_fermionic_frequency_axes_correctly():
+    """swap_fermionic_frequency_axes exchanges the two fermionic axes."""
     mat = np.zeros((2, 2, 2, 2, 5, 4, 4))
     random_1 = np.random.rand()
     random_2 = np.random.rand()
@@ -383,6 +428,7 @@ def test_swaps_two_fermionic_frequency_axes_correctly():
 
 @pytest.mark.parametrize("num_vn_dimensions", [0, 1])
 def test_raises_error_when_swapping_with_less_than_two_fermionic_dimensions(num_vn_dimensions):
+    """swap_fermionic_frequency_axes raises with fewer than two fermionic dimensions."""
     shape = (4, 4, 4, 4, 1) + (4,) * num_vn_dimensions
     mat = np.zeros(shape)
     obj = LocalNPoint(mat, 4, 1, num_vn_dimensions)
@@ -391,6 +437,7 @@ def test_raises_error_when_swapping_with_less_than_two_fermionic_dimensions(num_
 
 
 def test_saves_matrix_calls_to_full_niw_range_when_full_range():
+    """save converts to full then half niw range before writing for a full-range object."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=True)
     with patch.object(obj, "to_full_niw_range") as mock_full, patch.object(
@@ -403,6 +450,7 @@ def test_saves_matrix_calls_to_full_niw_range_when_full_range():
 
 
 def test_saves_matrix_calls_to_half_niw_range_when_half_range():
+    """save only converts to half niw range before writing for a half-range object."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=False)
     with patch.object(obj, "to_full_niw_range") as mock_full, patch.object(
@@ -415,6 +463,7 @@ def test_saves_matrix_calls_to_half_niw_range_when_half_range():
 
 
 def test_symmetrizes_orbitals_correctly():
+    """_symmetrize_orbitals averages the requested orbitals and leaves the rest untouched."""
     mat = np.random.rand(4, 4, 4, 4)
     obj = LocalNPoint(mat, 4, 0, 0)
     orbitals = [1, 2]
@@ -432,6 +481,7 @@ def test_symmetrizes_orbitals_correctly():
 
 
 def test_raises_error_for_invalid_orbitals():
+    """_symmetrize_orbitals raises for out-of-range orbital indices."""
     mat = np.random.rand(4, 4, 4, 4)
     obj = LocalNPoint(mat, 4, 0, 0)
     orbital_axes = (0, 1, 2, 3)
@@ -441,6 +491,7 @@ def test_raises_error_for_invalid_orbitals():
 
 
 def test_returns_self_for_single_orbital():
+    """_symmetrize_orbitals returns self for a single orbital."""
     mat = np.random.rand(4, 4, 4, 4)
     obj = LocalNPoint(mat, 4, 0, 0)
     orbital_axes = (0, 1, 2, 3)
@@ -449,6 +500,7 @@ def test_returns_self_for_single_orbital():
 
 
 def test_checks_if_orbitals_are_symmetrized():
+    """_is_orbitally_symmetrized reports True after symmetrization."""
     mat = np.random.rand(4, 4, 4, 4)
     obj = LocalNPoint(mat, 4, 0, 0)
     orbitals = [1, 3]
@@ -458,6 +510,7 @@ def test_checks_if_orbitals_are_symmetrized():
 
 
 def test_detects_unsymmetrized_orbitals():
+    """_is_orbitally_symmetrized reports False for unsymmetrized orbitals."""
     mat = np.random.rand(4, 4, 4, 4)
     obj = LocalNPoint(mat, 4, 0, 0)
     orbitals = [1, 3]
@@ -466,6 +519,7 @@ def test_detects_unsymmetrized_orbitals():
 
 
 def test_symmetrize_single_orbital_is_noop_and_returns_self():
+    """_symmetrize_orbitals on a single orbital is a no-op returning self."""
     mat = np.random.rand(4, 4, 4, 4)
     original = mat.copy()
     obj = LocalNPoint(mat, 4, 0, 0)
@@ -476,6 +530,7 @@ def test_symmetrize_single_orbital_is_noop_and_returns_self():
 
 @pytest.mark.parametrize("orbitals", [[1], [1, 2], [1, 3], [1, 2, 3], [1, 2, 3, 4]])
 def test_symmetrize_multiple_orbital_sets(orbitals):
+    """_symmetrize_orbitals enforces the expected degeneracies on four-orbital-axis tensors."""
     nb = 4
     mat = np.random.rand(nb, nb, nb, nb)
 
@@ -551,6 +606,7 @@ def test_symmetrize_multiple_orbital_sets(orbitals):
     "orbital_groups", [[[1, 2], [3, 4]], [[1, 2, 3], [4]], [[1, 3], [2, 4]], [[1, 2, 3, 4]], [[1], [2], [3], [4]]]
 )
 def test_symmetrize_multiple_groups(orbital_groups):
+    """_symmetrize_orbitals symmetrizes within each group without coupling different groups."""
     nb = 4
     mat = np.random.rand(nb, nb, nb, nb)
 
@@ -637,6 +693,7 @@ def test_symmetrize_multiple_groups(orbital_groups):
 
 
 def test_orbital_symmetrization_patterns():
+    """_symmetrize_orbitals produces the expected diagonal and pair patterns."""
     mat = np.random.rand(3, 3, 3, 3)
     obj = LocalNPoint(mat.copy(), 4, 0, 0)
 
@@ -661,6 +718,7 @@ def test_orbital_symmetrization_patterns():
 
 
 def test_symmetrize_raises_for_orbitals_out_of_range_negative_and_large():
+    """_symmetrize_orbitals raises for negative or too-large orbital indices."""
     mat = np.random.rand(4, 4, 4, 4)
     obj = LocalNPoint(mat, 4, 0, 0)
     with pytest.raises(ValueError):
@@ -671,6 +729,7 @@ def test_symmetrize_raises_for_orbitals_out_of_range_negative_and_large():
 
 @pytest.mark.parametrize("orbitals", [[1], [1, 2], [1, 3], [1, 2, 3], [1, 2, 3, 4]])
 def test_symmetrize_two_orbital_axes_single_set(orbitals):
+    """_symmetrize_orbitals enforces degeneracies on two-orbital-axis tensors."""
     nb = 4
     mat = np.random.rand(nb, nb)
 
@@ -708,6 +767,7 @@ def test_symmetrize_two_orbital_axes_single_set(orbitals):
     "orbital_groups", [[[1, 2], [3, 4]], [[1, 2, 3], [4]], [[1, 3], [2, 4]], [[1, 2, 3, 4]], [[1], [2], [3], [4]]]
 )
 def test_symmetrize_two_orbital_axes_multiple_groups(orbital_groups):
+    """_symmetrize_orbitals symmetrizes within each group on two-orbital-axis tensors."""
     nb = 4
     mat = np.random.rand(nb, nb)
 
@@ -755,8 +815,8 @@ def test_symmetrize_two_orbital_axes_multiple_groups(orbital_groups):
         )
 
 
-# --- B2: extend_vn_to_diagonal stays native dtype (no complex128 temporary) ---
 def test_extend_vn_to_diagonal_stays_native_dtype_without_c128_temporary(monkeypatch):
+    """extend_vn_to_diagonal stays in the native dtype with no complex128 temporary."""
     seen = {"c128": False}
     real_einsum = np.einsum
 
@@ -773,8 +833,8 @@ def test_extend_vn_to_diagonal_stays_native_dtype_without_c128_temporary(monkeyp
     assert seen["c128"] is False
 
 
-# --- R4: cut_niv / cut_niw copy parameter (in-place vs copy branch) ---
 def test_cut_niv_copy_false_mutates_self_in_place():
+    """cut_niv(copy=False) mutates and returns self."""
     obj = LocalNPoint(np.arange(2 * 2 * 4).reshape(2, 2, 4).astype(complex), 2, 0, 1)  # [o1,o2,v], niv=2
     returned = obj.cut_niv(1, copy=False)
     assert returned is obj
@@ -782,6 +842,7 @@ def test_cut_niv_copy_false_mutates_self_in_place():
 
 
 def test_cut_niv_copy_true_leaves_original_untouched():
+    """cut_niv(copy=True) returns a new object and leaves the original untouched."""
     obj = LocalNPoint(np.arange(2 * 2 * 4).reshape(2, 2, 4).astype(complex), 2, 0, 1)
     cut = obj.cut_niv(1, copy=True)
     assert cut is not obj
@@ -790,7 +851,114 @@ def test_cut_niv_copy_true_leaves_original_untouched():
 
 
 def test_cut_niw_copy_false_mutates_self_in_place():
+    """cut_niw(copy=False) mutates and returns self."""
     obj = LocalNPoint(np.arange(2 * 2 * 5).reshape(2, 2, 5).astype(complex), 2, 1, 0)  # [o1,o2,w], niw=2
     returned = obj.cut_niw(1, copy=False)
     assert returned is obj
     assert obj.niw == 1
+
+
+def test_cut_niw_releases_parent_array():
+    """cut_niw releases the trimmed parent array instead of keeping a view."""
+    obj = LocalNPoint(np.arange(2 * 2 * 10).reshape(2, 2, 10).astype(complex), 2, 1, 0, full_niw_range=True)
+    result = obj.cut_niw(2)
+    # A bare slice would keep the full pre-cut array alive via ``mat.base``; the copy releases it.
+    assert result.mat.base is None
+    assert result.mat.shape[-1] == 5
+
+
+def test_cut_niv_releases_parent_array_and_preserves_values():
+    """cut_niv releases the parent array and keeps the central frequency block."""
+    mat = np.arange(2 * 2 * 8 * 8).reshape(2, 2, 8, 8).astype(complex)
+    obj = LocalNPoint(mat.copy(), 2, 0, 2, full_niv_range=True)
+    result = obj.cut_niv(2)
+    assert result.mat.base is None
+    # niv goes 4 -> 2, keeping the central [2:6, 2:6] block.
+    assert np.array_equal(result.mat, mat[..., 2:6, 2:6])
+    # original object is untouched (copy=True default)
+    assert obj.niv == 4
+
+
+def test_cut_niv_copy_false_releases_parent_array():
+    """cut_niv(copy=False) releases the parent array."""
+    obj = LocalNPoint(np.arange(2 * 2 * 8 * 8).reshape(2, 2, 8, 8).astype(complex), 2, 0, 2)
+    result = obj.cut_niv(2, copy=False)
+    assert result is obj
+    assert result.mat.base is None
+
+
+def test_to_half_niv_range_releases_parent_and_keeps_positive_half():
+    """to_half_niv_range releases the parent and keeps the positive fermionic half."""
+    mat = np.arange(2 * 2 * 8).reshape(2, 2, 8).astype(complex)
+    obj = LocalNPoint(mat.copy(), 2, 0, 1, full_niv_range=True)  # niv=4
+    result = obj.to_half_niv_range()
+    assert result.mat.base is None
+    assert result.full_niv_range is False
+    assert np.array_equal(result.mat, mat[..., 4:])
+
+
+def test_take_vn_diagonal_is_writeable_and_releases_parent():
+    """take_vn_diagonal returns a writeable array that releases the parent."""
+    mat = np.arange(2 * 2 * 3 * 4 * 4).reshape(2, 2, 3, 4, 4).astype(complex)  # [o,o,w,v,v]
+    obj = LocalNPoint(mat.copy(), 2, 1, 2)
+    result = obj.take_vn_diagonal()
+    assert result.num_vn_dimensions == 1
+    assert result.mat.flags.writeable  # diagonal() alone would yield a read-only view
+    assert result.mat.base is None
+    assert np.array_equal(result.mat, np.diagonal(mat, axis1=-2, axis2=-1))
+    # the result must be writeable in practice
+    result.mat[0, 0, 0, 0] = 123.0
+    assert result.mat[0, 0, 0, 0] == 123.0
+
+
+@pytest.mark.parametrize("num_vn", [0, 1, 2])
+def test_to_negative_niw_range_twice_returns_original(num_vn):
+    """to_negative_niw_range is its own inverse and leaves self unchanged."""
+    # to_negative_niw_range is its own inverse: applying it twice recovers the original object.
+    nb, niw, niv = 2, 3, 2
+    shape = (nb, nb, niw + 1) + (2 * niv,) * num_vn  # half (positive) niw range -> w-axis has niw+1 entries
+    mat = np.random.rand(*shape) + 1j * np.random.rand(*shape)
+    obj = LocalNPoint(mat.copy(), 2, 1, num_vn, full_niw_range=False)
+
+    once = obj.to_negative_niw_range()
+    twice = once.to_negative_niw_range()
+
+    assert twice is not obj  # always a new object, never self
+    assert once.mat.shape == obj.mat.shape  # niw+1 entries preserved (w=0 included)
+    assert np.allclose(twice.mat, obj.mat)  # double application recovers the original
+    assert np.allclose(obj.mat, mat)  # self is left unchanged (non-destructive)
+
+
+def test_to_negative_niw_range_raises_when_in_full_bosonic_range():
+    """to_negative_niw_range raises when in the full bosonic range."""
+    mat = np.random.rand(2, 2, 7, 4) + 1j * np.random.rand(2, 2, 7, 4)
+    obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=True)
+    with pytest.raises(ValueError):
+        obj.to_negative_niw_range()
+
+
+def test_to_negative_niw_range_raises_without_bosonic_dimension():
+    """to_negative_niw_range raises without a bosonic-frequency dimension."""
+    mat = np.random.rand(2, 2, 4) + 1j * np.random.rand(2, 2, 4)
+    obj = LocalNPoint(mat, 2, 0, 1, full_niw_range=False)  # no bosonic frequency dimension
+    with pytest.raises(ValueError):
+        obj.to_negative_niw_range()
+
+
+@pytest.mark.parametrize("num_vn", [0, 1])
+def test_to_negative_niw_range_matches_full_niw_range_negative_block(num_vn):
+    """to_negative_niw_range matches the full object's negative bosonic block."""
+    # Keystone: index k of the negative block (w = -k) must equal the full object's w = -k slot, for k = 1..niw.
+    nb, niw, niv = 2, 3, 2
+    shape = (nb, nb, niw + 1) + (2 * niv,) * num_vn
+    mat = np.random.rand(*shape) + 1j * np.random.rand(*shape)
+
+    # build a symmetry-consistent full-range object from the same half-range data
+    full = LocalNPoint(mat.copy(), 2, 1, num_vn, full_niw_range=False).to_full_niw_range()
+    neg = LocalNPoint(mat.copy(), 2, 1, num_vn, full_niw_range=False).to_negative_niw_range()
+
+    w_axis = -(1 + num_vn)
+    for k in range(1, niw + 1):
+        neg_slice = np.take(neg.mat, k, axis=w_axis)  # w = -k at index k
+        full_slice = np.take(full.mat, niw - k, axis=w_axis)  # full index niw-k <-> w = -k
+        assert np.allclose(neg_slice, full_slice)

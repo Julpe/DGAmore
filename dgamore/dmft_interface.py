@@ -262,7 +262,7 @@ class W2dynInterface(DMFTInterface):
         """
         giw = self.file_1p[self._ineq_group(ineq, dmft_iter) + "/giw/value"][()]  # [band, spin, niv]
         giw = np.mean(giw, axis=1)  # mean over spin
-        return GreensFunction(self._extend_orbital(giw))
+        return GreensFunction(self._extend_orbital(giw), nk=config.lattice.nk, beta=config.sys.beta)
 
     def get_siw(self, ineq: int = 1, dmft_iter: str = "dmft-last") -> SelfEnergy:
         """
@@ -278,7 +278,7 @@ class W2dynInterface(DMFTInterface):
         siw = self._extend_orbital(siw)[None, None, None, ...]
         siw_dc = np.mean(self.get_dc(ineq, dmft_iter), axis=-1)  # from [band, spin] to spin-mean
         siw_dc = self._extend_orbital(siw_dc)[None, None, None, ..., None]
-        return SelfEnergy(siw, estimate_niv_core=True) + siw_dc
+        return SelfEnergy(siw, estimate_niv_core=True, beta=config.sys.beta) + siw_dc
 
     def get_g2iw(self, channel: SpinChannel, ineq: int = 1) -> LocalFourPoint:
         """

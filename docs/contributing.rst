@@ -3,7 +3,9 @@ Contributing
 
 Contributions to DGAmore are very welcome. If you would like to contribute, please fork the repository and open a
 pull request with your changes. Before opening it, make sure your code follows the existing coding style and is well
-documented, that it does not break any existing functionality, and that it is covered by tests. A continuous
+documented, that it does not break any existing functionality, and that it is covered by tests. The code base is
+formatted with `Black <https://black.readthedocs.io>`_ using a line length of 120 characters, so please run
+``black -l 120`` over your changes before opening a pull request. A continuous
 integration pipeline runs the test suite on every pull request, so changes that do not pass the tests will not be
 merged, and a coverage tool checks that the test coverage stays above eighty-five percent. If you are unsure about
 any of these points, feel free to get in touch by `e-mail <mailto:julian.peil@tuwien.ac.at>`_.

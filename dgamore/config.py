@@ -270,7 +270,7 @@ class OutputConfig:
 
 class MemoryConfig:
     """
-    Stores the speed-vs-memory trade-off switches. Each flag, when True, selects a slower but more memory-frugal code
+    Stores the speed-vs-memory trade-off switches. Each flag, when True, selects a slower but more memory-lean code
     path for the corresponding quantity.
 
     :ivar bool save_memory_for_chi0q: Use the per-q einsum bubble instead of the FFT bubble.

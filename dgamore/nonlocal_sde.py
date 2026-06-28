@@ -34,7 +34,7 @@ from dgamore.greens_function import GreensFunction, update_mu
 from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.matsubara_frequencies import MFHelper
-from dgamore.mpi_distributor import MpiDistributor
+from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel
 from dgamore.self_energy import SelfEnergy
 
@@ -46,9 +46,11 @@ def get_hartree_fock(
     Returns the Hartree-Fock term separately for the local and non-local interaction. Since we are always SU(2)-symmetric,
     the sum over the spins of the first term in Eq. (4.55) in Anna Galler's thesis results in a simple factor of 2. This
     can be seen in my master's thesis, Eq. (3.56). The Hartree-Fock term is given by
-    .. math:: \Sigma_{HF}^k = 2(U_{abcd} + V^{q=0}_{abcd}) n_{dc} - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}
-    where the Hartree-term reads :math:`\Sigma_{H} = 2(U_{abcd} + V^{q=0}_{abcd}) n_{dc}` and the Fock-term reads
-    :math:`\Sigma_{F}^k = - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}`.
+    .. math:: \Sigma_{HF}^k = 2(U_{acbd} + V^{q=0}_{acbd}) n_{dc} - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}
+    where the Hartree-term reads :math:`\Sigma_{H} = 2(U_{acbd} + V^{q=0}_{acbd}) n_{dc}` and the Fock-term reads
+    :math:`\Sigma_{F}^k = - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}`. The Hartree contraction uses the
+    middle-index-swapped ``U_{acbd}`` so it picks up the inter-orbital density :math:`U'` (stored at :math:`U_{abab}`);
+    see :func:`dgamore.local_sde.get_local_hartree_fock`.
     Processes the Fock-Term for each individual orbital to save memory, as for high momentum grids,
     the occ_qk property can become large.
 
@@ -58,7 +60,9 @@ def get_hartree_fock(
     :return: The tuple ``(hartree, fock)`` of self-energy contributions, broadcastable to ``[k, o1, o2, v]``.
     """
     v_q0 = v_nonloc.find_q((0, 0, 0))
-    hartree = 2 * (u_loc + v_q0).times("qabcd,dc->ab", config.sys.occ)
+    # The inter-orbital density U' is stored at U_{abab}, so the Hartree term contracts "qacbd" (swapping the middle
+    # orbital indices) to pick it up; the Fock term below uses U_{adcb}. See local_sde.get_local_hartree_fock.
+    hartree = 2 * (u_loc + v_q0).times("qacbd,dc->ab", config.sys.occ)
 
     nb = config.sys.n_bands
     nk_tot = np.prod(config.lattice.nk)
@@ -175,7 +179,7 @@ def create_auxiliary_chi_r_q_sum_v3(
 ) -> FourPoint:
     r"""
     Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis. This is the most
-    memory-frugal variant: it loops over the rank-local q-points and uses the highly memory-efficient
+    memory-lean variant: it loops over the rank-local q-points and uses the highly memory-efficient
     linear-solver-based fused invert-and-sum per q (see :meth:`FourPoint.invert_and_sum_over_last_vn_v2`),
 
     .. math:: \sum_{\nu'}\chi^{*;q\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi_{0;abcd}^{q\nu})^{-1} + (\Gamma_{r;abcd}^{\omega\nu\nu'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}.
@@ -568,7 +572,7 @@ def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full
             mat += np.einsum("aijdv,xyzadv->xyzijv", k_slice, g_qk, optimize=path)
 
     mat *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
-    return SelfEnergy(mat, config.lattice.nk, False).compress_q_dimension().to_full_niv_range()
+    return SelfEnergy(mat, config.lattice.nk, False, beta=config.sys.beta).compress_q_dimension().to_full_niv_range()
 
 
 def calculate_sigma_from_kernel_cpu(
@@ -616,7 +620,11 @@ def calculate_sigma_from_kernel_cpu(
             np.add(mat, acc, out=mat)
 
     mat *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
-    return SelfEnergy(np.ascontiguousarray(mat), config.lattice.nk, False).compress_q_dimension().to_full_niv_range()
+    return (
+        SelfEnergy(np.ascontiguousarray(mat), config.lattice.nk, False, beta=config.sys.beta)
+        .compress_q_dimension()
+        .to_full_niv_range()
+    )
 
 
 def calculate_sigma_from_kernel_gpu(
@@ -663,7 +671,7 @@ def calculate_sigma_from_kernel_gpu(
 
     mat_gpu *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
     return (
-        SelfEnergy(np.ascontiguousarray(cp.asnumpy(mat_gpu)), config.lattice.nk, False)
+        SelfEnergy(np.ascontiguousarray(cp.asnumpy(mat_gpu)), config.lattice.nk, False, beta=config.sys.beta)
         .compress_q_dimension()
         .to_full_niv_range()
     )
@@ -709,7 +717,7 @@ def calculate_sigma_from_kernel_auto(
 
 
 def calculate_sigma_from_kernel_fft_cpu(
-    mpi_dist: MpiDistributor, kernel: FourPoint, giwk: GreensFunction
+    mpi_dist: MpiDistributor, kernel: FourPoint, giwk: GreensFunction, niw_index_w_pairs: list[tuple[int, int]]
 ) -> SelfEnergy:
     r"""
     Optimized self-energy calculation using distributed FFTs (CPU). Replaces the q-loop with a real-space pointwise
@@ -718,9 +726,18 @@ def calculate_sigma_from_kernel_fft_cpu(
     positive-:math:`\nu` half only; the caller must ifft over :math:`(k_x, k_y, k_z)` and then call
     :meth:`SelfEnergy.to_full_niv_range` before use.
 
+    This contracts a **single** bosonic-frequency half (positive-w *or* negative-w) so the full-BZ kernel is never
+    materialized over the full niw range (see :meth:`LocalNPoint.to_negative_niw_range`): the kernel is consumed in
+    whatever niw orientation it is handed (no internal ``to_full_niw_range``), and ``niw_index_w_pairs`` selects which
+    kernel w-slices to contract and how to shift the Green's function.
+
     :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
-    :param kernel: The self-energy kernel :math:`K` (irreducible BZ).
+    :param kernel: The self-energy kernel :math:`K` for one niw half (full BZ): the positive half (``w >= 0``) or the
+        negative block from :meth:`LocalNPoint.to_negative_niw_range` (``w = 0, -1, ..., -niw``).
     :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract. The positive pass passes
+        ``[(i, i) for i in range(niw + 1)]`` (``w = 0..+niw``), the negative pass
+        ``[(i, -i) for i in range(1, niw + 1)]`` (``w = -1..-niw``, skipping the ``w = 0`` duplicate).
     :return: The rank-local R-space :class:`SelfEnergy` (compressed q, half niv range, moments not fitted).
     """
     comm = mpi_dist.comm
@@ -730,14 +747,14 @@ def calculate_sigma_from_kernel_fft_cpu(
     nk_tot = config.lattice.q_grid.nk_tot
     nb = config.sys.n_bands
     niv_core = config.box.niv_core
-    niw = config.box.niw_core
     beta = config.sys.beta
 
     # G(k) -> F[G](R), forward FFT, replicated on every rank
     g_r_mat = giwk.fft().mat
 
-    # K(q) -> F[K](-R) via the conjugate trick: conj, fft, conj.
-    kernel = kernel.to_full_niw_range().to_half_niv_range()
+    # K(q) -> F[K](-R) via the conjugate trick: conj, fft, conj. The kernel is already a single niw half (positive
+    # half, or the negative block), so there is no to_full_niw_range here -- the full-niw kernel is never built.
+    kernel = kernel.to_half_niv_range()
     kernel.mat = np.conj(kernel.mat)
     kernel = mpi_utils.execute_distributed_fft(kernel, comm)
     kernel.mat = np.conj(kernel.mat)
@@ -750,11 +767,13 @@ def calculate_sigma_from_kernel_fft_cpu(
     my_r_indices = mpi_utils.get_pencil_indices(rank, size, (nkx, nky, nkz), "flat")
     g_r_local = g_r_mat.reshape(nk_tot, nb, nb, -1)[my_r_indices]
 
-    wn = MFHelper.wn(niw)
-    for iw, w in enumerate(wn):
+    path = None
+    for idx, w in niw_index_w_pairs:
         g_slice = g_r_local[..., giwk.niv - w : giwk.niv + niv_core - w]
-        k_slice = kernel.mat[..., iw, :]
-        np.einsum("Radv,Raijdv->Rijv", g_slice, k_slice, out=acc, optimize=True)
+        k_slice = kernel.mat[..., idx, :]
+        if path is None:  # slice shapes are identical across the loop -> compute the contraction path once
+            path = np.einsum_path("Radv,Raijdv->Rijv", g_slice, k_slice, optimize="optimal")[0]
+        np.einsum("Radv,Raijdv->Rijv", g_slice, k_slice, out=acc, optimize=path)
         np.add(mat, acc, out=mat)
 
     mat *= -0.5 / beta / nk_tot
@@ -764,20 +783,25 @@ def calculate_sigma_from_kernel_fft_cpu(
         full_niv_range=False,
         has_compressed_q_dimension=True,
         calc_smom=False,
+        beta=config.sys.beta,
     )
 
 
 def calculate_sigma_from_kernel_fft_gpu(
-    mpi_dist: MpiDistributor, kernel: FourPoint, giwk: GreensFunction
+    mpi_dist: MpiDistributor, kernel: FourPoint, giwk: GreensFunction, niw_index_w_pairs: list[tuple[int, int]]
 ) -> SelfEnergy:
     r"""
     Optimized self-energy calculation using distributed FFTs, running on the GPU (CuPy). Same algorithm as
-    :func:`calculate_sigma_from_kernel_fft_cpu`. Returns :math:`\Sigma` in R-space, positive-:math:`\nu` half only;
-    the caller must ifft over :math:`(k_x, k_y, k_z)` and then call :meth:`SelfEnergy.to_full_niv_range` before use.
+    :func:`calculate_sigma_from_kernel_fft_cpu` (including the single-niw-half / ``niw_index_w_pairs`` contraction).
+    Returns :math:`\Sigma` in R-space, positive-:math:`\nu` half only; the caller must ifft over
+    :math:`(k_x, k_y, k_z)` and then call :meth:`SelfEnergy.to_full_niv_range` before use.
 
     :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
-    :param kernel: The self-energy kernel :math:`K` (irreducible BZ).
+    :param kernel: The self-energy kernel :math:`K` for one niw half (full BZ): the positive half or the negative
+        block from :meth:`LocalNPoint.to_negative_niw_range`.
     :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract (see
+        :func:`calculate_sigma_from_kernel_fft_cpu`).
     :return: The rank-local R-space :class:`SelfEnergy` (compressed q, half niv range, moments not fitted).
     """
     import cupy as cp
@@ -789,14 +813,14 @@ def calculate_sigma_from_kernel_fft_gpu(
     nk_tot = config.lattice.q_grid.nk_tot
     nb = config.sys.n_bands
     niv_core = config.box.niv_core
-    niw = config.box.niw_core
     beta = config.sys.beta
 
     # G(k) -> F[G](R), forward FFT, replicated on every rank
     g_r_mat = cp.asarray(giwk.fft().mat)
 
-    # K(q) -> F[K](-R) via the conjugate trick: conj, fft, conj.
-    kernel = kernel.to_full_niw_range().to_half_niv_range()
+    # K(q) -> F[K](-R) via the conjugate trick: conj, fft, conj. The kernel is already a single niw half, so there is
+    # no to_full_niw_range here -- the full-niw kernel is never built.
+    kernel = kernel.to_half_niv_range()
     kernel.mat = np.conj(kernel.mat)
     kernel = mpi_utils.execute_distributed_fft(kernel, comm)
     kernel.mat = cp.conj(cp.asarray(kernel.mat))
@@ -808,10 +832,9 @@ def calculate_sigma_from_kernel_fft_gpu(
     my_r_indices = mpi_utils.get_pencil_indices(rank, size, (nkx, nky, nkz), "flat")
     g_r_local = g_r_mat.reshape(nk_tot, nb, nb, -1)[cp.asarray(my_r_indices)]
 
-    wn = MFHelper.wn(niw)
-    for iw, w in enumerate(wn):
+    for idx, w in niw_index_w_pairs:
         g_slice = g_r_local[..., giwk.niv - w : giwk.niv + niv_core - w]
-        k_slice = kernel.mat[..., iw, :]
+        k_slice = kernel.mat[..., idx, :]
         mat += cp.einsum("Radv,Raijdv->Rijv", g_slice, k_slice, optimize=True)
 
     mat *= -0.5 / beta / nk_tot
@@ -821,45 +844,79 @@ def calculate_sigma_from_kernel_fft_gpu(
         full_niv_range=False,
         has_compressed_q_dimension=True,
         calc_smom=False,
+        beta=config.sys.beta,
     )
 
 
-def calculate_sigma_from_kernel_fft_auto(
-    mpi_distributor: MpiDistributor, kernel: FourPoint, giwk: GreensFunction
-) -> SelfEnergy:
+def select_sigma_fft_device(mpi_distributor: MpiDistributor) -> bool:
     """
-    Dispatches the FFT-based self-energy calculation to the GPU (:func:`calculate_sigma_from_kernel_fft_gpu`) when
-    CuPy and a usable CUDA device are available (one GPU per MPI rank, round-robin), otherwise falls back to the CPU
-    implementation (:func:`calculate_sigma_from_kernel_fft_cpu`).
+    Detects whether CuPy and a usable CUDA device are available (one GPU per MPI rank, round-robin), selects this
+    rank's GPU and logs the decision **once**. Intended to be called a single time before the positive- and
+    negative-w FFT passes so the GPU-detection message is not emitted per pass.
 
-    :param mpi_distributor: MPI distributor providing the communicator, pencil decomposition and per-rank GPU choice.
-    :param kernel: The self-energy kernel :math:`K` (irreducible BZ).
-    :param giwk: The momentum-dependent :class:`GreensFunction`.
-    :return: The rank-local R-space :class:`SelfEnergy`.
+    :param mpi_distributor: MPI distributor providing the per-rank GPU choice.
+    :return: True if the GPU implementation should be used, False to fall back to the CPU implementation.
     """
-    logger = config.logger
-
     cp = None
     try:
         import cupy as cp
     except ImportError:
-        pass  # CuPy not installed -> CPU
+        return False  # CuPy not installed -> CPU
 
     n_gpus = 0
-    if cp is not None:
-        try:
-            n_gpus = cp.cuda.runtime.getDeviceCount()
-        except cp.cuda.runtime.CUDARuntimeError:
-            n_gpus = 0  # no usable CUDA driver/device -> CPU
+    try:
+        n_gpus = cp.cuda.runtime.getDeviceCount()
+    except cp.cuda.runtime.CUDARuntimeError:
+        n_gpus = 0  # no usable CUDA driver/device -> CPU
 
     if n_gpus > 0 and cp.cuda.is_available():
-        logger.info(f"CuPy detected {n_gpus} GPU(s). Using GPU acceleration for self-energy calculation.")
+        config.logger.info(f"CuPy detected {n_gpus} GPU(s). Using GPU acceleration for self-energy calculation.")
+        cp.cuda.Device(mpi_distributor.my_rank % n_gpus).use()
+        return True
 
-        gpu_id = mpi_distributor.my_rank % n_gpus
-        cp.cuda.Device(gpu_id).use()
-        return calculate_sigma_from_kernel_fft_gpu(mpi_distributor, kernel, giwk)
+    return False
 
-    return calculate_sigma_from_kernel_fft_cpu(mpi_distributor, kernel, giwk)
+
+def calculate_sigma_from_kernel_fft(
+    mpi_dist: MpiDistributor,
+    kernel: FourPoint,
+    giwk: GreensFunction,
+    niw_index_w_pairs: list[tuple[int, int]],
+    use_gpu: bool,
+) -> SelfEnergy:
+    """
+    Dispatches one bosonic-frequency FFT pass to the GPU (:func:`calculate_sigma_from_kernel_fft_gpu`) or CPU
+    (:func:`calculate_sigma_from_kernel_fft_cpu`) implementation according to ``use_gpu`` (decided once by
+    :func:`select_sigma_fft_device`, so no per-pass GPU-detection logging).
+
+    :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
+    :param kernel: The self-energy kernel :math:`K` for one niw half (full BZ).
+    :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract (see
+        :func:`calculate_sigma_from_kernel_fft_cpu`).
+    :param use_gpu: Whether to run the GPU implementation (as decided by :func:`select_sigma_fft_device`).
+    :return: The rank-local R-space :class:`SelfEnergy`.
+    """
+    if use_gpu:
+        return calculate_sigma_from_kernel_fft_gpu(mpi_dist, kernel, giwk, niw_index_w_pairs)
+    return calculate_sigma_from_kernel_fft_cpu(mpi_dist, kernel, giwk, niw_index_w_pairs)
+
+
+def _map_kernel_to_full_bz(
+    kernel: FourPoint, mpi_dist_irrk: MpiDistributor, mpi_dist_fullbz: MpiDistributor
+) -> FourPoint:
+    """
+    Maps the self-energy kernel from the irreducible to the full Brillouin zone, choosing the gather/scatter routine
+    or the fully distributed peer-to-peer routine according to ``config.memory.save_memory_for_chiq_aux``.
+
+    :param kernel: The self-energy kernel on the irreducible BZ.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points.
+    :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
+    :return: The kernel distributed over the full BZ.
+    """
+    if not config.memory.save_memory_for_chiq_aux:
+        return mpi_utils.map_irrbz_fullbz(kernel, mpi_dist_irrk, mpi_dist_fullbz)
+    return mpi_utils.exchange_and_map_irrbz_fullbz(kernel, mpi_dist_irrk, mpi_dist_fullbz)
 
 
 def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
@@ -896,11 +953,31 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
 
     mat = np.load(max_file)
     return (
-        SelfEnergy(mat, mat.shape[:3], True, False)
+        SelfEnergy(mat, mat.shape[:3], True, False, beta=config.sys.beta)
         .cut_niv(config.box.niv_core)
         .interpolate_q_grid(config.lattice.k_grid.nk, False),
         max_iter,
     )
+
+
+def _init_mu_history(starting_iter: int) -> list[float]:
+    r"""
+    Seeds the chemical-potential history for the self-consistency loop. For a fresh run (``starting_iter == 0``) the
+    history starts at the current (DMFT) chemical potential :math:`\mu`. When resuming from a previous self-consistency
+    calculation it is seeded with that run's last :math:`\mu` (from ``mu_history.npy``) and the global ``config.sys.mu``
+    is synced to it: otherwise ``config.sys.mu`` would stay at the DMFT value while ``giwk_full`` is built with the
+    previous run's :math:`\mu`, and any quantity computed from the global (e.g. the lattice filling in
+    :meth:`GreensFunction.get_fill_nonlocal`, which now reads ``self._mu``) would use an inconsistent chemical potential.
+
+    :param starting_iter: The iteration the previous calculation stopped at (0 for a fresh run).
+    :return: The single-element chemical-potential history list.
+    """
+    if starting_iter == 0:
+        return [config.sys.mu]
+
+    previous_mu = float(np.load(os.path.join(config.self_consistency.previous_sc_path, "mu_history.npy"))[-1])
+    config.sys.mu = previous_mu
+    return [previous_mu]
 
 
 def read_last_n_sigmas_from_files(n: int, output_path: str = "./", previous_sc_path: str = "./") -> list[np.ndarray]:
@@ -948,7 +1025,7 @@ def read_last_n_sigmas_from_files(n: int, output_path: str = "./", previous_sc_p
     for _, file in last_iterations:
         sigma_mat = np.load(file)
         sigmas.append(
-            SelfEnergy(sigma_mat, sigma_mat.shape[:3], True, False, False, False)
+            SelfEnergy(sigma_mat, sigma_mat.shape[:3], True, False, False, False, beta=config.sys.beta)
             .cut_niv(config.box.niv_core)
             .interpolate_q_grid(config.lattice.k_grid.nk, False)
             .mat
@@ -978,12 +1055,16 @@ def calculate_self_energy_q(
     logger.info("Initializing MPI distributor.")
 
     # MPI distributor for the irreducible BZ
-    mpi_dist_irrk = MpiDistributor.create_distributor(ntasks=config.lattice.q_grid.nk_irr, comm=comm, name="Q")
+    mpi_dist_irrk = MpiDistributor.create_distributor(
+        ntasks=config.lattice.q_grid.nk_irr, comm=comm, name="Q", output_path=config.output.output_path
+    )
     full_q_list = config.lattice.q_grid.get_q_list()
     irrk_q_list = config.lattice.q_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrk.my_slice]
 
-    mpi_dist_fullbz = MpiDistributor.create_distributor(ntasks=config.lattice.q_grid.nk_tot, comm=comm, name="FBZ")
+    mpi_dist_fullbz = MpiDistributor.create_distributor(
+        ntasks=config.lattice.q_grid.nk_tot, comm=comm, name="FBZ", output_path=config.output.output_path
+    )
     my_full_q_list = full_q_list[mpi_dist_fullbz.my_slice]
 
     sigma_old, starting_iter = get_starting_sigma(sigma_dmft)
@@ -992,23 +1073,26 @@ def calculate_self_energy_q(
             f"Using previous calculation and starting the self-consistency loop at iteration {starting_iter + 1}."
         )
 
-    mu_history = (
-        [config.sys.mu]
-        if starting_iter == 0
-        else [float(np.load(os.path.join(config.self_consistency.previous_sc_path, "mu_history.npy"))[-1])]
-    )
+    mu_history = _init_mu_history(starting_iter)
 
     niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
     sigma_dmft_full = deepcopy(sigma_dmft)
 
     if comm.rank == 0:
+        giwk_full_dmft = GreensFunction.get_g_full(
+            sigma_dmft_full, config.sys.mu_dmft, config.lattice.hamiltonian.get_ek(), config.sys.beta
+        )
+        giwk_full_dmft.save(output_dir=config.output.output_path, name="g_latt_dmft")
+        giwk_full_dmft.free()
+
         sigma_old = sigma_old.concatenate_self_energies(sigma_dmft_full)
-        giwk_full = GreensFunction.get_g_full(sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek())
+
+        giwk_full = GreensFunction.get_g_full(
+            sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek(), config.sys.beta
+        )
         config.sys.n, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
         giwk_full.cut_niv(niv_cut)
 
-        if np.allclose(sigma_old.cut_niv(config.box.niv_core).mat, sigma_dmft.cut_niv(config.box.niv_core).mat):
-            giwk_full.save(output_dir=config.output.output_path, name="g_latt_dmft")
     config.sys.n, config.sys.occ, config.sys.occ_k = comm.bcast(
         (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
     )
@@ -1033,9 +1117,12 @@ def calculate_self_energy_q(
         fock = mpi_dist_fullbz.allreduce(fock)
         logger.info("Calculated Hartree and Fock terms.")
 
-        giwk_full = GreensFunction.get_g_full(sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek())
+        giwk_full = GreensFunction.get_g_full(
+            sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek(), config.sys.beta
+        )
 
         logger.log_memory_usage("giwk", giwk_full, comm.size)
+
         if config.memory.save_memory_for_chi0q:
             gchi0_q = BubbleGenerator.create_generalized_chi0_q_auto(
                 mpi_dist_irrk,
@@ -1062,7 +1149,13 @@ def calculate_self_energy_q(
             gchi0_q.save(name=f"gchi0_q_rank_{comm.rank}", output_dir=config.output.output_path)
 
         logger.log_memory_usage("Gchi0_q_full", gchi0_q, comm.size)
-        giwk_full = giwk_full.cut_niv(niv_cut)
+        giwk_full = giwk_full.cut_niv(config.box.niv_core + config.box.niw_core)
+
+        # sigma_old is not read again until the mixing step at the end of the iteration, and its shell
+        # [niv_core, niv_cut) is always the (k-independent) DMFT self-energy. Shrink the full-grid sigma_old to its core
+        # here -- freeing the broadcast shell through the kernel/SDE/fq peak -- and reconstruct the shell from sigma_dmft
+        # just before mixing, which restores it to niv_cut bit-for-bit.
+        sigma_old = sigma_old.cut_niv(config.box.niv_core)
 
         f_dc_loc = 2 * LocalFourPoint.load(os.path.join(config.output.output_path, "f_magn_loc.npy")).permute_orbitals(
             "abcd->cbad"
@@ -1110,22 +1203,58 @@ def calculate_self_energy_q(
         gamma_magn.free()
         logger.info("Calculated kernel for magnetic channel.")
 
-        if not config.memory.save_memory_for_chiq_aux:
-            kernel = mpi_utils.map_irrbz_fullbz(kernel, mpi_dist_irrk, mpi_dist_fullbz)
-            logger.info("Kernel mapped to full BZ and scattered across all MPI ranks.")
-        else:
-            kernel = mpi_utils.exchange_and_map_irrbz_fullbz(kernel, mpi_dist_irrk, mpi_dist_fullbz)
-            logger.info("Kernel mapped to full BZ individually on each rank.")
-
         logger.info("Started calculation of DGA self-energy.")
 
         if config.memory.save_memory_for_sde:
+            # q-loop path: the kernel is mapped to the full BZ once (the full niw range is handled inside the q-loop).
+            kernel = _map_kernel_to_full_bz(kernel, mpi_dist_irrk, mpi_dist_fullbz)
+            logger.info("Kernel mapped to full BZ.")
             sigma_new = calculate_sigma_from_kernel_auto(mpi_dist_fullbz, kernel, giwk_full, my_full_q_list)
             kernel.free()
             sigma_new.mat = mpi_dist_fullbz.allreduce(sigma_new.mat)
         else:
-            sigma_new = calculate_sigma_from_kernel_fft_auto(mpi_dist_irrk, kernel, giwk_full)
-            kernel.free()
+            # FFT path: split the bosonic-frequency sum into a positive- and a negative-w pass so the full-BZ
+            # kernel is only ever materialized over half the niw range AND only one niw half exists at a time. The
+            # small irreducible-BZ kernel is kept and mapped to the full BZ separately for each pass; the negative
+            # block's time-reversal is applied *after* the irreducible->full-BZ unfold (not before). The unfold applies
+            # a per-k orbital rotation U (complex for multi-band) plus an optional conjugation (see
+            # :meth:`IAmNonLocal._map_to_full_bz`), and ``to_negative_niw_range`` conjugates the data, so it must see
+            # the already-unfolded kernel (conj of U*..U^T), exactly as the q-loop path and the original single-pass
+            # implementation did. Flipping the irreducible-BZ kernel first would leave U un-conjugated and corrupt
+            # sigma on the symmetry-folded q-points.
+            niw = config.box.niw_core
+            kernel_irr = kernel  # the (small) irreducible-BZ positive-w kernel, mapped to the full BZ once per pass
+            # Decide CPU/GPU (and select the GPU) once, so the detection is not logged for each of the two passes.
+            use_gpu = select_sigma_fft_device(mpi_dist_fullbz)
+
+            # positive pass: map a copy of the irr-BZ kernel to the full BZ and contract w = 0..+niw. The deep copy
+            # keeps ``kernel_irr`` (small) intact for the negative pass, which maps it again -- so only a single
+            # full-BZ niw half is ever resident. ``_map_kernel_to_full_bz`` may either mutate-and-return its argument
+            # or return a fresh object, so free the source copy only when a distinct object came back.
+            kernel_pos_irr = deepcopy(kernel_irr)
+            kernel_pos = _map_kernel_to_full_bz(kernel_pos_irr, mpi_dist_irrk, mpi_dist_fullbz)
+            if kernel_pos is not kernel_pos_irr:
+                kernel_pos_irr.free()
+            sigma_new = calculate_sigma_from_kernel_fft(
+                mpi_dist_irrk, kernel_pos, giwk_full, [(i, i) for i in range(niw + 1)], use_gpu
+            )
+            kernel_pos.free()
+
+            # negative pass: map the irr-BZ kernel to the full BZ, time-reverse the full-BZ result (w = 0, -1, ...,
+            # -niw), and contract w = -1..-niw (skip the w=0 duplicate).
+            kernel_neg_full = _map_kernel_to_full_bz(kernel_irr, mpi_dist_irrk, mpi_dist_fullbz)
+            if kernel_neg_full is not kernel_irr:
+                kernel_irr.free()  # the irr-BZ kernel is no longer needed once the full-BZ negative source exists
+            kernel_neg = kernel_neg_full.to_negative_niw_range()
+            kernel_neg_full.free()  # release the full-BZ positive copy as soon as the negative block is built
+            sigma_neg = calculate_sigma_from_kernel_fft(
+                mpi_dist_irrk, kernel_neg, giwk_full, [(i, -i) for i in range(1, niw + 1)], use_gpu
+            )
+            kernel_neg.free()
+
+            sigma_new.mat += sigma_neg.mat  # accumulate the rank-local R-space partial self-energies (in place)
+            sigma_neg.free()
+
             sigma_new.mat = mpi_dist_fullbz.gather(sigma_new.mat)
             if comm.rank == 0:
                 sigma_new = sigma_new.ifft().to_full_niv_range()
@@ -1144,6 +1273,9 @@ def calculate_self_energy_q(
         # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
 
         logger.info("Applying mixing strategy to the self-energy.")
+        # Restore sigma_old's DMFT shell (cut after the bubble for memory) so the mixing and the residual below see the
+        # full niv_cut self-energy exactly as before.
+        sigma_old = sigma_old.concatenate_self_energies(sigma_dmft)
         sigma_new = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter)
 
         sigma_new = sigma_new.compress_q_dimension()
@@ -1159,7 +1291,13 @@ def calculate_self_energy_q(
         old_mu = mu_history[-1]
         if comm.rank == 0:
             config.sys.mu = update_mu(
-                old_mu, config.sys.n, giwk_full.ek, sigma_new.mat, config.sys.beta, sigma_new.fit_smom()[0]
+                old_mu,
+                config.sys.n,
+                giwk_full.ek,
+                sigma_new.mat,
+                config.sys.beta,
+                sigma_new.fit_smom()[0],
+                logger=logger,
             )
 
         config.sys.mu = comm.bcast(config.sys.mu)
@@ -1168,7 +1306,9 @@ def calculate_self_energy_q(
 
         if comm.rank == 0:
             sigma_occ = deepcopy(sigma_new).concatenate_self_energies(sigma_dmft_full)
-            giwk_occ = giwk_full.get_g_full(sigma_occ, config.sys.mu, config.lattice.hamiltonian.get_ek())
+            giwk_occ = giwk_full.get_g_full(
+                sigma_occ, config.sys.mu, config.lattice.hamiltonian.get_ek(), config.sys.beta
+            )
             # calculate new occupation matrix from new Green's function (outside asympt region it is the DMFT
             # lattice Green's function)
             _, config.sys.occ, config.sys.occ_k = giwk_occ.get_fill_nonlocal()  # n should not change
@@ -1193,8 +1333,7 @@ def calculate_self_energy_q(
             if config.self_energy_interpolation.do_interpolation:
                 beta_target = config.self_energy_interpolation.beta_target
                 niv_target = config.self_energy_interpolation.niv_target
-                beta_source = config.sys.beta
-                sigma_new.decompress_q_dimension().interpolate(beta_source, beta_target, niv_target).save(
+                sigma_new.decompress_q_dimension().interpolate(beta_target, niv_target).save(
                     name=f"sigma_dga_interpolated_beta{beta_target}_niv{niv_target}_iteration_{current_iter}",
                     output_dir=config.output.output_path,
                 )

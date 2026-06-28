@@ -4,14 +4,15 @@
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import os
+
 import numpy as np
 import pytest
 
 import dgamore.config as config
 import dgamore.symmetry_reduction as symmetry_reduction
 import dgamore.mpi_utils as mu
-import dgamore.mpi_distributor as md
-from dgamore.mpi_distributor import MpiDistributor
+from dgamore.mpi_utils import MpiDistributor
 import dgamore.brillouin_zone as bz
 from dgamore.brillouin_zone import KGrid
 from dgamore.four_point import FourPoint
@@ -19,26 +20,40 @@ from dgamore.n_point_base import SpinChannel
 
 from tests.conftest import run_parallel, FAKE_MPI as MPI
 
+# The shared conftest installs an autouse fixture that no-ops os.remove (so the rest of the suite never deletes real
+# files). Capture the genuine os.remove here, at import time, so the rank-file lifecycle test can opt back in to real
+# deletion for its own assertion without disturbing that fixture.
+_REAL_OS_REMOVE = os.remove
+
 
 @pytest.fixture(autouse=True)
 def _use_fake_mpi(monkeypatch):
-    # Inject the thread-based fake communicator into the modules under test for
-    # the duration of these tests only; real mpi4py is left untouched elsewhere.
+    # Inject the thread-based fake communicator into the module under test (the distributor, the chunking primitives
+    # and the data-movement routines all live in mpi_utils now); real mpi4py is left untouched elsewhere.
     monkeypatch.setattr(mu, "MPI", MPI)
-    monkeypatch.setattr(md, "MPI", MPI)
 
 
 @pytest.fixture(autouse=True)
 def _default_no_output_path(monkeypatch):
-    # The real config defaults output_path to "" (not None), which makes every
-    # MpiDistributor create a rank file on construction. None -> no files.
+    # The real config defaults output_path to "" (not None), which makes every MpiDistributor create a rank file on
+    # construction. None -> no files; the file-lifecycle tests opt back in by passing a tmp_path explicitly.
     monkeypatch.setattr(config.output, "output_path", None)
 
 
-# --------------------------------------------------------------------------- #
-# _get_node_aware_v_dist
-# --------------------------------------------------------------------------- #
+# A picklable object carrying a `.mat` array, matching what MpiDistributor.send_to_rank expects.
+class Holder:
+    def __init__(self, mat, label="obj"):
+        self.mat = mat
+        self.label = label
+
+
+def comm1():
+    """A size-1 communicator usable directly on the main thread."""
+    return MPI.Comm(1)
+
+
 def test_node_aware_single_node():
+    """_get_node_aware_v_dist puts the frequency excess on the first ranks for a single node."""
     # 7 frequencies, 3 ranks, all on one node -> excess on the first ranks.
     def fn(comm, rank):
         sizes, slices = mu._get_node_aware_v_dist(7, comm)
@@ -51,6 +66,7 @@ def test_node_aware_single_node():
 
 
 def test_node_aware_multi_node():
+    """_get_node_aware_v_dist splits frequencies per node and agrees across ranks."""
     # 4 ranks split across 2 nodes (2 ranks each); 6 frequencies.
     # 3 freqs per node; within a node, excess on first local rank -> [2,1].
     hostnames = ["n0", "n1", "n0", "n1"]
@@ -67,6 +83,7 @@ def test_node_aware_multi_node():
 
 
 def test_node_aware_uneven_nodes():
+    """_get_node_aware_v_dist preserves the total over unevenly sized nodes."""
     # 3 nodes, 5 frequencies -> 2,2,1 across nodes; total preserved.
     hostnames = ["a", "b", "c", "a"]
 
@@ -79,10 +96,8 @@ def test_node_aware_uneven_nodes():
     assert all(s == res[0] for s in res)
 
 
-# --------------------------------------------------------------------------- #
-# _send_in_chunks / _recv_in_chunks
-# --------------------------------------------------------------------------- #
 def test_send_recv_in_chunks_roundtrip():
+    """_send_in_chunks / _recv_in_chunks round-trip a 2D complex array."""
     arr = (np.arange(5 * 3).reshape(5, 3) + 1j).astype(np.complex128)
 
     def fn(comm, rank):
@@ -98,6 +113,7 @@ def test_send_recv_in_chunks_roundtrip():
 
 
 def test_send_recv_in_chunks_multichunk(monkeypatch):
+    """_send_in_chunks / _recv_in_chunks round-trip across multiple chunks."""
     arr = (np.arange(6 * 2).reshape(6, 2) + 2j).astype(np.complex128)
     monkeypatch.setattr(mu, "MAX_MPI_BYTES", 16)
 
@@ -114,6 +130,7 @@ def test_send_recv_in_chunks_multichunk(monkeypatch):
 
 
 def test_send_recv_in_chunks_1d():
+    """_send_in_chunks / _recv_in_chunks round-trip a 1D array."""
     arr = np.arange(10, dtype=np.float64)
 
     def fn(comm, rank):
@@ -128,9 +145,6 @@ def test_send_recv_in_chunks_1d():
     assert np.allclose(res[1], arr)
 
 
-# --------------------------------------------------------------------------- #
-# Shared fixtures for BZ mapping tests
-# --------------------------------------------------------------------------- #
 # A real (2x2x1) square-lattice grid reduces 4 full-BZ q-points to 3
 # irreducible ones; its inverse map is [0, 1, 1, 2] (point 1 is duplicated, so
 # the IBZ->FBZ expansion is non-trivial). We derive the sizes and the reference
@@ -150,6 +164,8 @@ def _q_grid():
 
 
 def test_map_irrbz_fullbz():
+    """map_irrbz_fullbz expands the distributed IBZ object to the full BZ."""
+
     def fn(comm, rank):
         config.lattice.q_grid = _q_grid()
         d_irr = MpiDistributor(ntasks=N_IRR, comm=comm)
@@ -164,6 +180,8 @@ def test_map_irrbz_fullbz():
 
 
 def test_exchange_and_map_matches_reference():
+    """exchange_and_map_irrbz_fullbz reproduces the reference full-BZ expansion."""
+
     def fn(comm, rank):
         config.lattice.q_grid = _q_grid()
         d_irr = MpiDistributor(ntasks=N_IRR, comm=comm)
@@ -180,6 +198,7 @@ def test_exchange_and_map_matches_reference():
 
 
 def test_exchange_and_map_single_rank():
+    """exchange_and_map_irrbz_fullbz works on a single rank and propagates metadata."""
     config.lattice.q_grid = _q_grid()
     comm = MPI.Comm(1)
     d_irr = MpiDistributor(ntasks=N_IRR, comm=comm)
@@ -193,6 +212,7 @@ def test_exchange_and_map_single_rank():
 
 
 def test_exchange_and_map_auto_orbital_transform(monkeypatch):
+    """exchange_and_map_irrbz_fullbz applies the auto orbital transform per rank slice."""
     # Record every apply_auto_orbital_transform call. Patching the function on
     # the symmetry_reduction module works whether that module is the real one
     # or the in-process fake (the auto branch in mpi_utils calls it by name).
@@ -245,12 +265,10 @@ def test_exchange_and_map_auto_orbital_transform(monkeypatch):
     assert all(c["num_orbital_dimensions"] == 4 for c in calls)
 
 
-# --------------------------------------------------------------------------- #
-# get_pencil_indices
-# --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("layout", ["flat", "z_pencil", "y_pencil", "x_pencil"])
 @pytest.mark.parametrize("size", [1, 2, 3, 4])
 def test_get_pencil_indices_partition(layout, size):
+    """get_pencil_indices partitions every global index exactly once across layouts and sizes."""
     nq = (2, 3, 2)
     n_tot = nq[0] * nq[1] * nq[2]
     parts = [mu.get_pencil_indices(r, size, nq, layout) for r in range(size)]
@@ -260,6 +278,7 @@ def test_get_pencil_indices_partition(layout, size):
 
 
 def test_get_pencil_indices_flat_matches_distributor():
+    """get_pencil_indices flat layout matches the MpiDistributor slicing convention."""
     nq = (2, 2, 2)
     size = 3
     for r in range(size):
@@ -271,21 +290,21 @@ def test_get_pencil_indices_flat_matches_distributor():
 
 
 def test_get_pencil_indices_invalid_layout():
+    """get_pencil_indices raises for an unknown layout."""
     with pytest.raises(ValueError):
         mu.get_pencil_indices(0, 1, (2, 2, 2), "bogus")
 
 
 def test_get_pencil_indices_empty_partition():
+    """get_pencil_indices returns an empty partition when ranks exceed pencils."""
     # More ranks than pencils -> some ranks own nothing.
     nq = (1, 1, 2)  # only 2 z-pencils? n_pencils for z = nx*ny = 1
     idx = mu.get_pencil_indices(3, 4, nq, "z_pencil")
     assert idx.size == 0
 
 
-# --------------------------------------------------------------------------- #
-# _redistribute_p2p
-# --------------------------------------------------------------------------- #
 def test_redistribute_flat_to_zpencil():
+    """_redistribute_p2p moves data from a flat to a z-pencil layout."""
     nq = (2, 3, 2)
     n_tot = nq[0] * nq[1] * nq[2]
     G = (np.arange(n_tot * 2).reshape(n_tot, 2) + 1j).astype(np.complex128)
@@ -302,6 +321,7 @@ def test_redistribute_flat_to_zpencil():
 
 
 def test_redistribute_roundtrip_multichunk(monkeypatch):
+    """_redistribute_p2p round-trips flat->z-pencil->flat across multiple chunks."""
     nq = (2, 2, 2)
     n_tot = 8
     G = (np.arange(n_tot * 3).reshape(n_tot, 3) + 2j).astype(np.complex128)
@@ -319,9 +339,6 @@ def test_redistribute_roundtrip_multichunk(monkeypatch):
         assert np.allclose(back, expected)
 
 
-# --------------------------------------------------------------------------- #
-# execute_distributed_fft
-# --------------------------------------------------------------------------- #
 def _run_dist_fft(size, G, nq):
     """Run the distributed FFT across `size` ranks and reconstruct the global
     flat-layout result."""
@@ -340,6 +357,7 @@ def _run_dist_fft(size, G, nq):
 
 
 def test_execute_distributed_fft_matches_numpy():
+    """execute_distributed_fft matches numpy.fft.fftn for 1-3 ranks."""
     nq = (2, 3, 2)
     nx, ny, nz = nq
     n_tot = nx * ny * nz
@@ -353,10 +371,8 @@ def test_execute_distributed_fft_matches_numpy():
         assert np.allclose(rebuilt, expected), f"mismatch for size={size}"
 
 
-# --------------------------------------------------------------------------- #
-# gather_full_ibz_for_vslice
-# --------------------------------------------------------------------------- #
 def test_gather_full_ibz_for_vslice():
+    """gather_full_ibz_for_vslice gives each rank the full IBZ for its frequency slice."""
     n_irrq = 4
     n_v = 3
     n_vp = 2
@@ -385,6 +401,7 @@ def test_gather_full_ibz_for_vslice():
 
 
 def test_gather_full_ibz_for_vslice_empty_rank_returns_none():
+    """gather_full_ibz_for_vslice returns None for a rank with no frequencies."""
     n_irrq = 3
     n_v = 1  # fewer frequencies than ranks -> rank 1 gets none
     n_vp = 2
@@ -406,3 +423,528 @@ def test_gather_full_ibz_for_vslice_empty_rank_returns_none():
     assert none_flags.count(True) == 1
     for _, is_none, my_v in res:
         assert is_none == (my_v == 0)
+
+
+def test_distribute_tasks_with_excess():
+    """MpiDistributor places the task excess on the last rank."""
+    d = MpiDistributor(ntasks=7, comm=MPI.Comm(3))
+    # 7 tasks over 3 ranks -> excess of 1 lands on the last rank.
+    assert list(d.sizes) == [2, 2, 3]
+    assert [(s.start, s.stop) for s in d.slices] == [(0, 2), (2, 4), (4, 7)]
+
+
+def test_distribute_tasks_even_no_excess():
+    """MpiDistributor splits tasks evenly when there is no excess."""
+    d = MpiDistributor(ntasks=6, comm=MPI.Comm(3))
+    assert list(d.sizes) == [2, 2, 2]
+
+
+def test_distribute_tasks_fewer_than_ranks():
+    """MpiDistributor gives empty slices to ranks beyond the task count."""
+    d = MpiDistributor(ntasks=1, comm=MPI.Comm(3))
+    assert list(d.sizes) == [0, 0, 1]
+
+
+def test_properties_single_rank():
+    """MpiDistributor exposes consistent properties on a single rank."""
+    d = MpiDistributor(ntasks=5, comm=comm1())
+    assert d.ntasks == 5
+    assert d.mpi_size == 1
+    assert d.my_rank == 0
+    assert d.is_root is True
+    assert d.my_size == 5
+    assert isinstance(d.my_slice, slice)
+    assert np.array_equal(d.my_tasks, np.arange(5))
+    assert d.comm is not None
+    assert np.array_equal(d.sizes, [5])
+    assert len(d.slices) == 1
+
+
+def test_is_root_false_on_nonzero_rank():
+    """MpiDistributor.is_root is True only on rank 0."""
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=4, comm=comm)
+        return d.is_root, d.my_rank
+
+    _, res = run_parallel(3, fn)
+    assert res[0] == (True, 0)
+    assert res[1] == (False, 1)
+    assert res[2] == (False, 2)
+
+
+def test_rankfile_created_and_context_manager(tmp_path, monkeypatch):
+    """MpiDistributor creates a rank file and supports the context-manager and delete cycle."""
+    d = MpiDistributor(ntasks=3, comm=comm1(), name="green", output_path=str(tmp_path))
+    assert d._fname.endswith("green_Rank00000.hdf5")
+    # context manager opens then closes the file
+    with d as f:
+        assert f is not None
+    # explicit open/close/delete cycle (opt back in to real deletion, since the
+    # shared conftest's autouse fixture otherwise no-ops os.remove)
+    monkeypatch.setattr(os, "remove", _REAL_OS_REMOVE)
+    d.open_file()
+    d.close_file()
+    d.delete_file()
+    assert not os.path.exists(d._fname)
+
+
+def test_open_close_delete_are_safe_without_file():
+    """MpiDistributor file ops are no-ops without an output path."""
+    # No output_path -> no _fname attribute; all file ops must swallow errors.
+    d = MpiDistributor(ntasks=2, comm=comm1())
+    assert d._file is None
+    d.open_file()  # AttributeError on missing _fname -> swallowed
+    d.close_file()  # None.close() -> swallowed
+    d.delete_file()  # os.remove(missing) -> swallowed
+
+
+def test_output_path_is_injected_not_read_from_config(tmp_path, monkeypatch):
+    """MpiDistributor uses the injected output_path, never config.output."""
+    # config.output.output_path is poisoned; the injected output_path must win and
+    # the distributor must never read the global config.
+    monkeypatch.setattr(config.output, "output_path", "/should/not/be/used")
+    d = MpiDistributor(ntasks=3, comm=comm1(), name="inj", output_path=str(tmp_path))
+    assert str(tmp_path) in d._fname
+    assert "/should/not/be/used" not in d._fname
+
+
+def test_config_output_path_is_ignored_when_not_injected(monkeypatch):
+    """MpiDistributor creates no spill file unless output_path is passed explicitly."""
+    # Even with config.output.output_path set, no spill file is created unless
+    # output_path is passed explicitly -> proves the global is no longer consulted.
+    monkeypatch.setattr(config.output, "output_path", "/should/not/be/used")
+    d = MpiDistributor(ntasks=3, comm=comm1(), name="ignored")
+    assert d._file is None
+    assert not hasattr(d, "_fname")
+
+
+def test_create_distributor_threads_output_path(tmp_path, monkeypatch):
+    """create_distributor forwards output_path to the rank file name."""
+    monkeypatch.setattr(config.output, "output_path", None)
+    d = MpiDistributor.create_distributor(ntasks=3, comm=comm1(), name="fac", output_path=str(tmp_path))
+    assert d._fname.endswith("fac_Rank00000.hdf5")
+
+
+def test_del_closes_file(tmp_path, monkeypatch):
+    """MpiDistributor.__del__ closes an open rank file."""
+    d = MpiDistributor(ntasks=1, comm=comm1(), name="del", output_path=str(tmp_path))
+    fname = d._fname
+    d.open_file()
+    d.__del__()  # exercise destructor path directly
+    assert fname.endswith("del_Rank00000.hdf5")
+
+
+def test_exit_without_open_file():
+    """MpiDistributor.__exit__ does nothing when no file is open."""
+    d = MpiDistributor(ntasks=1, comm=comm1())
+    # _file is None -> __exit__ must not attempt to close
+    d.__exit__(None, None, None)
+
+
+def test_barrier_runs_on_all_ranks():
+    """MpiDistributor.barrier runs on every rank."""
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=3, comm=comm)
+        d.barrier()
+        return rank
+
+    _, res = run_parallel(3, fn)
+    assert sorted(res) == [0, 1, 2]
+
+
+def test_allgather_reassembles_full_array():
+    """MpiDistributor.allgather reassembles the full array on every rank."""
+    full = (np.arange(7 * 2).reshape(7, 2) + 0.25).astype(np.float64)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=7, comm=comm)
+        return d.allgather(full[d.my_slice])
+
+    _, res = run_parallel(3, fn)
+    for r in res:
+        assert np.allclose(r, full)
+
+
+def test_allgather_single_rank():
+    """MpiDistributor.allgather returns the local data on a single rank."""
+    d = MpiDistributor(ntasks=4, comm=comm1())
+    local = np.arange(4, dtype=float)[:, None]
+    out = d.allgather(local)
+    assert np.allclose(out, local)
+
+
+def test_allgather_chunked(monkeypatch):
+    """MpiDistributor.allgather reassembles the full array across multiple chunks."""
+    full = (np.arange(6 * 3).reshape(6, 3) + 1j).astype(np.complex128)
+    # Force several chunks per rank: one complex row = 48 bytes.
+    monkeypatch.setattr(mu, "MAX_MPI_BYTES", 16)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=6, comm=comm)
+        return d.allgather(full[d.my_slice])
+
+    _, res = run_parallel(3, fn)
+    for r in res:
+        assert np.allclose(r, full)
+
+
+def test_gather_to_root():
+    """MpiDistributor.gather collects the full array on the root rank only."""
+    full = (np.arange(7 * 3).reshape(7, 3) + 1j).astype(np.complex128)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=7, comm=comm)
+        return d.gather(full[d.my_slice], root=0)
+
+    _, res = run_parallel(3, fn)
+    assert np.allclose(res[0], full)
+    assert res[1] is None and res[2] is None
+
+
+def test_gather_with_empty_ranks():
+    """MpiDistributor.gather works when some ranks hold no tasks."""
+    # ntasks=1, size=3 -> sizes [0, 0, 1]: a non-root rank has zero tasks.
+    full = np.arange(1 * 2).reshape(1, 2) + 3.0
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=1, comm=comm)
+        return d.gather(full[d.my_slice], root=0)
+
+    _, res = run_parallel(3, fn)
+    assert np.allclose(res[0], full)
+
+
+def test_gather_chunked(monkeypatch):
+    """MpiDistributor.gather collects the full array across multiple chunks."""
+    full = (np.arange(7 * 3).reshape(7, 3) + 1j).astype(np.complex128)
+    monkeypatch.setattr(mu, "MAX_MPI_BYTES", 16)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=7, comm=comm)
+        return d.gather(full[d.my_slice], root=0)
+
+    _, res = run_parallel(3, fn)
+    assert np.allclose(res[0], full)
+
+
+def test_gather_chunked_multidim_trailing(monkeypatch):
+    """MpiDistributor.gather writes chunks directly into multi-dimensional destination slices."""
+    # Regression: the chunked receive writes directly into the contiguous axis-0 destination slice
+    # (no staging buffer). Use a multi-dimensional trailing shape and force many small chunks.
+    full = (np.arange(5 * 2 * 3).reshape(5, 2, 3) + 1j).astype(np.complex128)
+    monkeypatch.setattr(mu, "MAX_MPI_BYTES", 16)  # 1 row per chunk -> exercises the per-chunk Recv path
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=5, comm=comm)
+        return d.gather(full[d.my_slice], root=0)
+
+    _, res = run_parallel(3, fn)
+    assert np.array_equal(res[0], full)
+
+
+def test_gather_single_rank():
+    """MpiDistributor.gather returns the local data on a single rank."""
+    d = MpiDistributor(ntasks=3, comm=comm1())
+    arr = np.arange(3 * 2).reshape(3, 2).astype(float)
+    out = d.gather(arr, root=0)
+    assert np.allclose(out, arr)
+
+
+def test_scatter_distributes_rows():
+    """MpiDistributor.scatter distributes the root's rows across ranks."""
+    full = (np.arange(7 * 3).reshape(7, 3) + 1j).astype(np.complex128)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=7, comm=comm)
+        return d.scatter(full if rank == 0 else None, root=0)
+
+    _, res = run_parallel(3, fn)
+    assert np.allclose(np.concatenate(res, axis=0), full)
+
+
+def test_scatter_chunked(monkeypatch):
+    """MpiDistributor.scatter distributes rows across multiple chunks."""
+    full = (np.arange(7 * 3).reshape(7, 3) + 1j).astype(np.complex128)
+    monkeypatch.setattr(mu, "MAX_MPI_BYTES", 16)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=7, comm=comm)
+        return d.scatter(full if rank == 0 else None, root=0)
+
+    _, res = run_parallel(3, fn)
+    assert np.allclose(np.concatenate(res, axis=0), full)
+
+
+def test_scatter_with_empty_rank():
+    """MpiDistributor.scatter gives empty slices to ranks with no tasks."""
+    # ntasks=1, size=3 -> rank 1 receives nothing (my_size 0).
+    full = np.arange(1 * 2).reshape(1, 2) + 2.0
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=1, comm=comm)
+        out = d.scatter(full if rank == 0 else None, root=0)
+        return out.shape[0]
+
+    _, res = run_parallel(3, fn)
+    assert res == [0, 0, 1]
+
+
+def test_scatter_type_error():
+    """MpiDistributor.scatter raises TypeError for a non-array payload."""
+    d = MpiDistributor(ntasks=3, comm=comm1())
+    with pytest.raises(TypeError):
+        d.scatter([1, 2, 3], root=0)  # not a numpy array
+
+
+def test_scatter_value_error_on_mismatch():
+    """MpiDistributor.scatter raises ValueError when the row count mismatches."""
+    d = MpiDistributor(ntasks=3, comm=comm1())
+    bad = np.zeros((4, 2))  # length 4 != ntasks(3) and != my_size(3)
+    with pytest.raises(ValueError):
+        d.scatter(bad, root=0)
+
+
+def test_scatter_none_on_root_single_rank():
+    """MpiDistributor.scatter on a single rank returns the full local size even for a None payload."""
+    d = MpiDistributor(ntasks=3, comm=comm1())
+    out = d.scatter(None, root=0)
+    assert out.shape[0] == 3
+
+
+def test_send_recv_object_roundtrip():
+    """MpiDistributor.send_to_rank / recv_from_rank round-trip a .mat-carrying object."""
+    arr = np.arange(5 * 4).reshape(5, 4) + 0.5
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=5, comm=comm)
+        if rank == 0:
+            h = Holder(arr.copy(), label="hello")
+            d.send_to_rank(h, dest=1)
+            return ("sent", h.mat)  # mat must be restored after send
+        if rank == 1:
+            h = d.recv_from_rank(source=0)
+            return ("recv", h.label, h.mat)
+        return None
+
+    _, res = run_parallel(2, fn)
+    assert res[0][0] == "sent"
+    assert np.allclose(res[0][1], arr)  # restored on sender
+    assert res[1][1] == "hello"
+    assert np.allclose(res[1][2], arr)
+
+
+def test_send_recv_object_chunked(monkeypatch):
+    """MpiDistributor.send_to_rank / recv_from_rank round-trip across multiple chunks."""
+    arr = np.arange(6 * 2).reshape(6, 2) + 1.0
+    monkeypatch.setattr(mu, "MAX_MPI_BYTES", 8)  # forces chunking of meta blob and mat
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=6, comm=comm)
+        if rank == 0:
+            d.send_to_rank(Holder(arr.copy(), "chunky"), dest=1)
+            return "sent"
+        if rank == 1:
+            h = d.recv_from_rank(source=0)
+            return (h.label, h.mat)
+        return None
+
+    _, res = run_parallel(2, fn)
+    assert res[1][0] == "chunky"
+    assert np.allclose(res[1][1], arr)
+
+
+def test_bcast_object():
+    """MpiDistributor.bcast broadcasts a python object to all ranks."""
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=3, comm=comm)
+        payload = {"v": 42} if rank == 0 else None
+        return d.bcast(payload, root=0)
+
+    _, res = run_parallel(3, fn)
+    assert all(r == {"v": 42} for r in res)
+
+
+def test_bcast_chunked():
+    """MpiDistributor.bcast_chunked broadcasts an array to all ranks."""
+    arr = (np.arange(10 * 2).reshape(10, 2) + 1j).astype(np.complex128)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=4, comm=comm)
+        local = arr.copy() if rank == 0 else np.empty((1, 1), dtype=np.complex128)
+        return d.bcast_chunked(local, root=0)
+
+    _, res = run_parallel(3, fn)
+    for r in res:
+        assert np.allclose(r, arr)
+
+
+def test_bcast_chunked_multi_chunk(monkeypatch):
+    """MpiDistributor.bcast_chunked broadcasts an array across multiple chunks."""
+    arr = (np.arange(8 * 3).reshape(8, 3) + 1j).astype(np.complex128)
+    monkeypatch.setattr(mu, "MAX_MPI_BYTES", 24)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=4, comm=comm)
+        local = arr.copy() if rank == 0 else np.empty((1, 1), dtype=np.complex128)
+        return d.bcast_chunked(local, root=0)
+
+    _, res = run_parallel(3, fn)
+    for r in res:
+        assert np.allclose(r, arr)
+
+
+def test_allreduce_sums_across_ranks():
+    """MpiDistributor.allreduce sums contributions across ranks."""
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=3, comm=comm)
+        return d.allreduce(np.array([float(rank + 1), 10.0]))
+
+    _, res = run_parallel(3, fn)
+    # ranks contribute (1,10),(2,10),(3,10) -> sum (6,30) on every rank.
+    for r in res:
+        assert np.allclose(r, [6.0, 30.0])
+
+
+def test_create_distributor_with_comm():
+    """create_distributor builds an MpiDistributor from a given communicator."""
+    d = MpiDistributor.create_distributor(ntasks=4, comm=comm1(), name="f")
+    assert isinstance(d, MpiDistributor)
+    assert d.ntasks == 4
+
+
+def test_create_distributor_defaults_to_comm_world():
+    """create_distributor defaults to COMM_WORLD when no comm is given."""
+    d = MpiDistributor.create_distributor(ntasks=2, comm=None)
+    assert d.comm is MPI.COMM_WORLD
+    assert d.mpi_size == 1
+
+
+def test_close_file_propagates_non_os_errors():
+    """close_file swallows OSError but propagates other errors."""
+    # File ops swallow only OSError; programming errors propagate.
+    dist = MpiDistributor.__new__(MpiDistributor)
+
+    class Boom:
+        def close(self):
+            raise ValueError("not an OSError")
+
+    dist._file = Boom()
+    try:
+        with pytest.raises(ValueError):
+            dist.close_file()
+    finally:
+        dist._file = None  # avoid Boom.close() raising again during __del__ on GC
+
+
+def test_chunk_step_floors_to_one_and_divides():
+    """chunk_step floors to one row and divides by the per-row item count safely."""
+    assert mu.chunk_step(16, 3, limit=16) == 1  # one row (48 B) exceeds the limit -> floor to 1
+    assert mu.chunk_step(1, 1, limit=10) == 10
+    assert mu.chunk_step(2, 1, limit=10) == 5
+    assert mu.chunk_step(4, 0, limit=100) >= 1  # items_per_row == 0 must not divide by zero
+
+
+@pytest.mark.parametrize(
+    "n, limit, expected",
+    [
+        (5, 2, [(0, 2), (2, 4), (4, 5)]),  # remainder
+        (4, 2, [(0, 2), (2, 4)]),  # exact multiple
+        (0, 2, []),  # empty
+        (3, 10_000, [(0, 3)]),  # single chunk when limit is huge
+    ],
+)
+def test_row_chunks_boundaries(n, limit, expected):
+    """row_chunks yields the correct chunk boundaries including remainder and empty cases."""
+    assert list(mu.row_chunks(n, 1, 1, limit=limit)) == expected
+
+
+@pytest.mark.parametrize("shape", [(7, 3), (5, 2, 3), (6,)])
+def test_send_recv_rows_roundtrip_multichunk(shape):
+    """send_rows / recv_rows_alloc round-trip arrays of various shapes across chunks."""
+    arr = (np.arange(int(np.prod(shape))).reshape(shape) + 1j).astype(np.complex128)
+
+    def fn(comm, rank):
+        if rank == 0:
+            mu.send_rows(comm, arr, dest=1, limit=16)  # 16 B < one row -> 1 row/chunk
+            return None
+        return mu.recv_rows_alloc(comm, arr.shape, arr.dtype, source=0, limit=16)
+
+    _, res = run_parallel(2, fn)
+    assert np.array_equal(res[1], arr)
+
+
+def test_recv_rows_into_writes_into_given_buffer():
+    """recv_rows_into fills the caller's preallocated buffer in place."""
+    # Regression: recv_rows_into must fill the caller's preallocated buffer in place (no staging copy).
+    arr = (np.arange(5 * 2 * 3).reshape(5, 2, 3) + 1j).astype(np.complex128)
+
+    def fn(comm, rank):
+        if rank == 0:
+            mu.send_rows(comm, arr, dest=1, limit=16)
+            return None
+        buf = np.zeros_like(arr)
+        ret = mu.recv_rows_into(comm, buf, source=0, limit=16)
+        return ret is buf, buf
+
+    _, res = run_parallel(2, fn)
+    same_object, buf = res[1]
+    assert same_object
+    assert np.array_equal(buf, arr)
+
+
+def test_send_recv_rows_default_limit_single_chunk():
+    """send_rows / recv_rows_alloc round-trip in a single chunk at the default limit."""
+    arr = np.arange(5 * 2).reshape(5, 2).astype(float)
+
+    def fn(comm, rank):
+        if rank == 0:
+            mu.send_rows(comm, arr, dest=1)  # default (2 GB) limit -> single chunk
+            return None
+        return mu.recv_rows_alloc(comm, arr.shape, arr.dtype, source=0)
+
+    _, res = run_parallel(2, fn)
+    assert np.allclose(res[1], arr)
+
+
+def test_bcast_rows_roundtrip_multichunk():
+    """bcast_rows broadcasts an array across multiple chunks."""
+    arr = (np.arange(6 * 2).reshape(6, 2) + 1j).astype(np.complex128)
+
+    def fn(comm, rank):
+        return mu.bcast_rows(comm, arr if rank == 0 else None, root=0, limit=16)
+
+    _, res = run_parallel(3, fn)
+    for r in range(3):
+        assert np.array_equal(res[r], arr)
+
+
+def test_bcast_rows_into_fills_view():
+    """bcast_rows_into fills the receiver's buffer view."""
+    arr = (np.arange(6 * 2).reshape(6, 2) + 1j).astype(np.complex128)
+
+    def fn(comm, rank):
+        buf = arr.copy() if rank == 0 else np.empty_like(arr)
+        mu.bcast_rows_into(comm, buf, root=0, limit=16)
+        return buf
+
+    _, res = run_parallel(3, fn)
+    for r in range(3):
+        assert np.array_equal(res[r], arr)
+
+
+def test_send_recv_bytes_roundtrip_multichunk():
+    """send_bytes / recv_bytes round-trip a raw byte blob across chunks."""
+    data = bytes(range(256)) * 5  # 1280 bytes
+
+    def fn(comm, rank):
+        if rank == 0:
+            mu.send_bytes(comm, data, dest=1, limit=64)
+            return None
+        return mu.recv_bytes(comm, source=0, limit=64)
+
+    _, res = run_parallel(2, fn)
+    assert res[1] == data

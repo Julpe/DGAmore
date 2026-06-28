@@ -10,7 +10,6 @@ import numpy as np
 import pytest
 from unittest.mock import patch
 
-import dgamore.config as real_config
 from dgamore.self_energy import SelfEnergy
 from dgamore.nonlocal_sde import apply_mixing_strategy
 
@@ -21,19 +20,10 @@ NIV = 8
 NIV_CORE = 4
 
 
-@pytest.fixture(autouse=True)
-def set_beta():
-    """Patches config.sys.beta globally for all tests so SelfEnergy can be constructed."""
-    original = real_config.sys.beta
-    real_config.sys.beta = BETA
-    yield
-    real_config.sys.beta = original
-
-
 def make_sigma(value: complex, nk: tuple[int, int, int] = NK, nb: int = NB, niv: int = NIV_CORE) -> SelfEnergy:
     """Creates a SelfEnergy with constant complex fill value."""
     mat = np.full((*nk, nb, nb, 2 * niv), value, dtype=np.complex64)
-    return SelfEnergy(mat, nk)
+    return SelfEnergy(mat, nk, beta=BETA)
 
 
 def make_sigma_mat(value: complex, nk: tuple[int, int, int] = NK, nb: int = NB, niv: int = NIV_CORE) -> np.ndarray:
@@ -380,10 +370,7 @@ def test_anderson_core_is_finite():
 
 
 def test_anderson_core_differs_from_linear_with_nontrivial_history():
-    """
-    With a nontrivial history (changing sigmas), Anderson's core window must
-    differ from plain linear mixing — otherwise it adds no value over linear.
-    """
+    """With a nontrivial history, Anderson's core window must differ from plain linear mixing."""
     sigma_new = make_sigma(2.0 + 0.5j)
     sigma_old = make_sigma(1.0 + 0.2j)
     sigma_dmft = make_sigma(0.0)
@@ -401,11 +388,7 @@ def test_anderson_core_differs_from_linear_with_nontrivial_history():
 
 
 def test_anderson_history_ordering_matters():
-    """
-    Passing history oldest-first vs newest-first must produce different results,
-    confirming the implementation depends on the correct ordering from
-    read_last_n_sigmas_from_files.
-    """
+    """Passing history oldest-first vs newest-first must produce different Anderson results (ordering matters)."""
     sigma_new = make_sigma(2.0)
     sigma_old = make_sigma(1.0)
     sigma_dmft = make_sigma(0.0)

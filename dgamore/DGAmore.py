@@ -20,6 +20,7 @@ from copy import deepcopy
 
 import matplotlib.pyplot as plt
 import numpy as np
+import psutil
 from matplotlib import font_manager
 from mpi4py import MPI
 
@@ -27,6 +28,7 @@ import dgamore.config as config
 import dgamore.dga_io as dga_io
 import dgamore.eliashberg_solver as eliashberg_solver
 import dgamore.local_sde as local_sde
+import dgamore.memory_estimator as memory_estimator
 import dgamore.nonlocal_sde as nonlocal_sde
 import dgamore.plotting as plotting
 from dgamore import max_ent
@@ -128,6 +130,8 @@ def execute_dga_routine():
             f"Automatically determined symmetries for the q-grid. The irreducible BZ has "
             f"{config.lattice.q_grid.nk_irr}/{config.lattice.q_grid.nk_tot} elements."
         )
+
+    autodetect_memory_settings(comm)
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
@@ -393,7 +397,7 @@ def execute_dga_routine():
     del sigma_dmft_full, sigma_loc_full
     logger.info("Non-local ladder-DGA routine finished.")
 
-    giwk_dga = GreensFunction.get_g_full(sigma_dga, config.sys.mu, ek)
+    giwk_dga = GreensFunction.get_g_full(sigma_dga, config.sys.mu, ek, config.sys.beta)
 
     if config.ana_cont.do_spectrum_dga:
         spectrum = max_ent.perform_maxent_giwk(giwk_dga, "DGA", comm)
@@ -417,9 +421,11 @@ def execute_dga_routine():
     if config.ana_cont.do_spectrum_dmft:
         g_latt = None
         if comm.rank == 0:
-            g_latt = GreensFunction(np.load(os.path.join(config.output.output_path, "g_latt_dmft.npy"))).cut_niv(
-                config.box.niv_core
-            )
+            g_latt = GreensFunction(
+                np.load(os.path.join(config.output.output_path, "g_latt_dmft.npy")),
+                nk=config.lattice.nk,
+                beta=config.sys.beta,
+            ).cut_niv(config.box.niv_core)
         g_latt = comm.bcast(g_latt, root=0)
         spectrum = max_ent.perform_maxent_giwk(g_latt, "DMFT", comm)
 
@@ -520,6 +526,108 @@ def execute_dga_routine():
 
     logger.info("Exiting ...")
     MPI.Finalize()
+
+
+def autodetect_memory_settings(comm: MPI.Comm) -> None:
+    """
+    Sets the five ``config.memory.save_memory_*`` switches automatically from the host memory available on every node
+    the job runs on and an analytic estimate of the peak memory each affected operation consumes. Must be called only
+    after the irreducible BZ is known (i.e. after auto-symmetry discovery), as the estimate depends on
+    ``q_grid.nk_irr``.
+
+    The budget is a **node total**: on a node with ``r`` ranks the memory held by all of them at a branch's peak is
+    ``r * (baseline + distributed) + single`` (every rank holds the persistent baseline; a *distributed* transient is
+    held by every rank at once, a *single-rank* transient by one rank while the others idle), and this must not exceed
+    ``psutil.virtual_memory().available * 0.9`` for that node. Each node's rank count and available memory are
+    collected with a single ``allgather`` of ``(hostname, available_bytes)``; a branch's fast path is judged to "fit"
+    only if it fits on **every** node (the flags are process-wide, so the tightest node governs, and a single-rank
+    transient may land on any node). For each branch the fast path is checked and the flag is switched on if it would
+    not fit -- but an explicit ``True`` from the config is always kept (floor semantics:
+    ``final = user_flag or autodetect_on``). If even the lean path of any considered branch does not fit on some
+    node, a :class:`MemoryError` is raised.
+
+    :param comm: The MPI communicator (used to group ranks by node).
+    :return: None.
+    :raises MemoryError: If the most memory-lean path of any considered branch still overflows some node's budget.
+    """
+    logger = config.logger
+
+    # Gather (hostname, available bytes) from every rank in a single collective and reduce to one entry per node:
+    # the rank count and the (minimum, conservative) available memory on that node.
+    node_available = psutil.virtual_memory().available
+    hostname = str(MPI.Get_processor_name()).strip()
+    nodes: dict[str, list] = {}
+    for host, avail in comm.allgather((hostname, node_available)):
+        if host not in nodes:
+            nodes[host] = [0, avail]
+        nodes[host][0] += 1
+        nodes[host][1] = min(nodes[host][1], avail)
+
+    niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
+    # Must mirror the giwk_full window kept through the SDE in nonlocal_sde.calculate_self_energy_q.
+    niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
+    baseline, peaks = memory_estimator.estimate_peaks(
+        n_bands=config.sys.n_bands,
+        nk_tot=config.lattice.q_grid.nk_tot,
+        nk_irr=config.lattice.q_grid.nk_irr,
+        niw_core=config.box.niw_core,
+        niv_core=config.box.niv_core,
+        niv_full=config.box.niv_full,
+        niv_cut=niv_cut,
+        niv_pp=niv_pp,
+        n_ranks=comm.size,
+        with_eliashberg=config.eliashberg.perform_eliashberg,
+        save_fq=config.eliashberg.save_fq,
+        construct_fq_cheap=config.eliashberg.construct_fq_cheap,
+    )
+
+    def node_total(distributed: float, single: float, n_ranks: int) -> float:
+        """Memory held on a node with ``n_ranks`` ranks at a branch's peak (see :func:`autodetect_memory_settings`)."""
+        return n_ranks * (baseline + distributed) + single
+
+    def fits_everywhere(distributed: float, single: float) -> bool:
+        """Whether a transient (per-rank ``distributed`` + one-off ``single``) fits the 90% budget on every node."""
+        return all(node_total(distributed, single, r) <= avail * 0.9 for r, avail in nodes.values())
+
+    flag_to_key = {
+        "save_memory_for_chi0q": "chi0q",
+        "save_memory_for_chiq_aux": "chiq_aux",
+        "save_memory_for_sde": "sde",
+        "save_memory_for_fq": "fq",
+        "save_memory_for_lanczos": "lanczos",
+    }
+    key_to_label = {
+        "chi0q": "Bare bubble",
+        "chiq_aux": "Auxiliary susceptibility",
+        "sde": "Schwinger-Dyson equation",
+        "fq": "Full vertex",
+        "lanczos": "Eliashberg solver",
+    }
+
+    logger.info(
+        f"Auto memory detection (node-total budget): {len(nodes)} node(s), "
+        f"per-rank baseline {baseline / 1024**3:.3f} GB."
+    )
+    for attr, key in flag_to_key.items():
+        if key not in peaks:
+            continue
+        bp = peaks[key]
+        label = key_to_label[key]
+        if not fits_everywhere(bp.on_distributed, bp.on_single):
+            worst = max(node_total(bp.on_distributed, bp.on_single, r) for r, _ in nodes.values())
+            raise MemoryError(
+                f"Even the most memory-lean path for '{label}' needs {worst / 1024**3:.3f} GB on a node, which "
+                f"exceeds 90% of that node's available memory. Use more nodes, fewer ranks per node, a smaller "
+                f"frequency box or k-grid."
+            )
+        autodetect_on = not fits_everywhere(bp.off_distributed, bp.off_single)
+        final = bool(getattr(config.memory, attr)) or autodetect_on
+        setattr(config.memory, attr, final)
+        worst_off = max(node_total(bp.off_distributed, bp.off_single, r) for r, _ in nodes.values())
+        logger.info(
+            f"{label}: fast-path node total {worst_off / 1024**3:.3f} GB -> "
+            f"memory saving {'enabled' if final else 'disabled'}."
+        )
 
 
 def setup_lambda_correction_settings(comm: MPI.Comm) -> None:

@@ -17,6 +17,7 @@ from dgamore.n_point_base import SpinChannel
 
 @pytest.mark.parametrize("n", [1, 2, 3])
 def test_exponentiation_with_positive_power_1(n):
+    """Exponentiation with a positive power contracts the object with itself (variant 1)."""
     mat = np.random.rand(2, 2, 2, 2, 21, 20) + 1j * np.random.rand(2, 2, 2, 2, 21, 20)
     obj = LocalFourPoint(mat, channel=SpinChannel.NONE, num_vn_dimensions=1)
     identity = LocalFourPoint.identity_like(obj)
@@ -29,6 +30,7 @@ def test_exponentiation_with_positive_power_1(n):
 
 @pytest.mark.parametrize("n", [1, 2, 3])
 def test_exponentiation_with_positive_power_2(n):
+    """Exponentiation with a positive power contracts the object with itself (variant 2)."""
     mat = np.random.rand(2, 2, 2, 2, 21, 20, 20) + 1j * np.random.rand(2, 2, 2, 2, 21, 20, 20)
     obj = LocalFourPoint(mat, channel=SpinChannel.NONE, num_vn_dimensions=2)
     identity = LocalFourPoint.identity_like(obj)
@@ -40,6 +42,7 @@ def test_exponentiation_with_positive_power_2(n):
 
 
 def test_exponentiation_with_zero_power_returns_identity_1():
+    """Exponentiation with power zero returns the identity (variant 1)."""
     mat = np.random.rand(2, 2, 2, 2, 21, 20) + 1j * np.random.rand(2, 2, 2, 2, 21, 20)
     obj = LocalFourPoint(mat, channel=SpinChannel.NONE, num_vn_dimensions=1)
     identity = LocalFourPoint.identity_like(obj)
@@ -48,6 +51,7 @@ def test_exponentiation_with_zero_power_returns_identity_1():
 
 
 def test_exponentiation_with_zero_power_returns_identity_2():
+    """Exponentiation with power zero returns the identity (variant 2)."""
     mat = np.random.rand(2, 2, 2, 2, 21, 20, 20) + 1j * np.random.rand(2, 2, 2, 2, 21, 20, 20)
     obj = LocalFourPoint(mat, channel=SpinChannel.NONE, num_vn_dimensions=2)
     identity = LocalFourPoint.identity_like(obj)
@@ -57,6 +61,7 @@ def test_exponentiation_with_zero_power_returns_identity_2():
 
 @pytest.mark.parametrize("n", [1, 2, 3])
 def test_exponentiation_with_negative_power_1(n):
+    """Exponentiation with a negative power inverts and powers the object (variant 1)."""
     mat = np.random.rand(2, 2, 2, 2, 21, 20) + 1j * np.random.rand(2, 2, 2, 2, 21, 20)
     obj = LocalFourPoint(mat, channel=SpinChannel.NONE, num_vn_dimensions=1)
     identity = LocalFourPoint.identity_like(obj)
@@ -69,6 +74,7 @@ def test_exponentiation_with_negative_power_1(n):
 
 @pytest.mark.parametrize("n", [1, 2, 3])
 def test_exponentiation_with_negative_power_2(n):
+    """Exponentiation with a negative power inverts and powers the object (variant 2)."""
     mat = np.random.rand(2, 2, 2, 2, 21, 20, 20) + 1j * np.random.rand(2, 2, 2, 2, 21, 20, 20)
     obj = LocalFourPoint(mat, channel=SpinChannel.NONE, num_vn_dimensions=2)
     identity = LocalFourPoint.identity_like(obj)
@@ -80,6 +86,7 @@ def test_exponentiation_with_negative_power_2(n):
 
 
 def test_exponentiation_with_non_integer_power_raises_error():
+    """Exponentiation with a non-integer power raises."""
     mat = np.random.rand(2, 2, 2, 2, 21, 20, 20) + 1j * np.random.rand(2, 2, 2, 2, 21, 20, 20)
     obj = LocalFourPoint(mat, channel=SpinChannel.NONE, num_vn_dimensions=2)
     identity = LocalFourPoint.identity_like(obj)
@@ -88,6 +95,7 @@ def test_exponentiation_with_non_integer_power_raises_error():
 
 
 def test_symmetrizes_square_matrix_correctly():
+    """symmetrize symmetrizes a square compound matrix correctly."""
     mat = np.array([[[[[[1, 2.5], [2.5, 4]]]]]])
     obj = LocalFourPoint(mat)
     result = obj.symmetrize_v_vp()
@@ -96,6 +104,7 @@ def test_symmetrizes_square_matrix_correctly():
 
 
 def test_symmetrizes_random_matrix_correctly():
+    """symmetrize symmetrizes a random matrix correctly."""
     mat = np.random.rand(2, 2, 2, 2, 5, 3, 3)
     obj = LocalFourPoint(mat)
     result = obj.symmetrize_v_vp()
@@ -104,6 +113,7 @@ def test_symmetrizes_random_matrix_correctly():
 
 
 def test_handles_symmetric_matrix_without_modification():
+    """symmetrize leaves an already-symmetric matrix unchanged."""
     mat = np.array([[[[[[1, 2], [2, 4]]]]]])
     obj = LocalFourPoint(mat)
     result = obj.symmetrize_v_vp()
@@ -111,6 +121,7 @@ def test_handles_symmetric_matrix_without_modification():
 
 
 def test_raises_error_for_non_square_last_two_axes():
+    """symmetrize raises for non-square last two axes."""
     mat = np.random.rand(2, 2, 2, 2, 5, 3, 4)
     obj = LocalFourPoint(mat)
     with pytest.raises(ValueError):
@@ -118,6 +129,7 @@ def test_raises_error_for_non_square_last_two_axes():
 
 
 def test_raises_error_for_not_having_two_vn_dimensions():
+    """symmetrize raises without two fermionic-frequency dimensions."""
     mat = np.random.rand(2, 2, 2, 2, 5, 3)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
     with pytest.raises(ValueError):
@@ -125,6 +137,7 @@ def test_raises_error_for_not_having_two_vn_dimensions():
 
 
 def test_sums_over_orbitals_correctly_1():
+    """sum_over_orbitals contracts the orbital indices correctly (variant 1)."""
     mat = np.random.rand(2, 2, 2, 2, 5, 3)
     obj = LocalFourPoint(mat)
     result = obj.sum_over_orbitals("abcd->ad")
@@ -133,6 +146,7 @@ def test_sums_over_orbitals_correctly_1():
 
 
 def test_sums_over_orbitals_correctly_2():
+    """sum_over_orbitals contracts the orbital indices correctly (variant 2)."""
     mat = np.random.rand(2, 2, 2, 2, 5, 3, 3)
     obj = LocalFourPoint(mat)
     result = obj.sum_over_orbitals("abcd->ad")
@@ -141,6 +155,7 @@ def test_sums_over_orbitals_correctly_2():
 
 
 def test_raises_error_for_invalid_orbital_contraction_format():
+    """sum_over_orbitals raises for an invalid contraction format."""
     mat = np.random.rand(2, 2, 2, 2, 5, 3, 3)
     obj = LocalFourPoint(mat)
     with pytest.raises(ValueError):
@@ -148,6 +163,7 @@ def test_raises_error_for_invalid_orbital_contraction_format():
 
 
 def test_handles_no_orbital_reduction():
+    """sum_over_orbitals leaves the object unchanged when no orbitals are reduced."""
     mat = np.random.rand(2, 2, 2, 2, 5, 3, 3)
     obj = LocalFourPoint(mat)
     result = obj.sum_over_orbitals("abcd->abcd")
@@ -155,6 +171,7 @@ def test_handles_no_orbital_reduction():
 
 
 def test_reduces_orbital_dimensions_correctly_1():
+    """sum_over_orbitals reduces the orbital dimensions correctly (variant 1)."""
     mat = np.random.rand(3, 3, 3, 3, 5, 4, 4)
     obj = LocalFourPoint(mat)
     result = obj.sum_over_orbitals("abcd->a")
@@ -163,6 +180,7 @@ def test_reduces_orbital_dimensions_correctly_1():
 
 
 def test_reduces_orbital_dimensions_correctly_2():
+    """sum_over_orbitals reduces the orbital dimensions correctly (variant 2)."""
     mat = np.random.rand(3, 3, 3, 3, 5, 4, 4)
     obj = LocalFourPoint(mat)
     result = obj.sum_over_orbitals("abcd->ab")
@@ -171,6 +189,7 @@ def test_reduces_orbital_dimensions_correctly_2():
 
 
 def test_reduces_orbital_dimensions_correctly_3():
+    """sum_over_orbitals reduces the orbital dimensions correctly (variant 3)."""
     mat = np.random.rand(3, 3, 3, 3, 5, 4, 4)
     obj = LocalFourPoint(mat)
     result = obj.sum_over_orbitals("abcd->abc")
@@ -179,6 +198,7 @@ def test_reduces_orbital_dimensions_correctly_3():
 
 
 def test_sums_over_single_vn_dimension_correctly_1():
+    """sum_over_vn sums over a single fermionic-frequency dimension (variant 1)."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
     beta = 10.0
@@ -190,6 +210,7 @@ def test_sums_over_single_vn_dimension_correctly_1():
 
 @pytest.mark.parametrize("n", [1, 2])
 def test_sums_over_single_vn_dimension_correctly_2(n):
+    """sum_over_vn sums over a single fermionic-frequency dimension (variant 2)."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     beta = 10.0
@@ -200,6 +221,7 @@ def test_sums_over_single_vn_dimension_correctly_2(n):
 
 
 def test_sums_over_multiple_vn_dimensions_correctly():
+    """sum_over_vn sums over multiple fermionic-frequency dimensions."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     beta = 10.0
@@ -210,6 +232,7 @@ def test_sums_over_multiple_vn_dimensions_correctly():
 
 
 def test_raises_error_when_summing_over_too_many_vn_dimensions():
+    """sum_over_vn raises when summing over too many fermionic dimensions."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
     beta = 10.0
@@ -218,6 +241,7 @@ def test_raises_error_when_summing_over_too_many_vn_dimensions():
 
 
 def test_sums_over_all_vn_with_double_vn_dimensions_correctly():
+    """sum_over_all_vn sums over both fermionic dimensions."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     beta = 10.0
@@ -228,6 +252,7 @@ def test_sums_over_all_vn_with_double_vn_dimensions_correctly():
 
 
 def test_sums_over_all_vn_with_single_vn_dimension_correctly():
+    """sum_over_all_vn sums over the single fermionic dimension."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
     beta = 10.0
@@ -238,6 +263,7 @@ def test_sums_over_all_vn_with_single_vn_dimension_correctly():
 
 
 def test_handles_no_vn_dimensions_without_modification_for_sum():
+    """sum_over_all_vn leaves an object with no fermionic dimensions unchanged."""
     mat = np.random.rand(2, 2, 2, 2, 5)
     obj = LocalFourPoint(mat, num_vn_dimensions=0)
     beta = 10.0
@@ -247,6 +273,7 @@ def test_handles_no_vn_dimensions_without_modification_for_sum():
 
 
 def test_contracts_legs_correctly_with_two_vn_dimensions():
+    """contract_legs contracts the legs correctly with two fermionic dimensions."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     beta = 10.0
@@ -256,6 +283,7 @@ def test_contracts_legs_correctly_with_two_vn_dimensions():
 
 
 def test_raises_error_when_contracting_legs_with_invalid_vn_dimensions():
+    """contract_legs raises for an invalid number of fermionic dimensions."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
     beta = 10.0
@@ -264,6 +292,7 @@ def test_raises_error_when_contracting_legs_with_invalid_vn_dimensions():
 
 
 def test_calls_sum_over_all_vn_and_sum_over_orbitals():
+    """contract_legs calls sum_over_all_vn and sum_over_orbitals."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     beta = 10.0
@@ -282,6 +311,7 @@ def test_calls_sum_over_all_vn_and_sum_over_orbitals():
 
 
 def test_converts_to_compound_indices_with_no_vn_dimensions():
+    """to_compound_indices converts an object with no fermionic dimensions."""
     mat = np.random.rand(2, 2, 2, 2, 5)
     obj = LocalFourPoint(mat, num_vn_dimensions=0)
     result = obj.to_compound_indices()
@@ -290,6 +320,7 @@ def test_converts_to_compound_indices_with_no_vn_dimensions():
 
 
 def test_converts_to_compound_indices_with_one_vn_dimension():
+    """to_compound_indices converts an object with one fermionic dimension."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
     result = obj.to_compound_indices()
@@ -297,6 +328,7 @@ def test_converts_to_compound_indices_with_one_vn_dimension():
 
 
 def test_calls_extend_vn_to_diagonal_with_one_vn_dimension_and_executes_original():
+    """to_compound_indices extends a single fermionic dimension to the diagonal."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
     with patch.object(
@@ -308,6 +340,7 @@ def test_calls_extend_vn_to_diagonal_with_one_vn_dimension_and_executes_original
 
 
 def test_converts_to_compound_indices_with_two_vn_dimensions():
+    """to_compound_indices converts an object with two fermionic dimensions."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     result = obj.to_compound_indices()
@@ -315,6 +348,7 @@ def test_converts_to_compound_indices_with_two_vn_dimensions():
 
 
 def test_raises_error_for_missing_bosonic_frequencies():
+    """to_compound_indices raises for missing bosonic frequencies."""
     mat = np.random.rand(2, 2, 2, 2, 4, 4)
     obj = LocalFourPoint(mat, num_wn_dimensions=0)
     with pytest.raises(ValueError):
@@ -322,6 +356,7 @@ def test_raises_error_for_missing_bosonic_frequencies():
 
 
 def test_handles_already_compound_indices_without_modification():
+    """to_compound_indices leaves an already-compound object unchanged."""
     mat = np.random.rand(5, 4, 4)
     obj = LocalFourPoint(mat, num_wn_dimensions=1, num_vn_dimensions=2)
     result = obj.to_compound_indices()
@@ -333,6 +368,7 @@ def test_handles_already_compound_indices_without_modification():
     [(0, (2, 2, 2, 2, 5), (5, 4, 4)), (2, (2, 2, 2, 2, 5, 4, 4), (5, 16, 16))],
 )
 def test_converts_compound_indices_to_full_indices_correctly(num_vn_dimensions, expected_shape, compound_shape):
+    """to_full_indices converts compound indices back to full indices."""
     mat = np.random.rand(*expected_shape)
     obj = LocalFourPoint(mat, num_vn_dimensions=num_vn_dimensions)
     obj = obj.to_compound_indices()
@@ -342,6 +378,7 @@ def test_converts_compound_indices_to_full_indices_correctly(num_vn_dimensions, 
 
 
 def test_converts_compound_indices_to_full_indices_correctly_for_one_vn_dimension():
+    """to_full_indices converts compound indices back for one fermionic dimension."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
     obj = obj.to_compound_indices()
@@ -353,6 +390,7 @@ def test_converts_compound_indices_to_full_indices_correctly_for_one_vn_dimensio
 
 
 def test_raises_error_for_invalid_current_shape():
+    """to_full_indices raises for an invalid current shape."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     with pytest.raises(ValueError, match="Converting to full indices with shape .* not supported."):
@@ -371,6 +409,7 @@ def test_raises_error_for_invalid_current_shape():
     ],
 )
 def test_returns_original_object_when_already_in_full_indices(num_wn_dimensions, num_vn_dimensions, shape):
+    """to_full_indices returns the original object when already in full indices."""
     mat = np.random.rand(*shape)
     obj = LocalFourPoint(mat, num_wn_dimensions=num_wn_dimensions, num_vn_dimensions=num_vn_dimensions)
     result = obj.to_full_indices()
@@ -381,6 +420,7 @@ def test_returns_original_object_when_already_in_full_indices(num_wn_dimensions,
 
 
 def test_handles_diagonal_extraction_for_single_vn_dimension():
+    """to_full_indices extracts the diagonal for a single fermionic dimension."""
     mat = np.random.rand(5, 16, 16)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
     obj._original_shape = (2, 2, 2, 2, 5, 4)
@@ -392,6 +432,7 @@ def test_handles_diagonal_extraction_for_single_vn_dimension():
 
 
 def test_raises_error_for_invalid_bosonic_frequency_dimensions():
+    """to_full_indices raises for invalid bosonic-frequency dimensions."""
     mat = np.random.rand(1, 16, 16)
     obj = LocalFourPoint(mat, num_wn_dimensions=0, num_vn_dimensions=2)
     with pytest.raises(ValueError):
@@ -400,6 +441,7 @@ def test_raises_error_for_invalid_bosonic_frequency_dimensions():
 
 @pytest.mark.parametrize("full_niw_range", [True, False])
 def test_assures_invert_calls_to_half_niw_range_to_compound_indices_and_to_full_indices(full_niw_range):
+    """invert routes through to_half_niw_range, to_compound_indices and to_full_indices."""
     mat = np.random.rand(2, 2, 2, 2, 11, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2, full_niw_range=full_niw_range)
     with (
@@ -420,6 +462,7 @@ def test_assures_invert_calls_to_half_niw_range_to_compound_indices_and_to_full_
 
 
 def test_assures_invert_always_returns_half_niw_range():
+    """invert always returns a half bosonic range."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     with patch.object(
@@ -431,6 +474,7 @@ def test_assures_invert_always_returns_half_niw_range():
 
 
 def test_assures_invert_calls_to_full_indices_with_default_shape():
+    """invert calls to_full_indices with the default shape."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     with patch.object(
@@ -443,6 +487,7 @@ def test_assures_invert_calls_to_full_indices_with_default_shape():
 
 
 def test_multiplies_two_objects_with_no_vn_dimensions_correctly():
+    """matmul multiplies two objects with no fermionic dimensions."""
     mat1 = np.random.rand(2, 2, 2, 2, 5)
     mat2 = np.random.rand(2, 2, 2, 2, 5)
     obj1 = LocalFourPoint(mat1, num_vn_dimensions=0)
@@ -456,6 +501,7 @@ def test_multiplies_two_objects_with_no_vn_dimensions_correctly():
 
 
 def test_multiplies_two_objects_with_one_vn_dimension_correctly():
+    """matmul multiplies two objects with one fermionic dimension."""
     mat1 = np.random.rand(2, 2, 2, 2, 5, 4)
     mat2 = np.random.rand(2, 2, 2, 2, 5, 4)
     obj1 = LocalFourPoint(mat1, num_vn_dimensions=1)
@@ -472,6 +518,7 @@ def test_multiplies_two_objects_with_one_vn_dimension_correctly():
     "full_niw_range1,full_niw_range2", [(False, False), (True, True), (False, True), (True, False)]
 )
 def test_assures_matmul_calls_to_compound_indices_for_two_vn_dimensions(full_niw_range1, full_niw_range2):
+    """matmul routes through to_compound_indices for two fermionic dimensions."""
     mat1 = np.random.rand(2, 2, 2, 2, 21 if full_niw_range1 else 11, 4, 4)
     mat2 = np.random.rand(2, 2, 2, 2, 21 if full_niw_range2 else 11, 4, 4)
     count_full_niw_range = [full_niw_range1, full_niw_range2].count(True)
@@ -501,6 +548,7 @@ def test_assures_matmul_calls_to_compound_indices_for_two_vn_dimensions(full_niw
 
 
 def test_raises_error_for_invalid_multiplication_with_non_local_four_point():
+    """matmul raises for an invalid multiplication with a non-local four point."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     with pytest.raises(ValueError, match="Multiplication .* not supported."):
@@ -508,6 +556,7 @@ def test_raises_error_for_invalid_multiplication_with_non_local_four_point():
 
 
 def test_handles_multiplication_with_local_interaction_correctly():
+    """matmul handles multiplication with a LocalInteraction."""
     mat1 = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     mat2 = np.random.rand(2, 2, 2, 2)
     obj1 = LocalFourPoint(mat1, num_vn_dimensions=2)
@@ -521,6 +570,7 @@ def test_handles_multiplication_with_local_interaction_correctly():
 
 
 def test_multiplies_objects_with_mixed_vn_dimensions_correctly():
+    """matmul multiplies objects with mixed fermionic dimensions."""
     mat1 = np.random.rand(2, 2, 2, 2, 5, 4)
     mat2 = np.random.rand(2, 2, 2, 2, 5)
     obj1 = LocalFourPoint(mat1, num_vn_dimensions=1)
@@ -536,6 +586,7 @@ def test_multiplies_objects_with_mixed_vn_dimensions_correctly():
 
 
 def test_multiplies_with_full_niw_range_and_restores_shape():
+    """matmul with a full bosonic range restores the original shape."""
     mat1 = np.random.rand(2, 2, 2, 2, 21, 4, 4)
     mat2 = np.random.rand(2, 2, 2, 2, 21, 4, 4)
     obj1 = LocalFourPoint(mat1, num_vn_dimensions=2, full_niw_range=True)
@@ -546,6 +597,7 @@ def test_multiplies_with_full_niw_range_and_restores_shape():
 
 
 def test_multiplies_with_scalar_correctly():
+    """Multiplication with a scalar scales the matrix."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
     scalar = 2.5
@@ -555,6 +607,7 @@ def test_multiplies_with_scalar_correctly():
 
 
 def test_multiplies_with_numpy_array_correctly():
+    """Multiplication with a numpy array multiplies elementwise."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
     array = np.random.rand(2, 2, 2, 2, 5, 4)
@@ -564,6 +617,7 @@ def test_multiplies_with_numpy_array_correctly():
 
 
 def test_raises_error_for_invalid_multiplication_type():
+    """Multiplication raises for an unsupported operand type."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
     with pytest.raises(
@@ -573,6 +627,7 @@ def test_raises_error_for_invalid_multiplication_type():
 
 
 def test_raises_error_for_invalid_vn_dimensions():
+    """matmul raises for an invalid number of fermionic dimensions."""
     mat1 = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     mat2 = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     mat3 = np.random.rand(2, 2, 2, 2, 5, 4)
@@ -588,6 +643,7 @@ def test_raises_error_for_invalid_vn_dimensions():
 
 
 def test_multiplies_two_objects_with_one_vn_dimension_and_generates_two_vn_dimensions():
+    """matmul of two one-vn objects generates a two-vn result."""
     mat1 = np.random.rand(2, 2, 2, 2, 21, 4)
     mat2 = np.random.rand(2, 2, 2, 2, 21, 4)
     obj1 = LocalFourPoint(mat1, num_vn_dimensions=1, full_niw_range=True)
@@ -598,6 +654,7 @@ def test_multiplies_two_objects_with_one_vn_dimension_and_generates_two_vn_dimen
 
 
 def test_converts_to_half_bosonic_range_correctly_1():
+    """to_half_niw_range keeps the positive bosonic half (variant 1)."""
     mat = np.random.rand(2, 2, 2, 2, 21) + 1j * np.random.rand(2, 2, 2, 2, 21)
     obj = LocalFourPoint(mat, num_vn_dimensions=0, full_niw_range=True)
     result = obj.to_half_niw_range()
@@ -607,6 +664,7 @@ def test_converts_to_half_bosonic_range_correctly_1():
 
 
 def test_converts_to_half_bosonic_range_correctly_2():
+    """to_half_niw_range keeps the positive bosonic half (variant 2)."""
     mat = np.random.rand(2, 2, 2, 2, 21, 20) + 1j * np.random.rand(2, 2, 2, 2, 21, 20)
     obj = LocalFourPoint(mat, num_vn_dimensions=1, full_niw_range=True)
     result = obj.to_half_niw_range()
@@ -616,6 +674,7 @@ def test_converts_to_half_bosonic_range_correctly_2():
 
 
 def test_converts_to_half_bosonic_range_correctly_3():
+    """to_half_niw_range keeps the positive bosonic half (variant 3)."""
     mat = np.random.rand(2, 2, 2, 2, 21, 10, 10) + 1j * np.random.rand(2, 2, 2, 2, 21, 10, 10)
     obj = LocalFourPoint(mat, num_vn_dimensions=2, full_niw_range=True)
     result = obj.to_half_niw_range()
@@ -624,38 +683,8 @@ def test_converts_to_half_bosonic_range_correctly_3():
     assert np.allclose(result.mat, np.take(mat, np.arange(10, 21), axis=-3), rtol=1e-4)
 
 
-# get a dataset where this works! no random matrix fulfils this symmetry
-"""
-def test_to_half_niw_range_to_full_niw_range_should_reproduce_original_1():
-    mat = np.random.rand(2, 2, 2, 2, 21) + 1j * np.random.rand(2, 2, 2, 2, 21)
-    obj = LocalFourPoint(mat, num_vn_dimensions=0, full_niw_range=True)
-    obj = obj.to_half_niw_range().to_full_niw_range()
-    assert np.allclose(obj.mat, mat, rtol=1e-4)
-    assert obj.full_niw_range is True
-    assert obj.num_vn_dimensions == 0
-
-
-def test_to_half_niw_range_to_full_niw_range_should_reproduce_original_2():
-    mat = np.random.rand(2, 2, 2, 2, 21, 4) + 1j * np.random.rand(2, 2, 2, 2, 21, 4)
-    obj = LocalFourPoint(mat, num_vn_dimensions=1, full_niw_range=True)
-    obj = obj.to_half_niw_range().to_full_niw_range()
-    assert np.allclose(obj.mat, mat, rtol=1e-4)
-    assert obj.full_niw_range is True
-    assert obj.num_vn_dimensions == 1
-
-
-def test_to_half_niw_range_to_full_niw_range_should_reproduce_original_3():
-    # get a dataset where this works! no random matrix fulfils this symmetry
-    mat = np.random.rand(2, 2, 2, 2, 21, 4, 4) + 1j * np.random.rand(2, 2, 2, 2, 21, 4, 4)
-    obj = LocalFourPoint(mat, num_vn_dimensions=2, full_niw_range=True)
-    obj = obj.to_half_niw_range().to_full_niw_range()
-    assert np.allclose(obj.mat, mat, rtol=1e-4)
-    assert obj.full_niw_range is True
-    assert obj.num_vn_dimensions == 2
-"""
-
-
 def test_to_full_niw_range_to_half_niw_range_should_reproduce_original_1():
+    """full->half bosonic range round-trips to the original (variant 1)."""
     mat = np.random.rand(2, 2, 2, 2, 21) + 1j * np.random.rand(2, 2, 2, 2, 21)
     obj = LocalFourPoint(mat, num_vn_dimensions=0, full_niw_range=False)
     obj = obj.to_full_niw_range().to_half_niw_range()
@@ -665,6 +694,7 @@ def test_to_full_niw_range_to_half_niw_range_should_reproduce_original_1():
 
 
 def test_to_full_niw_range_to_half_niw_range_should_reproduce_original_2():
+    """full->half bosonic range round-trips to the original (variant 2)."""
     mat = np.random.rand(2, 2, 2, 2, 21, 4) + 1j * np.random.rand(2, 2, 2, 2, 21, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1, full_niw_range=False)
     obj = obj.to_full_niw_range().to_half_niw_range()
@@ -674,6 +704,7 @@ def test_to_full_niw_range_to_half_niw_range_should_reproduce_original_2():
 
 
 def test_to_full_niw_range_to_half_niw_range_should_reproduce_original_3():
+    """full->half bosonic range round-trips to the original (variant 3)."""
     mat = np.random.rand(2, 2, 2, 2, 21, 4, 4) + 1j * np.random.rand(2, 2, 2, 2, 21, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2, full_niw_range=False)
     obj = obj.to_full_niw_range().to_half_niw_range()
@@ -683,6 +714,7 @@ def test_to_full_niw_range_to_half_niw_range_should_reproduce_original_3():
 
 
 def test_adds_two_local_four_point_objects_correctly():
+    """Adding two LocalFourPoint objects adds their matrices."""
     mat1 = np.random.rand(2, 2, 2, 2, 21, 4, 4) + 1j * np.random.rand(2, 2, 2, 2, 21, 4, 4)
     mat2 = np.random.rand(2, 2, 2, 2, 21, 4, 4) + 1j * np.random.rand(2, 2, 2, 2, 21, 4, 4)
     obj1 = LocalFourPoint(mat1, num_vn_dimensions=2)
@@ -694,6 +726,7 @@ def test_adds_two_local_four_point_objects_correctly():
 
 
 def test_adds_two_local_four_point_objects_with_different_vn_dimensions():
+    """Adding LocalFourPoint objects with different fermionic dimensions promotes correctly."""
     mat1 = np.random.rand(2, 2, 2, 2, 21, 4, 4)
     mat2 = np.random.rand(2, 2, 2, 2, 21, 4)
     mat2_diagonal = np.einsum("...i,ij->...ij", mat2, np.eye(mat2.shape[-1]))
@@ -736,6 +769,7 @@ def test_adds_two_local_four_point_objects_with_different_vn_dimensions():
 
 
 def test_adds_local_four_point_and_scalar_correctly():
+    """Adding a scalar to a LocalFourPoint adds elementwise."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     scalar = 2.5
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
@@ -745,6 +779,7 @@ def test_adds_local_four_point_and_scalar_correctly():
 
 
 def test_adds_local_four_point_and_numpy_array_correctly():
+    """Adding a numpy array to a LocalFourPoint adds elementwise."""
     mat1 = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     mat2 = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat1, num_vn_dimensions=2)
@@ -754,6 +789,7 @@ def test_adds_local_four_point_and_numpy_array_correctly():
 
 
 def test_adds_local_four_point_and_local_interaction_correctly():
+    """Adding a LocalInteraction to a LocalFourPoint broadcasts over frequencies."""
     mat1 = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     mat2 = np.random.rand(2, 2, 2, 2)
     obj1 = LocalFourPoint(mat1, num_vn_dimensions=2)
@@ -764,6 +800,7 @@ def test_adds_local_four_point_and_local_interaction_correctly():
 
 
 def test_raises_error_for_unsupported_addition_type():
+    """Addition raises for an unsupported operand type."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     with pytest.raises(ValueError, match="Operations '\\+/-' for .* not supported."):
@@ -771,6 +808,7 @@ def test_raises_error_for_unsupported_addition_type():
 
 
 def test_adds_local_four_point_and_interaction_with_compressed_q_dimension():
+    """Adding a compressed Interaction to a LocalFourPoint returns an Interaction."""
     mat1 = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     mat2 = np.random.rand(5, 2, 2, 2, 2)
     obj1 = LocalFourPoint(mat1, num_vn_dimensions=2)
@@ -784,6 +822,7 @@ def test_adds_local_four_point_and_interaction_with_compressed_q_dimension():
 
 
 def test_adds_local_four_point_and_interaction_with_decompressed_q_dimension():
+    """Adding a decompressed Interaction to a LocalFourPoint returns an Interaction."""
     mat1 = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     mat2 = np.random.rand(4, 4, 1, 2, 2, 2, 2)
     obj1 = LocalFourPoint(mat1, num_vn_dimensions=2)
@@ -797,6 +836,7 @@ def test_adds_local_four_point_and_interaction_with_decompressed_q_dimension():
 
 
 def test_permutes_orbitals_correctly():
+    """permute_orbitals applies the orbital permutation correctly."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     result = obj.permute_orbitals("abcd->cdab")
@@ -805,6 +845,7 @@ def test_permutes_orbitals_correctly():
 
 
 def test_raises_error_for_invalid_permutation_format():
+    """permute_orbitals raises for an invalid permutation format."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     with pytest.raises(ValueError, match="Invalid permutation."):
@@ -812,6 +853,7 @@ def test_raises_error_for_invalid_permutation_format():
 
 
 def test_raises_error_for_mismatched_orbital_dimensions():
+    """permute_orbitals raises for mismatched orbital dimensions."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     with pytest.raises(ValueError, match="Invalid permutation."):
@@ -819,6 +861,7 @@ def test_raises_error_for_mismatched_orbital_dimensions():
 
 
 def test_converts_to_full_niw_range_correctly_with_no_vn_dimensions():
+    """to_full_niw_range converts an object with no fermionic dimensions."""
     mat = np.random.rand(2, 2, 2, 2, 11) + 1j * np.random.rand(2, 2, 2, 2, 11)
     obj = LocalFourPoint(mat, num_vn_dimensions=0, full_niw_range=False)
     result = obj.to_full_niw_range()
@@ -829,6 +872,7 @@ def test_converts_to_full_niw_range_correctly_with_no_vn_dimensions():
 
 
 def test_converts_to_full_niw_range_correctly_with_one_vn_dimension():
+    """to_full_niw_range converts an object with one fermionic dimension."""
     mat = np.random.rand(2, 2, 2, 2, 11, 4) + 1j * np.random.rand(2, 2, 2, 2, 11, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1, full_niw_range=False)
     result = obj.to_full_niw_range()
@@ -839,6 +883,7 @@ def test_converts_to_full_niw_range_correctly_with_one_vn_dimension():
 
 
 def test_converts_to_full_niw_range_correctly_with_two_vn_dimensions():
+    """to_full_niw_range converts an object with two fermionic dimensions."""
     mat = np.random.rand(2, 2, 2, 2, 11, 4, 4) + 1j * np.random.rand(2, 2, 2, 2, 11, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2, full_niw_range=False)
     result = obj.to_full_niw_range()
@@ -849,6 +894,7 @@ def test_converts_to_full_niw_range_correctly_with_two_vn_dimensions():
 
 
 def test_handles_already_full_niw_range_without_modification():
+    """to_full_niw_range leaves an already-full object unchanged."""
     mat = np.random.rand(2, 2, 2, 2, 21, 4, 4) + 1j * np.random.rand(2, 2, 2, 2, 21, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2, full_niw_range=True)
     result = obj.to_full_niw_range()
@@ -857,21 +903,25 @@ def test_handles_already_full_niw_range_without_modification():
 
 
 def test_identity_returns_correct_shape_for_vn_2():
+    """identity returns the correct shape for two fermionic dimensions."""
     obj = LocalFourPoint.identity(2, 3, 4, num_vn_dimensions=2)
     assert obj.mat.shape == (2, 2, 2, 2, 7, 8, 8)
 
 
 def test_identity_returns_correct_shape_for_vn_1():
+    """identity returns the correct shape for one fermionic dimension."""
     obj = LocalFourPoint.identity(2, 3, 4, num_vn_dimensions=1)
     assert obj.mat.shape == (2, 2, 2, 2, 7, 8)
 
 
 def test_identity_raises_for_invalid_vn_dimensions():
+    """identity raises for an invalid number of fermionic dimensions."""
     with pytest.raises(ValueError):
         LocalFourPoint.identity(2, 3, 4, num_vn_dimensions=0)
 
 
 def test_identity_matrix_is_eye_in_compound_indices():
+    """The identity is the unit matrix in compound indices."""
     obj = LocalFourPoint.identity(2, 1, 1, num_vn_dimensions=2)
     obj_comp = obj.to_compound_indices()
     for mat in obj_comp.mat:
@@ -879,12 +929,14 @@ def test_identity_matrix_is_eye_in_compound_indices():
 
 
 def test_identity_like_returns_same_shape_as_other():
+    """identity_like returns the same shape as its operand."""
     other = LocalFourPoint.identity(2, 2, 2, num_vn_dimensions=2)
     ident = LocalFourPoint.identity_like(other)
     assert ident.mat.shape == other.mat.shape
 
 
 def test_identity_like_returns_eye_in_compound_indices():
+    """identity_like is the unit matrix in compound indices."""
     other = LocalFourPoint.identity(2, 1, 1, num_vn_dimensions=2)
     ident = LocalFourPoint.identity_like(other)
     ident_comp = ident.to_compound_indices()
@@ -893,12 +945,14 @@ def test_identity_like_returns_eye_in_compound_indices():
 
 
 def test_identity_like_works_for_vn_1():
+    """identity_like works for one fermionic dimension."""
     other = LocalFourPoint.identity(2, 1, 1, num_vn_dimensions=1)
     ident = LocalFourPoint.identity_like(other)
     assert ident.mat.shape == other.mat.shape
 
 
 def test_add_dunder_calls_add():
+    """__add__ delegates to add."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj1 = LocalFourPoint(mat, num_vn_dimensions=2)
     obj2 = LocalFourPoint(mat, num_vn_dimensions=2)
@@ -908,6 +962,7 @@ def test_add_dunder_calls_add():
 
 
 def test_sub_method_and_dunder():
+    """sub and __sub__ subtract correctly."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj1 = LocalFourPoint(mat, num_vn_dimensions=2)
     obj2 = LocalFourPoint(mat, num_vn_dimensions=2)
@@ -928,6 +983,7 @@ def test_sub_method_and_dunder():
 
 
 def test_sub_operator():
+    """The - operator subtracts two objects."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     fp = LocalFourPoint(mat, num_vn_dimensions=2)
     res = fp - 1.0
@@ -938,6 +994,7 @@ def test_sub_operator():
 
 
 def test_mul_dunder_calls_mul():
+    """__mul__ delegates to mul."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     scalar = 2.0
@@ -947,6 +1004,7 @@ def test_mul_dunder_calls_mul():
 
 
 def test_matmul_dunder_calls_matmul():
+    """__matmul__ delegates to matmul."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj1 = LocalFourPoint(mat, num_vn_dimensions=2)
     obj2 = LocalFourPoint(mat, num_vn_dimensions=2)
@@ -959,6 +1017,7 @@ def test_matmul_dunder_calls_matmul():
 
 
 def test_pow_dunder_calls_pow():
+    """__pow__ delegates to pow."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     exponent = 2
@@ -968,6 +1027,7 @@ def test_pow_dunder_calls_pow():
 
 
 def test_neg_dunder_calls_neg():
+    """__neg__ negates the matrix."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     with patch.object(LocalFourPoint, "__neg__", wraps=obj.__neg__) as mock_neg:
@@ -978,6 +1038,7 @@ def test_neg_dunder_calls_neg():
 
 @pytest.mark.parametrize("num_vn_dimensions", [0, 1, 2])
 def test_creates_bosonic_dimension_when_not_present(num_vn_dimensions):
+    """A bosonic dimension is created when not present."""
     shape = (2,) * 4 + (4,) * num_vn_dimensions
     mat = np.random.rand(*shape)
     obj = LocalFourPoint(mat, num_vn_dimensions=num_vn_dimensions, num_wn_dimensions=0)
@@ -989,6 +1050,7 @@ def test_creates_bosonic_dimension_when_not_present(num_vn_dimensions):
 
 @pytest.mark.parametrize("num_vn_dimensions", [0, 1, 2])
 def test_raises_error_when_bosonic_dimension_already_exists(num_vn_dimensions):
+    """Creating a bosonic dimension raises when one already exists."""
     shape = (2,) * 4 + (4,) * num_vn_dimensions
     mat = np.random.rand(*shape)
     obj = LocalFourPoint(mat, num_vn_dimensions=num_vn_dimensions, num_wn_dimensions=1)
@@ -998,6 +1060,7 @@ def test_raises_error_when_bosonic_dimension_already_exists(num_vn_dimensions):
 
 @pytest.mark.parametrize("num_vn_dimensions", [0, 1, 2])
 def test_removes_bosonic_dimension_correctly(num_vn_dimensions):
+    """The bosonic dimension is removed correctly."""
     shape = (2,) * 4 + (1,) + (4,) * num_vn_dimensions
     mat = np.random.rand(*shape)
     obj = LocalFourPoint(mat, num_vn_dimensions=num_vn_dimensions, num_wn_dimensions=1)
@@ -1009,6 +1072,7 @@ def test_removes_bosonic_dimension_correctly(num_vn_dimensions):
 
 @pytest.mark.parametrize("num_vn_dimensions", [0, 1, 2])
 def test_raises_error_when_no_bosonic_dimension(num_vn_dimensions):
+    """Removing the bosonic dimension raises when none exists."""
     shape = (2,) * 4 + (1,) + (4,) * num_vn_dimensions
     mat = np.random.rand(*shape)
     obj = LocalFourPoint(mat, num_vn_dimensions=num_vn_dimensions, num_wn_dimensions=0)
@@ -1018,6 +1082,7 @@ def test_raises_error_when_no_bosonic_dimension(num_vn_dimensions):
 
 @pytest.mark.parametrize("niv_pad", [5, 10, 15])
 def test_pads_with_u_correctly(niv_pad):
+    """pad_with_u pads the fermionic box with the interaction tail."""
     mat = np.random.rand(2, 2, 2, 2, 11, 8, 8)
     u_mat = np.random.rand(2, 2, 2, 2)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
@@ -1040,6 +1105,7 @@ def test_pads_with_u_correctly(niv_pad):
 
 @pytest.mark.parametrize("niv", [5, 10, 15])
 def test_does_not_pad_when_niv_pad_is_less_or_equal(niv):
+    """pad_with_u is a no-op when the target niv does not exceed the current one."""
     mat = np.random.rand(2, 2, 2, 2, 5, 2 * niv, 2 * niv)
     u_mat = np.random.rand(2, 2, 2, 2)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
@@ -1049,7 +1115,29 @@ def test_does_not_pad_when_niv_pad_is_less_or_equal(niv):
     assert result.mat.shape == mat.shape
 
 
+def test_pad_with_u_noop_returns_independent_copy():
+    """pad_with_u no-op returns an independent copy."""
+    mat = np.random.rand(2, 2, 2, 2, 5, 8, 8)
+    obj = LocalFourPoint(mat.copy(), num_vn_dimensions=2)
+    u = LocalInteraction(np.random.rand(2, 2, 2, 2))
+    result = obj.pad_with_u(u, 4)  # niv_pad == niv -> no-op branch
+    assert result is not obj
+    result.mat[0, 0, 0, 0, 0, 0, 0] = -999.0
+    assert obj.mat[0, 0, 0, 0, 0, 0, 0] != -999.0  # no-op must still hand back an independent copy
+
+
+def test_pad_with_u_does_not_mutate_self():
+    """pad_with_u does not mutate the original object."""
+    mat = np.random.rand(2, 2, 2, 2, 5, 8, 8)
+    obj = LocalFourPoint(mat.copy(), num_vn_dimensions=2)
+    u = LocalInteraction(np.random.rand(2, 2, 2, 2))
+    obj.pad_with_u(u, 8)
+    assert obj.mat.shape == (2, 2, 2, 2, 5, 8, 8)
+    assert np.allclose(obj.mat, mat, rtol=1e-4)  # source array left untouched
+
+
 def test_symmetrize_orbitals_already_symmetrized():
+    """symmetrize_orbitals returns self when already symmetrized."""
     obj = LocalFourPoint(np.zeros((2, 2, 2, 2)))
 
     obj.is_orbitally_symmetrized = MagicMock(return_value=True)
@@ -1065,6 +1153,7 @@ def test_symmetrize_orbitals_already_symmetrized():
 
 
 def test_symmetrize_orbitals_calls_private_method():
+    """symmetrize_orbitals delegates to the private method when not yet symmetrized."""
     obj = LocalFourPoint(np.zeros((2, 2, 2, 2)))
 
     obj.is_orbitally_symmetrized = MagicMock(return_value=False)
@@ -1080,6 +1169,7 @@ def test_symmetrize_orbitals_calls_private_method():
 
 
 def test_is_orbitally_symmetrized_delegates():
+    """is_orbitally_symmetrized delegates to the private check."""
     obj = LocalFourPoint(np.zeros((2, 2, 2, 2)))
 
     obj._is_orbitally_symmetrized = MagicMock(return_value=True)
@@ -1093,6 +1183,7 @@ def test_is_orbitally_symmetrized_delegates():
 
 
 def test_symmetrize_orbitals_empty_list():
+    """symmetrize_orbitals on an empty list returns self."""
     obj = LocalFourPoint(np.zeros((2, 2, 2, 2)))
 
     obj.is_orbitally_symmetrized = MagicMock(return_value=True)
@@ -1106,8 +1197,8 @@ def test_symmetrize_orbitals_empty_list():
     obj._symmetrize_orbitals.assert_not_called()
 
 
-# --- B3: from_constant builds complex64 directly (no float64 temporary) ---
 def test_from_constant_passes_complex64_dtype_to_np_full(monkeypatch):
+    """from_constant builds the array directly in complex64."""
     seen = {"dtype": None}
     real_full = np.full
 
@@ -1122,6 +1213,7 @@ def test_from_constant_passes_complex64_dtype_to_np_full(monkeypatch):
 
 
 def test_local_four_point_identity_is_valid_and_complex64():
+    """identity is built directly in the complex64 storage dtype."""
     ident = LocalFourPoint.identity(1, 1, 2, num_vn_dimensions=2)
     assert ident.mat.dtype == np.complex64
     # in compound-index space each bosonic-frequency slice must be the unit matrix
@@ -1131,8 +1223,8 @@ def test_local_four_point_identity_is_valid_and_complex64():
         assert np.allclose(w_slice, np.eye(n), atol=1e-5)
 
 
-# --- E6: identity_like uses its own operand's shape ---
 def test_identity_like_matches_its_own_operand_shape():
+    """identity_like uses its own operand's shape."""
     magn = LocalFourPoint.from_constant(1, 1, 3, num_vn_dimensions=2, channel=SpinChannel.MAGN, value=1.0)
     ident = LocalFourPoint.identity_like(magn)
     result = ident + magn  # must not raise on shape mismatch

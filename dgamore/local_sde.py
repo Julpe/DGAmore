@@ -13,6 +13,8 @@ against the DMFT input. Equation numbers refer to the author's master's thesis (
 functions implements the alternative ab-initio DGA formulation.
 """
 
+import numpy as np
+
 import dgamore.config as config
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.greens_function import GreensFunction
@@ -25,7 +27,7 @@ from dgamore.self_energy import SelfEnergy
 
 def create_generalized_chi(g2: LocalFourPoint, g_dmft: GreensFunction) -> LocalFourPoint:
     r"""
-    Returns the generalized susceptibility, see also Eq. (3.31) in my master's thesis,
+    Returns the generalized susceptibility, see also Eq. (3.41) in my master's thesis,
     :math:`\chi_{r;abcd}^{\omega\nu\nu'} = \beta (G_{r;abcd}^{(2);\omega\nu\nu'} - 2 \delta_{r,\mathrm{dens}}
     \delta_{\omega 0} G_{ab}^{\nu} G_{cd}^{\nu'})`. The disconnected term is subtracted only in the density
     (ph) channel at :math:`\omega = 0`.
@@ -128,7 +130,7 @@ def create_full_vertex_from_gamma(gamma_r, gchi0, u_loc):
 def create_full_vertex(gchi_r: LocalFourPoint, gchi0_inv: LocalFourPoint) -> LocalFourPoint:
     r"""
     Returns the local full vertex in the ``niv_core`` region, see Eq. (3.58) in my master's thesis,
-    :math:`F_{r;abcd}^{\omega\nu\nu'} = -\beta^2 (\chi_{0;abcd}^{-1} - \chi_{0;abef}^{-1} \chi_{r;fehg}
+    :math:`F_{r;abcd}^{\omega\nu\nu'} = \beta^2 (\chi_{0;abcd}^{-1} - \chi_{0;abef}^{-1} \chi_{r;fehg}
     \chi_{0;ghcd}^{-1})`.
 
     :param gchi_r: The generalized susceptibility :math:`\chi_{r}`.
@@ -207,6 +209,26 @@ def create_vertex_functions(
     return gamma_r, gchi_r_aux_sum, vrg_r, f_r, gchi_r
 
 
+def get_local_hartree_fock(u_loc: LocalInteraction, occ: np.ndarray) -> np.ndarray:
+    r"""
+    Returns the local Hartree-Fock (static, frequency-independent) self-energy
+    :math:`\Sigma^{HF}_{ab}` from the bare interaction and the local occupation, i.e. the density-channel
+    interaction contracted with the occupation, see Eq. (3.55) in my master's thesis.
+
+    The interaction tensor is stored with the inter-orbital density :math:`U'` at :math:`U_{abab}` (the convention
+    of :meth:`Hamiltonian.kanamori_interaction_dp` and the w2dynamics ``umatrix`` files), whereas the density-channel
+    projection contracted as ``"abcd,dc->ab"`` picks up :math:`U_{aabb}`. The middle two orbital indices are
+    therefore swapped (``"abcd->acbd"``) before the projection, so that the Hartree term uses :math:`U'` while the
+    Fock term still uses :math:`U_{adcb}`. This only affects multi-orbital systems with off-diagonal interactions;
+    single-orbital and purely orbital-diagonal interactions are unchanged.
+
+    :param u_loc: The bare local interaction :math:`U`.
+    :param occ: The local occupation matrix :math:`n_{ab}`, shape ``[n_bands, n_bands]``.
+    :return: The Hartree-Fock self-energy, shape ``[n_bands, n_bands]``.
+    """
+    return u_loc.permute_orbitals("abcd->acbd").as_channel(SpinChannel.DENS).times("abcd,dc->ab", occ)
+
+
 def get_loc_self_energy_vrg(
     vrg_dens: LocalFourPoint,
     vrg_magn: LocalFourPoint,
@@ -236,8 +258,8 @@ def get_loc_self_energy_vrg(
     inner -= vrg_magn - vrg_magn @ u_loc.as_channel(SpinChannel.MAGN) @ gchi_magn_sum
     inner = 0.5 * inner.to_full_niw_range()
     sigma_sum = -1.0 / config.sys.beta * u_loc.times("kjop,ilpowv,lkwv->ijv", inner, g_wv)
-    hartree_fock = u_loc.as_channel(SpinChannel.DENS).times("abcd,dc->ab", config.sys.occ_dmft)[..., None]
-    return SelfEnergy((hartree_fock + sigma_sum)[None, None, None, ...])
+    hartree_fock = get_local_hartree_fock(u_loc, config.sys.occ_dmft)[..., None]
+    return SelfEnergy((hartree_fock + sigma_sum)[None, None, None, ...], beta=config.sys.beta)
 
 
 def perform_local_schwinger_dyson(
@@ -293,13 +315,20 @@ def perform_local_schwinger_dyson(
 
 
 # ----------------------------------------------- AbinitioDGA algorithms -----------------------------------------------
+#
+# DEVELOPMENT / TESTING ONLY. The functions below are an alternative ("ab-initio DGA") rewriting of the local
+# Schwinger-Dyson cross-check: they build the local self-energy from the full vertex F and the density three-leg
+# vertex derived from it (density channel only, by design), as opposed to the auxiliary-susceptibility (Hedin)
+# form used by the production routine above. They are NOT part of the production routine (``DGAmore.py`` calls
+# :func:`perform_local_schwinger_dyson`) and exist only as an internal consistency check, hence are left untested.
 
 
 def get_loc_self_energy_gamma_abinitio_dga(
     gamma_dens: LocalFourPoint, u_loc: LocalInteraction, g_loc: GreensFunction
 ) -> SelfEnergy:
     r"""
-    Returns the local self-energy with the three-leg :math:`\gamma` from ab-initio DGA,
+    DEVELOPMENT / TESTING ONLY. Returns the local self-energy with the density three-leg :math:`\gamma` from
+    ab-initio DGA (density channel only, by design),
 
     .. math:: \Sigma_{ij}^{\nu} = -\frac{1}{\beta} \sum_\omega U_{iabc}\, \gamma_{cbdj}^{\omega\nu}\, G_{ad}^{\omega-\nu}.
 
@@ -311,7 +340,7 @@ def get_loc_self_energy_gamma_abinitio_dga(
     g_wv = g_loc.get_g_wv(MFHelper.wn(config.box.niw_core), config.box.niv_core)
     sigma = -1.0 / config.sys.beta * u_loc.times("iabc,cbdjwv,adwv->ijv", gamma_dens.to_full_niw_range(), g_wv)
     hartree = u_loc.as_channel(SpinChannel.DENS).times("abcd,dc->ab", config.sys.occ_dmft)[..., None]
-    return SelfEnergy((sigma + hartree)[None, None, None, ...])
+    return SelfEnergy((sigma + hartree)[None, None, None, ...], beta=config.sys.beta)
 
 
 def perform_local_schwinger_dyson_abinitio_dga(
@@ -321,8 +350,9 @@ def perform_local_schwinger_dyson_abinitio_dga(
     u_loc: LocalInteraction,
 ):
     """
-    ATTENTION: THIS IS THE ABINITODGA ROUTINE!
-    Performs the local Schwinger-Dyson equation calculation for the local (DMFT) self-energy for sanity checks.
+    DEVELOPMENT / TESTING ONLY -- this is the ab-initio DGA cross-check, NOT the production routine
+    (:func:`perform_local_schwinger_dyson`). Performs the local Schwinger-Dyson equation for the local (DMFT)
+    self-energy as an internal sanity check, building the local self-energy from the full vertices.
 
     :param g_loc: The local :class:`GreensFunction`.
     :param g2_dens: The two-particle (DMFT) Green's function in the density channel.

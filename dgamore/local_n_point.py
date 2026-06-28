@@ -160,16 +160,21 @@ class LocalNPoint(IHaveMat):
         if niw_cut > self.niw:
             return self
 
-        obj = deepcopy(self) if copy else self
+        if copy:
+            obj = self._clone_without_mat()
+            obj.mat = self.mat  # shared; the slice is copied below, so self.mat is left untouched
+        else:
+            obj = self
 
         niw_slice = slice(obj.niw - niw_cut, obj.niw + niw_cut + 1) if obj.full_niw_range else slice(0, niw_cut + 1)
 
+        # ``.copy()`` so the trimmed parent array is actually released; a bare slice would keep it alive via the view.
         if obj.num_vn_dimensions == 2:
-            obj.mat = obj.mat[..., niw_slice, :, :]
+            obj.mat = obj.mat[..., niw_slice, :, :].copy()
         elif obj.num_vn_dimensions == 1:
-            obj.mat = obj.mat[..., niw_slice, :]
+            obj.mat = obj.mat[..., niw_slice, :].copy()
         else:  # obj.num_vn_dimensions == 0
-            obj.mat = obj.mat[..., niw_slice]
+            obj.mat = obj.mat[..., niw_slice].copy()
 
         obj.update_original_shape()
         return obj
@@ -192,14 +197,19 @@ class LocalNPoint(IHaveMat):
         if niv_cut > self.niv:
             return self
 
-        obj = deepcopy(self) if copy else self
+        if copy:
+            obj = self._clone_without_mat()
+            obj.mat = self.mat  # shared; the slice is copied below, so self.mat is left untouched
+        else:
+            obj = self
 
         niv_slice = slice(obj.niv - niv_cut, obj.niv + niv_cut) if obj.full_niv_range else slice(0, niv_cut)
 
+        # ``.copy()`` so the trimmed parent array is actually released; a bare slice would keep it alive via the view.
         if obj.num_vn_dimensions == 2:
-            obj.mat = obj.mat[..., niv_slice, niv_slice]
+            obj.mat = obj.mat[..., niv_slice, niv_slice].copy()
         elif obj.num_vn_dimensions == 1:
-            obj.mat = obj.mat[..., niv_slice]
+            obj.mat = obj.mat[..., niv_slice].copy()
 
         obj.update_original_shape()
         return obj
@@ -247,7 +257,8 @@ class LocalNPoint(IHaveMat):
             raise ValueError("No fermionic frequency dimensions available for compression.")
         if self.num_vn_dimensions == 1:
             return self
-        self.mat = self.mat.diagonal(axis1=-2, axis2=-1)
+        # ``.copy()`` since ``diagonal`` returns a read-only view that also keeps the larger [...,v,v] parent alive.
+        self.mat = self.mat.diagonal(axis1=-2, axis2=-1).copy()
         self._num_vn_dimensions = 1
         self.update_original_shape()
         return self
@@ -307,6 +318,41 @@ class LocalNPoint(IHaveMat):
         self._full_niw_range = False
         return self
 
+    def to_negative_niw_range(self):
+        r"""
+        Returns a **new** object holding the negative bosonic frequency block :math:`\omega = 0, -1, \ldots, -niw`
+        (``niw + 1`` entries, :math:`\omega = 0` included for consistency with :meth:`to_half_niw_range`), derived from
+        a half (positive) niw-range object via the time-reversal symmetry
+        :math:`F^{-\omega,-\nu,-\nu'}_{abcd} = (F^{\omega\nu\nu'}_{abcd})^{*}`. The bosonic axis order is kept so that
+        index ``i`` corresponds to :math:`\omega = -i` (index 0 is :math:`\omega = 0`); only the fermionic axes are
+        flipped and the whole array is conjugated. This is the negative-frequency counterpart of
+        :meth:`to_full_niw_range`, and it is its own inverse (applying it twice returns the original object).
+
+        **Only allowed for an object already in the half (positive) bosonic frequency range** (``full_niw_range`` must
+        be ``False`` and a bosonic frequency dimension must exist); ``self`` is left unchanged. Memory-lean: the
+        result is a single freshly allocated array (``np.flip`` is a view, ``np.conj`` allocates only the output) plus
+        the (array-less) metadata clone.
+
+        :return: A new object holding the negative bosonic frequency block (``num_vn``/orbital/momentum layout unchanged).
+        :raises ValueError: If the object has no bosonic frequency dimension, or is not in the half (positive) niw range.
+        """
+        if self.num_wn_dimensions == 0:
+            raise ValueError("Cannot build the negative bosonic frequency range without a bosonic frequency dimension.")
+        if self.full_niw_range:
+            raise ValueError(
+                "Flipping to negative niw range requires the object to be "
+                "in the half (positive) bosonic frequency range."
+            )
+
+        result = self._clone_without_mat()
+        if self.num_vn_dimensions == 0:
+            result.mat = np.conj(self.mat)
+        else:
+            vn_axes = tuple(range(-self.num_vn_dimensions, 0))
+            result.mat = np.conj(np.flip(self.mat, axis=vn_axes))
+        result.update_original_shape()
+        return result
+
     def to_half_niv_range(self):
         r"""
         Converts the object to the half fermionic frequency range by taking
@@ -317,10 +363,12 @@ class LocalNPoint(IHaveMat):
         if self.num_vn_dimensions == 0 or not self.full_niv_range:
             return self
 
+        # ``.copy()`` so the discarded negative-frequency half is actually released; a bare slice would keep the full
+        # parent array alive via the view.
         if self.num_vn_dimensions == 1:
-            self.mat = self.mat[..., self.niv :]
+            self.mat = self.mat[..., self.niv :].copy()
         if self.num_vn_dimensions == 2:
-            self.mat = self.mat[..., self.niv :, self.niv :]
+            self.mat = self.mat[..., self.niv :, self.niv :].copy()
 
         self.update_original_shape()
         self._full_niv_range = False

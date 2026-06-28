@@ -8,7 +8,7 @@ Linearized Eliashberg equation solver. Starting from the ladder-DGA full vertex 
 non-local SDE step), this module assembles the particle-particle pairing vertex in the singlet/triplet channels at
 :math:`\omega = 0`, optionally adds the local reducible diagrams, and power-iterates the linearized gap equation
 :math:`\lambda \Delta = -\frac{1}{\beta N_q}\, \Gamma^{pp}\, \chi_0^{pp}\, \Delta` via an ARPACK/Lanczos
-eigensolver (two variants: an in-memory one and a memory-frugal frequency-distributed one). The leading
+eigensolver (two variants: an in-memory one and a memory-lean frequency-distributed one). The leading
 eigenvalue :math:`\lambda` signals the pairing instability and the eigenvector is the gap function
 :math:`\Delta(k, \nu)`. Requires ``nq == nk``. Equation numbers refer to the author's master's thesis (Chapter 4).
 """
@@ -28,7 +28,7 @@ from dgamore.greens_function import GreensFunction
 from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.matsubara_frequencies import MFHelper
-from dgamore.mpi_distributor import MpiDistributor
+from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE
 
 
@@ -228,7 +228,7 @@ def create_full_vertex_q_r_v2(
     q_index: int,
 ) -> FourPoint:
     """
-    Calculates the full ladder vertex for a single q-point (memory-frugal per-q variant of
+    Calculates the full ladder vertex for a single q-point (memory-lean per-q variant of
     :func:`create_full_vertex_q_r`), transforming it to pp notation unless ``save_fq`` keeps the ph form.
 
     :param u_loc: The bare local interaction :math:`U`.
@@ -269,7 +269,7 @@ def create_full_vertex_q_r_pp_w0_v2(
     u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist_irrk: MpiDistributor
 ):
     """
-    Memory-frugal variant of :func:`create_full_vertex_q_r_pp_w0`: loops over the rank-local q-points (see
+    Memory-lean variant of :func:`create_full_vertex_q_r_pp_w0`: loops over the rank-local q-points (see
     :func:`create_full_vertex_q_r_v2`), assembles the full ladder vertex, optionally saves it in ph notation, and
     returns it in pp notation at :math:`\\omega' = 0`.
 
@@ -696,7 +696,7 @@ def solve(
     Top-level driver of the Eliashberg step: assembles the singlet and triplet pairing vertices from the saved
     ladder-DGA full vertices (optionally adding the local reducible diagrams), then solves the linearized gap equation
     for each channel and returns the leading eigenvalues and gap functions. Dispatches between the in-memory and the
-    memory-frugal Lanczos solvers depending on the memory configuration.
+    memory-lean Lanczos solvers depending on the memory configuration.
 
     :param giwk_dga: The converged momentum-dependent DGA :class:`GreensFunction`.
     :param g_dmft: The local (DMFT) :class:`GreensFunction` (used for the local diagrams).
@@ -708,7 +708,9 @@ def solve(
     """
     logger = config.logger
 
-    mpi_dist_irrk = MpiDistributor.create_distributor(ntasks=config.lattice.q_grid.nk_irr, comm=comm, name="Q")
+    mpi_dist_irrk = MpiDistributor.create_distributor(
+        ntasks=config.lattice.q_grid.nk_irr, comm=comm, name="Q", output_path=config.output.output_path
+    )
     irrk_q_list = config.lattice.q_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrk.my_slice]
 
@@ -719,7 +721,7 @@ def solve(
     def dispatch_full_vertex_calculation(channel, u, v, niv, mpi_dist) -> FourPoint:
         """
         Loads the local irreducible vertex for ``channel`` and builds the full ladder pp vertex, dispatching between
-        the memory-frugal and the regular construction routine based on the memory configuration.
+        the memory-lean and the regular construction routine based on the memory configuration.
 
         :param channel: The spin channel (density or magnetic).
         :param u: The bare local interaction :math:`U`.
@@ -830,7 +832,9 @@ def solve(
             gaps_sing[i] = mpi_dist_irrk.bcast(gaps_sing[i], root=rank_sing)
             gaps_trip[i] = mpi_dist_irrk.bcast(gaps_trip[i], root=rank_trip)
     else:
-        mpi_dist_v = MpiDistributor.create_distributor(ntasks=gamma_sing_pp.current_shape[-2], comm=comm, name="V")
+        mpi_dist_v = MpiDistributor.create_distributor(
+            ntasks=gamma_sing_pp.current_shape[-2], comm=comm, name="V", output_path=config.output.output_path
+        )
 
         logger.info("Distributing Gamma_sing_pp along v equally to ranks/nodes.")
         gamma_sing_pp = mpi_utils.gather_full_ibz_for_vslice(

@@ -46,9 +46,9 @@ self-energy in :mod:`~dgamore.nonlocal_sde`, with an optional Moriya correction 
 :mod:`~dgamore.lambda_correction`. Pairing properties are obtained in :mod:`~dgamore.eliashberg_solver`, and an
 optional continuation to real frequencies is provided by :mod:`~dgamore.max_ent`. The remaining modules support the
 computation: :mod:`~dgamore.matsubara_frequencies` handles frequency-index arithmetic,
-:mod:`~dgamore.mpi_distributor` and :mod:`~dgamore.mpi_utils` manage the parallel work distribution,
-:mod:`~dgamore.dga_logger` provides the structured logging, and :mod:`~dgamore.plotting` produces the diagnostic
-figures.
+:mod:`~dgamore.mpi_utils` manages the parallel work distribution (message chunking, the work distributor and the
+data-movement routines), :mod:`~dgamore.dga_logger` provides the structured logging, and
+:mod:`~dgamore.plotting` produces the diagnostic figures.
 
 For the physics and the precise equations behind the implementation, see the accompanying paper and the author's
 Master's thesis, both linked on the :doc:`about` page. The pages listed in the sidebar walk through installation,

@@ -5,5 +5,7 @@ extend-ignore-words-re = [
     "ix",
     "iy",
     "iz",
-    "ket"
+    "ket",
+    # numpy exposes the array flag as ``arr.flags.writeable``; not a typo.
+    "writeable"
 ]

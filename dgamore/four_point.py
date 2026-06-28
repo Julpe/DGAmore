@@ -144,7 +144,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             raise ValueError(f"Cannot sum over more fermionic axes than available in {self.current_shape}.")
 
         if not copy:
-            summed = 1 / beta ** len(axis) * np.sum(self.mat, axis=axis)
+            summed = np.sum(self.mat, axis=axis)
+            summed *= 1.0 / beta ** len(axis)  # in-place scale avoids a second full-size temporary
             self.mat = None
             gc.collect()
             self.mat = summed
@@ -152,7 +153,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             self.update_original_shape()
             return self
 
-        copy_mat = 1 / beta ** len(axis) * np.sum(self.mat, axis=axis)
+        copy_mat = np.sum(self.mat, axis=axis)
+        copy_mat *= 1.0 / beta ** len(axis)  # in-place scale avoids a second full-size temporary
 
         self.update_original_shape()
         return FourPoint(
@@ -336,7 +338,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         )
 
         if self.num_vn_dimensions == 1:  # original was [q,o1,o2,o4,o3,w,v]
-            self.mat = self.mat.diagonal(axis1=-2, axis2=-1)
+            # ``.copy()`` since ``diagonal`` returns a read-only view that also keeps the larger parent alive.
+            self.mat = self.mat.diagonal(axis1=-2, axis2=-1).copy()
         return self
 
     def _to_full_indices_pp(self, shape: tuple = None) -> "FourPoint":
@@ -688,7 +691,10 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             self.mat = self.mat.transpose(0, 5, 6, 1, 2, 4, 3).reshape(
                 (self.current_shape[0], w_dim, 2 * self.niv, self.n_bands**2, self.n_bands**2)
             )  # transpose to [q,w,v,o1,o2,o4,o3] and collecting [q,w,v,x1,x2]
-            self.mat = np.linalg.inv(self.mat)  # invert in [x1,x2]
+            # invert in [x1,x2] per q (still batched over [w,v]); writing each q-slice in place caps the peak at the
+            # input size instead of allocating the full batched-inverse output (~one extra full array).
+            for i in range(self.current_shape[0]):
+                self.mat[i] = np.linalg.inv(self.mat[i])
             # reshape to [q,w,v,o1,o2,o4,o3] and transpose to [q,o1,o2,o3,o4,w,v]
             self.mat = self.mat.reshape(
                 (self.current_shape[0], w_dim, 2 * self.niv, self.n_bands, self.n_bands, self.n_bands, self.n_bands)
@@ -725,7 +731,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             new_arr[i] = (
                 np.linalg.inv(compound_arr).reshape((w_dim,) + compound_index_shape * 2).transpose(1, 2, 5, 4, 0, 3, 6)
             ).sum(axis=-1)
-        self.mat = new_arr / beta
+        new_arr /= beta  # in-place scale: new_arr is freshly allocated and unaliased, so no full-size temporary
+        self.mat = new_arr
         self._num_vn_dimensions = 1
         self.update_original_shape()
         return self
@@ -770,7 +777,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
                 np.linalg.solve(compound_arr, rhs_batched).reshape((w_dim, o, o, vn, o, o)).transpose(1, 2, 5, 4, 0, 3)
             )
 
-        self.mat = new_arr / beta
+        new_arr /= beta  # in-place scale: new_arr is freshly allocated and unaliased, so no full-size temporary
+        self.mat = new_arr
         self._num_vn_dimensions = 1
         self.update_original_shape()
         return self

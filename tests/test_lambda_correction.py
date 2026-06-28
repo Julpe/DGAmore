@@ -48,6 +48,7 @@ def load_local_four_point(lc_type: str, filename: str, channel: SpinChannel) -> 
 
 
 def test_lambda_correction_spch():
+    """spch-type single lambda correction reproduces reference chi and lambdas for dens and magn channels."""
     config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
@@ -72,6 +73,7 @@ def test_lambda_correction_spch():
 
 
 def test_lambda_correction_sp():
+    """sp-type single lambda correction (magn only) reproduces reference chi and lambda."""
     config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
 
@@ -104,6 +106,7 @@ def test_lambda_correction_sp():
 
 @pytest.mark.parametrize("lc_type", ["sp", "spch"])
 def test_lambda_correction_in_sde_sp(lc_type):
+    """nonlocal_sde.perform_lambda_correction reproduces reference chi for both sp and spch types."""
     config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.lambda_correction.type = lc_type
@@ -128,8 +131,8 @@ def test_lambda_correction_in_sde_sp(lc_type):
             assert np.allclose(chi_dens_corrected.mat, chi_dens_q_before_lambda.mat)
 
 
-# --- R2: find_lambda warns on non-convergence and returns a finite value ---
 def test_find_lambda_warns_on_non_convergence():
+    """find_lambda warns and returns a finite value when the target is unreachable within maxiter."""
     from unittest.mock import MagicMock
 
     config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())

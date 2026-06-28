@@ -14,54 +14,63 @@ from dgamore.brillouin_zone import KPath, KnownKPoints, Labels
 
 
 def test_applies_inversion_symmetry_along_x_axis():
+    """Inversion symmetry along the x axis maps the matrix correctly."""
     mat = np.random.rand(6, 4, 4)
     bz.inv_sym(mat, axis=0)
     assert np.allclose(mat[4:, :, :], mat[1:3, :, :][::-1])
 
 
 def test_applies_inversion_symmetry_along_y_axis():
+    """Inversion symmetry along the y axis maps the matrix correctly."""
     mat = np.random.rand(4, 6, 4)
     bz.inv_sym(mat, axis=1)
     assert np.allclose(mat[:, 4:, :], mat[:, 1:3, :][:, ::-1])
 
 
 def test_applies_inversion_symmetry_along_z_axis():
+    """Inversion symmetry along the z axis maps the matrix correctly."""
     mat = np.random.rand(4, 4, 6)
     bz.inv_sym(mat, axis=2)
     assert np.allclose(mat[:, :, 4:], mat[:, :, 1:3][:, :, ::-1])
 
 
 def test_raises_error_for_invalid_axis():
+    """Inversion symmetry raises for an invalid axis."""
     mat = np.random.rand(4, 4, 4)
     with pytest.raises(AssertionError, match="axis = 3 but must be in \[0,1,2\]"):
         bz.inv_sym(mat, axis=3)
 
 
 def test_raises_error_for_insufficient_dimensions_on_inv_sym():
+    """Inversion symmetry raises for insufficient dimensions."""
     mat = np.random.rand(4, 4)
     with pytest.raises(AssertionError, match="dim\(mat\) = 2 but must be at least 3 dimensional"):
         bz.inv_sym(mat, axis=0)
 
 
 def test_applies_x_y_symmetry_to_square_matrix():
+    """The x-y exchange symmetry maps a square matrix correctly."""
     mat = np.random.rand(4, 4, 6)
     bz.x_y_sym(mat)
     assert np.allclose(mat, np.minimum(mat, mat.swapaxes(0, 1)))
 
 
 def test_applies_x_z_symmetry_to_square_matrix():
+    """The x-z exchange symmetry maps a square matrix correctly."""
     mat = np.random.rand(4, 6, 4)
     bz.x_z_sym(mat)
     assert np.allclose(mat, np.minimum(mat, mat.swapaxes(0, 2)))
 
 
 def test_applies_y_z_symmetry_to_square_matrix():
+    """The y-z exchange symmetry maps a square matrix correctly."""
     mat = np.random.rand(6, 4, 4)
     bz.y_z_sym(mat)
     assert np.allclose(mat, np.minimum(mat, mat.swapaxes(1, 2)))
 
 
 def test_does_nothing_for_non_square_matrix():
+    """The exchange symmetry leaves a non-square matrix unchanged."""
     mat = np.random.rand(4, 5, 6)
     original_mat = mat.copy()
     bz.x_y_sym(mat)
@@ -69,36 +78,42 @@ def test_does_nothing_for_non_square_matrix():
 
 
 def test_raises_error_for_insufficient_dimensions_on_x_y_sym():
+    """The x-y symmetry raises for insufficient dimensions."""
     mat = np.random.rand(4, 4)
     with pytest.raises(AssertionError):
         bz.x_y_sym(mat)
 
 
 def test_raises_error_for_insufficient_dimensions_on_x_z_sym():
+    """The x-z symmetry raises for insufficient dimensions."""
     mat = np.random.rand(4, 4)
     with pytest.raises(AssertionError):
         bz.x_z_sym(mat)
 
 
 def test_raises_error_for_insufficient_dimensions_on_y_z_sym():
+    """The y-z symmetry raises for insufficient dimensions."""
     mat = np.random.rand(4, 4)
     with pytest.raises(AssertionError):
         bz.y_z_sym(mat)
 
 
 def test_applies_simultaneous_inversion_in_x_and_y_directions():
+    """Simultaneous x and y inversion maps the matrix correctly."""
     mat = np.random.rand(6, 6, 4)
     bz.x_y_inv(mat)
     assert np.allclose(mat[4:, 4:, :], mat[1:3, 1:3, :][::-1, ::-1, :])
 
 
 def test_raises_error_for_insufficient_dimensions_on_x_y_inv():
+    """Simultaneous x-y inversion raises for insufficient dimensions."""
     mat = np.random.rand(4, 4)
     with pytest.raises(AssertionError, match="dim\(mat\) = 2 but must be at least 3 dimensional"):
         bz.x_y_inv(mat)
 
 
 def test_applies_x_inversion_symmetry_correctly_with_mock():
+    """apply_symmetry dispatches the x inversion to the correct helper."""
     mat = np.random.rand(6, 4, 4)
     with patch("dgamore.brillouin_zone.inv_sym") as mock_inv_sym:
         bz.apply_symmetry(mat, bz.KnownSymmetries.X_INV)
@@ -106,6 +121,7 @@ def test_applies_x_inversion_symmetry_correctly_with_mock():
 
 
 def test_applies_y_inversion_symmetry_correctly_with_mock():
+    """apply_symmetry dispatches the y inversion to the correct helper."""
     mat = np.random.rand(4, 6, 4)
     with patch("dgamore.brillouin_zone.inv_sym") as mock_inv_sym:
         bz.apply_symmetry(mat, bz.KnownSymmetries.Y_INV)
@@ -113,6 +129,7 @@ def test_applies_y_inversion_symmetry_correctly_with_mock():
 
 
 def test_applies_z_inversion_symmetry_correctly_with_mock():
+    """apply_symmetry dispatches the z inversion to the correct helper."""
     mat = np.random.rand(4, 4, 6)
     with patch("dgamore.brillouin_zone.inv_sym") as mock_inv_sym:
         bz.apply_symmetry(mat, bz.KnownSymmetries.Z_INV)
@@ -120,6 +137,7 @@ def test_applies_z_inversion_symmetry_correctly_with_mock():
 
 
 def test_applies_x_y_symmetry_correctly_with_mock():
+    """apply_symmetry dispatches the x-y exchange to the correct helper."""
     mat = np.random.rand(4, 4, 6)
     with patch("dgamore.brillouin_zone.x_y_sym") as mock_x_y_sym:
         bz.apply_symmetry(mat, bz.KnownSymmetries.X_Y_SYM)
@@ -127,6 +145,7 @@ def test_applies_x_y_symmetry_correctly_with_mock():
 
 
 def test_applies_x_z_symmetry_correctly_with_mock():
+    """apply_symmetry dispatches the x-z exchange to the correct helper."""
     mat = np.random.rand(4, 6, 4)
     with patch("dgamore.brillouin_zone.x_z_sym") as mock_x_z_sym:
         bz.apply_symmetry(mat, bz.KnownSymmetries.X_Z_SYM)
@@ -134,6 +153,7 @@ def test_applies_x_z_symmetry_correctly_with_mock():
 
 
 def test_applies_y_z_symmetry_correctly_with_mock():
+    """apply_symmetry dispatches the y-z exchange to the correct helper."""
     mat = np.random.rand(6, 4, 4)
     with patch("dgamore.brillouin_zone.y_z_sym") as mock_y_z_sym:
         bz.apply_symmetry(mat, bz.KnownSymmetries.Y_Z_SYM)
@@ -141,6 +161,7 @@ def test_applies_y_z_symmetry_correctly_with_mock():
 
 
 def test_applies_x_y_inversion_symmetry_correctly_with_mock():
+    """apply_symmetry dispatches the simultaneous x-y inversion to the correct helper."""
     mat = np.random.rand(6, 6, 4)
     with patch("dgamore.brillouin_zone.x_y_inv") as mock_x_y_inv:
         bz.apply_symmetry(mat, bz.KnownSymmetries.X_Y_INV)
@@ -148,6 +169,7 @@ def test_applies_x_y_inversion_symmetry_correctly_with_mock():
 
 
 def test_raises_error_for_unknown_symmetry_with_mock():
+    """apply_symmetry raises for an unknown symmetry."""
     mat = np.random.rand(4, 4, 4)
     with patch("dgamore.brillouin_zone.KnownSymmetries") as mock_known_symmetries:
         with pytest.raises(AssertionError, match="sym = .* not in known symmetries .*"):
@@ -156,6 +178,7 @@ def test_raises_error_for_unknown_symmetry_with_mock():
 
 
 def test_applies_multiple_symmetries_in_order():
+    """apply_symmetries applies multiple symmetries in order."""
     mat = np.random.rand(6, 6, 6)
     with patch("dgamore.brillouin_zone.apply_symmetry") as mock_apply_symmetry:
         bz.apply_symmetries(mat, [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV, bz.KnownSymmetries.Z_INV])
@@ -166,6 +189,7 @@ def test_applies_multiple_symmetries_in_order():
 
 
 def test_does_nothing_when_no_symmetries_provided():
+    """apply_symmetries does nothing when no symmetries are provided."""
     mat = np.random.rand(6, 6, 6)
     with patch("dgamore.brillouin_zone.apply_symmetry") as mock_apply_symmetry:
         bz.apply_symmetries(mat, [])
@@ -173,37 +197,44 @@ def test_does_nothing_when_no_symmetries_provided():
 
 
 def test_raises_error_for_insufficient_dimensions_on_apply_symmetries():
+    """apply_symmetries raises for insufficient dimensions."""
     mat = np.random.rand(4, 4)
     with pytest.raises(AssertionError, match="dim\(mat\) = 2 but must at least 3 dimensional"):
         bz.apply_symmetries(mat, [bz.KnownSymmetries.X_INV])
 
 
 def test_returns_correct_symmetries_for_two_dimensional_square():
+    """two_dimensional_square_symmetries returns the expected symmetry list."""
     result = bz.get_lattice_symmetries_from_string("two_dimensional_square")
     assert result == bz.two_dimensional_square_symmetries()
 
 
 def test_returns_correct_symmetries_for_three_dimensional_cubic():
+    """three_dimensional_cubic_symmetries returns the expected symmetry list."""
     result = bz.get_lattice_symmetries_from_string("three_dimensional_cubic")
     assert result == bz.three_dimensional_cubic_symmetries()
 
 
 def test_returns_correct_symmetries_for_quasi_one_dimensional_square():
+    """quasi_one_dimensional_square_symmetries returns the expected symmetry list."""
     result = bz.get_lattice_symmetries_from_string("quasi_one_dimensional_square")
     assert result == bz.quasi_one_dimensional_square_symmetries()
 
 
 def test_returns_correct_symmetries_for_simultaneous_x_y_inversion():
+    """The simultaneous x-y inversion symmetry list is built correctly."""
     result = bz.get_lattice_symmetries_from_string("simultaneous_x_y_inversion")
     assert result == bz.simultaneous_x_y_inversion()
 
 
 def test_returns_correct_symmetries_for_quasi_two_dimensional_square_symmetries():
+    """quasi_two_dimensional_square_symmetries returns the expected symmetry list."""
     result = bz.get_lattice_symmetries_from_string("quasi_two_dimensional_square_symmetries")
     assert result == bz.quasi_two_dimensional_square_symmetries()
 
 
 def test_returns_empty_list_for_none_or_empty_string():
+    """get_lattice_symmetries_from_string returns an empty list for None or an empty string."""
     result_none = bz.get_lattice_symmetries_from_string(None)
     result_empty = bz.get_lattice_symmetries_from_string("")
     assert result_none == []
@@ -211,21 +242,25 @@ def test_returns_empty_list_for_none_or_empty_string():
 
 
 def test_raises_error_for_unsupported_symmetry_string():
+    """get_lattice_symmetries_from_string raises for an unsupported symmetry string."""
     with pytest.raises(ValueError, match="Symmetry does not exist or input cannot be parsed as a Python literal."):
         bz.get_lattice_symmetries_from_string("unsupported_symmetry")
 
 
 def test_raises_error_for_unsupported_symmetry_in_list():
+    """get_lattice_symmetries_from_string raises for an unsupported symmetry in a list."""
     with pytest.raises(NotImplementedError, match="Symmetry unsupported_symmetry not supported."):
         bz.get_lattice_symmetries_from_string(["x-inv", "unsupported_symmetry"])
 
 
 def test_returns_correct_symmetries_for_list_of_valid_symmetries():
+    """get_lattice_symmetries_from_string parses a list of valid symmetries."""
     result = bz.get_lattice_symmetries_from_string(["x-inv", "y-inv"])
     assert result == [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV]
 
 
 def test_maps_full_bz_to_irreducible_correctly():
+    """The full BZ is mapped to the irreducible BZ correctly."""
     nk = (4, 4, 4)
     symmetries = [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV]
     kgrid = bz.KGrid(nk=nk, symmetries=symmetries)
@@ -235,6 +270,7 @@ def test_maps_full_bz_to_irreducible_correctly():
 
 
 def test_handles_empty_symmetry_list_without_error():
+    """Mapping handles an empty symmetry list without error."""
     nk = (4, 4, 4)
     symmetries = []
     kgrid = bz.KGrid(nk=nk, symmetries=symmetries)
@@ -244,6 +280,7 @@ def test_handles_empty_symmetry_list_without_error():
 
 
 def test_maps_unique_elements_correctly_to_indices():
+    """Unique elements are mapped correctly to indices."""
     kgrid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     with patch("numpy.unique", wraps=np.unique) as mock_unique:
         kgrid.set_fbz2irrk()
@@ -252,6 +289,7 @@ def test_maps_unique_elements_correctly_to_indices():
 
 
 def test_handles_empty_input_without_error():
+    """Mapping handles an empty input without error."""
     fbz2irrk = np.array([])
     kgrid = bz.KGrid(nk=(0, 0, 0), symmetries=[])
     kgrid.fbz2irrk = fbz2irrk
@@ -262,6 +300,7 @@ def test_handles_empty_input_without_error():
 
 
 def test_sets_irrk_mesh_correctly_for_valid_input():
+    """set_irrk_mesh builds the irreducible mesh for valid input."""
     nk = (4, 4, 4)
     symmetries = [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV]
     kgrid = bz.KGrid(nk=nk, symmetries=symmetries)
@@ -270,42 +309,49 @@ def test_sets_irrk_mesh_correctly_for_valid_input():
 
 
 def test_returns_correct_kx_shift_for_valid_input():
+    """The kx shift is computed correctly."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     expected_shift = kgrid.kx - np.pi
     assert np.allclose(kgrid.kx_shift, expected_shift)
 
 
 def test_returns_correct_ky_shift_for_valid_input():
+    """The ky shift is computed correctly."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     expected_shift = kgrid.ky - np.pi
     assert np.allclose(kgrid.ky_shift, expected_shift)
 
 
 def test_returns_correct_kz_shift_for_valid_input():
+    """The kz shift is computed correctly."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     expected_shift = kgrid.kz - np.pi
     assert np.allclose(kgrid.kz_shift, expected_shift)
 
 
 def test_returns_correct_kx_shift_closed_for_valid_input():
+    """The closed kx shift is computed correctly."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     expected_shift_closed = np.array([*(kgrid.kx - np.pi), -kgrid.kx[0] + np.pi])
     assert np.allclose(kgrid.kx_shift_closed, expected_shift_closed)
 
 
 def test_returns_correct_ky_shift_closed_for_valid_input():
+    """The closed ky shift is computed correctly."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     expected_shift_closed = np.array([*(kgrid.ky - np.pi), -kgrid.ky[0] + np.pi])
     assert np.allclose(kgrid.ky_shift_closed, expected_shift_closed)
 
 
 def test_returns_correct_kz_shift_closed_for_valid_input():
+    """The closed kz shift is computed correctly."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     expected_shift_closed = np.array([*(kgrid.kz - np.pi), -kgrid.kz[0] + np.pi])
     assert np.allclose(kgrid.kz_shift_closed, expected_shift_closed)
 
 
 def test_returns_correct_k_grid_as_tuple():
+    """The k-grid is returned as the expected tuple."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     kx, ky, kz = kgrid.grid
     assert np.array_equal(kx, kgrid.kx)
@@ -314,16 +360,19 @@ def test_returns_correct_k_grid_as_tuple():
 
 
 def test_calculates_total_number_of_k_points_correctly():
+    """nk_tot is the total number of k-points."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     assert kgrid.nk_tot == 64
 
 
 def test_calculates_number_of_irreducible_k_points_correctly():
+    """nk_irr is the number of irreducible k-points."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.X_INV])
     assert kgrid.nk_irr == len(np.unique(kgrid.fbz2irrk))
 
 
 def test_returns_correct_k_meshgrid():
+    """The k meshgrid is built correctly."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     kmesh = kgrid.kmesh
     assert kmesh.shape == (3, 4, 4, 4)
@@ -333,6 +382,7 @@ def test_returns_correct_k_meshgrid():
 
 
 def test_returns_correct_kmesh_list_for_valid_input():
+    """The kmesh list is built correctly."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     kmesh_list = kgrid.kmesh_list
     assert kmesh_list.shape == (3, 64)
@@ -342,6 +392,7 @@ def test_returns_correct_kmesh_list_for_valid_input():
 
 
 def test_sets_k_axes_correctly_for_valid_input():
+    """The k axes are set correctly."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     assert np.allclose(kgrid.kx, np.linspace(0, 2 * np.pi, 4, endpoint=False))
     assert np.allclose(kgrid.ky, np.linspace(0, 2 * np.pi, 4, endpoint=False))
@@ -349,6 +400,7 @@ def test_sets_k_axes_correctly_for_valid_input():
 
 
 def test_returns_correct_q_list_for_valid_input():
+    """get_q_list returns the expected q-list."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     q_list = kgrid.get_q_list()
     assert q_list.shape == (64, 3)
@@ -358,6 +410,7 @@ def test_returns_correct_q_list_for_valid_input():
 
 
 def test_returns_correct_irrq_list_for_valid_input():
+    """get_irrq_list returns the expected irreducible q-list."""
     kgrid = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.X_INV])
     irrq_list = kgrid.get_irrq_list()
     assert irrq_list.shape == (kgrid.nk_irr, 3)
@@ -367,6 +420,7 @@ def test_returns_correct_irrq_list_for_valid_input():
 
 
 def test_corner_k_points_and_label_mapping_for_known_labels():
+    """Corner k-points and label mapping resolve known high-symmetry labels."""
     kx = np.arange(4)
     kp = KPath(nk=(4, 4, 4), path="gamma-x", kx=kx, ky=kx, kz=kx)
 
@@ -381,6 +435,7 @@ def test_corner_k_points_and_label_mapping_for_known_labels():
 
 
 def test_map_to_kpath_and_get_kpoints_return_expected_values():
+    """map_to_kpath and get_kpoints return the expected path points."""
     kx = np.arange(4)
     kp = KPath(nk=(4, 4, 4), path="gamma-x", kx=kx, ky=kx, kz=kx)
 
@@ -399,6 +454,7 @@ def test_map_to_kpath_and_get_kpoints_return_expected_values():
 
 
 def test_corner_k_points_accepts_numeric_string_points():
+    """Corner k-points accept numeric string coordinates."""
     kx = np.arange(4)
     kp = KPath(nk=(4, 4, 4), path="gamma-0.25 0.25 0", kx=kx, ky=kx, kz=kx)
 
@@ -408,12 +464,14 @@ def test_corner_k_points_accepts_numeric_string_points():
 
 
 def test_nk_tot_returns_sum_of_nkp():
+    """KPath.nk_tot returns the sum of the per-segment point counts."""
     kp = KPath(nk=(4, 4, 4), path="gamma-x")
     kp.nkp = [2, 3, 1]
     assert kp.nk_tot == 6
 
 
 def test_nk_seg_returns_diff_of_cind():
+    """KPath.nk_seg returns the per-segment point counts."""
     kp = KPath(nk=(4, 4, 4), path="gamma-x")
     kp.nkp = [2, 3, 1]
     cind = np.concatenate(([0], np.cumsum(kp.nkp) - 1))
@@ -422,6 +480,7 @@ def test_nk_seg_returns_diff_of_cind():
 
 
 def test_k_axis_normalized_positions_and_length():
+    """The k-axis normalizes positions to [0,1] by cumulative distance."""
     kp = KPath(nk=(4, 4, 4), path="gamma-x")
     # create 4 consecutive k-points with equal step lengths of 1
     kp.kpts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]])
@@ -434,10 +493,7 @@ def test_k_axis_normalized_positions_and_length():
 
 
 def test_build_k_path_single_segment_gamma_to_x():
-    """
-    For nk=(4,4,4) and path 'gamma-x' the segment should produce two indices:
-    [[0,0,0], [1,0,0]] and nkp should be [2].
-    """
+    """For nk=(4,4,4) and path 'gamma-x' the segment should produce two indices: [[0,0,0], [1,0,0]] and nkp should be [2]."""
     kp = KPath(nk=(4, 4, 4), path="gamma-x")
     k_path, nkp = kp.build_k_path()
 
@@ -448,10 +504,7 @@ def test_build_k_path_single_segment_gamma_to_x():
 
 
 def test_get_bands_returns_sorted_real_eigenvalues():
-    """
-    Patch KPath.map_to_kpath to return an object that yields 2x2 matrices.
-    Ensure get_bands returns sorted real eigenvalues for each k-point.
-    """
+    """Patch KPath.map_to_kpath to return an object that yields 2x2 matrices. Ensure get_bands returns sorted real eigenvalues for each k-point."""
 
     class MockEKPath:
         def __init__(self, mats):
@@ -477,14 +530,8 @@ def test_get_bands_returns_sorted_real_eigenvalues():
     assert np.allclose(bands, expected)
 
 
-# =============================================================================
-# Auto-symmetry sentinel and is_auto_symmetries helper
-# =============================================================================
-
-
 def test_auto_symmetries_sentinel_is_singleton():
-    """``_AutoSymmetriesSentinel`` is a singleton: every instantiation returns the
-    canonical ``AUTO_SYMMETRIES_SENTINEL`` object."""
+    """``_AutoSymmetriesSentinel`` is a singleton: every instantiation returns the canonical ``AUTO_SYMMETRIES_SENTINEL`` object."""
     a = bz._AutoSymmetriesSentinel()
     b = bz._AutoSymmetriesSentinel()
     assert a is b
@@ -492,35 +539,38 @@ def test_auto_symmetries_sentinel_is_singleton():
 
 
 def test_auto_symmetries_sentinel_repr_is_stable():
+    """The auto-symmetries sentinel has a stable repr."""
     assert repr(bz.AUTO_SYMMETRIES_SENTINEL) == "<auto-symmetries>"
 
 
 def test_auto_symmetries_sentinel_iterates_as_empty():
-    """The sentinel is iterable and yields nothing, so legacy ``for s in symmetries``
-    code paths see no operations to apply."""
+    """The sentinel is iterable and yields nothing, so legacy ``for s in symmetries`` code paths see no operations to apply."""
     assert list(bz.AUTO_SYMMETRIES_SENTINEL) == []
 
 
 def test_auto_symmetries_sentinel_has_length_zero():
+    """The auto-symmetries sentinel has length zero."""
     assert len(bz.AUTO_SYMMETRIES_SENTINEL) == 0
 
 
 def test_auto_symmetries_sentinel_is_truthy():
-    """Truthy so ``if symmetries:`` branches still enter, even though iteration is empty.
-    This is what lets KGrid detect auto-mode intent without triggering legacy code."""
+    """Truthy so ``if symmetries:`` branches still enter, even though iteration is empty. This is what lets KGrid detect auto-mode intent without triggering legacy code."""
     assert bool(bz.AUTO_SYMMETRIES_SENTINEL) is True
 
 
 def test_is_auto_symmetries_true_for_sentinel_only():
+    """is_auto_symmetries is True only for the sentinel singleton."""
     assert bz.is_auto_symmetries(bz.AUTO_SYMMETRIES_SENTINEL) is True
 
 
 def test_is_auto_symmetries_false_for_legacy_list():
+    """is_auto_symmetries is False for a legacy symmetry list."""
     assert bz.is_auto_symmetries(bz.two_dimensional_square_symmetries()) is False
     assert bz.is_auto_symmetries(bz.three_dimensional_cubic_symmetries()) is False
 
 
 def test_is_auto_symmetries_false_for_empty_list_none_or_other():
+    """is_auto_symmetries is False for an empty list, None, or other values."""
     assert bz.is_auto_symmetries([]) is False
     assert bz.is_auto_symmetries(None) is False
     # Identity-based check: only the sentinel singleton qualifies, the string
@@ -531,8 +581,7 @@ def test_is_auto_symmetries_false_for_empty_list_none_or_other():
 
 
 def test_get_lattice_symmetries_from_string_returns_sentinel_for_auto():
-    """The "auto" string is the documented public entry point for opting into
-    auto-discovery; it must resolve to the singleton sentinel."""
+    """The "auto" string is the documented public entry point for opting into auto-discovery; it must resolve to the singleton sentinel."""
     result = bz.get_lattice_symmetries_from_string("auto")
     assert result is bz.AUTO_SYMMETRIES_SENTINEL
 
@@ -541,11 +590,6 @@ def test_get_lattice_symmetries_from_string_auto_is_case_insensitive():
     """Lowercase normalization is applied to all string inputs; "auto" / "AUTO" / "Auto" all work."""
     for s in ("auto", "AUTO", "Auto", "AuTo"):
         assert bz.get_lattice_symmetries_from_string(s) is bz.AUTO_SYMMETRIES_SENTINEL
-
-
-# =============================================================================
-# KGrid construction in auto mode
-# =============================================================================
 
 
 def _make_small_real_cubic_h(nx=4, ny=4, nz=4, nb=1):
@@ -565,6 +609,7 @@ def _make_small_real_cubic_h(nx=4, ny=4, nz=4, nb=1):
 
 
 def test_kgrid_with_auto_sentinel_sets_auto_mode_flag():
+    """A KGrid built with the auto sentinel sets the auto-mode flag."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
     assert grid._auto_mode is True
 
@@ -576,13 +621,13 @@ def test_kgrid_with_legacy_symmetries_does_not_set_auto_mode():
 
 
 def test_kgrid_with_no_symmetries_does_not_set_auto_mode():
+    """A KGrid built with no symmetries does not set auto mode."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=[])
     assert grid._auto_mode is False
 
 
 def test_kgrid_auto_mode_starts_with_trivial_ibz_and_no_auto_data():
-    """Before specify_auto_symmetries() is called, the auto-mode KGrid behaves like
-    the symmetry-free case: the IBZ equals the FBZ. The auto-data slots are unset."""
+    """Before specify_auto_symmetries() is called, the auto-mode KGrid behaves like the symmetry-free case: the IBZ equals the FBZ. The auto-data slots are unset."""
     nx, ny, nz = 4, 4, 4
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
     assert grid._auto_us is None
@@ -593,18 +638,19 @@ def test_kgrid_auto_mode_starts_with_trivial_ibz_and_no_auto_data():
 
 
 def test_kgrid_is_auto_property_is_false_before_specify_auto_symmetries():
-    """``is_auto`` is the runtime indicator that auto-data has been populated.
-    It must be False between construction and specify_auto_symmetries()."""
+    """``is_auto`` is the runtime indicator that auto-data has been populated. It must be False between construction and specify_auto_symmetries()."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
     assert grid.is_auto is False
 
 
 def test_kgrid_is_auto_property_is_false_for_legacy_grid():
+    """KGrid.is_auto is False for a legacy grid."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
     assert grid.is_auto is False
 
 
 def test_kgrid_is_auto_property_is_true_after_specify_auto_symmetries():
+    """KGrid.is_auto becomes True after specify_auto_symmetries."""
     nx, ny, nz = 4, 4, 4
     H = _make_small_real_cubic_h(nx, ny, nz, nb=1)
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
@@ -612,14 +658,8 @@ def test_kgrid_is_auto_property_is_true_after_specify_auto_symmetries():
     assert grid.is_auto is True
 
 
-# =============================================================================
-# KGrid.specify_auto_symmetries: happy path
-# =============================================================================
-
-
 def test_specify_auto_symmetries_populates_all_expected_arrays():
-    """After a successful call, every cached IBZ-related field plus the new auto-data
-    fields must be populated and internally consistent."""
+    """After a successful call, every cached IBZ-related field plus the new auto-data fields must be populated and internally consistent."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
@@ -643,8 +683,7 @@ def test_specify_auto_symmetries_populates_all_expected_arrays():
 
 
 def test_specify_auto_symmetries_produces_consistent_fbz2irrk_and_irrk_inv():
-    """irrk_inv must be a true inverse of irrk_ind w.r.t. fbz2irrk:
-    irrk_ind[irrk_inv[k]] == fbz2irrk.flat[k] for every k."""
+    """irrk_inv must be a true inverse of irrk_ind w.r.t. fbz2irrk: irrk_ind[irrk_inv[k]] == fbz2irrk.flat[k] for every k."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
@@ -679,6 +718,7 @@ def test_specify_auto_symmetries_us_are_unitary():
 
 
 def test_specify_auto_symmetries_sigmas_are_plus_or_minus_one():
+    """specify_auto_symmetries yields sigma factors of +/-1."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
@@ -688,9 +728,7 @@ def test_specify_auto_symmetries_sigmas_are_plus_or_minus_one():
 
 
 def test_specify_auto_symmetries_default_drops_antiunitary_ops():
-    """The default ``include_antiunitary=False`` filters out time-reversal-like ops
-    so the FBZ expansion is safe for frequency-dependent objects: no per-k
-    transformation should carry conj=True."""
+    """The default ``include_antiunitary=False`` filters out time-reversal-like ops so the FBZ expansion is safe for frequency-dependent objects: no per-k transformation should carry conj=True."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
@@ -699,9 +737,7 @@ def test_specify_auto_symmetries_default_drops_antiunitary_ops():
 
 
 def test_specify_auto_symmetries_with_include_antiunitary_admits_conj_ops():
-    """Opting in via ``include_antiunitary=True`` produces a larger group; for a
-    purely-real H, anti-unitary ops always exist (H(k) = H(k)*), so at least some
-    FBZ k-points will carry conj=True."""
+    """Opting in via ``include_antiunitary=True`` produces a larger group; for a purely-real H, anti-unitary ops always exist (H(k) = H(k)*), so at least some FBZ k-points will carry conj=True."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
@@ -720,14 +756,8 @@ def test_specify_auto_symmetries_with_include_antiunitary_yields_smaller_or_equa
     assert g_full.nk_irr <= g_spatial.nk_irr
 
 
-# =============================================================================
-# KGrid.specify_auto_symmetries: input validation
-# =============================================================================
-
-
 def test_specify_auto_symmetries_raises_when_kgrid_is_not_in_auto_mode():
-    """Calling specify_auto_symmetries on a legacy KGrid must fail loudly so users
-    don't accidentally clobber a non-auto setup."""
+    """Calling specify_auto_symmetries on a legacy KGrid must fail loudly so users don't accidentally clobber a non-auto setup."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
     H = _make_small_real_cubic_h(4, 4, 4, 1)
     with pytest.raises(RuntimeError, match="auto mode"):
@@ -735,6 +765,7 @@ def test_specify_auto_symmetries_raises_when_kgrid_is_not_in_auto_mode():
 
 
 def test_specify_auto_symmetries_raises_on_grid_shape_mismatch():
+    """specify_auto_symmetries raises on a grid-shape mismatch."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
     H_wrong = _make_small_real_cubic_h(4, 4, 2, 1)  # nz=2 instead of 4
     with pytest.raises(ValueError, match="k-grid shape"):
@@ -742,6 +773,7 @@ def test_specify_auto_symmetries_raises_on_grid_shape_mismatch():
 
 
 def test_specify_auto_symmetries_raises_on_wrong_ndim():
+    """specify_auto_symmetries raises on the wrong number of dimensions."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
     bad = np.zeros((4, 4, 4), dtype=complex)  # missing orbital axes
     with pytest.raises(ValueError, match="must have shape"):
@@ -749,6 +781,7 @@ def test_specify_auto_symmetries_raises_on_wrong_ndim():
 
 
 def test_specify_auto_symmetries_raises_on_non_square_orbital_axes():
+    """specify_auto_symmetries raises on non-square orbital axes."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
     bad = np.zeros((4, 4, 4, 2, 3), dtype=complex)  # mismatched orbital dims
     with pytest.raises(ValueError, match="must have shape"):
@@ -756,18 +789,12 @@ def test_specify_auto_symmetries_raises_on_non_square_orbital_axes():
 
 
 def test_specify_auto_symmetries_accepts_non_contiguous_input():
-    """The implementation casts to complex128 explicitly; non-contiguous or
-    non-complex128 input should be accepted without crashing."""
+    """The implementation casts to complex128 explicitly; non-contiguous or non-complex128 input should be accepted without crashing."""
     H = _make_small_real_cubic_h(4, 4, 4, 1).astype(np.complex64)
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
     # Should not raise
     grid.specify_auto_symmetries(H)
     assert grid.is_auto is True
-
-
-# =============================================================================
-# Regression: legacy KGrid still works unchanged
-# =============================================================================
 
 
 def test_legacy_kgrid_two_dimensional_square_unchanged():
@@ -781,16 +808,14 @@ def test_legacy_kgrid_two_dimensional_square_unchanged():
 
 
 def test_legacy_kgrid_three_dimensional_cubic_unchanged():
+    """A legacy 3D cubic KGrid behaves unchanged."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
     assert grid.nk_irr <= 64
     assert grid.irrk_count.sum() == 64
 
 
 def test_specify_auto_symmetries_finds_at_least_legacy_symmetries_for_cubic_h():
-    """For a real cubic H, the auto-discovered spatial group must be at least as
-    large as the legacy ``three_dimensional_cubic`` group, so the auto IBZ must
-    be no larger than the legacy IBZ. (Auto can find accidental extra symmetries
-    on small grids, so we don't insist on strict equality here.)"""
+    """For a real cubic H, the auto-discovered spatial group must be at least as large as the legacy ``three_dimensional_cubic`` group, so the auto IBZ must be no larger than the legacy IBZ. (Auto can find accidental extra symmetries on small grids, so we don't insist on strict equality here.)"""
     H = _make_small_real_cubic_h(4, 4, 4, 1)
     g_auto = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
     g_auto.specify_auto_symmetries(H)

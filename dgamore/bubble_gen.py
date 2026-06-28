@@ -18,7 +18,7 @@ from dgamore.four_point import FourPoint
 from dgamore.greens_function import GreensFunction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.matsubara_frequencies import MFHelper
-from dgamore.mpi_distributor import MpiDistributor
+from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel, FrequencyNotation
 
 
@@ -198,12 +198,14 @@ class BubbleGenerator:
 
         gchi0_q = xp.zeros((nq, nb, nb, nb, nb, len(wn), 2 * niv), dtype=giwk.mat.dtype, order=order)
 
-        g_left = xp.asarray(giwk.cut_niv(niv + niw).mat, order=order)
-        g_right = g_left.copy()
-        giwk_niv = g_right.shape[-1] // 2
+        # g_left (the central niv window) and g_right (the full range, momentum-shifted per q) are both read-only,
+        # so they can share one backing array instead of holding a full-size duplicate.
+        g_full = xp.asarray(giwk.cut_niv(niv + niw).mat, order=order)
+        giwk_niv = g_full.shape[-1] // 2
 
-        g_r_buf = xp.empty_like(g_left)
-        g_left = g_left[..., giwk_niv - niv : giwk_niv + niv]
+        g_r_buf = xp.empty_like(g_full)
+        g_right = g_full
+        g_left = g_full[..., giwk_niv - niv : giwk_niv + niv]
 
         # the precomputed contraction path is only used on the CPU; cupy.einsum optimizes internally
         path = True if use_gpu else xp.einsum_path("xyzadv,xyzcbv->abcdv", g_left, g_left, optimize="optimal")[0]
@@ -285,8 +287,11 @@ class BubbleGenerator:
         :return: The local pp bubble as a :class:`LocalFourPoint` in pp notation at :math:`\omega = 0`.
         """
         g = g_dmft.cut_niv(niv_pp)
+        # transpose_orbitals() returns a fresh private copy, so flip it in place (copy=False) instead of deepcopying
+        # that throwaway again.
         gchi0_pp_w0 = (
-            g.mat[:, None, None, :, :] * g.transpose_orbitals().flip_frequency_axis(-1).mat[None, :, :, None, :]
+            g.mat[:, None, None, :, :]
+            * g.transpose_orbitals().flip_frequency_axis(-1, copy=False).mat[None, :, :, None, :]
         )
         return LocalFourPoint(
             -beta * gchi0_pp_w0[..., None, :], SpinChannel.NONE, 1, 1, frequency_notation=FrequencyNotation.PP
@@ -305,7 +310,10 @@ class BubbleGenerator:
         :return: The momentum-dependent pp bubble as a :class:`FourPoint` (no bosonic axis, pp notation, compressed q).
         """
         g = giwk.cut_niv(niv_pp).compress_q_dimension()
-        gchi0_q_pp_w0 = g.mat[:, :, None, None, :, :] * np.conj(g.transpose_orbitals().mat)[:, None, :, :, None, :]
+        # transpose_orbitals() returns a fresh private copy, so conjugate it in place to reuse its buffer.
+        g_t = g.transpose_orbitals()
+        np.conj(g_t.mat, out=g_t.mat)
+        gchi0_q_pp_w0 = g.mat[:, :, None, None, :, :] * g_t.mat[:, None, :, :, None, :]
 
         return FourPoint(
             gchi0_q_pp_w0, SpinChannel.NONE, q_grid.nk, 0, 1, True, True, True, FrequencyNotation.PP

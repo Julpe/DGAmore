@@ -184,7 +184,8 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         """
         if len(axis) > self.num_vn_dimensions:
             raise ValueError(f"Cannot sum over more fermionic axes than available in {self.current_shape}.")
-        copy_mat = 1 / beta ** len(axis) * np.sum(self.mat, axis=axis)
+        copy_mat = np.sum(self.mat, axis=axis)
+        copy_mat *= 1.0 / beta ** len(axis)  # in-place scale avoids a second full-size temporary
         self.update_original_shape()
         return LocalFourPoint(
             copy_mat,
@@ -345,7 +346,8 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         self.mat = self.mat.reshape((w_dim,) + compound_index_shape * 2).transpose(1, 2, 5, 4, 0, 3, 6)
 
         if self.num_vn_dimensions == 1:  # original was [o1,o2,o4,o3,w,v]
-            self.mat = self.mat.diagonal(axis1=-2, axis2=-1)
+            # ``.copy()`` since ``diagonal`` returns a read-only view that also keeps the larger parent alive.
+            self.mat = self.mat.diagonal(axis1=-2, axis2=-1).copy()
         return self
 
     def _to_full_indices_pp(self, shape: tuple = None) -> "LocalFourPoint":
@@ -765,14 +767,16 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         :param niv_pad: Target number of positive fermionic frequencies.
         :return: A new :class:`LocalFourPoint` padded to ``niv_pad``.
         """
-        copy = deepcopy(self)
+        if niv_pad <= self.niv:
+            return deepcopy(self)
 
-        if niv_pad <= copy.niv:
-            return copy
-
-        urange_mat = np.tile(u.mat[..., None, None, None], (1, 1, 1, 1, 2 * copy.niw + 1, 2 * niv_pad, 2 * niv_pad))
-        niv_diff = niv_pad - copy.niv
-        urange_mat[..., niv_diff : niv_diff + 2 * copy.niv, niv_diff : niv_diff + 2 * copy.niv] = copy.mat
+        copy = self._clone_without_mat()
+        # Allocate the padded array once and broadcast-fill the shell with ``u`` instead of materializing a full
+        # tiled copy; then write the core region from ``self.mat`` (which is left untouched).
+        urange_mat = np.empty(self.current_shape[:4] + (2 * self.niw + 1, 2 * niv_pad, 2 * niv_pad), dtype=DTYPE)
+        urange_mat[...] = u.mat[..., None, None, None]
+        niv_diff = niv_pad - self.niv
+        urange_mat[..., niv_diff : niv_diff + 2 * self.niv, niv_diff : niv_diff + 2 * self.niv] = self.mat
         copy.mat = urange_mat
         copy.update_original_shape()
         return copy
