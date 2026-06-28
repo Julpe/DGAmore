@@ -43,8 +43,8 @@ while an editable install is done with
    cd DGAmore
    pip install -e .
 
-The editable install is recommended for development, as it lets you modify the source without reinstalling and lets
-you pick up upstream changes simply by pulling the latest version. Please make sure no older cached versions of the
+The editable install is recommended for development, as it lets you modify the source without reinstalling and
+pick up upstream changes simply by pulling the latest version. Please make sure no older cached versions of the
 dependencies are reused, as this can lead to installation problems.
 
 Installing the package also places the entry point ``DGAmore.py`` on your ``PATH``, so you can launch a run from
