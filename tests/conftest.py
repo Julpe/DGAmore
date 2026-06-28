@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 import dgamore.brillouin_zone as bz
+import dgamore.config as config
 
 
 def pytest_addoption(parser):
@@ -71,6 +72,26 @@ def mock_logger(monkeypatch):
     monkeypatch.setattr(logging, "getLogger", lambda name=None: logger_mock)
     monkeypatch.setattr(logging, "Logger", MagicMock(return_value=logger_mock))
     yield logger_mock
+
+
+@pytest.fixture(autouse=True)
+def reset_config_singletons():
+    # Restore the global config singletons to fresh defaults after every test. config.py is module-level mutable state
+    # and the end-to-end tests reconfigure the whole singleton (grids, bands, symmetrize_orbitals, ...); without this
+    # reset those mutations leak into later tests (e.g. nonlocal-srvo3 -> eliashberg). Reset on teardown so it never
+    # interferes with a test's own setup.
+    yield
+    config.box = config.BoxConfig()
+    config.lattice = config.LatticeConfig()
+    config.lambda_correction = config.LambdaCorrectionConfig()
+    config.dmft = config.DmftConfig()
+    config.sys = config.SystemConfig()
+    config.output = config.OutputConfig()
+    config.self_energy_interpolation = config.SelfEnergyInterpolationConfig()
+    config.self_consistency = config.SelfConsistencyConfig()
+    config.eliashberg = config.EliashbergConfig()
+    config.memory = config.MemoryConfig()
+    config.ana_cont = config.AnaContConfig()
 
 
 def create_default_config(config, folder: str):
@@ -286,6 +307,23 @@ class Comm:
 
     def allgather(self, obj):
         return list(self._collective(obj))
+
+    def Allgatherv(self, sendspec, recvspec):
+        # Element-count semantics on flattened buffers: each rank contributes sendspec[1] elements, placed into the
+        # flat recvbuf at the per-rank (counts, displs) given in recvspec[1]. Mirrors mpi4py's Allgatherv contract.
+        sendbuf = sendspec[0] if isinstance(sendspec, (list, tuple)) else sendspec
+        scount = (
+            int(sendspec[1]) if isinstance(sendspec, (list, tuple)) and len(sendspec) > 1 else int(np.size(sendbuf))
+        )
+        recvbuf, (counts, displs) = recvspec[0], recvspec[1]
+        flat_send = np.ascontiguousarray(sendbuf).reshape(-1)[:scount]
+        store = self._collective(np.array(flat_send, copy=True))
+        rflat = np.asarray(recvbuf).reshape(-1)
+        for r in range(self._size):
+            c, d = int(counts[r]), int(displs[r])
+            if c:
+                rflat[d : d + c] = store[r][:c]
+        return recvbuf
 
     def Alltoall(self, sendbuf, recvbuf):
         store = self._collective(np.array(sendbuf, copy=True))

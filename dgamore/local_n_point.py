@@ -217,14 +217,48 @@ class LocalNPoint(IHaveMat):
     def cut_niw_and_niv(self, niw_cut: int, niv_cut: int, copy: bool = True):
         """
         Allows to place a cutoff on the number of bosonic and fermionic frequencies of the object. Returns a copy if
-        ``copy`` is True, otherwise modifies and returns ``self`` in place.
+        ``copy`` is True, otherwise modifies and returns ``self`` in place. Fuses the bosonic and fermionic cut into a
+        single slice (one allocation) instead of chaining :meth:`cut_niw` and :meth:`cut_niv` (which copies twice). As
+        with those methods, a cutoff not smaller than the available range is a no-op for that axis, and if neither axis
+        is cut ``self`` is returned unchanged (not a copy) regardless of ``copy``.
 
         :param niw_cut: Number of bosonic frequencies to keep (per sign).
         :param niv_cut: Number of fermionic frequencies to keep (per sign).
         :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
         :return: The cut object; see :meth:`cut_niw` and :meth:`cut_niv`.
+        :raises ValueError: If the object has no bosonic or no fermionic frequency dimension.
         """
-        return self.cut_niw(niw_cut, copy).cut_niv(niv_cut, copy)
+        if self.num_wn_dimensions == 0:
+            raise ValueError("Cannot cut bosonic frequencies if there are none.")
+        if self.num_vn_dimensions == 0:
+            raise ValueError("Cannot cut fermionic frequencies if there are none.")
+
+        cut_w = niw_cut <= self.niw
+        cut_v = niv_cut <= self.niv
+        if not cut_w and not cut_v:
+            return self
+
+        if copy:
+            obj = self._clone_without_mat()
+            obj.mat = self.mat  # shared; the slice is copied below, so self.mat is left untouched
+        else:
+            obj = self
+
+        idx = [slice(None)] * obj.mat.ndim
+        if cut_w:
+            idx[-(obj.num_vn_dimensions + 1)] = (
+                slice(obj.niw - niw_cut, obj.niw + niw_cut + 1) if obj.full_niw_range else slice(0, niw_cut + 1)
+            )
+        if cut_v:
+            niv_slice = slice(obj.niv - niv_cut, obj.niv + niv_cut) if obj.full_niv_range else slice(0, niv_cut)
+            idx[-1] = niv_slice
+            if obj.num_vn_dimensions == 2:
+                idx[-2] = niv_slice
+
+        # single ``.copy()`` so the trimmed parent array is released (a bare slice would keep it alive via the view).
+        obj.mat = obj.mat[tuple(idx)].copy()
+        obj.update_original_shape()
+        return obj
 
     def extend_vn_to_diagonal(self):
         """
@@ -238,9 +272,13 @@ class LocalNPoint(IHaveMat):
             raise ValueError("No fermionic frequency dimensions available for extension.")
         if self.num_vn_dimensions == 2:
             return self
-        self.mat = np.einsum(
-            "...i,ij->...ij", self.mat, np.eye(self.current_shape[-1], dtype=self.mat.dtype), optimize=True
-        )
+        # build the [...,v,v] diagonal embedding directly: a zero-fill plus a diagonal write is cheaper than the
+        # einsum-with-eye (which multiplies the whole [...,v,v] output by the identity) at identical peak memory.
+        n = self.current_shape[-1]
+        extended = np.zeros(self.mat.shape + (n,), dtype=self.mat.dtype)
+        diag = np.arange(n)
+        extended[..., diag, diag] = self.mat
+        self.mat = extended
         self._num_vn_dimensions = 2
         self.update_original_shape()
         return self
@@ -312,8 +350,12 @@ class LocalNPoint(IHaveMat):
             return self
 
         axis = -(self.num_wn_dimensions + self.num_vn_dimensions)
-        ind = np.arange(self.current_shape[axis] // 2, self.current_shape[axis])
-        self.mat = np.take(self.mat, ind, axis=axis)
+        n = self.current_shape[axis]
+        slicer = [slice(None)] * self.mat.ndim
+        slicer[axis] = slice(n // 2, n)
+        # ``.copy()`` so the discarded negative-w half is released (a bare slice would keep the parent alive via the
+        # view); a basic slice is faster than ``np.take`` with an index array at identical memory.
+        self.mat = self.mat[tuple(slicer)].copy()
         self.update_original_shape()
         self._full_niw_range = False
         return self

@@ -54,6 +54,7 @@ def comm1():
 
 def test_node_aware_single_node():
     """_get_node_aware_v_dist puts the frequency excess on the first ranks for a single node."""
+
     # 7 frequencies, 3 ranks, all on one node -> excess on the first ranks.
     def fn(comm, rank):
         sizes, slices = mu._get_node_aware_v_dist(7, comm)
@@ -265,6 +266,48 @@ def test_exchange_and_map_auto_orbital_transform(monkeypatch):
     assert all(c["num_orbital_dimensions"] == 4 for c in calls)
 
 
+def test_exchange_and_map_data_exchange_is_chunked(monkeypatch):
+    """exchange_and_map_irrbz_fullbz chunks the peer-to-peer data exchange under the 2 GB limit."""
+    nk = (4, 4, 1)
+    syms = bz.two_dimensional_square_symmetries()
+    inv = KGrid(nk, syms).irrk_inv.ravel()
+    n_irr = int(inv.max()) + 1
+    n_full = inv.size
+    g_irr = (np.arange(n_irr * 2 * 2).reshape(n_irr, 2, 2) + 1j).astype(np.complex128)
+    full_mapped = g_irr[inv]
+
+    counter = {"n": 0}
+    orig_isend = MPI.Comm.Isend
+
+    def counting_isend(self, buf, dest, tag=0):
+        counter["n"] += 1
+        return orig_isend(self, buf, dest, tag)
+
+    monkeypatch.setattr(MPI.Comm, "Isend", counting_isend)
+
+    def run(limit):
+        counter["n"] = 0
+        monkeypatch.setattr(mu, "MAX_MPI_BYTES", limit)
+
+        def fn(comm, rank):
+            config.lattice.q_grid = KGrid(nk, syms)
+            d_irr = MpiDistributor(ntasks=n_irr, comm=comm)
+            d_full = MpiDistributor(ntasks=n_full, comm=comm)
+            obj = FourPoint(g_irr[d_irr.my_slice].copy(), nq=nk, has_compressed_q_dimension=True)
+            out = mu.exchange_and_map_irrbz_fullbz(obj, d_irr, d_full)
+            return None if out is None else out.mat
+
+        _, res = run_parallel(2, fn)
+        rebuilt = np.concatenate([r for r in res if r is not None], axis=0)
+        return counter["n"], rebuilt
+
+    n_huge, rebuilt_huge = run(2**31 - 1)
+    n_tiny, rebuilt_tiny = run(16)  # one (2,2) complex row is 64 B > 16 -> one row per chunk
+    assert np.allclose(rebuilt_huge, full_mapped)
+    assert np.allclose(rebuilt_tiny, full_mapped)
+    assert n_tiny > n_huge  # chunking split at least one multi-row peer payload into several messages
+
+
 @pytest.mark.parametrize("layout", ["flat", "z_pencil", "y_pencil", "x_pencil"])
 @pytest.mark.parametrize("size", [1, 2, 3, 4])
 def test_get_pencil_indices_partition(layout, size):
@@ -318,6 +361,29 @@ def test_redistribute_flat_to_zpencil():
     for rank, out in res:
         expected = G[mu.get_pencil_indices(rank, 3, nq, "z_pencil")]
         assert np.allclose(out, expected)
+
+
+def test_redistribute_self_shift_skips_mpi(monkeypatch):
+    """_redistribute_p2p copies the self-overlap locally instead of round-tripping it through MPI."""
+    nq = (2, 2, 2)
+    n_tot = 8
+    G = (np.arange(n_tot * 2).reshape(n_tot, 2) + 1j).astype(np.complex128)
+    counter = {"n": 0}
+    for name in ("Isend", "Irecv"):
+        orig = getattr(MPI.Comm, name)
+
+        def wrap(self, *a, _o=orig, **k):
+            counter["n"] += 1
+            return _o(self, *a, **k)
+
+        monkeypatch.setattr(MPI.Comm, name, wrap)
+
+    comm = MPI.Comm(1)
+    src = mu.get_pencil_indices(0, 1, nq, "flat")
+    out = mu._redistribute_p2p(G[src].copy(), nq, comm, "flat", "z_pencil")
+    expected = G[mu.get_pencil_indices(0, 1, nq, "z_pencil")]
+    assert np.allclose(out, expected)
+    assert counter["n"] == 0  # the single rank's only shift is the self-shift -> no MPI traffic
 
 
 def test_redistribute_roundtrip_multichunk(monkeypatch):
@@ -567,12 +633,70 @@ def test_allgather_reassembles_full_array():
         assert np.allclose(r, full)
 
 
+def test_allgather_uses_allgatherv_collective(monkeypatch):
+    """MpiDistributor.allgather uses a single Allgatherv (not per-rank broadcasts) when the data fits the limit."""
+    full = (np.arange(6 * 2).reshape(6, 2) + 0.5).astype(np.float64)
+    calls = {"agv": 0, "bcast": 0}
+    orig_agv, orig_bcast = MPI.Comm.Allgatherv, MPI.Comm.Bcast
+
+    def agv(self, *a, **k):
+        calls["agv"] += 1
+        return orig_agv(self, *a, **k)
+
+    def bcast(self, *a, **k):
+        calls["bcast"] += 1
+        return orig_bcast(self, *a, **k)
+
+    monkeypatch.setattr(MPI.Comm, "Allgatherv", agv)
+    monkeypatch.setattr(MPI.Comm, "Bcast", bcast)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=6, comm=comm)
+        return d.allgather(full[d.my_slice])
+
+    _, res = run_parallel(3, fn)
+    for r in res:
+        assert np.allclose(r, full)
+    assert calls["agv"] >= 1
+    assert calls["bcast"] == 0
+
+
+def test_allgather_1d_payload():
+    """MpiDistributor.allgather reassembles a 1-D payload (items_per_row == 1)."""
+    full = np.arange(7, dtype=np.float64)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=7, comm=comm)
+        return d.allgather(full[d.my_slice])
+
+    _, res = run_parallel(3, fn)
+    for r in res:
+        assert np.allclose(r, full)
+
+
 def test_allgather_single_rank():
     """MpiDistributor.allgather returns the local data on a single rank."""
     d = MpiDistributor(ntasks=4, comm=comm1())
     local = np.arange(4, dtype=float)[:, None]
     out = d.allgather(local)
     assert np.allclose(out, local)
+
+
+def test_allgather_single_rank_skips_collective(monkeypatch):
+    """MpiDistributor.allgather short-circuits on a single rank (no collective, so it works on a minimal comm)."""
+    called = {"agv": 0}
+    orig = MPI.Comm.Allgatherv
+
+    def agv(self, *a, **k):
+        called["agv"] += 1
+        return orig(self, *a, **k)
+
+    monkeypatch.setattr(MPI.Comm, "Allgatherv", agv)
+    d = MpiDistributor(ntasks=4, comm=comm1())
+    local = (np.arange(4 * 2).reshape(4, 2) + 1j).astype(np.complex128)
+    out = d.allgather(local)
+    assert np.allclose(out, local)
+    assert called["agv"] == 0
 
 
 def test_allgather_chunked(monkeypatch):
@@ -796,6 +920,48 @@ def test_bcast_chunked_multi_chunk(monkeypatch):
         assert np.allclose(r, arr)
 
 
+def test_bcast_npoint_roundtrips_object_and_mat():
+    """bcast_npoint broadcasts an N-point-like object's metadata and chunk-broadcasts its .mat to every rank."""
+    arr = (np.arange(5 * 4).reshape(5, 4) + 0.5 + 1j).astype(np.complex128)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=5, comm=comm)
+        obj = Holder(arr.copy(), label="hello") if rank == 0 else Holder(np.empty((1, 1), np.complex128), label="x")
+        out = d.bcast_npoint(obj, root=0)
+        return out.label, out.mat
+
+    _, res = run_parallel(3, fn)
+    for label, mat in res:
+        assert label == "hello"
+        assert np.allclose(mat, arr)
+
+
+def test_bcast_npoint_chunked(monkeypatch):
+    """bcast_npoint chunk-broadcasts the .mat under the 2 GB limit (multiple chunks)."""
+    arr = (np.arange(6 * 2).reshape(6, 2) + 2j).astype(np.complex128)
+    monkeypatch.setattr(mu, "MAX_MPI_BYTES", 16)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=6, comm=comm)
+        obj = Holder(arr.copy(), label="chunky") if rank == 0 else Holder(None, label="x")
+        out = d.bcast_npoint(obj, root=0)
+        return out.label, out.mat
+
+    _, res = run_parallel(3, fn)
+    for label, mat in res:
+        assert label == "chunky"
+        assert np.array_equal(mat, arr)
+
+
+def test_bcast_npoint_single_rank_returns_object():
+    """bcast_npoint short-circuits on a single rank (no collective, works on a minimal comm)."""
+    d = MpiDistributor(ntasks=3, comm=comm1())
+    obj = Holder((np.arange(6).reshape(3, 2) + 1j).astype(np.complex128), label="solo")
+    out = d.bcast_npoint(obj, root=0)
+    assert out is obj
+    assert out.label == "solo"
+
+
 def test_allreduce_sums_across_ranks():
     """MpiDistributor.allreduce sums contributions across ranks."""
 
@@ -807,6 +973,44 @@ def test_allreduce_sums_across_ranks():
     # ranks contribute (1,10),(2,10),(3,10) -> sum (6,30) on every rank.
     for r in res:
         assert np.allclose(r, [6.0, 30.0])
+
+
+def test_allreduce_respects_message_limit(monkeypatch):
+    """MpiDistributor.allreduce chunks the reduction so no single MPI message exceeds the 2 GB limit (the reduced
+    arrays are always equally shaped across ranks, so every rank chunks identically)."""
+    base = (np.arange(6 * 2).reshape(6, 2) + 1j).astype(np.complex128)  # 32 bytes per row
+    recorded = []
+    orig = MPI.Comm.Allreduce
+
+    def rec(self, sendbuf, recvbuf=None):
+        buf = recvbuf if sendbuf is MPI.IN_PLACE else sendbuf
+        recorded.append(np.asarray(buf).nbytes)
+        return orig(self, sendbuf, recvbuf)
+
+    monkeypatch.setattr(MPI.Comm, "Allreduce", rec)
+    monkeypatch.setattr(mu, "MAX_MPI_BYTES", 64)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=3, comm=comm)
+        return d.allreduce((base * (rank + 1)).copy())
+
+    _, res = run_parallel(3, fn)
+    expected = base * (1 + 2 + 3)
+    for r in res:
+        assert np.allclose(r, expected)
+    assert recorded and max(recorded) <= 64
+
+
+def test_allreduce_empty_leading_axis():
+    """MpiDistributor.allreduce is a no-op on an array with a zero-length leading axis."""
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=3, comm=comm)
+        return d.allreduce(np.empty((0, 2), dtype=np.complex128))
+
+    _, res = run_parallel(3, fn)
+    for r in res:
+        assert r.shape == (0, 2)
 
 
 def test_create_distributor_with_comm():
@@ -948,3 +1152,26 @@ def test_send_recv_bytes_roundtrip_multichunk():
 
     _, res = run_parallel(2, fn)
     assert res[1] == data
+
+
+def test_isend_irecv_rows_roundtrip_multichunk():
+    """_isend_rows / _irecv_rows_into round-trip an array across multiple chunks via non-blocking requests."""
+    arr = (np.arange(6 * 2).reshape(6, 2) + 1j).astype(np.complex128)
+
+    def fn(comm, rank):
+        if rank == 0:
+            MPI.Request.Waitall(mu._isend_rows(comm, arr, dest=1, limit=16))
+            return None
+        buf = np.empty_like(arr)
+        MPI.Request.Waitall(mu._irecv_rows_into(comm, buf, source=0, limit=16))
+        return buf
+
+    _, res = run_parallel(2, fn)
+    assert np.array_equal(res[1], arr)
+
+
+def test_isend_rows_rejects_non_contiguous():
+    """_isend_rows refuses a non-C-contiguous array (it must not silently stage a throwaway copy)."""
+    arr = (np.arange(6 * 2).reshape(6, 2) + 1j).astype(np.complex128).T  # F-contiguous view
+    with pytest.raises(ValueError):
+        mu._isend_rows(comm1(), arr, dest=0)

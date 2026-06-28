@@ -810,7 +810,7 @@ def test_del_calls_free_without_trim(monkeypatch):
     obj.__del__()
 
     assert called.get("called") is True
-    assert called.get("trim") is True
+    assert called.get("trim") is False
     assert obj.mat is None
 
 
@@ -987,6 +987,27 @@ def test_filter_q_index_raises_for_out_of_bounds_index():
     obj = IAmNonLocal(mat, nq)
     with pytest.raises(IndexError):
         obj.filter_q_index(64)
+
+
+def test_filter_q_index_does_not_retain_parent_array():
+    """filter_q_index copies the single q-slice instead of keeping the full parent array alive via a view."""
+    mat = np.arange(64 * 2).reshape((4, 4, 4, 2))
+    obj = IAmNonLocal(mat, (4, 4, 4))
+    result = obj.filter_q_index(5)
+    assert result.mat.base is None
+
+
+def test_nq_tot_decompressed_is_product_of_nq():
+    """nq_tot multiplies the per-direction momentum counts (as a plain int) when decompressed."""
+    obj = IAmNonLocal(np.arange(2 * 3 * 4 * 2).reshape((2, 3, 4, 2)), (2, 3, 4))
+    assert obj.nq_tot == 24
+    assert isinstance(obj.nq_tot, int)
+
+
+def test_nq_tot_compressed_uses_stored_leading_axis():
+    """nq_tot uses the stored leading axis length when compressed (which may be IBZ-reduced below prod(nq))."""
+    obj = IAmNonLocal(np.arange(10 * 2).reshape((10, 2)), (2, 3, 4), has_compressed_q_dimension=True)
+    assert obj.nq_tot == 10
 
 
 def test_q_mean_averages_full_momentum_grid_to_single_q_point():

@@ -692,7 +692,12 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         if self.num_vn_dimensions != 2:
             raise ValueError("This method is only implemented for objects with 2 fermionic frequency dimensions.")
 
-        self.mat = 0.5 * (self.mat + np.swapaxes(self.permute_orbitals("abcd->dcba").mat, -1, -2))
+        # ``times`` (einsum) returns a view for the pure orbital permutation, avoiding the full-array deepcopy in
+        # ``permute_orbitals(copy=True)``; the sum is then scaled in place to avoid a second full-size temporary.
+        permuted = self.times("abcd...->dcba...")
+        result = self.mat + np.swapaxes(permuted, -1, -2)
+        result *= 0.5
+        self.mat = result
         return self
 
     def change_frequency_notation_ph_to_pp_w0(self):
@@ -749,9 +754,10 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         if self.num_wn_dimensions != 1:
             raise ValueError("Object must have exactly one bosonic frequency dimension.")
 
-        copy = deepcopy(self)
+        # ``np.take`` allocates a fresh array, so clone the metadata without duplicating ``mat`` first.
+        copy = self._clone_without_mat()
         # select first entry of wn
-        copy.mat = np.take(copy.mat, 0, axis=-(copy.num_vn_dimensions + 1))
+        copy.mat = np.take(self.mat, 0, axis=-(self.num_vn_dimensions + 1))
         copy._num_wn_dimensions = 0
         copy.update_original_shape()
         return copy

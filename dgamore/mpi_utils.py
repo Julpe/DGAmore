@@ -117,7 +117,9 @@ def recv_rows_into(comm, buf: np.ndarray, source: int, base_tag: int = 0, limit:
     return buf
 
 
-def recv_rows_alloc(comm, shape: tuple, dtype, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> np.ndarray:
+def recv_rows_alloc(
+    comm, shape: tuple, dtype, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES
+) -> np.ndarray:
     """
     Allocates an array of the given shape/dtype and receives into it (see :func:`recv_rows_into`).
 
@@ -130,6 +132,50 @@ def recv_rows_alloc(comm, shape: tuple, dtype, source: int, base_tag: int = 0, l
     :return: The received array.
     """
     return recv_rows_into(comm, np.empty(shape, dtype=dtype), source, base_tag=base_tag, limit=limit)
+
+
+def _isend_rows(comm, arr: np.ndarray, dest: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> list:
+    """
+    Non-blocking counterpart of :func:`send_rows`: posts one ``Isend`` per sub-``limit``-byte axis-0 chunk
+    (``tag = base_tag + chunk_index``) and returns the request list for a later ``Waitall``, so transfers to
+    different peers (and the chunks of one transfer) overlap instead of serializing.
+
+    ``arr`` must be C-contiguous and **kept alive by the caller** until the returned requests complete; the helper
+    deliberately does not stage a private copy (that copy would be freed on return and corrupt an in-flight send).
+
+    :param comm: The MPI communicator.
+    :param arr: The C-contiguous array to send.
+    :param dest: Destination rank.
+    :param base_tag: Base MPI tag; successive chunks use ``base_tag + chunk_index``.
+    :param limit: Maximum message size in bytes.
+    :return: The list of MPI request handles for the posted sends.
+    :raises ValueError: If ``arr`` is not C-contiguous.
+    """
+    if not arr.flags["C_CONTIGUOUS"]:
+        raise ValueError("_isend_rows requires a C-contiguous array (the caller must keep it alive until Waitall)")
+    reqs = []
+    for idx, (i, j) in enumerate(row_chunks(arr.shape[0], arr.dtype.itemsize, _items_per_row(arr.shape), limit)):
+        reqs.append(comm.Isend(arr[i:j], dest=dest, tag=base_tag + idx))
+    return reqs
+
+
+def _irecv_rows_into(comm, buf: np.ndarray, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> list:
+    """
+    Non-blocking counterpart of :func:`recv_rows_into`: posts one ``Irecv`` per sub-``limit``-byte axis-0 chunk
+    **directly into** the contiguous buffer ``buf`` (no per-chunk staging) and returns the request list for a later
+    ``Waitall``. The buffer's axis-0 slices must be contiguous (e.g. ``buf`` is C-contiguous).
+
+    :param comm: The MPI communicator.
+    :param buf: The destination buffer; its leading axis length determines the number of rows received.
+    :param source: Source rank.
+    :param base_tag: Base MPI tag; successive chunks use ``base_tag + chunk_index``.
+    :param limit: Maximum message size in bytes.
+    :return: The list of MPI request handles for the posted receives.
+    """
+    reqs = []
+    for idx, (i, j) in enumerate(row_chunks(buf.shape[0], buf.dtype.itemsize, _items_per_row(buf.shape), limit)):
+        reqs.append(comm.Irecv(buf[i:j], source=source, tag=base_tag + idx))
+    return reqs
 
 
 def bcast_rows(comm, arr: np.ndarray, root: int, limit: int = MAX_MPI_BYTES) -> np.ndarray:
@@ -407,17 +453,40 @@ class MpiDistributor:
 
     def allgather(self, rank_result: np.ndarray = None) -> np.ndarray:
         """
-        Gathers each rank's array slice (along axis 0) into the full array, replicated on every rank. Handles the 2 GB
-        MPI message limit by chunking the broadcasts.
+        Gathers each rank's array slice (along axis 0) into the full array, replicated on every rank. The common case
+        is a single bandwidth-optimal ``Allgatherv`` collective (a derived "row" count keeps the per-rank counts and
+        displacements small, so the result is correct regardless of element size); only when a rank's slice would
+        exceed the 2 GB per-message limit does it fall back to per-rank chunked broadcasts.
 
         :param rank_result: This rank's slice of the result (leading axis indexes the rank's tasks).
         :return: The full array of shape ``(ntasks, ...)`` on all ranks.
         """
         rank_result = np.ascontiguousarray(rank_result)
         tot_shape = (self.ntasks,) + rank_result.shape[1:]
+
+        # Single rank: nothing to gather. Returning a copy avoids a needless collective and keeps the routine usable
+        # on a minimal communicator that does not implement Allgatherv (e.g. the single-rank test mock).
+        if self.mpi_size == 1:
+            return rank_result.copy()
+
         tot_result = np.empty(tot_shape, dtype=rank_result.dtype)
 
-        # Broadcast each rank's contiguous slice of the target buffer from that rank, chunked under the 2 GB limit.
+        items = _items_per_row(rank_result.shape)
+        max_rows = chunk_step(rank_result.dtype.itemsize, items, limit=MAX_MPI_BYTES)
+
+        # Fast path: a single Allgatherv when every rank's slice fits one message and the whole result's element count
+        # fits an MPI int displacement. Counts/displacements are in elements of the flattened buffers.
+        if self._sizes.max(initial=0) <= max_rows and tot_result.size < 2**31:
+            counts = (self._sizes * items).astype(int)
+            displs = np.array([s.start for s in self._slices], dtype=int) * items
+            self.comm.Allgatherv(
+                [rank_result.reshape(-1), int(counts[self.my_rank])],
+                [tot_result.reshape(-1), (counts, displs)],
+            )
+            return tot_result
+
+        # Fallback for arrays exceeding the 2 GB per-message limit: broadcast each rank's contiguous slice of the
+        # target buffer from that rank, chunked under the 2 GB limit.
         for r in range(self.mpi_size):
             sub = tot_result[self._slices[r]]
             if self.my_rank == r:
@@ -443,14 +512,17 @@ class MpiDistributor:
             # copy own slice directly
             tot_result[self._slices[root]] = rank_result
 
-            # receive from all other ranks directly into the contiguous axis-0 destination slice (no staging buffer)
+            # Pre-post non-blocking receives into every rank's contiguous destination slice at once, so the incoming
+            # transfers overlap instead of completing rank-by-rank; data lands straight in place (no staging buffer).
+            reqs = []
             for r in range(self.mpi_size):
                 if r == root or self._sizes[r] == 0:
                     continue
-                recv_rows_into(self.comm, tot_result[self._slices[r]], source=r, limit=MAX_MPI_BYTES)
+                reqs += _irecv_rows_into(self.comm, tot_result[self._slices[r]], source=r, limit=MAX_MPI_BYTES)
+            MPI.Request.Waitall(reqs)
         else:
             if rank_result.shape[0] > 0:
-                send_rows(self.comm, rank_result, dest=root, limit=MAX_MPI_BYTES)
+                MPI.Request.Waitall(_isend_rows(self.comm, rank_result, dest=root, limit=MAX_MPI_BYTES))
 
         return tot_result
 
@@ -479,8 +551,7 @@ class MpiDistributor:
             rest_shape = None
             data_type = None
 
-        data_type = self.comm.bcast(data_type, root)
-        rest_shape = self.comm.bcast(rest_shape, root)
+        data_type, rest_shape = self.comm.bcast((data_type, rest_shape), root)
 
         rank_shape = (self._my_size,) + rest_shape if rest_shape else (self._my_size,)
         rank_data = np.empty(rank_shape, dtype=data_type)
@@ -489,9 +560,14 @@ class MpiDistributor:
             if full_data is None:
                 return rank_data
 
-            full_data = np.asarray(full_data, dtype=data_type)
+            # Make the source contiguous once so each rank's axis-0 slice is itself contiguous and can be sent as a
+            # view (no per-rank copy); this is also required for the non-blocking sends below.
+            full_data = np.ascontiguousarray(np.asarray(full_data, dtype=data_type))
 
             if data_len == self.ntasks:
+                # Post non-blocking sends to every other rank at once so the outgoing transfers overlap instead of
+                # going rank-by-rank; full_data stays alive (local) until the Waitall.
+                reqs = []
                 for r in range(self.mpi_size):
                     n = self._sizes[r]
                     if n == 0:
@@ -500,14 +576,15 @@ class MpiDistributor:
                     if r == root:
                         rank_data[...] = full_data[sl]
                     else:
-                        send_rows(self.comm, full_data[sl], dest=r, limit=MAX_MPI_BYTES)
+                        reqs += _isend_rows(self.comm, full_data[sl], dest=r, limit=MAX_MPI_BYTES)
+                MPI.Request.Waitall(reqs)
             elif data_len == self._my_size and self.mpi_size == 1:
-                rank_data[...] = np.ascontiguousarray(full_data)
+                rank_data[...] = full_data
             else:
                 raise ValueError(f"Mismatch in scatter!")
         else:
             if self._my_size > 0:
-                rank_data = recv_rows_alloc(self.comm, rank_shape, data_type, source=root, limit=MAX_MPI_BYTES)
+                MPI.Request.Waitall(_irecv_rows_into(self.comm, rank_data, source=root, limit=MAX_MPI_BYTES))
 
         return rank_data
 
@@ -577,14 +654,53 @@ class MpiDistributor:
         """
         return bcast_rows(self.comm, arr, root, limit=MAX_MPI_BYTES)
 
+    def bcast_npoint(self, obj, root: int = 0):
+        """
+        Broadcasts an N-point-like object (one exposing a ``.mat`` numpy array) from ``root`` to all ranks. The large
+        ``.mat`` is broadcast as raw sub-2 GB chunks (so there is no multi-gigabyte pickle blob and no >2 GB message),
+        while the rest of the object travels as a small pickled metadata blob — the broadcast analogue of
+        :meth:`send_to_rank`/:meth:`recv_from_rank`. Prefer this over :meth:`bcast` for large objects such as a
+        full-BZ self-energy or gap function, both to respect the 2 GB limit and to avoid the full in-memory pickle copy.
+
+        :param obj: The object to broadcast; must expose a ``.mat`` numpy array attribute. Only read on ``root``.
+        :param root: The broadcasting rank.
+        :return: The broadcast object with its ``.mat`` attached, on every rank.
+        """
+        if self.mpi_size == 1:
+            return obj
+
+        if self.my_rank == root:
+            # Detach .mat so the pickled metadata blob stays small; broadcast the array separately as raw chunks.
+            mat = obj.mat
+            obj.mat = None
+            try:
+                meta_bytes = pickle.dumps(obj)
+            finally:
+                obj.mat = mat  # always restore, even if pickle raises
+            self.comm.bcast(meta_bytes, root=root)
+            obj.mat = bcast_rows(self.comm, mat, root, limit=MAX_MPI_BYTES)
+            return obj
+
+        obj = pickle.loads(self.comm.bcast(None, root=root))
+        obj.mat = bcast_rows(self.comm, None, root, limit=MAX_MPI_BYTES)
+        return obj
+
     def allreduce(self, rank_result=None) -> np.ndarray:
         """
-        Sums an array element-wise across all ranks in place and returns the result on every rank.
+        Sums an array element-wise across all ranks in place and returns the result on every rank, chunked along axis 0
+        so no single message exceeds the 2 GB MPI limit (consistent with the rest of the module).
 
-        :param rank_result: This rank's contribution; reduced in place.
+        ``Allreduce`` is collective, so the chunk schedule must be identical on every rank. That holds here because the
+        reduced arrays are always equally shaped across ranks (the callers reduce full, replicated quantities such as
+        the full-k-space self-energy / Fock term — each rank holds a partial sum of the *same* array), so every rank
+        derives the same chunk boundaries. The single-chunk case is byte-for-byte the previous behaviour.
+
+        :param rank_result: This rank's contribution; reduced in place. Must have the same shape on every rank.
         :return: The summed array (same buffer), identical on all ranks.
         """
-        self.comm.Allreduce(MPI.IN_PLACE, rank_result)
+        rows, itemsize, per_row = rank_result.shape[0], rank_result.dtype.itemsize, _items_per_row(rank_result.shape)
+        for i, j in row_chunks(rows, itemsize, per_row, limit=MAX_MPI_BYTES):
+            self.comm.Allreduce(MPI.IN_PLACE, rank_result[i:j])
         return rank_result
 
     @staticmethod
@@ -866,7 +982,8 @@ def exchange_and_map_irrbz_fullbz(
             continue
         buf = np.empty((info["count"],) + rest_shape, dtype=dtype)
         receive_buffers[src] = buf
-        data_reqs.append(comm.Irecv(buf, source=src, tag=12))
+        # Chunk the receive under the 2 GB limit (the matching send chunks identically: same row count and shape).
+        data_reqs += _irecv_rows_into(comm, buf, source=src, base_tag=12, limit=MAX_MPI_BYTES)
 
     # Prepare Sends
     for dest in range(size):
@@ -875,7 +992,7 @@ def exchange_and_map_irrbz_fullbz(
         # Extract the matrices the remote rank requested from my local IRBZ slice
         data_to_send = np.ascontiguousarray(obj.mat[remote_indices_needed_from_me[dest]])
         send_buffers.append(data_to_send)
-        data_reqs.append(comm.Isend(data_to_send, dest=dest, tag=12))
+        data_reqs += _isend_rows(comm, data_to_send, dest=dest, base_tag=12, limit=MAX_MPI_BYTES)
 
     MPI.Request.Waitall(data_reqs)
 
@@ -1108,6 +1225,14 @@ def _redistribute_p2p(mat, nq, comm, source_layout, target_layout):
     tgt_map = {g_idx: l_idx for l_idx, g_idx in enumerate(tgt_indices)}
 
     for shift in range(size):
+        if shift == 0:
+            # Self-overlap: rows this rank both owns (source layout) and needs (target layout). Copy locally instead
+            # of round-tripping the data through MPI to itself.
+            common = np.intersect1d(src_indices, tgt_indices, assume_unique=True)
+            if len(common) > 0:
+                res_mat[[tgt_map[g] for g in common]] = mat[[src_map[g] for g in common]]
+            continue
+
         target_rank = (rank + shift) % size
         source_rank = (rank - shift) % size
 
