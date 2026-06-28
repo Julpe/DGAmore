@@ -20,7 +20,7 @@ from mpi4py import MPI
 import dgamore.config as config
 from dgamore.ana_cont import AnalyticContinuationProblem, RealFreqTwoPoint
 from dgamore.greens_function import GreensFunction
-from dgamore.mpi_distributor import MpiDistributor
+from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import DTYPE
 from dgamore.self_energy import SelfEnergy
 
@@ -85,7 +85,9 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
 
     irrq_list = config.lattice.k_grid.get_irrq_list()
 
-    mpi_dist = MpiDistributor(ntasks=len(irrq_list), comm=comm, name="Maxent_G")
+    mpi_dist = MpiDistributor(
+        ntasks=len(irrq_list), comm=comm, name="Maxent_G", output_path=config.output.output_path
+    )
 
     giwk_maxent = giwk_maxent.reduce_q(irrq_list)
     logger.info("Scattering Green's function in the IBZ to all ranks.")

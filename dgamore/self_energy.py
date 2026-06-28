@@ -17,17 +17,18 @@ from copy import deepcopy
 import numpy as np
 from scipy.interpolate import PchipInterpolator, interp1d
 
-import dgamore.config as config
-from dgamore.brillouin_zone import KGrid
-from dgamore.local_n_point import LocalNPoint
 from dgamore.matsubara_frequencies import MFHelper
-from dgamore.n_point_base import IAmNonLocal
+from dgamore.two_point import TwoPoint
 
 
-class SelfEnergy(IAmNonLocal, LocalNPoint):
-    """
-    Represents the self-energy.
-    This class is a bit of a mess and could be rewritten.
+class SelfEnergy(TwoPoint):
+    r"""
+    The (possibly momentum-dependent) single-particle self-energy :math:`\Sigma_{ab}(k, \nu)`. On top of the
+    two-point orbital bookkeeping inherited from :class:`LocalTwoPoint` it provides the high-frequency moments
+    (:math:`\Sigma_\infty` and the :math:`1/\imath\nu` coefficient), an estimate of the core frequency box, the
+    construction/append of the analytic asymptotic tail beyond the core, a polynomial tail fit, and the
+    temperature/frequency interpolation between grids. The moments are obtained by fitting the highest available
+    Matsubara frequencies.
     """
 
     def __init__(
@@ -38,6 +39,7 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
         has_compressed_q_dimension: bool = False,
         estimate_niv_core: bool = False,
         calc_smom: bool = True,
+        beta: float = None,
     ):
         r"""
         Initializes the self-energy and, unless disabled, fits its high-frequency moments and estimates the core box.
@@ -51,11 +53,13 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
         :param estimate_niv_core: If True, estimate the core frequency box from the deviation to the asymptotic tail;
             otherwise the core extends over the full stored box.
         :param calc_smom: If True, fit the high-frequency moments :math:`(\Sigma_\infty, \Sigma_1)` on construction.
+        :param beta: Inverse temperature :math:`\beta` used for the Matsubara frequencies in the moment fit and the
+            asymptotic tail.
         """
-        LocalNPoint.__init__(self, mat, 2, 0, 1, full_niv_range=full_niv_range)
-        IAmNonLocal.__init__(self, mat, nk, has_compressed_q_dimension=has_compressed_q_dimension)
+        TwoPoint.__init__(self, mat, nk, full_niv_range, has_compressed_q_dimension)
         # TODO: check if this is a reasonable value. I'd suggest it depends on the input data size.
         self._niv_core_min = 20
+        self._beta = beta
 
         if calc_smom:
             self._smom0, self._smom1 = self.fit_smom()
@@ -85,7 +89,7 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
             self.decompress_q_dimension()
 
         mat_half_v = np.mean(self.mat[..., self.niv :], axis=(0, 1, 2))
-        iv = 1j * MFHelper.vn(self.niv, config.sys.beta, return_only_positive=True)
+        iv = 1j * MFHelper.vn(self.niv, self._beta, return_only_positive=True)
 
         n_freq_fit = int(0.2 * self.niv)
         if n_freq_fit < 4:
@@ -179,10 +183,14 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
             raise ValueError(f"Can not add {type(other)} to {type(self)}.")
 
         if isinstance(other, np.ndarray):
-            return SelfEnergy(self.mat + other, self.nq, self.full_niv_range, self.has_compressed_q_dimension, False)
+            return SelfEnergy(
+                self.mat + other, self.nq, self.full_niv_range, self.has_compressed_q_dimension, False, beta=self._beta
+            )
 
         other = self._align_q_dimensions_for_operations(other)
-        return SelfEnergy(self.mat + other.mat, self.nq, self.full_niv_range, self.has_compressed_q_dimension, False)
+        return SelfEnergy(
+            self.mat + other.mat, self.nq, self.full_niv_range, self.has_compressed_q_dimension, False, beta=self._beta
+        )
 
     def sub(self, other) -> "SelfEnergy":
         """
@@ -213,7 +221,9 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
         result_mat = np.concatenate(
             (other_mat[..., :niv_diff], self.mat, other_mat[..., niv_diff + 2 * self.niv :]), axis=-1
         )
-        return SelfEnergy(result_mat, self.nq, self.full_niv_range, self.has_compressed_q_dimension, False)
+        return SelfEnergy(
+            result_mat, self.nq, self.full_niv_range, self.has_compressed_q_dimension, False, beta=self._beta
+        )
 
     def fit_polynomial(self, n_fit: int = 4, degree: int = 3, niv_core: int = 0) -> "SelfEnergy":
         """
@@ -248,61 +258,25 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
                     poly_mat[k, o1, o2, :] = np.polyval(poly, vn_full)
 
         return SelfEnergy(
-            poly_mat, copy.nq, copy.full_niv_range, copy.has_compressed_q_dimension, False
+            poly_mat, copy.nq, copy.full_niv_range, copy.has_compressed_q_dimension, False, beta=copy._beta
         ).to_full_niv_range()
 
-    def symmetrize_orbitals(self, orbitals: list | np.ndarray) -> "SelfEnergy":
-        """
-        Symmetrizes the object with respect to the given (equivalent) orbitals by averaging over all permutations of
-        those orbitals applied to the two orbital axes. The orbital labels are 1-based, ranging from 1 to the number
-        of bands; e.g. for a 3-band object ``orbitals=[1, 3]`` symmetrizes the first and third orbital.
-
-        :param orbitals: 1-based orbital indices to treat as equivalent.
-        :return: The symmetrized :class:`SelfEnergy` (``self`` unchanged if already symmetrized).
-        """
-        orbital_axes = self._get_orbital_axes()
-        if self.is_orbitally_symmetrized(orbitals):
-            return self
-        return self._symmetrize_orbitals(orbitals, orbital_axes)
-
-    def is_orbitally_symmetrized(self, orbitals: list | np.ndarray) -> bool:
-        """
-        Checks whether the object is already symmetric under all permutations of the given orbitals.
-
-        :param orbitals: 1-based orbital indices to test for equivalence.
-        :return: True if the object is invariant under permutations of those orbitals.
-        """
-        orbital_axes = self._get_orbital_axes()
-        return self._is_orbitally_symmetrized(orbitals, orbital_axes)
-
-    def map_to_full_bz(self, k_grid: KGrid, nq: tuple = None):
-        """
-        Unfolds the object from the irreducible BZ to the full BZ using the grid's symmetry index map (see
-        :meth:`IAmNonLocal._map_to_full_bz`), with two orbital dimensions.
-
-        :param k_grid: The :class:`KGrid` providing the irreducible-to-full BZ index mapping.
-        :param nq: Optional number of momenta per direction for the unfolded grid; defaults to the object's ``nq``.
-        :return: ``self`` defined on the full BZ.
-        """
-        return self._map_to_full_bz(k_grid, 2, nq)
-
-    def interpolate(self, beta_source: float, beta_target: float, niv_target: int, niv_linear: int = 4) -> "SelfEnergy":
+    def interpolate(self, beta_target: float, niv_target: int, niv_linear: int = 4) -> "SelfEnergy":
         r"""
-        Re-grid the self-energy from beta_source to beta_target. Only the last
-        (frequency) axis is interpolated.
+        Re-grid the self-energy from its own inverse temperature :math:`\beta` (``self._beta``) to ``beta_target``.
+        Only the last (frequency) axis is interpolated.
 
         The innermost niv_linear source frequencies are interpolated linearly
         (no curvature assumption where the grid is sparsest); everything above is
         interpolated with shape-preserving (PCHIP) splines. Re/Im are handled
         separately on the full signed grid. All target frequencies are returned.
 
-        :param beta_source: Inverse temperature :math:`\beta` of the source grid.
         :param beta_target: Inverse temperature :math:`\beta` of the target grid.
         :param niv_target: Number of positive fermionic frequencies of the target grid.
         :param niv_linear: Number of innermost positive source frequencies interpolated linearly (PCHIP above).
         :return: A new :class:`SelfEnergy` on the target frequency grid (half niv range flag set to full on output).
         """
-        vn_in = MFHelper.vn(self.niv, float(beta_source))
+        vn_in = MFHelper.vn(self.niv, float(self._beta))
         vn_out = MFHelper.vn(niv_target, float(beta_target))
 
         pchip_re = PchipInterpolator(vn_in, self.mat.real, axis=-1, extrapolate=True)
@@ -334,7 +308,7 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
         im = np.where(use_lin, lin_im(vn_out), pchip_im(vn_out))
         sigma_out = re + 1j * im
 
-        return SelfEnergy(sigma_out, self.nq, False, self.has_compressed_q_dimension, True)
+        return SelfEnergy(sigma_out, self.nq, False, self.has_compressed_q_dimension, True, beta=beta_target)
 
     def _estimate_niv_core(self, err: float = 1e-5):
         """
@@ -375,26 +349,8 @@ class SelfEnergy(IAmNonLocal, LocalNPoint):
         """
         if n_min is None:
             n_min = self.niv
-        iv_asympt = 1j * MFHelper.vn(niv, config.sys.beta, shift=n_min)[None, None, ...]
+        iv_asympt = 1j * MFHelper.vn(niv, self._beta, shift=n_min)[None, None, ...]
         asympt = (self._smom0[..., None] - 1.0 / iv_asympt * self._smom1[..., None])[None, None, None, ...] * np.ones(
             self.nq
         )[..., None, None, None]
-        return SelfEnergy(asympt, self.nq)
-
-    def _get_orbital_axes(self) -> tuple[int, int]:
-        """
-        Determines the axes carrying the two orbital indices for the current layout (local, compressed-q, or
-        decompressed-q).
-
-        :return: The tuple of the two orbital axis indices.
-        :raises ValueError: If the object does not have 3, 4, or 6 dimensions.
-        """
-        if len(self.current_shape) == 3:  # [o1,o2,v]
-            orbital_axes = (0, 1)
-        elif len(self.current_shape) == 4:  # [k,o1,o2,v]
-            orbital_axes = (1, 2)
-        elif len(self.current_shape) == 6:  # [kx,ky,kz,o1,o2,v]
-            orbital_axes = (3, 4)
-        else:
-            raise ValueError("The object has to have either 3, 4 or 6 dimensions.")
-        return orbital_axes
+        return SelfEnergy(asympt, self.nq, beta=self._beta)

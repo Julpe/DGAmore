@@ -305,48 +305,22 @@ class Interaction(IAmNonLocal, LocalInteraction):
             result = Interaction(result.times("qabcd,qdcef->qabef", self), self.channel, self.nq, True)
         return result if is_self_compressed else result.decompress_q_dimension()
 
-    def __add__(self, other) -> "Interaction":
-        """
-        Operator overload for ``self + other``; see :meth:`add`.
-
-        :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array.
-        :return: The sum as a new :class:`Interaction`.
-        """
-        return self.add(other)
-
     def __radd__(self, other) -> "Interaction":
         """
-        Reflected operator overload for ``other + self``; see :meth:`add` (addition commutes).
+        Reflected operator overload for ``other + self``; see :meth:`add` (addition commutes). Kept (not redundant)
+        so that a mixed ``LocalInteraction + Interaction`` dispatches here.
 
         :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array.
         :return: The sum as a new :class:`Interaction`.
         """
         return self.add(other)
-
-    def __sub__(self, other) -> "Interaction":
-        """
-        Operator overload for ``self - other``; see :meth:`sub`.
-
-        :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array.
-        :return: The difference ``self - other`` as a new :class:`Interaction`.
-        """
-        return self.sub(other)
 
     def __rsub__(self, other) -> "Interaction":
         """
-        Reflected operator overload for ``other - self`` (returns ``-(self - other)``).
+        Reflected operator overload for ``other - self`` (returns ``-(self - other)``). Kept (not redundant) so that
+        a mixed ``LocalInteraction - Interaction`` dispatches here.
 
         :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array on the left-hand side.
         :return: The difference ``other - self`` as a new :class:`Interaction`.
         """
         return -self.sub(other)
-
-    def __pow__(self, power, modulo=None) -> "Interaction":
-        """
-        Operator overload for ``self ** power``; see :meth:`pow`.
-
-        :param power: Positive integer exponent.
-        :param modulo: Unused (present for the ``__pow__`` protocol).
-        :return: ``self`` raised to ``power`` as a new :class:`Interaction`.
-        """
-        return self.pow(power)

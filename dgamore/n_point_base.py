@@ -74,6 +74,10 @@ class IHaveMat(ABC):
     _libc = None
     _malloc_trim_available = None
 
+    # Upper bound (in bytes) on the transient temporaries that filter_small_values may materialize per chunk. The
+    # mask is evaluated in slices so the full-size |real|/|imag|/boolean temporaries are never built all at once.
+    _FILTER_CHUNK_BYTES = 256 * 1024**2
+
     # Storage precision for the underlying matrix. Defaults to the module-level ``DTYPE`` (complex64).
     # Override the module constant (or this attribute) to switch the whole code base to double precision.
     DTYPE = DTYPE
@@ -269,6 +273,23 @@ class IHaveMat(ABC):
         """
         self.original_shape = self.current_shape
 
+    def _clone_without_mat(self):
+        """
+        Returns a deep copy of the object that carries all metadata but **not** the underlying array (``mat`` is
+        ``None`` on the clone). This avoids the wasteful duplication of ``mat`` in transformation methods that
+        deep-copy ``self`` only to overwrite ``copy.mat`` with a freshly computed array immediately afterwards. The
+        caller is expected to assign a new array to ``clone.mat`` before using it.
+
+        :return: A deep copy of ``self`` whose ``mat`` is ``None``.
+        """
+        mat = self._mat
+        self._mat = None
+        try:
+            clone = deepcopy(self)
+        finally:
+            self._mat = mat
+        return clone
+
     def times(self, contraction: str, *args) -> np.ndarray:
         """
         Multiplies the matrices of multiple objects with the contraction specified and returns the result as a
@@ -290,10 +311,43 @@ class IHaveMat(ABC):
         Sets all values in the underlying matrix to zero which are smaller than the given threshold in absolute value.
         This can be used to save memory and speed up calculations by setting very small values to zero.
 
+        The mask is evaluated in chunks so the full-size ``|real|``/``|imag|`` and boolean temporaries (~0.75x the
+        array) are never materialized all at once -- on a very large array that transient spike would otherwise
+        dominate the footprint right when ``mat`` is at its largest. Chunking is also faster (cache-resident
+        temporaries, fewer page faults). A small array is filtered in a single pass to avoid the per-chunk overhead.
+
         :param threshold: Values whose real and imaginary parts are both below this magnitude are zeroed (in place).
         :return: ``self`` (for chaining).
         """
-        self.mat[(np.abs(self.mat.real) < threshold) & (np.abs(self.mat.imag) < threshold)] = 0.0
+        mat = self.mat
+        # Per-element transient cost of the mask: the two float halves (== itemsize total) plus two boolean arrays.
+        temp_bytes_per_elem = mat.dtype.itemsize + 2
+        budget_bytes = self._FILTER_CHUNK_BYTES  # cap the per-chunk temporaries (class attribute; patchable in tests)
+
+        def _zero_below(view: np.ndarray) -> None:
+            """Zeroes the entries of ``view`` whose real and imag parts are both below ``threshold`` (in place)."""
+            view[(np.abs(view.real) < threshold) & (np.abs(view.imag) < threshold)] = 0.0
+
+        if mat.flags["C_CONTIGUOUS"]:
+            # A flat view is free for a C-contiguous array; chunk it along the single flat axis.
+            flat = mat.reshape(-1)
+            n = flat.shape[0]
+            step = max(1, budget_bytes // temp_bytes_per_elem)
+            if step >= n:
+                _zero_below(flat)
+            else:
+                for i in range(0, n, step):
+                    _zero_below(flat[i : i + step])
+        else:
+            # Non-contiguous: reshape(-1) would copy the whole array, so chunk axis 0 (slices stay views).
+            n = mat.shape[0]
+            rest_elems = max(1, mat.size // n)
+            step = max(1, budget_bytes // (rest_elems * temp_bytes_per_elem))
+            if step >= n:
+                _zero_below(mat)
+            else:
+                for i in range(0, n, step):
+                    _zero_below(mat[i : i + step])
         return self
 
     @classmethod
@@ -475,7 +529,8 @@ class IAmNonLocal(IHaveMat, ABC):
         :param q: The momentum shift :math:`\vec{q}` as integer grid offsets ``(qx, qy, qz)``.
         :return: A copy shifted by :math:`\vec{q}`, in the same momentum-compression state as ``self``.
         """
-        copy = deepcopy(self)
+        copy = self._clone_without_mat()
+        copy.mat = self.mat  # shared reference; np.roll below allocates a fresh array, leaving self.mat untouched
 
         compress = False
         if copy.has_compressed_q_dimension:
@@ -494,7 +549,8 @@ class IAmNonLocal(IHaveMat, ABC):
 
         :return: A copy shifted by :math:`\pi` along every momentum axis, in the same compression state as ``self``.
         """
-        copy = deepcopy(self)
+        copy = self._clone_without_mat()
+        copy.mat = self.mat  # shared reference; np.roll below allocates a fresh array, leaving self.mat untouched
 
         compress = False
         if copy.has_compressed_q_dimension:
@@ -545,15 +601,25 @@ class IAmNonLocal(IHaveMat, ABC):
         :param q_list: Array of momentum grid indices to keep, shape ``[3, n_q]`` (one column per momentum).
         :return: A copy reduced to ``q_list``, with a compressed momentum dimension.
         """
-        copy = deepcopy(self)
+        copy = self._clone_without_mat()
+        copy.mat = self.mat  # shared reference; the boolean-mask indexing below copies, leaving self.mat untouched
 
         if copy.has_compressed_q_dimension:
             copy.decompress_q_dimension()
 
-        indices = np.indices(copy.current_shape[:3])
-        mask = np.zeros(copy.current_shape[:3], dtype=bool)
-        mask |= np.any(np.all(indices == np.array(q_list)[:, :, None, None, None], axis=1), axis=0)
-        copy.mat = copy.mat[mask]
+        # Build the keep-mask via flat indices instead of a (n_q, 3, nqx, nqy, nqz) broadcast comparison. ``q_list``
+        # has shape [n_q, 3] (one momentum per row). Out-of-range momenta are silently dropped (matching the previous
+        # behaviour of yielding no match for them).
+        shape3 = copy.current_shape[:3]
+        q_arr = np.asarray(q_list)
+        if q_arr.ndim != 2 or q_arr.shape[1] != 3:
+            raise ValueError("q_list must have shape [n_q, 3].")
+        coords = (q_arr[:, 0], q_arr[:, 1], q_arr[:, 2])
+        in_range = np.all([(c >= 0) & (c < s) for c, s in zip(coords, shape3)], axis=0)
+        flat_idx = np.ravel_multi_index(tuple(c[in_range] for c in coords), shape3)
+        mask = np.zeros(int(np.prod(shape3)), dtype=bool)
+        mask[flat_idx] = True
+        copy.mat = copy.mat.reshape((mask.size, *copy.current_shape[3:]))[mask]
 
         copy.update_original_shape()
         copy._has_compressed_q_dimension = True
@@ -568,7 +634,7 @@ class IAmNonLocal(IHaveMat, ABC):
         :raises ValueError: If no matrix element is found for the given momentum.
         """
         q_arr = np.atleast_2d(np.array(q, dtype=int))
-        result = deepcopy(self).reduce_q(q_arr)
+        result = self.reduce_q(q_arr)  # reduce_q already returns an independent copy; no extra deepcopy needed
         result._nq = (1, 1, 1)
 
         if getattr(result, "mat", None) is None or result.mat.size == 0 or result.current_shape[0] == 0:
@@ -599,11 +665,11 @@ class IAmNonLocal(IHaveMat, ABC):
 
         :return: A copy holding the momentum average (``nq = (1, 1, 1)``).
         """
-        copy = deepcopy(self)
+        copy = self._clone_without_mat()
         if self.has_compressed_q_dimension:
-            copy.mat = np.mean(copy.mat, axis=0)[None, ...]
+            copy.mat = np.mean(self.mat, axis=0)[None, ...]
         else:
-            copy.mat = np.mean(copy.mat, axis=(0, 1, 2))[None, None, None, ...]
+            copy.mat = np.mean(self.mat, axis=(0, 1, 2))[None, None, None, ...]
         copy.update_original_shape()
         copy._nq = (1, 1, 1)
         return copy
@@ -736,6 +802,8 @@ class IAmNonLocal(IHaveMat, ABC):
         if self.has_compressed_q_dimension:
             compress = True
             self.decompress_q_dimension()
+        # scipy.fft + overwrite_x transforms the complex64 array in place (no extra buffer). Do NOT switch to
+        # numpy.fft.fftn: it computes in double precision internally and peaks at ~5x the array size.
         self.mat = sp.fft.fftn(self.mat, axes=(0, 1, 2), overwrite_x=True)
         return self.compress_q_dimension() if compress else self
 
@@ -753,6 +821,8 @@ class IAmNonLocal(IHaveMat, ABC):
         if self.has_compressed_q_dimension:
             compress = True
             self.decompress_q_dimension()
+        # scipy.fft + overwrite_x transforms the complex64 array in place (no extra buffer). Do NOT switch to
+        # numpy.fft.ifftn: it computes in double precision internally and peaks at ~5x the array size.
         self.mat = sp.fft.ifftn(self.mat, axes=(0, 1, 2), overwrite_x=True)
         return self.compress_q_dimension() if compress else self
 
@@ -764,7 +834,9 @@ class IAmNonLocal(IHaveMat, ABC):
         :return: The momentum-flipped object, in the same momentum-compression state as the input.
         """
         if copy:
-            return deepcopy(self).flip_momentum_axis(copy=False)
+            clone = self._clone_without_mat()
+            clone.mat = self.mat  # shared; flip/roll below allocate a fresh array, leaving self.mat untouched
+            return clone.flip_momentum_axis(copy=False)
 
         compress = False
         if self.has_compressed_q_dimension:

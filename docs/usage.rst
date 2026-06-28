@@ -80,15 +80,4 @@ The ``-o`` and ``-e`` options set the files for the job output and errors; here 
 but separate files may be used instead. The results of a completed run are written to a subdirectory of the output
 folder, whose name encodes run-specific parameters such as the momentum-grid size and the frequency box.
 
-Configuration
--------------
-
-All run parameters are specified in a YAML configuration file. You can either create a new file or modify the
-default ``dga_config.yaml`` shipped in the repository. Every entry is explained in detail in the file itself, and
-the default values are chosen to be reasonable for typical use cases, so when in doubt the defaults can usually be
-kept, with the exception of the input file paths, which must be set explicitly. Individual settings, or even entire
-sections, may be omitted; in that case the corresponding default values are used, and the order of the sections in
-the file does not matter. The configuration classes that hold these settings, together with the meaning and type of
-every field, are documented under :doc:`api` in :mod:`~dgamore.config`. If anything remains unclear, please consult
-the comments in the configuration file, the author's Master's thesis linked on the :doc:`about` page, or get in
-touch by `e-mail <mailto:julian.peil@tuwien.ac.at>`_.
+The full set of run-time parameters is described on the :doc:`configuration` page.

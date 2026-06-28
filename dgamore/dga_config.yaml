@@ -17,7 +17,7 @@ lattice:
 
 self_consistency:
   max_iter: 20 # Maximum number of iterations
-  epsilon: 1e-4 # Convergence criterion of the self-energy for the first (niv_core / 5) frequencies
+  epsilon: 1e-4 # Convergence criterion: relative L2 residual of the self-energy over the positive fermionic core frequencies (niv_core)
   mixing: 0.2 # Linear Mixing parameter for the self-energy: sigma_new = mixing * sigma_new + (1 - mixing) * sigma_old. Will be
   # used in every iteration if the mixing strategy is set to 'linear' and only for the first couple iterations if the mixing strategy is set to "pulay".
   mixing_strategy: "linear" # Available mixing strategies: "linear", "pulay" or "anderson".
@@ -55,7 +55,7 @@ eliashberg:
   n_eig: 4 # Number of eigenvalues and eigenvectors to be calculated. Default: 4
   epsilon: 1e-6 # Convergence criterion for the eigenvalues and eigenvectors
   symmetry: "random" # Symmetry of the gap function that will be used as a starting point for the power iteration. Available: p-wave-x, p-wave-y, d-wave, random
-  include_local_part: False # If True, the local part of the pairing vertex is included in the Eliashberg calculation. This is only relevant if one might expect s-wave symmetry.
+  include_local_part: True # If True, the local part of the pairing vertex is included in the Eliashberg calculation. This is only relevant if one might expect s-wave symmetry.
   # setting this to True will reduce the frequency box of the pairing vertex slightly due to an additional frequency shift that is necessary.
   subfolder_name: "Eliashberg" # name for the subfolder where certain outputs are generated
 
@@ -82,6 +82,9 @@ ana_cont:
   energy_window: [ -2, 3 ] # Energy window for the plot of the spectral function in eV.
 
 memory:
+  # These flags are auto-detected at startup from each node's available RAM.
+  # A value left False may still be switched ON automatically if the fast path would not fit in memory;
+  # an explicit True is always honoured (auto-detection only ever enables a flag, never disables it).
   save_memory_for_chi0q: False # If True, the code will construct chi0(q) in a way that is more memory efficient,
   # but much slower. If False, the code will use FFT, which requires larger intermediate arrays, but is much faster.
   save_memory_for_chiq_aux: False # If True, the code will construct the auxiliary susceptibility chi(q) (equal in size

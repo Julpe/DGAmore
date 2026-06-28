@@ -23,9 +23,10 @@ API Reference
    dgamore.local_four_point
    dgamore.local_n_point
    dgamore.local_sde
+   dgamore.local_two_point
    dgamore.matsubara_frequencies
    dgamore.max_ent
-   dgamore.mpi_distributor
+   dgamore.memory_estimator
    dgamore.mpi_utils
    dgamore.n_point_base
    dgamore.nonlocal_sde
@@ -33,3 +34,4 @@ API Reference
    dgamore.self_energy
    dgamore.symmetrize_new
    dgamore.symmetry_reduction
+   dgamore.two_point

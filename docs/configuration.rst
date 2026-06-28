@@ -296,3 +296,18 @@ largest speed-up while barely affecting the memory footprint, so it can be kept 
 The largest memory savings come from the auxiliary-susceptibility and full-ladder-vertex switches, which shrink
 those objects considerably, whereas the Lanczos switch matters only for extremely large parameter sets and can
 usually stay disabled.
+
+In practice these switches rarely need to be set by hand. Before the heavy part of a run begins, DGAmore inspects
+the memory available on every node together with an analytic estimate of the peak memory each of the five steps
+consumes, accounting for how the momentum points are distributed across the MPI ranks that share a node. Whenever
+the default, faster variant of a step would not fit, the corresponding switch is turned on automatically. The
+estimate is evaluated as a node total: it sums, over all ranks placed on a node, the data that each rank keeps
+resident throughout the calculation plus the transient peak of the step in question, and requires the result to stay
+below ninety percent of that node's available memory. Because the switches act process-wide, the most constrained
+node decides whether a given switch is enabled.
+
+A switch that is explicitly set to ``True`` in the configuration is always honoured: the automatic detection can
+only enable additional switches, never turn off one that was requested. Conversely, if even the most memory-frugal
+variant of a required step does not fit on some node, the run stops immediately with a ``MemoryError`` that
+recommends using more nodes, fewer ranks per node, or a smaller frequency box or momentum grid, rather than failing
+unpredictably partway through.

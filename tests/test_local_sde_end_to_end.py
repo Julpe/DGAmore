@@ -241,7 +241,6 @@ def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
     assert np.allclose(sigma_loc.mat, sigma_loc_ref, atol=1e-5)
 
 
-# --- R12: create_gamma_r takes an explicit beta with no default ---
 def test_create_gamma_r_requires_explicit_beta():
     import inspect
     from dgamore.local_sde import create_gamma_r

@@ -13,7 +13,7 @@ import pytest
 import dgamore.brillouin_zone as bz
 import dgamore.config as config
 import dgamore.max_ent as max_ent
-import dgamore.mpi_distributor as mpi_distributor
+import dgamore.mpi_utils as mpi_utils
 from dgamore.greens_function import GreensFunction
 from dgamore.max_ent import orbital_to_band_basis
 from dgamore.self_energy import SelfEnergy
@@ -35,6 +35,7 @@ def _random_unitary(n: int, seed: int) -> np.ndarray:
 
 
 def test_orbital_to_band_basis_no_frequency_recovers_band_diagonal():
+    """orbital_to_band_basis with no frequency axis recovers the band-diagonal Green's function."""
     # H(k) with distinct, ascending eigenvalues so eigh ordering is unambiguous.
     eigvals = np.array([-1.0, 2.0])
     u = _random_unitary(2, seed=1)
@@ -49,6 +50,7 @@ def test_orbital_to_band_basis_no_frequency_recovers_band_diagonal():
 
 
 def test_orbital_to_band_basis_with_frequency_axis_rotates_every_frequency():
+    """orbital_to_band_basis rotates every frequency slice into the band basis."""
     eigvals = np.array([-0.5, 1.5])
     u = _random_unitary(2, seed=2)
     hk = _hermitian_hk(eigvals, u)[None, None, None]
@@ -70,6 +72,7 @@ def test_orbital_to_band_basis_with_frequency_axis_rotates_every_frequency():
 
 
 def test_orbital_to_band_basis_single_band_is_identity():
+    """orbital_to_band_basis is the identity for a single band."""
     hk = np.array([[1.7]], dtype=complex)[None, None, None]
     niv = 3
     g = (np.arange(niv) - 1j * np.arange(niv)).reshape(1, 1, niv)
@@ -81,9 +84,7 @@ def test_orbital_to_band_basis_single_band_is_identity():
 
 
 def test_orbital_to_band_basis_band_diagonal_is_symmetry_invariant():
-    # Band-diagonal spectral content must be invariant when a symmetry operation
-    # U_g maps a representative k-point to an equivalent one: this is what makes
-    # the naive irrk_inv unfold of the band-resolved spectral function correct.
+    """Band-diagonal spectral content is invariant when a symmetry operation maps a k-point to an equivalent one."""
     eigvals = np.array([-0.8, 1.1])
     u_rep = _random_unitary(2, seed=3)
     u_g = _random_unitary(2, seed=4)
@@ -104,11 +105,6 @@ def test_orbital_to_band_basis_band_diagonal_is_symmetry_invariant():
     diag_rep = np.diagonal(result[0, 0, 0], axis1=0, axis2=1)  # [niv, band]
     diag_img = np.diagonal(result[1, 0, 0], axis1=0, axis2=1)
     assert np.allclose(diag_rep, diag_img, atol=1e-10)
-
-
-# ---------------------------------------------------------------------------
-# perform_maxent_giwk end-to-end (analytic continuation solver mocked out)
-# ---------------------------------------------------------------------------
 
 
 class _FakeResult:
@@ -166,7 +162,7 @@ def _expected_band_spectrum(mat, hk, nk, n_bands, niv_core, k_grid):
     """Independently reproduces the expected full-BZ band-resolved spectrum: rotate to
     band basis, take the band-diagonal at the IBZ points, read the first frequency, and
     unfold via irrk_inv. Returns shape [nk_tot, n_bands]."""
-    giwk = GreensFunction(mat.copy()).cut_niv(niv_core).to_half_niv_range()
+    giwk = GreensFunction(mat.copy(), nk=nk).cut_niv(niv_core).to_half_niv_range()
     rotated = orbital_to_band_basis(hk.copy(), giwk.mat.copy())
     nk_tot = int(np.prod(nk))
     rotated = rotated.reshape(nk_tot, n_bands, n_bands, -1)[k_grid.irrk_ind]  # [nk_irr, o, o, v]
@@ -176,7 +172,7 @@ def _expected_band_spectrum(mat, hk, nk, n_bands, niv_core, k_grid):
 
 def _orbital_diag_spectrum(mat, nk, n_bands, niv_core, k_grid):
     """Same as above but WITHOUT the band rotation (the old, orbital-diagonal behavior)."""
-    giwk = GreensFunction(mat.copy()).cut_niv(niv_core).to_half_niv_range()
+    giwk = GreensFunction(mat.copy(), nk=nk).cut_niv(niv_core).to_half_niv_range()
     nk_tot = int(np.prod(nk))
     arr = giwk.mat.reshape(nk_tot, n_bands, n_bands, -1)[k_grid.irrk_ind]
     orb_diag = np.imag(np.einsum("knnv->knv", arr)[..., 0])
@@ -185,19 +181,20 @@ def _orbital_diag_spectrum(mat, nk, n_bands, niv_core, k_grid):
 
 @pytest.fixture
 def patch_maxent_mpi(monkeypatch):
-    monkeypatch.setattr(mpi_distributor, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _FakeProblem)
 
 
 @pytest.mark.parametrize("size", [1, 2])
 def test_perform_maxent_giwk_continues_band_diagonal_and_unfolds(tmp_path, patch_maxent_mpi, size):
+    """perform_maxent_giwk continues the band-diagonal Green's function and unfolds it over the full BZ."""
     nk, n_bands, niv_core, w_count = (4, 4, 1), 2, 3, 7
     hk = _setup_maxent_config(tmp_path, nk, n_bands, niv_core, w_count, seed=7)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=11)
     k_grid = config.lattice.k_grid
 
     def fn(comm, rank):
-        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy()), "TEST", comm)
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
 
     _, results = run_parallel(size, fn)
     nk_tot = int(np.prod(nk))
@@ -214,13 +211,14 @@ def test_perform_maxent_giwk_continues_band_diagonal_and_unfolds(tmp_path, patch
 
 
 def test_perform_maxent_giwk_unfolds_symmetry_equivalent_kpoints(tmp_path, patch_maxent_mpi):
+    """perform_maxent_giwk gives every full-BZ k-point its IBZ representative's spectrum."""
     nk, n_bands = (4, 4, 1), 2
     _setup_maxent_config(tmp_path, nk, n_bands, seed=3)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=13)
     k_grid = config.lattice.k_grid
 
     def fn(comm, rank):
-        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy()), "TEST", comm)
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
 
     _, results = run_parallel(1, fn)
     nk_tot = int(np.prod(nk))
@@ -233,6 +231,7 @@ def test_perform_maxent_giwk_unfolds_symmetry_equivalent_kpoints(tmp_path, patch
 
 
 def test_perform_maxent_giwk_failed_continuation_yields_zeros(tmp_path, monkeypatch):
+    """perform_maxent_giwk yields zeros when the analytic continuation raises."""
     nk, n_bands, w_count = (4, 4, 1), 2, 6
     _setup_maxent_config(tmp_path, nk, n_bands, w_count=w_count, seed=4)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=19)
@@ -241,24 +240,25 @@ def test_perform_maxent_giwk_failed_continuation_yields_zeros(tmp_path, monkeypa
         def __init__(self, *args, **kwargs):
             raise RuntimeError("continuation failed")
 
-    monkeypatch.setattr(mpi_distributor, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _RaisingProblem)
 
     def fn(comm, rank):
-        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy()), "TEST", comm)
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
 
     _, results = run_parallel(1, fn)
     assert np.array_equal(results[0], np.zeros_like(results[0]))
 
 
 def test_perform_maxent_giwk_single_band(tmp_path, patch_maxent_mpi):
+    """perform_maxent_giwk reduces to the orbital-diagonal continuation for a single band."""
     nk, n_bands, w_count = (4, 4, 1), 1, 5
     hk = _setup_maxent_config(tmp_path, nk, n_bands, w_count=w_count, seed=2)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=17)
     k_grid = config.lattice.k_grid
 
     def fn(comm, rank):
-        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy()), "TEST", comm)
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
 
     _, results = run_parallel(1, fn)
     nk_tot = int(np.prod(nk))
@@ -267,11 +267,6 @@ def test_perform_maxent_giwk_single_band(tmp_path, patch_maxent_mpi):
     # For a single band the rotation is trivial: band-diagonal == orbital-diagonal.
     expected = _expected_band_spectrum(mat, hk, nk, n_bands, config.box.niv_core, k_grid)
     assert np.allclose(spectrum, expected[:, :, None], atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# perform_maxent_dmft (solver and Kramers-Kronig transform mocked out)
-# ---------------------------------------------------------------------------
 
 
 class _FakeRealFreqTwoPoint:
@@ -286,6 +281,7 @@ class _FakeRealFreqTwoPoint:
 
 
 def test_perform_maxent_dmft_builds_full_bz_spectral_function(tmp_path, monkeypatch):
+    """perform_maxent_dmft builds a real, non-negative full-BZ spectral function."""
     nk, n_bands, w_count, niv = (3, 3, 1), 2, 9, 4
     config.sys.beta = 12.0
     config.sys.mu = 0.4
@@ -299,7 +295,7 @@ def test_perform_maxent_dmft_builds_full_bz_spectral_function(tmp_path, monkeypa
     sig = np.zeros((1, 1, 1, n_bands, n_bands, 2 * niv), dtype=np.complex64)
     for b in range(n_bands):
         sig[0, 0, 0, b, b] = (0.2 * (b + 1)) - 0.1j * np.ones(2 * niv)
-    sigma_dmft = SelfEnergy(sig, nk=(1, 1, 1), full_niv_range=True, calc_smom=False)
+    sigma_dmft = SelfEnergy(sig, nk=(1, 1, 1), full_niv_range=True, calc_smom=False, beta=config.sys.beta)
 
     monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _FakeProblem)
     monkeypatch.setattr(max_ent, "RealFreqTwoPoint", _FakeRealFreqTwoPoint)

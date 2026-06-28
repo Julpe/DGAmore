@@ -9,15 +9,15 @@ The superconducting gap function :math:`\\Delta`, i.e. the eigenvector of the li
 
 import numpy as np
 
-from dgamore.brillouin_zone import KGrid
-from dgamore.local_n_point import LocalNPoint
-from dgamore.n_point_base import IAmNonLocal, IHaveChannel, SpinChannel, FrequencyNotation
+from dgamore.n_point_base import IHaveChannel, SpinChannel, FrequencyNotation
+from dgamore.two_point import TwoPoint
 
 
-class GapFunction(IAmNonLocal, LocalNPoint, IHaveChannel):
+class GapFunction(TwoPoint, IHaveChannel):
     """
     Represents the superconducting gap function. Has one momentum dimension, two orbital dimensions and one fermionic
-    frequency dimension.
+    frequency dimension. Inherits the two-point orbital bookkeeping and the irreducible-to-full-BZ unfold from
+    :class:`TwoPoint` and adds the pairing (singlet/triplet) channel.
     """
 
     def __init__(
@@ -39,16 +39,5 @@ class GapFunction(IAmNonLocal, LocalNPoint, IHaveChannel):
         :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
             (True) or as three separate axes ``[qx, qy, qz, ...]`` (False).
         """
-        LocalNPoint.__init__(self, mat, 2, 0, 1, full_niv_range=full_niv_range)
-        IAmNonLocal.__init__(self, mat, nk, has_compressed_q_dimension=has_compressed_q_dimension)
+        TwoPoint.__init__(self, mat, nk, full_niv_range, has_compressed_q_dimension)
         IHaveChannel.__init__(self, channel, FrequencyNotation.PP)
-
-    def map_to_full_bz(self, k_grid: KGrid, nq: tuple = None):
-        """
-        Maps the gap function from the irreducible to the full Brillouin zone using the grid's symmetry map.
-
-        :param k_grid: The momentum grid carrying the irreducible-to-full-BZ mapping (and orbital rotations).
-        :param nq: Optional override for the number of momenta; if None the object's own ``nq`` is used.
-        :return: ``self`` expanded to the full BZ (with two orbital dimensions transformed).
-        """
-        return self._map_to_full_bz(k_grid, 2, nq)
