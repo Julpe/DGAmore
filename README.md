@@ -1,5 +1,6 @@
 [![CI](https://github.com/Julpe/DGAmore/actions/workflows/CI.yml/badge.svg)](https://github.com/Julpe/DGAmore/actions/workflows/CI.yml)
 [![codecov](https://codecov.io/github/Julpe/DGAmore/graph/badge.svg?token=O1E161NNHP)](https://codecov.io/github/Julpe/DGAmore)
+[![Documentation Status](https://app.readthedocs.org/projects/dgamore/badge/?version=latest)](https://dgamore.readthedocs.io/en/latest/?badge=latest)
 
 ---
 
@@ -9,174 +10,60 @@
   <img src="logos/DGAmore_dark.png" alt="DGAmore" width="38%" />
 </p>
 
-## Introduction
+`DGAmore` is a Python toolbox that computes the multi-orbital, self-consistent ladder Dynamical Vertex Approximation
+and solves the Eliashberg equation for (strongly) correlated electron systems described by the multi-band Hubbard
+model. Starting from the one- and two-particle output of a dynamical mean-field theory (DMFT) calculation, it
+assembles the local vertex functions, solves the momentum-dependent ladder equations for the non-local self-energy
+and, optionally, extracts the leading superconducting eigenvalues and gap functions. It relies on vectorized `numpy`
+operations, parallelizes the heavy momentum-dependent work with `mpi4py`, and reads its DMFT input from HDF5 via
+`h5py`. It is partially based on [DGApy](https://github.com/PaulWorm/DGApy).
 
-`DGAmore` is a Python toolbox for performing the multi-orbital (self-consistent) Dynamical Vertex Approximation and 
-Eliashberg equation for (strongly) correlated electron systems. It is partially based on 
-[DGApy](https://github.com/PaulWorm/DGApy), which calculates the Dynamical Vertex Approximation for single-band models. 
-If you are familiar with [DGApy](https://github.com/PaulWorm/DGApy), you will find the installation and usage to be very 
-similar.
+For the implemented equations, see the author's
+[Master's thesis](https://doi.org/10.34726/hss.2025.130528) (Chapters 3 and 4).
 
-The code is written in Python and uses primarily `numpy` for numerical computations. It also uses `mpi4py` for 
-parallelization and `h5py` for reading data in HDF5 format. The code is structured in a modular way, with different 
-modules for different parts of the calculation.
+## 📖 Documentation
 
-Additionally, we feature extensive logging: every important step in the calculation will be logged. If `DGAmore` is 
-started from a terminal, the logging will be done to the standard output. If the code is executed on a slurm-based 
-cluster, one will find the logs in the job output file. The reason we employ a lot of logging is the ease of finding 
-errors that might occur during a calculation.
+**Full documentation is hosted at [dgamore.readthedocs.io](https://dgamore.readthedocs.io/en/latest).**
 
-For details regarding the implemented equations, please have a look at my 
-[Master's thesis](https://doi.org/10.34726/hss.2025.130528), specifically Chapters 3 and 4.
+| Topic | Description |
+| --- | --- |
+| [Installation](https://dgamore.readthedocs.io/en/latest/installation.html) | Environment setup, MPI dependencies, and installing the package. |
+| [Usage](https://dgamore.readthedocs.io/en/latest/usage.html) | Running the routine single-core, with MPI, and on a SLURM cluster. |
+| [Configuration](https://dgamore.readthedocs.io/en/latest/configuration.html) | The YAML configuration file and its parameters. |
+| [Contributing](https://dgamore.readthedocs.io/en/latest/contributing.html) | Reporting issues and submitting pull requests. |
+| [API reference](https://dgamore.readthedocs.io/en/latest/api.html) | Module-by-module reference. |
+| [About](https://dgamore.readthedocs.io/en/latest/about.html) | Background, citation, license, and contact. |
 
---- 
+## Quick start
 
-## Installation
+Install `mpich` and `mpi4py` (Python 3.12+ required), then install the package:
 
-We recommend installing `DGAmore` in a virtual environment. There are many options to create virtual environments, 
-however, we recommend `conda` or `miniconda`. We also recommend using Python 3.12 or higher, as we do not guarantee that 
-the code will work with older versions of Python. Currently, the CI pipeline tests the code with Python 3.12, 3.13, and 
-3.14 on both Linux and macOS, so we can guarantee that the code works with these versions of Python. We do not test the 
-code on Windows, so we cannot guarantee that it will work there.
-
-To install `conda` or `miniconda`, please follow the instructions on their respective websites:
-- `conda`: [Linux](https://docs.conda.io/projects/conda/en/latest/user-guide/install/linux.html) or 
-[macOS](https://docs.conda.io/projects/conda/en/latest/user-guide/install/macos.html).
-- `miniconda`: [Linux](https://www.anaconda.com/docs/getting-started/miniconda/install#linux-2) or
-[macOS](https://www.anaconda.com/docs/getting-started/miniconda/install#macos-2).
-
-Once you have created your virtual environment, make sure that you activate the `conda` or `miniconda` environment 
-after installation, and - for convenience - that you add the `conda` or `miniconda` executable to your `PATH` variable, 
-so that you can use the `conda` command from your terminal. First, you need to install `mpich` and `mpi4py` to be able 
-to run the code with MPI. You can install both into your environment by running the following command:
 ```bash
 conda install -c conda-forge mpich mpi4py
-```
-Then, you have to clone the repository into any folder of choice. Please make sure that you have `git` installed on your 
-system. You can clone the repository by running the following command: 
-```bash
 git clone https://github.com/Julpe/DGAmore.git
-```
-After switching to the `DGAmore` directory, i.e., where you find the file [setup.py](setup.py), you can install `DGAmore` 
-and all of its requirements in normal mode with 
-```bash 
+cd DGAmore
 pip install .
-``` 
-or in editable mode with 
-```bash
-pip install -e .
-```
-Editable mode is recommended if you want to make changes to the code, as it allows you to edit the code without having 
-to reinstall it every time. Also, if new changes are made to the code, you can simply pull the latest version from the 
-repository, and you will have the latest version of the code without having to reinstall it.
-
-Please make sure that you are not using any (older) cached versions of the required packages, as this might lead to 
-issues with the installation.
-
----
-
-## Code Execution
-
-The main entry point to the program is the file [DGAmore.py](dgamore/DGAmore.py), which can be started with either
-```bash
-DGAmore.py
-```
-for single-core execution (mostly used for testing purposes) or
-```bash
-mpiexec -np <n_proc> DGAmore.py
-```
-for multi-core processing with MPI. The entry file [DGAmore.py](dgamore/DGAmore.py) is added as a Python executable to 
-the python environment and does not need the full path specified to run. Instead of `mpiexec`, one can also use 
-`mpirun` or `srun` (if you are using a slurm-based cluster). The number of processes, `<n_proc>`, should be chosen 
-according to the size of the problem and the available computational resources.
-
-There are two additional command line parameters available
-- `-p`: This is used to specify the path to the configuration file, which contains all run-specific parameters. 
-This is useful if one wants to store multiple configuration files in different directories. If this parameter is not 
-set, the path defaults to the location of the repository directory.
-- `-c`: This is used to specify the name of the configuration file one wants to load. It defaults to `dga_config.yaml`.
-
-As an example, the following shell command runs the code using 8 MPI processes and loads the configuration file 
-`my_config.yaml` from the path `/configs/`:
-
-```bash
-mpiexec -np 8 DGAmore.py -p /configs/ -c my_config.yaml
 ```
 
-The following code snippet shows the content of an exemplary job submit script for a slurm-based cluster:
+Configure a run by editing your configuration file, then execute the routine with `-p` to point at the directory
+holding it and `-c` to name it (defaults: the repository directory and [dga_config.yaml](dgamore/dga_config.yaml)):
 
 ```bash
-#!/bin/bash
-#SBATCH -N <n nodes>
-#SBATCH -J <some job name>
-#SBATCH --partition = <some partition>
-#SBATCH --qos = <some qos>
-#SBATCH --ntasks-per-node = <n proc>
-#SBATCH -t <time limit>
-#SBATCH -o log.txt
-#SBATCH -e log.txt
-
-# Load the necessary modules, in this case activate the conda environment 
-# with the preinstalled DGAmore package and its dependencies
-module purge
-source <path to miniconda>/miniconda3/bin/activate <your conda env>
-
-# Set the number of OpenMP threads to 1, as we are using MPI for parallelization
-export OMP_NUM_THREADS=1
-
-# Run the code with MPI, in this case with srun, which is the recommended way to run MPI jobs on a slurm-based cluster:
-srun DGAmore.py -p "<path to config>" -c "<name of config>.yaml"
-
-# If you want to use mpirun or mpiexec instead of srun, you can use the following command:
-mpirun/mpiexec -np $SLURM_NTASKS DGAmore.py -p "<path to config>" -c "<name of config>.yaml"
+mpiexec -np 8 DGAmore.py -p /configs/ -c my_config.yaml   # or: DGAmore.py for a single-core test run
 ```
 
-The `#SBATCH` options `-o` and `-e` denote the file where the job output and errors, respectively, will be written. In
-this case both will be written into the same file, however, it is possible to use separate files.
-
----
-
-## Configuration
-
-To configure run parameters, one has to create or modify the existing configuration file, which is a YAML file. The 
-default configuration file is [dga_config.yaml](dgamore/dga_config.yaml), which can be found in the repository directory. 
-Each entry in the configuration file is explained in detail in the file itself, so please refer to the file for more 
-information on how to configure the code. The default values in the configuration file are set to reasonable 
-quantities, so if you are unsure about any of the parameters, you can simply use the default values (except for the file 
-paths to the input). If a setting or if a whole section is missing from the file, the code will use the default values. 
-If you are unsure about any of the parameters, please refer to the documentation in the configuration file, my 
-[Master's thesis](https://doi.org/10.34726/hss.2025.130528) or contact me via [E-Mail](mailto:julian.peil@tuwien.ac.at).
-
---- 
+See the [installation](https://dgamore.readthedocs.io/en/latest/installation.html) and
+[usage](https://dgamore.readthedocs.io/en/latest/usage.html) pages for the full instructions and an example SLURM submit script.
 
 ## Contributing
 
-If you want to contribute to the development of DGAmore, please feel free to fork the repository and create a pull 
-request with your changes. Before creating a pull request, please make sure that your code follows the existing coding 
-style and that it is well-documented. Also, please make sure that your code does not break any existing functionality 
-and that it is tested. We have set up a continuous integration (CI) pipeline that runs tests on every pull request, so 
-if your code does not pass the tests, it will not be merged. Additionally, we have set up a code coverage tool that 
-checks the coverage of the tests, so please make sure that your code is well-tested and that it has more than 85% 
-coverage. If you are unsure about any of these points, please feel free to contact me via 
-[E-Mail](mailto:julian.peil@tuwien.ac.at).
+Contributions are welcome. Please open an issue for bugs and feature requests, or submit a pull request. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
-If you find any bugs or issues with the code, please feel free to create an issue in the repository and explain the 
-problem in detail. If possible, please also provide a minimal example that reproduces the issue, so that we can easily 
-understand and fix the problem. Alternatively, if you have a feature request or an idea for improving the code, please 
-also create an issue and explain your idea in detail. If you are unsure about how to create or flag issues, feel free to 
-contact me via [E-Mail](mailto:julian.peil@tuwien.ac.at).
+## Citation and license
 
-We will try to fix an issue as soon as possible if it is a critical bug. However, if it is a feature request or minor 
-bug that does not affect the overall functionality of the code, we will consider it for future development. If you 
-create an issue, make sure to provide the correct label (bug, feature request, etc.), this will help us to keep track of 
-the issues more easily.
-
----
-
-## Citation and Acknowledgements
-
-If you use this code, please consider citing it and also consider citing my 
-[Master's thesis](https://doi.org/10.34726/hss.2025.130528). 
-
-A big thanks goes to my colleagues, who have contributed to the development of this code, either by providing feedback 
-or testing.
+`DGAmore` is released under the MIT license. If you use it, please consider citing it together with the author's
+[Master's thesis](https://doi.org/10.34726/hss.2025.130528). For questions, get in touch by
+[e-mail](mailto:julian.peil@tuwien.ac.at).
+</content>
+</invoke>
