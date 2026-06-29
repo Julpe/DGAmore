@@ -1,22 +1,17 @@
-Contributing
-============
+# Contributing to DGAmore
 
-First of all, thank you for taking the time to contribute. DGAmore is an openly developed research code, and it grows
-and improves through the people who use it, report problems with it, and extend it. Every kind of contribution is
-appreciated, whether that is a detailed bug report, a question that uncovers something unclear in the documentation, a
-small fix, or a substantial new feature. You do not need to be an expert in the underlying physics or in the entire
-code base to help out, and if anything below is unclear or feels like a hurdle, please do not hesitate to get in touch
-by `e-mail <mailto:julian.peil@tuwien.ac.at>`_. We are happy to help you get started.
+First of all, thank you for taking the time to contribute. `DGAmore` is an openly developed research code, and it
+grows and improves through the people who use it, report problems with it, and extend it. Every kind of contribution
+is appreciated, whether that is a detailed bug report, a question that uncovers something unclear in the
+documentation, a small fix, or a substantial new feature. You do not need to be an expert in the underlying physics or
+in the entire code base to help out, and if anything below is unclear or feels like a hurdle, please do not hesitate to
+get in touch by [e-mail](mailto:julian.peil@tuwien.ac.at). We are happy to help you get started.
 
-.. note::
+> The same information is also available in the [online documentation](https://dgamore.readthedocs.io/en/latest/contributing.html).
 
-   The same information is also available in the
-   `CONTRIBUTING.md <https://github.com/Julpe/DGAmore/blob/main/CONTRIBUTING.md>`_ file in the repository.
+## Ways to contribute
 
-Ways to contribute
-------------------
-
-There are many ways to make DGAmore better, and not all of them involve writing code:
+There are many ways to make `DGAmore` better, and not all of them involve writing code:
 
 - **Report a bug.** If something does not behave the way you expect, letting us know is already a valuable
   contribution.
@@ -25,10 +20,9 @@ There are many ways to make DGAmore better, and not all of them involve writing 
 - **Improve the documentation.** Clarifications, corrections, and examples help the next person who comes along.
 - **Contribute code.** Fixes and new features are very welcome, from one-line corrections to larger additions.
 
-Reporting bugs and requesting features
---------------------------------------
+## Reporting bugs and requesting features
 
-If you run into a bug, please `open an issue <https://github.com/Julpe/DGAmore/issues>`_ and describe what happened in
+If you run into a bug, please [open an issue](https://github.com/Julpe/DGAmore/issues) and describe what happened in
 as much detail as you can. A short, self-contained example that reproduces the problem is enormously helpful, as it
 lets us understand and fix the issue much more quickly, but please open an issue even if you cannot provide one: a
 clear description of what you did, what you expected, and what happened instead already goes a long way.
@@ -42,70 +36,62 @@ We try to look at critical bugs as soon as we can. Feature requests and smaller 
 functionality are noted and considered for future development, so even if something is not picked up right away, it is
 not forgotten.
 
-Setting up a development environment
-------------------------------------
+## Setting up a development environment
 
-DGAmore requires Python 3.12 or newer, together with ``mpich`` and ``mpi4py``. Once you have installed the
-dependencies (see :doc:`installation`), the easiest way to work on the code is to fork the repository, clone your fork,
-and install the package in editable mode. Editable mode means that your changes take effect immediately, without having
-to reinstall the package every time:
+`DGAmore` requires Python 3.12 or newer, together with `mpich` and `mpi4py`. Once you have
+[installed the dependencies](https://dgamore.readthedocs.io/en/latest/installation.html), the easiest way to work on
+the code is to fork the repository, clone your fork, and install the package in editable mode. Editable mode means
+that your changes take effect immediately, without having to reinstall the package every time:
 
-.. code-block:: bash
-
-   git clone https://github.com/<your-username>/DGAmore.git
-   cd DGAmore
-   pip install -e .
+```bash
+git clone https://github.com/<your-username>/DGAmore.git
+cd DGAmore
+pip install -e .
+```
 
 From here you are ready to make changes, run the code, and run the tests.
 
-Submitting changes
-------------------
+## Submitting changes
 
 When you would like to contribute code, the following workflow keeps things smooth for everyone:
 
 1. **Create a branch** on your fork for your changes, so that your work is easy to follow and review.
 2. **Write your code and add tests for it.** New functionality should come with tests that cover it, and existing
-   functionality should keep working. The test suite lives in the ``tests/`` directory, and ``tests/conftest.py``
+   functionality should keep working. The test suite lives in the `tests/` directory, and `tests/conftest.py`
    provides a number of fixtures (including an in-process fake MPI runtime) that make it easier to write tests without
    a full MPI setup.
-3. **Format your changes** with `Black <https://black.readthedocs.io>`_, using a line length of 120 characters. A
-   plain run picks up the project configuration automatically:
-
-   .. code-block:: bash
-
-      black .
-
+3. **Format your changes** with [Black](https://black.readthedocs.io), using a line length of 120 characters. A plain
+   run picks up the project configuration automatically:
+   ```bash
+   black .
+   ```
 4. **Run the tests locally** before opening your pull request, so that any problems surface early:
-
-   .. code-block:: bash
-
-      pytest tests                     # fast suite (skips tests marked slow)
-      pytest tests --runslow           # full suite, as run in CI
-      pytest tests --runslow --cov=dgamore --cov-report=term-missing   # with coverage
-
-5. **Open a pull request** against the ``main`` branch, with a short description of what you changed and why. If your
+   ```bash
+   pytest tests                       # fast suite (skips tests marked slow)
+   pytest tests --runslow             # full suite, as run in CI
+   pytest tests --runslow --cov=dgamore --cov-report=term-missing   # with coverage
+   ```
+5. **Open a pull request** against the `main` branch, with a short description of what you changed and why. If your
    pull request is related to an existing issue, mentioning it helps connect the two.
 
 A continuous integration pipeline runs the full test suite on every pull request, across Python 3.12 to 3.14 on both
 Linux and macOS. This is there to catch regressions, not to be a gatekeeper, so please do not worry if something turns
 red on the first try; it is a normal part of the process, and we are glad to help you get it passing. A coverage tool
-also checks that the overall test coverage stays above eighty-five percent, so adding tests for your changes is the
-best way to keep it healthy.
+also checks that the overall test coverage stays above 85%, so adding tests for your changes is the best way to keep it
+healthy.
 
-Coding style
-------------
+## Coding style
 
 To keep the code base consistent and easy to read, it helps to stay close to the style that is already there. In
-practice that means keeping the ``numpy`` and physics notation used throughout the code (the variable names mirror the
-author's `Master's thesis <https://doi.org/10.34726/hss.2025.130528>`_), documenting public classes and methods, using
+practice that means keeping the `numpy` and physics notation used throughout the code (the variable names mirror the
+author's [Master's thesis](https://doi.org/10.34726/hss.2025.130528)), documenting public classes and methods, using
 type hints, and applying the Black formatting described above. It is also easier to review changes that stay focused on
 one thing, so where possible please avoid reformatting or restructuring unrelated code in the same pull request.
 
-A final word
-------------
+## A final word
 
 If you are ever unsure about any of this, about how to set things up, how to label an issue, or whether an idea is
-worth pursuing, please just reach out by `e-mail <mailto:julian.peil@tuwien.ac.at>`_. Questions are always welcome, and
+worth pursuing, please just reach out by [e-mail](mailto:julian.peil@tuwien.ac.at). Questions are always welcome, and
 helping new contributors get going is part of what keeps the project alive. Thank you again for contributing to
-DGAmore.
+`DGAmore`.
 </content>
