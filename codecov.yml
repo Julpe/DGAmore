@@ -13,10 +13,7 @@ ignore:
   - "**/plotting.py"
   - "**/config_parser.py"
   - "**/symmetrize_new.py"
-  - "**/mpi_distributor.py"
-  - "**/mpi_utils.py"
   - "**/ana_cont.py"
-  - "**/max_ent.py"
   - "**/dmft_interface.py"
 
 coverage:
