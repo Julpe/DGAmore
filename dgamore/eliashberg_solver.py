@@ -7,7 +7,7 @@ r"""
 Linearized Eliashberg equation solver. Starting from the ladder-DGA full vertex (saved per channel by the
 non-local SDE step), this module assembles the particle-particle pairing vertex in the singlet/triplet channels at
 :math:`\omega = 0`, optionally adds the local reducible diagrams, and power-iterates the linearized gap equation
-:math:`\lambda \Delta = -\frac{1}{\beta N_q}\, \Gamma^{pp}\, \chi_0^{pp}\, \Delta` via an ARPACK/Lanczos
+:math:`\lambda \Delta = \pm\frac{1}{2\beta N_q}\, \Gamma^{pp}\, \chi_0^{pp}\, \Delta` via an ARPACK/Lanczos
 eigensolver (two variants: an in-memory one and a memory-lean frequency-distributed one). The leading
 eigenvalue :math:`\lambda` signals the pairing instability and the eigenvector is the gap function
 :math:`\Delta(k, \nu)`. Requires ``nq == nk``. Equation numbers refer to the author's master's thesis (Chapter 4).
@@ -77,8 +77,8 @@ def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp:
 
 
 def transform_vertex_loc_frequencies_w0(f_r_loc: LocalFourPoint, niv_pp: int) -> LocalFourPoint:
-    """
-    Transforms a local vertex from particle-hole to the modified particle-particle notation at :math:`\\omega' = 0`
+    r"""
+    Transforms a local vertex from particle-hole to the modified particle-particle notation at :math:`\omega' = 0`
     (see :func:`_transform_vertex_frequencies_w0`).
 
     :param f_r_loc: The local vertex :math:`F` in ph notation.
@@ -90,9 +90,9 @@ def transform_vertex_loc_frequencies_w0(f_r_loc: LocalFourPoint, niv_pp: int) ->
 
 
 def transform_vertex_q_frequencies_w0(f_q_r: FourPoint, niv_pp: int) -> FourPoint:
-    """
+    r"""
     Transforms a momentum-dependent vertex from particle-hole to the modified particle-particle notation at
-    :math:`\\omega' = 0` (see :func:`_transform_vertex_frequencies_w0`).
+    :math:`\omega' = 0` (see :func:`_transform_vertex_frequencies_w0`).
 
     :param f_q_r: The momentum-dependent vertex :math:`F^{q}` in ph notation.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
@@ -106,14 +106,14 @@ def transform_vertex_q_frequencies_w0(f_q_r: FourPoint, niv_pp: int) -> FourPoin
 def create_full_vertex_q_r(
     u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist: MpiDistributor
 ) -> FourPoint:
-    """
+    r"""
     Calculates the momentum-dependent full ladder vertex in the given channel (density or magnetic) from the saved
     intermediates (inverse bubble, three-leg vertex, summed auxiliary susceptibility), and transforms it to pp
     notation unless ``save_fq`` requests keeping the ph form. Deletes the consumed intermediate files afterwards.
 
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{q}`.
-    :param gamma_r: The local irreducible vertex :math:`\\Gamma_{r}` for this channel.
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :return: The full ladder vertex :math:`F^{q}_{r}` as a :class:`FourPoint`.
@@ -187,13 +187,13 @@ def create_full_vertex_q_r(
 def create_full_vertex_q_r_pp_w0(
     u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist_irrk: MpiDistributor
 ):
-    """
+    r"""
     Builds the full ladder vertex (see :func:`create_full_vertex_q_r`), optionally gathers and saves it in ph
-    notation in the irreducible BZ, and returns it transformed to pp notation at :math:`\\omega' = 0`.
+    notation in the irreducible BZ, and returns it transformed to pp notation at :math:`\omega' = 0`.
 
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{q}`.
-    :param gamma_r: The local irreducible vertex :math:`\\Gamma_{r}` for this channel.
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :return: The full ladder vertex :math:`F^{q}_{r}` in pp notation as a :class:`FourPoint`.
@@ -231,16 +231,16 @@ def create_full_vertex_q_r_v2(
     niv_pp: int,
     q_index: int,
 ) -> FourPoint:
-    """
+    r"""
     Calculates the full ladder vertex for a single q-point (memory-lean per-q variant of
     :func:`create_full_vertex_q_r`), transforming it to pp notation unless ``save_fq`` keeps the ph form.
 
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{q}`.
-    :param gamma_r: The local irreducible vertex :math:`\\Gamma_{r}` for this channel.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\\chi_0^q)^{-1}` over all rank-local q-points.
-    :param vrg_q_r: The momentum-dependent three-leg vertex :math:`\\gamma^q_{r}`.
-    :param gchi_aux_q_r_sum: The summed auxiliary susceptibility :math:`\\sum_{\\nu'}\\chi^{*;q}_{r}`.
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` over all rank-local q-points.
+    :param vrg_q_r: The momentum-dependent three-leg vertex :math:`\gamma^q_{r}`.
+    :param gchi_aux_q_r_sum: The summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q}_{r}`.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param q_index: Index of the q-point (into the rank-local list) to compute.
     :return: The full ladder vertex :math:`F^{q}_{r}` for that q-point as a :class:`FourPoint`.
@@ -272,14 +272,14 @@ def create_full_vertex_q_r_v2(
 def create_full_vertex_q_r_pp_w0_v2(
     u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist_irrk: MpiDistributor
 ):
-    """
-    Memory-lean variant of :func:`create_full_vertex_q_r_pp_w0`: loops over the rank-local q-points (see
-    :func:`create_full_vertex_q_r_v2`), assembles the full ladder vertex, optionally saves it in ph notation, and
-    returns it in pp notation at :math:`\\omega' = 0`.
+    r"""
+    Builds the full ladder vertex as a memory-lean variant of :func:`create_full_vertex_q_r_pp_w0`, looping over the
+    rank-local q-points (see :func:`create_full_vertex_q_r_v2`), optionally saving it in ph notation, and returning it
+    in pp notation at :math:`\omega' = 0`.
 
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{q}`.
-    :param gamma_r: The local irreducible vertex :math:`\\Gamma_{r}` for this channel.
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :return: The full ladder vertex :math:`F^{q}_{r}` in pp notation as a :class:`FourPoint`.
@@ -779,8 +779,8 @@ def solve_eliashberg_lanczos_v2(
 def solve(
     giwk_dga: GreensFunction, g_dmft: GreensFunction, u_loc: LocalInteraction, v_nonloc: Interaction, comm: MPI.Comm
 ):
-    """
-    Top-level driver of the Eliashberg step: assembles the singlet and triplet pairing vertices from the saved
+    r"""
+    Drives the Eliashberg step: assembles the singlet and triplet pairing vertices from the saved
     ladder-DGA full vertices (optionally adding the local reducible diagrams), then solves the linearized gap equation
     for each channel and returns the leading eigenvalues and gap functions. Dispatches between the in-memory and the
     memory-lean Lanczos solvers depending on the memory configuration.
@@ -806,7 +806,7 @@ def solve(
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
 
     def dispatch_full_vertex_calculation(channel, u, v, niv, mpi_dist) -> FourPoint:
-        """
+        r"""
         Loads the local irreducible vertex for ``channel`` and builds the full ladder pp vertex, dispatching between
         the memory-lean and the regular construction routine based on the memory configuration.
 

@@ -27,8 +27,8 @@ from dgamore.n_point_base import SpinChannel
 class HoppingElement:
     """
     Data class to store a hopping element of the Hamiltonian. The hopping element is defined by the relative lattice
-    vector 'r_lat', the orbitals 'orbs' and the value of the hopping 'value'. A hopping element represents a single line
-    in a w2k file. Added this to make the code more readable and to avoid passing around lists of values.
+    vector ``r_lat``, the orbitals ``orbs`` and the value of the hopping ``value``. A hopping element represents a
+    single line in a w2k file. Added this to make the code more readable and to avoid passing around lists of values.
     """
 
     def __init__(self, r_lat: list, orbs: list, value: float = 0.0):
@@ -38,7 +38,8 @@ class HoppingElement:
         :param r_lat: The relative lattice vector as a list of 3 integers.
         :param orbs: The two (1-based) orbital indices ``[o1, o2]`` of the hopping.
         :param value: The hopping amplitude.
-        :raises ValueError: If ``r_lat`` is not 3 integers, ``orbs`` is not 2 positive integers, or ``value`` is not a number.
+        :raises ValueError: If ``r_lat`` is not 3 integers, ``orbs`` is not 2 positive integers, or ``value`` is not
+            a number.
         """
         if not (isinstance(r_lat, list) and len(r_lat) == 3 and all(isinstance(x, int) for x in r_lat)):
             raise ValueError("'r_lat' must be a list with exactly 3 integer elements.")
@@ -59,9 +60,10 @@ class HoppingElement:
 
 class InteractionElement:
     """
-    Data class to store an interaction element of the Hamiltonian. The interaction element is defined by the relative lattice
-    vector 'r_lat', the orbitals 'orbs' and the value of the interaction 'value'. An interaction element represents a single entry
-    in the interaction matrix. Added this to make the code more readable and to avoid passing around lists of values.
+    Data class to store an interaction element of the Hamiltonian. The interaction element is defined by the relative
+    lattice vector ``r_lat``, the orbitals ``orbs`` and the value of the interaction ``value``. An interaction element
+    represents a single entry in the interaction matrix. Added this to make the code more readable and to avoid passing
+    around lists of values.
     """
 
     def __init__(self, r_lat: list[int], orbs: list[int], value: float):
@@ -71,7 +73,8 @@ class InteractionElement:
         :param r_lat: The relative lattice vector as a list of 3 integers.
         :param orbs: The four (1-based) orbital indices ``[o1, o2, o3, o4]`` of the interaction.
         :param value: The interaction value.
-        :raises ValueError: If ``r_lat`` is not 3 integers, ``orbs`` is not 4 positive integers, or ``value`` is not a number.
+        :raises ValueError: If ``r_lat`` is not 3 integers, ``orbs`` is not 4 positive integers, or ``value`` is not
+            a number.
         """
         if not (isinstance(r_lat, list) and len(r_lat) == 3 and all(isinstance(x, int) for x in r_lat)):
             raise ValueError("'r_lat' must be a list with exactly 3 integer elements.")
@@ -92,8 +95,9 @@ class InteractionElement:
 
 class Hamiltonian:
     """
-    Class to handle the Hamiltonian of the Hubbard model. Contains the hopping terms ('er') and the local ('local_interaction')
-    and nonlocal interaction ('nonlocal_interaction') terms. Has a few helper methods to simplify adding terms to the Hamiltonian.
+    Class to handle the Hamiltonian of the Hubbard model. Contains the hopping terms (``er``) and the local
+    (``local_interaction``) and nonlocal interaction (``nonlocal_interaction``) terms. Has a few helper methods to
+    simplify adding terms to the Hamiltonian.
     """
 
     def __init__(self):
@@ -117,7 +121,7 @@ class Hamiltonian:
         self._nonlocal_interaction = None
 
     def single_band_interaction(self, u: float) -> "Hamiltonian":
-        """
+        r"""
         Sets the local interaction for a single-band model from a single Hubbard :math:`U`.
 
         :param u: The Hubbard interaction :math:`U`.
@@ -126,7 +130,7 @@ class Hamiltonian:
         return self.interaction_orbital_diagonal(u, 1)
 
     def interaction_orbital_diagonal(self, u: float, n_bands: int = 1) -> "Hamiltonian":
-        """
+        r"""
         Sets a purely orbital-diagonal local interaction for a multi-band model: the interaction tensor is zero
         everywhere except the ``[0,0,0,0]`` element, which is set to ``u``.
 
@@ -144,11 +148,11 @@ class Hamiltonian:
         return self._add_interaction_term(interaction_elements)
 
     def kanamori_interaction_d(self, n_bands: int, udd: float, jdd: float, vdd: float = None) -> "Hamiltonian":
-        """
+        r"""
         Adds the Kanamori interaction terms ONLY for d orbitals to the Hamiltonian.
-        The interaction terms are defined by the Hubbard 'udd' (U),
-        the exchange interaction 'jdd' (J) and the pair hopping 'vdd' (V or sometimes U').
-        'vdd' is an optional parameter, if left empty, it is set to V=U-2J.
+        The interaction terms are defined by the Hubbard ``udd`` (U),
+        the exchange interaction ``jdd`` (J) and the inter-orbital density-density interaction ``vdd`` (V or sometimes U').
+        ``vdd`` is an optional parameter, if left empty, it is set to V=U-2J.
 
         :param n_bands: Number of d orbitals/bands.
         :param udd: The intra-orbital Hubbard interaction :math:`U_{dd}`.
@@ -159,11 +163,11 @@ class Hamiltonian:
         return self.kanamori_interaction_dp(nd_bands=n_bands, udd=udd, jdd=jdd, vdd=vdd)
 
     def kanamori_interaction_p(self, n_bands: int, upp: float, jpp: float, vpp: float = None) -> "Hamiltonian":
-        """
+        r"""
         Adds the Kanamori interaction terms ONLY for p orbitals to the Hamiltonian.
-        The interaction terms are defined by the Hubbard 'upp' (U),
-        the exchange interaction 'jpp' (J) and the pair hopping 'vpp' (V or sometimes U').
-        'vpp' is an optional parameter, if left empty, it is set to V=U-2J.
+        The interaction terms are defined by the Hubbard ``upp`` (U),
+        the exchange interaction ``jpp`` (J) and the inter-orbital density-density interaction ``vpp`` (V or sometimes U').
+        ``vpp`` is an optional parameter, if left empty, it is set to V=U-2J.
 
         :param n_bands: Number of p orbitals/bands.
         :param upp: The intra-orbital Hubbard interaction :math:`U_{pp}`.
@@ -186,10 +190,10 @@ class Hamiltonian:
         vdd: float = None,
         vpp: float = None,
     ) -> "Hamiltonian":
-        """
+        r"""
         Adds the full Kanamori interaction terms for d and p orbitals to the Hamiltonian.
         The interaction terms are defined by the local interaction Hubbard U,
-        the exchange interaction J and the pair hopping V or sometimes U'.
+        the exchange interaction J and the inter-orbital density-density interaction V or sometimes U'.
         vdd (vpp) (vdp) are optional parameters, if left empty, they are set to V=U-2J.
 
         :param nd_bands: Number of d orbitals (placed first in the orbital ordering).
@@ -258,7 +262,7 @@ class Hamiltonian:
         return self._add_interaction_term(interaction_elements)
 
     def kinetic_one_band_2d_t_tp_tpp(self, t: float, tp: float, tpp: float) -> "Hamiltonian":
-        """
+        r"""
         Adds the kinetic terms for a one-band model in 2D with nearest (t), next-nearest (tp) and next-next-nearest
         (tpp) neighbor hopping.
 
@@ -287,7 +291,7 @@ class Hamiltonian:
 
     def read_hr_w2k(self, filename: str = "./wannier_hr.dat") -> "Hamiltonian":
         """
-        Reads the 'wannier_hr.dat' file from a wien2k hr file and sets the real-space kinetic Hamiltonian.
+        Reads the ``wannier_hr.dat`` file from a wien2k hr file and sets the real-space kinetic Hamiltonian.
         This is then typically Fourier-transformed to momentum space to obtain the k-dependent band dispersion.
 
         :param filename: Path to the ``wannier_hr.dat`` file.

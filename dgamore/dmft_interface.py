@@ -27,24 +27,24 @@ from dgamore.self_energy import SelfEnergy
 
 class DMFTInterface(ABC):
     """
-    Abstract interface for DMFT calculations. Reads the necessary quantities which are needed for a DGA calculation
+    Abstract interface for DMFT calculations. Reads the quantities needed for a DGA calculation
     from the output files.
     """
 
     def get_beta(self) -> float:
-        """
+        r"""
         Returns the inverse temperature from the DMFT calculation.
 
-        :return: The inverse temperature :math:`\\beta` from the DMFT calculation.
+        :return: The inverse temperature :math:`\beta` from the DMFT calculation.
         :raises NotImplementedError: In the abstract base class.
         """
         raise NotImplementedError()
 
     def get_mu(self) -> float:
-        """
+        r"""
         Returns the chemical potential from the DMFT calculation.
 
-        :return: The chemical potential :math:`\\mu` from the DMFT calculation.
+        :return: The chemical potential :math:`\mu` from the DMFT calculation.
         :raises NotImplementedError: In the abstract base class.
         """
         raise NotImplementedError()
@@ -79,7 +79,7 @@ class DMFTInterface(ABC):
         raise NotImplementedError()
 
     def get_udd(self, ineq: int = 1) -> float:
-        """
+        r"""
         Returns the density-density interaction :math:`U` for the interacting d-orbitals (used both for plain
         density-density and Kanamori interactions).
 
@@ -90,7 +90,7 @@ class DMFTInterface(ABC):
         raise NotImplementedError()
 
     def get_jdd(self, ineq: int = 1) -> float:
-        """
+        r"""
         Returns the Hund's coupling :math:`J` for the interacting d-orbitals (nonzero only for Kanamori interactions).
 
         :param ineq: The index of the inequivalent atom (for multi-site DMFT).
@@ -100,7 +100,7 @@ class DMFTInterface(ABC):
         raise NotImplementedError()
 
     def get_vdd(self, ineq: int = 1) -> float:
-        """
+        r"""
         Returns the inter-orbital repulsion :math:`V` (often :math:`U'`) for the interacting d-orbitals (nonzero only
         for Kanamori interactions).
 
@@ -169,19 +169,19 @@ class W2dynInterface(DMFTInterface):
         self._open()
 
     def get_beta(self) -> float:
-        """
+        r"""
         Reads the inverse temperature from the w2dynamics config.
 
-        :return: The inverse temperature :math:`\\beta` from the DMFT calculation.
+        :return: The inverse temperature :math:`\beta` from the DMFT calculation.
         """
         return self.file_1p[".config"].attrs["general.beta"]
 
     def get_mu(self, dmft_iter: str = "dmft-last") -> float:
-        """
+        r"""
         Reads the chemical potential from the w2dynamics output.
 
         :param dmft_iter: The DMFT iteration to read from.
-        :return: The chemical potential :math:`\\mu`.
+        :return: The chemical potential :math:`\mu`.
         """
         return self.file_1p[dmft_iter + "/mu/value"][()]
 
@@ -215,7 +215,7 @@ class W2dynInterface(DMFTInterface):
         return 2 * np.mean(rho1, axis=(1, 3))
 
     def get_udd(self, ineq: int = 1) -> float:
-        """
+        r"""
         Reads the density-density interaction from the w2dynamics config.
 
         :param ineq: The index of the inequivalent atom (for multi-site DMFT).
@@ -224,7 +224,7 @@ class W2dynInterface(DMFTInterface):
         return self._from_ineq_config("udd", ineq=ineq)
 
     def get_jdd(self, ineq: int = 1) -> float:
-        """
+        r"""
         Reads the Hund's coupling from the w2dynamics config.
 
         :param ineq: The index of the inequivalent atom (for multi-site DMFT).
@@ -233,7 +233,7 @@ class W2dynInterface(DMFTInterface):
         return self._from_ineq_config("jdd", ineq=ineq)
 
     def get_vdd(self, ineq: int = 1) -> float:
-        """
+        r"""
         Reads the inter-orbital repulsion from the w2dynamics config.
 
         :param ineq: The index of the inequivalent atom (for multi-site DMFT).

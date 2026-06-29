@@ -408,7 +408,7 @@ class IHaveChannel(ABC):
     @property
     def channel(self) -> SpinChannel:
         """
-        Returns the spin channel of the object. For a set of available channels, see the enum `SpinChannel`.
+        Returns the spin channel of the object. For a set of available channels, see the enum :class:`SpinChannel`.
 
         :return: The current spin channel.
         """
@@ -417,7 +417,7 @@ class IHaveChannel(ABC):
     @channel.setter
     def channel(self, value: SpinChannel) -> None:
         """
-        Sets the spin channel of the object. For a set of available channels, see the enum `SpinChannel`.
+        Sets the spin channel of the object. For a set of available channels, see the enum :class:`SpinChannel`.
 
         :param value: The spin channel to set.
         :raises ValueError: If ``value`` is not a :class:`SpinChannel`.
@@ -428,7 +428,8 @@ class IHaveChannel(ABC):
 
     def set_channel(self, channel: SpinChannel):
         """
-        Sets the spin channel of the object (chainable). For a set of available channels, see the enum `SpinChannel`.
+        Sets the spin channel of the object (chainable). For a set of available channels, see the enum
+        :class:`SpinChannel`.
 
         :param channel: The spin channel to set.
         :return: ``self`` (for chaining).
@@ -440,7 +441,7 @@ class IHaveChannel(ABC):
     def frequency_notation(self) -> FrequencyNotation:
         """
         Returns the frequency notation (not the channel reducibility) of the object.
-        For a set of available frequency notations, see the enum `FrequencyNotation`.
+        For a set of available frequency notations, see the enum :class:`FrequencyNotation`.
 
         :return: The current frequency notation.
         """
@@ -450,7 +451,7 @@ class IHaveChannel(ABC):
     def frequency_notation(self, value: FrequencyNotation) -> None:
         """
         Sets the frequency notation of the object. For a set of available frequency notations,
-        see the enum `FrequencyNotation`.
+        see the enum :class:`FrequencyNotation`.
 
         :param value: The frequency notation to set.
         :raises ValueError: If ``value`` is not a :class:`FrequencyNotation`.
@@ -462,7 +463,7 @@ class IHaveChannel(ABC):
     def set_frequency_notation(self, value: FrequencyNotation):
         """
         Sets the frequency notation of the object (chainable). For a set of available frequency notations,
-        see the enum `FrequencyNotation`.
+        see the enum :class:`FrequencyNotation`.
 
         :param value: The frequency notation to set.
         :return: ``self`` (for chaining).
@@ -635,7 +636,7 @@ class IAmNonLocal(IHaveMat, ABC):
 
     def find_q(self, q: tuple[int, int, int] = (0, 0, 0)):
         r"""
-        Find the matrix element for a single momentum :math:`\vec{q}` and returns a compressed copy.
+        Finds the matrix element for a single momentum :math:`\vec{q}` and returns a compressed copy.
 
         :param q: The momentum grid index ``(qx, qy, qz)`` to select.
         :return: A compressed copy containing only the requested momentum (``nq = (1, 1, 1)``).

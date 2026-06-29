@@ -16,7 +16,7 @@ from dgamore.hamiltonian import Hamiltonian
 from dgamore.interaction import Interaction
 from dgamore.local_sde import get_local_hartree_fock
 from dgamore.n_point_base import SpinChannel
-from dgamore.nonlocal_sde import _init_mu_history, get_hartree_fock, perform_ornstein_zernicke_fit
+from dgamore.nonlocal_sde import _init_mu_history, get_hartree_fock, perform_ornstein_zernike_fit
 
 LOCAL_SDE_DATA = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/local_sde"
 
@@ -109,14 +109,14 @@ class _ConstantChi:
         return self._mat
 
 
-def test_ornstein_zernicke_fit_aggregates_nonconverged_warnings(monkeypatch):
+def test_ornstein_zernike_fit_aggregates_nonconverged_warnings(monkeypatch):
     """All non-converging OZ fits collapse into a single aggregated warning instead of one log per orbital."""
     config.sys.n_bands = 2
     logger = mock.Mock()
     monkeypatch.setattr(config, "logger", logger, raising=False)
     monkeypatch.setattr(nonlocal_sde.opt, "curve_fit", mock.Mock(side_effect=RuntimeError("forced non-convergence")))
 
-    perform_ornstein_zernicke_fit(_ConstantChi(np.ones((2, 2, 1, 2, 2, 2, 2), dtype=np.complex64)))
+    perform_ornstein_zernike_fit(_ConstantChi(np.ones((2, 2, 1, 2, 2, 2, 2), dtype=np.complex64)))
 
     logger.warning.assert_called_once()
     msg = logger.warning.call_args.args[0]
@@ -124,13 +124,13 @@ def test_ornstein_zernicke_fit_aggregates_nonconverged_warnings(monkeypatch):
     assert "(1, 1, 1, 1)" in msg and "(2, 2, 2, 2)" in msg  # 1-based orbital labels, not 0-based
 
 
-def test_ornstein_zernicke_fit_logs_no_warning_when_all_converge(monkeypatch):
+def test_ornstein_zernike_fit_logs_no_warning_when_all_converge(monkeypatch):
     """A fully converging set of OZ fits emits no warning at all (the aggregation guard stays silent)."""
     config.sys.n_bands = 2
     logger = mock.Mock()
     monkeypatch.setattr(config, "logger", logger, raising=False)
     monkeypatch.setattr(nonlocal_sde.opt, "curve_fit", mock.Mock(return_value=(np.array([1.0, 2.0]), None)))
 
-    perform_ornstein_zernicke_fit(_ConstantChi(np.ones((2, 2, 1, 2, 2, 2, 2), dtype=np.complex64)))
+    perform_ornstein_zernike_fit(_ConstantChi(np.ones((2, 2, 1, 2, 2, 2, 2), dtype=np.complex64)))
 
     logger.warning.assert_not_called()

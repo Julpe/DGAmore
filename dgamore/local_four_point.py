@@ -234,8 +234,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         Converts the indices of the LocalFourPoint object :math:`F^{wvv'}_{lmm'l'}` to compound indices :math:`F^{w}_{c_1, c_2}`
         by transposing the object to [w, o1, o2, v, o4, o3, v'] (if the object has any fermionic frequency dimension,
         otherwise the compound indices are built from orbital dimensions only) and grouping {o1, o2, v} and {o4, o3, v'}
-        to the new compound index. Always returns the object with a compressed momentum dimension and in the same niw
-        range as the original object.
+        to the new compound index. Always returns the object in the same niw range as the original object.
 
         :return: ``self`` with shape ``[w, c1, c2]`` (compound indices).
         :raises NotImplementedError: If the frequency notation is neither ph nor pp.
@@ -294,11 +293,11 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
     def to_full_indices(self, shape: tuple = None) -> "LocalFourPoint":
         """
-        Converts an object stored with compound indices to an object that has unraveled momentum,
-        orbital and frequency axes. Always returns the object with a compressed momentum dimension. This is the inverse
-        transformation as `to_compound_indices`. Will make use of the `original_shape` the object was created or last
-        modified with. If the `original_shape` is not set or is hard to obtain, the `shape` argument can be used to
-        specify the original shape of the object.
+        Converts an object stored with compound indices to an object that has unraveled orbital
+        and frequency axes. This is the inverse
+        transformation of :meth:`to_compound_indices`. Will make use of the ``original_shape`` the object was
+        created or last modified with. If the ``original_shape`` is not set or is hard to obtain, the ``shape``
+        argument can be used to specify the original shape of the object.
 
         :param shape: Optional override for the stored ``original_shape`` used to unravel the compound axes.
         :return: ``self`` with unraveled orbital and frequency axes.
@@ -634,7 +633,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
     def sub(self, other):
         """
-        Helper method that allows for Subtraction of LocalFourPoint objects and other LocalFourPoint or LocalInteraction
+        Helper method that allows for subtraction of LocalFourPoint objects and other LocalFourPoint or LocalInteraction
         objects. Subtractions with numpy arrays, floats, ints or complex numbers are also supported.
         Depending on the number of frequency and momentum dimensions, the vertices have to be subtracted slightly different.
         If the objects have different niw ranges, they will be converted to the half niw range before the subtraction.

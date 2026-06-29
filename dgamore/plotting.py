@@ -285,7 +285,7 @@ def plot_two_point_kx_ky(
     save: bool = True,
     show: bool = False,
 ):
-    """
+    r"""
     Plots the real and imaginary parts of a two-point function in the :math:`(k_x, k_y)` plane (at :math:`k_z = 0`
     and the first positive Matsubara frequency) for fixed orbitals, with the antiferromagnetic zone boundary and
     optional scatter points overlaid.
@@ -293,7 +293,7 @@ def plot_two_point_kx_ky(
     :param obj: The two-point object to plot (a :class:`LocalNPoint` / :class:`IAmNonLocal`).
     :param kx: The kx grid values for the plot axes.
     :param ky: The ky grid values for the plot axes.
-    :param pi_shift: Whether to shift the momentum grid by :math:`\\pi` before plotting.
+    :param pi_shift: Whether to shift the momentum grid by :math:`\pi` before plotting.
     :param title: Title suffix for the subplots.
     :param name: Output filename tag.
     :param orbs: The two orbital indices to select.
@@ -379,14 +379,14 @@ def plot_two_point_kx_ky_real_and_imag(
     save: bool = True,
     show: bool = False,
 ):
-    """
+    r"""
     Plots a two-point function in the :math:`(k_x, k_y)` plane for fixed orbitals, writing the real and imaginary
     parts to two separate files.
 
     :param obj: The two-point object to plot (a :class:`LocalNPoint` / :class:`IAmNonLocal`).
     :param kx: The kx grid values for the plot axes.
     :param ky: The ky grid values for the plot axes.
-    :param pi_shift: Whether to shift the momentum grid by :math:`\\pi` before plotting.
+    :param pi_shift: Whether to shift the momentum grid by :math:`\pi` before plotting.
     :param title: Title (rendered inside the math mode of the subplot titles).
     :param name: Output filename tag (``_real``/``_imag`` is appended).
     :param orbs: The two orbital indices to select.
@@ -458,7 +458,7 @@ def plot_two_point_kx_ky_with_fs_points(
     do_save: bool = True,
     show: bool = False,
 ):
-    """
+    r"""
     Plots a two-point function in the :math:`(k_x, k_y)` plane for fixed orbitals, with the Fermi-surface points
     (zero crossings of the quantity in the reduced BZ quadrant) scattered on top (see :func:`plot_two_point_kx_ky`).
 
@@ -466,7 +466,7 @@ def plot_two_point_kx_ky_with_fs_points(
     :param k_grid: The :class:`KGrid` providing the k-axis values for the Fermi-surface points.
     :param kx: The kx grid values for the plot axes.
     :param ky: The ky grid values for the plot axes.
-    :param pi_shift: Whether to shift the momentum grid by :math:`\\pi` before plotting.
+    :param pi_shift: Whether to shift the momentum grid by :math:`\pi` before plotting.
     :param title: Title suffix for the subplots.
     :param name: Output filename tag.
     :param orbs: The two orbital indices to select.

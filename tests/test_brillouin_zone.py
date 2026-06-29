@@ -37,14 +37,14 @@ def test_applies_inversion_symmetry_along_z_axis():
 def test_raises_error_for_invalid_axis():
     """Inversion symmetry raises for an invalid axis."""
     mat = np.random.rand(4, 4, 4)
-    with pytest.raises(AssertionError, match="axis = 3 but must be in \[0,1,2\]"):
+    with pytest.raises(AssertionError, match=r"axis = 3 but must be in \[0,1,2\]"):
         bz.inv_sym(mat, axis=3)
 
 
 def test_raises_error_for_insufficient_dimensions_on_inv_sym():
     """Inversion symmetry raises for insufficient dimensions."""
     mat = np.random.rand(4, 4)
-    with pytest.raises(AssertionError, match="dim\(mat\) = 2 but must be at least 3 dimensional"):
+    with pytest.raises(AssertionError, match=r"dim\(mat\) = 2 but must be at least 3 dimensional"):
         bz.inv_sym(mat, axis=0)
 
 
@@ -108,7 +108,7 @@ def test_applies_simultaneous_inversion_in_x_and_y_directions():
 def test_raises_error_for_insufficient_dimensions_on_x_y_inv():
     """Simultaneous x-y inversion raises for insufficient dimensions."""
     mat = np.random.rand(4, 4)
-    with pytest.raises(AssertionError, match="dim\(mat\) = 2 but must be at least 3 dimensional"):
+    with pytest.raises(AssertionError, match=r"dim\(mat\) = 2 but must be at least 3 dimensional"):
         bz.x_y_inv(mat)
 
 
@@ -199,7 +199,7 @@ def test_does_nothing_when_no_symmetries_provided():
 def test_raises_error_for_insufficient_dimensions_on_apply_symmetries():
     """apply_symmetries raises for insufficient dimensions."""
     mat = np.random.rand(4, 4)
-    with pytest.raises(AssertionError, match="dim\(mat\) = 2 but must at least 3 dimensional"):
+    with pytest.raises(AssertionError, match=r"dim\(mat\) = 2 but must at least 3 dimensional"):
         bz.apply_symmetries(mat, [bz.KnownSymmetries.X_INV])
 
 
@@ -501,6 +501,21 @@ def test_build_k_path_single_segment_gamma_to_x():
     assert isinstance(k_path, np.ndarray)
     assert np.array_equal(k_path, expected)
     assert nkp == [2]
+
+
+def test_get_kpath_val_reads_each_axis_for_its_own_column():
+    """get_kpath_val maps the x/y/z path columns through kx/ky/kz respectively (regression: kx was used for all three)."""
+    kp = KPath(nk=(4, 4, 4), path="gamma-x")
+    kp.kx = np.array([10.0, 11.0, 12.0])
+    kp.ky = np.array([20.0, 21.0, 22.0])
+    kp.kz = np.array([30.0, 31.0, 32.0])
+    kp.kpts = np.array([[0, 1, 2], [2, 0, 1]])
+
+    kx_vals, ky_vals, kz_vals = kp.get_kpath_val()
+
+    assert np.array_equal(kx_vals, np.array([10.0, 12.0]))
+    assert np.array_equal(ky_vals, np.array([21.0, 20.0]))
+    assert np.array_equal(kz_vals, np.array([32.0, 31.0]))
 
 
 def test_get_bands_returns_sorted_real_eigenvalues():

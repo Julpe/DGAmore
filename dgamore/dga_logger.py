@@ -17,8 +17,7 @@ import mpi4py.MPI as MPI
 
 class DgaLogger:
     """
-    A logger class that handles logging messages in a distributed environment using MPI. Currently, it logs messages
-    to the stdout and can also be extended to log to a file.
+    Handles logging messages in a distributed environment using MPI. Currently, it logs messages to stdout.
     """
 
     def __init__(self, comm: MPI.Comm, output_path: str = "./", filename: str = "dga.log"):
@@ -94,7 +93,8 @@ class DgaLogger:
 
     def debug(self, message: str, allowed_ranks: tuple = (0,)):
         """
-        Logs a debug message. This is intended for detailed debugging information that is not usually needed in production.
+        Logs a debug message. This is intended for detailed debugging information that is not usually needed in
+        production.
 
         :param message: The message to log.
         :param allowed_ranks: The MPI rank(s) permitted to emit this message.

@@ -23,7 +23,7 @@ from dgamore.dga_logger import DgaLogger
 
 class ConfigParser:
     """
-    Parses the config file and builds the DgaConfig singleton class. The Configuration is then broadcasted to all
+    Parses the config file and builds the global ``dgamore.config`` singletons (``box``, ``lattice``, ``dmft``, ...). The configuration is then broadcast to all
     processes. The config file location can be specified with the path and/or name arguments when executing the main
     Python file.
     """

@@ -7,7 +7,7 @@ r"""
 Single-particle Green's function. :class:`GreensFunction` builds the momentum-dependent interacting Green's
 function :math:`G_{ab}(k, \nu) = [(\imath\nu + \mu)\delta_{ab} - \varepsilon_{ab}(k) - \Sigma_{ab}(k, \nu)]^{-1}`
 from a :class:`SelfEnergy`, the band dispersion :math:`\varepsilon(k)` and the chemical potential :math:`\mu`,
-and derives the filling, occupation, kinetic and (Galitskii–Migdal) potential energies. The module-level helpers
+and derives the filling, occupation, kinetic and (Galitskii-Migdal) potential energies. The module-level helpers
 adjust :math:`\mu` to a target filling via a Newton root search. Moment-corrected asymptotic sums are used so the
 finite Matsubara box does not bias the energies/filling.
 """
@@ -137,7 +137,7 @@ class GreensFunction(TwoPoint):
     \varepsilon_{ab}(k) - \Sigma_{ab}(k, \nu)]^{-1}`. Built from a :class:`SelfEnergy`, the band dispersion
     :math:`\varepsilon(k)` and the chemical potential :math:`\mu`; on top of the two-point orbital bookkeeping
     inherited from :class:`LocalTwoPoint` it adds the Dyson construction (local and momentum-resolved) and the
-    derived quantities — filling, occupation matrices, kinetic and (Galitskii–Migdal) potential energy — all using
+    derived quantities — filling, occupation matrices, kinetic and (Galitskii-Migdal) potential energy — all using
     moment-corrected asymptotic Matsubara sums so the finite frequency box does not bias the result.
     """
 
@@ -164,9 +164,9 @@ class GreensFunction(TwoPoint):
         :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
         :param calc_filling: If True (and ``sigma``/``ek`` are given), compute the local Green's function and the
             filling/occupation, exposed via the :attr:`n`, :attr:`occ` and :attr:`occ_k` properties.
-        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis (True) or as
-            ``[kx, ky, kz, ...]`` (False).
-        :param nk: Number of momenta per spatial direction.
+        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
+            (True) or as three separate axes ``[kx, ky, kz, ...]`` (False).
+        :param nk: Number of momenta per spatial direction ``(nkx, nky, nkz)``.
         :param beta: Inverse temperature :math:`\beta`.
         :param mu: Chemical potential :math:`\mu`.
         """
@@ -185,16 +185,16 @@ class GreensFunction(TwoPoint):
 
     @property
     def ek(self) -> np.ndarray:
-        """
+        r"""
         The band dispersion stored on this object.
 
-        :return: The band dispersion :math:`\\varepsilon(k)` as a numpy array.
+        :return: The band dispersion :math:`\varepsilon(k)` as a numpy array.
         """
         return self._ek
 
     @property
     def n(self) -> float:
-        """
+        r"""
         The total filling computed for this Green's function.
 
         :return: The total filling :math:`n`, or None if the filling has not been computed.
@@ -246,13 +246,13 @@ class GreensFunction(TwoPoint):
 
     @staticmethod
     def create_g_loc(siw: SelfEnergy, ek: np.ndarray, beta: float, mu: float, calc_filling: bool = True) -> "GreensFunction":
-        """
+        r"""
         Builds a local (k-summed) Green's function from a self-energy and band dispersion.
 
-        :param siw: The :class:`SelfEnergy` :math:`\\Sigma`.
-        :param ek: Band dispersion :math:`\\varepsilon(k)`.
-        :param beta: Inverse temperature :math:`\\beta`.
-        :param mu: Chemical potential :math:`\\mu`.
+        :param siw: The :class:`SelfEnergy` :math:`\Sigma`.
+        :param ek: Band dispersion :math:`\varepsilon(k)`.
+        :param beta: Inverse temperature :math:`\beta`.
+        :param mu: Chemical potential :math:`\mu`.
         :param calc_filling: If True, compute the filling/occupation (exposed via the ``n``/``occ``/``occ_k``
             properties).
         :return: The local :class:`GreensFunction`.
@@ -321,7 +321,7 @@ class GreensFunction(TwoPoint):
 
     def get_epot(self, niv_asympt: int = 50000) -> float:
         r"""
-        Moment-corrected Galitskii–Migdal potential energy,
+        Computes the moment-corrected Galitskii-Migdal potential energy,
 
         .. math::
 
