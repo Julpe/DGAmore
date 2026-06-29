@@ -599,7 +599,7 @@ def solve_eliashberg_lanczos_v2(
     gap_shape = gamma_r_pp.nq + 2 * (gamma_r_pp.n_bands,) + (gamma_r_pp.current_shape[-1],)
 
     gap0 = get_initial_gap_function(gap_shape, gamma_r_pp.channel)
-    gap0 = mpi_dist_v.bcast(gap0, root=root)
+    gap0 = mpi_dist_v.bcast_chunked(gap0, root=root)
 
     symmetry_label = config.eliashberg.symmetry.lower() if config.eliashberg.symmetry else "random"
     logger.info(
@@ -829,8 +829,8 @@ def solve(
         lambdas_trip = mpi_dist_irrk.bcast(lambdas_trip, root=rank_trip)
 
         for i in range(len(gaps_sing)):
-            gaps_sing[i] = mpi_dist_irrk.bcast(gaps_sing[i], root=rank_sing)
-            gaps_trip[i] = mpi_dist_irrk.bcast(gaps_trip[i], root=rank_trip)
+            gaps_sing[i] = mpi_dist_irrk.bcast_npoint(gaps_sing[i], root=rank_sing)
+            gaps_trip[i] = mpi_dist_irrk.bcast_npoint(gaps_trip[i], root=rank_trip)
     else:
         mpi_dist_v = MpiDistributor.create_distributor(
             ntasks=gamma_sing_pp.current_shape[-2], comm=comm, name="V", output_path=config.output.output_path
@@ -880,8 +880,8 @@ def solve(
         lambdas_trip = comm.bcast(lambdas_trip, root=root)
 
         for i in range(len(gaps_sing)):
-            gaps_sing[i] = mpi_dist_irrk.bcast(gaps_sing[i], root=root)
-            gaps_trip[i] = mpi_dist_irrk.bcast(gaps_trip[i], root=root)
+            gaps_sing[i] = mpi_dist_irrk.bcast_npoint(gaps_sing[i], root=root)
+            gaps_trip[i] = mpi_dist_irrk.bcast_npoint(gaps_trip[i], root=root)
 
     return lambdas_sing, lambdas_trip, gaps_sing, gaps_trip
 

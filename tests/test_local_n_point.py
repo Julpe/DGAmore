@@ -887,6 +887,51 @@ def test_cut_niv_copy_false_releases_parent_array():
     assert result.mat.base is None
 
 
+def test_cut_niw_and_niv_matches_separate_cuts_and_releases_parent():
+    """cut_niw_and_niv yields the same result as chaining cut_niw and cut_niv, in a single freed-parent copy."""
+    mat = np.arange(2 * 2 * 11 * 8 * 8).reshape(2, 2, 11, 8, 8).astype(complex)
+    obj = LocalNPoint(mat.copy(), 2, 1, 2, full_niw_range=True, full_niv_range=True)
+    result = obj.cut_niw_and_niv(2, 3)
+    expected = LocalNPoint(mat.copy(), 2, 1, 2, full_niw_range=True, full_niv_range=True).cut_niw(2).cut_niv(3)
+    assert np.array_equal(result.mat, expected.mat)
+    assert result.mat.base is None
+
+
+def test_cut_niw_and_niv_copy_false_mutates_self_in_place():
+    """cut_niw_and_niv(copy=False) mutates and returns self."""
+    obj = LocalNPoint(np.arange(2 * 2 * 11 * 8 * 8).reshape(2, 2, 11, 8, 8).astype(complex), 2, 1, 2)
+    result = obj.cut_niw_and_niv(2, 3, copy=False)
+    assert result is obj
+    assert obj.niw == 2 and obj.niv == 3
+
+
+def test_cut_niw_and_niv_copy_true_leaves_original_untouched():
+    """cut_niw_and_niv(copy=True) does not modify the original object."""
+    obj = LocalNPoint(np.arange(2 * 2 * 11 * 8 * 8).reshape(2, 2, 11, 8, 8).astype(complex), 2, 1, 2)
+    _ = obj.cut_niw_and_niv(2, 3)
+    assert obj.niw == 5 and obj.niv == 4
+
+
+def test_cut_niw_and_niv_no_op_returns_self_unchanged():
+    """cut_niw_and_niv with both cutoffs not smaller than the range returns self unchanged."""
+    obj = LocalNPoint(np.arange(2 * 2 * 11 * 8 * 8).reshape(2, 2, 11, 8, 8).astype(complex), 2, 1, 2)
+    assert obj.cut_niw_and_niv(10, 10) is obj
+
+
+def test_cut_niw_and_niv_raises_without_bosonic_dimension():
+    """cut_niw_and_niv raises when there is no bosonic frequency dimension."""
+    obj = LocalNPoint(np.zeros((2, 2, 8, 8)), 2, 0, 2)
+    with pytest.raises(ValueError):
+        obj.cut_niw_and_niv(2, 3)
+
+
+def test_cut_niw_and_niv_raises_without_fermionic_dimension():
+    """cut_niw_and_niv raises when there is no fermionic frequency dimension."""
+    obj = LocalNPoint(np.zeros((2, 2, 11)), 2, 1, 0)
+    with pytest.raises(ValueError):
+        obj.cut_niw_and_niv(2, 3)
+
+
 def test_to_half_niv_range_releases_parent_and_keeps_positive_half():
     """to_half_niv_range releases the parent and keeps the positive fermionic half."""
     mat = np.arange(2 * 2 * 8).reshape(2, 2, 8).astype(complex)

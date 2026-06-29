@@ -227,11 +227,13 @@ class IHaveMat(ABC):
         if you call this method directly, e.g. by del obj, because the object might still be part of a reference cycle.
         In this case, the memory will be freed when the reference cycle is collected by the garbage collector, which
         can be forced by calling gc.collect() after del obj. However, it is generally recommended to use the free()
-        method instead of del obj to explicitly free memory, since it also allows for the option to return freed heap
-        memory back to the OS on Linux systems. If you want to use the context manager, you can use "with obj:" which
-        will automatically free memory after the block.
+        method instead of del obj to explicitly free memory. The destructor does **not** trim the heap (it calls
+        ``free()`` with the default ``trim=False``): ``malloc_trim`` walks the whole heap, so trimming on every object
+        destruction in the tight per-q/per-w loops is wasted work for no memory benefit (the buffer is released
+        regardless). Return freed pages to the OS explicitly with ``free(trim=True)`` at coarse, heavy boundaries, or
+        via the ``with obj:`` context manager.
         """
-        self.free(True)
+        self.free()
 
     def __enter__(self):
         """
@@ -255,6 +257,10 @@ class IHaveMat(ABC):
         """
         Explicitly releases the underlying numpy array. If True and running on Linux, attempts to return freed heap
         memory back to the OS using malloc_trim.
+
+        ``trim`` defaults to **False** on purpose: ``malloc_trim`` walks the entire heap, so it should be requested
+        only at coarse, heavy boundaries (e.g. after a large object is released at the end of a self-consistency
+        iteration), never on every release in a hot loop.
 
         :param trim: If True, additionally attempt to return freed heap memory to the OS (Linux only).
         """
@@ -501,7 +507,9 @@ class IAmNonLocal(IHaveMat, ABC):
 
         :return: The total number of stored momenta.
         """
-        return np.prod(self.nq).astype(int) if not self.has_compressed_q_dimension else self.original_shape[0]
+        return (
+            int(self.nq[0] * self.nq[1] * self.nq[2]) if not self.has_compressed_q_dimension else self.original_shape[0]
+        )
 
     @property
     def has_compressed_q_dimension(self) -> bool:
@@ -653,8 +661,10 @@ class IAmNonLocal(IHaveMat, ABC):
         if not self.has_compressed_q_dimension:
             self.compress_q_dimension()
 
-        copy = deepcopy(self)
-        copy.mat = copy.mat[index][None, ...]
+        # Copy only the single requested q-slice instead of deep-copying the whole multi-q array; ``.copy()`` so the
+        # returned object does not keep the full parent array alive via a view.
+        copy = self._clone_without_mat()
+        copy.mat = self.mat[index][None, ...].copy()
         copy.update_original_shape()
         copy._nq = (1, 1, 1)
         return copy

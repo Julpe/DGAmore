@@ -1210,7 +1210,7 @@ def calculate_self_energy_q(
             kernel = _map_kernel_to_full_bz(kernel, mpi_dist_irrk, mpi_dist_fullbz)
             logger.info("Kernel mapped to full BZ.")
             sigma_new = calculate_sigma_from_kernel_auto(mpi_dist_fullbz, kernel, giwk_full, my_full_q_list)
-            kernel.free()
+            kernel.free(trim=True)  # coarse per-iteration trim: return the full-BZ kernel peak to the OS
             sigma_new.mat = mpi_dist_fullbz.allreduce(sigma_new.mat)
         else:
             # FFT path: split the bosonic-frequency sum into a positive- and a negative-w pass so the full-BZ
@@ -1250,7 +1250,7 @@ def calculate_self_energy_q(
             sigma_neg = calculate_sigma_from_kernel_fft(
                 mpi_dist_irrk, kernel_neg, giwk_full, [(i, -i) for i in range(1, niw + 1)], use_gpu
             )
-            kernel_neg.free()
+            kernel_neg.free(trim=True)  # coarse per-iteration trim: return the full-BZ kernel peak to the OS
 
             sigma_new.mat += sigma_neg.mat  # accumulate the rank-local R-space partial self-energies (in place)
             sigma_neg.free()
@@ -1258,7 +1258,7 @@ def calculate_self_energy_q(
             sigma_new.mat = mpi_dist_fullbz.gather(sigma_new.mat)
             if comm.rank == 0:
                 sigma_new = sigma_new.ifft().to_full_niv_range()
-            sigma_new = mpi_dist_fullbz.bcast(sigma_new)
+            sigma_new = mpi_dist_fullbz.bcast_npoint(sigma_new)
 
         logger.info("Self-energy calculated from kernel.")
         logger.log_memory_usage("Non-local sigma", sigma_new, comm.size)

@@ -112,6 +112,18 @@ def test_symmetrizes_random_matrix_correctly():
     assert np.allclose(result.mat, expected, rtol=1e-4)
 
 
+def test_take_first_wn_selects_first_entry_and_returns_independent_copy():
+    """take_first_wn removes the bosonic axis (keeping its first entry) and returns an independent copy."""
+    mat = np.random.rand(2, 2, 2, 2, 5, 6, 6) + 1j * np.random.rand(2, 2, 2, 2, 5, 6, 6)
+    obj = LocalFourPoint(mat, num_vn_dimensions=2)
+    expected = obj.mat[..., 0, :, :].copy()
+    result = obj.take_first_wn()
+    assert result.num_wn_dimensions == 0
+    assert np.allclose(result.mat, expected, rtol=1e-4)
+    result.mat[0, 0, 0, 0, 0, 0] = 12345.0
+    assert not np.allclose(obj.mat[0, 0, 0, 0, 0, 0, 0], 12345.0)
+
+
 def test_handles_symmetric_matrix_without_modification():
     """symmetrize leaves an already-symmetric matrix unchanged."""
     mat = np.array([[[[[[1, 2], [2, 4]]]]]])
