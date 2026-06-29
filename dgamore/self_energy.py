@@ -46,10 +46,10 @@ class SelfEnergy(TwoPoint):
 
         :param mat: Underlying self-energy array (two orbital axes and one fermionic frequency axis, optionally
             preceded by momentum axes).
-        :param nk: Number of momenta per spatial direction.
+        :param nk: Number of momenta per spatial direction ``(nkx, nky, nkz)``.
         :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
-        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis (True) or as
-            ``[kx, ky, kz, ...]`` (False).
+        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
+            (True) or as three separate axes ``[kx, ky, kz, ...]`` (False).
         :param estimate_niv_core: If True, estimate the core frequency box from the deviation to the asymptotic tail;
             otherwise the core extends over the full stored box.
         :param calc_smom: If True, fit the high-frequency moments :math:`(\Sigma_\infty, \Sigma_1)` on construction.
@@ -295,7 +295,7 @@ class SelfEnergy(TwoPoint):
 
     def interpolate(self, beta_target: float, niv_target: int, niv_linear: int = 4) -> "SelfEnergy":
         r"""
-        Re-grid the self-energy from its own inverse temperature :math:`\beta` (``self._beta``) to ``beta_target``.
+        Re-grids the self-energy from its own inverse temperature :math:`\beta` (``self._beta``) to ``beta_target``.
         Only the last (frequency) axis is interpolated.
 
         The innermost niv_linear source frequencies are interpolated linearly

@@ -3,7 +3,7 @@
 #
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
-"""
+r"""
 Interaction tensors. :class:`LocalInteraction` wraps the momentum-independent (Hubbard/Kanamori) interaction
 :math:`U_{abcd}`; :class:`Interaction` adds a momentum dimension for the non-local interaction :math:`V_{abcd}^q`.
 Both provide the channel projections (density/magnetic/singlet/triplet) and the algebra used in the ladder
@@ -46,7 +46,7 @@ class LocalInteraction(IHaveMat, IHaveChannel):
         """
         Permutes the four orbital axes according to an einsum-style permutation string.
 
-        :param permutation: einsum permutation of the four orbital labels, e.g. ``"abcd->adcb"``.
+        :param permutation: Einsum permutation of the four orbital labels, e.g. ``"abcd->adcb"``.
         :return: A new :class:`LocalInteraction` with permuted orbitals (a deep copy for the identity permutation).
         :raises ValueError: If the permutation string is not a valid four-orbital permutation.
         """
@@ -91,7 +91,7 @@ class LocalInteraction(IHaveMat, IHaveChannel):
 
     def add(self, other) -> "LocalInteraction":
         """
-        Adds another interaction or a raw numpy array elementwise; see :meth:`_add`.
+        Adds another interaction or a raw numpy array element-wise; see :meth:`_add`.
 
         :param other: A :class:`LocalInteraction` or a numpy array broadcastable to ``mat``.
         :return: A new :class:`LocalInteraction` holding the sum (inheriting the non-``NONE`` channel of the operands).
@@ -100,7 +100,7 @@ class LocalInteraction(IHaveMat, IHaveChannel):
 
     def _add(self, other, subtract: bool = False) -> "LocalInteraction":
         """
-        Adds (or, if ``subtract`` is True, subtracts) another interaction or a raw numpy array elementwise.
+        Adds (or, if ``subtract`` is True, subtracts) another interaction or a raw numpy array element-wise.
 
         :param other: A :class:`LocalInteraction` or a numpy array broadcastable to ``mat``.
         :param subtract: If True, subtract ``other`` instead of adding it (used by :meth:`sub` to avoid a negated copy).
@@ -121,7 +121,7 @@ class LocalInteraction(IHaveMat, IHaveChannel):
 
     def sub(self, other) -> "LocalInteraction":
         """
-        Subtracts another interaction or a raw numpy array elementwise; see :meth:`_add`.
+        Subtracts another interaction or a raw numpy array element-wise; see :meth:`_add`.
 
         :param other: A :class:`LocalInteraction` or a numpy array broadcastable to ``mat``.
         :return: A new :class:`LocalInteraction` holding the difference ``self - other``.
@@ -219,7 +219,7 @@ class Interaction(IAmNonLocal, LocalInteraction):
         """
         Permutes the four orbital axes (leaving the momentum axis untouched).
 
-        :param permutation: einsum permutation of the four orbital labels, e.g. ``"abcd->adcb"``.
+        :param permutation: Einsum permutation of the four orbital labels, e.g. ``"abcd->adcb"``.
         :return: A new :class:`Interaction` with permuted orbitals (a deep copy for the identity permutation).
         :raises ValueError: If the permutation string is not a valid four-orbital permutation.
         """

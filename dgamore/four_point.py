@@ -196,7 +196,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
     def to_compound_indices(self) -> "FourPoint":
         r"""
-        Converts the indices of the LocalFourPoint object :math:`F^{wvv'}_{lmm'l'}` to compound indices :math:`F^{w}_{c_1, c_2}`
+        Converts the indices of the FourPoint object :math:`F^{wvv'}_{lmm'l'}` to compound indices :math:`F^{w}_{c_1, c_2}`
         by transposing the object to [q, w, o1, o2, v, o4, o3, v'] (if the object has any fermionic frequency dimension,
         otherwise the compound indices are built from orbital dimensions only) and grouping {o1, o2, v} and {o4, o3, v'}
         to the new compound index. Always returns the object with a compressed momentum dimension and in the same niw
@@ -275,9 +275,9 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         """
         Converts an object stored with compound indices to an object that has unraveled momentum,
         orbital and frequency axes. Always returns the object with a compressed momentum dimension. This is the inverse
-        transformation as `to_compound_indices`. Will make use of the `original_shape` the object was created or last
-        modified with. If the `original_shape` is not set or is hard to obtain, the `shape` argument can be used to
-        specify the original shape of the object.
+        transformation of :meth:`to_compound_indices`. Will make use of the ``original_shape`` the object was
+        created or last modified with. If the ``original_shape`` is not set or is hard to obtain, the ``shape``
+        argument can be used to specify the original shape of the object.
 
         :param shape: Optional override for the stored ``original_shape`` used to unravel the compound axes.
         :return: ``self`` with unraveled orbital and frequency axes (compressed momentum).
@@ -513,9 +513,9 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
     def sub(self, other) -> "FourPoint":
         """
-        Helper method that allows for subtracted of FourPoint objects and other FourPoint, LocalFourPoint, Interaction or
-        LocalInteraction objects. Additions with numpy arrays, floats, ints or complex numbers are also supported.
-        Depending on the number of frequency and momentum dimensions, the vertices have to be added slightly different.
+        Helper method that allows for subtraction of FourPoint objects and other FourPoint, LocalFourPoint, Interaction or
+        LocalInteraction objects. Subtractions with numpy arrays, floats, ints or complex numbers are also supported.
+        Depending on the number of frequency and momentum dimensions, the vertices have to be subtracted slightly different.
         If the objects have different niw ranges, they will be converted to the half niw range before the subtraction.
         Objects will always be returned in the half niw range to save memory.
 
@@ -529,7 +529,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
     def mul(self, other) -> "FourPoint":
         r"""
         Allows for the multiplication with a number, a numpy array or another FourPoint object. This is different from
-        the `matmul` method, which is used for matrix multiplication.
+        the :meth:`matmul` method, which is used for matrix multiplication.
         In the case the other object is a FourPoint object, we require that both objects have only one fermionic
         frequency dimension, such that :math:`A_{abcd}^{qv} * B_{dcef}^{qv'} = C_{abef}^{qvv'}`. This is needed to
         construct the full vertex, see Eq. (3.139) in my thesis. Returns the object in the half niw range.
@@ -752,7 +752,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         return self
 
     def invert_and_sum_over_last_vn_v2(self, beta: float):
-        """
+        r"""
         Helper method that explicitly handles the calculation of the sum over the auxiliary susceptibility while
         being highly memory-efficient. Does not invert the matrix directly but uses a linear solver to avoid the
         creation of large intermediate arrays. This is especially important for objects with a large number of

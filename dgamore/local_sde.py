@@ -4,11 +4,11 @@
 # DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
-Local Schwinger–Dyson step. Given the two-particle DMFT Green's functions and the bare interaction, the functions
+Local Schwinger-Dyson step. Given the two-particle DMFT Green's functions and the bare interaction, the functions
 here build the local vertex hierarchy per spin channel — the generalized susceptibility :math:`\chi_{r}`, the
 irreducible vertex :math:`\Gamma_{r}` (with the Kitatani shell asymptotics), the auxiliary susceptibility
 :math:`\chi^{*}_{r}`, the three-leg vertex :math:`\gamma_{r}` (``vrg``), the full vertex :math:`F_{r}`, and the
-physical susceptibility — and recompute the local self-energy via the Schwinger–Dyson equation as a sanity check
+physical susceptibility — and recompute the local self-energy via the Schwinger-Dyson equation as a sanity check
 against the DMFT input. Equation numbers refer to the author's master's thesis (Chapter 3). A second set of
 functions implements the alternative ab-initio DGA formulation.
 """
@@ -65,7 +65,7 @@ def create_gamma_r_with_shell_correction(
 ) -> LocalFourPoint:
     r"""
     Calculates the irreducible vertex with the shell correction as described by Motoharu Kitatani
-    et al. 2022 J. Phys. Mater. 5 034005; DOI 10.1088/2515-7639/ac7e6d. More specifically equations A.4 and A.8.
+    et al. 2022 J. Phys. Mater. 5 034005; DOI 10.1088/2515-7639/ac7e6d. More specifically, see equations A.4 and A.8.
     The irreducible vertex has an additional factor of :math:`1/\beta^2` compared to DGApy. This is also described in
     my master's thesis, Sec. 3.7.2.
 
@@ -96,15 +96,15 @@ def create_auxiliary_chi(gamma_r: LocalFourPoint, gchi0_inv: LocalFourPoint, u_l
 def create_generalized_chi_with_shell_correction(
     gchi_aux_sum: LocalFourPoint, gchi0: LocalFourPoint, u_loc: LocalInteraction
 ) -> LocalFourPoint:
-    """
+    r"""
     Calculates the generalized susceptibility with the shell correction as described by
     Motoharu Kitatani et al. 2022 J. Phys. Mater. 5 034005; DOI 10.1088/2515-7639/ac7e6d. Eq. A.15. This is also
     described in my master's thesis, Sec. 3.7.2.
 
-    :param gchi_aux_sum: The frequency-summed auxiliary susceptibility :math:`\\sum_{\\nu\\nu'} \\chi^{*}_{r}`.
-    :param gchi0: The bare bubble :math:`\\chi_0` over the full frequency box.
+    :param gchi_aux_sum: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu\nu'} \chi^{*}_{r}`.
+    :param gchi0: The bare bubble :math:`\chi_0` over the full frequency box.
     :param u_loc: The bare local interaction :math:`U`.
-    :return: The shell-corrected physical susceptibility :math:`\\chi_{r}^{\\omega}` as a :class:`LocalFourPoint`.
+    :return: The shell-corrected physical susceptibility :math:`\chi_{r}^{\omega}` as a :class:`LocalFourPoint`.
     """
     gchi0_full_sum = 1.0 / config.sys.beta * gchi0.sum_over_all_vn(config.sys.beta)
     gchi0_core_sum = 1.0 / config.sys.beta * gchi0.cut_niv(config.box.niv_core).sum_over_all_vn(config.sys.beta)
@@ -114,7 +114,7 @@ def create_generalized_chi_with_shell_correction(
 def create_full_vertex_from_gamma(gamma_r, gchi0, u_loc):
     r"""
     Returns the local full vertex in the ``niv_full`` region from the irreducible vertex,
-    :math:`F = \Gamma [1 + \chi_0 \Gamma]^{-1}` (with :math:`\Gamma` padded with :math:`U` beyond the core box).
+    :math:`F = \Gamma [1 + \frac{1}{\beta^2} \chi_0 \Gamma]^{-1}` (with :math:`\Gamma` padded with :math:`U` beyond the core box).
 
     :param gamma_r: The irreducible vertex :math:`\Gamma_{r}` (core box).
     :param gchi0: The bare bubble :math:`\chi_0` (with its fermionic axis taken on the diagonal).
@@ -237,20 +237,20 @@ def get_loc_self_energy_vrg(
     g_dmft: GreensFunction,
     u_loc: LocalInteraction,
 ) -> SelfEnergy:
-    """
+    r"""
     Performs the local self-energy calculation using the Schwinger-Dyson equation, i.e. the local variant of Eq. (3.64)
     in my master's thesis. This is done to verify the implementation of the Schwinger-Dyson equation with the three-leg
     vertex and the local susceptibility against the DMFT self-energy. Note that there will never be a perfect match due
     to the sampling method of w2dynamics and the stochastic nature of the CTQMC solver. Nevertheless, the results should
     be very close. For more details, see also Paul Worm's PhD thesis, Eq. (3.70) and Anna Galler's PhD Thesis, P. 76 ff.
 
-    :param vrg_dens: The density three-leg vertex :math:`\\gamma_{\\mathrm{dens}}`.
-    :param vrg_magn: The magnetic three-leg vertex :math:`\\gamma_{\\mathrm{magn}}`.
-    :param gchi_dens_sum: The frequency-summed density susceptibility :math:`\\chi_{\\mathrm{dens}}^{\\omega}`.
-    :param gchi_magn_sum: The frequency-summed magnetic susceptibility :math:`\\chi_{\\mathrm{magn}}^{\\omega}`.
+    :param vrg_dens: The density three-leg vertex :math:`\gamma_{\mathrm{dens}}`.
+    :param vrg_magn: The magnetic three-leg vertex :math:`\gamma_{\mathrm{magn}}`.
+    :param gchi_dens_sum: The frequency-summed density susceptibility :math:`\chi_{\mathrm{dens}}^{\omega}`.
+    :param gchi_magn_sum: The frequency-summed magnetic susceptibility :math:`\chi_{\mathrm{magn}}^{\omega}`.
     :param g_dmft: The local (DMFT) :class:`GreensFunction`.
     :param u_loc: The bare local interaction :math:`U`.
-    :return: The local :class:`SelfEnergy` (including the Hartree–Fock term).
+    :return: The local :class:`SelfEnergy` (including the Hartree-Fock term).
     """
     # 1=i, 2=j, 3=k, 4=l, 7=o, 8=p
     g_wv = g_dmft.get_g_wv(MFHelper.wn(config.box.niw_core), config.box.niv_core)
@@ -265,7 +265,7 @@ def get_loc_self_energy_vrg(
 def perform_local_schwinger_dyson(
     g_dmft: GreensFunction, g2_dens: LocalFourPoint, g2_magn: LocalFourPoint, u_loc: LocalInteraction
 ):
-    """
+    r"""
     Performs the local Schwinger-Dyson equation calculation for the local self-energy for sanity checks against the
     DMFT self-energy. Includes the calculation of the local three-leg and full vertices, (auxiliary/bare/physical)
     susceptibilities and the irreducible vertices for both the density and magnetic channel. Employs explicit
@@ -349,7 +349,7 @@ def perform_local_schwinger_dyson_abinitio_dga(
     g2_magn: LocalFourPoint,
     u_loc: LocalInteraction,
 ):
-    """
+    r"""
     DEVELOPMENT / TESTING ONLY -- this is the ab-initio DGA cross-check, NOT the production routine
     (:func:`perform_local_schwinger_dyson`). Performs the local Schwinger-Dyson equation for the local (DMFT)
     self-energy as an internal sanity check, building the local self-energy from the full vertices.

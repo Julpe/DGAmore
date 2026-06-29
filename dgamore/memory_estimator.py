@@ -13,7 +13,7 @@ config singleton: every input is passed as an argument, which keeps the formulas
 
 All heavy quantities are backed by a single :data:`~dgamore.n_point_base.DTYPE` array, and q-points are distributed
 across MPI ranks, so per-rank arrays scale with the per-rank q-count rather than the total. Only the dominant large
-arrays of each branch are modelled; a single global ``OVERHEAD_FACTOR`` accounts for the un-modelled transients.
+arrays of each branch are modeled; a single global ``OVERHEAD_FACTOR`` accounts for the un-modeled transients.
 """
 
 from dataclasses import dataclass
@@ -127,7 +127,7 @@ def estimate_peaks(
     construct_fq_cheap: bool = False,
     overhead: float = OVERHEAD_FACTOR,
 ) -> tuple[float, dict[str, BranchPeak]]:
-    """
+    r"""
     Estimates the per-rank transient peak host-memory (in bytes) of the fast and lean code path of each
     memory-sensitive branch, split by whether each transient is distributed across the ranks of a node or built on a
     single rank, together with the per-rank persistent baseline.
@@ -156,7 +156,7 @@ def estimate_peaks(
         True the per-rank ``fq`` accumulator spans the full ``[wn, vc, vc]`` block instead of the small pp box.
     :param construct_fq_cheap: Whether the ``fq`` per-q blocks are built on the smaller pp frequency box
         (``config.eliashberg.construct_fq_cheap``), shrinking every per-q two-fermion block from ``vc`` to ``vpp``.
-    :param overhead: Global multiplicative factor accounting for un-modelled transient arrays.
+    :param overhead: Global multiplicative factor accounting for un-modeled transient arrays.
     :return: A tuple ``(baseline_bytes, peaks)`` of the per-rank baseline and a dict mapping each branch key to its
         :class:`BranchPeak`.
     """

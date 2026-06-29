@@ -12,7 +12,7 @@ the bubble :math:`\chi_0^q`, the auxiliary susceptibility :math:`\chi^{*;q}_{r}`
 the momentum-dependent self-energy :math:`\Sigma(k, \nu)`. Several CPU/GPU/FFT variants of the heavy contractions
 are provided, distributed over MPI ranks. The whole thing is wrapped in a self-consistency loop with chemical-
 potential adjustment and self-energy mixing (linear / Pulay / Anderson). Equation numbers refer to the author's
-master's thesis (Chapter 4).
+master's thesis (Chapters 3 & 4).
 """
 
 import glob
@@ -45,14 +45,16 @@ def get_hartree_fock(
     r"""
     Returns the Hartree-Fock term separately for the local and non-local interaction. Since we are always SU(2)-symmetric,
     the sum over the spins of the first term in Eq. (4.55) in Anna Galler's thesis results in a simple factor of 2. This
-    can be seen in my master's thesis, Eq. (3.56). The Hartree-Fock term is given by
+    can be seen in my master's thesis, Eq. (3.55). The Hartree-Fock term is given by
+
     .. math:: \Sigma_{HF}^k = 2(U_{acbd} + V^{q=0}_{acbd}) n_{dc} - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}
-    where the Hartree-term reads :math:`\Sigma_{H} = 2(U_{acbd} + V^{q=0}_{acbd}) n_{dc}` and the Fock-term reads
+
+    where the Hartree term reads :math:`\Sigma_{H} = 2(U_{acbd} + V^{q=0}_{acbd}) n_{dc}` and the Fock term reads
     :math:`\Sigma_{F}^k = - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}`. The Hartree contraction uses the
     middle-index-swapped ``U_{acbd}`` so it picks up the inter-orbital density :math:`U'` (stored at :math:`U_{abab}`);
     see :func:`dgamore.local_sde.get_local_hartree_fock`.
-    Processes the Fock-Term for each individual orbital to save memory, as for high momentum grids,
-    the occ_qk property can become large.
+    Processes the Fock term for each individual orbital to save memory, as for high momentum grids,
+    the ``occ_qk`` property can become large.
 
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{q}` (see :class:`Interaction`).
@@ -228,17 +230,17 @@ def create_generalized_chi_q_with_shell_correction(
     u_loc: LocalInteraction,
     v_nonloc: Interaction,
 ) -> FourPoint:
-    """
+    r"""
     Calculates the generalized susceptibility with the shell correction as described by
     Motoharu Kitatani et al. 2022 J. Phys. Mater. 5 034005; DOI 10.1088/2515-7639/ac7e6d. Eq. A.15. See also Sec. 3.7.2
     in my master's thesis for details.
 
-    :param gchi_aux_q_sum: The frequency-summed auxiliary susceptibility :math:`\\sum_{\\nu\\nu'}\\chi^{*;q}_{r}`.
+    :param gchi_aux_q_sum: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu\nu'}\chi^{*;q}_{r}`.
     :param gchi0_q_full_sum: The frequency-summed bare bubble over the full box.
     :param gchi0_q_core_sum: The frequency-summed bare bubble over the core box.
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{q}`.
-    :return: The shell-corrected physical susceptibility :math:`\\chi^{q}_{r}` as a :class:`FourPoint`.
+    :return: The shell-corrected physical susceptibility :math:`\chi^{q}_{r}` as a :class:`FourPoint`.
     """
     return (
         (gchi_aux_q_sum + gchi0_q_full_sum - gchi0_q_core_sum).invert()
@@ -247,12 +249,12 @@ def create_generalized_chi_q_with_shell_correction(
 
 
 def calculate_sigma_dc_kernel(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, u_loc: LocalInteraction) -> FourPoint:
-    """
+    r"""
     Returns the double-counting kernel for the self-energy calculation, contracting the local full vertex with the
     momentum-dependent bubble per q-point. For details, see Eq. (4.28) in my master's thesis.
 
     :param f_dc_loc: The local full vertex :math:`F` used for the double-counting correction.
-    :param gchi0_q: The momentum-dependent bare bubble :math:`\\chi_0^q`.
+    :param gchi0_q: The momentum-dependent bare bubble :math:`\chi_0^q`.
     :param u_loc: The bare local interaction :math:`U`.
     :return: The double-counting kernel as a :class:`FourPoint`, cut to the core fermionic box.
     """
@@ -291,9 +293,9 @@ def calculate_kernel_r_q(
     return u_r @ kernel
 
 
-def perform_ornstein_zernicke_fit(chi_phys_q_r: FourPoint) -> None:
+def perform_ornstein_zernike_fit(chi_phys_q_r: FourPoint) -> None:
     r"""
-    Fits the static (:math:`\omega = 0`) physical susceptibility to an Ornstein–Zernike form
+    Fits the static (:math:`\omega = 0`) physical susceptibility to an Ornstein-Zernike form
     :math:`\chi(q) = A / (\xi^{-2} + (q - q_0)^2)` around the antiferromagnetic wave vector
     :math:`q_0 = (\pi, \pi, 0)`, per orbital combination, and writes the amplitude :math:`A` and correlation length
     :math:`\xi` to ``oz_coeff.txt``. Non-converging fits are flagged with ``[-1, -1]``.
@@ -303,12 +305,12 @@ def perform_ornstein_zernicke_fit(chi_phys_q_r: FourPoint) -> None:
     """
 
     def oz_spin_w0(q_grid: KGrid, a: float, xi: float):
-        """
-        Evaluates the Ornstein–Zernike model on the full BZ grid, flattened to match the fit data.
+        r"""
+        Evaluates the Ornstein-Zernike model on the full BZ grid, flattened to match the fit data.
 
         :param q_grid: The :class:`KGrid` providing the momentum coordinates.
         :param a: The amplitude :math:`A`.
-        :param xi: The correlation length :math:`\\xi`.
+        :param xi: The correlation length :math:`\xi`.
         :return: The flattened model susceptibility over the BZ grid.
         """
         qx = qy = np.pi
@@ -323,7 +325,7 @@ def perform_ornstein_zernicke_fit(chi_phys_q_r: FourPoint) -> None:
 
     def fit_oz_spin(q_grid: KGrid, mat: np.ndarray):
         """
-        Least-squares fits the Ornstein–Zernike model to one orbital slice of the susceptibility.
+        Least-squares fits the Ornstein-Zernike model to one orbital slice of the susceptibility.
 
         :param q_grid: The :class:`KGrid` providing the momentum coordinates.
         :param mat: The flattened susceptibility slice to fit.
@@ -465,9 +467,9 @@ def calculate_sigma_kernel_r_q(
             chi_phys_q_r = perform_lambda_correction(chi_phys_q_r)
         chi_phys_q_r.save(name=f"chi_phys_q_{chi_phys_q_r.channel.value}", output_dir=config.output.output_path)
 
-        # perform Ornstein-Zernicke fit
+        # perform Ornstein-Zernike fit
         if chi_phys_q_r.channel == SpinChannel.MAGN:
-            perform_ornstein_zernicke_fit(chi_phys_q_r)
+            perform_ornstein_zernike_fit(chi_phys_q_r)
 
     chi_phys_q_r.mat = mpi_dist_irrq.scatter(chi_phys_q_r.mat)
     logger.info(f"Saved physical susceptibility ({chi_phys_q_r.channel.value}) to file.")
@@ -688,7 +690,7 @@ def calculate_sigma_from_kernel_gpu(
 def calculate_sigma_from_kernel_auto(
     mpi_distributor: MpiDistributor, kernel: FourPoint, giwk: GreensFunction, my_full_q_list: np.ndarray
 ) -> SelfEnergy:
-    """
+    r"""
     Dispatches the q-loop self-energy contraction to the GPU (:func:`calculate_sigma_from_kernel_gpu`) when CuPy and
     a usable CUDA device are available (one GPU per MPI rank, round-robin), otherwise falls back to the CPU
     implementation (:func:`calculate_sigma_from_kernel_cpu`).
@@ -728,7 +730,7 @@ def calculate_sigma_from_kernel_fft_cpu(
     mpi_dist: MpiDistributor, kernel: FourPoint, giwk: GreensFunction, niw_index_w_pairs: list[tuple[int, int]]
 ) -> SelfEnergy:
     r"""
-    Optimized self-energy calculation using distributed FFTs (CPU). Replaces the q-loop with a real-space pointwise
+    Computes the self-energy using distributed FFTs (CPU). Replaces the q-loop with a real-space pointwise
     multiplication: both the Green's function and the kernel are FFT'd to real space (the kernel to :math:`-R` via the
     conjugate trick), contracted pointwise per rank-local R-slice, and accumulated. Returns :math:`\Sigma` in R-space,
     positive-:math:`\nu` half only; the caller must ifft over :math:`(k_x, k_y, k_z)` and then call
@@ -799,7 +801,7 @@ def calculate_sigma_from_kernel_fft_gpu(
     mpi_dist: MpiDistributor, kernel: FourPoint, giwk: GreensFunction, niw_index_w_pairs: list[tuple[int, int]]
 ) -> SelfEnergy:
     r"""
-    Optimized self-energy calculation using distributed FFTs, running on the GPU (CuPy). Same algorithm as
+    Computes the self-energy using distributed FFTs, running on the GPU (CuPy). Same algorithm as
     :func:`calculate_sigma_from_kernel_fft_cpu` (including the single-niw-half / ``niw_index_w_pairs`` contraction).
     Returns :math:`\Sigma` in R-space, positive-:math:`\nu` half only; the caller must ifft over
     :math:`(k_x, k_y, k_z)` and then call :meth:`SelfEnergy.to_full_niv_range` before use.
@@ -892,7 +894,7 @@ def calculate_sigma_from_kernel_fft(
     niw_index_w_pairs: list[tuple[int, int]],
     use_gpu: bool,
 ) -> SelfEnergy:
-    """
+    r"""
     Dispatches one bosonic-frequency FFT pass to the GPU (:func:`calculate_sigma_from_kernel_fft_gpu`) or CPU
     (:func:`calculate_sigma_from_kernel_fft_cpu`) implementation according to ``use_gpu`` (decided once by
     :func:`select_sigma_fft_device`, so no per-pass GPU-detection logging).
@@ -929,9 +931,9 @@ def _map_kernel_to_full_bz(
 
 def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
     """
-    If one continues from a previous self-consistency calculation, we try to retrieve the last calculated self-energy as
-    a starting point for the next calculation. Whether the normal or interpolated sigma is chosen depends on the
-    setting. If no ``sigma_dga_*_N.npy`` file is found, we use the DMFT self-energy as a starting point.
+    Tries to retrieve the last calculated self-energy from a previous self-consistency calculation as a starting point
+    for the next calculation. Whether the normal or interpolated sigma is chosen depends on the setting. If no
+    ``sigma_dga_*_N.npy`` file is found, we use the DMFT self-energy as a starting point.
 
     :param default_sigma: The fallback (DMFT) :class:`SelfEnergy` used when no previous result is found.
     :return: A tuple of the starting :class:`SelfEnergy` (cut to the core box and interpolated onto the k-grid) and
@@ -1044,8 +1046,8 @@ def read_last_n_sigmas_from_files(n: int, output_path: str = "./", previous_sc_p
 def calculate_self_energy_q(
     comm: MPI.Comm, u_loc: LocalInteraction, v_nonloc: Interaction, sigma_dmft: SelfEnergy, sigma_local: SelfEnergy
 ) -> SelfEnergy:
-    """
-    Main routine for the non-local DGA self-energy calculation. Calculates the Hartree- and Fock-terms, the bubble,
+    r"""
+    Runs the non-local DGA self-energy calculation. Calculates the Hartree- and Fock terms, the bubble,
     the double-counting correction and the kernel in the density and magnetic channel. Finally, calculates the
     non-local self-energy from the kernel and the Green's function. Also takes care of the self-consistency loop and
     the chemical potential adjustment as well as the self-energy mixing, etc.
@@ -1054,7 +1056,7 @@ def calculate_self_energy_q(
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{q}`.
     :param sigma_dmft: The DMFT self-energy (used as the starting point and for the shell/tail correction).
-    :param sigma_local: The locally recomputed self-energy (used for the double-counting :math:`\\Delta\\Sigma`).
+    :param sigma_local: The locally recomputed self-energy (used for the double-counting :math:`\Delta\Sigma`).
     :return: The converged (or last-iteration) momentum-dependent DGA :class:`SelfEnergy`.
     """
     logger = config.logger

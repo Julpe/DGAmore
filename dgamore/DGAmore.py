@@ -633,10 +633,10 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
 def setup_lambda_correction_settings(comm: MPI.Comm) -> None:
     """
     Sets up the lambda correction settings based on the configuration provided by the user. If the user has enabled
-    the lambda correction in the self-consistency settings, it will be enabled in the lambda correction settings as well.
-    If the user has enabled the lambda correction in the lambda correction settings, but not in the self-consistency settings,
-    the self-consistency will be set to a single iteration with full mixing. Will raise an error if the user tries to enable
-    the lambda correction for multi-band systems.
+    the lambda correction in the self-consistency settings, it will be enabled in the lambda correction settings
+    as well. If the user has enabled the lambda correction in the lambda correction settings, but not in the
+    self-consistency settings, the self-consistency will be set to a single iteration with full mixing. Will raise
+    an error if the user tries to enable the lambda correction for multi-band systems.
 
     :param comm: The MPI communicator (only rank 0 validates the multi-band restriction).
     :return: None.
@@ -679,7 +679,7 @@ def setup_lambda_correction_settings(comm: MPI.Comm) -> None:
 def configure_matplotlib():
     """
     Configures matplotlib to use the Euler font for mathematical expressions if it is available on the system. This is
-    done because The Euler font is the default math font in my thesis.
+    done because the Euler font is the default math font in my thesis.
 
     :return: None.
     """

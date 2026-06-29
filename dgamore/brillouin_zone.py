@@ -183,8 +183,8 @@ def simultaneous_x_y_inversion() -> list[KnownSymmetries]:
 
 
 def inv_sym(mat: np.ndarray, axis) -> None:
-    """
-    Applies an inversion symmetry along ``axis`` to ``mat`` in place, assuming the grid runs over :math:`[0, 2\\pi)`
+    r"""
+    Applies an inversion symmetry along ``axis`` to ``mat`` in place, assuming the grid runs over :math:`[0, 2\pi)`
     so that the zero point does not map.
 
     :param mat: The (at least 3D) array to symmetrize in place; the leading three axes are the momentum axes.
@@ -308,12 +308,11 @@ def apply_symmetries(mat: np.ndarray, symmetries: list[KnownSymmetries]) -> None
 
 def get_lattice_symmetries_from_string(symmetry_string: str | tuple | list) -> list[KnownSymmetries]:
     """
-    Return the lattice symmetries from a string.
+    Returns the lattice symmetries from a string.
 
-    The special string "auto" signals that symmetries should be auto-detected
-    from a Hamiltonian H(k) at runtime via KGrid.specify_auto_symmetries(hk).
-    In that case an empty list is returned here, but a marker is set so that
-    the KGrid defers building fbz2irrk until specify_auto_symmetries is called.
+    The special string ``"auto"`` signals that symmetries should be auto-detected from a Hamiltonian ``H(k)`` at
+    runtime via :meth:`specify_auto_symmetries`. In that case an empty list is returned here, but a marker is set so
+    that the KGrid defers building ``fbz2irrk`` until :meth:`specify_auto_symmetries` is called.
 
     :param symmetry_string: A named preset (e.g. ``"two_dimensional_square"``), the special ``"auto"``, an empty
         string/``"none"``, or a list/tuple (or its string repr) of :class:`KnownSymmetries` values.
@@ -408,13 +407,11 @@ class KGrid:
     """
     Class to build the k-grid for the Brillouin zone.
 
-    The ``symmetries`` argument accepts the usual list of ``KnownSymmetries``
-    *and* the special "auto" mode (passed as the ``AUTO_SYMMETRIES_SENTINEL``,
-    typically obtained from ``get_lattice_symmetries_from_string("auto")``).
-    In auto mode the symmetry group is discovered from a Hamiltonian H(k) at
-    runtime: instantiate the grid with the sentinel, then call
-    :meth:`specify_auto_symmetries` with the Hamiltonian. Until that call the
-    grid behaves as if no symmetries were applied (full BZ = IBZ).
+    The ``symmetries`` argument accepts the usual list of ``KnownSymmetries`` *and* the special "auto" mode (passed as
+    the ``AUTO_SYMMETRIES_SENTINEL``, typically obtained from ``get_lattice_symmetries_from_string("auto")``). In auto
+    mode the symmetry group is discovered from a Hamiltonian ``H(k)`` at runtime: instantiate the grid with the
+    sentinel, then call :meth:`specify_auto_symmetries` with the Hamiltonian. Until that call the grid behaves as if
+    no symmetries were applied (full BZ = IBZ).
     """
 
     def __init__(self, nk: tuple = None, symmetries: list[KnownSymmetries] = None):
@@ -480,8 +477,8 @@ class KGrid:
         verbose: bool = False,
         include_antiunitary: bool = False,
     ) -> None:
-        """
-        Auto-detect the symmetry group of the Hamiltonian ``hk`` and replay
+        r"""
+        Auto-detects the symmetry group of the Hamiltonian ``hk`` and replay
         the IBZ reduction onto this grid.
 
         Only applicable when this ``KGrid`` was constructed in auto mode
@@ -684,8 +681,8 @@ class KGrid:
         return self.kmesh.reshape((3, -1))
 
     def set_k_axes(self) -> None:
-        """
-        Builds the three k-axis arrays spanning :math:`[0, 2\\pi)` for the full BZ.
+        r"""
+        Builds the three k-axis arrays spanning :math:`[0, 2\pi)` for the full BZ.
 
         :return: None.
         """
@@ -713,18 +710,18 @@ class KGrid:
 class KPath:
     """
     Object to generate paths in the Brillouin zone.
-    Currently assumed that the BZ grid is from (0,2*pi).
+    It is currently assumed that the BZ grid is from (0,2*pi).
     """
 
     def __init__(self, nk, path, kx=None, ky=None, kz=None, path_deliminator="-"):
-        """
+        r"""
         Builds the k-axes and the discretized path (and its k-points) from the path string.
 
         :param nk: Number of k-points per spatial direction, as a tuple ``(nx, ny, nz)``.
         :param path: The desired path through the BZ as a delimiter-separated string of corner-point labels.
-        :param kx: Optional explicit kx-axis array; a :math:`[0, 2\\pi)` grid is built if None.
-        :param ky: Optional explicit ky-axis array; a :math:`[0, 2\\pi)` grid is built if None.
-        :param kz: Optional explicit kz-axis array; a :math:`[0, 2\\pi)` grid is built if None.
+        :param kx: Optional explicit kx-axis array; a :math:`[0, 2\pi)` grid is built if None.
+        :param ky: Optional explicit ky-axis array; a :math:`[0, 2\pi)` grid is built if None.
+        :param kz: Optional explicit kz-axis array; a :math:`[0, 2\pi)` grid is built if None.
         :param path_deliminator: The delimiter separating corner-point labels in ``path``.
         """
         self.path_deliminator = path_deliminator
@@ -748,12 +745,12 @@ class KPath:
 
         :return: The k-axis values along the path as a list ``[kx_vals, ky_vals, kz_vals]``.
         """
-        k = [self.kx[self.kpts[:, 0]], self.kx[self.kpts[:, 1]], self.kx[self.kpts[:, 2]]]
+        k = [self.kx[self.kpts[:, 0]], self.ky[self.kpts[:, 1]], self.kz[self.kpts[:, 2]]]
         return k
 
     def set_kgrid(self, k_in, nk):
-        """
-        Returns an explicit k-axis if given, otherwise builds a :math:`[0, 2\\pi)` grid of ``nk`` points.
+        r"""
+        Returns an explicit k-axis if given, otherwise builds a :math:`[0, 2\pi)` grid of ``nk`` points.
 
         :param k_in: Explicit k-axis array, or None to build a default grid.
         :param nk: Number of points in the default grid.

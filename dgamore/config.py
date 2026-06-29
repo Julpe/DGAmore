@@ -26,11 +26,11 @@ class InteractionConfig:
     interactions); the remaining parameters are reserved for future use.
 
     :ivar float udd: Intra-orbital Hubbard interaction :math:`U_{dd}` on the d orbitals.
-    :ivar float udp: d-p inter-orbital Hubbard interaction.
+    :ivar float udp: Inter-orbital d-p Hubbard interaction.
     :ivar float upp: Intra-orbital Hubbard interaction :math:`U_{pp}` on the p orbitals.
     :ivar float uppod: Off-diagonal p-p Hubbard interaction.
     :ivar float jdd: Hund's exchange :math:`J_{dd}` on the d orbitals.
-    :ivar float jdp: d-p exchange.
+    :ivar float jdp: Inter-orbital d-p exchange.
     :ivar float jpp: Hund's exchange :math:`J_{pp}` on the p orbitals.
     :ivar float jppod: Off-diagonal p-p exchange.
     :ivar float vdd: Inter-orbital interaction :math:`V_{dd}` on the d orbitals.
@@ -107,14 +107,14 @@ class LatticeConfig:
 
 
 class SelfConsistencyConfig:
-    """
+    r"""
     Stores the self-consistency-loop parameters: the maximum iteration count, the convergence criterion, the mixing
     parameter/scheme and continuation options. If ``previous_sc_path`` is set, the loop resumes from a previous run.
     The mixing scheme can be ``"linear"``, ``"pulay"`` or ``"anderson"`` (the latter two use an iteration history).
 
     :ivar int max_iter: Maximum number of self-consistency iterations.
     :ivar float epsilon: Relative-residual convergence threshold on the self-energy.
-    :ivar float mixing: The mixing parameter :math:`\\alpha`.
+    :ivar float mixing: The mixing parameter :math:`\alpha`.
     :ivar str mixing_strategy: The mixing scheme (``"linear"``, ``"pulay"`` or ``"anderson"``).
     :ivar int mixing_history_length: Number of past iterations used by the accelerated mixing schemes.
     :ivar str previous_sc_path: Path to a previous self-consistency run to resume from (empty to start fresh).
@@ -217,7 +217,7 @@ class SystemConfig:
     :ivar float n: Total filling :math:`n`.
     :ivar int n_bands: Number of bands.
     :ivar numpy.ndarray occ: Local (k-averaged) occupation matrix.
-    :ivar numpy.ndarray occ_k: k-resolved occupation matrix.
+    :ivar numpy.ndarray occ_k: Full (k-resolved) occupation matrix.
     :ivar numpy.ndarray occ_dmft: Local occupation matrix from the DMFT input.
     :ivar list occ_dmft_per_ineq: DMFT occupation matrices per inequivalent atom.
     """

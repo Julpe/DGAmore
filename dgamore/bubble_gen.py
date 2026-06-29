@@ -124,7 +124,7 @@ class BubbleGenerator:
         beta: float,
         logger: DgaLogger,
     ):
-        """
+        r"""
         Dispatches :meth:`create_generalized_chi0_q_fft` to the GPU when CuPy and a usable CUDA device are available
         (assigning one GPU per MPI rank round-robin), otherwise falls back to the CPU.
 
@@ -133,7 +133,7 @@ class BubbleGenerator:
         :param niw: Number of positive bosonic frequencies.
         :param niv: Number of positive fermionic frequencies.
         :param k_grid: The :class:`KGrid` over which the BZ sum/FFT is performed.
-        :param beta: Inverse temperature :math:`\\beta`.
+        :param beta: Inverse temperature :math:`\beta`.
         :param logger: Logger used to report whether GPU acceleration is used.
         :return: The bubble as a :class:`FourPoint` over the irreducible BZ.
         """
@@ -239,7 +239,7 @@ class BubbleGenerator:
         beta: float,
         logger: DgaLogger,
     ):
-        """
+        r"""
         Dispatches :meth:`create_generalized_chi0_q` to the GPU when CuPy and a usable CUDA device are available
         (assigning one GPU per MPI rank round-robin), otherwise falls back to the CPU.
 
@@ -249,7 +249,7 @@ class BubbleGenerator:
         :param niv: Number of positive fermionic frequencies.
         :param q_list: Array of integer q-point index triplets to compute.
         :param q_grid: The :class:`KGrid` providing the momentum normalization.
-        :param beta: Inverse temperature :math:`\\beta`.
+        :param beta: Inverse temperature :math:`\beta`.
         :param logger: Logger used to report whether GPU acceleration is used.
         :return: The bubble as a :class:`FourPoint` over the given q-points.
         """

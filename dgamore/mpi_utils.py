@@ -261,7 +261,7 @@ class MpiDistributor:
     """
     Distributes tasks among all available cores. Uses the first (q) dimension to slice the vertex data into chunks
     and sends it to all active MPI processes. Saves intermediate computational results in rank files. Each rank
-    has their own instance of an MPI distributor and hdf5-file to avoid write conflicts.
+    has its own instance of an MPI distributor and hdf5-file to avoid write conflicts.
     """
 
     def __init__(self, ntasks: int = 1, comm: MPI.Comm = None, name: str = "", output_path: str = None):
@@ -693,7 +693,7 @@ class MpiDistributor:
         ``Allreduce`` is collective, so the chunk schedule must be identical on every rank. That holds here because the
         reduced arrays are always equally shaped across ranks (the callers reduce full, replicated quantities such as
         the full-k-space self-energy / Fock term — each rank holds a partial sum of the *same* array), so every rank
-        derives the same chunk boundaries. The single-chunk case is byte-for-byte the previous behaviour.
+        derives the same chunk boundaries. The single-chunk case is byte-for-byte the previous behavior.
 
         :param rank_result: This rank's contribution; reduced in place. Must have the same shape on every rank.
         :return: The summed array (same buffer), identical on all ranks.
@@ -867,13 +867,13 @@ def exchange_and_map_irrbz_fullbz(
     obj: FourPoint, mpi_dist_irrk: MpiDistributor, mpi_dist_fullbz: MpiDistributor
 ) -> FourPoint:
     """
-    Maps an obj from the irreducible BZ distribution to the full BZ distribution without
+    Maps an object from the irreducible BZ distribution to the full BZ distribution without
     ever assembling the full object on any single rank.
 
-    Each rank holds a slice of the obj over the irreducible BZ (shape [q_irr_rank, ...]).
+    Each rank holds a slice of the object over the irreducible BZ (shape [q_irr_rank, ...]).
     This routine redistributes the data peer-to-peer so that each rank ends up with a slice
     over the full BZ (shape [q_full_rank, ...]), with symmetry-equivalent points correctly
-    replicated according to the irrk_inv mapping.
+    replicated according to the ``irrk_inv`` mapping.
 
     If ``config.lattice.q_grid`` is in auto-discovered symmetry mode (its
     ``specify_auto_symmetries`` has been called), the per-k orbital transformation
@@ -887,7 +887,7 @@ def exchange_and_map_irrbz_fullbz(
             obj = obj.map_to_full_bz(q_grid)
         obj.mat = mpi_dist_fullbz.scatter(obj.mat)
 
-    which would require rank 0 to hold the entire full-BZ obj in memory.
+    which would require rank 0 to hold the entire full-BZ object in memory.
 
     :param obj: The :class:`FourPoint` distributed over the irreducible BZ.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ (source layout).
@@ -1043,7 +1043,7 @@ def gather_full_ibz_for_vslice(
     gamma_r: FourPoint, mpi_dist_irrq: MpiDistributor, mpi_dist_v: MpiDistributor, q_grid: KGrid
 ) -> FourPoint:
     """
-    Re-layouts a q-distributed pairing vertex into a fermionic-frequency-distributed one for the Eliashberg solver:
+    Re-lays out a q-distributed pairing vertex into a fermionic-frequency-distributed one for the Eliashberg solver:
     each rank ends up with the full BZ but only its node-aware slice of the (second) fermionic frequency. The
     momentum is unfolded to the full BZ locally. Ranks with an empty frequency slice receive ``None``.
 
@@ -1272,12 +1272,12 @@ def _redistribute_p2p(mat, nq, comm, source_layout, target_layout):
 def execute_distributed_fft(obj: FourPoint, comm: MPI.Comm) -> FourPoint:
     """
     Main routine: Call this for objects that are local to a rank but in the respective full BZ slice. E.g., after
-    a call of exchange_and_map_irrbz_fullbz.
+    a call to :func:`exchange_and_map_irrbz_fullbz`.
     This routine performs a distributed 3D FFT by redistributing the data into pencil decompositions for
     each dimension, performing local FFTs, and then redistributing back to the original layout.
-    The final result is that obj.mat is transformed in-place to the Fourier space representation
+    The final result is that ``obj.mat`` is transformed in place to the Fourier space representation
     corresponding to the full BZ.
-    Attention: modifies the object in-place!
+    Attention: modifies the object in place!
 
     :param obj: The :class:`FourPoint` distributed over the full BZ (``flat`` layout), transformed in place.
     :param comm: The MPI communicator.

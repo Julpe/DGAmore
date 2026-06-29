@@ -44,11 +44,11 @@ def uniquify_path(path: str = None):
 def load_from_dmft_file_and_update_config() -> (
     tuple[list[GreensFunction], list[SelfEnergy], list[LocalFourPoint], list[LocalFourPoint]]
 ):
-    """
+    r"""
     Loads the per-inequivalent-atom DMFT quantities (1- and 2-particle) and updates the global config: inverse
     temperature, interaction parameters, chemical potential, filling, frequency boxes, band count, Hamiltonian and
     output paths. Also cuts the two-particle Green's functions to the core box and applies the requested orbital and
-    :math:`(\\nu, \\nu')` symmetrizations.
+    :math:`(\nu, \nu')` symmetrizations.
 
     :return: A tuple of per-inequivalent-atom lists ``(g_per_ineq, sigma_per_ineq, g2_dens_per_ineq,
         g2_magn_per_ineq)`` of Green's functions, self-energies and density/magnetic two-particle Green's functions.
