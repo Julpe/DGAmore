@@ -27,9 +27,9 @@ from dgamore.n_point_base import DTYPE
 DTYPE_BYTES: int = np.dtype(DTYPE).itemsize
 OVERHEAD_FACTOR: float = 1.1
 
-# chiq_aux builds its two-fermion block via ``(gchi0_inv + gamma) - (v + u)``; ``sub`` is ``add(-other)``, so the
-# add-then-sub chain holds two full blocks live, and the following invert_and_sum_over_last_vn keeps its input block
-# resident while looping over q (the per-q inversion transient is single-q, hence negligible). The peak is therefore
+# chiq_aux builds its two-fermion block via ``(gchi0_inv + gamma) - (v + u)``; each add/sub returns a new full block
+# while its input block is still live, and the following invert_and_sum_over_last_vn keeps its input block resident
+# while looping over q (the per-q inversion transient is single-q, hence negligible). The peak is therefore
 # ~2x the rank-local block, not 1x.
 CHIQ_AUX_INVERT_FACTOR: int = 2
 

@@ -113,15 +113,19 @@ class SelfEnergy(TwoPoint):
 
         :return: A copy of the self-energy with the asymptotic tail outside the core region.
         """
-        copy = deepcopy(self)
-        asympt = copy._get_asympt(niv=copy.niv)
+        # ``_get_asympt`` reads only the moments/grid (not ``mat``), and ``cut_niv`` already returns an independent
+        # copy, so source from ``self`` directly and drop the wasteful initial ``deepcopy`` of the full array.
+        asympt = self._get_asympt(niv=self.niv)
 
-        if copy._niv_core == copy.niv:
-            return copy
+        if self._niv_core == self.niv:
+            return deepcopy(self)
         if asympt.niv == 0:
-            return copy
+            return deepcopy(self)
 
-        copy = copy.cut_niv(copy._niv_core)
+        copy = self.cut_niv(self._niv_core)
+        if copy is self:
+            # ``cut_niv`` was a no-op (``_niv_core >= self.niv``); deep-copy so the operation stays non-destructive.
+            copy = deepcopy(self)
         copy.mat = np.concatenate(
             (asympt.mat[..., : asympt.niv - copy.niv], copy.mat, asympt.mat[..., asympt.niv + copy.niv :]), axis=-1
         )
@@ -135,12 +139,14 @@ class SelfEnergy(TwoPoint):
         :param niv: Target number of positive fermionic frequencies.
         :return: A copy of the self-energy extended to ``niv``.
         """
-        copy = deepcopy(self)
-        asympt = copy._get_asympt(niv)
-        if niv <= copy.niv:
-            return copy
+        asympt = self._get_asympt(niv)
+        if niv <= self.niv:
+            return deepcopy(self)
+        # ``np.concatenate`` allocates the result and only reads ``self.mat``, so clone the metadata without
+        # duplicating the array first.
+        copy = self._clone_without_mat()
         copy.mat = np.concatenate(
-            (asympt.mat[..., : asympt.niv - copy.niv], copy.mat, asympt.mat[..., asympt.niv + copy.niv :]), axis=-1
+            (asympt.mat[..., : asympt.niv - self.niv], self.mat, asympt.mat[..., asympt.niv + self.niv :]), axis=-1
         )
         return copy
 
@@ -173,33 +179,56 @@ class SelfEnergy(TwoPoint):
 
     def add(self, other) -> "SelfEnergy":
         """
+        Adds another :class:`SelfEnergy` (momentum dimensions are aligned first) or a numpy array; see :meth:`_add`.
+
+        :param other: A :class:`SelfEnergy` or numpy array.
+        :return: A new :class:`SelfEnergy` holding the sum (moments not recomputed).
+        """
+        return self._add(other)
+
+    def _add(self, other, subtract: bool = False) -> "SelfEnergy":
+        """
         Adds another :class:`SelfEnergy` (momentum dimensions are aligned first) or a numpy array.
 
         :param other: A :class:`SelfEnergy` or numpy array.
+        :param subtract: If True, subtract ``other`` instead of adding it (used by :meth:`sub` to avoid a negated copy).
         :return: A new :class:`SelfEnergy` holding the sum (moments not recomputed).
         :raises ValueError: If ``other`` is neither a :class:`SelfEnergy` nor a numpy array.
         """
         if not isinstance(other, (SelfEnergy, np.ndarray)):
             raise ValueError(f"Can not add {type(other)} to {type(self)}.")
 
+        op = np.subtract if subtract else np.add
+
         if isinstance(other, np.ndarray):
             return SelfEnergy(
-                self.mat + other, self.nq, self.full_niv_range, self.has_compressed_q_dimension, False, beta=self._beta
+                op(self.mat, other),
+                self.nq,
+                self.full_niv_range,
+                self.has_compressed_q_dimension,
+                False,
+                beta=self._beta,
             )
 
         other = self._align_q_dimensions_for_operations(other)
         return SelfEnergy(
-            self.mat + other.mat, self.nq, self.full_niv_range, self.has_compressed_q_dimension, False, beta=self._beta
+            op(self.mat, other.mat),
+            self.nq,
+            self.full_niv_range,
+            self.has_compressed_q_dimension,
+            False,
+            beta=self._beta,
         )
 
     def sub(self, other) -> "SelfEnergy":
         """
-        Subtracts another :class:`SelfEnergy` or numpy array, implemented as ``self.add(-other)`` (see :meth:`add`).
+        Subtracts another :class:`SelfEnergy` or numpy array, implemented as ``self._add(other, subtract=True)`` (see
+        :meth:`_add`).
 
         :param other: A :class:`SelfEnergy` or numpy array.
         :return: A new :class:`SelfEnergy` holding the difference.
         """
-        return self.add(-other)
+        return self._add(other, subtract=True)
 
     def concatenate_self_energies(self, other: "SelfEnergy") -> "SelfEnergy":
         """
@@ -237,14 +266,17 @@ class SelfEnergy(TwoPoint):
         :param niv_core: Core frequency count used for the fallback ``n_fit`` when ``n_fit`` is out of range.
         :return: A new :class:`SelfEnergy` holding the polynomial fit, in the full fermionic frequency range.
         """
-        copy = deepcopy(self)
-
         if n_fit == 0:
-            return copy
+            return deepcopy(self)
 
-        if n_fit > copy.niv or n_fit < 0:
+        if n_fit > self.niv or n_fit < 0:
             n_fit = niv_core + 200
 
+        # Share ``self.mat`` into the metadata clone instead of deep-copying it: ``compress_q_dimension`` is a view and
+        # ``to_half_niv_range`` copies (breaking the share), and ``poly_mat``/``fit_mat`` below are independent, so
+        # ``self.mat`` is never mutated.
+        copy = self._clone_without_mat()
+        copy.mat = self.mat
         copy = copy.compress_q_dimension().to_half_niv_range()
         vn_fit = MFHelper.vn(n_fit, return_only_positive=True)
         vn_full = MFHelper.vn(2 * copy.niv, return_only_positive=True)

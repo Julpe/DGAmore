@@ -394,6 +394,17 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
     def add(self, other) -> "FourPoint":
         """
+        Adds ``other`` to this object (operator ``+``); see :meth:`_add` for the accepted operands and the niw-range
+        handling.
+
+        :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, :class:`LocalInteraction`,
+            numpy array, or number.
+        :return: A new :class:`FourPoint` holding the sum.
+        """
+        return self._add(other)
+
+    def _add(self, other, subtract: bool = False) -> "FourPoint":
+        """
         Helper method that allows for addition of FourPoint objects and other FourPoint, LocalFourPoint, Interaction or
         LocalInteraction objects. Additions with numpy arrays, floats, ints or complex numbers are also supported.
         Depending on the number of frequency and momentum dimensions, the vertices have to be added slightly different.
@@ -402,6 +413,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
         :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, :class:`LocalInteraction`,
             numpy array, or number. Local operands are broadcast over the momentum axis.
+        :param subtract: If True, subtract ``other`` instead of adding it (used by :meth:`sub` to avoid a negated copy).
         :return: A new :class:`FourPoint` (in the half niw range for the vertex-vertex case).
         :raises ValueError: If ``other`` has an unsupported type.
         """
@@ -410,9 +422,11 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         ):
             raise ValueError(f"Operations '+/-' for {type(self)} and {type(other)} not supported.")
 
+        op = np.subtract if subtract else np.add
+
         if isinstance(other, (np.ndarray, float, int, complex)):
             return FourPoint(
-                self.mat + other,
+                op(self.mat, other),
                 self.channel,
                 self.nq,
                 self.num_wn_dimensions,
@@ -431,7 +445,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             other_mat = other.mat[None, ...] if not isinstance(other, Interaction) else other.compress_q_dimension().mat
             other_mat = other_mat.reshape(other.mat.shape + (1,) * (self.num_wn_dimensions + self.num_vn_dimensions))
             return FourPoint(
-                self.mat + other_mat,
+                op(self.mat, other_mat),
                 self.channel,
                 self.nq,
                 self.num_wn_dimensions,
@@ -452,9 +466,9 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             # if other is LocalFourPoint
             other, self_extended, other_extended = self._align_frequency_dimensions_for_operation(other)
             result = FourPoint(
-                (
-                    self.mat
-                    + (other.mat[None, ...] if self.has_compressed_q_dimension else other.mat[None, None, None, ...])
+                op(
+                    self.mat,
+                    (other.mat[None, ...] if self.has_compressed_q_dimension else other.mat[None, None, None, ...]),
                 ),
                 channel,
                 self.nq,
@@ -478,7 +492,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         other, self_extended, other_extended = self._align_frequency_dimensions_for_operation(other)
 
         result = FourPoint(
-            self.mat + other.mat,
+            op(self.mat, other.mat),
             channel,
             self.nq,
             self.num_wn_dimensions,
@@ -507,10 +521,10 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
         :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, :class:`LocalInteraction`,
             numpy array, or number.
-        :return: The difference, implemented as ``self.add(-other)`` (see :meth:`add`).
-        :raises ValueError: Propagated from :meth:`add` for unsupported operands.
+        :return: The difference, implemented as ``self._add(other, subtract=True)`` (see :meth:`_add`).
+        :raises ValueError: Propagated from :meth:`_add` for unsupported operands.
         """
-        return self.add(-other)
+        return self._add(other, subtract=True)
 
     def mul(self, other) -> "FourPoint":
         r"""

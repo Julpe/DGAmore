@@ -202,15 +202,19 @@ def create_full_vertex_q_r_pp_w0(
 
     f_q_r = create_full_vertex_q_r(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk)
 
+    logger.info(f"Full ladder-vertex ({f_q_r.channel.value}) calculated.")
+    logger.log_memory_usage(
+        f"Full ladder-vertex ({f_q_r.channel.value})",
+        f_q_r,
+        mpi_dist_irrk.comm.size * (1 if config.eliashberg.save_fq else 4 * (config.box.niw_core + 1)),
+    )
+
     if config.eliashberg.save_fq:
         f_q_r.mat = mpi_dist_irrk.gather(f_q_r.mat)
         if mpi_dist_irrk.comm.rank == 0:
             f_q_r.save(output_dir=config.output.output_path, name=f"f_irrq_{f_q_r.channel.value}")
         f_q_r.mat = mpi_dist_irrk.scatter(f_q_r.mat)
         config.logger.info(f"Saved full ladder-vertex ({f_q_r.channel.value}) in the irreducible BZ to file.")
-
-    logger.info(f"Full ladder-vertex ({f_q_r.channel.value}) calculated.")
-    logger.log_memory_usage(f"Full ladder-vertex ({f_q_r.channel.value})", f_q_r, mpi_dist_irrk.comm.size)
 
     if config.eliashberg.save_fq:
         return transform_vertex_q_frequencies_w0(f_q_r, niv_pp)
@@ -347,9 +351,15 @@ def create_full_vertex_q_r_pp_w0_v2(
     )
 
     if not config.eliashberg.save_fq:
-        return FourPoint(
+        f_q_r = FourPoint(
             f_q_r_mat, gamma_r.channel, config.lattice.q_grid.nk, 0, 2, False, True, True, FrequencyNotation.PP
         )
+        logger.log_memory_usage(
+            f"Full ladder-vertex ({f_q_r.channel.value})",
+            f_q_r,
+            mpi_dist_irrk.comm.size * 4 * (config.box.niw_core + 1),
+        )
+        return f_q_r
 
     f_q_r = FourPoint(
         f_q_r_mat, gamma_r.channel, config.lattice.q_grid.nk, 1, 2, False, True, True, FrequencyNotation.PP
@@ -452,6 +462,72 @@ def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
 
 
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
+def _chi0_to_matmul_layout(chi0_mat: np.ndarray) -> np.ndarray:
+    r"""
+    Returns the bare pp bubble in batched-matmul layout ``[x, y, z, v, o2, o2]`` (a view, no copy) for use with
+    :func:`_apply_gchi0_pp`. ``chi0_mat`` is in the einsum layout ``[x, y, z, a, b, c, d, v]``.
+
+    :param chi0_mat: The bubble array :math:`\chi_0^{pp}`, shape ``[x, y, z, o, o, o, o, v]``.
+    :return: A view reshaped/transposed to ``[x, y, z, v, o2, o2]`` (rows ``(a, b)``, columns ``(c, d)``).
+    """
+    nqx, nqy, nqz, nb = chi0_mat.shape[:4]
+    v = chi0_mat.shape[-1]
+    return np.moveaxis(chi0_mat.reshape(nqx, nqy, nqz, nb * nb, nb * nb, v), -1, 3)
+
+
+def _apply_gchi0_pp(chi0_mm: np.ndarray, gap: np.ndarray, n_bands: int) -> np.ndarray:
+    r"""
+    Batched-matmul equivalent of ``np.einsum("xyzabcdv,xyzcdv->xyzabv", chi0, gap)`` (multiply the gap by the bare pp
+    bubble per momentum and frequency). ``np.matmul`` is both faster than ``np.einsum`` and far leaner here: einsum
+    materializes a vertex-sized internal temporary, the matmul allocates only the gap-sized output.
+
+    :param chi0_mm: The bubble in matmul layout from :func:`_chi0_to_matmul_layout`, shape ``[x, y, z, v, o2, o2]``.
+    :param gap: The gap vector, reshapeable to ``[x, y, z, o, o, v]``.
+    :param n_bands: Number of orbitals ``o``.
+    :return: ``chi0 @ gap`` in shape ``[x, y, z, o, o, v]``.
+    """
+    nqx, nqy, nqz, v = chi0_mm.shape[0], chi0_mm.shape[1], chi0_mm.shape[2], chi0_mm.shape[3]
+    oo = n_bands * n_bands
+    gap_r = np.moveaxis(gap.reshape(nqx, nqy, nqz, oo, v), -1, 3)[..., None]  # [x, y, z, v, o2, 1]
+    out = np.matmul(chi0_mm, gap_r)[..., 0]  # [x, y, z, v, o2]
+    return np.moveaxis(out, 3, -1).reshape(nqx, nqy, nqz, n_bands, n_bands, v)
+
+
+def _gamma_to_matmul_layout(gamma_mat: np.ndarray) -> np.ndarray:
+    r"""
+    Materializes the pp pairing vertex in batched-matmul layout ``[x, y, z, o2*nv, o2*np]`` (rows ``(a, b, v)``,
+    columns ``(c, d, p)``) for :func:`_apply_gamma_pp`. The einsum layout is ``[x, y, z, a, c, b, d, v, p]`` with the
+    orbitals interleaved (``a, c, b, d``), so a transpose to ``(a, b, v, c, d, p)`` precedes the (copying) reshape.
+    The per-matvec ``np.matmul`` then allocates only the gap-sized output.
+
+    :param gamma_mat: The pp vertex, shape ``[x, y, z, a, c, b, d, v, p]`` (``v`` may be a frequency slice).
+    :return: A contiguous array ``[x, y, z, o2*nv, o2*np]`` in matmul layout.
+    """
+    nqx, nqy, nqz, nb = gamma_mat.shape[:4]
+    nv, npp = gamma_mat.shape[-2], gamma_mat.shape[-1]
+    transposed = np.ascontiguousarray(np.transpose(gamma_mat, (0, 1, 2, 3, 5, 7, 4, 6, 8)))  # [x,y,z,a,b,v,c,d,p]
+    return transposed.reshape(nqx, nqy, nqz, nb * nb * nv, nb * nb * npp)
+
+
+def _apply_gamma_pp(gamma_mm: np.ndarray, gap_gg: np.ndarray, n_bands: int) -> np.ndarray:
+    r"""
+    Batched-matmul equivalent of ``np.einsum("xyzacbdvp,xyzcdp->xyzabv", gamma, gap_gg)`` (contract the pairing vertex
+    with the gap over ``(c, d, p)``). Faster and leaner than ``np.einsum`` (see :func:`_apply_gchi0_pp`).
+
+    :param gamma_mm: The vertex in matmul layout from :func:`_gamma_to_matmul_layout`, shape ``[x, y, z, o2*nv, o2*np]``.
+    :param gap_gg: The transformed gap, shape ``[x, y, z, c, d, p]``.
+    :param n_bands: Number of orbitals ``o``.
+    :return: ``gamma @ gap_gg`` in shape ``[x, y, z, o, o, nv]``.
+    """
+    nqx, nqy, nqz = gamma_mm.shape[:3]
+    oo = n_bands * n_bands
+    npp = gap_gg.shape[-1]
+    nv = gamma_mm.shape[3] // oo
+    gg_r = gap_gg.reshape(nqx, nqy, nqz, oo * npp)[..., None]  # [x, y, z, o2*np, 1]
+    out = np.matmul(gamma_mm, gg_r)[..., 0]  # [x, y, z, o2*nv]
+    return out.reshape(nqx, nqy, nqz, n_bands, n_bands, nv)
+
+
 def solve_eliashberg_lanczos(
     gamma_r_pp: FourPoint, gchi0_q0_pp: FourPoint, ranks: tuple[int, int]
 ) -> tuple[list[float], list[GapFunction]]:
@@ -495,30 +571,38 @@ def solve_eliashberg_lanczos(
         allowed_ranks=ranks,
     )
 
-    einsum_str1 = "xyzabcdv,xyzcdv->xyzabv"
-    path1 = np.einsum_path(einsum_str1, gchi0_q0_pp.mat, gap0, optimize=True)[1]
-    einsum_str2 = "xyzacbdvp,xyzcdp->xyzabv"
-    path2 = np.einsum_path(einsum_str2, gamma_r_pp.mat, gap0, optimize=True)[1]
-
+    n_bands = gamma_r_pp.n_bands
     norm = 0.5 / config.lattice.q_grid.nk_tot / config.sys.beta
+
+    # Build the vertices in batched-matmul layout: chi0 as a view, the pairing vertices materialized once. The matmul
+    # matvec is ~3x faster than einsum and avoids einsum's per-matvec vertex-sized temporary. Each einsum-layout source
+    # is freed right after its matmul-layout copy is built (peak stays ~1 vertex, not 3), and the flipped-term sign is
+    # folded in place.
+    chi0_mm = _chi0_to_matmul_layout(gchi0_q0_pp.mat)
+    gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.mat)
+    gamma_r_pp.free()
+    gamma_flipped_mm = _gamma_to_matmul_layout(gamma_pp_flipped.mat)
+    gamma_pp_flipped.free()
+    gamma_flipped_mm *= sign
 
     def mv(gap: np.ndarray):
         r"""
         Applies the pairing kernel to a flattened gap vector (the matrix-vector product for the eigensolver):
-        multiplies by :math:`\chi_0^{pp}`, FFTs to real space, contracts with the pairing vertex (direct plus
-        sign-weighted momentum-/frequency-flipped term), and transforms back.
+        multiplies by :math:`\chi_0^{pp}`, FFTs to real space, contracts with the pairing vertex (direct plus the
+        momentum-/frequency-flipped term; the sign is folded into the vertices), and transforms back. The orbital
+        contractions are batched ``np.matmul`` products and the BZ transforms run in place through ``scipy.fft``.
 
         :param gap: The flattened gap vector.
         :return: The flattened result of applying the pairing kernel to ``gap``.
         """
-        gap_gg = np.fft.fftn(
-            np.einsum(einsum_str1, gchi0_q0_pp.mat, gap.reshape(gap_shape), optimize=path1), axes=(0, 1, 2)
-        )
+        gap_gg = sp.fft.fftn(_apply_gchi0_pp(chi0_mm, gap, n_bands), axes=(0, 1, 2), overwrite_x=True)
         gap_gg_flipped = np.roll(np.flip(gap_gg, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-        gap_new = np.einsum(einsum_str2, gamma_r_pp.mat, gap_gg, optimize=path2) + sign * np.einsum(
-            einsum_str2, gamma_pp_flipped.mat, gap_gg_flipped, optimize=path2
+        gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands) + _apply_gamma_pp(
+            gamma_flipped_mm, gap_gg_flipped, n_bands
         )
-        return np.fft.ifftn(norm * gap_new, axes=(0, 1, 2)).flatten()
+        gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True)
+        gap_new *= norm
+        return gap_new.flatten()
 
     mat = sp.sparse.linalg.LinearOperator(shape=(np.prod(gap_shape), np.prod(gap_shape)), matvec=mv)
 
@@ -532,7 +616,7 @@ def solve_eliashberg_lanczos(
     )
 
     lambdas, gaps = sp.sparse.linalg.eigsh(
-        mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0, which="LA", maxiter=10000
+        mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0.flatten(), which="LA", maxiter=10000
     )
 
     logger.info(
@@ -607,13 +691,18 @@ def solve_eliashberg_lanczos_v2(
         allowed_ranks=root,
     )
 
-    if mpi_dist_v.comm.rank == root:
-        einsum_str1 = "xyzabcdv,xyzcdv->xyzabv"
-        path1 = np.einsum_path(einsum_str1, gchi0_q0_pp.mat, gap0, optimize=True)[1]
-    einsum_str2 = "xyzacbdvp,xyzcdp->xyzabv"  # sliced v
-    path2 = np.einsum_path(einsum_str2, gamma_r_pp.mat, gap0, optimize=True)[1]
-
+    n_bands = gamma_r_pp.n_bands
     norm = 0.5 / config.lattice.q_grid.nk_tot / config.sys.beta
+
+    # Batched-matmul layout (see :func:`solve_eliashberg_lanczos`): chi0 on the root rank (a view), the frequency-sliced
+    # pairing vertices materialized once per rank. Each einsum-layout source is freed right after its matmul-layout copy
+    # is built (peak stays ~1 vertex, not 3), and the flipped-term sign is folded in place.
+    chi0_mm = _chi0_to_matmul_layout(gchi0_q0_pp.mat) if mpi_dist_v.comm.rank == root else None
+    gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.mat)
+    gamma_r_pp.free()
+    gamma_flipped_mm = _gamma_to_matmul_layout(gamma_r_pp_flipped.mat)
+    gamma_r_pp_flipped.free()
+    gamma_flipped_mm *= sign
 
     def mv(gap: np.ndarray):
         r"""
@@ -625,21 +714,19 @@ def solve_eliashberg_lanczos_v2(
         :return: The flattened result of applying the pairing kernel to ``gap``.
         """
         # 1. multiply chi0 * gap for the full BZ (only done by one rank, since memory would be an issue)
-        gap_gg = None
-        if mpi_dist_v.comm.rank == root:
-            gap = gap.reshape(gap_shape)
-            gap_gg = np.einsum(einsum_str1, gchi0_q0_pp.mat, gap, optimize=path1)
+        gap_gg = _apply_gchi0_pp(chi0_mm, gap, n_bands) if mpi_dist_v.comm.rank == root else None
         gap_gg = mpi_dist_v.bcast_chunked(gap_gg, root=root)
         # 2. perform Fourier transform for the full chi0 * gap quantity
-        gap_gg = np.fft.fftn(gap_gg, axes=(0, 1, 2))
+        gap_gg = sp.fft.fftn(gap_gg, axes=(0, 1, 2), overwrite_x=True)
         # 3. create gap_gg_flipped
         gap_gg_flipped = np.roll(np.flip(gap_gg, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-        # 4. multiply with the pairing vertex along the vp frequency axis (yields the gap for the broadcasted v)
-        gap_new = np.einsum(einsum_str2, gamma_r_pp.mat, gap_gg, optimize=path2) + sign * np.einsum(
-            einsum_str2, gamma_r_pp_flipped.mat, gap_gg_flipped, optimize=path2
+        # 4. contract with the pairing vertex over (c, d, p) -> the gap for this rank's v slice (sign folded in)
+        gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands) + _apply_gamma_pp(
+            gamma_flipped_mm, gap_gg_flipped, n_bands
         )
         # 5. perform fourier transform on the local v slice
-        gap_new = np.fft.ifftn(norm * gap_new, axes=(0, 1, 2))
+        gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True)
+        gap_new *= norm
         # 6. assemble gap_new for the full v range through mpi_dist_v and allgather (remember we distributed v)
         gap_new = np.moveaxis(gap_new, -1, 0)  # (v_local, nq_tot, orb, orb)
         gap_new = mpi_dist_v.allgather(gap_new)  # (v_total, nq_tot, orb, orb)
@@ -657,7 +744,7 @@ def solve_eliashberg_lanczos_v2(
     )
 
     lambdas, gaps = sp.sparse.linalg.eigsh(
-        mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0, which="LA", maxiter=10000
+        mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0.flatten(), which="LA", maxiter=10000
     )
 
     logger.info(

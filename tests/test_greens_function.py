@@ -198,6 +198,46 @@ def test_energies_use_injected_state_not_config(monkeypatch):
     assert np.isfinite(g.get_epot())
 
 
+def test_fermi_dirac_density_matches_diagonal_matmul_reference():
+    """_fermi_dirac_density (column-scaling) equals the explicit V diag(f) V^-1 construction, bit-for-bit."""
+    from dgamore.greens_function import _fermi_dirac_density
+
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((5, 3, 3))
+    h = 0.5 * (a + a.swapaxes(-1, -2))
+    beta = 7.0
+    eigvals, eigvecs = np.linalg.eig(beta * h)
+    d = np.empty_like(eigvals)
+    m = eigvals > 0
+    d[m] = np.exp(-eigvals[m]) / (1 + np.exp(-eigvals[m]))
+    d[~m] = 1 / (1 + np.exp(eigvals[~m]))
+    ref = eigvecs @ np.einsum("...i,ij->...ij", d, np.eye(3, dtype=d.dtype)) @ np.linalg.inv(eigvecs)
+    assert np.array_equal(_fermi_dirac_density(h, beta), ref)
+
+
+def test_get_epot_e_corr_einsum_matches_transposed_product_reference():
+    """get_epot's correlation term (fused einsum) matches the explicit transposed-product form (multi-band)."""
+    nk = (2, 2, 1)
+    nb, niv = 2, 6
+    beta, mu = 5.0, 0.3
+    rng = np.random.default_rng(1)
+    ek = rng.standard_normal((*nk, nb, nb))
+    ek = 0.5 * (ek + ek.swapaxes(-1, -2))
+    sig_mat = rng.standard_normal((int(np.prod(nk)), nb, nb, 2 * niv)) + 1j * rng.standard_normal(
+        (int(np.prod(nk)), nb, nb, 2 * niv)
+    )
+    sig = SelfEnergy(sig_mat, nk=nk, has_compressed_q_dimension=True, beta=beta)
+    g = GreensFunction.get_g_full(sig, mu, ek, beta)
+    g.get_fill_nonlocal()
+
+    smom0 = sig.smom[0]
+    dsigma = g._sigma.decompress_q_dimension().mat - smom0[..., None]
+    e_corr_ref = (dsigma * g.decompress_q_dimension().transpose_orbitals().mat).sum().real / beta
+    e_corr_new = np.einsum("...abv,...bav->...", dsigma, g.decompress_q_dimension().mat).sum().real / beta
+    assert np.allclose(e_corr_new, e_corr_ref, rtol=1e-5)
+    assert np.isfinite(g.get_epot())
+
+
 def test_update_mu_without_logger_is_silent_on_failure():
     """update_mu with logger=None returns the input mu silently when root-finding fails."""
     nk, ek, sig, beta, mu = _toy_inputs()
