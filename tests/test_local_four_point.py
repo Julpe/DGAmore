@@ -974,24 +974,24 @@ def test_add_dunder_calls_add():
 
 
 def test_sub_method_and_dunder():
-    """sub and __sub__ subtract correctly."""
+    """sub and __sub__ subtract correctly, delegating to _add with subtract=True (no negated copy)."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj1 = LocalFourPoint(mat, num_vn_dimensions=2)
     obj2 = LocalFourPoint(mat, num_vn_dimensions=2)
     with (
         patch.object(LocalFourPoint, "sub", wraps=obj1.sub) as mock_sub,
-        patch.object(LocalFourPoint, "add", wraps=obj1.add) as mock_add,
+        patch.object(LocalFourPoint, "_add", wraps=obj1._add) as mock_add,
     ):
         _ = obj1.sub(obj2)
         mock_sub.assert_called_once_with(obj2)
-        mock_add.assert_called_once()
+        mock_add.assert_called_once_with(obj2, subtract=True)
     with (
         patch.object(LocalFourPoint, "sub", wraps=obj1.sub) as mock_sub,
-        patch.object(LocalFourPoint, "add", wraps=obj1.add) as mock_add,
+        patch.object(LocalFourPoint, "_add", wraps=obj1._add) as mock_add,
     ):
         _ = obj1 - obj2
         mock_sub.assert_called_once_with(obj2)
-        mock_add.assert_called_once()
+        mock_add.assert_called_once_with(obj2, subtract=True)
 
 
 def test_sub_operator():

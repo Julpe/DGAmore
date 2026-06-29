@@ -21,7 +21,7 @@ operations, parallelizes the heavy momentum-dependent work with `mpi4py`, and re
 For the implemented equations, see the author's
 [Master's thesis](https://doi.org/10.34726/hss.2025.130528) (Chapters 3 and 4).
 
-## 📖 Documentation
+# Documentation
 
 **Full documentation is hosted at [dgamore.readthedocs.io](https://dgamore.readthedocs.io/en/latest).**
 
@@ -34,7 +34,7 @@ For the implemented equations, see the author's
 | [API reference](https://dgamore.readthedocs.io/en/latest/api.html) | Module-by-module reference. |
 | [About](https://dgamore.readthedocs.io/en/latest/about.html) | Background, citation, license, and contact. |
 
-## Quick start
+# Quick start
 
 Install `mpich` and `mpi4py` (Python 3.12+ required), then install the package:
 
@@ -55,15 +55,13 @@ mpiexec -np 8 DGAmore.py -p /configs/ -c my_config.yaml   # or: DGAmore.py for a
 See the [installation](https://dgamore.readthedocs.io/en/latest/installation.html) and
 [usage](https://dgamore.readthedocs.io/en/latest/usage.html) pages for the full instructions and an example SLURM submit script.
 
-## Contributing
+# Contributing
 
 Contributions are welcome. Please open an issue for bugs and feature requests, or submit a pull request. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
-## Citation and license
+# Citation and license
 
 `DGAmore` is released under the MIT license. If you use it, please consider citing it together with the author's
 [Master's thesis](https://doi.org/10.34726/hss.2025.130528). For questions, get in touch by
 [e-mail](mailto:julian.peil@tuwien.ac.at).
-</content>
-</invoke>

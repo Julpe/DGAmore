@@ -94,4 +94,3 @@ If you are ever unsure about any of this, about how to set things up, how to lab
 worth pursuing, please just reach out by [e-mail](mailto:julian.peil@tuwien.ac.at). Questions are always welcome, and
 helping new contributors get going is part of what keeps the project alive. Thank you again for contributing to
 `DGAmore`.
-</content>

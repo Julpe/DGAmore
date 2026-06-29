@@ -365,6 +365,36 @@ def test_fits_polynomial_coefficients_correctly_with_default_parameters():
     assert np.allclose(result.mat[0, 0, 0], f_vn + 1j * f_vn, rtol=1e-2, atol=1e6)
 
 
+def test_create_with_asympt_up_to_core_does_not_mutate_self():
+    """create_with_asympt_up_to_core leaves the original self-energy untouched (sources from a copy)."""
+    self_energy = _se(mat_decompressed, nk=nk, has_compressed_q_dimension=False)
+    self_energy._niv_core = 3
+    before = self_energy.mat.copy()
+    result = self_energy.create_with_asympt_up_to_core()
+    assert np.array_equal(self_energy.mat, before)
+    assert result is not self_energy
+
+
+def test_append_asympt_does_not_mutate_self_and_returns_independent_copy():
+    """append_asympt extends the box without mutating the original and returns an independent copy."""
+    self_energy = _se(mat_decompressed, nk=nk, has_compressed_q_dimension=False)
+    before = self_energy.mat.copy()
+    result = self_energy.append_asympt(niv=10)
+    assert np.array_equal(self_energy.mat, before)
+    result.mat[...] = 0.0
+    assert np.array_equal(self_energy.mat, before)
+
+
+def test_fit_polynomial_does_not_mutate_self():
+    """fit_polynomial leaves the original self-energy untouched (the shared-ref clone is only read)."""
+    mat = np.random.rand(*nk, 2, 2, 100)
+    self_energy = _se(mat, nk=nk, has_compressed_q_dimension=False)
+    before = self_energy.mat.copy()
+    result = self_energy.fit_polynomial(n_fit=5, degree=2)
+    assert np.array_equal(self_energy.mat, before)
+    assert result is not self_energy
+
+
 @pytest.mark.parametrize("error_margin", [1e-5, 1e-3, 1e-1])
 def test_estimates_niv_core_correctly_with_varying_error_margins(error_margin):
     """_estimate_niv_core respects the minimum core for varying error margins."""

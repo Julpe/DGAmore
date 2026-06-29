@@ -514,6 +514,16 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
     def add(self, other):
         """
+        Adds ``other`` to this object (operator ``+``); see :meth:`_add` for the accepted operands and the niw-range
+        handling.
+
+        :param other: A :class:`LocalFourPoint`, :class:`LocalInteraction`, numpy array, or number.
+        :return: The sum (a new :class:`LocalFourPoint`, or a raw numpy array for a non-local :class:`Interaction`).
+        """
+        return self._add(other)
+
+    def _add(self, other, subtract: bool = False):
+        """
         Helper method that allows for addition of LocalFourPoint objects and other LocalFourPoint or LocalInteraction
         objects. Additions with numpy arrays, floats, ints or complex numbers are also supported.
         Depending on the number of frequency and momentum dimensions, the vertices have to be added slightly different.
@@ -521,6 +531,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         Objects will always be returned in the half niw range to save memory.
 
         :param other: A :class:`LocalFourPoint`, :class:`LocalInteraction`, numpy array, or number.
+        :param subtract: If True, subtract ``other`` instead of adding it (used by :meth:`sub` to avoid a negated copy).
         :return: The sum. For a non-local :class:`Interaction` operand a raw numpy array is returned (to avoid a
             dependency on the :class:`FourPoint` class); otherwise a new :class:`LocalFourPoint`.
         :raises ValueError: If ``other`` has an unsupported type, or the bosonic-frequency counts do not match.
@@ -528,9 +539,11 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         if not isinstance(other, (LocalFourPoint, LocalInteraction, np.ndarray, float, int, complex)):
             raise ValueError(f"Operations '+/-' for {type(self)} and {type(other)} not supported.")
 
+        op = np.subtract if subtract else np.add
+
         if isinstance(other, (np.ndarray, float, int, complex)):
             return LocalFourPoint(
-                self.mat + other,
+                op(self.mat, other),
                 self.channel,
                 self.num_wn_dimensions,
                 self.num_vn_dimensions,
@@ -546,13 +559,13 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
             if not is_local:
                 # since we do not want to have a dependency on the FourPoint class, we simply return a numpy array
                 return (
-                    (self.mat[None, ...] + other_mat)
+                    op(self.mat[None, ...], other_mat)
                     if other.has_compressed_q_dimension
-                    else (self.mat[None, None, None, ...] + other_mat)
+                    else op(self.mat[None, None, None, ...], other_mat)
                 )
 
             return LocalFourPoint(
-                self.mat + other_mat,
+                op(self.mat, other_mat),
                 self.channel,
                 self.num_wn_dimensions,
                 self.num_vn_dimensions,
@@ -583,7 +596,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
                     other_mat = np.expand_dims(other_mat, axis=-1 if self.num_vn_dimensions == 1 else (-1, -2))
 
             result = LocalFourPoint(
-                self_mat + other_mat,
+                op(self_mat, other_mat),
                 self.channel,
                 max(self.num_wn_dimensions, other.num_wn_dimensions),
                 max(self.num_vn_dimensions, other.num_vn_dimensions),
@@ -602,7 +615,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         other, self_extended, other_extended = self._align_frequency_dimensions_for_operation(other)
 
         result = LocalFourPoint(
-            self.mat + other.mat,
+            op(self.mat, other.mat),
             channel,
             self.num_wn_dimensions,
             max(self.num_vn_dimensions, other.num_vn_dimensions),
@@ -628,10 +641,10 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         Objects will always be returned in the half niw range to save memory.
 
         :param other: A :class:`LocalFourPoint`, :class:`LocalInteraction`, numpy array, or number.
-        :return: The difference, implemented as ``self.add(-other)`` (see :meth:`add`).
-        :raises ValueError: Propagated from :meth:`add` for unsupported operands.
+        :return: The difference, implemented as ``self._add(other, subtract=True)`` (see :meth:`_add`).
+        :raises ValueError: Propagated from :meth:`_add` for unsupported operands.
         """
-        return self.add(-other)
+        return self._add(other, subtract=True)
 
     def permute_orbitals(self, permutation: str = "abcd->abcd", copy: bool = True) -> "LocalFourPoint":
         """

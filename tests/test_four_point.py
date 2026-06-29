@@ -99,6 +99,22 @@ def test_sub_operator(small_fourpoint):
     assert np.allclose(res2.mat, 1.0 - fp.mat)
 
 
+def test_sub_fourpoint_equals_add_of_negated(rng):
+    """a - b (direct subtract via _add, no negated copy) bit-equals the reference a + (-b) for two vertices."""
+    nq = (4, 4, 1)
+    o, niw, niv = 2, 3, 3
+    shape = (*nq, o, o, o, o, 2 * niw + 1, 2 * niv, 2 * niv)
+
+    def _fp():
+        mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+        return FourPoint(mat, SpinChannel.DENS, nq, 1, 2, True, True, False, FrequencyNotation.PH)
+
+    a, b = _fp(), _fp()
+    res_ref = deepcopy(a) + (-deepcopy(b))
+    res_sub = a - b
+    assert np.array_equal(res_sub.mat, res_ref.mat)
+
+
 def test_mul_with_scalar_and_array(small_fourpoint):
     """Multiplying by a scalar or array scales the FourPoint matrix elementwise."""
     fp = small_fourpoint

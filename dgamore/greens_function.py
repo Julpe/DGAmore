@@ -38,9 +38,10 @@ def _fermi_dirac_density(h: np.ndarray, beta: float) -> np.ndarray:
     mask = eigenvals > 0
     rho_diag[mask] = np.exp(-eigenvals[mask]) / (1 + np.exp(-eigenvals[mask]))
     rho_diag[~mask] = 1 / (1 + np.exp(eigenvals[~mask]))
-    rho_diag = np.einsum("...i,ij->...ij", rho_diag, np.eye(h.shape[-1], dtype=rho_diag.dtype))
 
-    return eigenvecs @ rho_diag @ np.linalg.inv(eigenvecs)
+    # rho = V diag(rho_diag) V^-1. Scaling the columns of V by rho_diag is identical to the diagonal matmul (each
+    # entry is a single product, no accumulation), but avoids materializing the dense [..., o, o] diagonal and one matmul.
+    return (eigenvecs * rho_diag[..., None, :]) @ np.linalg.inv(eigenvecs)
 
 
 def get_total_fill(mu: float, ek: np.ndarray, sigma_mat: np.ndarray, beta: float, smom0: np.ndarray) -> float:
@@ -343,10 +344,13 @@ class GreensFunction(TwoPoint):
         # 1) Hartree: physical (tail-corrected) occupation, convergence factor exact.
         e_hartree = np.sum(smom0[None, None, None] * self._occ_k.swapaxes(-1, -2)).real
 
-        # 2) In-box correlation part: Tr[(Sigma - Sigma_inf) G], Sigma_inf already counted above.
+        # 2) In-box correlation part: Tr[(Sigma - Sigma_inf) G], Sigma_inf already counted above. Contract the orbital
+        # trace directly with einsum (g transposed in orbitals) instead of materializing the transposed copy -- this
+        # avoids the GreensFunction deepcopy in ``transpose_orbitals`` (which duplicates ``_ek``/``_sigma``) and the
+        # full [k, o, o, v] product temporary.
         dsigma = self._sigma.decompress_q_dimension().mat - smom0[..., None]
-        g_ba = self.decompress_q_dimension().transpose_orbitals().mat
-        e_corr = (dsigma * g_ba).sum().real / self._beta
+        g = self.decompress_q_dimension().mat
+        e_corr = np.einsum("...abv,...bav->...", dsigma, g).sum().real / self._beta
 
         # 3) Analytic 1/v^2 model tail: replace the truncated box value by the large-box one.
         e_tail = self._model_epot(smom0, smom1, niv_asympt, self._beta) - self._model_epot(

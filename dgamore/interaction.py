@@ -91,30 +91,42 @@ class LocalInteraction(IHaveMat, IHaveChannel):
 
     def add(self, other) -> "LocalInteraction":
         """
-        Adds another interaction or a raw numpy array elementwise.
+        Adds another interaction or a raw numpy array elementwise; see :meth:`_add`.
 
         :param other: A :class:`LocalInteraction` or a numpy array broadcastable to ``mat``.
         :return: A new :class:`LocalInteraction` holding the sum (inheriting the non-``NONE`` channel of the operands).
+        """
+        return self._add(other)
+
+    def _add(self, other, subtract: bool = False) -> "LocalInteraction":
+        """
+        Adds (or, if ``subtract`` is True, subtracts) another interaction or a raw numpy array elementwise.
+
+        :param other: A :class:`LocalInteraction` or a numpy array broadcastable to ``mat``.
+        :param subtract: If True, subtract ``other`` instead of adding it (used by :meth:`sub` to avoid a negated copy).
+        :return: A new :class:`LocalInteraction` holding the sum/difference (the non-``NONE`` channel of the operands).
         :raises ValueError: If ``other`` is neither a :class:`LocalInteraction` nor a numpy array.
         """
         if not isinstance(other, (LocalInteraction, np.ndarray)):
             raise ValueError(f"Operation {type(self)} +/- {type(other)} not supported.")
 
+        op = np.subtract if subtract else np.add
+
         if isinstance(other, np.ndarray):
-            return LocalInteraction(self.mat + other, self.channel)
+            return LocalInteraction(op(self.mat, other), self.channel)
 
         return LocalInteraction(
-            self.mat + other.mat, self.channel if self.channel != SpinChannel.NONE else other.channel
+            op(self.mat, other.mat), self.channel if self.channel != SpinChannel.NONE else other.channel
         )
 
     def sub(self, other) -> "LocalInteraction":
         """
-        Subtracts another interaction or a raw numpy array elementwise.
+        Subtracts another interaction or a raw numpy array elementwise; see :meth:`_add`.
 
         :param other: A :class:`LocalInteraction` or a numpy array broadcastable to ``mat``.
         :return: A new :class:`LocalInteraction` holding the difference ``self - other``.
         """
-        return self.add(-other)
+        return self._add(other, subtract=True)
 
     def pow(self, power) -> "LocalInteraction":
         r"""
@@ -254,18 +266,31 @@ class Interaction(IAmNonLocal, LocalInteraction):
 
     def add(self, other) -> "Interaction":
         """
-        Adds another (non-)local interaction or a raw numpy array. A local operand is broadcast over the
-        momentum axis.
+        Adds another (non-)local interaction or a raw numpy array (a local operand is broadcast over the momentum
+        axis); see :meth:`_add`.
 
         :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array.
         :return: A new :class:`Interaction` holding the sum (inheriting the non-``NONE`` channel of the operands).
+        """
+        return self._add(other)
+
+    def _add(self, other, subtract: bool = False) -> "Interaction":
+        """
+        Adds (or, if ``subtract`` is True, subtracts) another (non-)local interaction or a raw numpy array. A local
+        operand is broadcast over the momentum axis.
+
+        :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array.
+        :param subtract: If True, subtract ``other`` instead of adding it (used by :meth:`sub` to avoid a negated copy).
+        :return: A new :class:`Interaction` holding the sum/difference (the non-``NONE`` channel of the operands).
         :raises ValueError: If ``other`` is not one of the supported types.
         """
         if not isinstance(other, (LocalInteraction, Interaction, np.ndarray)):
             raise ValueError(f"Operation {type(self)} +/- {type(other)} not supported.")
 
+        op = np.subtract if subtract else np.add
+
         if isinstance(other, np.ndarray):
-            return Interaction(self.mat + other, self.channel, self.nq, self.has_compressed_q_dimension)
+            return Interaction(op(self.mat, other), self.channel, self.nq, self.has_compressed_q_dimension)
 
         if not isinstance(other, Interaction):
             other_mat = other.mat[None, ...] if self.has_compressed_q_dimension else other.mat[None, None, None, ...]
@@ -273,7 +298,7 @@ class Interaction(IAmNonLocal, LocalInteraction):
             other_mat = other.mat
 
         return Interaction(
-            self.mat + other_mat,
+            op(self.mat, other_mat),
             self.channel if self.channel != SpinChannel.NONE else other.channel,
             self.nq,
             self.has_compressed_q_dimension,
@@ -281,12 +306,12 @@ class Interaction(IAmNonLocal, LocalInteraction):
 
     def sub(self, other) -> "Interaction":
         """
-        Subtracts another (non-)local interaction or a raw numpy array.
+        Subtracts another (non-)local interaction or a raw numpy array; see :meth:`_add`.
 
         :param other: An :class:`Interaction`, a :class:`LocalInteraction`, or a numpy array.
         :return: A new :class:`Interaction` holding the difference ``self - other``.
         """
-        return self.add(-other)
+        return self._add(other, subtract=True)
 
     def pow(self, power) -> "Interaction":
         r"""
