@@ -336,15 +336,23 @@ def perform_ornstein_zernicke_fit(chi_phys_q_r: FourPoint) -> None:
     chi_mat = chi.map_to_full_bz(config.lattice.q_grid).to_half_niw_range().take_first_wn().mat.real
     orb_shape = (config.sys.n_bands,) * 4
     oz_coeffs = np.zeros(orb_shape + (2,), dtype=float)
+    failed_orbitals = []
 
     for idx in np.ndindex(orb_shape):
         mat_slice = chi_mat[..., idx[0], idx[1], idx[2], idx[3]].flatten()
         try:
             coeffs = fit_oz_spin(config.lattice.q_grid, mat_slice) if not np.all(mat_slice == 0) else [0.0, 0.0]
         except (ValueError, RuntimeError, opt.OptimizeWarning):
-            config.logger.warning(f"OZ fit did not converge for orbitals {idx}. Using [-1, -1].")
+            failed_orbitals.append(idx)
             coeffs = [-1.0, -1.0]
         oz_coeffs[idx] = coeffs
+
+    if failed_orbitals:
+        one_based = [tuple(o + 1 for o in idx) for idx in failed_orbitals]
+        config.logger.warning(
+            f"OZ fit did not converge for {len(failed_orbitals)} orbital combination(s): "
+            f"{one_based}. Using [-1, -1]."
+        )
 
     rows = []
     for idx in np.ndindex(orb_shape):
