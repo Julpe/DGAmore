@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 from unittest.mock import MagicMock
@@ -82,8 +82,8 @@ def test_fits_smom_algorithm_correctly_with_dummy_data(has_compressed_q_dimensio
     )
     self_energy.mat = dummy_data  # Assign dummy data to the matrix
     smom0, smom1 = self_energy.fit_smom()
-    assert np.allclose(smom0, dummy_smom0, rtol=1e-2)
-    assert np.allclose(smom1, dummy_smom1, rtol=1e-2)
+    assert np.allclose(smom0, dummy_smom0, atol=1e-2)
+    assert np.allclose(smom1, dummy_smom1, atol=1e-2)
 
 
 def test_fits_smom_correctly_with_edge_case_data():
@@ -125,7 +125,7 @@ def test_returns_correct_asymptotic_self_energy(custom_niv, n_min):
     ]
 
     asympt = self_energy._get_asympt(niv=niv, n_min=n_min)
-    assert np.allclose(asympt.mat, asympt_expected, rtol=1e-2)
+    assert np.allclose(asympt.mat, asympt_expected, atol=1e-2)
 
 
 def test_asympt_returns_self_energy_unchanged_when_core_equals_niv():
@@ -248,7 +248,7 @@ def test_interpolate_returns_same_values_when_beta_and_grid_are_unchanged():
     result = self_energy.interpolate(beta_target=beta, niv_target=self_energy.niv)
 
     assert result.mat.shape == self_energy.mat.shape
-    assert np.allclose(result.mat, self_energy.mat, rtol=1e-6, atol=1e-6)
+    assert np.allclose(result.mat, self_energy.mat, atol=1e-6)
 
 
 def test_interpolate_reproduces_linear_frequency_dependence_on_a_new_grid():
@@ -270,7 +270,7 @@ def test_interpolate_reproduces_linear_frequency_dependence_on_a_new_grid():
     expected = np.broadcast_to(expected_signal, result.mat.shape).copy()
 
     assert result.mat.shape == expected.shape
-    assert np.allclose(result.mat, expected, rtol=1e-4, atol=1e-4)
+    assert np.allclose(result.mat, expected, atol=1e-4)
 
 
 def _build_linear_self_energy(niv_value: int, beta_value: float, has_compressed_q_dimension: bool) -> SelfEnergy:
@@ -362,7 +362,7 @@ def test_fits_polynomial_coefficients_correctly_with_default_parameters():
     mat = np.full(mat.shape, f_vn + 1j * f_vn)  # Dummy data for testing
     self_energy = _se(mat, nk=nk, has_compressed_q_dimension=False)
     result = self_energy.fit_polynomial(n_fit=25, degree=2)
-    assert np.allclose(result.mat[0, 0, 0], f_vn + 1j * f_vn, rtol=1e-2, atol=1e6)
+    assert np.allclose(result.mat[0, 0, 0], f_vn + 1j * f_vn, atol=1e6)
 
 
 def test_create_with_asympt_up_to_core_does_not_mutate_self():

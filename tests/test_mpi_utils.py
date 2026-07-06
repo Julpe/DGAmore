@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
@@ -1175,3 +1175,97 @@ def test_isend_rows_rejects_non_contiguous():
     arr = (np.arange(6 * 2).reshape(6, 2) + 1j).astype(np.complex128).T  # F-contiguous view
     with pytest.raises(ValueError):
         mu._isend_rows(comm1(), arr, dest=0)
+
+
+def test_build_node_shared_array_single_rank_returns_private_array():
+    """A single-rank node short-circuits to a private array (no window) and still computes once."""
+    calls = []
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+
+        def compute():
+            calls.append(rank)
+            return np.full((2, 3), 5.0, dtype=np.complex64)
+
+        arr, win = mu.build_node_shared_array(node_comm, compute)
+        return np.array(arr), win
+
+    _, res = run_parallel(1, fn)
+    assert calls == [0]
+    assert np.array_equal(res[0][0], np.full((2, 3), 5.0, dtype=np.complex64))
+    assert res[0][1] is None
+
+
+def test_build_node_shared_array_computes_once_and_shares_within_node():
+    """On one node the root computes once and every rank maps the same populated buffer through a window."""
+    calls = []
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+
+        def compute():
+            calls.append(rank)
+            return np.full((2, 3), 7.0, dtype=np.complex64)
+
+        arr, win = mu.build_node_shared_array(node_comm, compute)
+        seen = np.array(arr)
+        node_comm.Barrier()
+        if win is not None:
+            win.Free()
+        node_comm.Free()
+        return seen, win is not None
+
+    _, res = run_parallel(4, fn, hostnames=["h", "h", "h", "h"])
+    assert calls == [0]
+    for seen, has_win in res:
+        assert has_win
+        assert np.array_equal(seen, np.full((2, 3), 7.0, dtype=np.complex64))
+
+
+def test_build_node_shared_array_isolates_between_nodes():
+    """Two nodes each compute on their own root; ranks see only their own node's buffer."""
+    calls = []
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+
+        def compute():
+            calls.append(rank)
+            return np.full((3,), float(rank + 1), dtype=np.complex64)
+
+        arr, win = mu.build_node_shared_array(node_comm, compute)
+        seen = np.array(arr)
+        node_comm.Barrier()
+        if win is not None:
+            win.Free()
+        node_comm.Free()
+        return seen
+
+    _, res = run_parallel(4, fn, hostnames=["n0", "n0", "n1", "n1"])
+    assert sorted(calls) == [0, 2]  # one compute per node root (global ranks 0 and 2)
+    assert np.array_equal(res[0], np.full((3,), 1.0, dtype=np.complex64))
+    assert np.array_equal(res[1], np.full((3,), 1.0, dtype=np.complex64))
+    assert np.array_equal(res[2], np.full((3,), 3.0, dtype=np.complex64))
+    assert np.array_equal(res[3], np.full((3,), 3.0, dtype=np.complex64))
+
+
+def test_build_node_shared_array_view_is_live_shared_memory():
+    """A write by the root after construction is visible to the other node ranks (a true shared view)."""
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+        arr, win = mu.build_node_shared_array(node_comm, lambda: np.zeros((4,), dtype=np.complex64))
+        if node_comm.Get_rank() == 0:
+            arr[:] = np.arange(4)  # mutate the shared buffer after it was built
+        node_comm.Barrier()
+        seen = np.array(arr)
+        node_comm.Barrier()
+        if win is not None:
+            win.Free()
+        node_comm.Free()
+        return seen
+
+    _, res = run_parallel(2, fn, hostnames=["h", "h"])
+    for seen in res:
+        assert np.array_equal(seen, np.arange(4).astype(np.complex64))

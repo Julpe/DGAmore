@@ -1,16 +1,14 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Interaction tensors. :class:`LocalInteraction` wraps the momentum-independent (Hubbard/Kanamori) interaction
-:math:`U_{abcd}`; :class:`Interaction` adds a momentum dimension for the non-local interaction :math:`V_{abcd}^q`.
+:math:`U_{1234}`; :class:`Interaction` adds a momentum dimension for the non-local interaction :math:`V_{1234}^q`.
 Both provide the channel projections (density/magnetic/singlet/triplet) and the algebra used in the ladder
 equations.
 """
-
-from copy import deepcopy
 
 import numpy as np
 
@@ -19,14 +17,14 @@ from dgamore.n_point_base import IHaveMat, IHaveChannel, IAmNonLocal, SpinChanne
 
 class LocalInteraction(IHaveMat, IHaveChannel):
     r"""
-    Class for the local (momentum-independent) interaction :math:`U_{abcd}`.
+    Class for the local (momentum-independent) interaction :math:`U_{1234}`.
     """
 
     def __init__(self, mat: np.ndarray, channel: SpinChannel = SpinChannel.NONE):
         r"""
         Initializes the local interaction tensor in the given spin channel.
 
-        :param mat: Interaction tensor :math:`U_{abcd}` with four orbital axes ``[o1, o2, o3, o4]``.
+        :param mat: Interaction tensor :math:`U_{1234}` with four orbital axes ``[o1, o2, o3, o4]``.
         :param channel: Spin channel the tensor is expressed in (see :class:`SpinChannel`); ``NONE`` for the
             bare, not-yet-projected interaction.
         """
@@ -55,21 +53,21 @@ class LocalInteraction(IHaveMat, IHaveChannel):
             raise ValueError("Invalid permutation.")
 
         if split[0] == split[1]:
-            return deepcopy(self)
+            return self.copy()
 
         return LocalInteraction(np.einsum(permutation, self.mat, optimize=True), self.channel)
 
     def as_channel(self, channel: SpinChannel) -> "LocalInteraction":
         r"""
         Projects the bare interaction onto a given spin channel. With the crossing-permuted tensor
-        :math:`\tilde U_{abcd} = U_{adcb}` the projections are
+        :math:`\tilde U_{1234} = U_{1432}` the projections are
         :math:`U_d = 2U - \tilde U`, :math:`U_m = -\tilde U`, :math:`U_s = U + \tilde U`, :math:`U_t = U - \tilde U`.
 
         :param channel: Target spin channel (density, magnetic, singlet or triplet).
         :return: A new :class:`LocalInteraction` in the requested channel.
         :raises ValueError: If the object is already in a (non-``NONE``) channel, or the target channel is unsupported.
         """
-        copy = deepcopy(self)
+        copy = self.copy()
 
         if copy.channel == channel:
             return copy
@@ -131,7 +129,7 @@ class LocalInteraction(IHaveMat, IHaveChannel):
     def pow(self, power) -> "LocalInteraction":
         r"""
         Raises the interaction to an integer power via repeated orbital contraction
-        :math:`U^{(n)}_{abef} = U_{abcd} U^{(n-1)}_{dcef}`.
+        :math:`U^{(n)}_{1234} = \sum_{ab} U_{12ab} U^{(n-1)}_{ba34}`.
 
         :param power: Positive integer exponent (must be greater than zero).
         :return: A new :class:`LocalInteraction` equal to ``self`` contracted with itself ``power`` times.
@@ -139,7 +137,7 @@ class LocalInteraction(IHaveMat, IHaveChannel):
         """
         if power <= 0:
             raise ValueError("Exponentiation of Interaction objects only supports positive powers greater than zero.")
-        result = deepcopy(self)
+        result = self.copy()
         for _ in range(1, power):
             result = LocalInteraction(result.times("abcd,dcef->abef", self), self.channel)
         return result
@@ -193,7 +191,7 @@ class LocalInteraction(IHaveMat, IHaveChannel):
 
 class Interaction(IAmNonLocal, LocalInteraction):
     r"""
-    Class for the non-local (momentum-dependent) interaction :math:`V_{abcd}^q`.
+    Class for the non-local (momentum-dependent) interaction :math:`V_{1234}^q`.
     """
 
     def __init__(
@@ -206,7 +204,7 @@ class Interaction(IAmNonLocal, LocalInteraction):
         r"""
         Initializes the non-local interaction tensor in the given spin channel and momentum layout.
 
-        :param mat: Interaction tensor :math:`V_{abcd}^q` with one momentum dimension and four orbital axes.
+        :param mat: Interaction tensor :math:`V_{1234}^q` with one momentum dimension and four orbital axes.
         :param channel: Spin channel the tensor is expressed in (see :class:`SpinChannel`).
         :param nq: Number of momenta per spatial direction ``(nqx, nqy, nqz)``.
         :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
@@ -228,7 +226,7 @@ class Interaction(IAmNonLocal, LocalInteraction):
             raise ValueError("Invalid permutation.")
 
         if split[0] == split[1]:
-            return deepcopy(self)
+            return self.copy()
 
         permutation = f"...{split[0]}->...{split[1]}"
         return Interaction(
@@ -245,7 +243,7 @@ class Interaction(IAmNonLocal, LocalInteraction):
         :return: A new :class:`Interaction` in the requested channel.
         :raises ValueError: If the object is already in a (non-``NONE``) channel, or the target channel is unsupported.
         """
-        copy = deepcopy(self)
+        copy = self.copy()
 
         if copy.channel == channel:
             return copy
@@ -316,7 +314,7 @@ class Interaction(IAmNonLocal, LocalInteraction):
     def pow(self, power) -> "Interaction":
         r"""
         Raises the interaction to an integer power via repeated momentum-diagonal orbital contraction
-        :math:`V^{(n);q}_{abef} = V^{q}_{abcd} V^{(n-1);q}_{dcef}`.
+        :math:`V^{(n);q}_{1234} = \sum_{ab} V^{q}_{12ab} V^{(n-1);q}_{ba34}`.
 
         :param power: Positive integer exponent (must be greater than zero).
         :return: A new :class:`Interaction` in the same momentum-compression state as ``self``.
@@ -325,7 +323,7 @@ class Interaction(IAmNonLocal, LocalInteraction):
         if power <= 0:
             raise ValueError("Exponentiation of Interaction objects only supports positive powers greater than zero.")
         is_self_compressed = self.has_compressed_q_dimension
-        result = deepcopy(self).compress_q_dimension()
+        result = self.copy().compress_q_dimension()
         for _ in range(1, power):
             result = Interaction(result.times("qabcd,qdcef->qabef", self), self.channel, self.nq, True)
         return result if is_self_compressed else result.decompress_q_dimension()

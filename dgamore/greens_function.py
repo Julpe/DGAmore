@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Single-particle Green's function. :class:`GreensFunction` builds the momentum-dependent interacting Green's
-function :math:`G_{ab}(k, \nu) = [(\imath\nu + \mu)\delta_{ab} - \varepsilon_{ab}(k) - \Sigma_{ab}(k, \nu)]^{-1}`
+function :math:`G_{12}(k, \nu) = [(\imath\nu + \mu)\delta_{12} - \varepsilon_{12}(k) - \Sigma_{12}(k, \nu)]^{-1}`
 from a :class:`SelfEnergy`, the band dispersion :math:`\varepsilon(k)` and the chemical potential :math:`\mu`,
 and derives the filling, occupation, kinetic and (Galitskii-Migdal) potential energies. The module-level helpers
 adjust :math:`\mu` to a target filling via a Newton root search. Moment-corrected asymptotic sums are used so the
@@ -99,7 +99,12 @@ def root_fun(
 
 
 def update_mu(
-    mu0: float, target_filling: float, ek: np.ndarray, sigma_mat: np.ndarray, beta: float, smom0: np.ndarray,
+    mu0: float,
+    target_filling: float,
+    ek: np.ndarray,
+    sigma_mat: np.ndarray,
+    beta: float,
+    smom0: np.ndarray,
     logger=None,
 ) -> float:
     r"""
@@ -133,11 +138,11 @@ def update_mu(
 
 class GreensFunction(TwoPoint):
     r"""
-    The single-particle Green's function :math:`G_{ab}(k, \nu) = [(\imath\nu + \mu)\delta_{ab} -
-    \varepsilon_{ab}(k) - \Sigma_{ab}(k, \nu)]^{-1}`. Built from a :class:`SelfEnergy`, the band dispersion
+    The single-particle Green's function :math:`G_{12}(k, \nu) = [(\imath\nu + \mu)\delta_{12} -
+    \varepsilon_{12}(k) - \Sigma_{12}(k, \nu)]^{-1}`. Built from a :class:`SelfEnergy`, the band dispersion
     :math:`\varepsilon(k)` and the chemical potential :math:`\mu`; on top of the two-point orbital bookkeeping
     inherited from :class:`LocalTwoPoint` it adds the Dyson construction (local and momentum-resolved) and the
-    derived quantities — filling, occupation matrices, kinetic and (Galitskii-Migdal) potential energy — all using
+    derived quantities - filling, occupation matrices, kinetic and (Galitskii-Migdal) potential energy - all using
     moment-corrected asymptotic Matsubara sums so the finite frequency box does not bias the result.
     """
 
@@ -245,7 +250,9 @@ class GreensFunction(TwoPoint):
         return GreensFunction(mat, siw, ek, siw.full_niv_range, False, False, nk=ek.shape[:3], beta=beta, mu=mu)
 
     @staticmethod
-    def create_g_loc(siw: SelfEnergy, ek: np.ndarray, beta: float, mu: float, calc_filling: bool = True) -> "GreensFunction":
+    def create_g_loc(
+        siw: SelfEnergy, ek: np.ndarray, beta: float, mu: float, calc_filling: bool = True
+    ) -> "GreensFunction":
         r"""
         Builds a local (k-summed) Green's function from a self-energy and band dispersion.
 
@@ -276,7 +283,7 @@ class GreensFunction(TwoPoint):
 
     def get_g_wv(self, wn: np.ndarray, niv_cut: int) -> np.ndarray:
         r"""
-        Returns the frequency-shifted Green's function :math:`G_{ab}^{\nu - \omega}` on a fermionic window of half
+        Returns the frequency-shifted Green's function :math:`G_{12}^{\nu - \omega}` on a fermionic window of half
         width ``niv_cut``, for the bosonic frequencies in ``wn``.
 
         :param wn: Array of bosonic Matsubara indices :math:`\omega`.
@@ -313,7 +320,7 @@ class GreensFunction(TwoPoint):
     def get_ekin(self) -> float:
         r"""
         Returns the kinetic energy from the band dispersion and the k-resolved occupation,
-        :math:`E_{kin} = \sum_{\sigma \vec{k} ab} \varepsilon(\vec{k})_{ab}\, n(\vec{k})_{ba}`.
+        :math:`E_{kin} = \sum_{\sigma \vec{k} ab} \varepsilon_{ab}(\vec{k})\, n_{ba}(\vec{k})`.
 
         :return: The kinetic energy per site.
         """

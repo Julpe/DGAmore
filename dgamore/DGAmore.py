@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 """
-Main entry point and top-level driver of a DGAmore run (installed on the PATH as ``DGAmore.py``). The
-:func:`execute_dga_routine` orchestrates the full pipeline: parse the config, load the DMFT input, run the local
+Main entry point and top-level driver of a DGAmore run (installed on the PATH as ``DGAmore``). The
+:func:`main` orchestrates the full pipeline: parse the config, load the DMFT input, run the local
 Schwinger-Dyson step per inequivalent atom and assemble the full multi-band quantities, run the non-local ladder
 DGA self-energy, optionally analytically continue to real frequencies, and optionally solve the Eliashberg
 equation -- saving and plotting results along the way. Rank 0 owns the file I/O, local assembly and plotting; the
@@ -16,7 +16,11 @@ configuration and the assembled local quantities are broadcast to the other MPI 
 import itertools as it
 import logging
 import os
-from copy import deepcopy
+
+# OpenMPI: exclude the UCX one-sided (RMA) component before MPI is initialised. On some OpenMPI 5.x builds it fails its
+# own component-query and prints a benign "OSC UCX component priority set inside component query failed" warning when
+# the per-node shared-memory giwk window is created.
+os.environ.setdefault("OMPI_MCA_osc", "^ucx")
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -42,7 +46,7 @@ from dgamore.self_energy import SelfEnergy
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
 
-def execute_dga_routine():
+def main():
     """
     Runs the complete DGA pipeline end to end: config parsing and folder setup, DMFT input loading, the local
     Schwinger-Dyson step (per inequivalent atom, assembled into full multi-band quantities), the non-local
@@ -224,7 +228,7 @@ def execute_dga_routine():
             :return: The full object with this atom's block filled in.
             """
             if obj_full is None:
-                obj_full = deepcopy(obj_ineq)
+                obj_full = obj_ineq.copy()
                 obj_full.mat = np.zeros(
                     (config.sys.n_bands,) * 4 + obj_ineq.current_shape[4:], dtype=obj_ineq.mat.dtype
                 )
@@ -246,7 +250,7 @@ def execute_dga_routine():
             :return: The full object with this atom's block filled in.
             """
             if obj_full is None:
-                obj_full = deepcopy(obj_ineq)
+                obj_full = obj_ineq.copy()
                 obj_full.mat = np.zeros(
                     ((1, 1, 1) + (config.sys.n_bands,) * 2 if has_momentum else (config.sys.n_bands,) * 2)
                     + (obj_ineq.current_shape[-1],),
@@ -496,6 +500,9 @@ def execute_dga_routine():
         if not np.allclose(config.lattice.q_grid.nk, config.lattice.k_grid.nk):
             raise ValueError("Eliashberg equation can only be solved when nq = nk.")
         logger.info("Starting with Eliashberg equation.")
+        # sigma_dga is already saved to disk and never consumed by the Eliashberg step - drop the replicated
+        # full-grid copy on every rank before the memory-heavy vertex construction
+        sigma_dga.free()
         lambdas_sing, lambdas_trip, gaps_sing, gaps_trip = eliashberg_solver.solve(
             giwk_dga, g_dmft_full, u_loc, v_nonloc, comm
         )
@@ -530,25 +537,28 @@ def execute_dga_routine():
 
 def autodetect_memory_settings(comm: MPI.Comm) -> None:
     """
-    Sets the five ``config.memory.save_memory_*`` switches automatically from the host memory available on every node
-    the job runs on and an analytic estimate of the peak memory each affected operation consumes. Must be called only
-    after the irreducible BZ is known (i.e. after auto-symmetry discovery), as the estimate depends on
-    ``q_grid.nk_irr``.
+    Sets the four ``config.memory.save_memory_*`` switches automatically from the host memory available on every node
+    the job runs on and an analytic estimate of the peak memory each affected operation consumes; the flag-less
+    Schwinger-Dyson contraction (always the two-pass FFT path) is verified to fit as well. Must be called only after
+    the irreducible BZ is known (i.e. after auto-symmetry discovery), as the estimate depends on ``q_grid.nk_irr``.
 
     The budget is a **node total**: on a node with ``r`` ranks the memory held by all of them at a branch's peak is
-    ``r * (baseline + distributed) + single`` (every rank holds the persistent baseline; a *distributed* transient is
-    held by every rank at once, a *single-rank* transient by one rank while the others idle), and this must not exceed
-    ``psutil.virtual_memory().available * 0.9`` for that node. Each node's rank count and available memory are
-    collected with a single ``allgather`` of ``(hostname, available_bytes)``; a branch's fast path is judged to "fit"
-    only if it fits on **every** node (the flags are process-wide, so the tightest node governs, and a single-rank
-    transient may land on any node). For each branch the fast path is checked and the flag is switched on if it would
-    not fit -- but an explicit ``True`` from the config is always kept (floor semantics:
-    ``final = user_flag or autodetect_on``). If even the lean path of any considered branch does not fit on some
-    node, a :class:`MemoryError` is raised.
+    ``r * (baseline + distributed) + single`` (every rank holds the branch's persistent baseline; a *distributed*
+    transient is held by every rank at once, a *single-rank* transient by one rank while the others idle), minus
+    ``(r - 1) * giwk_shareable`` when ``config.memory.use_shared_memory_common_obj`` deduplicates the branch's ``giwk_full``
+    to one copy per node, and this must not exceed ``psutil.virtual_memory().available * 0.9`` for that node. Each
+    node's rank count and available memory are collected with a single ``allgather`` of
+    ``(hostname, available_bytes)``; a branch's path is judged to "fit" only if it fits on **every** node (the flags
+    are process-wide, so the tightest node governs, and a single-rank transient may land on any node). The
+    ``lanczos`` fast-path single-rank peak is doubled on a single-node multi-rank job because the singlet and triplet
+    solves then run concurrently on the same node. For each branch the fast path is checked and the flag is switched
+    on if it would not fit -- but an explicit ``True`` from the config is always kept (floor semantics:
+    ``final = user_flag or autodetect_on``). A :class:`MemoryError` is raised only if the path that would actually
+    run does not fit.
 
     :param comm: The MPI communicator (used to group ranks by node).
     :return: None.
-    :raises MemoryError: If the most memory-lean path of any considered branch still overflows some node's budget.
+    :raises MemoryError: If the code path selected for some branch overflows some node's budget.
     """
     logger = config.logger
 
@@ -564,9 +574,9 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
         nodes[host][1] = min(nodes[host][1], avail)
 
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
-    # Must mirror the giwk_full window kept through the SDE in nonlocal_sde.calculate_self_energy_q.
+    # Must mirror the giwk_full window the SDE section starts from in nonlocal_sde.calculate_self_energy_q.
     niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
-    baseline, peaks = memory_estimator.estimate_peaks(
+    peaks = memory_estimator.estimate_peaks(
         n_bands=config.sys.n_bands,
         nk_tot=config.lattice.q_grid.nk_tot,
         nk_irr=config.lattice.q_grid.nk_irr,
@@ -579,54 +589,101 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
         with_eliashberg=config.eliashberg.perform_eliashberg,
         save_fq=config.eliashberg.save_fq,
         construct_fq_cheap=config.eliashberg.construct_fq_cheap,
+        save_pairing_vertex=config.eliashberg.save_pairing_vertex,
+        n_eig=config.eliashberg.n_eig,
     )
 
-    def node_total(distributed: float, single: float, n_ranks: int) -> float:
-        """Memory held on a node with ``n_ranks`` ranks at a branch's peak (see :func:`autodetect_memory_settings`)."""
-        return n_ranks * (baseline + distributed) + single
+    # The singlet and triplet in-memory Eliashberg solves run concurrently on two ranks; on a single-node multi-rank
+    # job both land on the same node, so its lanczos fast-path single-rank peak is doubled.
+    single_node_multi_rank = len(nodes) == 1 and comm.size >= 2
 
-    def fits_everywhere(distributed: float, single: float) -> bool:
+    def node_total(bp: memory_estimator.BranchPeak, distributed: float, single: float, n_ranks: int) -> float:
+        """Memory held on a node with ``n_ranks`` ranks at a branch's peak (see :func:`autodetect_memory_settings`).
+        When ``config.memory.use_shared_memory_common_obj`` is on, the branch's shareable ``giwk_full`` is counted once per
+        node instead of once per rank."""
+        total = n_ranks * (bp.baseline + distributed) + single
+        if config.memory.use_shared_memory_common_obj:
+            total -= (n_ranks - 1) * bp.giwk_shareable
+        return total
+
+    def fits_everywhere(bp: memory_estimator.BranchPeak, distributed: float, single: float) -> bool:
         """Whether a transient (per-rank ``distributed`` + one-off ``single``) fits the 90% budget on every node."""
-        return all(node_total(distributed, single, r) <= avail * 0.9 for r, avail in nodes.values())
+        return all(node_total(bp, distributed, single, r) <= avail * 0.9 for r, avail in nodes.values())
 
     flag_to_key = {
         "save_memory_for_chi0q": "chi0q",
         "save_memory_for_chiq_aux": "chiq_aux",
-        "save_memory_for_sde": "sde",
         "save_memory_for_fq": "fq",
         "save_memory_for_lanczos": "lanczos",
     }
     key_to_label = {
         "chi0q": "Bare bubble",
         "chiq_aux": "Auxiliary susceptibility",
-        "sde": "Schwinger-Dyson equation",
         "fq": "Full vertex",
         "lanczos": "Eliashberg solver",
     }
 
-    logger.info(
-        f"Auto memory detection (node-total budget): {len(nodes)} node(s), "
-        f"per-rank baseline {baseline / 1024**3:.3f} GB."
-    )
+    logger.info(f"Auto memory detection (node-total budget): {len(nodes)} node(s).")
+
+    # The Schwinger-Dyson contraction has no save_memory switch (the q-loop variant is unused - it peaked HIGHER
+    # than the two-pass FFT path); its single path is still checked so an oversized box fails fast, not mid-run.
+    if "sde" in peaks:
+        bp_sde = peaks["sde"]
+        if not fits_everywhere(bp_sde, bp_sde.off_distributed, bp_sde.off_single):
+            worst = max(node_total(bp_sde, bp_sde.off_distributed, bp_sde.off_single, r) for r, _ in nodes.values())
+            raise MemoryError(
+                f"The Schwinger-Dyson equation needs {worst / 1024**3:.3f} GB on a node, which exceeds 90% of that "
+                f"node's available memory. Use more nodes, fewer ranks per node, a smaller frequency box or k-grid."
+            )
+        worst_sde = max(node_total(bp_sde, bp_sde.off_distributed, bp_sde.off_single, r) for r, _ in nodes.values())
+        logger.info(
+            f"Schwinger-Dyson equation: per-rank baseline {bp_sde.baseline / 1024**3:.3f} GB, "
+            f"node total {worst_sde / 1024**3:.3f} GB (single FFT path, no memory-saving switch)."
+        )
     for attr, key in flag_to_key.items():
         if key not in peaks:
             continue
         bp = peaks[key]
         label = key_to_label[key]
-        if not fits_everywhere(bp.on_distributed, bp.on_single):
-            worst = max(node_total(bp.on_distributed, bp.on_single, r) for r, _ in nodes.values())
-            raise MemoryError(
-                f"Even the most memory-lean path for '{label}' needs {worst / 1024**3:.3f} GB on a node, which "
-                f"exceeds 90% of that node's available memory. Use more nodes, fewer ranks per node, a smaller "
-                f"frequency box or k-grid."
-            )
-        autodetect_on = not fits_everywhere(bp.off_distributed, bp.off_single)
+        off_single = bp.off_single * (2 if key == "lanczos" and single_node_multi_rank else 1)
+        fits_off = fits_everywhere(bp, bp.off_distributed, off_single)
+        fits_on = fits_everywhere(bp, bp.on_distributed, bp.on_single)
+        autodetect_on = not fits_off
         final = bool(getattr(config.memory, attr)) or autodetect_on
+        if final and not fits_on:
+            worst = max(node_total(bp, bp.on_distributed, bp.on_single, r) for r, _ in nodes.values())
+            raise MemoryError(
+                f"The memory-saving path for '{label}' needs {worst / 1024**3:.3f} GB on a node, which exceeds 90% "
+                f"of that node's available memory"
+                + (
+                    " (and its fast path does not fit either)"
+                    if autodetect_on
+                    else " (its fast path would fit; unset the save_memory flag)"
+                )
+                + ". Use more nodes, fewer ranks per node, a smaller frequency box or k-grid."
+            )
         setattr(config.memory, attr, final)
-        worst_off = max(node_total(bp.off_distributed, bp.off_single, r) for r, _ in nodes.values())
+        worst_off = max(node_total(bp, bp.off_distributed, off_single, r) for r, _ in nodes.values())
         logger.info(
-            f"{label}: fast-path node total {worst_off / 1024**3:.3f} GB -> "
-            f"memory saving {'enabled' if final else 'disabled'}."
+            f"{label}: per-rank baseline {bp.baseline / 1024**3:.3f} GB, fast-path node total "
+            f"{worst_off / 1024**3:.3f} GB -> memory saving {'enabled' if final else 'disabled'}."
+        )
+
+
+def _disable_restrict_chi_phys_with_lambda_correction() -> None:
+    """
+    Disables the susceptibility restriction when the lambda correction is active: the lambda correction calibrates
+    its sum rule on the physical susceptibility, which must not contain eigenvalue-floored blocks. The combination
+    is not recommended and the lambda correction takes precedence.
+
+    :return: None.
+    """
+    if config.self_consistency.restrict_chi_phys:
+        config.self_consistency.restrict_chi_phys = False
+        config.logger.warning(
+            "Both the lambda correction and restrict_chi_phys were enabled - this combination is not recommended "
+            "since the lambda correction would calibrate its sum rule on eigenvalue-floored susceptibilities. "
+            "Keeping the lambda correction and disabling restrict_chi_phys."
         )
 
 
@@ -660,12 +717,14 @@ def setup_lambda_correction_settings(comm: MPI.Comm) -> None:
     if config.self_consistency.max_iter > 1 and config.self_consistency.use_lambda_correction:
         config.lambda_correction.perform_lambda_correction = True
         config.logger.info("Calculating self-consistency with lambda correction.")
+        _disable_restrict_chi_phys_with_lambda_correction()
         return
 
     if config.lambda_correction.perform_lambda_correction:
         config.self_consistency.max_iter = 1
         config.self_consistency.mixing = 1.0
         config.logger.info("Performing one-shot DGA with lambda correction.")
+        _disable_restrict_chi_phys_with_lambda_correction()
         return
     elif not config.lambda_correction.perform_lambda_correction:
         config.self_consistency.max_iter = 1
@@ -702,4 +761,4 @@ def configure_matplotlib():
 
 
 if __name__ == "__main__":
-    execute_dga_routine()
+    main()

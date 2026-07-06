@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Test on ${{ matrix.os }} / Python ${{ matrix.python-version }}
@@ -57,7 +61,7 @@ jobs:
       # 7. Run tests with coverage
       - name: Run tests
         run: |
-          pytest tests --runslow --cov=dgamore --cov-report=term-missing --cov-report=xml -vv
+          pytest tests --runslow --cov=dgamore --cov-report=term-missing --cov-report=xml --cov-fail-under=85 -vv
         # pytest tests --runslow --cov=dgamore --cov-report=xml --cov-report=term
 
       # 8. Upload coverage to Codecov (requires CODECOV_TOKEN for private repos)

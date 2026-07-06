@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Lattice model setup. :class:`Hamiltonian` assembles the (multi-orbital) Hubbard model: the real-space hopping
-:math:`t_{ab}(R)`, the local interaction :math:`U_{abcd}` and the non-local interaction :math:`V_{abcd}(R)`. It
+:math:`t_{12}(R)`, the local interaction :math:`U_{1234}` and the non-local interaction :math:`V_{1234}(R)`. It
 offers convenience builders (single-band, orbital-diagonal, Kanamori, 2D :math:`t`-:math:`t'`-:math:`t''`),
 readers/writers for wannier90 / wien2k ``hr``/``hk`` and ``umatrix`` files, and Fourier transforms to obtain the
-band dispersion :math:`\varepsilon_{ab}(k)` and momentum-dependent interaction :math:`V_{abcd}(q)`.
+band dispersion :math:`\varepsilon_{12}(k)` and momentum-dependent interaction :math:`V_{1234}(q)`.
 :class:`HoppingElement` and :class:`InteractionElement` are small validated containers for single hopping/
 interaction entries.
 """
@@ -501,7 +501,7 @@ class Hamiltonian:
 
     def get_ek(self, k_grid: bz.KGrid = None) -> np.ndarray:
         r"""
-        Returns the band dispersion :math:`\varepsilon_{ab}(k)`, computing and caching it from the real-space hopping
+        Returns the band dispersion :math:`\varepsilon_{12}(k)`, computing and caching it from the real-space hopping
         on ``k_grid`` if not already set.
 
         :param k_grid: The :class:`KGrid` to evaluate on (ignored if the dispersion is already cached/set).
@@ -535,7 +535,7 @@ class Hamiltonian:
 
     def get_vq(self, q_grid: bz.KGrid) -> "Interaction":
         r"""
-        Returns the momentum-dependent non-local interaction :math:`V_{abcd}(q)` by Fourier-transforming the
+        Returns the momentum-dependent non-local interaction :math:`V_{1234}(q)` by Fourier-transforming the
         real-space interaction onto ``q_grid``.
 
         :param q_grid: The :class:`KGrid` defining the momentum grid.
@@ -703,7 +703,7 @@ class Hamiltonian:
 
     def _convham_2_orbs(self, k_mesh: np.ndarray) -> np.ndarray:
         r"""
-        Fourier-transforms the real-space hopping to the band dispersion :math:`\varepsilon_{ab}(k)`, looping over
+        Fourier-transforms the real-space hopping to the band dispersion :math:`\varepsilon_{12}(k)`, looping over
         lattice vectors to keep the memory footprint low.
 
         :param k_mesh: The k-points as an array of shape ``[3, nk]``.
@@ -724,7 +724,7 @@ class Hamiltonian:
 
     def _convham_4_orbs(self, k_mesh: np.ndarray) -> np.ndarray:
         r"""
-        Fourier-transforms the real-space non-local interaction to :math:`V_{abcd}(q)`, looping over lattice vectors
+        Fourier-transforms the real-space non-local interaction to :math:`V_{1234}(q)`, looping over lattice vectors
         to keep the memory footprint low.
 
         :param k_mesh: The q-points as an array of shape ``[3, nk]``.
@@ -775,8 +775,8 @@ class Hamiltonian:
         NOTE: The check for the non-local :math:`V^q` needs to be revised because a straight inversion of the first
         axis is not correct.
 
-        :param uq_local: The local interaction tensor :math:`U_{abcd}`.
-        :param uq_nonlocal: The non-local interaction tensor :math:`V_{abcd}(q)`.
+        :param uq_local: The local interaction tensor :math:`U_{1234}`.
+        :param uq_nonlocal: The non-local interaction tensor :math:`V_{1234}(q)`.
         :return: None.
         :raises AssertionError: If either swapping symmetry is violated.
         """

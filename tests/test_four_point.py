@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 from copy import deepcopy
@@ -126,6 +126,116 @@ def test_mul_with_scalar_and_array(small_fourpoint):
     assert np.allclose(res2.mat, fp.mat * 2.0)
 
 
+def test_scale_in_place_multiplies_and_returns_self(small_fourpoint):
+    """scale(factor) multiplies mat in place (copy=False default), returns self, and stays complex64."""
+    fp = small_fourpoint
+    before = fp.mat.copy()
+    out = fp.scale(3.0)
+    assert out is fp
+    assert np.array_equal(fp.mat, (before * 3.0).astype(np.complex64))
+    assert fp.mat.dtype == np.complex64
+
+
+def test_scale_copy_true_leaves_original_untouched(small_fourpoint):
+    """scale(factor, copy=True) returns a new scaled object and leaves self unchanged."""
+    fp = small_fourpoint
+    before = fp.mat.copy()
+    out = fp.scale(-2.0, copy=True)
+    assert out is not fp
+    assert np.array_equal(out.mat, (before * -2.0).astype(np.complex64))
+    assert np.array_equal(fp.mat, before)
+
+
+def test_scale_rejects_non_scalar(small_fourpoint):
+    """scale only accepts numbers (mirrors __mul__)."""
+    with pytest.raises(ValueError):
+        small_fourpoint.scale(np.ones(3))
+
+
+def test_copy_returns_independent_deep_copy(small_fourpoint):
+    """copy() returns a new, independent deep copy whose mutation does not affect the original."""
+    fp = small_fourpoint
+    c = fp.copy()
+    assert c is not fp
+    assert c.mat is not fp.mat
+    assert np.array_equal(c.mat, fp.mat)
+    before = fp.mat.copy()
+    c.mat[...] = 0.0
+    assert np.array_equal(fp.mat, before)
+
+
+def _kernel_block(rng, channel, num_vn=1):
+    """Builds a half-niw, compressed-q FourPoint matching the self-energy-kernel layout (num_vn 1 or 2)."""
+    nq = (4, 4, 1)
+    qtot, o, niw, niv = 16, 2, 3, 3
+    shape = (qtot, o, o, o, o, niw + 1) + (2 * niv,) * num_vn
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    return FourPoint(mat, channel, nq, 1, num_vn, False, True, True, FrequencyNotation.PH)
+
+
+def test_add_inplace_equals_out_of_place_and_returns_self(rng):
+    """add(other, copy=False) accumulates into self in place, returns self, bit-equal to self + other."""
+    a, b = _kernel_block(rng, SpinChannel.NONE), _kernel_block(rng, SpinChannel.DENS)
+    ref = deepcopy(a) + deepcopy(b)
+    out = a.add(b, copy=False)
+    assert out is a
+    assert np.array_equal(a.mat, ref.mat)
+    assert a.channel == ref.channel == SpinChannel.DENS
+
+
+def test_sub_inplace_equals_out_of_place_and_returns_self(rng):
+    """sub(other, copy=False) subtracts into self in place, returns self, bit-equal to self - other."""
+    a, b = _kernel_block(rng, SpinChannel.DENS), _kernel_block(rng, SpinChannel.MAGN)
+    ref = deepcopy(a) - deepcopy(b)
+    out = a.sub(b, copy=False)
+    assert out is a
+    assert np.array_equal(a.mat, ref.mat)
+
+
+def test_add_inplace_with_scaled_other_matches_reference(rng):
+    """The kernel-accumulation idiom k.add(other.scale(3), copy=False) equals k + 3 * other."""
+    a, b = _kernel_block(rng, SpinChannel.NONE), _kernel_block(rng, SpinChannel.MAGN)
+    ref = deepcopy(a) + 3 * deepcopy(b)
+    a.add(b.scale(3.0), copy=False)
+    assert np.array_equal(a.mat, ref.mat)
+
+
+def test_add_copy_true_is_nondestructive(rng):
+    """add(other) (copy=True default) returns a new object and leaves self unchanged (unchanged behavior)."""
+    a, b = _kernel_block(rng, SpinChannel.DENS), _kernel_block(rng, SpinChannel.DENS)
+    before = a.mat.copy()
+    out = a.add(b)
+    assert out is not a
+    assert np.array_equal(a.mat, before)
+
+
+def test_add_inplace_rejects_non_fourpoint(rng):
+    """copy=False is only defined between two FourPoints; a scalar/array/interaction operand raises."""
+    a = _kernel_block(rng, SpinChannel.DENS)
+    with pytest.raises(NotImplementedError):
+        a.add(2.0, copy=False)
+
+
+def test_add_inplace_rejects_vn_extension(rng):
+    """copy=False refuses to diagonally extend self (num_vn=1 += num_vn=2), which would allocate a larger array."""
+    a, b = _kernel_block(rng, SpinChannel.NONE, num_vn=1), _kernel_block(rng, SpinChannel.DENS, num_vn=2)
+    with pytest.raises(ValueError):
+        a.add(b, copy=False)
+
+
+def test_add_inplace_reverts_other_niw_range(rng):
+    """copy=False converts a full-niw other to half for the op, then restores its range (non-destructive to other)."""
+    nq, qtot, o, niw, niv = (4, 4, 1), 16, 2, 3, 3
+    a = _kernel_block(rng, SpinChannel.DENS)  # half niw range
+    full_shape = (qtot, o, o, o, o, 2 * niw + 1, 2 * niv)
+    full_mat = rng.standard_normal(full_shape) + 1j * rng.standard_normal(full_shape)
+    b = FourPoint(full_mat, SpinChannel.MAGN, nq, 1, 1, True, True, True, FrequencyNotation.PH)
+    ref = deepcopy(a) + deepcopy(b)
+    a.add(b, copy=False)
+    assert np.array_equal(a.mat, ref.mat)
+    assert b.full_niw_range
+
+
 def test_add_with_localinteraction_and_interaction(rng):
     """A FourPoint adds a LocalInteraction and a momentum-dependent Interaction, preserving its shape."""
     nq = (4, 4, 1)
@@ -246,7 +356,7 @@ def test_sum_over_vn_reduces_dims(small_fourpoint):
     sl = fp.mat[0, 0, 0, 0, 0, 0, :, :, :]
     expect = (1 / beta) * np.sum(sl, axis=-1)
     got = out.mat[0, 0, 0, 0, 0, 0, :, :]
-    assert np.allclose(got, expect, rtol=1e-6, atol=1e-6)
+    assert np.allclose(got, expect, atol=1e-6)
 
 
 def test_sum_over_vn_raises_on_too_many_axes(small_fourpoint):
@@ -565,7 +675,7 @@ def test_invert_and_sum_methods_agree_on_decompressed_fp(small_fourpoint):
     assert out1._num_vn_dimensions == 1
     assert out2._num_vn_dimensions == 1
     assert out1.current_shape == out2.current_shape
-    assert np.allclose(out1.mat, out2.mat, rtol=1e-6, atol=1e-8)
+    assert np.allclose(out1.mat, out2.mat, atol=1e-6)
 
 
 def test_invert_and_sum_methods_agree_on_compressed_fp(small_fourpoint_compressed):
@@ -580,7 +690,7 @@ def test_invert_and_sum_methods_agree_on_compressed_fp(small_fourpoint_compresse
     assert out1._num_vn_dimensions == 1
     assert out2._num_vn_dimensions == 1
     assert out1.current_shape == out2.current_shape
-    assert np.allclose(out1.mat, out2.mat, rtol=1e-6, atol=1e-8)
+    assert np.allclose(out1.mat, out2.mat, atol=1e-6)
 
 
 def test_invert_and_sum_scales_with_beta(small_fourpoint_compressed):
@@ -594,7 +704,7 @@ def test_invert_and_sum_scales_with_beta(small_fourpoint_compressed):
     out_beta2 = deepcopy(fp).invert_and_sum_over_last_vn_v2(beta2)
 
     scale = beta1 / beta2
-    assert np.allclose(out_beta2.mat, out_beta1.mat * scale, rtol=1e-8, atol=1e-10)
+    assert np.allclose(out_beta2.mat, out_beta1.mat * scale, atol=1e-8)
 
 
 def test_invert_and_sum_v1_scales_with_beta(small_fourpoint_compressed):
@@ -640,3 +750,98 @@ def test_invert_and_sum_and_invert_preserve_complex64(small_fourpoint_compressed
     assert deepcopy(fp).invert_and_sum_over_last_vn(2.0).mat.dtype == np.complex64
     assert deepcopy(fp).invert_and_sum_over_last_vn_v2(2.0).mat.dtype == np.complex64
     assert deepcopy(fp).invert().mat.dtype == np.complex64
+
+
+def _compound_product_reference_q(mat1: np.ndarray, mat2: np.ndarray, notation: FrequencyNotation) -> np.ndarray:
+    """Per-momentum compound-space matrix product of two full-index tensors [q,o,o,o,o,v,v'] in the given frequency
+    notation (ph: rows {1,2,v}, cols {4,3,v'}; pp: rows {1,3,v}, cols {4,2,v'})."""
+    nq_tot, o, n2 = mat1.shape[0], mat1.shape[1], mat1.shape[-1]
+    dim = o * o * n2
+    order = (0, 1, 4, 3, 2, 5) if notation == FrequencyNotation.PH else (0, 2, 4, 3, 1, 5)
+    order_q = (0,) + tuple(i + 1 for i in order)
+    compound_shape = (nq_tot,) + tuple(np.array(mat1.shape[1:])[list(order)])
+    prod = np.transpose(mat1, order_q).reshape(nq_tot, dim, dim) @ np.transpose(mat2, order_q).reshape(nq_tot, dim, dim)
+    return np.transpose(prod.reshape(compound_shape), np.argsort(order_q))
+
+
+@pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
+def test_matmul_propagates_frequency_notation_and_compound_pairing(notation):
+    """Matmul contracts each momentum slice in the compound space of the operands' notation and the result carries
+    the frequency notation of self, so pp results unravel with the acbd back-permute."""
+    rng = np.random.default_rng(13)
+    nq, o, niv = (2, 2, 1), 2, 3
+    nq_tot = int(np.prod(nq))
+    shape = (nq_tot, o, o, o, o, 1, 2 * niv, 2 * niv)
+    mat1 = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    mat2 = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    x = FourPoint(mat1.copy(), SpinChannel.DENS, nq, 1, 2, True, True, True, notation)
+    y = FourPoint(mat2.copy(), SpinChannel.DENS, nq, 1, 2, True, True, True, notation)
+    z = x @ y
+    ref = _compound_product_reference_q(
+        mat1[:, :, :, :, :, 0].astype(np.complex64), mat2[:, :, :, :, :, 0].astype(np.complex64), notation
+    )
+    assert z.frequency_notation == notation
+    assert np.allclose(z.mat[:, :, :, :, :, 0], ref, atol=1e-4)
+
+
+@pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
+def test_matmul_mixed_vn_respects_frequency_notation(notation):
+    """The memory-saving 2vn @ 1vn matmul branch contracts each momentum slice with the notation's orbital pairing
+    (the 1vn operand acts nu-diagonally on the result's second frequency) and keeps the frequency notation of
+    self."""
+    rng = np.random.default_rng(16)
+    nq, o, niv = (2, 2, 1), 2, 3
+    nq_tot = int(np.prod(nq))
+    shape2 = (nq_tot, o, o, o, o, 1, 2 * niv, 2 * niv)
+    shape1 = (nq_tot, o, o, o, o, 1, 2 * niv)
+    mat2v = rng.standard_normal(shape2) + 1j * rng.standard_normal(shape2)
+    mat1v = rng.standard_normal(shape1) + 1j * rng.standard_normal(shape1)
+    x = FourPoint(mat2v.copy(), SpinChannel.DENS, nq, 1, 2, True, True, True, notation)
+    y = FourPoint(mat1v.copy(), SpinChannel.DENS, nq, 1, 1, True, True, True, notation)
+    z = x @ y
+    y_diag = np.zeros(shape2, dtype=np.complex64)
+    idx = np.arange(2 * niv)
+    y_diag[..., idx, idx] = mat1v
+    ref = _compound_product_reference_q(
+        mat2v[:, :, :, :, :, 0].astype(np.complex64), y_diag[:, :, :, :, :, 0], notation
+    )
+    assert z.frequency_notation == notation
+    assert z.num_vn_dimensions == 2
+    assert np.allclose(z.mat[:, :, :, :, :, 0], ref, atol=1e-4)
+
+
+@pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
+def test_matmul_with_local_interaction_respects_frequency_notation(notation):
+    """FourPoint @ LocalInteraction contracts the frequency-constant bare interaction with the notation's orbital
+    pairing on every momentum slice and keeps the frequency notation of the four-point operand."""
+    rng = np.random.default_rng(17)
+    nq, o, niv = (2, 2, 1), 2, 3
+    nq_tot = int(np.prod(nq))
+    shape = (nq_tot, o, o, o, o, 1, 2 * niv, 2 * niv)
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    umat = rng.standard_normal((o, o, o, o)) + 1j * rng.standard_normal((o, o, o, o))
+    x = FourPoint(mat.copy(), SpinChannel.DENS, nq, 1, 2, True, True, True, notation)
+    u = LocalInteraction(umat.copy())
+    u_diag = np.zeros(shape, dtype=np.complex64)
+    idx = np.arange(2 * niv)
+    u_diag[..., idx, idx] = umat[None, :, :, :, :, None, None].astype(np.complex64)
+    z = x @ u
+    ref = _compound_product_reference_q(mat[:, :, :, :, :, 0].astype(np.complex64), u_diag[:, :, :, :, :, 0], notation)
+    assert z.frequency_notation == notation
+    assert np.allclose(z.mat[:, :, :, :, :, 0], ref, atol=1e-4)
+
+
+def test_pow_pp_squares_in_pp_compound_space_without_explicit_identity():
+    """fp ** 2 on a pp object squares each momentum slice in the pp compound space (rows {1,3,v}, cols {4,2,v'})
+    and keeps the PP notation, with the matching identity derived internally via identity_like."""
+    rng = np.random.default_rng(20)
+    nq, o, niv = (2, 2, 1), 2, 3
+    nq_tot = int(np.prod(nq))
+    shape = (nq_tot, o, o, o, o, 1, 2 * niv, 2 * niv)
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    fp = FourPoint(mat.copy(), SpinChannel.DENS, nq, 1, 2, True, True, True, FrequencyNotation.PP)
+    result = fp**2
+    mat64 = mat[:, :, :, :, :, 0].astype(np.complex64)
+    ref = _compound_product_reference_q(mat64, mat64, FrequencyNotation.PP)
+    assert result.frequency_notation == FrequencyNotation.PP
+    assert np.allclose(result.mat[:, :, :, :, :, 0], ref, atol=1e-4)

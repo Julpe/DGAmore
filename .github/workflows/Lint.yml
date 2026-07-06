@@ -1,0 +1,38 @@
+name: Lint
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  black:
+    name: Black format check
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Checkout repository
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      # 2. Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # 3. Install Black (pinned; keep local Black matching this version)
+      - name: Install Black
+        run: pip install black==26.5.1
+
+      # 4. Verify formatting (line-length also read from [tool.black] in pyproject.toml)
+      - name: Check formatting
+        run: black --check --line-length 120 .

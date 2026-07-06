@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Local Schwinger-Dyson step. Given the two-particle DMFT Green's functions and the bare interaction, the functions
-here build the local vertex hierarchy per spin channel — the generalized susceptibility :math:`\chi_{r}`, the
+here build the local vertex hierarchy per spin channel - the generalized susceptibility :math:`\chi_{r}`, the
 irreducible vertex :math:`\Gamma_{r}` (with the Kitatani shell asymptotics), the auxiliary susceptibility
 :math:`\chi^{*}_{r}`, the three-leg vertex :math:`\gamma_{r}` (``vrg``), the full vertex :math:`F_{r}`, and the
-physical susceptibility — and recompute the local self-energy via the Schwinger-Dyson equation as a sanity check
+physical susceptibility - and recompute the local self-energy via the Schwinger-Dyson equation as a sanity check
 against the DMFT input. Equation numbers refer to the author's master's thesis (Chapter 3). A second set of
 functions implements the alternative ab-initio DGA formulation.
 """
@@ -28,8 +28,8 @@ from dgamore.self_energy import SelfEnergy
 def create_generalized_chi(g2: LocalFourPoint, g_dmft: GreensFunction) -> LocalFourPoint:
     r"""
     Returns the generalized susceptibility, see also Eq. (3.41) in my master's thesis,
-    :math:`\chi_{r;abcd}^{\omega\nu\nu'} = \beta (G_{r;abcd}^{(2);\omega\nu\nu'} - 2 \delta_{r,\mathrm{dens}}
-    \delta_{\omega 0} G_{ab}^{\nu} G_{cd}^{\nu'})`. The disconnected term is subtracted only in the density
+    :math:`\chi_{r;1234}^{\omega\nu\nu'} = \beta (G_{r;1234}^{(2);\omega\nu\nu'} - 2 \delta_{r,\mathrm{dens}}
+    \delta_{\omega 0} G_{12}^{\nu} G_{34}^{\nu'})`. The disconnected term is subtracted only in the density
     (ph) channel at :math:`\omega = 0`.
 
     :param g2: Two-particle (DMFT) Green's function :math:`G^{(2)}_{r}` as a :class:`LocalFourPoint`.
@@ -49,15 +49,15 @@ def create_generalized_chi(g2: LocalFourPoint, g_dmft: GreensFunction) -> LocalF
 def create_gamma_r(gchi_r: LocalFourPoint, gchi0_inv: LocalFourPoint, beta: float) -> LocalFourPoint:
     r"""
     Returns the ph-irreducible vertex
-    :math:`\Gamma_{r;abcd}^{\omega\nu\nu'} = \beta^2 [(\chi_{r;abcd}^{\omega\nu\nu'})^{-1} -
-    (\delta_{\nu\nu'}\chi_{0;abcd}^{\omega\nu\nu'})^{-1}]`.
+    :math:`\Gamma_{r;1234}^{\omega\nu\nu'} = \beta^2 [(\chi_{r;1234}^{\omega\nu\nu'})^{-1} -
+    (\delta_{\nu\nu'}\chi_{0;1234}^{\omega\nu})^{-1}]`.
 
     :param gchi_r: The generalized susceptibility :math:`\chi_{r}`.
     :param gchi0_inv: The inverse bare bubble :math:`\chi_0^{-1}` (diagonal in :math:`\nu\nu'`).
     :param beta: Inverse temperature :math:`\beta`.
     :return: The irreducible vertex :math:`\Gamma_{r}` as a :class:`LocalFourPoint`.
     """
-    return beta**2 * (gchi_r.invert() - gchi0_inv)
+    return (gchi_r.invert() - gchi0_inv).scale(beta**2)
 
 
 def create_gamma_r_with_shell_correction(
@@ -76,21 +76,21 @@ def create_gamma_r_with_shell_correction(
     """
     chi_tilde_shell = (gchi0.invert() + 1.0 / config.sys.beta**2 * u_loc.as_channel(gchi_r.channel)).invert()
     chi_tilde_core_inv = chi_tilde_shell.cut_niv(config.box.niv_core).invert()
-    return config.sys.beta**2 * (gchi_r.invert() - chi_tilde_core_inv) + u_loc.as_channel(gchi_r.channel)
+    return (gchi_r.invert() - chi_tilde_core_inv).scale(config.sys.beta**2) + u_loc.as_channel(gchi_r.channel)
 
 
 def create_auxiliary_chi(gamma_r: LocalFourPoint, gchi0_inv: LocalFourPoint, u_loc: LocalInteraction) -> LocalFourPoint:
     r"""
     Returns the auxiliary susceptibility, see Eq. (3.60) in my master's thesis,
-    :math:`\chi^{*;\omega\nu\nu'}_{r;abcd} = ((\chi_{0;abcd}^{\omega\nu})^{-1} +
-    (\Gamma_{r;abcd}^{\omega\nu\nu'} - U_{r;abcd})/\beta^2)^{-1}`.
+    :math:`\chi^{*;\omega\nu\nu'}_{r;1234} = ((\chi_{0;1234}^{\omega\nu})^{-1} +
+    (\Gamma_{r;1234}^{\omega\nu\nu'} - U_{r;1234})/\beta^2)^{-1}`.
 
     :param gamma_r: The irreducible vertex :math:`\Gamma_{r}`.
     :param gchi0_inv: The inverse bare bubble :math:`\chi_0^{-1}` (core box).
     :param u_loc: The bare local interaction :math:`U`.
     :return: The auxiliary susceptibility :math:`\chi^{*}_{r}` as a :class:`LocalFourPoint`.
     """
-    return (gchi0_inv + (gamma_r - u_loc.as_channel(gamma_r.channel)) / config.sys.beta**2).invert()
+    return (gchi0_inv + (gamma_r - u_loc.as_channel(gamma_r.channel)).scale(1.0 / config.sys.beta**2)).invert()
 
 
 def create_generalized_chi_with_shell_correction(
@@ -106,8 +106,8 @@ def create_generalized_chi_with_shell_correction(
     :param u_loc: The bare local interaction :math:`U`.
     :return: The shell-corrected physical susceptibility :math:`\chi_{r}^{\omega}` as a :class:`LocalFourPoint`.
     """
-    gchi0_full_sum = 1.0 / config.sys.beta * gchi0.sum_over_all_vn(config.sys.beta)
-    gchi0_core_sum = 1.0 / config.sys.beta * gchi0.cut_niv(config.box.niv_core).sum_over_all_vn(config.sys.beta)
+    gchi0_full_sum = gchi0.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
+    gchi0_core_sum = gchi0.cut_niv(config.box.niv_core).sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
     return ((gchi_aux_sum + gchi0_full_sum - gchi0_core_sum).invert() + u_loc.as_channel(gchi_aux_sum.channel)).invert()
 
 
@@ -130,28 +130,28 @@ def create_full_vertex_from_gamma(gamma_r, gchi0, u_loc):
 def create_full_vertex(gchi_r: LocalFourPoint, gchi0_inv: LocalFourPoint) -> LocalFourPoint:
     r"""
     Returns the local full vertex in the ``niv_core`` region, see Eq. (3.58) in my master's thesis,
-    :math:`F_{r;abcd}^{\omega\nu\nu'} = \beta^2 (\chi_{0;abcd}^{-1} - \chi_{0;abef}^{-1} \chi_{r;fehg}
-    \chi_{0;ghcd}^{-1})`.
+    :math:`F_{r;1234}^{\omega\nu\nu'} = \beta^2 ((\chi_{0;1234}^{\omega\nu\nu'})^{-1} - \sum_{abcd} (\chi_{0;12ab}^{\omega\nu})^{-1}
+    \chi_{r;bacd}^{\omega\nu\nu'} (\chi_{0;dc34}^{\omega\nu'})^{-1})`.
 
     :param gchi_r: The generalized susceptibility :math:`\chi_{r}`.
     :param gchi0_inv: The inverse bare bubble :math:`\chi_0^{-1}`.
     :return: The full vertex :math:`F_{r}` as a :class:`LocalFourPoint`.
     """
-    return config.sys.beta**2 * (gchi0_inv - gchi0_inv @ gchi_r @ gchi0_inv)
+    return (gchi0_inv - gchi0_inv @ gchi_r @ gchi0_inv).scale(config.sys.beta**2)
 
 
 def create_vrg(gchi_aux: LocalFourPoint, gchi0_inv: LocalFourPoint) -> LocalFourPoint:
     r"""
     Returns the three-leg vertex, see Eq. (3.63) in my master's thesis,
-    :math:`\gamma_{r;abcd}^{\omega\nu} = \beta (\chi^{\omega\nu\nu}_{0;ablm})^{-1} (\sum_{\nu'}
-    \chi^{*;\omega\nu\nu'}_{r;mlcd})`.
+    :math:`\gamma_{r;1234}^{\omega\nu} = \beta \sum_{ab} \sum_{\nu'} (\chi^{\omega\nu}_{0;12ab})^{-1}
+    \chi^{*;\omega\nu\nu'}_{r;ba34}`.
 
     :param gchi_aux: The auxiliary susceptibility :math:`\chi^{*}_{r}`.
     :param gchi0_inv: The inverse bare bubble :math:`\chi_0^{-1}` (core box).
     :return: The three-leg vertex :math:`\gamma_{r}` (``vrg``) as a :class:`LocalFourPoint`.
     """
     gchi_aux_sum = gchi_aux.sum_over_vn(config.sys.beta, axis=(-1,))
-    return config.sys.beta * (gchi0_inv @ gchi_aux_sum)
+    return (gchi0_inv @ gchi_aux_sum).scale(config.sys.beta)
 
 
 def create_vertex_functions(
@@ -212,18 +212,18 @@ def create_vertex_functions(
 def get_local_hartree_fock(u_loc: LocalInteraction, occ: np.ndarray) -> np.ndarray:
     r"""
     Returns the local Hartree-Fock (static, frequency-independent) self-energy
-    :math:`\Sigma^{HF}_{ab}` from the bare interaction and the local occupation, i.e. the density-channel
+    :math:`\Sigma^{HF}_{12}` from the bare interaction and the local occupation, i.e. the density-channel
     interaction contracted with the occupation, see Eq. (3.55) in my master's thesis.
 
-    The interaction tensor is stored with the inter-orbital density :math:`U'` at :math:`U_{abab}` (the convention
+    The interaction tensor is stored with the inter-orbital density :math:`U'` at :math:`U_{1212}` (the convention
     of :meth:`Hamiltonian.kanamori_interaction_dp` and the w2dynamics ``umatrix`` files), whereas the density-channel
-    projection contracted as ``"abcd,dc->ab"`` picks up :math:`U_{aabb}`. The middle two orbital indices are
+    projection contracted as ``"abcd,dc->ab"`` picks up :math:`U_{1122}`. The middle two orbital indices are
     therefore swapped (``"abcd->acbd"``) before the projection, so that the Hartree term uses :math:`U'` while the
-    Fock term still uses :math:`U_{adcb}`. This only affects multi-orbital systems with off-diagonal interactions;
+    Fock term still uses :math:`U_{1432}`. This only affects multi-orbital systems with off-diagonal interactions;
     single-orbital and purely orbital-diagonal interactions are unchanged.
 
     :param u_loc: The bare local interaction :math:`U`.
-    :param occ: The local occupation matrix :math:`n_{ab}`, shape ``[n_bands, n_bands]``.
+    :param occ: The local occupation matrix :math:`n_{12}`, shape ``[n_bands, n_bands]``.
     :return: The Hartree-Fock self-energy, shape ``[n_bands, n_bands]``.
     """
     return u_loc.permute_orbitals("abcd->acbd").as_channel(SpinChannel.DENS).times("abcd,dc->ab", occ)
@@ -380,20 +380,20 @@ def perform_local_schwinger_dyson_abinitio_dga(
     # F_r = -beta^2 * [chi0^(-1) - chi0^(-1) chi_r chi0^(-1)]
     # gamma_r is NOT the irreducible vertex in channel r but rather the three-point vertex from AbinitioDGA
     gchi0_inv_core = gchi0_core.invert()
-    f_dens_loc = -config.sys.beta**2 * (gchi0_inv_core - gchi0_inv_core @ gchi_dens_loc @ gchi0_inv_core)
+    f_dens_loc = (gchi0_inv_core - gchi0_inv_core @ gchi_dens_loc @ gchi0_inv_core).scale(-config.sys.beta**2)
     logger.info("Local full vertex F^wvv' (dens) calculated.")
-    f_magn_loc = -config.sys.beta**2 * (gchi0_inv_core - gchi0_inv_core @ gchi_magn_loc @ gchi0_inv_core)
+    f_magn_loc = (gchi0_inv_core - gchi0_inv_core @ gchi_magn_loc @ gchi0_inv_core).scale(-config.sys.beta**2)
     logger.info("Local full vertex F^wvv' (magn) calculated.")
     del gchi0_inv_core
 
     # f_dens_loc_with_asympt = create_asympt_f(gchi_dens_loc, gchi_magn_loc, gchi_ud_pp_loc_sum, u_loc)
 
     # in most equations we need 1 + gamma_r so we add it here
-    gamma_dens_loc = 1.0 / config.sys.beta * (gchi0_core @ f_dens_loc).sum_over_vn(config.sys.beta, axis=(-2,))
+    gamma_dens_loc = (gchi0_core @ f_dens_loc).sum_over_vn(config.sys.beta, axis=(-2,)).scale(1.0 / config.sys.beta)
     one_plus_gamma_dens_loc = LocalFourPoint.identity_like(gamma_dens_loc) + gamma_dens_loc
     logger.info("Local three-leg vertex gamma^wv (dens) calculated.")
 
-    gamma_magn_loc = 1.0 / config.sys.beta * (gchi0_core @ f_magn_loc).sum_over_vn(config.sys.beta, axis=(-2,))
+    gamma_magn_loc = (gchi0_core @ f_magn_loc).sum_over_vn(config.sys.beta, axis=(-2,)).scale(1.0 / config.sys.beta)
     one_plus_gamma_magn_loc = LocalFourPoint.identity_like(gamma_magn_loc) + gamma_magn_loc
     logger.info("Local three-leg vertex gamma^wv (magn) calculated.")
     del gchi0_core, gamma_magn_loc

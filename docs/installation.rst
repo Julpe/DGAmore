@@ -47,8 +47,8 @@ The editable install is recommended for development, as it lets you modify the s
 pick up upstream changes simply by pulling the latest version. Please make sure no older cached versions of the
 dependencies are reused, as this can lead to installation problems.
 
-Installing the package also places the entry point ``DGAmore.py`` on your ``PATH``, so you can launch a run from
-anywhere without specifying its full path. To verify the installation, you can optionally install ``pytest`` and run
+Installing the package also places the entry points ``DGAmore`` and ``symmetrize`` on your ``PATH``, so you can
+launch a run from anywhere without specifying its full path. To verify the installation, you can optionally install ``pytest`` and run
 the test suite:
 
 .. code-block:: bash

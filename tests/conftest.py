@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import logging
@@ -179,8 +179,10 @@ def create_comm_mock():
     comm_mock.Bcast.side_effect = bcast_numpy
     comm_mock.Allreduce.side_effect = allreduce_numpy
 
-    # Split should return itself
+    # Split / Split_type return the single-rank comm itself; Free is a no-op
     comm_mock.Split.return_value = comm_mock
+    comm_mock.Split_type.return_value = comm_mock
+    comm_mock.Free.return_value = None
 
     return comm_mock
 
@@ -235,15 +237,17 @@ def _assign(buf, data):
 
 
 class Comm:
-    def __init__(self, size=1):
-        self._size = int(size)
+    def __init__(self, size=1, members=None):
+        self._members = tuple(members) if members is not None else tuple(range(int(size)))
+        self._size = len(self._members)
         self._barrier = _threading.Barrier(self._size) if self._size > 1 else None
         self._inboxes = [dict() for _ in range(self._size)]
         self._lock = _threading.Lock()
         self._store = [None] * self._size
+        self._split_cache = {}
 
     def Get_rank(self):
-        return getattr(_tls, "rank", 0)
+        return self._members.index(getattr(_tls, "rank", 0))
 
     def Get_size(self):
         return self._size
@@ -264,6 +268,21 @@ class Comm:
     def abort_barrier(self):
         if self._barrier is not None:
             self._barrier.abort()
+
+    def Split_type(self, split_type, key=0, info=None):
+        # Group the ranks by hostname (COMM_TYPE_SHARED -> one sub-communicator per node). Threads share memory, so
+        # same-node ranks receive the SAME cached Comm instance and therefore a shared barrier/store, which is what
+        # makes the shared-memory window below genuinely shared.
+        host = getattr(_tls, "hostname", "node0")
+        hosts = list(self._collective(host))
+        group = tuple(self._members[i] for i in range(self._size) if hosts[i] == host)
+        with self._lock:
+            if host not in self._split_cache:
+                self._split_cache[host] = Comm(members=group)
+        return self._split_cache[host]
+
+    def Free(self):
+        pass
 
     def _collective(self, contribution):
         r = self.rank
@@ -356,13 +375,33 @@ class Comm:
         return _Request(lambda: _assign(buf, self._queue(self.rank, (source, tag)).get(timeout=_QUEUE_TIMEOUT)))
 
 
+class Win:
+    # Minimal MPI shared-memory window over the threaded fake Comm. Because threads share an address space, the node
+    # root (local rank 0) allocates one bytearray and every rank of the (node) communicator receives the SAME object
+    # via bcast, so a numpy view over it is genuinely shared - writes by the root are visible to all.
+    @staticmethod
+    def Allocate_shared(size, disp_unit=1, info=None, comm=None):
+        win = Win()
+        buf = bytearray(int(size)) if comm.Get_rank() == 0 else None
+        win._buf = comm.bcast(buf, root=0)
+        return win
+
+    def Shared_query(self, rank):
+        return self._buf, 1
+
+    def Free(self):
+        self._buf = None
+
+
 COMM_WORLD = Comm(1)
 
 FAKE_MPI = _types.SimpleNamespace(
     Comm=Comm,
     Request=Request,
+    Win=Win,
     IN_PLACE=IN_PLACE,
     REQUEST_NULL=REQUEST_NULL,
+    COMM_TYPE_SHARED=1,
     COMM_WORLD=COMM_WORLD,
     Get_processor_name=Get_processor_name,
 )

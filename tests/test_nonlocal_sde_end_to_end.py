@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import contextlib
@@ -165,7 +165,6 @@ def test_calculates_nonlocal_sde_correctly(setup, niw_core, niv_core, niv_shell,
     config.dmft.symmetrize_orbitals = []
     config.memory.save_memory_for_chi0q = save_memory
     config.memory.save_memory_for_chiq_aux = save_memory
-    config.memory.save_memory_for_sde = save_memory
 
     g_dmft, s_dmft, g2_dens, g2_magn = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
 
@@ -200,7 +199,6 @@ def test_calculates_srvo3_correctly(setup_srvo3_cubic, save_memory):
 
     config.memory.save_memory_for_chi0q = save_memory
     config.memory.save_memory_for_chiq_aux = save_memory
-    config.memory.save_memory_for_sde = save_memory
 
     config.output.output_path = folder_cubic
 

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 """
@@ -361,7 +361,7 @@ def get_lattice_symmetries_from_string(symmetry_string: str | tuple | list) -> l
 
 
 # Sentinel object returned by get_lattice_symmetries_from_string for "auto".
-# Identity-checked, so it must be a unique singleton — a small dedicated object.
+# Identity-checked, so it must be a unique singleton - a small dedicated object.
 class _AutoSymmetriesSentinel:
     """Marker indicating that lattice symmetries are to be detected automatically
     from a Hamiltonian, via KGrid.specify_auto_symmetries()."""

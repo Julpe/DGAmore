@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 """
 YAML configuration parsing. :class:`ConfigParser` reads the run's YAML config (rank 0), broadcasts it to all MPI
@@ -260,6 +260,9 @@ class ConfigParser:
         conf.epsilon = self._try_parse(section, "epsilon", conf.epsilon)
         conf.symmetry = self._try_parse(section, "symmetry", conf.symmetry)
         conf.include_local_part = self._try_parse(section, "include_local_part", conf.include_local_part)
+        conf.symmetrize_degenerate_gaps = self._try_parse(
+            section, "symmetrize_degenerate_gaps", conf.symmetrize_degenerate_gaps
+        )
         conf.subfolder_name = self._try_parse(section, "subfolder_name", conf.subfolder_name)
 
         return conf
@@ -323,9 +326,11 @@ class ConfigParser:
         conf.save_memory_for_chiq_aux = self._try_parse(
             section, "save_memory_for_chiq_aux", conf.save_memory_for_chiq_aux
         )
-        conf.save_memory_for_sde = self._try_parse(section, "save_memory_for_sde", conf.save_memory_for_sde)
         conf.save_memory_for_fq = self._try_parse(section, "save_memory_for_fq", conf.save_memory_for_fq)
         conf.save_memory_for_lanczos = self._try_parse(section, "save_memory_for_lanczos", conf.save_memory_for_lanczos)
+        conf.use_shared_memory_common_obj = self._try_parse(
+            section, "use_shared_memory_common_obj", conf.use_shared_memory_common_obj
+        )
 
         return conf
 
