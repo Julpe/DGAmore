@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Standalone preprocessing script (a second installed console script) that converts a w2dynamics worm-sampled
@@ -362,7 +362,7 @@ def complete(text, state):
         return None
 
 
-if __name__ == "__main__":
+def main():
     default_filename = "Vertex.hdf5"
     default_output_filename = "g4iw_sym.hdf5"
 
@@ -441,3 +441,7 @@ if __name__ == "__main__":
     print(f"{len(ineq_numbers)} inequivalent atom(s) written to {output_filename}.")
     print("Done!")
     exit()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import itertools
@@ -245,15 +245,15 @@ def test_extends_correctly_with_one_fermionic_dimension():
     result = obj.extend_vn_to_diagonal()
     assert result is obj
     assert result.mat.shape == (4, 4, 4, 4, 4)
-    assert np.allclose(result.mat[..., 0, 0], mat[..., 0], rtol=1e-2)
-    assert np.allclose(result.mat[..., 0, 1], 0, rtol=1e-2)
-    assert np.allclose(result.mat[..., 1, 0], 0, rtol=1e-2)
-    assert np.allclose(result.mat[..., 1, 1], mat[..., 1], rtol=1e-2)
-    assert np.allclose(result.mat[..., 2, 0], 0, rtol=1e-2)
-    assert np.allclose(result.mat[..., 0, 2], 0, rtol=1e-2)
-    assert np.allclose(result.mat[..., 2, 1], 0, rtol=1e-2)
-    assert np.allclose(result.mat[..., 1, 2], 0, rtol=1e-2)
-    assert np.allclose(result.mat[..., 2, 2], mat[..., 2], rtol=1e-2)
+    assert np.allclose(result.mat[..., 0, 0], mat[..., 0], atol=1e-2)
+    assert np.allclose(result.mat[..., 0, 1], 0, atol=1e-2)
+    assert np.allclose(result.mat[..., 1, 0], 0, atol=1e-2)
+    assert np.allclose(result.mat[..., 1, 1], mat[..., 1], atol=1e-2)
+    assert np.allclose(result.mat[..., 2, 0], 0, atol=1e-2)
+    assert np.allclose(result.mat[..., 0, 2], 0, atol=1e-2)
+    assert np.allclose(result.mat[..., 2, 1], 0, atol=1e-2)
+    assert np.allclose(result.mat[..., 1, 2], 0, atol=1e-2)
+    assert np.allclose(result.mat[..., 2, 2], mat[..., 2], atol=1e-2)
 
 
 def test_raises_error_when_taking_diagonal_with_no_fermionic_dimensions():
@@ -282,10 +282,10 @@ def test_compresses_correctly_with_two_fermionic_dimensions():
     result = obj.take_vn_diagonal()
     assert result is obj
     assert result.mat.shape == (4, 4, 4, 4)
-    assert np.allclose(result.mat[..., 0], 1, rtol=1e-2)
-    assert np.allclose(result.mat[..., 1], 2, rtol=1e-2)
-    assert np.allclose(result.mat[..., 2], 3, rtol=1e-2)
-    assert np.allclose(result.mat[..., 3], 4, rtol=1e-2)
+    assert np.allclose(result.mat[..., 0], 1, atol=1e-2)
+    assert np.allclose(result.mat[..., 1], 2, atol=1e-2)
+    assert np.allclose(result.mat[..., 2], 3, atol=1e-2)
+    assert np.allclose(result.mat[..., 3], 4, atol=1e-2)
 
 
 def test_flips_matrix_along_valid_single_axis():
@@ -293,7 +293,7 @@ def test_flips_matrix_along_valid_single_axis():
     mat = np.zeros((4, 4, 9, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
     result = obj.flip_frequency_axis(axis=(-1,))
-    assert np.allclose(result.mat, np.flip(mat, axis=-1), rtol=1e-2)
+    assert np.allclose(result.mat, np.flip(mat, axis=-1), atol=1e-2)
 
 
 def test_flips_matrix_along_valid_multiple_axes():
@@ -301,7 +301,7 @@ def test_flips_matrix_along_valid_multiple_axes():
     mat = np.zeros((4, 4, 9, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
     result = obj.flip_frequency_axis(axis=(-2, -1))
-    assert np.allclose(result.mat, np.flip(mat, axis=(-2, -1)), rtol=1e-2)
+    assert np.allclose(result.mat, np.flip(mat, axis=(-2, -1)), atol=1e-2)
 
 
 def test_raises_error_when_flipping_with_no_frequency_dimensions():
@@ -328,7 +328,7 @@ def test_handles_single_axis_as_integer():
     mat = np.zeros((4, 4, 9, 10))
     obj = LocalNPoint(mat, 2, 1, 1)
     result = obj.flip_frequency_axis(axis=-1)
-    assert np.allclose(result.mat, np.flip(mat, axis=-1), rtol=1e-2)
+    assert np.allclose(result.mat, np.flip(mat, axis=-1), atol=1e-2)
 
 
 def test_aligns_frequency_dimensions_correctly_when_self_has_one_and_other_has_two_fermionic_dimensions():
@@ -401,7 +401,7 @@ def test_converts_to_half_bosonic_range_correctly():
     result = obj.to_half_niw_range()
     assert result is obj
     assert result.mat.shape == (4, 4, 11, 20)
-    assert np.allclose(result.mat, np.take(mat, np.arange(10, 21), axis=-2), rtol=1e-2)
+    assert np.allclose(result.mat, np.take(mat, np.arange(10, 21), axis=-2), atol=1e-2)
 
 
 def test_returns_self_when_already_in_half_bosonic_range():

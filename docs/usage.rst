@@ -7,7 +7,7 @@ Preparing the input
 DGAmore takes as input the result of a DMFT calculation, which currently must be produced with w2dynamics, a
 continuous-time quantum Monte Carlo solver based on the hybridisation expansion. A w2dynamics run yields both the
 one-particle quantities and a two-particle output containing the four-point Green's functions. The two-particle
-output first has to be converted into the format DGAmore expects. This is done by running the ``symmetrize_new.py``
+output first has to be converted into the format DGAmore expects. This is done by running the ``symmetrize``
 script, which is installed alongside the main entry point; it prompts for the input and output file names and writes
 only the density and magnetic spin components of the two-particle Green's function to the output file. The original,
 unsymmetrised vertex file is not needed afterwards.
@@ -20,19 +20,19 @@ additional file specifying the local and non-local interaction can be provided.
 Running a calculation
 ---------------------
 
-The main entry point of the program is ``DGAmore.py``. Because it is added to the Python environment as a standalone
+The main entry point of the program is ``DGAmore``. Because it is added to the Python environment as a standalone
 executable, it can be invoked by name without its full path. For single-core execution, which is mainly intended for
 testing, run:
 
 .. code-block:: bash
 
-   DGAmore.py
+   DGAmore
 
 For a parallel run with MPI, use:
 
 .. code-block:: bash
 
-   mpiexec -np <n_proc> DGAmore.py
+   mpiexec -np <n_proc> DGAmore
 
 Instead of ``mpiexec`` you may also use ``mpirun`` or, on SLURM-based clusters, ``srun``. The number of processes
 ``<n_proc>`` should be chosen according to the problem size and the available resources; note that increasing the
@@ -46,7 +46,7 @@ processes and loads the configuration file ``my_config.yaml`` from ``/configs/``
 
 .. code-block:: bash
 
-   mpiexec -np 8 DGAmore.py -p /configs/ -c my_config.yaml
+   mpiexec -np 8 DGAmore -p /configs/ -c my_config.yaml
 
 On a SLURM-based cluster, a typical job submission script looks as follows:
 
@@ -71,10 +71,10 @@ On a SLURM-based cluster, a typical job submission script looks as follows:
    export OMP_NUM_THREADS=1
 
    # Recommended on SLURM-based clusters:
-   srun DGAmore.py -p "<path to config>" -c "<name of config>.yaml"
+   srun DGAmore -p "<path to config>" -c "<name of config>.yaml"
 
    # Alternatively, with mpirun or mpiexec:
-   mpirun -np $SLURM_NTASKS DGAmore.py -p "<path to config>" -c "<name of config>.yaml"
+   mpirun -np $SLURM_NTASKS DGAmore -p "<path to config>" -c "<name of config>.yaml"
 
 The ``-o`` and ``-e`` options set the files for the job output and errors; here both are written to the same file,
 but separate files may be used instead. The results of a completed run are written to a subdirectory of the output

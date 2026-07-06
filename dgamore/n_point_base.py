@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 """
 Foundational mixins for every physical quantity in the code. :class:`IHaveMat` owns the underlying numpy array
@@ -159,6 +159,16 @@ class IHaveMat(ABC):
         """
         return self.mat.nbytes / (1024**3)
 
+    def copy(self) -> "IHaveMat":
+        """
+        Returns an independent deep copy of the object -- a thin wrapper around :func:`copy.deepcopy` used in place of
+        a bare ``deepcopy(obj)`` throughout the package. Mutating the returned object (including its ``mat``) does not
+        affect the original.
+
+        :return: A deep copy of ``self``.
+        """
+        return deepcopy(self)
+
     def __mul__(self, other) -> "IHaveMat":
         """
         Multiplies the object by a scalar number, returning a new (deep-copied) object.
@@ -170,7 +180,7 @@ class IHaveMat(ABC):
         if not isinstance(other, (int, float, complex)):
             raise ValueError("Multiplication only supported with numbers.")
 
-        copy = deepcopy(self)
+        copy = self.copy()
         copy.mat *= other
         return copy
 
@@ -202,6 +212,26 @@ class IHaveMat(ABC):
         if not isinstance(other, (int, float, complex)):
             raise ValueError("Division only supported with numbers.")
         return self.__mul__(1.0 / other)
+
+    def scale(self, factor, copy: bool = False) -> "IHaveMat":
+        """
+        Multiplies the matrix by a scalar. The in-place branch (``copy=False``, the default here) mutates and
+        returns ``self`` without allocating a copy -- the memory-lean counterpart of the non-destructive
+        ``*``/:meth:`__mul__` operator (which already covers the copying case). Used to fold a scalar prefactor
+        into an in-place accumulation (e.g. the self-energy-kernel assembly in :mod:`dgamore.nonlocal_sde`)
+        without a throwaway scaled copy. ``copy=True`` returns a scaled deep copy and leaves ``self`` untouched.
+
+        :param factor: A scalar (int, float or complex) to multiply with.
+        :param copy: If True, return a scaled deep copy; if False (default), scale ``self.mat`` in place.
+        :return: The scaled object (``self`` when ``copy=False``).
+        :raises ValueError: If ``factor`` is not a number.
+        """
+        if not isinstance(factor, (int, float, complex)):
+            raise ValueError("Multiplication only supported with numbers.")
+        if copy:
+            return self.copy().scale(factor, copy=False)
+        self.mat *= factor
+        return self
 
     def __getitem__(self, item):
         """
@@ -291,7 +321,7 @@ class IHaveMat(ABC):
         mat = self._mat
         self._mat = None
         try:
-            clone = deepcopy(self)
+            clone = self.copy()
         finally:
             self._mat = mat
         return clone
@@ -705,7 +735,7 @@ class IAmNonLocal(IHaveMat, ABC):
         :return: The re-gridded object in the same momentum-compression state as the input.
         :raises ValueError: If a target size is not a positive integer, or the object is compressed but not full-BZ.
         """
-        copy = deepcopy(self) if copy else self
+        copy = self.copy() if copy else self
 
         nq_new = tuple(int(n) for n in nq_new)
         if any(n < 1 for n in nq_new):
@@ -753,12 +783,12 @@ class IAmNonLocal(IHaveMat, ABC):
         per-k orbital transformation stored on ``k_grid`` by ``specify_auto_symmetries(hk)``.
 
         The orbital transformation follows the ket/bra convention of the operator ordering
-        :math:`G_{abcd} := \langle T[c_a c^\dagger_b c_c c^\dagger_d]\rangle` -- annihilation indices
+        :math:`G_{1234} := \langle T[c_1 c^\dagger_2 c_3 c^\dagger_4]\rangle` -- annihilation indices
         (positions 1, 3) transform with :math:`U`, creation indices (positions 2, 4) with :math:`U^\dagger` --
         combined with a per-k antisymmetry sign :math:`\sigma_k` and an optional complex conjugation ``conj_k``:
 
-            2-index : :math:`M_{ab}(k)   = \sigma_k     \, U_{aa'} [M_{a'b'}(k_{rep})]^{[*conj_k]} U^\dagger_{b'b}`
-            4-index : :math:`M_{abcd}(k) = \sigma_k^2 \, U_{aa'} [M_{a'b'c'd'}(k_{rep})]^{[*conj_k]} U^\dagger_{b'b} U_{cc'} U^\dagger_{d'd}`
+            2-index : :math:`M_{12}(k)   = \sigma_k     \, U_{1a} [M_{ab}(k_{rep})]^{[*conj_k]} U^\dagger_{b2}`
+            4-index : :math:`M_{1234}(k) = \sigma_k^2 \, U_{1a} [M_{abcd}(k_{rep})]^{[*conj_k]} U^\dagger_{b2} U_{3c} U^\dagger_{d4}`
 
         If ``k_grid`` is not yet in auto mode (``specify_auto_symmetries`` has not been called),
         only the momentum expansion is performed and orbital indices are left unchanged.
@@ -807,7 +837,7 @@ class IAmNonLocal(IHaveMat, ABC):
         :return: The Fourier-transformed object, in the same momentum-compression state as the input.
         """
         if copy:
-            return deepcopy(self).fft(copy=False)
+            return self.copy().fft(copy=False)
 
         compress = False
         if self.has_compressed_q_dimension:
@@ -826,7 +856,7 @@ class IAmNonLocal(IHaveMat, ABC):
         :return: The inverse-Fourier-transformed object, in the same momentum-compression state as the input.
         """
         if copy:
-            return deepcopy(self).ifft(copy=False)
+            return self.copy().ifft(copy=False)
 
         compress = False
         if self.has_compressed_q_dimension:

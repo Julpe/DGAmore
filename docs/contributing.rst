@@ -81,16 +81,18 @@ When you would like to contribute code, the following workflow keeps things smoo
 
       pytest tests                     # fast suite (skips tests marked slow)
       pytest tests --runslow           # full suite, as run in CI
-      pytest tests --runslow --cov=dgamore --cov-report=term-missing   # with coverage
+      pytest tests --runslow --cov=dgamore --cov-report=term-missing --cov-fail-under=85   # coverage, as CI runs it
 
 5. **Open a pull request** against the ``main`` branch, with a short description of what you changed and why. If your
    pull request is related to an existing issue, mentioning it helps connect the two.
 
-A continuous integration pipeline runs the full test suite on every pull request, across Python 3.12 to 3.14 on both
-Linux and macOS. This is there to catch regressions, not to be a gatekeeper, so please do not worry if something turns
-red on the first try; it is a normal part of the process, and we are glad to help you get it passing. A coverage tool
-also checks that the overall test coverage stays above eighty-five percent, so adding tests for your changes is the
-best way to keep it healthy.
+A continuous integration pipeline runs on every pull request. It checks that the code is Black-formatted, then runs the
+full test suite across Python 3.12 to 3.14 on both Linux and macOS. This is there to catch regressions, not to be a
+gatekeeper, so please do not worry if something turns red on the first try; it is a normal part of the process, and we
+are glad to help you get it passing. The pipeline also requires the overall test coverage to stay at **at least
+eighty-five percent**, and the build fails if it drops below that threshold. Beyond the overall figure, the new or
+changed code in a pull request (the *patch*) must itself be covered to **at least eighty-five percent**, so please add
+tests for what you write rather than relying on the rest of the code base to carry the average.
 
 Coding style
 ------------

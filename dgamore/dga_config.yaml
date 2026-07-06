@@ -26,7 +26,7 @@ self_consistency:
   # the code will start from the last iteration of the previous calculation and does max_iter steps on top
   use_interpolated_sigma: False # If True, the code will use the interpolated self-energy from the previous iteration
   use_lambda_correction: False # If True, the code will perform a lambda correction for each iteration, and it will automatically set perform_lambda_correction in the settings below to True.
-  restrict_chi_phys: False # If True, the physical susceptibilities will be restricted to positive values during the self-consistency cycle.
+  restrict_chi_phys: False # If True, the physical susceptibilities are restricted to positive-semidefinite compound blocks (eigenvalue floor on the inverse) during the self-consistency cycle.
 
 lambda_correction:
   perform_lambda_correction: False # If True, the code will perform a lambda correction. This is only possible for single-orbital systems!
@@ -48,15 +48,15 @@ dmft_input:
   # for multi-orbital systems with more than one inequivalent atom specified in w2dynamics.
 
 eliashberg:
-  perform_eliashberg: False # If True, the code will perform a power iteration to solve the linearized Eliashberg equation for the superconducting eigenvalues and gap functions
+  perform_eliashberg: False # If True, the code will perform an ARNOLDI Lanczos to solve the linearized Eliashberg equation for the superconducting eigenvalues and gap functions
   save_pairing_vertex: False # if true, saves the s/t pairing vertices Gamma(qvv') for the irreducible BZ to files. Attention: this could be a large file!
   save_fq: False # If True, saves the full d/m vertex F(qvv') for the irreducible BZ to files. Attention: this could be a large file!
   construct_fq_cheap: False # If True, the code will construct F(qvv') for the d/m channels in a way that is less memory intensive (only 1/4) but also less accurate. This is recommended for large frequency boxes.
   n_eig: 4 # Number of eigenvalues and eigenvectors to be calculated. Default: 4
   epsilon: 1e-6 # Convergence criterion for the eigenvalues and eigenvectors
-  symmetry: "random" # Symmetry of the gap function that will be used as a starting point for the power iteration. Available: p-wave-x, p-wave-y, d-wave, random
+  symmetry: "random" # Symmetry of the gap function that will be used as a starting point for the ARNOLDI Lanczos. Available: p-wave-x, p-wave-y, d-wave, random
   include_local_part: True # If True, the local part of the pairing vertex is included in the Eliashberg calculation. This is only relevant if one might expect s-wave symmetry.
-  # setting this to True will reduce the frequency box of the pairing vertex slightly due to an additional frequency shift that is necessary.
+  symmetrize_degenerate_gaps: True # If True, gap functions within (near-)degenerate eigenvalue clusters are orthogonalized (Loewdin) and doublets rotated to the mirror-adapted p_x/p_y basis.
   subfolder_name: "Eliashberg" # name for the subfolder where certain outputs are generated
 
 self_energy_interpolation:
@@ -89,11 +89,11 @@ memory:
   # but much slower. If False, the code will use FFT, which requires larger intermediate arrays, but is much faster.
   save_memory_for_chiq_aux: False # If True, the code will construct the auxiliary susceptibility chi(q) (equal in size
   # compared to F(q)) in a way that is more memory efficient, but much slower.
-  save_memory_for_sde: False # If True, the code will perform the calculations in a more
-  # memory efficient way, without the use of FFTs. Setting it to False will not increase the memory usage significantly,
-  # but it is much faster.
   save_memory_for_fq: False # If True, the code will construct F(qvv') for the d/m channels in a way that is
   # less memory intensive, but it will increase runtime.
   save_memory_for_lanczos: False # If True, the code will perform the Lanczos algorithm with the pairing vertex for
   # the Eliashberg calculation in a more memory efficient way. This will reduce memory usage but increase runtime
   # due to required MPI communication in each Lanczos step.
+  use_shared_memory_common_obj: True # If True (default), replicated full-grid objects that are common to all ranks (the
+  # lattice Green's function and its real-space copy in the Schwinger-Dyson step) are stored once per node in MPI
+  # shared-memory windows (computed only by the node's first rank)

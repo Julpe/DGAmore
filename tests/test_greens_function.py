@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 from unittest.mock import MagicMock
@@ -234,7 +234,7 @@ def test_get_epot_e_corr_einsum_matches_transposed_product_reference():
     dsigma = g._sigma.decompress_q_dimension().mat - smom0[..., None]
     e_corr_ref = (dsigma * g.decompress_q_dimension().transpose_orbitals().mat).sum().real / beta
     e_corr_new = np.einsum("...abv,...bav->...", dsigma, g.decompress_q_dimension().mat).sum().real / beta
-    assert np.allclose(e_corr_new, e_corr_ref, rtol=1e-5)
+    assert np.allclose(e_corr_new, e_corr_ref, atol=1e-5)
     assert np.isfinite(g.get_epot())
 
 

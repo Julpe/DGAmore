@@ -1,18 +1,16 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Local (momentum-independent) four-point objects. :class:`LocalFourPoint` wraps a single array carrying four
 orbital indices and a variable number of bosonic/fermionic Matsubara axes, e.g. the generalized susceptibility
-:math:`\chi_{abcd}^{\omega\nu\nu'}`, the vertex :math:`F`, the irreducible vertex :math:`\Gamma`, and the
+:math:`\chi_{1234}^{\omega\nu\nu'}`, the vertex :math:`F`, the irreducible vertex :math:`\Gamma`, and the
 physical susceptibility :math:`\chi`. It adds channel-/notation-aware arithmetic (``+``, ``-``, ``*``, ``@``,
 inversion, integer powers), orbital and frequency contractions, and conversions to/from the compound-index
 matrix layout used for inversion and matrix products. Notation mirrors the thesis (Chapters 3 & 4).
 """
-
-from copy import deepcopy
 
 import numpy as np
 
@@ -82,7 +80,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         """
         Reflected operator form of :meth:`sub` (``B - A``), returning ``-(A - B)``. See :meth:`sub`.
         """
-        return -self.sub(other)
+        return self.sub(other).scale(-1.0)
 
     def __mul__(self, other):
         """
@@ -116,32 +114,41 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
     def __pow__(self, power, modulo=None):
         """
-        Operator form of :meth:`pow` (``A ** n``), supplying the matching identity. See :meth:`pow`.
+        Operator form of :meth:`pow` (``A ** n``). See :meth:`pow`.
         """
-        return self.pow(power, LocalFourPoint.identity_like(self))
+        return self.pow(power)
 
-    def pow(self, power: int, identity):
+    def pow(self, power: int, identity=None):
         r"""
-        Raises the object to an integer power using exponentiation by squaring (in compound-index matrix space).
-        For :math:`n < 0` the inverse is exponentiated, i.e. :math:`A^{-n} = (A^{-1})^{n}`.
+        Raises the object to an integer power using exponentiation by squaring (in compound-index matrix space of
+        the object's :attr:`~dgamore.n_point_base.IHaveChannel.frequency_notation`). For :math:`n < 0` the inverse
+        (see :meth:`invert`) is exponentiated, i.e. :math:`A^{-n} = (A^{-1})^{n}`.
 
         :param power: Integer exponent :math:`n`.
         :param identity: Identity object matching ``self`` (see :meth:`identity_like`), returned for :math:`n = 0`.
-        :return: The exponentiated :class:`LocalFourPoint`.
-        :raises ValueError: If ``power`` is not an integer.
+            Built via :meth:`identity_like` (carrying the frequency notation of ``self``) if omitted.
+        :return: The exponentiated object.
+        :raises ValueError: If ``power`` is not an integer or ``identity`` does not share the frequency notation
+            of ``self``.
         """
         if not isinstance(power, int):
             raise ValueError("Only integer powers are supported.")
 
-        if power == 0:
-            return identity
+        if identity is not None and identity.frequency_notation != self.frequency_notation:
+            raise ValueError("Identity must be in the same frequency notation as the object.")
+
         if power == 1:
             return self
         if power < 0:
             return self.invert() ** abs(power)
 
+        if identity is None:
+            identity = type(self).identity_like(self)
+        if power == 0:
+            return identity
+
         result = identity
-        base = deepcopy(self)
+        base = self.copy()
 
         # Exponentiation by squaring
         while power > 0:
@@ -219,7 +226,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         r"""
         Contracts the outer legs of a four-point vertex: sums over both fermionic frequency axes (with the
         :math:`1/\beta^2` prefactor) and traces the inner two orbitals (``abcd->ad``). Used e.g. to obtain the
-        physical susceptibility :math:`\chi_{ad}^{\omega}` from a generalized susceptibility.
+        physical susceptibility :math:`\chi_{14}^{\omega}` from a generalized susceptibility.
 
         :param beta: Inverse temperature :math:`\beta`.
         :return: A new :class:`LocalFourPoint` with two orbital indices and no fermionic frequency axes.
@@ -231,7 +238,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
     def to_compound_indices(self) -> "LocalFourPoint":
         r"""
-        Converts the indices of the LocalFourPoint object :math:`F^{wvv'}_{lmm'l'}` to compound indices :math:`F^{w}_{c_1, c_2}`
+        Converts the indices of the LocalFourPoint object :math:`F^{\omega\nu\nu'}_{1234}` to compound indices :math:`F^{\omega}_{c_1, c_2}`
         by transposing the object to [w, o1, o2, v, o4, o3, v'] (if the object has any fermionic frequency dimension,
         otherwise the compound indices are built from orbital dimensions only) and grouping {o1, o2, v} and {o4, o3, v'}
         to the new compound index. Always returns the object in the same niw range as the original object.
@@ -286,7 +293,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
         :return: ``self`` in compound-index layout.
         """
-        if len(self.current_shape) == 3:  # [w,x1,x2]
+        if len(self.current_shape) == 2 + self.num_wn_dimensions:  # [w, x1, x2] or [x1, x2]
             return self
 
         return self.permute_orbitals("abcd->acbd", copy=False)._to_compound_indices_ph()
@@ -370,7 +377,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         """
 
         if copy:
-            return deepcopy(self).invert(copy=False)
+            return self.copy().invert(copy=False)
 
         self.to_half_niw_range().to_compound_indices()
         self.mat = np.linalg.inv(self.mat)
@@ -387,18 +394,31 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
         :param other: The right/left operand, a :class:`LocalFourPoint` or :class:`LocalInteraction`.
         :param left_hand_side: If True, compute ``self @ other``; if False, compute ``other @ self``.
-        :return: A new :class:`LocalFourPoint` in the half bosonic frequency range, carrying the non-NONE channel.
-        :raises ValueError: If ``other`` is neither a :class:`LocalFourPoint` nor a :class:`LocalInteraction`.
+        :return: A new :class:`LocalFourPoint` in the half bosonic frequency range, carrying the non-NONE channel
+            and the :attr:`~dgamore.n_point_base.IHaveChannel.frequency_notation` of ``self``. All branches
+            contract in the compound space of that notation (ph: rows {1,2,v}, cols {4,3,v'}; pp: rows {1,3,v},
+            cols {4,2,v'}; see :meth:`to_compound_indices`).
+        :raises ValueError: If ``other`` is neither a :class:`LocalFourPoint` nor a :class:`LocalInteraction`, or
+            if the operands' frequency notations differ.
         """
         if not isinstance(other, (LocalFourPoint, LocalInteraction)):
             raise ValueError(f"Multiplication {type(self)} @ {type(other)} not supported.")
 
+        if isinstance(other, LocalFourPoint) and other.frequency_notation != self.frequency_notation:
+            raise ValueError("Cannot multiply two objects with different frequency notations.")
+
         if isinstance(other, LocalInteraction):
-            einsum_str = {
-                0: "abijw,jief->abefw" if left_hand_side else "abij,jiefw->abefw",
-                1: "abijwv,jief->abefwv" if left_hand_side else "abij,jiefwv->abefwv",
-                2: "abijwvp,jief->abefwvp" if left_hand_side else "abij,jiefwvp->abefwvp",
-            }.get(self.num_vn_dimensions)
+            left_orbs, right_orbs, final_orbs = (
+                ("abij", "jief", "abef")
+                if self.frequency_notation == FrequencyNotation.PH
+                else ("afce", "ebfd", "abcd")
+            )
+            suffix = {0: "w", 1: "wv", 2: "wvp"}.get(self.num_vn_dimensions)
+            einsum_str = (
+                f"{left_orbs}{suffix},{right_orbs}->{final_orbs}{suffix}"
+                if left_hand_side
+                else f"{left_orbs},{right_orbs}{suffix}->{final_orbs}{suffix}"
+            )
             return LocalFourPoint(
                 (
                     np.einsum(einsum_str, self.mat, other.mat, optimize=True)
@@ -424,10 +444,15 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
             suffix_other, suffix_result, suffix_self = self._get_frequency_suffixes_for_matmul(other, left_hand_side)
 
+            left_orbs, right_orbs, final_orbs = (
+                ("abcd", "dcef", "abef")
+                if self.frequency_notation == FrequencyNotation.PH
+                else ("afce", "ebfd", "abcd")
+            )
             einsum_str = (
-                f"abcd{suffix_self},dcef{suffix_other}->abef{suffix_result}"
+                f"{left_orbs}{suffix_self},{right_orbs}{suffix_other}->{final_orbs}{suffix_result}"
                 if left_hand_side
-                else f"abcd{suffix_other},dcef{suffix_self}->abef{suffix_result}"
+                else f"{left_orbs}{suffix_other},{right_orbs}{suffix_self}->{final_orbs}{suffix_result}"
             )
 
             return LocalFourPoint(
@@ -441,6 +466,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
                 max(self.num_vn_dimensions, other.num_vn_dimensions),
                 self.full_niw_range,
                 self.full_niv_range,
+                self.frequency_notation,
             )
 
         self_full_niw_range = self.full_niw_range
@@ -472,13 +498,14 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
             max(self.num_vn_dimensions, other.num_vn_dimensions),
             full_niw_range=False,
             full_niv_range=self.full_niv_range,
+            frequency_notation=self.frequency_notation,
         ).to_full_indices(shape)
 
     def mul(self, other):
         r"""
         Multiplies the object by a scalar/array (element-wise) or by another :class:`LocalFourPoint`. Note this is
         **not** a matrix product (see :meth:`matmul`): for two four-point operands, each with a single fermionic
-        frequency, it forms :math:`A_{abcd}^{\omega\nu} \, B_{dcef}^{\omega\nu'} = C_{abef}^{\omega\nu\nu'}`,
+        frequency, it forms :math:`\sum_{ab} A_{12ab}^{\omega\nu} \, B_{ba34}^{\omega\nu'} = C_{1234}^{\omega\nu\nu'}`,
         contracting the inner orbitals while keeping both fermionic frequencies as separate axes.
 
         :param other: A number, numpy array, or :class:`LocalFourPoint`.
@@ -490,7 +517,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
             raise ValueError("Multiplication only supported with numbers, numpy arrays or LocalFourPoint objects.")
 
         if not isinstance(other, LocalFourPoint):
-            copy = deepcopy(self)
+            copy = self.copy()
             copy.mat *= other
             return copy
 
@@ -664,7 +691,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
             raise ValueError("Invalid permutation.")
 
         if copy:
-            return deepcopy(self).permute_orbitals(permutation, copy=False)
+            return self.copy().permute_orbitals(permutation, copy=False)
 
         permutation = f"{split[0]}...->{split[1]}..."
         self.mat = np.einsum(permutation, self.mat, optimize=True)
@@ -695,7 +722,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
     def symmetrize_v_vp(self):
         r"""
         Symmetrizes the vertex with respect to :math:`(\nu, \nu')` via time-reversal symmetry:
-        :math:`G_{abcd}(\nu, \nu', \omega) = G_{dcba}(\nu', \nu, \omega)`. Valid for TR-symmetric (real-hopping,
+        :math:`G_{1234}(\nu, \nu', \omega) = G_{4321}(\nu', \nu, \omega)`. Valid for TR-symmetric (real-hopping,
         paramagnetic) systems with SU(2) symmetry. Mutates ``self`` in place.
 
         :return: ``self``, symmetrized in :math:`(\nu, \nu')`.
@@ -724,7 +751,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         if self.num_wn_dimensions != 1 or self.num_vn_dimensions not in (1, 2):
             raise ValueError("Object must have 1 bosonic and 1 or 2 fermionic frequency dimensions.")
 
-        copy = deepcopy(self)
+        copy = self.copy()
 
         if copy.frequency_notation == FrequencyNotation.PP:
             return copy
@@ -749,7 +776,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         if self.num_wn_dimensions != 0:
             raise ValueError("Object already has bosonic frequency dimensions.")
 
-        copy = deepcopy(self)
+        copy = self.copy()
         # insert bosonic axis immediately before the last vn axes
         copy.mat = np.expand_dims(copy.mat, axis=-(copy.num_vn_dimensions + 1))
         copy._num_wn_dimensions = 1
@@ -786,7 +813,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         :return: A new :class:`LocalFourPoint` padded to ``niv_pad``.
         """
         if niv_pad <= self.niv:
-            return deepcopy(self)
+            return self.copy()
 
         copy = self._clone_without_mat()
         # Allocate the padded array once and broadcast-fill the shell with ``u`` instead of materializing a full
