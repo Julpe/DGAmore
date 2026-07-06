@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 """
-Multiprocessing (MPI) utilities for the non-local step — a single module covering everything parallel:
+Multiprocessing (MPI) utilities for the non-local step - a single module covering everything parallel:
 
 * low-level **message-chunking primitives** (``send_rows`` / ``recv_rows_into`` / ``recv_rows_alloc`` /
   ``bcast_rows`` / ``bcast_rows_into`` / ``send_bytes`` / ``recv_bytes`` and the ``row_chunks`` / ``chunk_step``
@@ -37,10 +37,48 @@ import dgamore.config as config
 from dgamore import symmetry_reduction
 from dgamore.brillouin_zone import KGrid
 from dgamore.four_point import FourPoint
+from dgamore.n_point_base import DTYPE
 
 # Canonical 2 GB MPI per-message limit. The chunking helpers below take it as an explicit ``limit`` argument so the
 # established test hook of monkeypatching ``mpi_utils.MAX_MPI_BYTES`` to force the chunked path keeps working.
 MAX_MPI_BYTES = 2**31 - 1
+
+
+def build_node_shared_array(node_comm, compute_fn, dtype=DTYPE):
+    r"""
+    Build an array once per node and expose it to every rank on that node through a single MPI shared-memory window,
+    so a large replicated quantity (e.g. the full-grid Green's function ``giwk_full``) is stored **once per node
+    instead of once per rank** and computed only on the node root.
+
+    ``compute_fn`` is called **only on the node-local root rank** (rank 0 of ``node_comm``) and must return the fully
+    built numpy array; the other ranks do not call it. Its result is copied into a shared-memory segment allocated by
+    the root, and every rank receives a numpy view of that same physical buffer (read-only by convention - only the
+    root writes it). ``node_comm`` must be a node-local communicator, e.g. ``comm.Split_type(MPI.COMM_TYPE_SHARED)``.
+
+    When the node holds a single rank the shared window is pointless, so the freshly computed private array is
+    returned unchanged with ``win = None`` (this also keeps single-rank / mock communicators working). The caller
+    owns the returned window and must free it (``win.Free()``) once all ranks are done reading the array.
+
+    :param node_comm: The node-local (shared-memory) communicator.
+    :param compute_fn: Zero-argument callable returning the array; invoked only on the node root.
+    :param dtype: Storage dtype of the shared buffer (defaults to the global ``DTYPE``, complex64).
+    :return: The tuple ``(array, win)`` - the (shared) numpy array on every rank and the MPI window (``None`` for a
+        single-rank node).
+    """
+    is_root = node_comm.Get_rank() == 0
+    local = compute_fn() if is_root else None
+    if node_comm.Get_size() == 1:
+        return local, None
+    shape = node_comm.bcast(local.shape if is_root else None)
+    itemsize = np.dtype(dtype).itemsize
+    nbytes = int(np.prod(shape)) * itemsize if is_root else 0
+    win = MPI.Win.Allocate_shared(nbytes, itemsize, comm=node_comm)
+    buf, _ = win.Shared_query(0)
+    shared = np.ndarray(buffer=buf, dtype=dtype, shape=shape)
+    if is_root:
+        shared[...] = local
+    node_comm.Barrier()
+    return shared, win
 
 
 # ====================================================================================================================
@@ -658,7 +696,7 @@ class MpiDistributor:
         """
         Broadcasts an N-point-like object (one exposing a ``.mat`` numpy array) from ``root`` to all ranks. The large
         ``.mat`` is broadcast as raw sub-2 GB chunks (so there is no multi-gigabyte pickle blob and no >2 GB message),
-        while the rest of the object travels as a small pickled metadata blob — the broadcast analogue of
+        while the rest of the object travels as a small pickled metadata blob - the broadcast analogue of
         :meth:`send_to_rank`/:meth:`recv_from_rank`. Prefer this over :meth:`bcast` for large objects such as a
         full-BZ self-energy or gap function, both to respect the 2 GB limit and to avoid the full in-memory pickle copy.
 
@@ -692,7 +730,7 @@ class MpiDistributor:
 
         ``Allreduce`` is collective, so the chunk schedule must be identical on every rank. That holds here because the
         reduced arrays are always equally shaped across ranks (the callers reduce full, replicated quantities such as
-        the full-k-space self-energy / Fock term — each rank holds a partial sum of the *same* array), so every rank
+        the full-k-space self-energy / Fock term - each rank holds a partial sum of the *same* array), so every rank
         derives the same chunk boundaries. The single-chunk case is byte-for-byte the previous behavior.
 
         :param rank_result: This rank's contribution; reduced in place. Must have the same shape on every rank.

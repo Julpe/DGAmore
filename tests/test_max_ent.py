@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import warnings
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -230,8 +231,8 @@ def test_perform_maxent_giwk_unfolds_symmetry_equivalent_kpoints(tmp_path, patch
         assert np.allclose(spectrum[k], spectrum[flat_rep[k]], atol=1e-6)
 
 
-def test_perform_maxent_giwk_failed_continuation_yields_zeros(tmp_path, monkeypatch):
-    """perform_maxent_giwk yields zeros when the analytic continuation raises."""
+def test_perform_maxent_giwk_failed_continuation_logs_kpoint_and_yields_zeros(tmp_path, monkeypatch):
+    """perform_maxent_giwk logs a per-k-point error (not a stack trace) and yields zeros when continuation raises."""
     nk, n_bands, w_count = (4, 4, 1), 2, 6
     _setup_maxent_config(tmp_path, nk, n_bands, w_count=w_count, seed=4)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=19)
@@ -248,6 +249,66 @@ def test_perform_maxent_giwk_failed_continuation_yields_zeros(tmp_path, monkeypa
 
     _, results = run_parallel(1, fn)
     assert np.array_equal(results[0], np.zeros_like(results[0]))
+
+    # one log per failed (irreducible k-point, band), each naming the k-point and the A=0 fallback
+    fail_msgs = [
+        call.args[0]
+        for call in config.logger.info.call_args_list
+        if "Failed to determine analytic continuation of k=" in call.args[0]
+    ]
+    assert len(fail_msgs) == config.lattice.k_grid.nk_irr * n_bands
+    assert all("setting A(k=" in m and "= 0.0" in m for m in fail_msgs)
+
+
+def test_perform_maxent_giwk_reroutes_solver_prints_to_logger(tmp_path, monkeypatch):
+    """The vendored solver's stdout is captured and re-logged as 'ana_cont: <message>', not leaked to stdout."""
+    nk, n_bands = (4, 4, 1), 1
+    _setup_maxent_config(tmp_path, nk, n_bands, seed=6)
+    mat = _build_giwk_mat(nk, n_bands, niv=4, seed=23)
+
+    class _PrintingProblem:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def solve(self, *args, **kwargs):
+            print("Fermi fit failed.")
+            return (SimpleNamespace(A_opt=np.zeros(config.ana_cont.w_count)),)
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _PrintingProblem)
+
+    def fn(comm, rank):
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
+
+    run_parallel(1, fn)
+    info_msgs = [call.args[0] for call in config.logger.info.call_args_list]
+    assert "ana_cont: Fermi fit failed." in info_msgs
+
+
+def test_perform_maxent_giwk_runtime_warning_is_treated_as_failure(tmp_path, monkeypatch):
+    """A numpy/scipy RuntimeWarning during the continuation is escalated to a failure: A(k, w) = 0."""
+    nk, n_bands = (4, 4, 1), 1
+    _setup_maxent_config(tmp_path, nk, n_bands, seed=8)
+    mat = _build_giwk_mat(nk, n_bands, niv=4, seed=29)
+
+    class _WarningProblem:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def solve(self, *args, **kwargs):
+            warnings.warn("overflow encountered", RuntimeWarning)
+            return (SimpleNamespace(A_opt=np.ones(config.ana_cont.w_count)),)
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _WarningProblem)
+
+    def fn(comm, rank):
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
+
+    _, results = run_parallel(1, fn)
+    assert np.array_equal(results[0], np.zeros_like(results[0]))
+    fail_msgs = [c.args[0] for c in config.logger.info.call_args_list if "Failed to determine" in c.args[0]]
+    assert len(fail_msgs) == config.lattice.k_grid.nk_irr * n_bands
 
 
 def test_perform_maxent_giwk_single_band(tmp_path, patch_maxent_mpi):

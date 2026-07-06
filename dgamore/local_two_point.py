@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Base class for the local (momentum-independent) two-point quantities. :class:`LocalTwoPoint` wraps a single array
@@ -11,8 +11,6 @@ orbital axes for the current layout, orbital permutation/transposition and orbit
 :class:`LocalFourPoint` for the two-orbital case; the momentum-dependent counterpart :class:`TwoPoint` adds the
 single momentum dimension on top (just as :class:`FourPoint` extends :class:`LocalFourPoint`).
 """
-
-from copy import deepcopy
 
 import numpy as np
 
@@ -69,7 +67,7 @@ class LocalTwoPoint(LocalNPoint):
         if split[0] == split[1]:
             return self
 
-        copy = deepcopy(self)
+        copy = self.copy()
         copy.mat = np.einsum(f"{split[0]}...->{split[1]}...", copy.mat, optimize=True)
         return copy
 

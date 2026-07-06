@@ -5,3 +5,7 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "monthly"
+  - package-ecosystem: "pip"
+    directory: "/" # root requirements.txt (docs/requirements.txt is intentionally pinned, left out)
+    schedule:
+      interval: "monthly"

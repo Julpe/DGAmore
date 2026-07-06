@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Analytic continuation of imaginary-frequency quantities to the real axis via the maximum-entropy method. This
@@ -11,8 +11,11 @@ and the local DMFT Green's function to real frequencies, yielding the spectral f
 irreducible BZ.
 """
 
+import contextlib
 import gc
+import io
 import os
+import warnings
 
 import numpy as np
 from mpi4py import MPI
@@ -85,9 +88,7 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
 
     irrq_list = config.lattice.k_grid.get_irrq_list()
 
-    mpi_dist = MpiDistributor(
-        ntasks=len(irrq_list), comm=comm, name="Maxent_G", output_path=config.output.output_path
-    )
+    mpi_dist = MpiDistributor(ntasks=len(irrq_list), comm=comm, name="Maxent_G", output_path=config.output.output_path)
 
     giwk_maxent = giwk_maxent.reduce_q(irrq_list)
     logger.info("Scattering Green's function in the IBZ to all ranks.")
@@ -108,17 +109,33 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
     for band in range(config.sys.n_bands):
         logger.info(f"Processing analytic continuation of band {band+1}.")
         for k in range(giwk_maxent.mat.shape[0]):
+            # Capture the vendored solver's stdout so its print() diagnostics go through the logger instead of
+            # leaking to the output; re-logged (prefixed) below whether the continuation succeeds or fails.
+            captured_output = io.StringIO()
             try:
-                probl_maxent = AnalyticContinuationProblem(
-                    im_axis=wn, re_axis=w, im_data=giwk_maxent[k, band, band], beta=config.sys.beta
-                )
-                result = probl_maxent.solve(model=model, stdev=stdev)[0]
-                spectral_function[k, band] = result.A_opt.astype(np.float32)
+                with warnings.catch_warnings(), contextlib.redirect_stdout(captured_output):
+                    # Escalate numpy/scipy RuntimeWarnings (divide/invalid/overflow) to exceptions so a numerically
+                    # broken continuation falls through to the A(k, w) = 0 fallback below (its own errors are caught too).
+                    warnings.simplefilter("error", RuntimeWarning)
+                    probl_maxent = AnalyticContinuationProblem(
+                        im_axis=wn, re_axis=w, im_data=giwk_maxent[k, band, band], beta=config.sys.beta
+                    )
+                    result = probl_maxent.solve(model=model, stdev=stdev)[0]
+                    spectral_function[k, band] = result.A_opt.astype(np.float32)
 
                 del probl_maxent, result
                 gc.collect()
             except Exception:
+                kpt = tuple(int(c) for c in irrq_list[mpi_dist.my_tasks[k]])
+                logger.info(
+                    f"Failed to determine analytic continuation of k={kpt} (band {band + 1}), "
+                    f"setting A(k={kpt}, w) = 0.0."
+                )
                 spectral_function[k, band] = 0.0
+            finally:
+                for message in captured_output.getvalue().splitlines():
+                    if message.strip():
+                        logger.info(f"ana_cont: {message}")
         mpi_dist.comm.barrier()
         logger.info(f"Completed analytic continuation of band {band+1}.")
     spectral_function = mpi_dist.gather(spectral_function)

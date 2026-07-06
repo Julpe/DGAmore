@@ -26,7 +26,7 @@ coverage:
       default:
         target: 85%
         threshold: 0%
-        informational: true
+        informational: false
 comment:
   layout: "reach, diff, flags, files"
   behavior: default

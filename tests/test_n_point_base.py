@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
@@ -828,6 +828,7 @@ def test_skip_on_non_posix_or_no_proc(monkeypatch):
 
 def test_loads_libc_and_calls_malloc_trim(monkeypatch):
     """malloc_trim loads libc and calls malloc_trim when available."""
+
     # simulate posix with /proc and a working ctypes.CDLL returning a libc with malloc_trim
     class FakeLib:
         def __init__(self):
@@ -855,6 +856,7 @@ def test_loads_libc_and_calls_malloc_trim(monkeypatch):
 
 def test_ctypes_cdll_failure_sets_unavailable(monkeypatch):
     """A ctypes CDLL failure marks malloc_trim unavailable."""
+
     # simulate posix with /proc but CDLL raises -> should mark unavailable and not raise
     def failing_cdll(name):
         raise OSError("no libc")
@@ -874,6 +876,7 @@ def test_ctypes_cdll_failure_sets_unavailable(monkeypatch):
 
 def test_malloc_trim_exception_is_suppressed(monkeypatch):
     """An exception from malloc_trim is suppressed."""
+
     # simulate libc present but malloc_trim itself raises -> should be suppressed (no exception)
     class BadLib:
         def malloc_trim(self, arg):
@@ -1316,7 +1319,7 @@ def test_map_to_full_bz_auto_2idx_reconstructs_H_exactly():
 
 
 def test_map_to_full_bz_auto_2idx_reconstructs_H_for_multiorbital_case():
-    """Same as above but with multiple orbitals — exercises the orbital einsum path."""
+    """Same as above but with multiple orbitals - exercises the orbital einsum path."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=2)
     nb = 2
     H_flat = H.reshape(-1, nb, nb)
@@ -1483,7 +1486,7 @@ def test_map_to_full_bz_auto_1x1x1_trivial_grid_is_identity():
 
 
 def test_map_to_full_bz_auto_preserves_dtype():
-    """The output matrix has the same dtype as the input (the function does not silently cast within the auto branch — the cast to complex64 happens elsewhere in ``IHaveMat.mat = value``)."""
+    """The output matrix has the same dtype as the input (the function does not silently cast within the auto branch - the cast to complex64 happens elsewhere in ``IHaveMat.mat = value``)."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
     H_ibz_64 = H.reshape(-1, 1, 1)[grid.irrk_ind].astype(np.complex64).copy()
     obj = _DoublePrecisionNonLocal(mat=H_ibz_64, nq=(4, 4, 4), has_compressed_q_dimension=True)

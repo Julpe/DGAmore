@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 """
 Parity tests for :class:`dgamore.bubble_gen.BubbleGenerator`. Each test compares the produced bubble against an
@@ -59,7 +59,7 @@ def test_create_generalized_chi0_matches_reference():
                             ref[a, b, c, d, iw, iv] = -beta * gl * gr
 
     assert res.mat.shape == ref.shape
-    assert np.allclose(res.mat, ref, atol=1e-4, rtol=1e-4)
+    assert np.allclose(res.mat, ref, atol=1e-4)
 
 
 def test_create_generalized_chi0_q_matches_reference():
@@ -90,7 +90,7 @@ def test_create_generalized_chi0_q_matches_reference():
 
     assert res.mat.shape == ref.shape
     assert res.has_compressed_q_dimension is True
-    assert np.allclose(res.mat, ref, atol=1e-4, rtol=1e-4)
+    assert np.allclose(res.mat, ref, atol=1e-4)
 
 
 def test_create_generalized_chi0_q_no_copy_of_full_green_function():
@@ -125,7 +125,7 @@ def test_create_generalized_chi0_pp_w0_matches_reference():
 
     assert res.mat.shape == ref.shape
     assert res.frequency_notation == FrequencyNotation.PP
-    assert np.allclose(res.mat, ref, atol=1e-4, rtol=1e-4)
+    assert np.allclose(res.mat, ref, atol=1e-4)
 
 
 def test_create_generalized_chi0_pp_w0_does_not_mutate_input():
@@ -153,12 +153,12 @@ def test_create_generalized_chi0_q_pp_w0_matches_reference():
             for b in range(nb):
                 for c in range(nb):
                     for d in range(nb):
-                        # G_ad^k * conj(G_cb^k)   (transpose_orbitals -> g[c,b], conjugated)
+                        # G_14^{kv} * conj(G_32^{kv})   (transpose_orbitals -> g[c,b], conjugated)
                         ref[k, a, b, c, d, :] = gm[k, a, d, :] * np.conj(gm[k, c, b, :])
 
     assert res.mat.shape == ref.shape
     assert res.frequency_notation == FrequencyNotation.PP
-    assert np.allclose(res.mat, ref, atol=1e-4, rtol=1e-4)
+    assert np.allclose(res.mat, ref, atol=1e-4)
 
 
 def test_create_generalized_chi0_q_pp_w0_does_not_mutate_input():
@@ -168,3 +168,25 @@ def test_create_generalized_chi0_q_pp_w0_does_not_mutate_input():
     g_before = g.mat.copy()
     BubbleGenerator.create_generalized_chi0_q_pp_w0(g, niv_pp, bz.KGrid(nk, symmetries=[]))
     assert np.array_equal(g.mat, g_before)
+
+
+def test_momentum_pp_bubble_is_local_pp_bubble_in_acbd_layout():
+    """Momentum pp bubble equals the local pp bubble permuted 'abcd->acbd' (up to the -beta the momentum form omits)."""
+    nb, niv_pp, beta = 2, 3, 2.0
+    nk = (2, 2, 1)
+    config.lattice.nk = nk
+    q_grid = bz.KGrid(nk, symmetries=[])
+    rng = np.random.default_rng(11)
+    nvg = niv_pp + 2
+    # asymmetric G_ij != G_ji obeying the physical conjugation symmetry G_ij(-nu) = conj(G_ji(nu))
+    half = rng.standard_normal((nb, nb, nvg)) + 1j * rng.standard_normal((nb, nb, nvg))
+    gloc = np.empty((nb, nb, 2 * nvg), dtype=np.complex64)
+    gloc[:, :, nvg:] = half
+    gloc[:, :, :nvg] = np.conj(np.swapaxes(half, 0, 1))[:, :, ::-1]
+    g_loc = GreensFunction(gloc)
+    g_mom = GreensFunction(
+        np.broadcast_to(gloc, (*nk, nb, nb, 2 * nvg)).copy(), has_compressed_q_dimension=False, nk=nk
+    )
+    local_acbd = BubbleGenerator.create_generalized_chi0_pp_w0(g_loc, niv_pp, beta).permute_orbitals("abcd->acbd")
+    momentum = BubbleGenerator.create_generalized_chi0_q_pp_w0(g_mom, niv_pp, q_grid).decompress_q_dimension()
+    assert np.allclose(momentum.mat, local_acbd.mat[..., 0, :][None, None, None] / (-beta), atol=1e-4)

@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Generalized bare susceptibilities (the "bubbles"). :class:`BubbleGenerator` builds the products of two Green's
-functions :math:`\chi_{0;abcd} = -\beta\, G_{ad}\, G_{cb}` in the particle-hole and particle-particle channels,
+functions :math:`\chi_{0;1234}^{\omega\nu} = -\beta\, G_{14}^{\nu}\, G_{32}^{\nu-\omega}` in the particle-hole and particle-particle channels,
 both local and momentum-dependent. The non-local versions are evaluated either by an FFT over the BZ or by a
 direct momentum-shift einsum, distributed over MPI ranks and optionally accelerated on the GPU (CuPy).
 """
@@ -32,7 +32,7 @@ class BubbleGenerator:
     def create_generalized_chi0(g_dmft: GreensFunction, niw: int, niv: int, beta: float) -> LocalFourPoint:
         r"""
         Returns the local generalized bare susceptibility
-        :math:`\chi_{0;abcd}^{\omega\nu} = -\beta\, G_{ad}^{\nu}\, G_{cb}^{\nu-\omega}`.
+        :math:`\chi_{0;1234}^{\omega\nu} = -\beta\, G_{14}^{\nu}\, G_{32}^{\nu-\omega}`.
 
         :param g_dmft: The local (DMFT) :class:`GreensFunction`.
         :param niw: Number of positive bosonic frequencies.
@@ -59,7 +59,7 @@ class BubbleGenerator:
     ) -> FourPoint:
         r"""
         Returns the momentum-dependent generalized bare susceptibility
-        :math:`\chi_{0;abcd}^{q\nu} = -\beta \sum_k G^{k}_{ad}\, G^{k-q}_{cb}`, evaluated via an FFT over the BZ with
+        :math:`\chi_{0;1234}^{q\omega\nu} = -\beta \sum_k G^{k\nu}_{14}\, G^{(k-q)(\nu-\omega)}_{32}`, evaluated via an FFT over the BZ with
         preallocated buffers. The result is computed on rank 0 over the irreducible BZ and scattered across ranks.
 
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
@@ -173,7 +173,7 @@ class BubbleGenerator:
     ) -> FourPoint:
         r"""
         Returns the momentum-dependent generalized bare susceptibility
-        :math:`\chi_{0;abcd}^{q\nu} = -\beta \sum_k G^{k}_{ad}\, G^{k-q}_{cb}`, evaluated by a direct momentum-shift
+        :math:`\chi_{0;1234}^{q\omega\nu} = -\beta \sum_k G^{k\nu}_{14}\, G^{(k-q)(\nu-\omega)}_{32}`, evaluated by a direct momentum-shift
         and a fused einsum over the explicit list of q-points (preallocated buffers).
 
         :param giwk: The momentum-dependent :class:`GreensFunction`.
@@ -279,7 +279,7 @@ class BubbleGenerator:
     def create_generalized_chi0_pp_w0(g_dmft: GreensFunction, niv_pp: int, beta: float) -> LocalFourPoint:
         r"""
         Returns the local particle-particle bare bubble at :math:`\omega = 0`,
-        :math:`\chi_{0;abcd}^{\nu} = -\beta\, G_{ad}^{\nu}\, G_{cb}^{-\nu}`.
+        :math:`\chi_{0;1234}^{\nu} = -\beta\, G_{14}^{\nu}\, G_{32}^{-\nu}`.
 
         :param g_dmft: The local (DMFT) :class:`GreensFunction`.
         :param niv_pp: Number of positive fermionic frequencies of the pp bubble.
@@ -301,7 +301,7 @@ class BubbleGenerator:
     def create_generalized_chi0_q_pp_w0(giwk: GreensFunction, niv_pp: int, q_grid: KGrid) -> FourPoint:
         r"""
         Returns the momentum-dependent particle-particle bare bubble at :math:`\omega = 0`,
-        :math:`\chi_{0;abcd}^{\vec{k}(\omega=0)\nu} = G_{ad}^{k}\, G_{bc}^{-k}` with :math:`G_{bc}^{-k} = G_{cb}^{*k}`.
+        :math:`\chi_{0;1234}^{k(\omega=0)\nu} = G_{14}^{k\nu}\, G_{23}^{(-k)(-\nu)}` with :math:`G_{23}^{(-k)(-\nu)} = G_{32}^{*k\nu}`.
         Note that no factor of :math:`-\beta` is included here.
 
         :param giwk: The momentum-dependent :class:`GreensFunction`.

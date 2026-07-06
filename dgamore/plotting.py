@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 """
-All matplotlib plotting helpers. These functions produce the diagnostic and result figures of a run — local
+All matplotlib plotting helpers. These functions produce the diagnostic and result figures of a run - local
 self-energy / susceptibility checks, frequency-resolved four-point maps, momentum-space two-point maps (with
 optional Fermi-surface markers), the superconducting gap function, and the analytically continued spectral
 function along a high-symmetry path. Each routine saves and/or shows its figure. All plotting is gated behind

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Momentum-dependent two-point objects. :class:`TwoPoint` extends :class:`LocalTwoPoint` with one momentum axis
@@ -10,8 +10,6 @@ the superconducting gap function. It overrides the orbital permutation to accoun
 and adds the irreducible-to-full-BZ unfold with two orbital dimensions. It mirrors how :class:`FourPoint` extends
 :class:`LocalFourPoint`.
 """
-
-from copy import deepcopy
 
 import numpy as np
 
@@ -65,7 +63,7 @@ class TwoPoint(IAmNonLocal, LocalTwoPoint):
         if split[0] == split[1]:
             return self
 
-        copy = deepcopy(self)
+        copy = self.copy()
 
         permutation = (
             (

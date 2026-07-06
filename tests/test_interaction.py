@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import pytest
@@ -18,7 +18,7 @@ def test_localinteraction_adds_correctly():
     interaction1 = LocalInteraction(mat1)
     interaction2 = LocalInteraction(mat2)
     result = interaction1 + interaction2
-    assert np.allclose(result.mat, mat1 + mat2, rtol=1e-2)
+    assert np.allclose(result.mat, mat1 + mat2, atol=1e-2)
 
 
 def test_localinteraction_handles_identity_permutation():
@@ -26,7 +26,7 @@ def test_localinteraction_handles_identity_permutation():
     mat = np.array([[1, 2], [3, 4]])
     interaction = LocalInteraction(mat)
     result = interaction.permute_orbitals("abcd->abcd")
-    assert np.allclose(result.mat, mat, rtol=1e-2)
+    assert np.allclose(result.mat, mat, atol=1e-2)
 
 
 def test_localinteraction_raises_error_on_invalid_permutation():
@@ -58,7 +58,7 @@ def test_transforms_to_correct_channel(channel, expected_mat):
     """LocalInteraction.as_channel builds the dens/magn/sing/trip combinations."""
     interaction = LocalInteraction(u_loc, SpinChannel.NONE)
     result = interaction.as_channel(channel)
-    assert np.allclose(result.mat, expected_mat, rtol=1e-2)
+    assert np.allclose(result.mat, expected_mat, atol=1e-2)
     assert result.channel == channel
 
 
@@ -67,7 +67,7 @@ def test_interaction_exponentiates_correctly():
     mat = np.array(np.random.rand(2, 2, 2, 2))
     interaction = LocalInteraction(mat)
     result = interaction**2
-    assert np.allclose(result.mat, np.einsum("abcd,dcef->abef", mat, mat, optimize=True), rtol=1e-2)
+    assert np.allclose(result.mat, np.einsum("abcd,dcef->abef", mat, mat, optimize=True), atol=1e-2)
 
 
 def test_interaction_raises_error_on_invalid_exponentiation():
@@ -92,7 +92,7 @@ def test_localinteraction_rsub_has_correct_sign():
     u = LocalInteraction(mat)
     other = np.zeros_like(mat)
     result = u.__rsub__(other)  # directly call __rsub__ to test B - A = C
-    assert np.allclose(result.mat, -mat, rtol=1e-2)
+    assert np.allclose(result.mat, -mat, atol=1e-2)
 
 
 def test_interaction_handles_channel_transformation():
@@ -100,7 +100,7 @@ def test_interaction_handles_channel_transformation():
     mat = np.array([[1, 2], [3, 4]])
     interaction = Interaction(mat, SpinChannel.NONE)
     result = interaction.as_channel(SpinChannel.DENS)
-    assert np.allclose(result.mat, 2 * mat, rtol=1e-2)
+    assert np.allclose(result.mat, 2 * mat, atol=1e-2)
 
 
 def test_interaction_raises_error_on_invalid_channel_transformation():
@@ -133,7 +133,7 @@ def test_permute_orbitals_returns_same_object_for_identity_permutation(n):
     mat = np.random.rand(16, n, n, n, n)
     interaction = Interaction(mat)
     result = interaction.permute_orbitals("abcd->abcd")
-    assert np.allclose(result.mat, interaction.mat, rtol=1e-2)
+    assert np.allclose(result.mat, interaction.mat, atol=1e-2)
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])
@@ -143,7 +143,7 @@ def test_permute_orbitals_applies_correct_permutation_with_compressed_q_dimensio
     interaction = Interaction(mat, has_compressed_q_dimension=True)
     result = interaction.permute_orbitals("abcd->adcb")
     expected = np.einsum("...abcd->...adcb", mat, optimize=True)
-    assert np.allclose(result.mat, expected, rtol=1e-2)
+    assert np.allclose(result.mat, expected, atol=1e-2)
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])
@@ -153,7 +153,7 @@ def test_permute_orbitals_applies_correct_permutation_with_decompressed_q_dimens
     interaction = Interaction(mat, has_compressed_q_dimension=False)
     result = interaction.permute_orbitals("abcd->adcb")
     expected = np.einsum("...abcd->...adcb", mat, optimize=True)
-    assert np.allclose(result.mat, expected, rtol=1e-2)
+    assert np.allclose(result.mat, expected, atol=1e-2)
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])
@@ -179,7 +179,7 @@ def test_interaction_handles_compressed_q_dimension_exponentiation():
     interaction = Interaction(mat, has_compressed_q_dimension=True)
     result = interaction**2
     assert result.mat.shape == mat.shape
-    assert np.allclose(result.mat, np.einsum("qabcd,qdcef->qabef", mat, mat, optimize=True), rtol=1e-2)
+    assert np.allclose(result.mat, np.einsum("qabcd,qdcef->qabef", mat, mat, optimize=True), atol=1e-2)
 
 
 def test_raises_error_when_exponentiating_with_invalid_power():
@@ -196,7 +196,7 @@ def test_transforms_to_dens_channel_correctly(n):
     mat = np.random.rand(4, n, n, n, n)
     interaction = Interaction(mat, SpinChannel.NONE)
     result = interaction.as_channel(SpinChannel.DENS)
-    assert np.allclose(result.mat, 2 * interaction.mat, rtol=1e-2)
+    assert np.allclose(result.mat, 2 * interaction.mat, atol=1e-2)
     assert result.channel == SpinChannel.DENS
 
 
@@ -206,7 +206,7 @@ def test_transforms_to_magn_channel_correctly(n):
     mat = np.random.rand(4, n, n, n, n)
     interaction = Interaction(mat, SpinChannel.NONE)
     result = interaction.as_channel(SpinChannel.MAGN)
-    assert np.allclose(result.mat, 0 * interaction.mat, rtol=1e-2)
+    assert np.allclose(result.mat, 0 * interaction.mat, atol=1e-2)
     assert result.channel == SpinChannel.MAGN
 
 
@@ -216,7 +216,7 @@ def test_transforms_to_sing_channel_correctly(n):
     mat = np.random.rand(4, n, n, n, n)
     interaction = Interaction(mat, SpinChannel.NONE)
     result = interaction.as_channel(SpinChannel.SING)
-    assert np.allclose(result.mat, interaction.mat, rtol=1e-2)
+    assert np.allclose(result.mat, interaction.mat, atol=1e-2)
     assert result.channel == SpinChannel.SING
 
 
@@ -226,7 +226,7 @@ def test_transforms_to_trip_channel_correctly(n):
     mat = np.random.rand(4, n, n, n, n)
     interaction = Interaction(mat, SpinChannel.NONE)
     result = interaction.as_channel(SpinChannel.TRIP)
-    assert np.allclose(result.mat, interaction.mat, rtol=1e-2)
+    assert np.allclose(result.mat, interaction.mat, atol=1e-2)
     assert result.channel == SpinChannel.TRIP
 
 
@@ -246,7 +246,7 @@ def test_adds_interaction_with_numpy_array_correctly(n):
     mat2 = np.random.rand(16, n, n, n, n)
     interaction = Interaction(mat1, has_compressed_q_dimension=True)
     result = interaction + mat2
-    assert np.allclose(result.mat, mat1 + mat2, rtol=1e-2)
+    assert np.allclose(result.mat, mat1 + mat2, atol=1e-2)
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])
@@ -257,7 +257,7 @@ def test_adds_two_interactions_correctly_1(n):
     interaction1 = Interaction(mat1, has_compressed_q_dimension=True)
     interaction2 = Interaction(mat2, has_compressed_q_dimension=True)
     result = interaction1 + interaction2
-    assert np.allclose(result.mat, mat1 + mat2, rtol=1e-2)
+    assert np.allclose(result.mat, mat1 + mat2, atol=1e-2)
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])
@@ -268,7 +268,7 @@ def test_adds_two_interactions_correctly_2(n):
     interaction1 = Interaction(mat1, has_compressed_q_dimension=True)
     interaction2 = Interaction(mat2, has_compressed_q_dimension=False)
     result = interaction1 + interaction2
-    assert np.allclose(result.mat, mat1 + mat2, rtol=1e-2)
+    assert np.allclose(result.mat, mat1 + mat2, atol=1e-2)
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])
@@ -279,7 +279,7 @@ def test_adds_two_interactions_correctly_3(n):
     interaction1 = Interaction(mat1, has_compressed_q_dimension=False)
     interaction2 = Interaction(mat2, has_compressed_q_dimension=True)
     result = interaction1 + interaction2
-    assert np.allclose(result.mat, mat1 + mat2, rtol=1e-2)
+    assert np.allclose(result.mat, mat1 + mat2, atol=1e-2)
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])
@@ -291,7 +291,7 @@ def test_adds_interaction_with_localinteraction_correctly_if_decompressed(n):
     local_interaction = LocalInteraction(mat2)
     result = interaction + local_interaction
     expected = mat1 + mat2[None, ...]
-    assert np.allclose(result.mat, expected, rtol=1e-2)
+    assert np.allclose(result.mat, expected, atol=1e-2)
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])
@@ -303,7 +303,7 @@ def test_adds_interaction_with_localinteraction_correctly_if_compressed(n):
     local_interaction = LocalInteraction(mat2)
     result = interaction + local_interaction
     expected = mat1 + mat2[None, ...]
-    assert np.allclose(result.mat, expected, rtol=1e-2)
+    assert np.allclose(result.mat, expected, atol=1e-2)
 
 
 @pytest.mark.parametrize("n", [1, 2])
@@ -319,7 +319,7 @@ def test_adds_localinteraction_on_left_with_interaction_returns_interaction(n):
     assert isinstance(result, Interaction)
     assert result.has_compressed_q_dimension
     assert result.current_shape == v_mat.shape
-    assert np.allclose(result.mat, u_mat[None, ...] + v_mat, rtol=1e-2)
+    assert np.allclose(result.mat, u_mat[None, ...] + v_mat, atol=1e-2)
 
 
 @pytest.mark.parametrize("n", [1, 2])
@@ -335,7 +335,7 @@ def test_subtracts_interaction_from_localinteraction_on_left_returns_interaction
     assert isinstance(result, Interaction)
     assert result.has_compressed_q_dimension
     assert result.current_shape == v_mat.shape
-    assert np.allclose(result.mat, u_mat[None, ...] - v_mat, rtol=1e-2)
+    assert np.allclose(result.mat, u_mat[None, ...] - v_mat, atol=1e-2)
 
 
 def test_adds_two_interactions_using_operator_correctly():
@@ -345,7 +345,7 @@ def test_adds_two_interactions_using_operator_correctly():
     interaction1 = Interaction(mat1)
     interaction2 = Interaction(mat2)
     result = interaction1 + interaction2
-    assert np.allclose(result.mat, mat1 + mat2, rtol=1e-2)
+    assert np.allclose(result.mat, mat1 + mat2, atol=1e-2)
 
 
 def test_adds_interaction_and_numpy_array_using_operator_correctly():
@@ -354,7 +354,7 @@ def test_adds_interaction_and_numpy_array_using_operator_correctly():
     mat2 = np.random.rand(4, 4, 2, 2)
     interaction = Interaction(mat1)
     result = interaction + mat2
-    assert np.allclose(result.mat, mat1 + mat2, rtol=1e-2)
+    assert np.allclose(result.mat, mat1 + mat2, atol=1e-2)
 
 
 def test_subtracts_two_interactions_using_operator_correctly():
@@ -364,7 +364,7 @@ def test_subtracts_two_interactions_using_operator_correctly():
     interaction1 = Interaction(mat1)
     interaction2 = Interaction(mat2)
     result = interaction1 - interaction2
-    assert np.allclose(result.mat, mat1 - mat2, rtol=1e-2)
+    assert np.allclose(result.mat, mat1 - mat2, atol=1e-2)
 
 
 def test_subtracts_interaction_and_numpy_array_using_operator_correctly():
@@ -373,7 +373,7 @@ def test_subtracts_interaction_and_numpy_array_using_operator_correctly():
     mat2 = np.random.rand(4, 4, 2, 2)
     interaction = Interaction(mat1)
     result = interaction - mat2
-    assert np.allclose(result.mat, mat1 - mat2, rtol=1e-2)
+    assert np.allclose(result.mat, mat1 - mat2, atol=1e-2)
 
 
 def test_raises_error_when_adding_unsupported_type():
@@ -390,4 +390,4 @@ def test_nonlocal_interaction_rsub_has_correct_sign():
     v = Interaction(mat, SpinChannel.NONE, (1, 1, 1), has_compressed_q_dimension=True)
     other = np.zeros_like(mat)
     result = v.__rsub__(other)  # directly call __rsub__ to test B - A = C
-    assert np.allclose(result.mat, -mat, rtol=1e-2)
+    assert np.allclose(result.mat, -mat, atol=1e-2)

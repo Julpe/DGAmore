@@ -21,7 +21,7 @@ autosummary_generate = True
 
 # Native/optional dependencies that need not (and on a docs runner cannot easily) be installed to build the docs.
 # autodoc only needs to *import* the package; mocking these keeps the docs build light and runner-agnostic.
-autodoc_mock_imports = ["mpi4py", "cupy"]
+autodoc_mock_imports = ["mpi4py", "cupy", "psutil"]
 
 # Cross-reference the standard library and the scientific stack.
 intersphinx_mapping = {
