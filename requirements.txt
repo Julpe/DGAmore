@@ -7,5 +7,5 @@ scipy~=1.18
 multimethod~=2.0
 pytest~=8.3
 setuptools~=83.0
-ruamel.yaml~=0.18
+ruamel.yaml~=0.19
 psutil~=7.2
