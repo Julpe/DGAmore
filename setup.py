@@ -22,6 +22,11 @@ setup(
         "Operating System :: POSIX",
         "Operating System :: POSIX :: Linux",
     ],
-    scripts=["dgamore/DGAmore.py", "dgamore/symmetrize_new.py"],
+    entry_points={
+        "console_scripts": [
+            "DGAmore = dgamore.DGAmore:main",
+            "symmetrize = dgamore.symmetrize_new:main",
+        ],
+    },
     python_requires=">=3.12",
 )

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 from unittest.mock import patch
@@ -488,7 +488,7 @@ def test_k_axis_normalized_positions_and_length():
     # distances between consecutive points: [1, 1, 1] -> cumulative [1,2,3]
     # k_axis_pos = [0,1,2,3] -> normalized by 3 -> [0, 1/3, 2/3, 1]
     expected = np.array([0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0])
-    assert np.allclose(kp.k_axis, expected, rtol=1e-12, atol=1e-12)
+    assert np.allclose(kp.k_axis, expected, atol=1e-12)
     assert kp.k_axis.size == kp.nk_tot
 
 
@@ -608,7 +608,7 @@ def test_get_lattice_symmetries_from_string_auto_is_case_insensitive():
 
 
 def _make_small_real_cubic_h(nx=4, ny=4, nz=4, nb=1):
-    """A simple real, Hermitian, cubic-symmetric H on a small grid — convenient for
+    """A simple real, Hermitian, cubic-symmetric H on a small grid - convenient for
     testing auto-detection. With a single band the orbital action is trivial; the
     discovered symmetry is the spatial cubic group (8 ops for nx=ny=nz with all-axes
     inversions + permutations)."""

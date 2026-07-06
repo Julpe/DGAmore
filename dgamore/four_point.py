@@ -1,19 +1,18 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Momentum-dependent four-point objects. :class:`FourPoint` extends :class:`LocalFourPoint` with one momentum axis
 (see :class:`IAmNonLocal`) to represent quantities such as the ladder susceptibility
-:math:`\chi_{abcd}^{q\omega\nu\nu'}` and vertex :math:`F^{q}` over the (irreducible) BZ. The arithmetic and
+:math:`\chi_{1234}^{q\omega\nu\nu'}` and vertex :math:`F^{q}` over the (irreducible) BZ. The arithmetic and
 compound-index machinery mirrors :class:`LocalFourPoint` but accounts for the extra momentum dimension; these
 operations are the performance and memory bottleneck of the non-local ladder DGA step, so several variants are
 provided that trade speed for footprint. Notation mirrors the thesis (Chapters 3 & 4).
 """
 
 import gc
-from copy import deepcopy
 
 import numpy as np
 
@@ -90,7 +89,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         """
         Reflected operator form of :meth:`sub` (``B - A``), returning ``-(A - B)``. See :meth:`sub`.
         """
-        return -self.sub(other)
+        return self.sub(other).scale(-1.0)
 
     def __mul__(self, other) -> "FourPoint":
         """
@@ -124,9 +123,9 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
     def __pow__(self, power, modulo=None) -> "FourPoint":
         """
-        Operator form of :meth:`pow` (``A ** n``), supplying the matching identity. See :meth:`pow`.
+        Operator form of :meth:`pow` (``A ** n``). See :meth:`pow`.
         """
-        return self.pow(power, FourPoint.identity_like(self))
+        return self.pow(power)
 
     def sum_over_vn(self, beta: float, axis: tuple = (-1,), copy: bool = True) -> "FourPoint":
         r"""
@@ -196,7 +195,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
     def to_compound_indices(self) -> "FourPoint":
         r"""
-        Converts the indices of the FourPoint object :math:`F^{wvv'}_{lmm'l'}` to compound indices :math:`F^{w}_{c_1, c_2}`
+        Converts the indices of the FourPoint object :math:`F^{\omega\nu\nu'}_{1234}` to compound indices :math:`F^{\omega}_{c_1, c_2}`
         by transposing the object to [q, w, o1, o2, v, o4, o3, v'] (if the object has any fermionic frequency dimension,
         otherwise the compound indices are built from orbital dimensions only) and grouping {o1, o2, v} and {o4, o3, v'}
         to the new compound index. Always returns the object with a compressed momentum dimension and in the same niw
@@ -266,7 +265,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
         :return: ``self`` in compound-index layout.
         """
-        if len(self.current_shape) == 3:  # [q, w, x1, x2]
+        if len(self.current_shape) == 3 + self.num_wn_dimensions:  # [q, w, x1, x2] or [q, x1, x2]
             return self
 
         return self.permute_orbitals("abcd->acbd", copy=False)._to_compound_indices_ph()
@@ -371,7 +370,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             return self
 
         if copy:
-            return deepcopy(self).permute_orbitals(permutation, copy=False)
+            return self.copy().permute_orbitals(permutation, copy=False)
 
         permutation = (
             f"i{split[0]}...->i{split[1]}..."
@@ -392,18 +391,20 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         """
         return self._map_to_full_bz(grid, 4, nq)
 
-    def add(self, other) -> "FourPoint":
+    def add(self, other, copy: bool = True) -> "FourPoint":
         """
         Adds ``other`` to this object (operator ``+``); see :meth:`_add` for the accepted operands and the niw-range
         handling.
 
         :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, :class:`LocalInteraction`,
             numpy array, or number.
-        :return: A new :class:`FourPoint` holding the sum.
+        :param copy: If True (default), return a new :class:`FourPoint`; if False, accumulate into ``self`` in place
+            (only supported when ``other`` is a conforming :class:`FourPoint`, see :meth:`_add`).
+        :return: A new :class:`FourPoint` holding the sum (or ``self`` when ``copy=False``).
         """
-        return self._add(other)
+        return self._add(other, copy=copy)
 
-    def _add(self, other, subtract: bool = False) -> "FourPoint":
+    def _add(self, other, subtract: bool = False, copy: bool = True) -> "FourPoint":
         """
         Helper method that allows for addition of FourPoint objects and other FourPoint, LocalFourPoint, Interaction or
         LocalInteraction objects. Additions with numpy arrays, floats, ints or complex numbers are also supported.
@@ -414,8 +415,16 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, :class:`LocalInteraction`,
             numpy array, or number. Local operands are broadcast over the momentum axis.
         :param subtract: If True, subtract ``other`` instead of adding it (used by :meth:`sub` to avoid a negated copy).
-        :return: A new :class:`FourPoint` (in the half niw range for the vertex-vertex case).
-        :raises ValueError: If ``other`` has an unsupported type.
+        :param copy: If True (default), return a new :class:`FourPoint`; if False, accumulate the result into
+            ``self.mat`` in place and return ``self`` (no out-of-place result block). The in-place branch is only
+            supported between two :class:`FourPoint` objects whose fermionic frequency dimensions already match (it
+            refuses to diagonally extend ``self``), which is the self-energy-kernel accumulation case in
+            :mod:`dgamore.nonlocal_sde`.
+        :return: A new :class:`FourPoint` (in the half niw range for the vertex-vertex case), or ``self`` when
+            ``copy=False``.
+        :raises ValueError: If ``other`` has an unsupported type, or ``copy=False`` would have to diagonally extend
+            ``self``.
+        :raises NotImplementedError: If ``copy=False`` and ``other`` is not a :class:`FourPoint`.
         """
         if not isinstance(
             other, (FourPoint, LocalFourPoint, Interaction, LocalInteraction, np.ndarray, float, int, complex)
@@ -423,6 +432,11 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             raise ValueError(f"Operations '+/-' for {type(self)} and {type(other)} not supported.")
 
         op = np.subtract if subtract else np.add
+
+        if not copy and not isinstance(other, FourPoint):
+            raise NotImplementedError(
+                "In-place addition/subtraction (copy=False) is only supported between two FourPoint objects."
+            )
 
         if isinstance(other, (np.ndarray, float, int, complex)):
             return FourPoint(
@@ -491,6 +505,23 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         other = self._align_q_dimensions_for_operations(other)
         other, self_extended, other_extended = self._align_frequency_dimensions_for_operation(other)
 
+        if not copy:
+            if self_extended:
+                raise ValueError(
+                    "In-place addition/subtraction (copy=False) cannot diagonally extend 'self'; both operands "
+                    "must have the same number of fermionic frequency dimensions."
+                )
+            # accumulate into self in place: no out-of-place result block (and the caller folds any scalar prefactor
+            # via FourPoint.scale, so no negated/scaled copy of ``other`` either).
+            op(self.mat, other.mat, out=self.mat)
+            self.channel = channel
+            self._full_niw_range = False
+            self.update_original_shape()
+            if other_full_niw_range:
+                other = other.to_full_niw_range()
+            self._revert_frequency_dimensions_after_operation(other, other_extended, False)
+            return self
+
         result = FourPoint(
             op(self.mat, other.mat),
             channel,
@@ -511,7 +542,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         other = self._revert_frequency_dimensions_after_operation(other, other_extended, self_extended)
         return result
 
-    def sub(self, other) -> "FourPoint":
+    def sub(self, other, copy: bool = True) -> "FourPoint":
         """
         Helper method that allows for subtraction of FourPoint objects and other FourPoint, LocalFourPoint, Interaction or
         LocalInteraction objects. Subtractions with numpy arrays, floats, ints or complex numbers are also supported.
@@ -521,17 +552,20 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
         :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, :class:`LocalInteraction`,
             numpy array, or number.
-        :return: The difference, implemented as ``self._add(other, subtract=True)`` (see :meth:`_add`).
+        :param copy: If True (default), return a new :class:`FourPoint`; if False, subtract into ``self`` in place
+            and return ``self`` (only supported when ``other`` is a conforming :class:`FourPoint`, see :meth:`_add`).
+        :return: The difference, implemented as ``self._add(other, subtract=True)`` (see :meth:`_add`), or ``self``
+            when ``copy=False``.
         :raises ValueError: Propagated from :meth:`_add` for unsupported operands.
         """
-        return self._add(other, subtract=True)
+        return self._add(other, subtract=True, copy=copy)
 
     def mul(self, other) -> "FourPoint":
         r"""
         Allows for the multiplication with a number, a numpy array or another FourPoint object. This is different from
         the :meth:`matmul` method, which is used for matrix multiplication.
         In the case the other object is a FourPoint object, we require that both objects have only one fermionic
-        frequency dimension, such that :math:`A_{abcd}^{qv} * B_{dcef}^{qv'} = C_{abef}^{qvv'}`. This is needed to
+        frequency dimension, such that :math:`\sum_{ab} A_{12ab}^{q\nu} * B_{ba34}^{q\nu'} = C_{1234}^{q\nu\nu'}`. This is needed to
         construct the full vertex, see Eq. (3.139) in my thesis. Returns the object in the half niw range.
 
         :param other: A number, numpy array, or :class:`FourPoint`.
@@ -543,7 +577,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             raise ValueError("Multiplication only supported with numbers, numpy arrays or FourPoint objects.")
 
         if not isinstance(other, FourPoint):
-            copy = deepcopy(self)
+            copy = self.copy()
             copy.mat *= other
             return copy
 
@@ -576,11 +610,17 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, or :class:`LocalInteraction`.
             Local operands are broadcast over the momentum axis.
         :param left_hand_side: If True, compute ``self @ other``; if False, compute ``other @ self``.
-        :return: A new :class:`FourPoint` in the half bosonic frequency range, carrying the non-NONE channel.
-        :raises ValueError: If ``other`` has an unsupported type.
+        :return: A new :class:`FourPoint` in the half bosonic frequency range, carrying the non-NONE channel and the
+            :attr:`~dgamore.n_point_base.IHaveChannel.frequency_notation` of ``self``. All branches contract in
+            the compound space of that notation (ph: rows {1,2,v}, cols {4,3,v'}; pp: rows {1,3,v}, cols
+            {4,2,v'}; see :meth:`to_compound_indices`).
+        :raises ValueError: If ``other`` has an unsupported type, or if the operands' frequency notations differ.
         """
         if not isinstance(other, (FourPoint, LocalFourPoint, Interaction, LocalInteraction)):
             raise ValueError(f"Multiplication {type(self)} @ {type(other)} not supported.")
+
+        if isinstance(other, LocalFourPoint) and other.frequency_notation != self.frequency_notation:
+            raise ValueError("Cannot multiply two objects with different frequency notations.")
 
         if isinstance(other, (LocalInteraction, Interaction)):
             is_local = not isinstance(other, Interaction)
@@ -588,9 +628,11 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
             self.compress_q_dimension()
 
-            left_orbs = "abij"
-            right_orbs = "jief"
-            final_orbs = "abef"
+            left_orbs, right_orbs, final_orbs = (
+                ("abij", "jief", "abef")
+                if self.frequency_notation == FrequencyNotation.PH
+                else ("afce", "ebfd", "abcd")
+            )
             suffix = {0: "w", 1: "wv", 2: "wvp"}.get(self.num_vn_dimensions, "")
             einsum_str = (
                 f"q{left_orbs}{suffix},{q_prefix}{right_orbs}->q{final_orbs}{suffix}"
@@ -632,10 +674,15 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
             suffix_other, suffix_result, suffix_self = self._get_frequency_suffixes_for_matmul(other, left_hand_side)
 
+            left_orbs, right_orbs, final_orbs = (
+                ("abcd", "dcef", "abef")
+                if self.frequency_notation == FrequencyNotation.PH
+                else ("afce", "ebfd", "abcd")
+            )
             einsum_str = (
-                f"qabcd{suffix_self},{q_prefix}dcef{suffix_other}->qabef{suffix_result}"
+                f"q{left_orbs}{suffix_self},{q_prefix}{right_orbs}{suffix_other}->q{final_orbs}{suffix_result}"
                 if left_hand_side
-                else f"{q_prefix}abcd{suffix_other},qdcef{suffix_self}->qabef{suffix_result}"
+                else f"{q_prefix}{left_orbs}{suffix_other},q{right_orbs}{suffix_self}->q{final_orbs}{suffix_result}"
             )
 
             return FourPoint(
@@ -696,7 +743,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         """
 
         if copy:
-            return deepcopy(self).invert(copy=False)
+            return self.copy().invert(copy=False)
 
         self.to_half_niw_range()
         if self.num_vn_dimensions == 1:

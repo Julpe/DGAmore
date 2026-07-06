@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 """
 Base class for all local (momentum-independent) N-point quantities. :class:`LocalNPoint` adds the orbital and
@@ -12,7 +12,6 @@ on top of :class:`IHaveMat`.
 
 import itertools
 import os
-from copy import deepcopy
 
 import numpy as np
 
@@ -341,7 +340,7 @@ class LocalNPoint(IHaveMat):
     def to_half_niw_range(self):
         r"""
         Converts the object to the half bosonic frequency range by taking
-        :math:`F^{\omega\nu\nu'}_{abcd}\to F^{\omega\geq0;\nu\nu'}_{abcd}`. Returns the original object.
+        :math:`F^{\omega\nu\nu'}_{1234}\to F^{\omega\geq0;\nu\nu'}_{1234}`. Returns the original object.
 
         :return: ``self`` over the half bosonic range (a no-op if there is no bosonic axis or it is already half).
         """
@@ -364,7 +363,7 @@ class LocalNPoint(IHaveMat):
         Returns a **new** object holding the negative bosonic frequency block :math:`\omega = 0, -1, \ldots, -niw`
         (``niw + 1`` entries, :math:`\omega = 0` included for consistency with :meth:`to_half_niw_range`), derived from
         a half (positive) niw-range object via the time-reversal symmetry
-        :math:`F^{-\omega,-\nu,-\nu'}_{abcd} = (F^{\omega\nu\nu'}_{abcd})^{*}`. The bosonic axis order is kept so that
+        :math:`F^{-\omega,-\nu,-\nu'}_{1234} = (F^{\omega\nu\nu'}_{1234})^{*}`. The bosonic axis order is kept so that
         index ``i`` corresponds to :math:`\omega = -i` (index 0 is :math:`\omega = 0`); only the fermionic axes are
         flipped and the whole array is conjugated. This is the negative-frequency counterpart of
         :meth:`to_full_niw_range`, and it is its own inverse (applying it twice returns the original object).
@@ -397,7 +396,7 @@ class LocalNPoint(IHaveMat):
     def to_half_niv_range(self):
         r"""
         Converts the object to the half fermionic frequency range by taking
-        :math:`F^{\omega\nu\nu'}_{abcd}\to F^{\omega;\nu\geq0,\nu'\geq0}_{abcd}`. Returns the original object.
+        :math:`F^{\omega\nu\nu'}_{1234}\to F^{\omega;\nu\geq0,\nu'\geq0}_{1234}`. Returns the original object.
 
         :return: ``self`` over the half fermionic range (a no-op if there is no fermionic axis or it is already half).
         """
@@ -435,7 +434,7 @@ class LocalNPoint(IHaveMat):
             raise ValueError(f"Invalid axis {axis}. Possible axes are {axis_possible}.")
 
         if copy:
-            return deepcopy(self).flip_frequency_axis(axis, copy=False)
+            return self.copy().flip_frequency_axis(axis, copy=False)
 
         self.mat = np.flip(self.mat, axis=axis)
         return self
@@ -452,7 +451,7 @@ class LocalNPoint(IHaveMat):
             raise ValueError("Cannot swap axes if there are less than two fermionic frequency dimensions.")
 
         if copy:
-            return deepcopy(self).swap_fermionic_frequency_axes(copy=False)
+            return self.copy().swap_fermionic_frequency_axes(copy=False)
 
         self.mat = np.swapaxes(self.mat, -1, -2)
         return self

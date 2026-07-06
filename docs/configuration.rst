@@ -119,11 +119,22 @@ Setting ``use_lambda_correction`` to ``True`` applies the lambda correction thro
 cycle for single-band data, which can help stabilise convergence or reveal how a lambda-corrected cycle changes the
 results. The correction scheme is taken from the ``type`` field of the
 :ref:`lambda correction section <lambda-correction>`, and ``perform_lambda_correction`` is enabled automatically for
-every iteration. Lastly, ``restrict_chi_phys`` clamps the inverse physical susceptibilities to
-positive values, replacing any negative value by a small positive one. This sometimes stabilises early iterations
-but generally yields unphysical results, so once the self-energy converges with this option enabled and iterations
+every iteration. Lastly, ``restrict_chi_phys`` regularizes the physical
+susceptibilities: per momentum and bosonic frequency, the eigenvalues of the Hermitian part of the inverse
+susceptibility are floored at a small positive value (a negative eigenvalue of the inverse marks a crossed pole of
+the Bethe-Salpeter equation), while healthy eigenpairs - including legitimately negative off-diagonal matrix
+elements - pass through unchanged.
+This stabilises cycles that would otherwise converge onto an unphysical branch, but the floored blocks are a
+regularization rather than physics, so once the self-energy converges with this option enabled and iterations
 remain, the option is switched off automatically and the cycle continues until convergence is reached again or
-``max_iter`` is hit.
+``max_iter`` is hit. The restricted phase only serves as a scaffold for the unrestricted one, so it is converged to
+a relaxed threshold of ten times ``epsilon``; at the release the mixing history is reset (the accelerated schemes
+must not extrapolate across the discontinuity) and the unrestricted phase then converges to the full ``epsilon``.
+The log reports the number of floored eigenvalues per iteration - releasing is only promising once that count has
+decayed to zero - and the minimum static eigenvalue of every channel's susceptibility, which certifies whether the
+final state is physical. Combining ``restrict_chi_phys`` with the lambda correction is not recommended (the lambda
+correction would calibrate its sum rule on eigenvalue-floored susceptibilities); if both are enabled, the lambda
+correction takes precedence and ``restrict_chi_phys`` is disabled automatically with a warning.
 
 .. _lambda-correction:
 
@@ -196,6 +207,7 @@ Superconducting properties are obtained by solving the linearised Eliashberg equ
      epsilon: 1e-6                # float
      symmetry: "random"           # str
      include_local_part: True     # bool
+     symmetrize_degenerate_gaps: True # bool
      subfolder_name: "Eliashberg" # str
 
 The equation is solved only when ``perform_eliashberg`` is ``True``. Enabling ``save_pairing_vertex`` or ``save_fq``
@@ -210,8 +222,10 @@ eigenvalues and the corresponding gap functions to an accuracy of ``epsilon``. T
 starting vector of the iteration: entering ``"d-wave"``, for example, begins from a gap function with d-wave
 symmetry, but ``"random"`` is sufficient most of the time. The pairing vertex includes local reducible diagrams by default,
 which can be skipped by setting ``include_local_part`` to ``False``; this is only advisable when s-wave symmetry is
-not expected, as these diagrams become relevant in that case. Finally, the results are written to a subfolder named
-according to ``subfolder_name``.
+not expected, as these diagrams become relevant in that case. With ``symmetrize_degenerate_gaps`` enabled (the
+default), gap functions belonging to (near-)degenerate eigenvalues are orthogonalized with a Loewdin scheme and
+degenerate doublets are rotated to their mirror-adapted (:math:`p_x`/:math:`p_y`-like) partners. Finally, the
+results are written to a subfolder named according to ``subfolder_name``.
 
 .. _self-energy-interpolation:
 
@@ -278,30 +292,32 @@ Memory efficiency
 -----------------
 
 For very large parameter sets memory becomes the main bottleneck, owing to the vectorised nature of the implemented
-equations. This section therefore exposes more memory-efficient algorithms for five of the heaviest steps.
+equations. This section therefore exposes more memory-efficient algorithms for four of the heaviest steps.
 
 .. code-block:: yaml
 
    memory:
      save_memory_for_chi0q: False    # bool
      save_memory_for_chiq_aux: False # bool
-     save_memory_for_sde: False      # bool
      save_memory_for_fq: False       # bool
      save_memory_for_lanczos: False  # bool
+     use_shared_memory_common_obj: True    # bool
 
-These switches control, in turn, the construction of the bare bubble susceptibility, of the auxiliary
-susceptibility entering the Schwinger-Dyson equation, of the Schwinger-Dyson equation itself, of the full ladder
-vertices for the Eliashberg equation, and of the Lanczos algorithm. Enabling any of them increases the runtime
-substantially because of the additional Python-level looping and MPI communication. Under the hood, the bubble and the
-Schwinger-Dyson steps use fast Fourier transforms when their switches are left at ``False``; this gives by far the
-largest speed-up while barely affecting the memory footprint, so it can be kept at the default in almost all cases.
-The largest memory savings come from the auxiliary-susceptibility and full-ladder-vertex switches, which shrink
-those objects considerably, whereas the Lanczos switch matters only for extremely large parameter sets and can
-usually stay disabled.
+The first four switches control, in turn, the construction of the bare bubble susceptibility, of the auxiliary
+susceptibility entering the Schwinger-Dyson equation, of the full ladder vertices for the Eliashberg equation, and
+of the Lanczos algorithm. Enabling any of them increases the runtime substantially because of the additional
+Python-level looping and MPI communication. Under the hood, the bubble uses fast Fourier transforms when its switch
+is left at ``False``; this gives by far the largest speed-up while barely affecting the memory footprint, so it can
+be kept at the default in almost all cases. The Schwinger-Dyson equation itself has no switch: it always runs its
+Fourier-transformed form, which processes the two bosonic frequency halves in separate passes and thereby needs no
+more memory than the alternative momentum-loop formulation would. The largest memory savings come from the
+auxiliary-susceptibility and full-ladder-vertex switches, which shrink those objects considerably, whereas the
+Lanczos switch matters only for extremely large parameter sets and can usually stay disabled.
 
 In practice these switches rarely need to be set by hand. Before the heavy part of a run begins, DGAmore inspects
-the memory available on every node together with an analytic estimate of the peak memory each of the five steps
-consumes, accounting for how the momentum points are distributed across the MPI ranks that share a node. Whenever
+the memory available on every node together with an analytic estimate of the peak memory each of the heavy steps
+(including the switch-less Schwinger-Dyson contraction) consumes, accounting for how the momentum points are
+distributed across the MPI ranks that share a node. Whenever
 the default, faster variant of a step would not fit, the corresponding switch is turned on automatically. The
 estimate is evaluated as a node total: it sums, over all ranks placed on a node, the data that each rank keeps
 resident throughout the calculation plus the transient peak of the step in question, and requires the result to stay
@@ -309,7 +325,19 @@ below ninety percent of that node's available memory. Because the switches act p
 node decides whether a given switch is enabled.
 
 A switch that is explicitly set to ``True`` in the configuration is always honoured: the automatic detection can
-only enable additional switches, never turn off one that was requested. Conversely, if even the most memory-frugal
-variant of a required step does not fit on some node, the run stops immediately with a ``MemoryError`` that
-recommends using more nodes, fewer ranks per node, or a smaller frequency box or momentum grid, rather than failing
+only enable additional switches, never turn off one that was requested. Conversely, if the variant of a step that is
+about to run does not fit on some node - because neither of its variants fits, or because a switch forced by the
+configuration selects a variant that does not - the run stops immediately with a ``MemoryError`` that recommends
+using more nodes, fewer ranks per node, or a smaller frequency box or momentum grid, rather than failing
 unpredictably partway through.
+
+The final switch, ``use_shared_memory_common_obj``, is of a different kind and is enabled by default. The full-grid lattice
+Green's function is identical on every rank, yet each rank would normally rebuild and store its own copy, so a node
+running many ranks holds that (large) array many times over. When this switch is on, the ranks that share a physical
+node instead keep a single copy in one MPI shared-memory window: the Dyson inversion is performed only by that node's
+first rank and the others map the same buffer read-only. The real-space copy of the Green's function used by the
+Schwinger-Dyson contraction is deduplicated through the same mechanism (built once per node, with each rank keeping
+only its slice of real-space points). The node topology is discovered automatically at runtime, so nothing about the
+cluster needs to be configured. Independently of this switch, the Eliashberg step no longer holds replicated
+full-grid objects: ``sigma_dga`` is freed on every rank before the step (it is already saved to disk) and
+``giwk_dga`` survives only on the rank that builds the pairing bubble.

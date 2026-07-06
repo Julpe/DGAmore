@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import logging
@@ -195,7 +195,7 @@ def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
 
     u_loc = config.lattice.hamiltonian.get_local_u()
 
-    (gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc) = (
+    gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc = (
         local_sde.perform_local_schwinger_dyson(g_dmft, g2_dens, g2_magn, u_loc)
     )
 

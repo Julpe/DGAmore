@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import builtins
@@ -852,7 +852,7 @@ def test_auto_discovery_finds_smaller_group_for_anisotropic_lattice():
 
 @pytest.mark.slow
 def test_auto_discovery_matches_legacy_for_12cubed_cubic_hamiltonian():
-    """Auto-discovered IBZ partition must match the legacy three_dimensional_cubic partition for a genuinely cubic 3-band Hamiltonian. (12^3 — slower.)"""
+    """Auto-discovered IBZ partition must match the legacy three_dimensional_cubic partition for a genuinely cubic 3-band Hamiltonian. (12^3 - slower.)"""
     import dgamore.brillouin_zone as bz
 
     fname, shape = "hk_3band_srvo3_cubic_12x12x12.npy", (12, 12, 12, 3, 3)
@@ -870,7 +870,7 @@ def test_auto_discovery_matches_legacy_for_12cubed_cubic_hamiltonian():
 
 @pytest.mark.slow
 def test_auto_discovery_matches_legacy_for_20cubed_cubic_hamiltonian():
-    """Same as above for the 20^3 grid. (Even slower — covers the larger-grid path.)"""
+    """Same as above for the 20^3 grid. (Even slower - covers the larger-grid path.)"""
     import dgamore.brillouin_zone as bz
 
     fname, shape = "hk_3band_srvo3_cubic_20x20x20.npy", (20, 20, 20, 3, 3)
@@ -1016,7 +1016,7 @@ def test_get_symmetry_reduction_default_excludes_antiunitary_ops():
     """The default behaviour must drop anti-unitary operations; therefore no FBZ point should carry conj=True. This is the safe semantics for frequency- dependent quantities."""
     H = _make_real_cubic_h(4, 4, 4, 1)
     result = sr.get_symmetry_reduction(H, atol=1e-8)
-    assert result["conjs"].any() == False  # noqa: E712 — explicit bool check
+    assert result["conjs"].any() == False  # noqa: E712 - explicit bool check
 
 
 def test_get_symmetry_reduction_include_antiunitary_admits_conj_ops():
@@ -1035,7 +1035,7 @@ def test_get_symmetry_reduction_include_antiunitary_shrinks_or_equals_ibz():
 
 
 def test_get_symmetry_reduction_include_antiunitary_reconstructs_H_correctly():
-    """When anti-unitary ops are included, reconstruction of H itself is still correct (anti-unitary ops are valid symmetries of H — only frequency-dependent objects are affected by the missing freq flip)."""
+    """When anti-unitary ops are included, reconstruction of H itself is still correct (anti-unitary ops are valid symmetries of H - only frequency-dependent objects are affected by the missing freq flip)."""
     H = _make_real_cubic_h(4, 4, 4, 1)
     result = sr.get_symmetry_reduction(H, atol=1e-8, include_antiunitary=True)
     H_ibz = H.reshape(-1, 1, 1)[result["irrk_ind"]]
@@ -1063,7 +1063,7 @@ def test_get_symmetry_reduction_default_yields_no_conjugation_in_expansion():
     """Concrete consequence of default ``include_antiunitary=False``: applying ``expand`` to any IBZ payload does NOT conjugate orbital indices anywhere. We verify this by feeding a complex payload built so that conjugation would be detectable (the conjugate differs from the original)."""
     H = _make_real_cubic_h(4, 4, 4, 1)
     result = sr.get_symmetry_reduction(H, atol=1e-8)
-    # Reconstruct H itself — well-defined and exact
+    # Reconstruct H itself - well-defined and exact
     H_ibz = H.reshape(-1, 1, 1)[result["irrk_ind"]]
     H_rec = result["expand"](H_ibz)
     assert np.allclose(H_rec, H, atol=1e-12)
@@ -1203,9 +1203,7 @@ def test_fix_gauge_degenerate_returns_none_on_stacked_svd_linalgerror(monkeypatc
         raise np.linalg.LinAlgError("forced")
 
     monkeypatch.setattr(sr.np.linalg, "svd", boom)
-    out = sr._fix_gauge_degenerate(
-        np.eye(2, dtype=complex), np.eye(2, dtype=complex), [[0, 1]], Hk, Hg, atol=1e-12
-    )
+    out = sr._fix_gauge_degenerate(np.eye(2, dtype=complex), np.eye(2, dtype=complex), [[0, 1]], Hk, Hg, atol=1e-12)
     assert out is None
 
 
@@ -1227,9 +1225,7 @@ def test_fix_gauge_degenerate_returns_none_on_block_svd_linalgerror(monkeypatch)
         raise np.linalg.LinAlgError("forced on block")
 
     monkeypatch.setattr(sr.np.linalg, "svd", flaky_svd)
-    out = sr._fix_gauge_degenerate(
-        np.eye(2, dtype=complex), np.eye(2, dtype=complex), [[0, 1]], Hk, Hg, atol=1e-12
-    )
+    out = sr._fix_gauge_degenerate(np.eye(2, dtype=complex), np.eye(2, dtype=complex), [[0, 1]], Hk, Hg, atol=1e-12)
     assert out is None
     assert state["n"] >= 2
 
@@ -1332,9 +1328,7 @@ def test_group_element_with_near_zero_U_skips_phase_normalization():
 
 
 def _rot2(theta):
-    return np.array(
-        [[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]], dtype=np.complex128
-    )
+    return np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]], dtype=np.complex128)
 
 
 def test_apply_auto_orbital_transform_four_orbital_nonidentity_einsum():

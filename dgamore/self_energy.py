@@ -1,18 +1,17 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Single-particle self-energy. :class:`SelfEnergy` wraps the (possibly momentum-dependent) self-energy
-:math:`\Sigma_{ab}(k, \nu)` and provides its high-frequency moments (:math:`\Sigma_\infty` and the
+:math:`\Sigma_{12}(k, \nu)` and provides its high-frequency moments (:math:`\Sigma_\infty` and the
 :math:`1/\imath\nu` coefficient), tools to estimate the core frequency box, to append the analytic asymptotic
 tail beyond the core, to polynomial-fit the tail, and to interpolate the self-energy between temperatures. The
 moments are obtained by fitting the highest available Matsubara frequencies.
 """
 
 import itertools as it
-from copy import deepcopy
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator, interp1d
@@ -23,7 +22,7 @@ from dgamore.two_point import TwoPoint
 
 class SelfEnergy(TwoPoint):
     r"""
-    The (possibly momentum-dependent) single-particle self-energy :math:`\Sigma_{ab}(k, \nu)`. On top of the
+    The (possibly momentum-dependent) single-particle self-energy :math:`\Sigma_{12}(k, \nu)`. On top of the
     two-point orbital bookkeeping inherited from :class:`LocalTwoPoint` it provides the high-frequency moments
     (:math:`\Sigma_\infty` and the :math:`1/\imath\nu` coefficient), an estimate of the core frequency box, the
     construction/append of the analytic asymptotic tail beyond the core, a polynomial tail fit, and the
@@ -118,14 +117,14 @@ class SelfEnergy(TwoPoint):
         asympt = self._get_asympt(niv=self.niv)
 
         if self._niv_core == self.niv:
-            return deepcopy(self)
+            return self.copy()
         if asympt.niv == 0:
-            return deepcopy(self)
+            return self.copy()
 
         copy = self.cut_niv(self._niv_core)
         if copy is self:
             # ``cut_niv`` was a no-op (``_niv_core >= self.niv``); deep-copy so the operation stays non-destructive.
-            copy = deepcopy(self)
+            copy = self.copy()
         copy.mat = np.concatenate(
             (asympt.mat[..., : asympt.niv - copy.niv], copy.mat, asympt.mat[..., asympt.niv + copy.niv :]), axis=-1
         )
@@ -141,7 +140,7 @@ class SelfEnergy(TwoPoint):
         """
         asympt = self._get_asympt(niv)
         if niv <= self.niv:
-            return deepcopy(self)
+            return self.copy()
         # ``np.concatenate`` allocates the result and only reads ``self.mat``, so clone the metadata without
         # duplicating the array first.
         copy = self._clone_without_mat()
@@ -267,7 +266,7 @@ class SelfEnergy(TwoPoint):
         :return: A new :class:`SelfEnergy` holding the polynomial fit, in the full fermionic frequency range.
         """
         if n_fit == 0:
-            return deepcopy(self)
+            return self.copy()
 
         if n_fit > self.niv or n_fit < 0:
             n_fit = niv_core + 200

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 from unittest.mock import patch, MagicMock
@@ -12,7 +12,7 @@ from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.local_four_point import LocalFourPoint
 import numpy as np
 
-from dgamore.n_point_base import SpinChannel
+from dgamore.n_point_base import FrequencyNotation, SpinChannel
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])
@@ -25,7 +25,7 @@ def test_exponentiation_with_positive_power_1(n):
     expected = obj
     for _ in range(n - 1):
         expected = expected @ obj
-    assert np.allclose(result.mat, expected.mat, rtol=1e-4)
+    assert np.allclose(result.mat, expected.mat, atol=1e-4)
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])
@@ -38,7 +38,7 @@ def test_exponentiation_with_positive_power_2(n):
     expected = obj
     for _ in range(n - 1):
         expected = expected @ obj
-    assert np.allclose(result.mat, expected.mat, rtol=1e-4)
+    assert np.allclose(result.mat, expected.mat, atol=1e-4)
 
 
 def test_exponentiation_with_zero_power_returns_identity_1():
@@ -47,7 +47,7 @@ def test_exponentiation_with_zero_power_returns_identity_1():
     obj = LocalFourPoint(mat, channel=SpinChannel.NONE, num_vn_dimensions=1)
     identity = LocalFourPoint.identity_like(obj)
     result = obj.pow(0, identity)
-    assert np.allclose(result.mat, identity.mat, rtol=1e-4)
+    assert np.allclose(result.mat, identity.mat, atol=1e-4)
 
 
 def test_exponentiation_with_zero_power_returns_identity_2():
@@ -56,7 +56,7 @@ def test_exponentiation_with_zero_power_returns_identity_2():
     obj = LocalFourPoint(mat, channel=SpinChannel.NONE, num_vn_dimensions=2)
     identity = LocalFourPoint.identity_like(obj)
     result = obj.pow(0, identity)
-    assert np.allclose(result.mat, identity.mat, rtol=1e-4)
+    assert np.allclose(result.mat, identity.mat, atol=1e-4)
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])
@@ -69,7 +69,7 @@ def test_exponentiation_with_negative_power_1(n):
     expected = obj.invert()
     for _ in range(n - 1):
         expected = expected @ obj.invert()
-    assert np.allclose(result.mat, expected.mat, rtol=1e-4)
+    assert np.allclose(result.mat, expected.mat, atol=1e-4)
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])
@@ -82,7 +82,7 @@ def test_exponentiation_with_negative_power_2(n):
     expected = obj.invert()
     for _ in range(n - 1):
         expected = expected @ obj.invert()
-    assert np.allclose(result.mat, expected.mat, rtol=1e-2)
+    assert np.allclose(result.mat, expected.mat, atol=1e-2)
 
 
 def test_exponentiation_with_non_integer_power_raises_error():
@@ -100,7 +100,7 @@ def test_symmetrizes_square_matrix_correctly():
     obj = LocalFourPoint(mat)
     result = obj.symmetrize_v_vp()
     expected = np.array([[[[[[1, 2.5], [2.5, 4]]]]]])
-    assert np.allclose(result.mat, expected, rtol=1e-4)
+    assert np.allclose(result.mat, expected, atol=1e-4)
 
 
 def test_symmetrizes_random_matrix_correctly():
@@ -109,7 +109,7 @@ def test_symmetrizes_random_matrix_correctly():
     obj = LocalFourPoint(mat)
     result = obj.symmetrize_v_vp()
     expected = 0.5 * (mat + mat.swapaxes(0, 3).swapaxes(1, 2).swapaxes(-1, -2))
-    assert np.allclose(result.mat, expected, rtol=1e-4)
+    assert np.allclose(result.mat, expected, atol=1e-4)
 
 
 def test_take_first_wn_selects_first_entry_and_returns_independent_copy():
@@ -119,7 +119,7 @@ def test_take_first_wn_selects_first_entry_and_returns_independent_copy():
     expected = obj.mat[..., 0, :, :].copy()
     result = obj.take_first_wn()
     assert result.num_wn_dimensions == 0
-    assert np.allclose(result.mat, expected, rtol=1e-4)
+    assert np.allclose(result.mat, expected, atol=1e-4)
     result.mat[0, 0, 0, 0, 0, 0] = 12345.0
     assert not np.allclose(obj.mat[0, 0, 0, 0, 0, 0, 0], 12345.0)
 
@@ -129,7 +129,7 @@ def test_handles_symmetric_matrix_without_modification():
     mat = np.array([[[[[[1, 2], [2, 4]]]]]])
     obj = LocalFourPoint(mat)
     result = obj.symmetrize_v_vp()
-    assert np.allclose(result.mat, mat, rtol=1e-4)
+    assert np.allclose(result.mat, mat, atol=1e-4)
 
 
 def test_raises_error_for_non_square_last_two_axes():
@@ -154,7 +154,7 @@ def test_sums_over_orbitals_correctly_1():
     obj = LocalFourPoint(mat)
     result = obj.sum_over_orbitals("abcd->ad")
     assert result.mat.shape == (2, 2, 5, 3)
-    assert np.allclose(result.mat, np.sum(mat, axis=(1, 2)), rtol=1e-4)
+    assert np.allclose(result.mat, np.sum(mat, axis=(1, 2)), atol=1e-4)
 
 
 def test_sums_over_orbitals_correctly_2():
@@ -163,7 +163,7 @@ def test_sums_over_orbitals_correctly_2():
     obj = LocalFourPoint(mat)
     result = obj.sum_over_orbitals("abcd->ad")
     assert result.mat.shape == (2, 2, 5, 3, 3)
-    assert np.allclose(result.mat, np.sum(mat, axis=(1, 2)), rtol=1e-4)
+    assert np.allclose(result.mat, np.sum(mat, axis=(1, 2)), atol=1e-4)
 
 
 def test_raises_error_for_invalid_orbital_contraction_format():
@@ -179,7 +179,7 @@ def test_handles_no_orbital_reduction():
     mat = np.random.rand(2, 2, 2, 2, 5, 3, 3)
     obj = LocalFourPoint(mat)
     result = obj.sum_over_orbitals("abcd->abcd")
-    assert np.allclose(result.mat, mat, rtol=1e-4)
+    assert np.allclose(result.mat, mat, atol=1e-4)
 
 
 def test_reduces_orbital_dimensions_correctly_1():
@@ -188,7 +188,7 @@ def test_reduces_orbital_dimensions_correctly_1():
     obj = LocalFourPoint(mat)
     result = obj.sum_over_orbitals("abcd->a")
     assert result.mat.shape == (3, 5, 4, 4)
-    assert np.allclose(result.mat, np.sum(mat, axis=(1, 2, 3)), rtol=1e-4)
+    assert np.allclose(result.mat, np.sum(mat, axis=(1, 2, 3)), atol=1e-4)
 
 
 def test_reduces_orbital_dimensions_correctly_2():
@@ -197,7 +197,7 @@ def test_reduces_orbital_dimensions_correctly_2():
     obj = LocalFourPoint(mat)
     result = obj.sum_over_orbitals("abcd->ab")
     assert result.mat.shape == (3, 3, 5, 4, 4)
-    assert np.allclose(result.mat, np.sum(mat, axis=(2, 3)), rtol=1e-4)
+    assert np.allclose(result.mat, np.sum(mat, axis=(2, 3)), atol=1e-4)
 
 
 def test_reduces_orbital_dimensions_correctly_3():
@@ -206,7 +206,7 @@ def test_reduces_orbital_dimensions_correctly_3():
     obj = LocalFourPoint(mat)
     result = obj.sum_over_orbitals("abcd->abc")
     assert result.mat.shape == (3, 3, 3, 5, 4, 4)
-    assert np.allclose(result.mat, np.sum(mat, axis=(3,)), rtol=1e-4)
+    assert np.allclose(result.mat, np.sum(mat, axis=(3,)), atol=1e-4)
 
 
 def test_sums_over_single_vn_dimension_correctly_1():
@@ -216,7 +216,7 @@ def test_sums_over_single_vn_dimension_correctly_1():
     beta = 10.0
     result = obj.sum_over_vn(beta, axis=(-1,))
     expected_mat = 1 / beta * np.sum(mat, axis=-1)
-    assert np.allclose(result.mat, expected_mat, rtol=1e-4)
+    assert np.allclose(result.mat, expected_mat, atol=1e-4)
     assert result.num_vn_dimensions == 0
 
 
@@ -228,7 +228,7 @@ def test_sums_over_single_vn_dimension_correctly_2(n):
     beta = 10.0
     result = obj.sum_over_vn(beta, axis=(-n,))
     expected_mat = 1 / beta * np.sum(mat, axis=(-n,))
-    assert np.allclose(result.mat, expected_mat, rtol=1e-4)
+    assert np.allclose(result.mat, expected_mat, atol=1e-4)
     assert result.num_vn_dimensions == 1
 
 
@@ -239,7 +239,7 @@ def test_sums_over_multiple_vn_dimensions_correctly():
     beta = 10.0
     result = obj.sum_over_vn(beta, axis=(-2, -1))
     expected_mat = 1 / beta**2 * np.sum(mat, axis=(-2, -1))
-    assert np.allclose(result.mat, expected_mat, rtol=1e-4)
+    assert np.allclose(result.mat, expected_mat, atol=1e-4)
     assert result.num_vn_dimensions == 0
 
 
@@ -259,7 +259,7 @@ def test_sums_over_all_vn_with_double_vn_dimensions_correctly():
     beta = 10.0
     result = obj.sum_over_all_vn(beta)
     expected_mat = 1 / beta**2 * np.sum(mat, axis=(-2, -1))
-    assert np.allclose(result.mat, expected_mat, rtol=1e-4)
+    assert np.allclose(result.mat, expected_mat, atol=1e-4)
     assert result.num_vn_dimensions == 0
 
 
@@ -270,7 +270,7 @@ def test_sums_over_all_vn_with_single_vn_dimension_correctly():
     beta = 10.0
     result = obj.sum_over_all_vn(beta)
     expected_mat = 1 / beta * np.sum(mat, axis=-1)
-    assert np.allclose(result.mat, expected_mat, rtol=1e-4)
+    assert np.allclose(result.mat, expected_mat, atol=1e-4)
     assert result.num_vn_dimensions == 0
 
 
@@ -280,7 +280,7 @@ def test_handles_no_vn_dimensions_without_modification_for_sum():
     obj = LocalFourPoint(mat, num_vn_dimensions=0)
     beta = 10.0
     result = obj.sum_over_all_vn(beta)
-    assert np.allclose(result.mat, mat, rtol=1e-4)
+    assert np.allclose(result.mat, mat, atol=1e-4)
     assert result.num_vn_dimensions == 0
 
 
@@ -291,7 +291,7 @@ def test_contracts_legs_correctly_with_two_vn_dimensions():
     beta = 10.0
     result = obj.contract_legs(beta)
     assert result.mat.shape == (2, 2, 5)
-    assert np.allclose(result.mat, 1.0 / beta**2 * np.einsum("abcdefg->ade", mat), rtol=1e-4)
+    assert np.allclose(result.mat, 1.0 / beta**2 * np.einsum("abcdefg->ade", mat), atol=1e-4)
 
 
 def test_raises_error_when_contracting_legs_with_invalid_vn_dimensions():
@@ -328,7 +328,7 @@ def test_converts_to_compound_indices_with_no_vn_dimensions():
     obj = LocalFourPoint(mat, num_vn_dimensions=0)
     result = obj.to_compound_indices()
     assert result.mat.shape == (5, 4, 4)
-    assert np.allclose(result.mat, mat.transpose(4, 0, 1, 3, 2).reshape(5, 4, 4), rtol=1e-4)
+    assert np.allclose(result.mat, mat.transpose(4, 0, 1, 3, 2).reshape(5, 4, 4), atol=1e-4)
 
 
 def test_converts_to_compound_indices_with_one_vn_dimension():
@@ -356,7 +356,7 @@ def test_converts_to_compound_indices_with_two_vn_dimensions():
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     result = obj.to_compound_indices()
-    assert np.allclose(result.mat, mat.transpose(4, 0, 1, 5, 3, 2, 6).reshape(5, 16, 16), rtol=1e-4)
+    assert np.allclose(result.mat, mat.transpose(4, 0, 1, 5, 3, 2, 6).reshape(5, 16, 16), atol=1e-4)
 
 
 def test_raises_error_for_missing_bosonic_frequencies():
@@ -372,7 +372,7 @@ def test_handles_already_compound_indices_without_modification():
     mat = np.random.rand(5, 4, 4)
     obj = LocalFourPoint(mat, num_wn_dimensions=1, num_vn_dimensions=2)
     result = obj.to_compound_indices()
-    assert np.allclose(result.mat, mat, rtol=1e-4)
+    assert np.allclose(result.mat, mat, atol=1e-4)
 
 
 @pytest.mark.parametrize(
@@ -398,7 +398,7 @@ def test_converts_compound_indices_to_full_indices_correctly_for_one_vn_dimensio
     result = obj.to_full_indices()
     assert result.mat.shape == (2, 2, 2, 2, 5, 4, 4)
     assert result.num_vn_dimensions == 2
-    assert np.allclose(mat, result.take_vn_diagonal().mat, rtol=1e-4)
+    assert np.allclose(mat, result.take_vn_diagonal().mat, atol=1e-4)
 
 
 def test_raises_error_for_invalid_current_shape():
@@ -426,7 +426,7 @@ def test_returns_original_object_when_already_in_full_indices(num_wn_dimensions,
     obj = LocalFourPoint(mat, num_wn_dimensions=num_wn_dimensions, num_vn_dimensions=num_vn_dimensions)
     result = obj.to_full_indices()
     assert result.mat.shape == shape
-    assert np.allclose(result.mat, mat, rtol=1e-4)
+    assert np.allclose(result.mat, mat, atol=1e-4)
     assert result.num_wn_dimensions == num_wn_dimensions
     assert result.num_vn_dimensions == num_vn_dimensions
 
@@ -440,7 +440,7 @@ def test_handles_diagonal_extraction_for_single_vn_dimension():
     assert result.mat.shape == (2, 2, 2, 2, 5, 4)
 
     mat = mat.reshape((5,) + (2, 2, 4) * 2).transpose(1, 2, 5, 4, 0, 3, 6).diagonal(axis1=-2, axis2=-1)
-    assert np.allclose(result.mat, mat, rtol=1e-4)
+    assert np.allclose(result.mat, mat, atol=1e-4)
 
 
 def test_raises_error_for_invalid_bosonic_frequency_dimensions():
@@ -508,8 +508,8 @@ def test_multiplies_two_objects_with_no_vn_dimensions_correctly():
     result2 = obj2 @ obj1
     expected1 = np.einsum("abcdw,dcefw->abefw", mat1, mat2, optimize=True)
     expected2 = np.einsum("abcdw,dcefw->abefw", mat2, mat1, optimize=True)
-    assert np.allclose(result1.mat, expected1[..., 2:], rtol=1e-4)
-    assert np.allclose(result2.mat, expected2[..., 2:], rtol=1e-4)
+    assert np.allclose(result1.mat, expected1[..., 2:], atol=1e-4)
+    assert np.allclose(result2.mat, expected2[..., 2:], atol=1e-4)
 
 
 def test_multiplies_two_objects_with_one_vn_dimension_correctly():
@@ -522,8 +522,8 @@ def test_multiplies_two_objects_with_one_vn_dimension_correctly():
     result2 = obj2 @ obj1
     expected1 = np.einsum("abcdwv,dcefwv->abefwv", mat1, mat2, optimize=True)
     expected2 = np.einsum("abcdwv,dcefwv->abefwv", mat2, mat1, optimize=True)
-    assert np.allclose(result1.mat, expected1[..., 2:, :], rtol=1e-4)
-    assert np.allclose(result2.mat, expected2[..., 2:, :], rtol=1e-4)
+    assert np.allclose(result1.mat, expected1[..., 2:, :], atol=1e-4)
+    assert np.allclose(result2.mat, expected2[..., 2:, :], atol=1e-4)
 
 
 @pytest.mark.parametrize(
@@ -577,8 +577,8 @@ def test_handles_multiplication_with_local_interaction_correctly():
     result2 = obj2 @ obj1
     expected1 = np.einsum("abcdwvp,dcef->abefwvp", mat1, mat2, optimize=True)
     expected2 = np.einsum("abcd,dcefwvp->abefwvp", mat2, mat1, optimize=True)
-    assert np.allclose(result1.mat, expected1, rtol=1e-4)
-    assert np.allclose(result2.mat, expected2, rtol=1e-4)
+    assert np.allclose(result1.mat, expected1, atol=1e-4)
+    assert np.allclose(result2.mat, expected2, atol=1e-4)
 
 
 def test_multiplies_objects_with_mixed_vn_dimensions_correctly():
@@ -591,8 +591,8 @@ def test_multiplies_objects_with_mixed_vn_dimensions_correctly():
     result2 = obj2 @ obj1
     expected1 = np.einsum("abcdwv,dcefw->abefwv", mat1, mat2, optimize=True)
     expected2 = np.einsum("abcdw,dcefwv->abefwv", mat2, mat1, optimize=True)
-    assert np.allclose(result1.mat, expected1[..., 2:, :], rtol=1e-4)
-    assert np.allclose(result2.mat, expected2[..., 2:, :], rtol=1e-4)
+    assert np.allclose(result1.mat, expected1[..., 2:, :], atol=1e-4)
+    assert np.allclose(result2.mat, expected2[..., 2:, :], atol=1e-4)
     assert result1.num_vn_dimensions == 1
     assert result2.num_vn_dimensions == 1
 
@@ -615,7 +615,7 @@ def test_multiplies_with_scalar_correctly():
     scalar = 2.5
     result = obj * scalar
     expected = mat * scalar
-    assert np.allclose(result.mat, expected, rtol=1e-4)
+    assert np.allclose(result.mat, expected, atol=1e-4)
 
 
 def test_multiplies_with_numpy_array_correctly():
@@ -625,7 +625,7 @@ def test_multiplies_with_numpy_array_correctly():
     array = np.random.rand(2, 2, 2, 2, 5, 4)
     result = obj * array
     expected = mat * array
-    assert np.allclose(result.mat, expected, rtol=1e-4)
+    assert np.allclose(result.mat, expected, atol=1e-4)
 
 
 def test_raises_error_for_invalid_multiplication_type():
@@ -662,7 +662,7 @@ def test_multiplies_two_objects_with_one_vn_dimension_and_generates_two_vn_dimen
     obj2 = LocalFourPoint(mat2, num_vn_dimensions=1, full_niw_range=True)
     result = obj1 * obj2
     expected = np.einsum("abcdwv,dcefwp->abefwvp", mat1, mat2, optimize=True)
-    assert np.allclose(result.mat, expected[..., 10:, :, :], rtol=1e-4)
+    assert np.allclose(result.mat, expected[..., 10:, :, :], atol=1e-4)
 
 
 def test_converts_to_half_bosonic_range_correctly_1():
@@ -672,7 +672,7 @@ def test_converts_to_half_bosonic_range_correctly_1():
     result = obj.to_half_niw_range()
     assert result is obj
     assert result.mat.shape == (2, 2, 2, 2, 11)
-    assert np.allclose(result.mat, np.take(mat, np.arange(10, 21), axis=-1), rtol=1e-4)
+    assert np.allclose(result.mat, np.take(mat, np.arange(10, 21), axis=-1), atol=1e-4)
 
 
 def test_converts_to_half_bosonic_range_correctly_2():
@@ -682,7 +682,7 @@ def test_converts_to_half_bosonic_range_correctly_2():
     result = obj.to_half_niw_range()
     assert result is obj
     assert result.mat.shape == (2, 2, 2, 2, 11, 20)
-    assert np.allclose(result.mat, np.take(mat, np.arange(10, 21), axis=-2), rtol=1e-4)
+    assert np.allclose(result.mat, np.take(mat, np.arange(10, 21), axis=-2), atol=1e-4)
 
 
 def test_converts_to_half_bosonic_range_correctly_3():
@@ -692,7 +692,7 @@ def test_converts_to_half_bosonic_range_correctly_3():
     result = obj.to_half_niw_range()
     assert result is obj
     assert result.mat.shape == (2, 2, 2, 2, 11, 10, 10)
-    assert np.allclose(result.mat, np.take(mat, np.arange(10, 21), axis=-3), rtol=1e-4)
+    assert np.allclose(result.mat, np.take(mat, np.arange(10, 21), axis=-3), atol=1e-4)
 
 
 def test_to_full_niw_range_to_half_niw_range_should_reproduce_original_1():
@@ -700,7 +700,7 @@ def test_to_full_niw_range_to_half_niw_range_should_reproduce_original_1():
     mat = np.random.rand(2, 2, 2, 2, 21) + 1j * np.random.rand(2, 2, 2, 2, 21)
     obj = LocalFourPoint(mat, num_vn_dimensions=0, full_niw_range=False)
     obj = obj.to_full_niw_range().to_half_niw_range()
-    assert np.allclose(obj.mat, mat, rtol=1e-4)
+    assert np.allclose(obj.mat, mat, atol=1e-4)
     assert obj.full_niw_range is False
     assert obj.num_vn_dimensions == 0
 
@@ -710,7 +710,7 @@ def test_to_full_niw_range_to_half_niw_range_should_reproduce_original_2():
     mat = np.random.rand(2, 2, 2, 2, 21, 4) + 1j * np.random.rand(2, 2, 2, 2, 21, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1, full_niw_range=False)
     obj = obj.to_full_niw_range().to_half_niw_range()
-    assert np.allclose(obj.mat, mat, rtol=1e-4)
+    assert np.allclose(obj.mat, mat, atol=1e-4)
     assert obj.full_niw_range is False
     assert obj.num_vn_dimensions == 1
 
@@ -720,7 +720,7 @@ def test_to_full_niw_range_to_half_niw_range_should_reproduce_original_3():
     mat = np.random.rand(2, 2, 2, 2, 21, 4, 4) + 1j * np.random.rand(2, 2, 2, 2, 21, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2, full_niw_range=False)
     obj = obj.to_full_niw_range().to_half_niw_range()
-    assert np.allclose(obj.mat, mat, rtol=1e-4)
+    assert np.allclose(obj.mat, mat, atol=1e-4)
     assert obj.full_niw_range is False
     assert obj.num_vn_dimensions == 2
 
@@ -734,7 +734,7 @@ def test_adds_two_local_four_point_objects_correctly():
     result = obj1 + obj2
     expected = mat1 + mat2
     assert result.full_niw_range == False
-    assert np.allclose(result.mat, expected[..., 10:, :, :], rtol=1e-4)
+    assert np.allclose(result.mat, expected[..., 10:, :, :], atol=1e-4)
 
 
 def test_adds_two_local_four_point_objects_with_different_vn_dimensions():
@@ -772,12 +772,12 @@ def test_adds_two_local_four_point_objects_with_different_vn_dimensions():
         assert result5.full_niw_range is False
         assert result6.full_niw_range is False
 
-        assert np.allclose(result1.mat, (mat1 + mat2_diagonal)[..., 10:, :, :], rtol=1e-4)
-        assert np.allclose(result2.mat, (mat1 + mat3[..., None, None])[..., 10:, :, :], rtol=1e-4)
-        assert np.allclose(result3.mat, (mat2 + mat3[..., None])[..., 10:, :], rtol=1e-4)
-        assert np.allclose(result4.mat, (mat2 + mat2)[..., 10:, :], rtol=1e-4)
-        assert np.allclose(result5.mat, (mat3 + mat3)[..., 10:], rtol=1e-4)
-        assert np.allclose(result6.mat, (mat1 + mat1)[..., 10:, :, :], rtol=1e-4)
+        assert np.allclose(result1.mat, (mat1 + mat2_diagonal)[..., 10:, :, :], atol=1e-4)
+        assert np.allclose(result2.mat, (mat1 + mat3[..., None, None])[..., 10:, :, :], atol=1e-4)
+        assert np.allclose(result3.mat, (mat2 + mat3[..., None])[..., 10:, :], atol=1e-4)
+        assert np.allclose(result4.mat, (mat2 + mat2)[..., 10:, :], atol=1e-4)
+        assert np.allclose(result5.mat, (mat3 + mat3)[..., 10:], atol=1e-4)
+        assert np.allclose(result6.mat, (mat1 + mat1)[..., 10:, :, :], atol=1e-4)
 
 
 def test_adds_local_four_point_and_scalar_correctly():
@@ -787,7 +787,7 @@ def test_adds_local_four_point_and_scalar_correctly():
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     result = obj + scalar
     expected = mat + scalar
-    assert np.allclose(result.mat, expected, rtol=1e-4)
+    assert np.allclose(result.mat, expected, atol=1e-4)
 
 
 def test_adds_local_four_point_and_numpy_array_correctly():
@@ -797,7 +797,7 @@ def test_adds_local_four_point_and_numpy_array_correctly():
     obj = LocalFourPoint(mat1, num_vn_dimensions=2)
     result = obj + mat2
     expected = mat1 + mat2
-    assert np.allclose(result.mat, expected, rtol=1e-4)
+    assert np.allclose(result.mat, expected, atol=1e-4)
 
 
 def test_adds_local_four_point_and_local_interaction_correctly():
@@ -808,7 +808,7 @@ def test_adds_local_four_point_and_local_interaction_correctly():
     obj2 = LocalInteraction(mat2)
     result = obj1 + obj2
     expected = mat1 + mat2[..., None, None, None]
-    assert np.allclose(result.mat, expected, rtol=1e-4)
+    assert np.allclose(result.mat, expected, atol=1e-4)
 
 
 def test_raises_error_for_unsupported_addition_type():
@@ -828,7 +828,7 @@ def test_adds_local_four_point_and_interaction_with_compressed_q_dimension():
     result = obj1 + interaction
     assert isinstance(result, np.ndarray)
     expected = mat1[None, ...] + mat2[..., None, None, None]
-    assert np.allclose(result, expected, rtol=1e-4)
+    assert np.allclose(result, expected, atol=1e-4)
     assert result.shape[1:] == mat1.shape
     assert result.shape[0] == 5
 
@@ -842,7 +842,7 @@ def test_adds_local_four_point_and_interaction_with_decompressed_q_dimension():
     result = obj1 + interaction
     assert isinstance(result, np.ndarray)
     expected = mat1[None, None, None, ...] + mat2[..., None, None, None]
-    assert np.allclose(result, expected, rtol=1e-4)
+    assert np.allclose(result, expected, atol=1e-4)
     assert result.shape[3:] == mat1.shape
     assert result.shape[:2] == mat2.shape[:2]
 
@@ -879,7 +879,7 @@ def test_converts_to_full_niw_range_correctly_with_no_vn_dimensions():
     result = obj.to_full_niw_range()
     expected = np.conj(np.flip(np.take(mat, np.arange(1, mat.shape[-1]), axis=-1), axis=-1))
     expected = np.concatenate((expected, mat), axis=-1)
-    assert np.allclose(result.mat, expected, rtol=1e-4)
+    assert np.allclose(result.mat, expected, atol=1e-4)
     assert result.full_niw_range is True
 
 
@@ -890,7 +890,7 @@ def test_converts_to_full_niw_range_correctly_with_one_vn_dimension():
     result = obj.to_full_niw_range()
     expected = np.conj(np.flip(np.take(mat, np.arange(1, mat.shape[-2]), axis=-2), axis=(-2, -1)))
     expected = np.concatenate((expected, mat), axis=-2)
-    assert np.allclose(result.mat, expected, rtol=1e-4)
+    assert np.allclose(result.mat, expected, atol=1e-4)
     assert result.full_niw_range is True
 
 
@@ -901,7 +901,7 @@ def test_converts_to_full_niw_range_correctly_with_two_vn_dimensions():
     result = obj.to_full_niw_range()
     expected = np.conj(np.flip(np.take(mat, np.arange(1, mat.shape[-3]), axis=-3), axis=(-3, -2, -1)))
     expected = np.concatenate((expected, mat), axis=-3)
-    assert np.allclose(result.mat, expected, rtol=1e-4)
+    assert np.allclose(result.mat, expected, atol=1e-4)
     assert result.full_niw_range is True
 
 
@@ -910,7 +910,7 @@ def test_handles_already_full_niw_range_without_modification():
     mat = np.random.rand(2, 2, 2, 2, 21, 4, 4) + 1j * np.random.rand(2, 2, 2, 2, 21, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2, full_niw_range=True)
     result = obj.to_full_niw_range()
-    assert np.allclose(result.mat, mat, rtol=1e-4)
+    assert np.allclose(result.mat, mat, atol=1e-4)
     assert result.full_niw_range is True
 
 
@@ -1045,7 +1045,7 @@ def test_neg_dunder_calls_neg():
     with patch.object(LocalFourPoint, "__neg__", wraps=obj.__neg__) as mock_neg:
         result = -obj
         mock_neg.assert_called()
-        assert np.allclose(result.mat, -obj.mat, rtol=1e-4)
+        assert np.allclose(result.mat, -obj.mat, atol=1e-4)
 
 
 @pytest.mark.parametrize("num_vn_dimensions", [0, 1, 2])
@@ -1057,7 +1057,7 @@ def test_creates_bosonic_dimension_when_not_present(num_vn_dimensions):
     result = obj.create_wn_dimension()
     assert result.num_wn_dimensions == 1
     assert result.mat.shape == (2,) * 4 + (1,) + (4,) * num_vn_dimensions
-    assert np.allclose(result.mat, np.expand_dims(mat, axis=-(num_vn_dimensions + 1)), rtol=1e-4)
+    assert np.allclose(result.mat, np.expand_dims(mat, axis=-(num_vn_dimensions + 1)), atol=1e-4)
 
 
 @pytest.mark.parametrize("num_vn_dimensions", [0, 1, 2])
@@ -1079,7 +1079,7 @@ def test_removes_bosonic_dimension_correctly(num_vn_dimensions):
     result = obj.take_first_wn()
     assert result.num_wn_dimensions == 0
     assert result.mat.shape == (2,) * 4 + (4,) * num_vn_dimensions
-    assert np.allclose(result.mat, np.take(mat, 0, axis=-(num_vn_dimensions + 1)), rtol=1e-4)
+    assert np.allclose(result.mat, np.take(mat, 0, axis=-(num_vn_dimensions + 1)), atol=1e-4)
 
 
 @pytest.mark.parametrize("num_vn_dimensions", [0, 1, 2])
@@ -1102,17 +1102,17 @@ def test_pads_with_u_correctly(niv_pad):
     result = obj.pad_with_u(u, niv_pad)
     assert result.mat.shape == (2, 2, 2, 2, 11, 2 * niv_pad, 2 * niv_pad)
     assert result.original_shape == result.mat.shape
-    assert np.allclose(result.mat[..., niv_pad - 4 : niv_pad + 4, niv_pad - 4 : niv_pad + 4], mat, rtol=1e-4)
+    assert np.allclose(result.mat[..., niv_pad - 4 : niv_pad + 4, niv_pad - 4 : niv_pad + 4], mat, atol=1e-4)
 
-    assert np.allclose(result.mat[..., : niv_pad - 4, :], u_mat[..., None, None, None], rtol=1e-4)
-    assert np.allclose(result.mat[..., : niv_pad - 4], u_mat[..., None, None, None], rtol=1e-4)
-    assert np.allclose(result.mat[..., niv_pad + 4 :, :], u_mat[..., None, None, None], rtol=1e-4)
-    assert np.allclose(result.mat[..., niv_pad + 4 :], u_mat[..., None, None, None], rtol=1e-4)
+    assert np.allclose(result.mat[..., : niv_pad - 4, :], u_mat[..., None, None, None], atol=1e-4)
+    assert np.allclose(result.mat[..., : niv_pad - 4], u_mat[..., None, None, None], atol=1e-4)
+    assert np.allclose(result.mat[..., niv_pad + 4 :, :], u_mat[..., None, None, None], atol=1e-4)
+    assert np.allclose(result.mat[..., niv_pad + 4 :], u_mat[..., None, None, None], atol=1e-4)
 
-    assert np.allclose(result.mat[..., niv_pad + 4 :, : niv_pad - 4], u_mat[..., None, None, None], rtol=1e-4)
-    assert np.allclose(result.mat[..., : niv_pad - 4, niv_pad + 4 :], u_mat[..., None, None, None], rtol=1e-4)
-    assert np.allclose(result.mat[..., : niv_pad - 4, : niv_pad - 4], u_mat[..., None, None, None], rtol=1e-4)
-    assert np.allclose(result.mat[..., niv_pad + 4 :, niv_pad + 4 :], u_mat[..., None, None, None], rtol=1e-4)
+    assert np.allclose(result.mat[..., niv_pad + 4 :, : niv_pad - 4], u_mat[..., None, None, None], atol=1e-4)
+    assert np.allclose(result.mat[..., : niv_pad - 4, niv_pad + 4 :], u_mat[..., None, None, None], atol=1e-4)
+    assert np.allclose(result.mat[..., : niv_pad - 4, : niv_pad - 4], u_mat[..., None, None, None], atol=1e-4)
+    assert np.allclose(result.mat[..., niv_pad + 4 :, niv_pad + 4 :], u_mat[..., None, None, None], atol=1e-4)
 
 
 @pytest.mark.parametrize("niv", [5, 10, 15])
@@ -1123,7 +1123,7 @@ def test_does_not_pad_when_niv_pad_is_less_or_equal(niv):
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     u = LocalInteraction(u_mat)
     result = obj.pad_with_u(u, niv)
-    assert np.allclose(result.mat, mat, rtol=1e-4)
+    assert np.allclose(result.mat, mat, atol=1e-4)
     assert result.mat.shape == mat.shape
 
 
@@ -1145,7 +1145,7 @@ def test_pad_with_u_does_not_mutate_self():
     u = LocalInteraction(np.random.rand(2, 2, 2, 2))
     obj.pad_with_u(u, 8)
     assert obj.mat.shape == (2, 2, 2, 2, 5, 8, 8)
-    assert np.allclose(obj.mat, mat, rtol=1e-4)  # source array left untouched
+    assert np.allclose(obj.mat, mat, atol=1e-4)  # source array left untouched
 
 
 def test_symmetrize_orbitals_already_symmetrized():
@@ -1241,3 +1241,135 @@ def test_identity_like_matches_its_own_operand_shape():
     ident = LocalFourPoint.identity_like(magn)
     result = ident + magn  # must not raise on shape mismatch
     assert result.niv == magn.niv
+
+
+def _compound_product_reference(mat1: np.ndarray, mat2: np.ndarray, notation: FrequencyNotation) -> np.ndarray:
+    """Compound-space matrix product of two full-index tensors [o,o,o,o,v,v'] in the given frequency notation
+    (ph: rows {1,2,v}, cols {4,3,v'}; pp: rows {1,3,v}, cols {4,2,v'})."""
+    dim = mat1.shape[0] * mat1.shape[1] * mat1.shape[-1]
+    order = (0, 1, 4, 3, 2, 5) if notation == FrequencyNotation.PH else (0, 2, 4, 3, 1, 5)
+    compound_shape = tuple(np.array(mat1.shape)[list(order)])
+    prod = np.transpose(mat1, order).reshape(dim, dim) @ np.transpose(mat2, order).reshape(dim, dim)
+    return np.transpose(prod.reshape(compound_shape), np.argsort(order))
+
+
+def _extend_to_vn_diagonal(mat: np.ndarray) -> np.ndarray:
+    """Extends a full-index tensor [o,o,o,o,v] (or [o,o,o,o] for none) to [o,o,o,o,v,v] with a diagonal (constant)
+    fermionic frequency structure."""
+    n = mat.shape[-1] if mat.ndim == 5 else 1
+    extended = np.zeros(mat.shape[:4] + (n, n) if mat.ndim == 5 else mat.shape + (1, 1), dtype=mat.dtype)
+    idx = np.arange(n)
+    extended[..., idx, idx] = mat if mat.ndim == 5 else mat[..., None]
+    return extended
+
+
+@pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
+def test_matmul_propagates_frequency_notation_and_compound_pairing(notation):
+    """Matmul contracts in the compound space of the operands' notation and the result carries the frequency
+    notation of self, so pp results unravel with the acbd back-permute."""
+    rng = np.random.default_rng(12)
+    o, niv = 2, 3
+    shape = (o, o, o, o, 1, 2 * niv, 2 * niv)
+    mat1 = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    mat2 = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    x = LocalFourPoint(mat1.copy(), SpinChannel.DENS, 1, 2, True, True, notation)
+    y = LocalFourPoint(mat2.copy(), SpinChannel.DENS, 1, 2, True, True, notation)
+    z = x @ y
+    ref = _compound_product_reference(
+        mat1[:, :, :, :, 0].astype(np.complex64), mat2[:, :, :, :, 0].astype(np.complex64), notation
+    )
+    assert z.frequency_notation == notation
+    assert np.allclose(z.mat[:, :, :, :, 0], ref, atol=1e-4)
+
+
+@pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
+def test_matmul_mixed_vn_respects_frequency_notation(notation):
+    """The memory-saving 2vn @ 1vn matmul branch contracts with the notation's orbital pairing (the 1vn operand
+    acts nu-diagonally on the result's second frequency) and the result carries the frequency notation of self."""
+    rng = np.random.default_rng(14)
+    o, niv = 2, 3
+    shape2 = (o, o, o, o, 1, 2 * niv, 2 * niv)
+    shape1 = (o, o, o, o, 1, 2 * niv)
+    mat2v = rng.standard_normal(shape2) + 1j * rng.standard_normal(shape2)
+    mat1v = rng.standard_normal(shape1) + 1j * rng.standard_normal(shape1)
+    x = LocalFourPoint(mat2v.copy(), SpinChannel.DENS, 1, 2, True, True, notation)
+    y = LocalFourPoint(mat1v.copy(), SpinChannel.DENS, 1, 1, True, True, notation)
+    z = x @ y
+    ref = _compound_product_reference(
+        mat2v[:, :, :, :, 0].astype(np.complex64),
+        _extend_to_vn_diagonal(mat1v[:, :, :, :, 0].astype(np.complex64)),
+        notation,
+    )
+    assert z.frequency_notation == notation
+    assert z.num_vn_dimensions == 2
+    assert np.allclose(z.mat[:, :, :, :, 0], ref, atol=1e-4)
+
+
+@pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
+def test_matmul_with_interaction_respects_frequency_notation(notation):
+    """4pt @ LocalInteraction (and the reversed order) contracts the frequency-constant bare interaction with the
+    notation's orbital pairing and keeps the frequency notation of the four-point operand."""
+    rng = np.random.default_rng(15)
+    o, niv = 2, 3
+    shape = (o, o, o, o, 1, 2 * niv, 2 * niv)
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    umat = rng.standard_normal((o, o, o, o)) + 1j * rng.standard_normal((o, o, o, o))
+    x = LocalFourPoint(mat.copy(), SpinChannel.DENS, 1, 2, True, True, notation)
+    u = LocalInteraction(umat.copy())
+    u_ext = _extend_to_vn_diagonal(np.broadcast_to(umat[..., None], (o, o, o, o, 2 * niv)).astype(np.complex64))
+    ref_left = _compound_product_reference(mat[:, :, :, :, 0].astype(np.complex64), u_ext, notation)
+    ref_right = _compound_product_reference(u_ext, mat[:, :, :, :, 0].astype(np.complex64), notation)
+    z_left = x @ u
+    z_right = u @ x
+    assert z_left.frequency_notation == notation
+    assert z_right.frequency_notation == notation
+    assert np.allclose(z_left.mat[:, :, :, :, 0], ref_left, atol=1e-4)
+    assert np.allclose(z_right.mat[:, :, :, :, 0], ref_right, atol=1e-4)
+
+
+def test_matmul_rejects_mismatched_frequency_notations():
+    """Multiplying two four-point objects living in different frequency notations raises."""
+    mat = np.random.rand(2, 2, 2, 2, 1, 6, 6) + 1j * np.random.rand(2, 2, 2, 2, 1, 6, 6)
+    x = LocalFourPoint(mat.copy(), SpinChannel.DENS, 1, 2, True, True, FrequencyNotation.PP)
+    y = LocalFourPoint(mat.copy(), SpinChannel.DENS, 1, 2, True, True, FrequencyNotation.PH)
+    with pytest.raises(ValueError):
+        x @ y
+
+
+def test_pow_pp_squares_in_pp_compound_space_without_explicit_identity():
+    """obj ** 2 on a pp object squares in the pp compound space (rows {1,3,v}, cols {4,2,v'}) and keeps the PP
+    notation, with the matching identity derived internally via identity_like."""
+    rng = np.random.default_rng(18)
+    o, niv = 2, 3
+    shape = (o, o, o, o, 1, 2 * niv, 2 * niv)
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    obj = LocalFourPoint(mat.copy(), SpinChannel.DENS, 1, 2, True, True, FrequencyNotation.PP)
+    result = obj**2
+    mat64 = mat[:, :, :, :, 0].astype(np.complex64)
+    ref = _compound_product_reference(mat64, mat64, FrequencyNotation.PP)
+    assert result.frequency_notation == FrequencyNotation.PP
+    assert np.allclose(result.mat[:, :, :, :, 0], ref, atol=1e-4)
+
+
+def test_pow_zero_returns_identity_in_own_frequency_notation():
+    """obj ** 0 without an explicit identity returns the compound-space identity carrying the object's frequency
+    notation (the identity tensor delta_14 delta_23 delta_vv' is the same for both notations)."""
+    rng = np.random.default_rng(19)
+    o, niv = 2, 3
+    shape = (o, o, o, o, 1, 2 * niv, 2 * niv)
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    obj = LocalFourPoint(mat, SpinChannel.DENS, 1, 2, True, True, FrequencyNotation.PP)
+    result = obj**0
+    expected = np.einsum("ad,bc,vp->abcdvp", np.eye(o), np.eye(o), np.eye(2 * niv))
+    assert result.frequency_notation == FrequencyNotation.PP
+    assert np.allclose(result.mat[:, :, :, :, 0], expected, atol=1e-6)
+
+
+def test_pow_rejects_identity_with_mismatched_frequency_notation():
+    """pow with an explicitly passed identity in a different frequency notation raises instead of silently
+    returning or contracting a mislabeled object."""
+    mat = np.random.rand(2, 2, 2, 2, 1, 6, 6) + 1j * np.random.rand(2, 2, 2, 2, 1, 6, 6)
+    obj = LocalFourPoint(mat, SpinChannel.DENS, 1, 2, True, True, FrequencyNotation.PP)
+    identity_ph = LocalFourPoint.identity(2, 0, 3, num_vn_dimensions=2, full_niw_range=True)
+    with pytest.raises(ValueError):
+        obj.pow(0, identity_ph)

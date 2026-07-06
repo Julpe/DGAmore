@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 """
@@ -57,7 +57,6 @@ matrices and will not be detected. Re-grid H onto the lattice basis first.
 import numpy as np
 import itertools
 import string
-
 
 # ============================================================================
 # Spatial ops on a discrete reciprocal grid
@@ -475,7 +474,7 @@ def _discover_symmetries(H, atol, verbose=False):
     M_all = _enumerate_integer_matrices()
     M_candidates = [M for M in M_all if _M_preserves_grid(M, nk)]
 
-    # Dedupe M's by their grid action — when N_i = 1 for some axis, many M's
+    # Dedupe M's by their grid action - when N_i = 1 for some axis, many M's
     # produce the same k-grid index map. Use a tuple of (hash, length) plus
     # confirmation against stored representatives to avoid keeping nktot-sized
     # bytes for every distinct M (which costs ~nktot bytes per entry; for cubic
@@ -566,7 +565,7 @@ def _discover_symmetries(H, atol, verbose=False):
                 for conj in (False, True):
                     # Quick dedup: if for this (idx_q, sigma, conj) we already have
                     # an op, only one U is enough (the U is determined up to the
-                    # group's commutant — finding more here is redundant for the IBZ).
+                    # group's commutant - finding more here is redundant for the IBZ).
                     # But we keep distinct U's because they're truly different group elts.
                     if Hg is None:
                         Hg = H_flat[idx_q].reshape(nx, ny, nz, norb, norb)
@@ -952,7 +951,7 @@ def get_symmetry_reduction(H, atol=1e-8, verbose=False, include_antiunitary=Fals
         # For every FBZ point k (in (nx,ny,nz) layout):
         #   T_full(k) = sigma_k * U_k T(rep(k))^[*conj_k] U_k^dagger  (per orbital index pair)
         # where rep(k) is given by pos_in_irrk[k_flat] -> position in irrk_ind.
-        "pos_in_irrk": pos_in_irrk,  # shape (nktot,), int — irrk_inv equivalent
+        "pos_in_irrk": pos_in_irrk,  # shape (nktot,), int - irrk_inv equivalent
         "Us": Us,  # shape (nx, ny, nz, norb, norb), complex
         "sigmas": sigmas,  # shape (nx, ny, nz), float (+/-1)
         "conjs": conjs,  # shape (nx, ny, nz), bool
@@ -971,15 +970,15 @@ def apply_auto_orbital_transform(
     axis enumerates k-points (or a contiguous slice thereof).
 
     The transformation follows the operator ordering
-    :math:`G_{abcd} := \langle T[c_a c^\dagger_b c_c c^\dagger_d]\rangle`, with annihilation indices (positions 1, 3)
+    :math:`G_{1234} := \langle T[c_1 c^\dagger_2 c_3 c^\dagger_4]\rangle`, with annihilation indices (positions 1, 3)
     transforming with :math:`U` and creation indices (positions 2, 4) with :math:`U^\dagger`, combined with
     :math:`\sigma` and conjugation:
 
     .. math::
 
-        M_{ab}(k)   &= \sigma_k\, U_{aa'} [M_{a'b'}(k_{\mathrm{rep}})]^{[*\mathrm{conj}_k]} U^\dagger_{b'b} \\
-        M_{abcd}(k) &= \sigma_k^2\, U_{aa'} [M_{a'b'c'd'}(k_{\mathrm{rep}})]^{[*\mathrm{conj}_k]} U^\dagger_{b'b}
-                       U_{cc'} U^\dagger_{d'd}
+        M_{12}(k)   &= \sigma_k\, U_{1a} [M_{ab}(k_{\mathrm{rep}})]^{[*\mathrm{conj}_k]} U^\dagger_{b2} \\
+        M_{1234}(k) &= \sigma_k^2\, U_{1a} [M_{abcd}(k_{\mathrm{rep}})]^{[*\mathrm{conj}_k]} U^\dagger_{b2}
+                       U_{3c} U^\dagger_{d4}
 
     Since :math:`\sigma_k = \pm 1`, :math:`\sigma_k^2 = 1`; the 4-index case effectively has no sign factor, which is
     the correct physics for vertex quantities under particle-hole-like antisymmetries.

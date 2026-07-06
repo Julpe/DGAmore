@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
 #
-# DGAmore — Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
+# DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 from copy import deepcopy
@@ -104,7 +104,7 @@ def test_linear_mixing_basic():
     with patch_config(strategy="linear", mixing=0.5):
         result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)
 
-    np.testing.assert_allclose(result.mat, 1.0, atol=1e-5)
+    assert np.allclose(result.mat, 1.0, atol=1e-5)
 
 
 def test_linear_mixing_alpha_zero():
@@ -116,7 +116,7 @@ def test_linear_mixing_alpha_zero():
     with patch_config(strategy="linear", mixing=0.0):
         result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)
 
-    np.testing.assert_allclose(result.mat, 1.0, atol=1e-5)
+    assert np.allclose(result.mat, 1.0, atol=1e-5)
 
 
 def test_linear_mixing_alpha_one():
@@ -128,7 +128,7 @@ def test_linear_mixing_alpha_one():
     with patch_config(strategy="linear", mixing=1.0):
         result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)
 
-    np.testing.assert_allclose(result.mat, 5.0, atol=1e-5)
+    assert np.allclose(result.mat, 5.0, atol=1e-5)
 
 
 def test_linear_mixing_complex():
@@ -140,7 +140,7 @@ def test_linear_mixing_complex():
     with patch_config(strategy="linear", mixing=0.5):
         result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=1)
 
-    np.testing.assert_allclose(result.mat, 1.0 + 1.0j, atol=1e-5)
+    assert np.allclose(result.mat, 1.0 + 1.0j, atol=1e-5)
 
 
 def test_linear_mixing_returns_self_energy_instance():
@@ -164,7 +164,7 @@ def test_pulay_falls_back_to_linear_when_iter_too_small():
     with patch_config(strategy="pulay", mixing=0.5, n_hist=5):
         result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=3)
 
-    np.testing.assert_allclose(result.mat, 1.0, atol=1e-5)
+    assert np.allclose(result.mat, 1.0, atol=1e-5)
 
 
 def test_pulay_returns_self_energy_instance():
@@ -190,7 +190,7 @@ def test_pulay_converged_fixed_point():
     result = run_pulay(sigma_new, sigma_old, sigma_dmft, file_sigmas)
 
     niv_dmft = sigma_new.mat.shape[-1] // 2
-    np.testing.assert_allclose(
+    assert np.allclose(
         result.mat[..., niv_dmft - NIV_CORE : niv_dmft + NIV_CORE],
         np.full_like(result.mat[..., niv_dmft - NIV_CORE : niv_dmft + NIV_CORE], value),
         atol=1e-4,
@@ -219,7 +219,7 @@ def test_pulay_does_not_mutate_sigma_old():
     original_mat = sigma_old.mat.copy()
     run_pulay(sigma_new, sigma_old, sigma_dmft, file_sigmas)
 
-    np.testing.assert_array_equal(sigma_old.mat, original_mat)
+    assert np.array_equal(sigma_old.mat, original_mat)
 
 
 def test_pulay_tails_come_from_sigma_new():
@@ -232,8 +232,8 @@ def test_pulay_tails_come_from_sigma_new():
     result = run_pulay(sigma_new, sigma_old, sigma_dmft, file_sigmas)
 
     niv_dmft = sigma_new.mat.shape[-1] // 2
-    np.testing.assert_allclose(result.mat[..., : niv_dmft - NIV_CORE], 2.0, atol=1e-5)
-    np.testing.assert_allclose(result.mat[..., niv_dmft + NIV_CORE :], 2.0, atol=1e-5)
+    assert np.allclose(result.mat[..., : niv_dmft - NIV_CORE], 2.0, atol=1e-5)
+    assert np.allclose(result.mat[..., niv_dmft + NIV_CORE :], 2.0, atol=1e-5)
 
 
 def test_pulay_result_shape_matches_sigma_new():
@@ -271,7 +271,7 @@ def test_anderson_falls_back_to_linear_when_iter_too_small():
     with patch_config(strategy="anderson", mixing=0.5, n_hist=5):
         result = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=3)
 
-    np.testing.assert_allclose(result.mat, 1.0, atol=1e-5)
+    assert np.allclose(result.mat, 1.0, atol=1e-5)
 
 
 def test_anderson_returns_self_energy_instance():
@@ -297,7 +297,7 @@ def test_anderson_converged_fixed_point():
     result = run_anderson(sigma_new, sigma_old, sigma_dmft, file_sigmas)
 
     niv_dmft = sigma_new.mat.shape[-1] // 2
-    np.testing.assert_allclose(
+    assert np.allclose(
         result.mat[..., niv_dmft - NIV_CORE : niv_dmft + NIV_CORE],
         np.full_like(result.mat[..., niv_dmft - NIV_CORE : niv_dmft + NIV_CORE], value),
         atol=1e-4,
@@ -326,7 +326,7 @@ def test_anderson_does_not_mutate_sigma_old():
     original_mat = sigma_old.mat.copy()
     run_anderson(sigma_new, sigma_old, sigma_dmft, file_sigmas)
 
-    np.testing.assert_array_equal(sigma_old.mat, original_mat)
+    assert np.array_equal(sigma_old.mat, original_mat)
 
 
 def test_anderson_tails_come_from_sigma_new():
@@ -339,8 +339,8 @@ def test_anderson_tails_come_from_sigma_new():
     result = run_anderson(sigma_new, sigma_old, sigma_dmft, file_sigmas)
 
     niv_dmft = sigma_new.mat.shape[-1] // 2
-    np.testing.assert_allclose(result.mat[..., : niv_dmft - NIV_CORE], 2.0, atol=1e-5)
-    np.testing.assert_allclose(result.mat[..., niv_dmft + NIV_CORE :], 2.0, atol=1e-5)
+    assert np.allclose(result.mat[..., : niv_dmft - NIV_CORE], 2.0, atol=1e-5)
+    assert np.allclose(result.mat[..., niv_dmft + NIV_CORE :], 2.0, atol=1e-5)
 
 
 def test_anderson_result_shape_matches_sigma_new():
@@ -403,3 +403,20 @@ def test_anderson_history_ordering_matters():
     assert not np.allclose(
         result_forward.mat[..., sl], result_reversed.mat[..., sl], atol=1e-6
     ), "reversed history should give a different Anderson result"
+
+
+def test_history_cap_zero_falls_back_to_linear():
+    """With history_cap=0 (the mixing-history reset right after the susceptibility-restriction release) the
+    accelerated schemes must ignore the on-file history and reproduce the plain linear-mixing result."""
+    nk_tot = int(np.prod(NK))
+    file_sigmas = [make_sigma_mat(v) for v in (0.7, 0.9, 1.1)]
+    with (
+        patch_config(strategy="anderson", mixing=0.5, n_hist=3, niv_core=NIV_CORE, nk_tot=nk_tot),
+        patch("dgamore.nonlocal_sde.read_last_n_sigmas_from_files", return_value=file_sigmas),
+    ):
+        capped = apply_mixing_strategy(
+            make_sigma(2.0 + 1.0j), make_sigma(1.0), make_sigma(0.5), current_iter=10, history_cap=0
+        )
+    with patch_config(strategy="linear", mixing=0.5):
+        expected = apply_mixing_strategy(make_sigma(2.0 + 1.0j), make_sigma(1.0), make_sigma(0.5), current_iter=10)
+    assert np.allclose(capped.mat, expected.mat, atol=1e-12)
