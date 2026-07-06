@@ -13,4 +13,4 @@ h5py~=3.16
 pandas~=2.2
 matplotlib~=3.10
 multimethod~=2.0
-ruamel.yaml~=0.18
+ruamel.yaml~=0.19
