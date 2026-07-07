@@ -420,3 +420,27 @@ def test_history_cap_zero_falls_back_to_linear():
     with patch_config(strategy="linear", mixing=0.5):
         expected = apply_mixing_strategy(make_sigma(2.0 + 1.0j), make_sigma(1.0), make_sigma(0.5), current_iter=10)
     assert np.allclose(capped.mat, expected.mat, atol=1e-12)
+
+
+def test_in_memory_history_matches_file_history_for_pulay_and_anderson():
+    """apply_mixing_strategy with an in-memory sigma_history produces bit-identical results to the file-read path
+    on the same history arrays, for both accelerated schemes (the rank-0 ring buffer replaces the per-rank file
+    re-reads without changing a single value)."""
+    rng = np.random.default_rng(91)
+    nk_tot = int(np.prod(NK))
+    shape = (nk_tot, 1, 1, 2 * NIV_CORE)
+    file_sigmas = [rng.standard_normal(shape) + 1j * rng.standard_normal(shape) for _ in range(3)]
+    make = lambda seed: SelfEnergy(
+        (np.random.default_rng(seed).standard_normal((*NK, 1, 1, 2 * NIV_CORE + 4)) * (1 + 1j)).astype(np.complex64),
+        nk=NK,
+        calc_smom=False,
+        beta=10.0,
+    )
+    for runner, strategy in ((run_pulay, "pulay"), (run_anderson, "anderson")):
+        ref = runner(make(1), make(2), make(3), file_sigmas)
+        with (
+            patch_config(strategy=strategy, mixing=0.5, n_hist=3, niv_core=NIV_CORE, nk_tot=nk_tot),
+            patch("dgamore.nonlocal_sde.read_last_n_sigmas_from_files", side_effect=AssertionError("file read!")),
+        ):
+            out = apply_mixing_strategy(make(1), make(2), make(3), current_iter=10, sigma_history=list(file_sigmas))
+        assert np.array_equal(out.mat, ref.mat)

@@ -984,14 +984,14 @@ def test_sub_method_and_dunder():
     ):
         _ = obj1.sub(obj2)
         mock_sub.assert_called_once_with(obj2)
-        mock_add.assert_called_once_with(obj2, subtract=True)
+        mock_add.assert_called_once_with(obj2, subtract=True, copy=True)
     with (
         patch.object(LocalFourPoint, "sub", wraps=obj1.sub) as mock_sub,
         patch.object(LocalFourPoint, "_add", wraps=obj1._add) as mock_add,
     ):
         _ = obj1 - obj2
         mock_sub.assert_called_once_with(obj2)
-        mock_add.assert_called_once_with(obj2, subtract=True)
+        mock_add.assert_called_once_with(obj2, subtract=True, copy=True)
 
 
 def test_sub_operator():
@@ -1373,3 +1373,88 @@ def test_pow_rejects_identity_with_mismatched_frequency_notation():
     identity_ph = LocalFourPoint.identity(2, 0, 3, num_vn_dimensions=2, full_niw_range=True)
     with pytest.raises(ValueError):
         obj.pow(0, identity_ph)
+
+
+def test_change_frequency_notation_ph_to_pp_w0_trims_unread_bosonic_window():
+    """The w0 pp map samples only |w| <= 2*min(niw//2, niv) ph slices, so the trimmed-window conversion must equal
+    the untrimmed reference gather bit-for-bit, for half- and full-range inputs and both parities of the window."""
+    from dgamore.matsubara_frequencies import MFHelper
+
+    rng = np.random.default_rng(41)
+    o = 2
+    for niw, niv, full in [(9, 2, False), (9, 2, True), (8, 2, False), (5, 3, False)]:
+        w_len = 2 * niw + 1 if full else niw + 1
+        shape = (o, o, o, o, w_len, 2 * niv, 2 * niv)
+        mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+        obj = LocalFourPoint(mat, SpinChannel.DENS, 1, 2, full, True)
+        ref = obj.copy().to_full_niw_range()
+        iw_pp, iv_pp, ivp_pp = MFHelper.get_frequencies_for_ph_to_pp_w0_channel_conversion(ref.niw, ref.niv)
+        ref_mat = ref.mat[..., iw_pp, iv_pp, ivp_pp][..., None, :, :]
+        out = obj.change_frequency_notation_ph_to_pp_w0()
+        assert out.frequency_notation == FrequencyNotation.PP
+        assert np.array_equal(out.mat, ref_mat)
+
+
+def _half_block(rng, num_vn=2, o=2, niw=3, niv=3, channel=SpinChannel.NONE):
+    """Builds a half-niw LocalFourPoint [o, o, o, o, niw + 1, (2*niv,) * num_vn] with random complex entries."""
+    shape = (o, o, o, o, niw + 1) + (2 * niv,) * num_vn
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    return LocalFourPoint(mat, channel, 1, num_vn, False, True, FrequencyNotation.PH)
+
+
+def test_add_inplace_local_fourpoint_matches_copy():
+    """add/sub(other, copy=False) accumulate into self in place, bit-equal to the copying branch, return self."""
+    rng = np.random.default_rng(61)
+    a, b = _half_block(rng, channel=SpinChannel.DENS), _half_block(rng, channel=SpinChannel.MAGN)
+    ref_add = a.copy().add(b)
+    a2 = a.copy()
+    res = a2.add(b, copy=False)
+    assert res is a2
+    assert np.array_equal(a2.mat, ref_add.mat)
+    ref_sub = a.copy().sub(b)
+    a3 = a.copy()
+    a3.sub(b, copy=False)
+    assert np.array_equal(a3.mat, ref_sub.mat)
+
+
+def test_add_inplace_local_interaction_matches_copy():
+    """add(u_loc, copy=False) broadcast-accumulates the interaction in place, bit-equal to the copying branch."""
+    rng = np.random.default_rng(62)
+    a = _half_block(rng, channel=SpinChannel.DENS)
+    u = LocalInteraction(rng.standard_normal((2,) * 4), SpinChannel.DENS)
+    ref = a.copy().add(u)
+    res = a.add(u, copy=False)
+    assert res is a
+    assert np.array_equal(a.mat, ref.mat)
+
+
+def test_add_inplace_rejects_extension_scalar_and_zero_vn():
+    """copy=False raises for scalar operands, for diagonal extension and for 0-vn broadcasting."""
+    rng = np.random.default_rng(63)
+    a2, b1 = _half_block(rng, num_vn=2), _half_block(rng, num_vn=1)
+    b0 = _half_block(rng, num_vn=0)
+    with pytest.raises(NotImplementedError):
+        a2.add(2.0, copy=False)
+    with pytest.raises(ValueError):
+        a2.add(b1, copy=False)
+    with pytest.raises(ValueError):
+        a2.add(b0, copy=False)
+
+
+def test_invert_one_vn_keeps_single_fermionic_dimension_and_matches_dense_reference():
+    """The ph 1-vn invert inverts per (w, v) orbital block and keeps one fermionic dimension; its values must equal
+    the fermionic diagonal of the former dense route (diagonal extension + compound inversion), whose off-diagonal
+    blocks are exactly zero for a block-diagonal matrix. Inverting twice returns the original."""
+    rng = np.random.default_rng(97)
+    o, nw, niv = 3, 4, 3
+    shape = (o, o, o, o, nw, 2 * niv)
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    mat[..., np.arange(o)[:, None], np.arange(o)[None, :], np.arange(o)[:, None], np.arange(o)[None, :], :, :] += 4.0
+    obj = LocalFourPoint(mat, SpinChannel.DENS, 1, 1, False, True)
+
+    ref = obj.copy().extend_vn_to_diagonal().invert().take_vn_diagonal()
+    out = obj.invert()
+    assert out.num_vn_dimensions == 1
+    assert out.mat.shape == obj.mat.shape
+    assert np.allclose(out.mat, ref.mat, atol=1e-4)
+    assert np.allclose(out.invert().mat, obj.mat, atol=1e-4)

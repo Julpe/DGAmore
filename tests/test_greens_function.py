@@ -253,3 +253,31 @@ def test_update_mu_with_logger_logs_on_failure():
     out = update_mu(mu, 1e9, ek, sig.mat, beta, sig.smom[0], logger=logger)
     assert out == mu
     logger.debug.assert_called_once()
+
+
+def test_model_epot_chunked_matches_unchunked_reference(monkeypatch):
+    """_model_epot evaluated with a tiny chunk budget (forcing many frequency chunks) equals the single-pass
+    reference formula - the analytic 1/v^2 tail must not change when the [k, band, v] temporaries are bounded."""
+    import dgamore.greens_function as gf_module
+    from dgamore.matsubara_frequencies import MFHelper
+
+    nk, nb, niv, beta, mu = (2, 2, 1), 2, 6, 5.0, 0.3
+    rng = np.random.default_rng(2)
+    ek = rng.standard_normal((*nk, nb, nb))
+    ek = 0.5 * (ek + ek.swapaxes(-1, -2))
+    sig_mat = rng.standard_normal((int(np.prod(nk)), nb, nb, 2 * niv)) + 1j * rng.standard_normal(
+        (int(np.prod(nk)), nb, nb, 2 * niv)
+    )
+    sig = SelfEnergy(sig_mat, nk=nk, has_compressed_q_dimension=True, beta=beta)
+    g = GreensFunction.get_g_full(sig, mu, ek, beta)
+    smom0, smom1 = sig.smom
+
+    h = (ek + smom0[None, None, None]).reshape(int(np.prod(nk)), nb, nb)
+    lam, u = np.linalg.eig(h)
+    smom1_rot = np.linalg.inv(u) @ smom1 @ u
+    iv = 1j * MFHelper.vn(37, beta)
+    g_diag = 1.0 / (iv[None, :] + mu - lam[:, :, None])
+    ref = (-np.einsum("kii,kiv->kv", smom1_rot, g_diag) / iv[None, :]).sum().real / beta
+
+    monkeypatch.setattr(gf_module, "_MODEL_EPOT_CHUNK_ELEMENTS", 50)
+    assert np.allclose(g._model_epot(smom0, smom1, 37, beta), ref, atol=1e-10)

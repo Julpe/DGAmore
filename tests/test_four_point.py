@@ -210,7 +210,7 @@ def test_add_copy_true_is_nondestructive(rng):
 
 
 def test_add_inplace_rejects_non_fourpoint(rng):
-    """copy=False is only defined between two FourPoints; a scalar/array/interaction operand raises."""
+    """copy=False is only defined for FourPoint and (Local)Interaction operands; a scalar operand raises."""
     a = _kernel_block(rng, SpinChannel.DENS)
     with pytest.raises(NotImplementedError):
         a.add(2.0, copy=False)
@@ -234,6 +234,101 @@ def test_add_inplace_reverts_other_niw_range(rng):
     a.add(b, copy=False)
     assert np.array_equal(a.mat, ref.mat)
     assert b.full_niw_range
+
+
+def _channel_interactions(rng, o=2, qtot=16, nq=(4, 4, 1)):
+    """Builds a random LocalInteraction [o, o, o, o] and Interaction [q, o, o, o, o] pair (compressed q)."""
+    u_mat = rng.standard_normal((o,) * 4)
+    v_mat = rng.standard_normal((qtot,) + (o,) * 4)
+    return LocalInteraction(u_mat, SpinChannel.DENS), Interaction(v_mat, SpinChannel.DENS, nq, True)
+
+
+def test_sub_inplace_with_local_interaction_matches_copy(rng):
+    """sub(u_loc, copy=False) broadcast-subtracts the local interaction into self in place, bit-equal to the
+    copying branch, and returns self."""
+    a, ref = _kernel_block(rng, SpinChannel.DENS, num_vn=2), None
+    u_loc, _ = _channel_interactions(rng)
+    ref = deepcopy(a).sub(u_loc)
+    out = a.sub(u_loc, copy=False)
+    assert out is a
+    assert np.array_equal(a.mat, ref.mat)
+
+
+def test_add_inplace_with_nonlocal_interaction_matches_copy(rng):
+    """add(v_nonloc, copy=False) broadcast-adds the q-dependent interaction into self in place, bit-equal to the
+    copying branch."""
+    a = _kernel_block(rng, SpinChannel.DENS, num_vn=2)
+    _, v_nonloc = _channel_interactions(rng)
+    ref = deepcopy(a).add(v_nonloc)
+    out = a.add(v_nonloc, copy=False)
+    assert out is a
+    assert np.array_equal(a.mat, ref.mat)
+
+
+def _local_block(rng, num_vn=2, o=2, niw=3, niv=3):
+    """Builds a half-niw LocalFourPoint [o, o, o, o, niw + 1, (2*niv,) * num_vn] with random complex entries."""
+    from dgamore.local_four_point import LocalFourPoint
+
+    shape = (o, o, o, o, niw + 1) + (2 * niv,) * num_vn
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    return LocalFourPoint(mat, SpinChannel.NONE, 1, num_vn, False, True, FrequencyNotation.PH)
+
+
+def test_add_inplace_with_local_fourpoint_matches_copy(rng):
+    """add(local_other, copy=False) broadcast-accumulates a momentum-independent operand into self in place,
+    bit-equal to the copying branch, leaving the operand untouched."""
+    a, b = _kernel_block(rng, SpinChannel.DENS, num_vn=2), _local_block(rng, num_vn=2)
+    b_before = b.mat.copy()
+    ref = deepcopy(a).add(deepcopy(b))
+    out = a.add(b, copy=False)
+    assert out is a
+    assert np.array_equal(a.mat, ref.mat)
+    assert np.array_equal(b.mat, b_before)
+
+
+def test_sub_inplace_with_local_fourpoint_rejects_vn_extension(rng):
+    """copy=False with a 2-vn local operand refuses to diagonally extend a 1-vn self."""
+    a, b = _kernel_block(rng, SpinChannel.DENS, num_vn=1), _local_block(rng, num_vn=2)
+    with pytest.raises(ValueError):
+        a.sub(b, copy=False)
+
+
+def test_add_on_vn_diagonal_matches_extend_and_add(rng):
+    """add_on_vn_diagonal(other, factor) equals extending the 1-vn other to the fermionic diagonal and adding the
+    scaled result, without allocating the extended block; mutates and returns self."""
+    a = _kernel_block(rng, SpinChannel.DENS, num_vn=2)
+    b = _kernel_block(rng, SpinChannel.NONE, num_vn=1)
+    ref = deepcopy(a).add(deepcopy(b).scale(2.5).extend_vn_to_diagonal())
+    out = a.add_on_vn_diagonal(b, factor=2.5)
+    assert out is a
+    assert np.allclose(a.mat, ref.mat, atol=1e-6)
+    assert b.num_vn_dimensions == 1
+
+
+def test_add_on_vn_diagonal_with_local_other_broadcasts_over_q(rng):
+    """A momentum-independent 1-vn LocalFourPoint other is broadcast over the momentum axis of self."""
+    from dgamore.local_four_point import LocalFourPoint
+
+    a = _kernel_block(rng, SpinChannel.DENS, num_vn=2)
+    o, niw, niv = 2, 3, 3
+    b_shape = (o, o, o, o, niw + 1, 2 * niv)
+    b_mat = rng.standard_normal(b_shape) + 1j * rng.standard_normal(b_shape)
+    b = LocalFourPoint(b_mat, SpinChannel.NONE, 1, 1, False, True, FrequencyNotation.PH)
+    ref = deepcopy(a).add(deepcopy(b).extend_vn_to_diagonal())
+    out = a.add_on_vn_diagonal(b)
+    assert out is a
+    assert np.allclose(a.mat, ref.mat, atol=1e-6)
+
+
+def test_add_on_vn_diagonal_rejects_mismatched_operands(rng):
+    """Mismatched vn counts, niw ranges or fermionic box sizes raise instead of silently mis-adding."""
+    a2, b1 = _kernel_block(rng, SpinChannel.DENS, num_vn=2), _kernel_block(rng, SpinChannel.NONE, num_vn=1)
+    with pytest.raises(ValueError):
+        b1.add_on_vn_diagonal(b1)
+    with pytest.raises(ValueError):
+        a2.add_on_vn_diagonal(a2)
+    with pytest.raises(ValueError):
+        a2.add_on_vn_diagonal(deepcopy(b1).to_full_niw_range())
 
 
 def test_add_with_localinteraction_and_interaction(rng):
@@ -661,6 +756,33 @@ def test_invert_num_vn1_per_q_matches_batched_reference(rng):
     assert not result.full_niw_range  # invert returns the half niw range
     assert result.mat.dtype == np.complex64
     assert np.allclose(result.mat, ref_mat)
+
+
+def test_invert_num_vn2_per_q_matches_batched_compound_reference(rng):
+    """The num_vn==2 invert matches a batched np.linalg.inv on the explicit compound layout [q, w, (1, 2, v),
+    (4, 3, v')] for both frequency notations (pp pairs rows (1, 3, v) x cols (4, 2, v') via the acbd permute), and
+    inverting twice returns the original."""
+    nq = (3, 2, 1)
+    qtot, o, niw, niv = 6, 2, 2, 2
+    size = o * o * 2 * niv
+    for notation in (FrequencyNotation.PH, FrequencyNotation.PP):
+        shape = (qtot, o, o, o, o, 2 * niw + 1, 2 * niv, 2 * niv)
+        mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+        fp = FourPoint(mat, SpinChannel.DENS, nq, 1, 2, True, True, True, notation)
+
+        ref = fp.copy().to_half_niw_range()
+        ref_mat = ref.mat if notation == FrequencyNotation.PH else np.einsum("qabcdwvp->qacbdwvp", ref.mat)
+        comp = np.linalg.inv(ref_mat.transpose(0, 5, 1, 2, 6, 4, 3, 7).reshape(qtot, niw + 1, size, size))
+        ref_mat = comp.reshape(qtot, niw + 1, o, o, 2 * niv, o, o, 2 * niv).transpose(0, 2, 3, 6, 5, 1, 4, 7)
+        if notation == FrequencyNotation.PP:
+            ref_mat = np.einsum("qacbdwvp->qabcdwvp", ref_mat)
+
+        result = fp.copy().invert(copy=True)
+        assert not result.full_niw_range and result.mat.dtype == np.complex64
+        assert np.allclose(result.mat, ref_mat, atol=1e-3)
+
+        roundtrip = result.invert(copy=True)
+        assert np.allclose(roundtrip.mat, fp.copy().to_half_niw_range().mat, atol=1e-3)
 
 
 def test_invert_and_sum_methods_agree_on_decompressed_fp(small_fourpoint):

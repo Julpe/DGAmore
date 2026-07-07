@@ -65,12 +65,12 @@ def test_constants():
 
 def test_keys_without_eliashberg():
     """Without Eliashberg the estimator reports the chi0q, chiq_aux and sde branches."""
-    assert set(_peaks(with_eliashberg=False)) == {"chi0q", "chiq_aux", "sde"}
+    assert set(_peaks(with_eliashberg=False)) == {"chi0q", "chiq_aux", "sde", "local"}
 
 
 def test_keys_with_eliashberg():
     """With Eliashberg the estimator adds the fq and lanczos branches."""
-    assert set(_peaks(with_eliashberg=True)) == {"chi0q", "chiq_aux", "sde", "fq", "lanczos"}
+    assert set(_peaks(with_eliashberg=True)) == {"chi0q", "chiq_aux", "sde", "fq", "lanczos", "local"}
 
 
 def test_every_branch_has_positive_baseline_and_off_transient():
@@ -83,18 +83,22 @@ def test_every_branch_has_positive_baseline_and_off_transient():
         assert bp.off_distributed + bp.off_single > 0
 
 
-def test_chi0q_fast_path_is_single_rank_only():
-    """The chi0q fast path is single-rank-only while its lean path is distributed."""
-    bp = _peaks()["chi0q"]
-    assert bp.off_distributed == 0.0 and bp.off_single > 0.0
-    assert bp.on_distributed > 0.0 and bp.on_single == 0.0
+def test_chi0q_fast_path_is_distributed_on_multi_rank_runs():
+    """The chi0q fast path is column-distributed across the ranks on a multi-rank run and falls back to the
+    rank-0 build (a single-rank transient) only when there is one rank; the lean path is always distributed."""
+    multi = _peaks()["chi0q"]
+    assert multi.off_distributed > 0.0 and multi.off_single == 0.0
+    single = _peaks(n_ranks=1)["chi0q"]
+    assert single.off_distributed == 0.0 and single.off_single > 0.0
+    assert multi.on_distributed > 0.0 and multi.on_single == 0.0
 
 
-def test_chiq_aux_off_has_distributed_block_and_single_rank_gather():
-    """The chiq_aux fast path holds a per-rank two-fermion block plus a single-rank full-BZ gather."""
+def test_chiq_aux_off_has_distributed_block_and_no_single_rank_gather():
+    """The chiq_aux fast path holds a per-rank two-fermion block; the irr-to-full-BZ map is always the p2p
+    exchange, so no single-rank full-BZ assembly remains."""
     bp = _peaks()["chiq_aux"]
     assert bp.off_distributed > 0.0  # per-rank two-fermion block
-    assert bp.off_single > 0.0  # full-BZ kernel gather on one rank
+    assert bp.off_single == 0.0
 
 
 def test_lanczos_fast_path_is_single_rank_only():
@@ -104,9 +108,9 @@ def test_lanczos_fast_path_is_single_rank_only():
     assert bp.on_distributed > 0.0 and bp.on_single > 0.0  # lean single: the root rank's full-BZ pp bubble
 
 
-def test_chi0q_single_rank_peak_independent_of_rank_count():
-    """The chi0q single-rank peak (built over the whole irreducible BZ) does not shrink with more ranks."""
-    assert _peaks(n_ranks=2)["chi0q"].off_single == pytest.approx(_peaks(n_ranks=16)["chi0q"].off_single)
+def test_chi0q_distributed_peak_shrinks_with_more_ranks():
+    """The column-distributed chi0q fast-path transient shrinks as the rank count grows."""
+    assert _peaks(n_ranks=16)["chi0q"].off_distributed < _peaks(n_ranks=2)["chi0q"].off_distributed
 
 
 def test_chiq_aux_distributed_block_shrinks_with_more_ranks():
@@ -155,16 +159,19 @@ def test_overhead_scales_everything_linearly():
 
 
 def test_fq_distributed_block_heavier_than_chiq_aux_block():
-    """The fq distributed block is heavier than chiq_aux (3 vs 2 two-fermion blocks per q)."""
+    """The fq distributed block is heavier than chiq_aux (2 vs 1 two-fermion blocks per q)."""
     assert FQ_MATMUL_FACTOR > CHIQ_AUX_INVERT_FACTOR
     peaks = _peaks(with_eliashberg=True)
     assert peaks["fq"].on_distributed > peaks["chiq_aux"].on_distributed
 
 
 def test_bubble_baseline_is_giwk_plus_sigma_old_at_niv_cut():
-    """The chi0q baseline equals giwk_full plus sigma_old, both at the niv_cut window."""
-    expected = SCALE * 2 * (TINY["nk_tot"] * TINY["n_bands"] ** 2 * (2 * TINY["niv_cut"]))
-    assert estimate_peaks(**TINY)["chi0q"].baseline == pytest.approx(expected)
+    """The chi0q baseline equals giwk_full plus sigma_old at the niv_cut window, plus (on a multi-rank run) the two
+    node-shareable R-space Green's functions of the distributed bubble at the niv_full + niw_core window."""
+    two_point = SCALE * 2 * (TINY["nk_tot"] * TINY["n_bands"] ** 2 * (2 * TINY["niv_cut"]))
+    g_r_windows = SCALE * 2 * TINY["nk_tot"] * TINY["n_bands"] ** 2 * (2 * (TINY["niv_full"] + TINY["niw_core"]))
+    assert estimate_peaks(**TINY)["chi0q"].baseline == pytest.approx(two_point + g_r_windows)
+    assert estimate_peaks(**{**TINY, "n_ranks": 1})["chi0q"].baseline == pytest.approx(two_point)
 
 
 def test_sde_section_baseline_uses_post_bubble_windows():
@@ -174,16 +181,19 @@ def test_sde_section_baseline_uses_post_bubble_windows():
     giwk = nk * nb**2 * 2 * (TINY["niv_core"] + TINY["niw_core"])
     sigma_old = nk * nb**2 * 2 * TINY["niv_core"]
     peaks = estimate_peaks(**TINY)
-    assert peaks["chiq_aux"].baseline == pytest.approx(SCALE * (giwk + sigma_old))
+    local_vertex = TINY["n_bands"] ** 4 * (TINY["niw_core"] + 1) * (2 * TINY["niv_full"]) ** 2
+    assert peaks["chiq_aux"].baseline == pytest.approx(SCALE * (giwk + sigma_old + local_vertex))
     assert peaks["sde"].baseline == pytest.approx(SCALE * (2 * giwk + sigma_old))
-    assert peaks["chiq_aux"].giwk_shareable == pytest.approx(SCALE * giwk)
+    assert peaks["chiq_aux"].giwk_shareable == pytest.approx(SCALE * (giwk + local_vertex))
     assert peaks["sde"].giwk_shareable == pytest.approx(SCALE * 2 * giwk)
 
 
 def test_giwk_shareable_is_the_giwk_part_of_each_sde_section_baseline():
-    """giwk_shareable covers exactly the giwk_full part of the chi0q/chiq_aux/sde baselines."""
+    """giwk_shareable covers exactly the Green's-function part of the chi0q/chiq_aux/sde baselines (giwk_full plus,
+    for the multi-rank chi0q, the distributed bubble's R-space copy)."""
     peaks = _peaks(with_eliashberg=True)
-    assert peaks["chi0q"].giwk_shareable == pytest.approx(peaks["chi0q"].baseline / 2)
+    sigma_old = SCALE * BASE["nk_tot"] * BASE["n_bands"] ** 2 * (2 * BASE["niv_cut"])
+    assert peaks["chi0q"].giwk_shareable == pytest.approx(peaks["chi0q"].baseline - sigma_old)
     for key in ("chi0q", "chiq_aux", "sde"):
         assert 0 < peaks[key].giwk_shareable < peaks[key].baseline
 
@@ -201,8 +211,12 @@ def test_eliashberg_branches_are_not_giwk_shareable():
 
 
 def test_bubble_baseline_depends_on_niv_cut_not_niv_full():
-    """The chi0q baseline tracks niv_cut and is independent of niv_full when niv_cut is fixed."""
-    assert _peaks(niv_full=40)["chi0q"].baseline == pytest.approx(_peaks(niv_full=400)["chi0q"].baseline)
+    """The single-rank chi0q baseline tracks niv_cut and is independent of niv_full; the multi-rank baseline
+    additionally tracks niv_full through the node-shareable R-space Green's function."""
+    assert _peaks(niv_full=40, n_ranks=1)["chi0q"].baseline == pytest.approx(
+        _peaks(niv_full=400, n_ranks=1)["chi0q"].baseline
+    )
+    assert _peaks(niv_full=40)["chi0q"].baseline < _peaks(niv_full=400)["chi0q"].baseline
     assert _peaks(niv_cut=80)["chi0q"].baseline != pytest.approx(_peaks(niv_cut=800)["chi0q"].baseline)
 
 
@@ -215,14 +229,23 @@ def test_chiq_aux_off_block_is_two_rank_local_two_fermion_blocks():
 
 
 def test_chi0q_fast_single_counts_buffer_ifftn_transient_and_g_copies():
-    """The chi0q fast single-rank peak counts the multiply buffer, the ~2x ifftn transient and three G copies."""
+    """The single-rank chi0q fast peak counts the multiply buffer, the ~2x ifftn transient and three G copies."""
     nb, wp, vf = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_full"]
     bubble_irr = TINY["nk_irr"] * nb**4 * wp * vf
     fft_buffers = (1 + CHI0Q_IFFTN_TRANSIENT_FACTOR) * TINY["nk_tot"] * nb**4 * vf
     gf_copies = 2 * TINY["nk_tot"] * nb**2 * (2 * (TINY["niv_full"] + TINY["niw_core"]))
     g_center = TINY["nk_tot"] * nb**2 * vf
     expected = SCALE * (bubble_irr + fft_buffers + gf_copies + g_center)
-    assert estimate_peaks(**TINY)["chi0q"].off_single == pytest.approx(expected)
+    assert estimate_peaks(**{**TINY, "n_ranks": 1})["chi0q"].off_single == pytest.approx(expected)
+
+
+def test_chi0q_fast_distributed_is_bounded_by_the_result_slice():
+    """The multi-rank chi0q fast peak counts the per-rank irr-BZ result slice plus the bounded sub-chunk group
+    (column buffer + ifftn transient + irr chunk + staging, capped at half a slice)."""
+    nb, wp, vf = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_full"]
+    qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
+    expected = SCALE * 1.5 * qi * nb**4 * wp * vf
+    assert estimate_peaks(**TINY)["chi0q"].off_distributed == pytest.approx(expected)
 
 
 def test_sde_holds_two_kernels_plus_irr_kernel():
@@ -278,8 +301,9 @@ def test_fq_cheap_construction_shrinks_per_q_block():
     assert cheap < normal
 
 
-def test_lanczos_fast_counts_three_vertices_bubble_and_arpack_basis():
-    """The lanczos fast single-rank peak holds 3 full-BZ vertices, the pp bubble and the ARPACK workspace."""
+def test_lanczos_fast_counts_layout_build_vertices_bubble_and_arpack_basis():
+    """The lanczos fast single-rank peak holds LANCZOS_VERTEX_FACTOR full-BZ vertices (direct + its matmul-layout
+    copy at the build peak; the flipped vertex is never stored), the pp bubble and the ARPACK workspace."""
     p = {**TINY, "with_eliashberg": True, "n_ranks": 4}
     nb, vpp = p["n_bands"], 2 * p["niv_pp"]
     vertex = p["nk_tot"] * nb**4 * vpp * vpp
@@ -330,3 +354,20 @@ def test_save_pairing_vertex_sets_the_lean_single_rank_gather():
     without = estimate_peaks(**{**p, "save_pairing_vertex": False})["lanczos"]
     assert with_save.on_single == pytest.approx(max(chi0, gather) + giwk_dga)
     assert without.on_single == pytest.approx(chi0 + giwk_dga)
+
+
+def test_local_step_is_flagless_single_rank_and_band_heavy():
+    """The local branch is verify-only (off == on, no distributed share, no baseline), rank-count-independent and
+    scales with nb^4; its formula counts both channels' outputs, the halved g2 inputs and the chi-tilde shell
+    transient at the niv_full box."""
+    from dgamore.memory_estimator import LOCAL_SHELL_INVERT_FACTOR
+
+    bp = _peaks()["local"]
+    assert bp.baseline == 0.0 and bp.giwk_shareable == 0.0 and bp.off_distributed == 0.0
+    assert bp.off_single == bp.on_single > 0.0
+    assert _peaks(n_ranks=16)["local"].off_single == pytest.approx(bp.off_single)
+    assert _peaks(n_bands=2)["local"].off_single == pytest.approx(16 * bp.off_single)
+    wp, vc, vf = BASE["niw_core"] + 1, 2 * BASE["niv_core"], 2 * BASE["niv_full"]
+    l_core, l_full = wp * vc * vc, wp * vf * vf
+    expected = SCALE * (2 * (2 * l_core + l_full) + 2 * l_core + LOCAL_SHELL_INVERT_FACTOR * l_full)
+    assert bp.off_single == pytest.approx(expected)

@@ -190,3 +190,81 @@ def test_momentum_pp_bubble_is_local_pp_bubble_in_acbd_layout():
     local_acbd = BubbleGenerator.create_generalized_chi0_pp_w0(g_loc, niv_pp, beta).permute_orbitals("abcd->acbd")
     momentum = BubbleGenerator.create_generalized_chi0_q_pp_w0(g_mom, niv_pp, q_grid).decompress_q_dimension()
     assert np.allclose(momentum.mat, local_acbd.mat[..., 0, :][None, None, None] / (-beta), atol=1e-4)
+
+
+def _fft_bubble_reference(g, niw, niv, q_grid, beta):
+    """Computes the single-rank rank-0 FFT bubble (the mock-comm path) as the distributed-path reference."""
+    from dgamore.mpi_utils import MpiDistributor
+    from tests.conftest import create_comm_mock
+
+    dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock(), name="Q")
+    return BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, beta)
+
+
+def test_fft_bubble_distributed_matches_single_rank(monkeypatch):
+    """The R-scattered multi-rank FFT bubble (pointwise R product, distributed pencil ifft via the conjugation
+    trick, row exchange onto the irr-BZ distribution) must reproduce the single-rank rank-0 path on a grid with a
+    non-trivial irreducible wedge."""
+    import dgamore.mpi_utils as mpi_utils
+    from dgamore.mpi_utils import MpiDistributor
+    from tests.conftest import FAKE_MPI, run_parallel
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 2, 2, 2.5
+    g = _make_momentum_g(nk, nb, niv + niw + 2, seed=11)
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    ref = _fft_bubble_reference(g, niw, niv, q_grid, beta)
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+        return BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, beta).mat
+
+    _, res = run_parallel(3, fn)
+    assembled = np.concatenate(res, axis=0)
+    assert assembled.shape == ref.mat.shape
+    assert np.allclose(assembled, ref.mat, atol=1e-5)
+
+
+def test_fft_bubble_distributed_with_node_shared_greens_function(monkeypatch):
+    """With a node communicator the distributed bubble builds the R-space Green's function once per node in a
+    shared window and still reproduces the single-rank reference (two fake nodes exercise the window path)."""
+    import dgamore.mpi_utils as mpi_utils
+    from dgamore.mpi_utils import MpiDistributor
+    from tests.conftest import FAKE_MPI, run_parallel
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (2, 2, 1), 2, 1, 1, 2.0
+    g = _make_momentum_g(nk, nb, niv + niw + 1, seed=12)
+    q_grid = bz.KGrid(nk, symmetries=[])
+    ref = _fft_bubble_reference(g, niw, niv, q_grid, beta)
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+        return BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, beta, node_comm=node_comm).mat
+
+    _, res = run_parallel(4, fn, hostnames=["n0", "n0", "n1", "n1"])
+    assembled = np.concatenate(res, axis=0)
+    assert np.allclose(assembled, ref.mat, atol=1e-5)
+
+
+def test_fft_bubble_distributed_with_fewer_columns_than_ranks(monkeypatch):
+    """With fewer (w, v) columns than ranks the surplus ranks compute nothing but still receive their irr-BZ
+    q-slice through the ring exchange, and the assembled bubble matches the single-rank reference."""
+    import dgamore.mpi_utils as mpi_utils
+    from dgamore.mpi_utils import MpiDistributor
+    from tests.conftest import FAKE_MPI, run_parallel
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (5, 1, 1), 1, 1, 0, 2.0
+    g = _make_momentum_g(nk, nb, niv + niw + 1, seed=13)
+    q_grid = bz.KGrid(nk, symmetries=[])
+    ref = _fft_bubble_reference(g, niw, niv, q_grid, beta)
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+        return BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, beta).mat
+
+    _, res = run_parallel(5, fn)
+    assembled = np.concatenate(res, axis=0)
+    assert np.allclose(assembled, ref.mat, atol=1e-5)

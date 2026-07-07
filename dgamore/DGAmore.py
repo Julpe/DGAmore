@@ -640,6 +640,22 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
             f"Schwinger-Dyson equation: per-rank baseline {bp_sde.baseline / 1024**3:.3f} GB, "
             f"node total {worst_sde / 1024**3:.3f} GB (single FFT path, no memory-saving switch)."
         )
+    # The local Schwinger-Dyson step runs serially on rank 0 before the loop and has no memory switch either;
+    # its single-rank peak is checked so an oversized multi-band box fails fast, not minutes into the run.
+    if "local" in peaks:
+        bp_local = peaks["local"]
+        if not fits_everywhere(bp_local, bp_local.off_distributed, bp_local.off_single):
+            worst = max(
+                node_total(bp_local, bp_local.off_distributed, bp_local.off_single, r) for r, _ in nodes.values()
+            )
+            raise MemoryError(
+                f"The local Schwinger-Dyson step needs {worst / 1024**3:.3f} GB on rank 0's node, which exceeds 90% "
+                f"of that node's available memory. Use a smaller frequency box or fewer bands."
+            )
+        logger.info(
+            f"Local Schwinger-Dyson step: rank-0 single peak {bp_local.off_single / 1024**3:.3f} GB "
+            f"(serial, no memory-saving switch)."
+        )
     for attr, key in flag_to_key.items():
         if key not in peaks:
             continue

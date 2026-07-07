@@ -19,6 +19,11 @@ from dgamore.matsubara_frequencies import MFHelper
 from dgamore.self_energy import SelfEnergy
 from dgamore.two_point import TwoPoint
 
+# Element budget for one [k, band, v-chunk] temporary of the analytic potential-energy tail (~256 MB complex128).
+# The default asymptotic box (niv_asympt = 50000) would otherwise materialize [nk_tot, n_bands, 2*niv_asympt]
+# arrays - several GB on production grids - for a plain frequency sum.
+_MODEL_EPOT_CHUNK_ELEMENTS: int = 2**24
+
 
 def _fermi_dirac_density(h: np.ndarray, beta: float) -> np.ndarray:
     r"""
@@ -383,11 +388,17 @@ class GreensFunction(TwoPoint):
         u_inv = np.linalg.inv(u)
         smom1_rot = u_inv @ smom1 @ u  # rotate tail coeff into eigenbasis
 
-        iv = 1j * MFHelper.vn(niv, beta)
-        g_diag = 1.0 / (iv[None, :] + self._mu - lam[:, :, None])  # [k, band, v]
-        # Tr[(-smom1/iv) G_mod] = -sum_i (smom1_rot)_ii * g_diag_i / iv
-        integrand = -np.einsum("kii,kiv->kv", smom1_rot, g_diag) / iv[None, :]
-        return integrand.sum().real / beta
+        # the frequency sum is evaluated in bounded v-chunks: the single-pass form materialized several
+        # [k, band, 2*niv] complex temporaries, which for the default niv_asympt = 50000 spikes to many GB
+        iv_full = 1j * MFHelper.vn(niv, beta)
+        step = max(1, _MODEL_EPOT_CHUNK_ELEMENTS // (self.nq_tot * self.n_bands))
+        total = 0.0
+        for i in range(0, len(iv_full), step):
+            iv = iv_full[i : i + step]
+            g_diag = 1.0 / (iv[None, :] + self._mu - lam[:, :, None])  # [k, band, v-chunk]
+            # Tr[(-smom1/iv) G_mod] = -sum_i (smom1_rot)_ii * g_diag_i / iv
+            total += (-np.einsum("kii,kiv->kv", smom1_rot, g_diag) / iv[None, :]).sum().real
+        return total / beta
 
     def _get_gfull_mat(self) -> np.ndarray:
         r"""

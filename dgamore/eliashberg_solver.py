@@ -76,15 +76,27 @@ def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp:
     :return: The transformed vertex as a raw numpy array with two fermionic axes ``[..., 2*niv_pp, 2*niv_pp]``.
     """
     vn = MFHelper.vn(niv_pp)
-    wn = MFHelper.wn(config.box.niw_core)
-
     omega = vn[:, None] - vn[None, :]
-    vertex = (
-        vertex.cut_niv(niv_pp)
-        .to_full_niw_range()
-        .permute_orbitals("abcd->adcb", copy=False)
-        .flip_frequency_axis(-1, False)
-    )
+
+    vertex = vertex.cut_niv(niv_pp)
+    # only the |w| <= 2*niv_pp - 1 anti-diagonals (omega = v - v') are read below, so the bosonic axis is trimmed
+    # to that window before to_full_niw_range doubles it (cut_niw cannot be used here - its no-op guard misjudges
+    # half-range objects)
+    w_axis = -3
+    niw_stored = vertex.current_shape[w_axis] // 2 if vertex.full_niw_range else vertex.current_shape[w_axis] - 1
+    niw_window = min(niw_stored, 2 * niv_pp - 1)
+    if niw_window < niw_stored:
+        slicer = [slice(None)] * vertex.mat.ndim
+        slicer[w_axis] = (
+            slice(niw_stored - niw_window, niw_stored + niw_window + 1)
+            if vertex.full_niw_range
+            else slice(0, niw_window + 1)
+        )
+        vertex.mat = vertex.mat[tuple(slicer)].copy()
+        vertex.update_original_shape()
+    wn = MFHelper.wn(niw_window)
+
+    vertex = vertex.to_full_niw_range().permute_orbitals("abcd->adcb", copy=False).flip_frequency_axis(-1, False)
     f_q_r_pp_mat = np.zeros((*vertex.current_shape[:-3], 2 * niv_pp, 2 * niv_pp), dtype=vertex.mat.dtype)
 
     for idx, w in enumerate(wn):
@@ -149,7 +161,11 @@ def create_full_vertex_q_r(
     f_q_r = nonlocal_sde.create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_loc, v_nonloc)
     logger.info(f"Non-Local auxiliary susceptibility ({gamma_r.channel.value}) calculated.")
 
-    f_q_r = (gchi0_q_inv - gchi0_q_inv @ f_q_r @ gchi0_q_inv).scale(config.sys.beta**2)
+    # eager rebinding releases chi* right after the first matmul, and the bubble term enters on the fermionic
+    # diagonal in place - the former single-expression form held four two-fermion blocks at its subtraction peak
+    f_q_r = gchi0_q_inv @ f_q_r
+    f_q_r = f_q_r @ gchi0_q_inv
+    f_q_r = f_q_r.scale(-config.sys.beta**2).add_on_vn_diagonal(gchi0_q_inv, factor=config.sys.beta**2)
     gchi0_q_inv.free()
 
     if not config.eliashberg.save_fq:
@@ -194,7 +210,7 @@ def create_full_vertex_q_r(
 
     if not config.eliashberg.save_fq:
         f_q_r_2 = transform_vertex_q_frequencies_w0(f_q_r_2, niv_pp)
-    f_q_r += f_q_r_2
+    f_q_r = f_q_r.add(f_q_r_2, copy=False)  # accumulate in place: no third full-size vertex block
     f_q_r_2.free()
 
     mpi_dist.barrier()
@@ -283,9 +299,13 @@ def create_full_vertex_q_r_v2(
     u = u_loc.as_channel(gamma_r.channel) + v_nonloc_idx.as_channel(gamma_r.channel)
 
     f_q_r_idx = nonlocal_sde.create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv_idx, u_loc, v_nonloc_idx)
-    f_q_r_idx = (gchi0_q_inv_idx - gchi0_q_inv_idx @ f_q_r_idx @ gchi0_q_inv_idx).scale(config.sys.beta**2) + (
-        vrg_q_r_left_idx @ u - vrg_q_r_left_idx @ (u @ chi_phys_q_r_idx @ u)
-    ) * vrg_q_r_right_idx
+    # same eager-rebinding / diagonal-add construction as in create_full_vertex_q_r, per q-point
+    f_q_r_idx = gchi0_q_inv_idx @ f_q_r_idx
+    f_q_r_idx = f_q_r_idx @ gchi0_q_inv_idx
+    f_q_r_idx = f_q_r_idx.scale(-config.sys.beta**2).add_on_vn_diagonal(gchi0_q_inv_idx, factor=config.sys.beta**2)
+    f_q_r_idx = f_q_r_idx.add(
+        (vrg_q_r_left_idx @ u - vrg_q_r_left_idx @ (u @ chi_phys_q_r_idx @ u)) * vrg_q_r_right_idx, copy=False
+    )
 
     gchi0_q_inv_idx.free()
     vrg_q_r_left_idx.free()
@@ -576,7 +596,9 @@ def create_local_ud_diagrams_pp_w0(
     gchi_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"gchi_dens_loc.npy"), SpinChannel.DENS)
     gchi_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"gchi_magn_loc.npy"), SpinChannel.MAGN)
     gchi_ud_loc = (gchi_dens_loc - gchi_magn_loc).set_channel(SpinChannel.UD).scale(0.5)
-    gchi_ud_loc_pp_w0 = gchi_ud_loc.change_frequency_notation_ph_to_pp_w0().cut_niv(niv_pp)
+    # the fermionic cut commutes with the w0 pp map (it samples only the retained window), so cutting first shrinks
+    # the transform transient from the full box to the pp box
+    gchi_ud_loc_pp_w0 = gchi_ud_loc.cut_niv(niv_pp).change_frequency_notation_ph_to_pp_w0()
     del gchi_dens_loc, gchi_magn_loc, gchi_ud_loc
 
     gamma_ud_loc_pp_w0 = create_local_gamma_ud_pp_w0_per_ineq(gchi_ud_loc_pp_w0, g_dmft, config.sys.beta)
@@ -587,7 +609,7 @@ def create_local_ud_diagrams_pp_w0(
     f_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_dens_loc.npy"), SpinChannel.DENS)
     f_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_magn_loc.npy"), SpinChannel.MAGN)
     f_ud_loc = (f_dens_loc - f_magn_loc).set_channel(SpinChannel.UD).scale(0.5)
-    f_ud_loc_pp_w0 = f_ud_loc.change_frequency_notation_ph_to_pp_w0().cut_niv(niv_pp)
+    f_ud_loc_pp_w0 = f_ud_loc.cut_niv(niv_pp).change_frequency_notation_ph_to_pp_w0()
 
     del f_dens_loc, f_magn_loc, f_ud_loc
 
@@ -786,9 +808,11 @@ def solve_eliashberg_lanczos(
     r"""
     Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using
     an ARPACK/Lanczos eigensolver, with the pairing kernel applied matrix-free via FFTs over the BZ. This in-memory
-    variant holds the full-BZ pairing vertex on the solving rank.
+    variant holds the full-BZ pairing vertex on the solving rank. The passed pairing vertex is **consumed** (mapped
+    to the full BZ, Fourier transformed and sign-folded in place, then freed once its matmul-layout copy is built).
 
-    :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (irreducible BZ, pp notation) for one channel.
+    :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (irreducible BZ, pp notation) for one channel;
+        consumed by the solve.
     :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{pp}` at :math:`\omega = 0`.
     :param ranks: The ``(rank_sing, rank_trip)`` pair used for logging.
     :return: A tuple ``(lambdas, gaps)`` of the leading eigenvalues and the corresponding :class:`GapFunction` objects.
@@ -805,10 +829,11 @@ def solve_eliashberg_lanczos(
 
     sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
 
-    gamma_r_pp = sign * gamma_r_pp.fft(False)
-    gamma_pp_flipped = (
-        gamma_r_pp.flip_momentum_axis().flip_frequency_axis(-1, False).permute_orbitals("abcd->adcb", False)
-    )
+    # in-place sign fold: the former ``sign * fft`` deep-copied the full-BZ vertex and left the pre-copy original
+    # alive (still referenced by the caller) for the entire solve
+    gamma_r_pp = gamma_r_pp.fft(False)
+    if sign != 1:
+        gamma_r_pp.scale(sign)
 
     gap_shape = gamma_r_pp.nq + 2 * (gamma_r_pp.n_bands,) + (2 * gamma_r_pp.niv,)
     gchi0_q0_pp = gchi0_q0_pp.decompress_q_dimension()
@@ -823,35 +848,32 @@ def solve_eliashberg_lanczos(
     n_bands = gamma_r_pp.n_bands
     norm = 0.5 / config.lattice.q_grid.nk_tot / config.sys.beta
 
-    # Build the vertices in batched-matmul layout: chi0 as a view, the pairing vertices materialized once. The matmul
-    # matvec is ~3x faster than einsum and avoids einsum's per-matvec vertex-sized temporary. Each einsum-layout source
-    # is freed right after its matmul-layout copy is built (peak stays ~1 vertex, not 3), and the flipped-term sign is
-    # folded in place.
     chi0_mm = _chi0_to_matmul_layout(gchi0_q0_pp.mat)
     # The pairing vertex arrives in the w2dynamics G2 leg order (c cdag c cdag), whereas the contraction in
     # _apply_gamma_pp expects the TRIQS order (cdag c cdag c), see
     # https://triqs.github.io/tprf/latest/theory/eliashberg.html
     gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.permute_orbitals("abcd->badc", False).mat)
     gamma_r_pp.free()
-    gamma_flipped_mm = _gamma_to_matmul_layout(gamma_pp_flipped.permute_orbitals("abcd->badc", False).mat)
-    gamma_pp_flipped.free()
-    gamma_flipped_mm *= sign
 
     def mv(gap: np.ndarray):
         r"""
         Applies the pairing kernel to a flattened gap vector (the matrix-vector product for the eigensolver):
         multiplies by :math:`\chi_0^{pp}`, FFTs to real space, contracts with the pairing vertex (direct plus the
-        momentum-/frequency-flipped term; the sign is folded into the vertices), and transforms back. The orbital
-        contractions are batched ``np.matmul`` products and the BZ transforms run in place through ``scipy.fft``.
+        crossed term, the latter reusing the direct vertex via gap-sized index shuffles), and transforms back. The
+        orbital contractions are batched ``np.matmul`` products and the BZ transforms run in place through
+        ``scipy.fft``.
 
         :param gap: The flattened gap vector.
         :return: The flattened result of applying the pairing kernel to ``gap``.
         """
         gap_gg = sp.fft.fftn(_apply_gchi0_pp(chi0_mm, gap, n_bands), axes=(0, 1, 2), overwrite_x=True)
-        gap_gg_flipped = np.roll(np.flip(gap_gg, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-        gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands) + _apply_gamma_pp(
-            gamma_flipped_mm, gap_gg_flipped, n_bands
-        )
+        gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands)
+        # crossed term: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]
+        crossed = _apply_gamma_pp(gamma_mm, np.flip(gap_gg, axis=-1), n_bands)
+        crossed = np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+        if sign != 1:
+            crossed *= sign
+        gap_new += crossed
         gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True)
         gap_new *= norm
         return gap_new.flatten()
@@ -911,9 +933,11 @@ def solve_eliashberg_lanczos_v2(
     Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using
     an ARPACK/Lanczos eigensolver. This variant distributes the gap function along the fermionic frequency axis across
     ranks (and performs the :math:`\chi_0^{pp}` multiplication only on the root rank), so it is more memory-efficient
-    but slower than :func:`solve_eliashberg_lanczos`.
+    but slower than :func:`solve_eliashberg_lanczos`. The passed pairing vertex is **consumed** (Fourier transformed
+    and sign-folded in place, then freed once its matmul-layout copy is built).
 
-    :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (frequency-distributed) for one channel.
+    :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (frequency-distributed) for one channel; consumed
+        by the solve.
     :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{pp}` at :math:`\omega = 0` (held on the root rank).
     :param mpi_dist_v: MPI distributor over the fermionic frequency axis (see :class:`MpiDistributor`).
     :param active_ranks: The ranks participating in this solve; the first is used as root.
@@ -930,10 +954,10 @@ def solve_eliashberg_lanczos_v2(
 
     sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
 
-    gamma_r_pp = sign * gamma_r_pp.fft(False).decompress_q_dimension()
-    gamma_r_pp_flipped = (
-        gamma_r_pp.flip_momentum_axis().flip_frequency_axis(-1, False).permute_orbitals("abcd->adcb", False)
-    )
+    # in-place sign fold (see solve_eliashberg_lanczos): avoids the deep copy and the orphaned pre-copy vertex
+    gamma_r_pp = gamma_r_pp.fft(False).decompress_q_dimension()
+    if sign != 1:
+        gamma_r_pp.scale(sign)
 
     gap_shape = gamma_r_pp.nq + 2 * (gamma_r_pp.n_bands,) + (gamma_r_pp.current_shape[-1],)
 
@@ -949,19 +973,17 @@ def solve_eliashberg_lanczos_v2(
     n_bands = gamma_r_pp.n_bands
     norm = 0.5 / config.lattice.q_grid.nk_tot / config.sys.beta
 
-    # Batched-matmul layout (see :func:`solve_eliashberg_lanczos`): chi0 on the root rank (a view), the frequency-sliced
-    # pairing vertices materialized once per rank. Each einsum-layout source is freed right after its matmul-layout copy
-    # is built (peak stays ~1 vertex, not 3), and the flipped-term sign is folded in place.
+    # Batched-matmul layout (see :func:`solve_eliashberg_lanczos`): chi0 on the root rank (a view), the
+    # frequency-sliced pairing vertex materialized once per rank. The flipped vertex is never stored - its
+    # contraction reuses the direct array via gap-sized index shuffles in the matvec (the crossing map touches only
+    # the row orbitals, the column frequency and the momentum, so it holds per v-slice).
     chi0_mm = _chi0_to_matmul_layout(gchi0_q0_pp.mat) if mpi_dist_v.comm.rank == root else None
     # The pairing vertex arrives in the w2dynamics G2 leg order (c cdag c cdag), whereas the contraction in
     # _apply_gamma_pp expects the TRIQS order (cdag c cdag c). The two differ by the "abcd->badc" swap
-    # (o1<->o2, o3<->o4); applying it to both the direct and the flipped vertex makes the gap's creation legs
-    # contract with the vertex's creation legs. This is a no-op for a single band.
+    # (o1<->o2, o3<->o4); applying it makes the gap's creation legs contract with the vertex's creation legs.
+    # This is a no-op for a single band.
     gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.permute_orbitals("abcd->badc", False).mat)
     gamma_r_pp.free()
-    gamma_flipped_mm = _gamma_to_matmul_layout(gamma_r_pp_flipped.permute_orbitals("abcd->badc", False).mat)
-    gamma_r_pp_flipped.free()
-    gamma_flipped_mm *= sign
 
     def mv(gap: np.ndarray):
         r"""
@@ -977,16 +999,18 @@ def solve_eliashberg_lanczos_v2(
         gap_gg = mpi_dist_v.bcast_chunked(gap_gg, root=root)
         # 2. perform Fourier transform for the full chi0 * gap quantity
         gap_gg = sp.fft.fftn(gap_gg, axes=(0, 1, 2), overwrite_x=True)
-        # 3. create gap_gg_flipped
-        gap_gg_flipped = np.roll(np.flip(gap_gg, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-        # 4. contract with the pairing vertex over (c, d, p) -> the gap for this rank's v slice (sign folded in)
-        gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands) + _apply_gamma_pp(
-            gamma_flipped_mm, gap_gg_flipped, n_bands
-        )
-        # 5. perform fourier transform on the local v slice
+        # 3. contract with the pairing vertex over (c, d, p) -> the gap for this rank's v slice; the crossed term
+        #    reuses the direct vertex: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]
+        gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands)
+        crossed = _apply_gamma_pp(gamma_mm, np.flip(gap_gg, axis=-1), n_bands)
+        crossed = np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+        if sign != 1:
+            crossed *= sign
+        gap_new += crossed
+        # 4. perform fourier transform on the local v slice
         gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True)
         gap_new *= norm
-        # 6. assemble gap_new for the full v range through mpi_dist_v and allgather (remember we distributed v)
+        # 5. assemble gap_new for the full v range through mpi_dist_v and allgather (remember we distributed v)
         gap_new = np.moveaxis(gap_new, -1, 0)  # (v_local, nq_tot, orb, orb)
         gap_new = mpi_dist_v.allgather(gap_new)  # (v_total, nq_tot, orb, orb)
         return np.moveaxis(gap_new, 0, -1).flatten()  # (nq_tot, orb, orb, v_total)
@@ -1129,13 +1153,13 @@ def solve(
 
     mpi_dist_irrk.delete_file()
 
-    gamma_sing_pp = 0.5 * f_dens_pp - 1.5 * f_magn_pp
+    gamma_sing_pp = f_dens_pp.scale(0.5).sub(f_magn_pp.scale(1.5, copy=True), copy=False)
+    del f_dens_pp
     gamma_sing_pp.channel = SpinChannel.SING
     logger.info("Calculated full ladder-vertex (singlet) in pp notation.")
 
-    gamma_trip_pp = 0.5 * f_dens_pp + 0.5 * f_magn_pp
+    gamma_trip_pp = gamma_sing_pp.add(f_magn_pp.scale(2.0))
     gamma_trip_pp.channel = SpinChannel.TRIP
-    f_dens_pp.free()
     f_magn_pp.free()
     logger.info("Calculated full ladder-vertex (triplet) in pp notation.")
 
@@ -1164,9 +1188,10 @@ def solve(
         phi_ud_loc_pp_w0 = phi_ud_loc_pp_w0.flip_frequency_axis(-1, copy=False).permute_orbitals(
             "abcd->adcb", copy=False
         )
-        gamma_sing_pp += phi_ud_loc_pp_w0 - f_ud_loc_transf_w0
-        gamma_trip_pp += phi_ud_loc_pp_w0 - f_ud_loc_transf_w0
-        del phi_ud_loc_pp_w0, f_ud_loc_transf_w0
+        delta_loc = phi_ud_loc_pp_w0.sub(f_ud_loc_transf_w0)
+        gamma_sing_pp.add(delta_loc, copy=False)
+        gamma_trip_pp.add(delta_loc, copy=False)
+        del phi_ud_loc_pp_w0, f_ud_loc_transf_w0, delta_loc
 
     if config.eliashberg.save_pairing_vertex:
         gamma_sing_pp.mat = mpi_dist_irrk.gather(gamma_sing_pp.mat)

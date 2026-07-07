@@ -311,6 +311,72 @@ def test_perform_maxent_giwk_runtime_warning_is_treated_as_failure(tmp_path, mon
     assert len(fail_msgs) == config.lattice.k_grid.nk_irr * n_bands
 
 
+def test_perform_maxent_giwk_optimize_warning_is_suppressed(tmp_path, monkeypatch):
+    """An OptimizeWarning from the solver's alpha fit is muted and does not fail the continuation."""
+    from scipy.optimize import OptimizeWarning
+
+    nk, n_bands = (4, 4, 1), 1
+    _setup_maxent_config(tmp_path, nk, n_bands, seed=10)
+    mat = _build_giwk_mat(nk, n_bands, niv=4, seed=31)
+
+    class _OptimizeWarningProblem:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def solve(self, *args, **kwargs):
+            warnings.warn("Covariance of the parameters could not be estimated", OptimizeWarning)
+            return (SimpleNamespace(A_opt=np.ones(config.ana_cont.w_count)),)
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _OptimizeWarningProblem)
+
+    def fn(comm, rank):
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        _, results = run_parallel(1, fn)
+
+    assert not any(issubclass(r.category, OptimizeWarning) for r in recorded)
+    assert np.any(results[0] != 0.0)
+
+
+def test_perform_maxent_dmft_optimize_warning_is_suppressed(tmp_path, monkeypatch):
+    """perform_maxent_dmft mutes the solver's OptimizeWarning rather than leaking it."""
+    from scipy.optimize import OptimizeWarning
+
+    nk, n_bands, w_count, niv = (3, 3, 1), 1, 7, 4
+    config.sys.beta = 12.0
+    config.sys.mu = 0.4
+    config.sys.n_bands = n_bands
+    config.ana_cont.w_count = w_count
+    config.output.output_path = str(tmp_path)
+    config.logger = MagicMock()
+
+    hk = _build_hk(nk, n_bands, seed=33)
+    sig = np.zeros((1, 1, 1, n_bands, n_bands, 2 * niv), dtype=np.complex64)
+    sig[0, 0, 0, 0, 0] = 0.2 - 0.1j * np.ones(2 * niv)
+    sigma_dmft = SelfEnergy(sig, nk=(1, 1, 1), full_niv_range=True, calc_smom=False, beta=config.sys.beta)
+
+    class _OptimizeWarningProblem:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def solve(self, *args, **kwargs):
+            warnings.warn("Covariance of the parameters could not be estimated", OptimizeWarning)
+            return (SimpleNamespace(A_opt=np.ones(w_count)),)
+
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _OptimizeWarningProblem)
+    monkeypatch.setattr(max_ent, "RealFreqTwoPoint", _FakeRealFreqTwoPoint)
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        spectrum = max_ent.perform_maxent_dmft(sigma_dmft, hk)
+
+    assert not any(issubclass(r.category, OptimizeWarning) for r in recorded)
+    assert spectrum.shape == (*nk, n_bands, w_count)
+
+
 def test_perform_maxent_giwk_single_band(tmp_path, patch_maxent_mpi):
     """perform_maxent_giwk reduces to the orbital-diagonal continuation for a single band."""
     nk, n_bands, w_count = (4, 4, 1), 1, 5

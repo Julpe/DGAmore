@@ -14,7 +14,7 @@ from tests.conftest import create_comm_mock
 
 # the q-grid / box parameters the fake_system fixture installs, so tests can reproduce the driver's estimate
 # niv_cut == min(niw_core + niv_full + 10, niv_dmft) == min(32, 50) == 32 with the fixture's niv_dmft below.
-FIXTURE_PARAMS = dict(n_bands=1, nk_tot=64, nk_irr=10, niw_core=10, niv_core=10, niv_full=12, niv_cut=32, niv_pp=5)
+FIXTURE_PARAMS = dict(n_bands=1, nk_tot=256, nk_irr=40, niw_core=10, niv_core=10, niv_full=12, niv_cut=32, niv_pp=5)
 
 
 @pytest.fixture
@@ -85,10 +85,11 @@ def test_large_memory_keeps_all_flags_off(fake_system):
 
 
 def test_tiny_memory_forces_lean_flags_on(fake_system):
-    """A budget below chiq_aux's fast-path node total forces its lean flag on without overflowing the node."""
+    """A budget below chiq_aux's fast-path node total forces its lean flag on without overflowing the node (the
+    budget floor is the flag-less local step, which must always fit)."""
     off = _node_total("chiq_aux", "off", r=1)
     max_on = max(_all_node_totals("on", r=1, with_eliashberg=False))
-    budget = 0.5 * (max_on + off)
+    budget = max(0.5 * (max_on + off), 1.01 * _node_total("local", "off", r=1))
     fake_system(int(budget / 0.9))
     dgamore_main.autodetect_memory_settings(_mock_comm())
     assert config.memory.save_memory_for_chiq_aux is True
@@ -103,11 +104,13 @@ def test_user_true_is_preserved_as_floor(fake_system):
 
 
 def test_chi0q_single_rank_peak_fits_under_node_total(fake_system):
-    """chi0q's single-rank transient peak stays off against the node total while the heavier branch is forced on."""
+    """chi0q's single-rank transient peak stays off against the node total while the heavier chiq_aux branch is
+    forced on (the budget floor is the flag-less sde step, which must always fit)."""
     chi0q_off = _node_total("chi0q", "off", r=1)
     chiq_aux_off = _node_total("chiq_aux", "off", r=1)
-    assert chi0q_off < chiq_aux_off  # sanity: chi0q is the lighter one here
-    budget = 0.5 * (chi0q_off + chiq_aux_off)
+    floor = max(chi0q_off, _node_total("sde", "off", r=1), _node_total("local", "off", r=1))
+    assert floor < chiq_aux_off  # sanity: chiq_aux is the heaviest of the three here
+    budget = 0.5 * (floor + chiq_aux_off)
     fake_system(int(budget / 0.9))
     dgamore_main.autodetect_memory_settings(_mock_comm())
     assert config.memory.save_memory_for_chi0q is False  # single-rank peak fits the node
@@ -120,7 +123,7 @@ def test_more_ranks_per_node_raise_the_distributed_node_total(fake_system):
     one = _node_total("chiq_aux", "off", r=1)
     two = _node_total("chiq_aux", "off", r=2)
     assert two > one  # distributed block counted r times (minus the one-copy giwk credit)
-    budget = 0.5 * (one + two)  # fits at 1 rank, overflows at 2
+    budget = max(0.5 * (one + two), 1.01 * _node_total("local", "off", r=1))  # fits at 1 rank, overflows at 2
     avail = int(budget / 0.9)
 
     fake_system(avail)
@@ -345,3 +348,17 @@ def test_dgamore_excludes_osc_ucx_before_mpi_init():
     src = open(dgamore_main.__file__, encoding="utf-8").read()
     assert 'os.environ.setdefault("OMPI_MCA_osc", "^ucx")' in src
     assert src.index('os.environ.setdefault("OMPI_MCA_osc", "^ucx")') < src.index("from mpi4py import MPI")
+
+
+def test_local_step_overflow_raises_before_the_flag_loop(fake_system, monkeypatch):
+    """A budget below the flag-less local single peak raises MemoryError naming the local Schwinger-Dyson step
+    (a large shell box makes the rank-0 local step the dominant requirement)."""
+    monkeypatch.setattr(config.box, "niv_full", 100)
+    params = {**FIXTURE_PARAMS, "niv_full": 100, "niv_cut": 50}  # niv_cut = min(10 + 100 + 10, niv_dmft=50)
+    peaks = estimate_peaks(**params, n_ranks=1, with_eliashberg=False)
+    totals = {k: bp.baseline + bp.off_distributed + bp.off_single for k, bp in peaks.items()}
+    local = totals.pop("local")
+    assert max(totals.values()) < 0.9 * local  # sanity: every other requirement fits at this budget
+    fake_system(int(0.95 * local / 0.9))
+    with pytest.raises(MemoryError, match="local Schwinger-Dyson"):
+        dgamore_main.autodetect_memory_settings(_mock_comm())
