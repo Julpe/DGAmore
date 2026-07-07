@@ -83,6 +83,93 @@ def _j_conjugate(mat: np.ndarray) -> np.ndarray:
     return np.einsum("abcdwvp->cdabwvp", mat)[..., ::-1, ::-1]
 
 
+def test_crossed_term_reuses_direct_vertex_via_index_shuffles():
+    """The flipped-vertex contraction Gamma_flip[K] @ gap_flip[K] (Gamma_flip = momentum-flip + v'-flip + adcb of
+    the direct vertex, sign-folded) must equal the K-flipped, row-orbital-swapped image of the DIRECT vertex applied
+    to the p-flipped gap: sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]] - the identity that lets the matvec drop
+    the second stored vertex."""
+    from dgamore.n_point_base import FrequencyNotation
+
+    rng = np.random.default_rng(37)
+    nqx, nqy, nqz, o, n2 = 3, 4, 2, 2, 4
+    shape = (nqx, nqy, nqz, o, o, o, o, n2, n2)
+    gam = FourPoint(
+        rng.standard_normal(shape) + 1j * rng.standard_normal(shape),
+        SpinChannel.SING,
+        (nqx, nqy, nqz),
+        0,
+        2,
+        True,
+        True,
+        False,
+        FrequencyNotation.PP,
+    )
+    gap_gg = rng.standard_normal((nqx, nqy, nqz, o, o, n2)) + 1j * rng.standard_normal((nqx, nqy, nqz, o, o, n2))
+    gap_gg = gap_gg.astype(np.complex64)
+    for sign in (1.0, -1.0):
+        flipped = gam.flip_momentum_axis().flip_frequency_axis(-1, False).permute_orbitals("abcd->adcb", False)
+        flipped_mm = _gamma_to_matmul_layout(flipped.permute_orbitals("abcd->badc", False).mat) * sign
+        gap_gg_flipped = np.roll(np.flip(gap_gg, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+        ref = _apply_gamma_pp(flipped_mm, gap_gg_flipped, o)
+
+        direct_mm = _gamma_to_matmul_layout(gam.copy().permute_orbitals("abcd->badc", False).mat)
+        crossed = _apply_gamma_pp(direct_mm, np.flip(gap_gg, axis=-1), o)
+        crossed = sign * np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+        assert np.allclose(crossed, ref, atol=1e-4)
+
+
+def test_transform_vertex_q_frequencies_w0_matches_untrimmed_reference():
+    """The trimmed-bosonic-window pp transform must equal the untrimmed reference gather (full niw restoration plus
+    the omega = v - v' selection over wn(niw)) for niw far larger than the read window 2*niv_pp - 1."""
+    from dgamore.eliashberg_solver import transform_vertex_q_frequencies_w0
+    from dgamore.matsubara_frequencies import MFHelper
+
+    rng = np.random.default_rng(33)
+    o, nqi, niw, niv, niv_pp = 2, 2, 9, 4, 2
+    config.lattice.q_grid = bz.KGrid((nqi, 1, 1), symmetries=[])
+    shape = (nqi, o, o, o, o, niw + 1, 2 * niv, 2 * niv)
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    vertex = FourPoint(mat, SpinChannel.DENS, (nqi, 1, 1), 1, 2, False, True, True)
+
+    ref_v = (
+        vertex.copy()
+        .cut_niv(niv_pp)
+        .to_full_niw_range()
+        .permute_orbitals("abcd->adcb", copy=False)
+        .flip_frequency_axis(-1, False)
+    )
+    vn = MFHelper.vn(niv_pp)
+    omega = vn[:, None] - vn[None, :]
+    ref = np.zeros((*ref_v.current_shape[:-3], 2 * niv_pp, 2 * niv_pp), dtype=ref_v.mat.dtype)
+    for idx, w in enumerate(MFHelper.wn(niw)):
+        ref[..., omega == w] = -ref_v.mat[..., idx, omega == w]
+
+    out = transform_vertex_q_frequencies_w0(vertex, niv_pp)
+    assert np.array_equal(out.mat, ref)
+
+
+def test_full_vertex_first_term_restructure_matches_original_expression():
+    """The eager-rebound first term of the full ladder vertex, F_1 = -beta^2 (chi0^-1 chi* chi0^-1) plus beta^2
+    chi0^-1 added on the fermionic diagonal, must equal the original single-expression form
+    beta^2 (chi0^-1 delta - chi0^-1 chi* chi0^-1) within complex64 rounding, without mutating the bubble."""
+    rng = np.random.default_rng(31)
+    o, nqi, nw, niv, beta = 2, 3, 2, 2, 12.5
+    config.sys.beta = beta
+    aux_shape = (nqi, o, o, o, o, nw, 2 * niv, 2 * niv)
+    aux_mat = rng.standard_normal(aux_shape) + 1j * rng.standard_normal(aux_shape)
+    chi_aux = FourPoint(aux_mat, SpinChannel.DENS, (nqi, 1, 1), 1, 2, False, True, True)
+    chi0_shape = (nqi, o, o, o, o, nw, 2 * niv)
+    chi0_mat = rng.standard_normal(chi0_shape) + 1j * rng.standard_normal(chi0_shape)
+    gchi0_inv = FourPoint(chi0_mat, SpinChannel.NONE, (nqi, 1, 1), 1, 1, False, True, True)
+    chi0_before = gchi0_inv.mat.copy()
+    ref = (gchi0_inv - gchi0_inv @ chi_aux.copy() @ gchi0_inv).scale(beta**2)
+    new = gchi0_inv @ chi_aux
+    new = new @ gchi0_inv
+    new = new.scale(-(beta**2)).add_on_vn_diagonal(gchi0_inv, factor=beta**2)
+    assert np.allclose(new.mat, ref.mat, atol=0.05)
+    assert np.array_equal(gchi0_inv.mat, chi0_before)
+
+
 def test_local_gamma_ud_pp_w0_matches_b26_for_single_band():
     """For one band and crossing-symmetric chi the J-decorated BSE inversion is identical to the old flipped-bubble
     B.26 form, locking backwards compatibility of the single-orbital results."""

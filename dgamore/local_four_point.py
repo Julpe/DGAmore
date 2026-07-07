@@ -370,7 +370,11 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
     def invert(self, copy: bool = True):
         r"""
         Inverts the object in compound-index (matrix) space. The result is always returned in the half bosonic
-        frequency range to save memory.
+        frequency range to save memory. A ph object with a **single** fermionic dimension is block-diagonal in
+        :math:`\nu`, so it is inverted per :math:`(\omega, \nu)` orbital block and **keeps one fermionic
+        dimension** (the inverse of a block-diagonal matrix is block-diagonal); the former route diagonally
+        extended it and dense-inverted the whole compound matrix - :math:`(2 n_{\nu})^2` more flops and a full
+        two-fermion block for the same information.
 
         :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
         :return: The inverted :class:`LocalFourPoint` in the half niw range.
@@ -379,7 +383,18 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         if copy:
             return self.copy().invert(copy=False)
 
-        self.to_half_niw_range().to_compound_indices()
+        self.to_half_niw_range()
+        if self.num_vn_dimensions == 1 and self.frequency_notation == FrequencyNotation.PH:
+            n = self.n_bands
+            w_dim, v_dim = self.current_shape[-2], self.current_shape[-1]
+            # [o1, o2, o3, o4, w, v] -> [w, v, (o1, o2), (o4, o3)] (the compound pairing) and back
+            mat = self.mat.transpose(4, 5, 0, 1, 3, 2).reshape(w_dim, v_dim, n * n, n * n)
+            mat = np.linalg.inv(mat)
+            self.mat = mat.reshape(w_dim, v_dim, n, n, n, n).transpose(2, 3, 5, 4, 0, 1)
+            self.update_original_shape()
+            return self
+
+        self.to_compound_indices()
         self.mat = np.linalg.inv(self.mat)
         return self.to_full_indices()
 
@@ -538,17 +553,21 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
         return LocalFourPoint(result_mat, self.channel, 1, 2, False, True, self.frequency_notation)
 
-    def add(self, other):
+    def add(self, other, copy: bool = True):
         """
         Adds ``other`` to this object (operator ``+``); see :meth:`_add` for the accepted operands and the niw-range
         handling.
 
         :param other: A :class:`LocalFourPoint`, :class:`LocalInteraction`, numpy array, or number.
-        :return: The sum (a new :class:`LocalFourPoint`, or a raw numpy array for a non-local :class:`Interaction`).
+        :param copy: If True (default), return a new :class:`LocalFourPoint`; if False, accumulate into ``self`` in
+            place (only supported for conforming :class:`LocalFourPoint` and :class:`LocalInteraction` operands,
+            see :meth:`_add`).
+        :return: The sum (a new :class:`LocalFourPoint`, ``self`` when ``copy=False``, or a raw numpy array for a
+            non-local :class:`Interaction`).
         """
-        return self._add(other)
+        return self._add(other, copy=copy)
 
-    def _add(self, other, subtract: bool = False):
+    def _add(self, other, subtract: bool = False, copy: bool = True):
         """
         Helper method that allows for addition of LocalFourPoint objects and other LocalFourPoint or LocalInteraction
         objects. Additions with numpy arrays, floats, ints or complex numbers are also supported.
@@ -558,12 +577,26 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
         :param other: A :class:`LocalFourPoint`, :class:`LocalInteraction`, numpy array, or number.
         :param subtract: If True, subtract ``other`` instead of adding it (used by :meth:`sub` to avoid a negated copy).
+        :param copy: If True (default), return a new :class:`LocalFourPoint`; if False, accumulate the result into
+            ``self.mat`` in place and return ``self`` (no out-of-place result block). The in-place branch is
+            supported for a local :class:`LocalInteraction` operand (broadcast accumulate) and for a
+            :class:`LocalFourPoint` operand whose bosonic and fermionic dimension counts already match ``self``
+            (it refuses to diagonally extend either operand).
         :return: The sum. For a non-local :class:`Interaction` operand a raw numpy array is returned (to avoid a
-            dependency on the :class:`FourPoint` class); otherwise a new :class:`LocalFourPoint`.
-        :raises ValueError: If ``other`` has an unsupported type, or the bosonic-frequency counts do not match.
+            dependency on the :class:`FourPoint` class); otherwise a new :class:`LocalFourPoint` (or ``self`` when
+            ``copy=False``).
+        :raises ValueError: If ``other`` has an unsupported type, the bosonic-frequency counts do not match, or
+            ``copy=False`` would have to diagonally extend an operand.
+        :raises NotImplementedError: If ``copy=False`` is requested for a scalar/array/non-local operand.
         """
         if not isinstance(other, (LocalFourPoint, LocalInteraction, np.ndarray, float, int, complex)):
             raise ValueError(f"Operations '+/-' for {type(self)} and {type(other)} not supported.")
+
+        if not copy and (not isinstance(other, (LocalFourPoint, LocalInteraction)) or isinstance(other, Interaction)):
+            raise NotImplementedError(
+                "In-place addition/subtraction (copy=False) is only supported for LocalFourPoint or "
+                "LocalInteraction operands."
+            )
 
         op = np.subtract if subtract else np.add
 
@@ -590,6 +623,10 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
                     else op(self.mat[None, None, None, ...], other_mat)
                 )
 
+            if not copy:
+                # broadcast-accumulate the (small) interaction into self in place: no full-size result block
+                op(self.mat, other_mat, out=self.mat)
+                return self
             return LocalFourPoint(
                 op(self.mat, other_mat),
                 self.channel,
@@ -612,6 +649,11 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         channel = self.channel if self.channel != SpinChannel.NONE else other.channel
 
         if self.num_vn_dimensions == 0 or other.num_vn_dimensions == 0:
+            if not copy:
+                raise ValueError(
+                    "In-place addition/subtraction (copy=False) is not supported when a fermionic axis has to be "
+                    "broadcast (an operand without fermionic frequency dimensions)."
+                )
             self_mat = self.mat
             other_mat = other.mat
 
@@ -640,6 +682,18 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
         other, self_extended, other_extended = self._align_frequency_dimensions_for_operation(other)
 
+        if not copy:
+            if self_extended or other_extended:
+                raise ValueError(
+                    "In-place addition/subtraction (copy=False) cannot diagonally extend an operand; both must "
+                    "have the same number of fermionic frequency dimensions."
+                )
+            op(self.mat, other.mat, out=self.mat)
+            self.channel = channel
+            if other_full_niw_range:
+                other = other.to_full_niw_range()
+            return self
+
         result = LocalFourPoint(
             op(self.mat, other.mat),
             channel,
@@ -658,7 +712,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         other = self._revert_frequency_dimensions_after_operation(other, other_extended, self_extended)
         return result
 
-    def sub(self, other):
+    def sub(self, other, copy: bool = True):
         """
         Helper method that allows for subtraction of LocalFourPoint objects and other LocalFourPoint or LocalInteraction
         objects. Subtractions with numpy arrays, floats, ints or complex numbers are also supported.
@@ -667,10 +721,37 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         Objects will always be returned in the half niw range to save memory.
 
         :param other: A :class:`LocalFourPoint`, :class:`LocalInteraction`, numpy array, or number.
+        :param copy: If True (default), return a new :class:`LocalFourPoint`; if False, subtract into ``self`` in
+            place and return ``self`` (see :meth:`_add` for the supported operands).
         :return: The difference, implemented as ``self._add(other, subtract=True)`` (see :meth:`_add`).
         :raises ValueError: Propagated from :meth:`_add` for unsupported operands.
         """
-        return self._add(other, subtract=True)
+        return self._add(other, subtract=True, copy=copy)
+
+    def add_on_vn_diagonal(self, other: "LocalFourPoint", factor: float = 1.0) -> "LocalFourPoint":
+        r"""
+        Adds ``factor * other`` onto the fermionic frequency diagonal of ``self`` in place, i.e.
+        :math:`A^{\omega\nu\nu'}_{1234} \mathrel{+}= f\, \delta_{\nu\nu'}\, B^{\omega\nu}_{1234}`. This is the
+        memory-lean equivalent of ``self.add(other.extend_vn_to_diagonal().scale(factor))``: the diagonally extended
+        block (by far the largest allocation of that pattern) is never materialized, only a 1-vn temporary for the
+        scaled ``other``. A momentum-independent ``other`` broadcasts over the momentum axis of a non-local ``self``.
+        Mutates and returns ``self``.
+
+        :param other: The object holding the diagonal data, with exactly one fermionic frequency dimension.
+        :param factor: Scalar prefactor applied to ``other`` (``self`` is not scaled).
+        :return: ``self`` with the scaled diagonal added.
+        :raises ValueError: If the fermionic dimension counts, bosonic ranges or fermionic box sizes do not match.
+        """
+        if self.num_vn_dimensions != 2 or other.num_vn_dimensions != 1:
+            raise ValueError("Diagonal addition requires two fermionic dimensions on 'self' and one on 'other'.")
+        if self.full_niw_range != other.full_niw_range:
+            raise ValueError("Both objects must be in the same bosonic frequency range.")
+        if self.current_shape[-1] != other.current_shape[-1]:
+            raise ValueError("Fermionic frequency box sizes do not match.")
+
+        diag = np.arange(self.current_shape[-1])
+        self.mat[..., diag, diag] += other.mat if factor == 1.0 else factor * other.mat
+        return self
 
     def permute_orbitals(self, permutation: str = "abcd->abcd", copy: bool = True) -> "LocalFourPoint":
         """
@@ -755,6 +836,22 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
         if copy.frequency_notation == FrequencyNotation.PP:
             return copy
+
+        # the w0 pp map samples only |w| <= 2*min(niw//2, niv) ph slices, so the bosonic axis is trimmed to that
+        # (even, so the map's fermionic box min(niw//2, niv) is preserved) window before to_full_niw_range doubles
+        # it (cut_niw cannot be used here - its no-op guard misjudges half-range objects)
+        w_axis = -(copy.num_vn_dimensions + 1)
+        niw_stored = copy.current_shape[w_axis] // 2 if copy.full_niw_range else copy.current_shape[w_axis] - 1
+        niw_window = min(niw_stored, 2 * min(niw_stored // 2, copy.niv))
+        if niw_window < niw_stored:
+            slicer = [slice(None)] * copy.mat.ndim
+            slicer[w_axis] = (
+                slice(niw_stored - niw_window, niw_stored + niw_window + 1)
+                if copy.full_niw_range
+                else slice(0, niw_window + 1)
+            )
+            copy.mat = copy.mat[tuple(slicer)].copy()
+            copy.update_original_shape()
 
         copy = copy.to_full_niw_range()
 

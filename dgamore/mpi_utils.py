@@ -1097,7 +1097,6 @@ def gather_full_ibz_for_vslice(
     mpi_dist_v._my_size = sizes[mpi_dist_v.my_rank]
 
     comm = mpi_dist_irrq.comm
-    rank = mpi_dist_irrq.my_rank
     size = mpi_dist_irrq.mpi_size
     dtype = gamma_r.mat.dtype
 
@@ -1128,7 +1127,10 @@ def gather_full_ibz_for_vslice(
 
             for chunk_idx, i in enumerate(range(0, q_src_count, max_q_recv)):
                 j = min(q_src_count, i + max_q_recv)
-                tag = (r_src * size + rank) + chunk_idx
+                # MPI matching is (source, tag)-scoped, so the tag only needs to distinguish the chunks of ONE
+                # pair transfer; a rank-dependent base (the former ``r_src * size + rank``) overflows the
+                # MPI-guaranteed minimum ``MPI_TAG_UB`` (32767) above ~180 ranks.
+                tag = 700 + chunk_idx
                 reqs.append(comm.Irecv(full_ibz_mat[q_offset + i : q_offset + j], source=r_src, tag=tag))
 
     # B. Post Sends
@@ -1143,7 +1145,7 @@ def gather_full_ibz_for_vslice(
 
         for chunk_idx, i in enumerate(range(0, mpi_dist_irrq.my_size, max_q_send)):
             j = min(mpi_dist_irrq.my_size, i + max_q_send)
-            tag = (rank * size + r_dst) + chunk_idx
+            tag = 700 + chunk_idx  # rank-independent, see the matching receive above
 
             # Payload must be contiguous for Send
             payload = np.ascontiguousarray(gamma_r.mat[i:j, ..., v_dst_slice, :])

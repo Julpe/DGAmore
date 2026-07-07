@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
-import scipy as sp
 from mpi4py import MPI as RealMPI
 
 from dgamore import config, eliashberg_solver, dga_io
@@ -180,9 +179,16 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup):
             return lam.real[order], vec[:, order]
 
         channel = gamma_r_pp.channel.value
+        # the solver consumes the passed vertex (in-place BZ map, fft, sign fold, free), so the momentum-space
+        # full-BZ vertex is captured from a copy before the solve
+        gamma_full = (
+            gamma_r_pp.copy().map_to_full_bz(config.lattice.q_grid, config.lattice.q_grid.nk).decompress_q_dimension()
+        )
+        captured[channel] = {"gamma": gamma_full.mat.copy()}
+        gamma_full.free()
         with patch("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", side_effect=fake_eigsh):
             out = real_solver(gamma_r_pp, gchi0_q0_pp, ranks)
-        captured[channel] = {"gamma": gamma_r_pp.mat.copy(), "dense": dense_holder[0]}
+        captured[channel]["dense"] = dense_holder[0]
         return out
 
     with patch("dgamore.eliashberg_solver.solve_eliashberg_lanczos", side_effect=capture_solver):
@@ -198,9 +204,7 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup):
     norm = 0.5 / nq_tot / beta
 
     for ch, sign in (("sing", 1.0), ("trip", -1.0)):
-        # the solver fft's the passed object in place, so undo the transform to recover the momentum-space vertex
-        gam = sp.fft.ifftn(captured[ch]["gamma"], axes=(0, 1, 2)).astype(np.complex128)
-        gam = gam.reshape(nq_tot, o, o, o, o, n2, n2)
+        gam = captured[ch]["gamma"].astype(np.complex128).reshape(nq_tot, o, o, o, o, n2, n2)
         dense = captured[ch]["dense"].astype(np.complex128)
 
         gcm = np.transpose(gam, (0, 1, 4, 3, 2, 5, 6))[kncross][..., ::-1]

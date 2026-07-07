@@ -83,11 +83,45 @@ def get_hartree_fock(
                 [np.roll(config.sys.occ_k[..., d, c], [-i for i in q], axis=(0, 1, 2)) for q in q_list]
             )
             occ_qk_dc = occ_qk_dc.reshape(len(q_list), nk_tot)
-            contribution = u_slice[:, None, :, :] * occ_qk_dc[:, :, None, None]
-            fock += contribution.sum(axis=0)
+            # contract over q directly: the broadcast product materialized a full [q, k, o1, o2] block
+            fock += np.einsum("qab,qk->kab", u_slice, occ_qk_dc, optimize=True)
 
     fock *= -1.0 / nq_tot
     return hartree[None, ..., None], fock[..., None]  # [k,o1,o2,v]
+
+
+def create_inverse_auxiliary_chi_r_q(gamma_r: LocalFourPoint, gchi0_q_inv: FourPoint, u_r: Interaction) -> FourPoint:
+    r"""
+    Assembles the Bethe-Salpeter matrix whose inversion yields the auxiliary susceptibility (Eq. (3.60) in my
+    master's thesis),
+
+    .. math:: M^{q\nu\nu'}_{1234} = (\chi_{0;1234}^{q\nu})^{-1}\delta_{\nu\nu'} + (\Gamma_{r;1234}^{\omega\nu\nu'}-\mathcal{U}_{r;1234}^{q})/\beta^2,
+
+    in a **single** two-fermion block: the result is broadcast-filled with the scaled local vertex over the momentum
+    axis, the inverse bubble is added on the fermionic frequency diagonal in place (see
+    :meth:`~dgamore.local_four_point.LocalFourPoint.add_on_vn_diagonal`) and the channel interaction is subtracted
+    in place. The former add/extend/subtract chain held two of these blocks alive at its peak (the diagonally
+    extended bubble plus the out-of-place result). Neither input is mutated.
+
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` (full or half bosonic range; read via a
+        half-range view).
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (half bosonic range, one fermionic dimension).
+    :param u_r: The channel-projected total interaction :math:`\mathcal{U}_{r}^{q} = U_{r} + V_{r}^{q}`.
+    :return: The assembled matrix :math:`M^{q}` as a :class:`FourPoint` (half niw range, two fermionic dimensions).
+    """
+    beta = config.sys.beta
+    gamma_mat = gamma_r.mat
+    if gamma_r.full_niw_range:
+        gamma_mat = gamma_mat[..., gamma_mat.shape[-3] // 2 :, :, :]
+
+    out = np.empty((gchi0_q_inv.current_shape[0],) + gamma_mat.shape, dtype=gchi0_q_inv.mat.dtype)
+    np.multiply(gamma_mat, 1.0 / beta**2, out=out)
+
+    return (
+        FourPoint(out, gamma_r.channel, gchi0_q_inv.nq, 1, 2, False, gchi0_q_inv.full_niv_range, True)
+        .add_on_vn_diagonal(gchi0_q_inv)
+        .sub(u_r.scale(1.0 / beta**2, copy=True), copy=False)
+    )
 
 
 def create_auxiliary_chi_r_q(
@@ -96,7 +130,9 @@ def create_auxiliary_chi_r_q(
     r"""
     Returns the auxiliary susceptibility, see Eq. (3.60) in my master's thesis,
 
-    .. math:: \chi^{*;q\nu\nu'}_{r;abcd} = ((\chi_{0;abcd}^{q\nu})^{-1} + (\Gamma_{r;abcd}^{\omega\nu\nu'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}.
+    .. math:: \chi^{*;q\nu\nu'}_{r;abcd} = ((\chi_{0;abcd}^{q\nu})^{-1} + (\Gamma_{r;abcd}^{\omega\nu\nu'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1},
+
+    with the matrix to invert assembled in a single block by :func:`_assemble_bse_matrix`.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
@@ -104,10 +140,8 @@ def create_auxiliary_chi_r_q(
     :param v_nonloc: The non-local interaction :math:`V^{q}`.
     :return: The momentum-dependent auxiliary susceptibility :math:`\chi^{*;q}_{r}` as a :class:`FourPoint`.
     """
-    return (
-        (gchi0_q_inv + 1.0 / config.sys.beta**2 * gamma_r)
-        - 1.0 / config.sys.beta**2 * (v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel))
-    ).invert(False)
+    u_r = v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel)
+    return create_inverse_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_r).invert(False)
 
 
 def create_auxiliary_chi_r_q_sum_v1(
@@ -126,10 +160,8 @@ def create_auxiliary_chi_r_q_sum_v1(
     :param v_nonloc: The non-local interaction :math:`V^{q}`.
     :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q}_{r}` as a :class:`FourPoint`.
     """
-    return (
-        (gchi0_q_inv + 1.0 / config.sys.beta**2 * gamma_r)
-        - 1.0 / config.sys.beta**2 * (v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel))
-    ).invert_and_sum_over_last_vn(config.sys.beta)
+    u_r = v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel)
+    return create_inverse_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_r).invert_and_sum_over_last_vn(config.sys.beta)
 
 
 def create_auxiliary_chi_r_q_sum_v2(
@@ -157,14 +189,10 @@ def create_auxiliary_chi_r_q_sum_v2(
     my_irr_q_list = irrk_q_list[mpi_dist_irrq.my_slice]
     chi_r_q_sum_mat = np.zeros_like(gchi0_q_inv.mat)
 
+    u_r = v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel)
     for idx in range(len(my_irr_q_list)):
         chi_r_q_sum_mat[idx] = (
-            (
-                (gchi0_q_inv.filter_q_index(idx) + 1.0 / config.sys.beta**2 * gamma_r)
-                - 1.0
-                / config.sys.beta**2
-                * (v_nonloc.as_channel(gamma_r.channel).filter_q_index(idx) + u_loc.as_channel(gamma_r.channel))
-            )
+            create_inverse_auxiliary_chi_r_q(gamma_r, gchi0_q_inv.filter_q_index(idx), u_r.filter_q_index(idx))
             .invert_and_sum_over_last_vn(config.sys.beta)
             .mat
         )
@@ -196,14 +224,10 @@ def create_auxiliary_chi_r_q_sum_v3(
     my_irr_q_list = irrk_q_list[mpi_dist_irrq.my_slice]
     chi_r_q_sum_mat = np.zeros_like(gchi0_q_inv.mat)
 
+    u_r = v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel)
     for idx in range(len(my_irr_q_list)):
         chi_r_q_sum_mat[idx] = (
-            (
-                (gchi0_q_inv.filter_q_index(idx) + 1.0 / config.sys.beta**2 * gamma_r)
-                - 1.0
-                / config.sys.beta**2
-                * (v_nonloc.as_channel(gamma_r.channel).filter_q_index(idx) + u_loc.as_channel(gamma_r.channel))
-            )
+            create_inverse_auxiliary_chi_r_q(gamma_r, gchi0_q_inv.filter_q_index(idx), u_r.filter_q_index(idx))
             .invert_and_sum_over_last_vn_v2(config.sys.beta)
             .mat
         )
@@ -365,7 +389,10 @@ def calculate_kernel_r_q(
     kernel = vrg_q_r - vrg_q_r @ u_r @ chi_phys_q_r
 
     if vrg_q_r.channel == SpinChannel.MAGN:
-        kernel.sub(FourPoint.identity_like(kernel).scale(2.0 / 3.0), copy=False)
+        # subtract 2/3 directly on the compound-identity positions (o1 == o4, o2 == o3, every frequency) instead of
+        # materializing a full kernel-sized identity block via FourPoint.identity_like
+        orb = np.arange(kernel.n_bands)
+        kernel.mat[:, orb[:, None], orb[None, :], orb[None, :], orb[:, None], ...] -= 2.0 / 3.0
 
     return u_r @ kernel
 
@@ -1043,23 +1070,6 @@ def calculate_sigma_from_kernel_fft(
     return calculate_sigma_from_kernel_fft_cpu(mpi_dist, kernel, giwk, niw_index_w_pairs, node_comm)
 
 
-def _map_kernel_to_full_bz(
-    kernel: FourPoint, mpi_dist_irrk: MpiDistributor, mpi_dist_fullbz: MpiDistributor
-) -> FourPoint:
-    """
-    Maps the self-energy kernel from the irreducible to the full Brillouin zone, choosing the gather/scatter routine
-    or the fully distributed peer-to-peer routine according to ``config.memory.save_memory_for_chiq_aux``.
-
-    :param kernel: The self-energy kernel on the irreducible BZ.
-    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points.
-    :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
-    :return: The kernel distributed over the full BZ.
-    """
-    if not config.memory.save_memory_for_chiq_aux:
-        return mpi_utils.map_irrbz_fullbz(kernel, mpi_dist_irrk, mpi_dist_fullbz)
-    return mpi_utils.exchange_and_map_irrbz_fullbz(kernel, mpi_dist_irrk, mpi_dist_fullbz)
-
-
 def _run_fft_sde_pass(
     kernel_src: FourPoint,
     mpi_dist_irrk: MpiDistributor,
@@ -1092,11 +1102,9 @@ def _run_fft_sde_pass(
         the R-space Green's function is built once per node in a shared-memory window instead of once per rank.
     :return: The rank-local R-space :class:`SelfEnergy` of this pass.
     """
-    # ``_map_kernel_to_full_bz`` may mutate-and-return its argument or return a fresh object, so free the source
-    # only when a distinct object came back.
-    kernel_full = _map_kernel_to_full_bz(kernel_src, mpi_dist_irrk, mpi_dist_fullbz)
-    if kernel_full is not kernel_src:
-        kernel_src.free()
+    # the distributed p2p exchange always returns a fresh full-BZ object, so the irreducible source is freed
+    kernel_full = mpi_utils.exchange_and_map_irrbz_fullbz(kernel_src, mpi_dist_irrk, mpi_dist_fullbz)
+    kernel_src.free()
 
     if negative_w:
         kernel_neg = kernel_full.to_negative_niw_range()
@@ -1222,6 +1230,37 @@ def read_last_n_sigmas_from_files(n: int, output_path: str = "./", previous_sc_p
             .mat
         )
     return sigmas
+
+
+def _load_node_shared_local_vertex(node_comm, path: str, channel: SpinChannel, transform=None) -> tuple:
+    r"""
+    Loads a local four-point vertex from file **once per node** into an MPI shared-memory window (see
+    :func:`dgamore.mpi_utils.build_node_shared_array`): the node root reads the file (and applies ``transform``),
+    every other rank maps the same physical buffer read-only. Without a node communicator each rank loads
+    privately (the previous behavior). At production box sizes these local vertices are multi-GB and were held
+    once **per rank** before - the largest replicated objects of the kernel section after ``giwk_full``.
+
+    :param node_comm: The node-local communicator (or ``None`` for a private per-rank load).
+    :param path: Path to the ``.npy`` file.
+    :param channel: Spin channel of the loaded vertex.
+    :param transform: Optional callable applied to the loaded :class:`LocalFourPoint` on the node root before the
+        array is placed in the window (e.g. an orbital permute + scale).
+    :return: The tuple ``(vertex, win)``; free the window via :func:`_free_shared_window` once every rank is done
+        reading (``win`` is ``None`` on the private path, then ``vertex.free()`` applies as before).
+    """
+
+    def _load() -> np.ndarray:
+        obj = LocalFourPoint.load(path, channel)
+        if transform is not None:
+            obj = transform(obj)
+        return obj.mat
+
+    if node_comm is None or not config.memory.use_shared_memory_common_obj:
+        # ascontiguousarray since a pure orbital-permute transform returns a strided view of the loaded array
+        return LocalFourPoint(np.ascontiguousarray(_load()), channel, 1, 2, False, True), None
+
+    mat, win = mpi_utils.build_node_shared_array(node_comm, _load)
+    return LocalFourPoint(mat, channel, 1, 2, False, True), win
 
 
 def _build_giwk_full(comm: MPI.Comm, sigma: SelfEnergy, mu: float, ek: np.ndarray, beta: float) -> tuple:
@@ -1364,6 +1403,17 @@ def calculate_self_energy_q(
 
     mu_history = _init_mu_history(starting_iter)
 
+    # rank 0 keeps the accelerated-mixing self-energy history in memory (seeded once from the saved files for
+    # resumed runs): every rank used to re-read and re-interpolate the last n sigma files each iteration -
+    # identical data on every rank, pure redundant IO at scale
+    sigma_history = None
+    if comm.rank == 0 and config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson"):
+        sigma_history = read_last_n_sigmas_from_files(
+            config.self_consistency.mixing_history_length,
+            config.output.output_path,
+            config.self_consistency.previous_sc_path,
+        )
+
     niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
     sigma_dmft_full = sigma_dmft.copy()
 
@@ -1407,7 +1457,7 @@ def calculate_self_energy_q(
         fock = mpi_dist_fullbz.allreduce(fock)
         logger.info("Calculated Hartree and Fock terms.")
 
-        giwk_full, giwk_win, giwk_node_comm = _build_giwk_full(
+        giwk_full, giwk_win, shared_node_comm = _build_giwk_full(
             comm, sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek(), config.sys.beta
         )
 
@@ -1433,6 +1483,7 @@ def calculate_self_energy_q(
                 config.lattice.k_grid,
                 config.sys.beta,
                 config.logger,
+                node_comm=shared_node_comm,
             )
 
         if config.eliashberg.perform_eliashberg:
@@ -1443,19 +1494,24 @@ def calculate_self_energy_q(
         # per-node window and the large full-niv window is freed; the cut giwk stays one copy per node through the SDE.
         old_giwk_win = giwk_win
         giwk_full, giwk_win = _cut_and_reshare_giwk(
-            giwk_full, giwk_win, giwk_node_comm, config.box.niv_core + config.box.niw_core
+            giwk_full, giwk_win, shared_node_comm, config.box.niv_core + config.box.niw_core
         )
-        _free_shared_window(old_giwk_win, giwk_node_comm)
+        _free_shared_window(old_giwk_win, shared_node_comm)
 
         sigma_old = sigma_old.cut_niv(config.box.niv_core)
 
-        f_dc_loc = (
-            LocalFourPoint.load(os.path.join(config.output.output_path, "f_magn_loc.npy"))
-            .permute_orbitals("abcd->cbad")
-            .scale(2.0)
+        # the local vertices are identical on every rank, so they are loaded once per node into shared windows
+        f_dc_loc, f_dc_win = _load_node_shared_local_vertex(
+            shared_node_comm,
+            os.path.join(config.output.output_path, "f_magn_loc.npy"),
+            SpinChannel.NONE,
+            transform=lambda obj: obj.permute_orbitals("abcd->cbad", copy=False).scale(2.0),
         )
         kernel = calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc).scale(-1.0)
-        f_dc_loc.free()
+        f_dc_loc.mat = None
+        if f_dc_win is None:
+            f_dc_loc.free()
+        _free_shared_window(f_dc_win, shared_node_comm)
         logger.info("Calculated double-counting kernel.")
 
         gchi0_q_full_sum = gchi0_q.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
@@ -1463,7 +1519,9 @@ def calculate_self_energy_q(
         gchi0_q.free()
         logger.log_memory_usage("Gchi0_q_core", gchi0_q_core, comm.size)
 
-        gchi0_q_core_inv = gchi0_q_core.copy().invert(False)
+        gchi0_q_core_sum = gchi0_q_core.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
+        gchi0_q_core_inv = gchi0_q_core.invert(copy=False)
+        del gchi0_q_core
         logger.log_memory_usage("Gchi0_q_inv", gchi0_q_core_inv, comm.size)
 
         if current_iter == 1:
@@ -1472,11 +1530,8 @@ def calculate_self_energy_q(
         if config.eliashberg.perform_eliashberg:
             gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
 
-        gchi0_q_core_sum = gchi0_q_core.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
-        gchi0_q_core.free()
-
-        gamma_dens = LocalFourPoint.load(
-            os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
+        gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
+            shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
         )
         kernel.add(
             calculate_sigma_kernel_r_q(
@@ -1484,12 +1539,15 @@ def calculate_self_energy_q(
             ),
             copy=False,
         )
-        gamma_dens.free()
+        gamma_dens.mat = None
+        if gamma_dens_win is None:
+            gamma_dens.free()
+        _free_shared_window(gamma_dens_win, shared_node_comm)
         mpi_dist_irrk.barrier()
         logger.info("Calculated kernel for density channel.")
 
-        gamma_magn = LocalFourPoint.load(
-            os.path.join(config.output.output_path, "gamma_magn_loc.npy"), SpinChannel.MAGN
+        gamma_magn, gamma_magn_win = _load_node_shared_local_vertex(
+            shared_node_comm, os.path.join(config.output.output_path, "gamma_magn_loc.npy"), SpinChannel.MAGN
         )
         kernel.add(
             calculate_sigma_kernel_r_q(
@@ -1500,7 +1558,10 @@ def calculate_self_energy_q(
         gchi0_q_core_inv.free()
         gchi0_q_full_sum.free()
         gchi0_q_core_sum.free()
-        gamma_magn.free()
+        gamma_magn.mat = None
+        if gamma_magn_win is None:
+            gamma_magn.free()
+        _free_shared_window(gamma_magn_win, shared_node_comm)
         logger.info("Calculated kernel for magnetic channel.")
 
         logger.info("Starting calculation of DGA self-energy.")
@@ -1521,7 +1582,7 @@ def calculate_self_energy_q(
             [(i, i) for i in range(niw + 1)],
             use_gpu,
             negative_w=False,
-            node_comm=giwk_node_comm,
+            node_comm=shared_node_comm,
         )
         sigma_neg = _run_fft_sde_pass(
             kernel_irr,
@@ -1531,7 +1592,7 @@ def calculate_self_energy_q(
             [(i, -i) for i in range(1, niw + 1)],
             use_gpu,
             negative_w=True,
-            node_comm=giwk_node_comm,
+            node_comm=shared_node_comm,
         )
 
         sigma_new.mat += sigma_neg.mat  # accumulate the rank-local R-space partial self-energies (in place)
@@ -1549,7 +1610,7 @@ def calculate_self_energy_q(
         # on every rank, then release the per-node cut-giwk window and its node communicator.
         if giwk_win is not None:
             giwk_full.mat = None
-        _release_shared_giwk(giwk_win, giwk_node_comm)
+        _release_shared_giwk(giwk_win, shared_node_comm)
 
         sigma_new = sigma_new + hartree + fock
         logger.info("Full non-local self-energy calculated.")
@@ -1563,7 +1624,16 @@ def calculate_self_energy_q(
         logger.info("Applying mixing strategy to the self-energy.")
         sigma_old = sigma_old.concatenate_self_energies(sigma_dmft)
         history_cap = None if release_iter is None else max(0, current_iter - release_iter - 1)
-        sigma_new = apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter, history_cap)
+        # mixing runs on rank 0 only (all ranks computed identical results before) and the mixed sigma is broadcast
+        if comm.rank == 0:
+            sigma_new = apply_mixing_strategy(
+                sigma_new, sigma_old, sigma_dmft, current_iter, history_cap, sigma_history
+            )
+        sigma_new = mpi_dist_fullbz.bcast_npoint(sigma_new)
+        if sigma_history is not None:
+            # the in-memory analogue of what read_last_n_sigmas_from_files reproduced from the file just saved below
+            sigma_history.append(sigma_new.decompress_q_dimension().cut_niv(config.box.niv_core).mat)
+            del sigma_history[: -config.self_consistency.mixing_history_length]
 
         sigma_new = sigma_new.compress_q_dimension()
         sigma_old = sigma_old.compress_q_dimension()
@@ -1680,6 +1750,7 @@ def apply_mixing_strategy(
     sigma_dmft: SelfEnergy,
     current_iter: int,
     history_cap: int | None = None,
+    sigma_history: list | None = None,
 ) -> SelfEnergy:
     """
     Applies the self-energy mixing strategy for the self-consistency loop. Supports linear mixing as well as the
@@ -1694,6 +1765,10 @@ def apply_mixing_strategy(
     :param history_cap: Optional upper bound on the number of history entries used by the accelerated schemes
         (``None`` for no bound). Used to reset the mixing history after the susceptibility-restriction release, so
         the accelerated schemes never extrapolate across the restricted-to-unrestricted discontinuity.
+    :param sigma_history: Optional in-memory self-energy history (core-cut arrays, oldest first, the layout of
+        :func:`read_last_n_sigmas_from_files`). When given, the accelerated schemes read it instead of re-loading
+        and re-interpolating the saved sigma files - the caller (rank 0 of the self-consistency loop) maintains it
+        across iterations, so the per-iteration per-rank file reads disappear.
     :return: The mixed :class:`SelfEnergy` for the next iteration.
     """
     logger = config.logger
@@ -1704,9 +1779,12 @@ def apply_mixing_strategy(
 
     last_results, last_proposals = [], []
     if config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson") and n_hist > 0:
-        last_results = read_last_n_sigmas_from_files(
-            n_hist, config.output.output_path, config.self_consistency.previous_sc_path
-        )
+        if sigma_history is not None:
+            last_results = list(sigma_history[-n_hist:])
+        else:
+            last_results = read_last_n_sigmas_from_files(
+                n_hist, config.output.output_path, config.self_consistency.previous_sc_path
+            )
         sigma_dmft_stacked = np.tile(
             sigma_dmft.cut_niv(config.box.niv_core).mat, (config.lattice.k_grid.nk_tot, 1, 1, 1)
         )
@@ -1714,7 +1792,7 @@ def apply_mixing_strategy(
         last_proposals = [sigma_dmft_stacked] + last_results  # [dmft, s1, ..., s_{n-1}]
         last_results = last_results + [sigma_new.cut_niv(config.box.niv_core).mat]  # [s1,  s2, ..., s_n]
 
-        logger.info(f"Loaded last {n_hist} self-energies from files.")
+        logger.info(f"Using the last {min(n_hist, len(last_results))} self-energies of the mixing history.")
 
     accelerated_mixing_condition = current_iter > n_hist and len(last_results) > n_hist and len(last_proposals) > n_hist
 

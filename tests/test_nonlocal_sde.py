@@ -227,6 +227,123 @@ def test_cut_and_reshare_giwk_shared_single_rank_matches_plain_cut():
     assert np.array_equal(cut.mat, GreensFunction.get_g_full(sigma, 0.3, ek, 10.0).cut_niv(4).mat)
 
 
+def _bse_assembly_inputs(rng, o=2, nqi=3, nw=3, niv=2, beta=12.5):
+    """Builds (gamma [full niw], gchi0_q_inv [half niw, 1 vn], u_loc, v_nonloc) for the BSE-matrix assembly tests."""
+    from dgamore.four_point import FourPoint
+    from dgamore.interaction import Interaction, LocalInteraction
+    from dgamore.local_four_point import LocalFourPoint
+
+    config.sys.beta = beta
+    gamma_shape = (o, o, o, o, 2 * nw - 1, 2 * niv, 2 * niv)
+    gamma_mat = rng.standard_normal(gamma_shape) + 1j * rng.standard_normal(gamma_shape)
+    gamma = LocalFourPoint(gamma_mat, SpinChannel.DENS, 1, 2, True, True)
+    chi0_shape = (nqi, o, o, o, o, nw, 2 * niv)
+    chi0_mat = rng.standard_normal(chi0_shape) + 1j * rng.standard_normal(chi0_shape)
+    gchi0_q_inv = FourPoint(chi0_mat, SpinChannel.NONE, (nqi, 1, 1), 1, 1, False, True, True)
+    u_loc = LocalInteraction(rng.standard_normal((o,) * 4), SpinChannel.NONE)
+    v_nonloc = Interaction(rng.standard_normal((nqi,) + (o,) * 4), SpinChannel.NONE, (nqi, 1, 1), True)
+    return gamma, gchi0_q_inv, u_loc, v_nonloc
+
+
+def _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc):
+    """Evaluates the pre-fusion two-block expression (chi0^-1 + Gamma/beta^2) - (U + V^q)/beta^2 via the object API."""
+    beta = config.sys.beta
+    return (gchi0_q_inv.copy() + 1.0 / beta**2 * gamma.copy()) - 1.0 / beta**2 * (
+        v_nonloc.as_channel(gamma.channel) + u_loc.as_channel(gamma.channel)
+    )
+
+
+def test_assemble_bse_matrix_matches_two_block_expression():
+    """The fused single-block BSE-matrix assembly must be bit-equal to the former add/extend/subtract chain
+    (broadcast gamma fill + diagonal chi0^-1 add + in-place interaction subtract commute elementwise with it)
+    and must leave gamma and gchi0_q_inv untouched."""
+    rng = np.random.default_rng(21)
+    gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
+    gamma_before, chi0_before = gamma.mat.copy(), gchi0_q_inv.mat.copy()
+    ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc)
+    u_r = v_nonloc.as_channel(gamma.channel) + u_loc.as_channel(gamma.channel)
+    fused = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
+    assert np.array_equal(fused.mat, ref.mat)
+    assert fused.channel == SpinChannel.DENS
+    assert not fused.full_niw_range and fused.num_vn_dimensions == 2
+    assert np.array_equal(gamma.mat, gamma_before) and gamma.full_niw_range
+    assert np.array_equal(gchi0_q_inv.mat, chi0_before) and gchi0_q_inv.num_vn_dimensions == 1
+
+
+def test_assemble_bse_matrix_accepts_half_niw_gamma():
+    """A gamma already in the half bosonic range assembles identically to its full-range twin."""
+    rng = np.random.default_rng(22)
+    gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
+    u_r = v_nonloc.as_channel(gamma.channel) + u_loc.as_channel(gamma.channel)
+    full = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
+    half = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma.copy().to_half_niw_range(), gchi0_q_inv, u_r)
+    assert np.array_equal(full.mat, half.mat)
+
+
+def test_create_auxiliary_chi_r_q_sum_v1_matches_explicit_reference():
+    """The fused-assembly v1 auxiliary susceptibility must reproduce the explicit two-block expression followed by
+    the fused invert-and-sum, locking the rewired create_auxiliary_chi_r_q_sum_v1 against the pre-fusion result."""
+    rng = np.random.default_rng(23)
+    gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
+    ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc).invert_and_sum_over_last_vn(config.sys.beta)
+    out = nonlocal_sde.create_auxiliary_chi_r_q_sum_v1(gamma, gchi0_q_inv, u_loc, v_nonloc)
+    assert np.allclose(out.mat, ref.mat, atol=1e-10)
+    assert out.channel == SpinChannel.DENS
+
+
+def test_create_auxiliary_chi_r_q_matches_explicit_reference():
+    """The fused-assembly full inversion variant must reproduce the explicit two-block expression inverted in
+    compound space, locking the rewired create_auxiliary_chi_r_q (also used by the Eliashberg vertex build)."""
+    rng = np.random.default_rng(24)
+    gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
+    ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc).invert(False)
+    out = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc, v_nonloc)
+    assert np.allclose(out.mat, ref.mat, atol=1e-10)
+
+
+def test_calculate_kernel_r_q_matches_identity_like_reference():
+    """The self-energy kernel U_r (gamma - gamma U_r chi - 2/3 identity)_magn must equal the explicit expression
+    built with the full identity_like block, locking the in-place orbital-diagonal subtraction (the identity is
+    nonzero at o1 == o4, o2 == o3 for every frequency); the density channel carries no identity term."""
+    from dgamore.four_point import FourPoint
+
+    rng = np.random.default_rng(25)
+    o, nqi, nw, niv, beta = 2, 3, 3, 2, 12.5
+    config.sys.beta = beta
+    vrg_shape = (nqi, o, o, o, o, nw, 2 * niv)
+    chi_shape = (nqi, o, o, o, o, nw)
+    for channel in (SpinChannel.MAGN, SpinChannel.DENS):
+        vrg = FourPoint(
+            rng.standard_normal(vrg_shape) + 1j * rng.standard_normal(vrg_shape),
+            channel,
+            (nqi, 1, 1),
+            1,
+            1,
+            False,
+            True,
+            True,
+        )
+        chi = FourPoint(
+            rng.standard_normal(chi_shape) + 1j * rng.standard_normal(chi_shape),
+            channel,
+            (nqi, 1, 1),
+            1,
+            0,
+            False,
+            True,
+            True,
+        )
+        u_loc = nonlocal_sde.LocalInteraction(rng.standard_normal((o,) * 4), SpinChannel.NONE)
+        v_nonloc = Interaction(rng.standard_normal((nqi,) + (o,) * 4), SpinChannel.NONE, (nqi, 1, 1), True)
+        u_r = v_nonloc.as_channel(channel) + u_loc.as_channel(channel)
+        ref = vrg.copy() - vrg.copy() @ u_r @ chi.copy()
+        if channel == SpinChannel.MAGN:
+            ref = ref - FourPoint.identity_like(ref).scale(2.0 / 3.0)
+        ref = u_r @ ref
+        out = nonlocal_sde.calculate_kernel_r_q(vrg, chi, v_nonloc, u_loc)
+        assert np.allclose(out.mat, ref.mat, atol=1e-10)
+
+
 def test_vrg_right_is_first_frequency_summed_three_leg_vertex():
     """The right-sided three-leg vertex must equal its definition gamma-tilde^{qv}_{1234} = beta sum_{ab} sum_{v_1}
     chi*^{q v_1 v}_{12ab} (chi^{qv}_{0;ba34})^{-1}, which the dcba orbital permutation of the last-frequency-summed
@@ -435,3 +552,57 @@ def test_sde_fft_rspace_greens_function_node_sharing_matches_private_build():
         mpi_dist, make_kernel(), giwk, pairs, node_comm=_SingleRankComm()
     )
     assert np.array_equal(sigma_shared.mat, sigma_plain.mat)
+
+
+def test_load_node_shared_local_vertex_private_path_applies_transform(monkeypatch):
+    """Without a node communicator the helper loads privately, applies the transform and returns win=None, matching
+    the former per-rank load + permute + scale chain."""
+    from dgamore.local_four_point import LocalFourPoint
+
+    rng = np.random.default_rng(81)
+    mat = (rng.standard_normal((2, 2, 2, 2, 3, 4, 4)) + 1j * rng.standard_normal((2, 2, 2, 2, 3, 4, 4))).astype(
+        np.complex64
+    )
+    monkeypatch.setattr(np, "load", lambda *a, **k: mat.copy())
+    ref = LocalFourPoint(mat.copy(), SpinChannel.NONE, 1, 2, False, True).permute_orbitals("abcd->cbad").scale(2.0)
+    out, win = nonlocal_sde._load_node_shared_local_vertex(
+        None,
+        "unused.npy",
+        SpinChannel.NONE,
+        transform=lambda o: o.permute_orbitals("abcd->cbad", copy=False).scale(2.0),
+    )
+    assert win is None
+    assert np.array_equal(out.mat, ref.mat)
+    assert out.mat.flags["C_CONTIGUOUS"]
+
+
+def test_load_node_shared_local_vertex_loads_once_per_node(monkeypatch):
+    """With a node communicator the file is read once per node (the root) and every rank maps the same values."""
+    import dgamore.mpi_utils as mpi_utils_mod
+    from tests.conftest import FAKE_MPI, run_parallel
+
+    monkeypatch.setattr(mpi_utils_mod, "MPI", FAKE_MPI)
+    config.memory.use_shared_memory_common_obj = True
+    rng = np.random.default_rng(82)
+    mat = (rng.standard_normal((2, 2, 2, 2, 3, 4, 4)) + 1j * rng.standard_normal((2, 2, 2, 2, 3, 4, 4))).astype(
+        np.complex64
+    )
+    load_calls = []
+
+    def fake_load(*a, **k):
+        load_calls.append(1)
+        return mat.copy()
+
+    monkeypatch.setattr(np, "load", fake_load)
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        out, win = nonlocal_sde._load_node_shared_local_vertex(node_comm, "unused.npy", SpinChannel.DENS)
+        res = out.mat.copy()
+        out.mat = None
+        nonlocal_sde._free_shared_window(win, node_comm)
+        return res
+
+    _, res = run_parallel(2, fn, hostnames=["n0", "n0"])
+    assert len(load_calls) == 1  # one read per node, not per rank
+    assert np.array_equal(res[0], mat) and np.array_equal(res[1], mat)

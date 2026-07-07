@@ -19,6 +19,7 @@ import warnings
 
 import numpy as np
 from mpi4py import MPI
+from scipy.optimize import OptimizeWarning
 
 import dgamore.config as config
 from dgamore.ana_cont import AnalyticContinuationProblem, RealFreqTwoPoint
@@ -117,6 +118,8 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
                     # Escalate numpy/scipy RuntimeWarnings (divide/invalid/overflow) to exceptions so a numerically
                     # broken continuation falls through to the A(k, w) = 0 fallback below (its own errors are caught too).
                     warnings.simplefilter("error", RuntimeWarning)
+                    # The alpha-fit curve_fit inside the solver harmlessly fails to estimate its covariance; mute it.
+                    warnings.simplefilter("ignore", OptimizeWarning)
                     probl_maxent = AnalyticContinuationProblem(
                         im_axis=wn, re_axis=w, im_data=giwk_maxent[k, band, band], beta=config.sys.beta
                     )
@@ -182,10 +185,13 @@ def perform_maxent_dmft(sigma_dmft: SelfEnergy, hk: np.ndarray) -> np.ndarray:
     for band in range(config.sys.n_bands):
         logger.info(f"Processing analytic continuation of band {band+1}.")
         try:
-            probl_maxent = AnalyticContinuationProblem(
-                im_axis=wn, re_axis=w, im_data=sigma_maxent[band, band] - hartree[band], beta=config.sys.beta
-            )
-            result = probl_maxent.solve(model=model, stdev=stdev)[0]
+            with warnings.catch_warnings():
+                # The alpha-fit curve_fit inside the solver harmlessly fails to estimate its covariance; mute it.
+                warnings.simplefilter("ignore", OptimizeWarning)
+                probl_maxent = AnalyticContinuationProblem(
+                    im_axis=wn, re_axis=w, im_data=sigma_maxent[band, band] - hartree[band], beta=config.sys.beta
+                )
+                result = probl_maxent.solve(model=model, stdev=stdev)[0]
             a_opt = result.A_opt
 
             del probl_maxent, result

@@ -9,6 +9,7 @@ extend-ignore-words-re = [
     "bse",
     "BSE",
     "gam",
+    "mis",
     # numpy exposes the array flag as ``arr.flags.writeable``; not a typo.
     "writeable"
 ]

@@ -466,6 +466,40 @@ def test_gather_full_ibz_for_vslice():
         assert np.allclose(mat, G[:, :, vs:ve, :])
 
 
+def test_gather_full_ibz_for_vslice_tags_stay_below_mpi_tag_ub_minimum():
+    """The exchange tags must be rank-independent (MPI matching is (source, tag)-scoped), so they stay far below
+    the MPI-guaranteed MPI_TAG_UB minimum of 32767 at any rank count - the former rank*size base overflowed it
+    above ~180 ranks."""
+    n_irrq, n_v, n_vp, norb = 4, 3, 2, 2
+    q_grid = KGrid((n_irrq, 1, 1), [])
+    G = (np.arange(n_irrq * norb * n_v * n_vp).reshape(n_irrq, norb, n_v, n_vp) + 1j).astype(np.complex128)
+    seen_tags = []
+
+    def fn(comm, rank):
+        config.lattice.q_grid = q_grid
+        orig_isend, orig_irecv = comm.Isend, comm.Irecv
+
+        def isend(buf, dest, tag=0):
+            seen_tags.append(tag)
+            return orig_isend(buf, dest, tag)
+
+        def irecv(buf, source, tag=0):
+            seen_tags.append(tag)
+            return orig_irecv(buf, source, tag)
+
+        comm.Isend, comm.Irecv = isend, irecv
+        d_irrq = MpiDistributor(ntasks=n_irrq, comm=comm)
+        d_v = MpiDistributor(ntasks=n_v, comm=comm)
+        gamma = FourPoint(G[d_irrq.my_slice].copy(), nq=(2, 2, 1), has_compressed_q_dimension=True)
+        mu.gather_full_ibz_for_vslice(gamma, d_irrq, d_v, q_grid)
+        comm.Isend, comm.Irecv = orig_isend, orig_irecv
+        return None
+
+    run_parallel(2, fn, hostnames=["h", "h"])
+    assert seen_tags and max(seen_tags) < 32767
+    assert max(seen_tags) < 1000  # rank-independent scheme: base 700 + chunk index
+
+
 def test_gather_full_ibz_for_vslice_empty_rank_returns_none():
     """gather_full_ibz_for_vslice returns None for a rank with no frequencies."""
     n_irrq = 3

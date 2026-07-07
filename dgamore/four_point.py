@@ -416,10 +416,11 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             numpy array, or number. Local operands are broadcast over the momentum axis.
         :param subtract: If True, subtract ``other`` instead of adding it (used by :meth:`sub` to avoid a negated copy).
         :param copy: If True (default), return a new :class:`FourPoint`; if False, accumulate the result into
-            ``self.mat`` in place and return ``self`` (no out-of-place result block). The in-place branch is only
+            ``self.mat`` in place and return ``self`` (no out-of-place result block). The in-place branch is
             supported between two :class:`FourPoint` objects whose fermionic frequency dimensions already match (it
-            refuses to diagonally extend ``self``), which is the self-energy-kernel accumulation case in
-            :mod:`dgamore.nonlocal_sde`.
+            refuses to diagonally extend ``self``) - the self-energy-kernel accumulation case in
+            :mod:`dgamore.nonlocal_sde` - and for (:class:`LocalInteraction`/:class:`Interaction`) operands, which
+            broadcast-accumulate without a full-size result block (the BSE-matrix assembly case).
         :return: A new :class:`FourPoint` (in the half niw range for the vertex-vertex case), or ``self`` when
             ``copy=False``.
         :raises ValueError: If ``other`` has an unsupported type, or ``copy=False`` would have to diagonally extend
@@ -433,9 +434,10 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
         op = np.subtract if subtract else np.add
 
-        if not copy and not isinstance(other, FourPoint):
+        if not copy and not isinstance(other, (FourPoint, LocalFourPoint, Interaction, LocalInteraction)):
             raise NotImplementedError(
-                "In-place addition/subtraction (copy=False) is only supported between two FourPoint objects."
+                "In-place addition/subtraction (copy=False) is only supported for (Local)FourPoint or "
+                "(Local)Interaction operands."
             )
 
         if isinstance(other, (np.ndarray, float, int, complex)):
@@ -458,6 +460,10 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
             other_mat = other.mat[None, ...] if not isinstance(other, Interaction) else other.compress_q_dimension().mat
             other_mat = other_mat.reshape(other.mat.shape + (1,) * (self.num_wn_dimensions + self.num_vn_dimensions))
+            if not copy:
+                # broadcast-accumulate the (small) interaction into self in place: no full-size result block
+                op(self.mat, other_mat, out=self.mat)
+                return self
             return FourPoint(
                 op(self.mat, other_mat),
                 self.channel,
@@ -479,11 +485,26 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         if not isinstance(other, FourPoint):
             # if other is LocalFourPoint
             other, self_extended, other_extended = self._align_frequency_dimensions_for_operation(other)
+            other_mat = other.mat[None, ...] if self.has_compressed_q_dimension else other.mat[None, None, None, ...]
+
+            if not copy:
+                if self_extended:
+                    raise ValueError(
+                        "In-place addition/subtraction (copy=False) cannot diagonally extend 'self'; both operands "
+                        "must have the same number of fermionic frequency dimensions."
+                    )
+                # broadcast-accumulate the momentum-independent operand into self in place
+                op(self.mat, other_mat, out=self.mat)
+                self.channel = channel
+                self._full_niw_range = False
+                self.update_original_shape()
+                if other_full_niw_range:
+                    other = other.to_full_niw_range()
+                self._revert_frequency_dimensions_after_operation(other, other_extended, False)
+                return self
+
             result = FourPoint(
-                op(
-                    self.mat,
-                    (other.mat[None, ...] if self.has_compressed_q_dimension else other.mat[None, None, None, ...]),
-                ),
+                op(self.mat, other_mat),
                 channel,
                 self.nq,
                 self.num_wn_dimensions,
@@ -760,6 +781,31 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             self.mat = self.mat.reshape(
                 (self.current_shape[0], w_dim, 2 * self.niv, self.n_bands, self.n_bands, self.n_bands, self.n_bands)
             ).transpose(0, 3, 4, 6, 5, 1, 2)
+            return self
+
+        self.compress_q_dimension()
+        # full-index layout check: one (compressed) momentum axis + four orbital axes + the frequency axes
+        full_index_ndim = 1 + 4 + self.num_wn_dimensions + self.num_vn_dimensions
+        if self.num_wn_dimensions == 1 and self.num_vn_dimensions == 2 and len(self.current_shape) == full_index_ndim:
+            # per-q compound round trip for the full-index two-fermion layout: the former global
+            # to_compound_indices/to_full_indices pair materialized a second full-size layout copy; here only one
+            # [w, x1, x2] workspace per q-slice is live besides the object
+            if self.frequency_notation == FrequencyNotation.PP:
+                self.permute_orbitals("abcd->acbd", copy=False)  # pure permutation, returns a view
+
+            n = self.n_bands
+            w_dim = self.current_shape[-3]
+            size = n * n * 2 * self.niv
+            for i in range(self.current_shape[0]):
+                compound = self.mat[i].transpose(4, 0, 1, 5, 3, 2, 6).reshape(w_dim, size, size)
+                self.mat[i] = (
+                    np.linalg.inv(compound)
+                    .reshape(w_dim, n, n, 2 * self.niv, n, n, 2 * self.niv)
+                    .transpose(1, 2, 5, 4, 0, 3, 6)
+                )
+
+            if self.frequency_notation == FrequencyNotation.PP:
+                self.permute_orbitals("abcd->acbd", copy=False)  # the pp pairing permute is self-inverse
             return self
 
         self.to_compound_indices()

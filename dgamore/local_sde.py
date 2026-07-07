@@ -74,9 +74,21 @@ def create_gamma_r_with_shell_correction(
     :param u_loc: The bare local interaction :math:`U`.
     :return: The shell-corrected irreducible vertex :math:`\Gamma_{r}` as a :class:`LocalFourPoint`.
     """
-    chi_tilde_shell = (gchi0.invert() + 1.0 / config.sys.beta**2 * u_loc.as_channel(gchi_r.channel)).invert()
+    # the +U below must couple ALL fermionic frequencies (the Kitatani shell ladder with the constant-U vertex),
+    # so the block-diagonally inverted bubble is explicitly extended to the two-fermion layout first - keeping it
+    # 1-vn would put U on the nu-diagonal only (wrong physics). The first inversion is still per (w, v) block.
+    chi_tilde_shell = (
+        gchi0.invert().extend_vn_to_diagonal() + 1.0 / config.sys.beta**2 * u_loc.as_channel(gchi_r.channel)
+    ).invert()
     chi_tilde_core_inv = chi_tilde_shell.cut_niv(config.box.niv_core).invert()
-    return (gchi_r.invert() - chi_tilde_core_inv).scale(config.sys.beta**2) + u_loc.as_channel(gchi_r.channel)
+    # subtract/scale/accumulate in place on the freshly inverted block, so only that one two-fermion block is
+    # allocated (the former chain held up to three such blocks at its peak)
+    return (
+        gchi_r.invert()
+        .sub(chi_tilde_core_inv, copy=False)
+        .scale(config.sys.beta**2)
+        .add(u_loc.as_channel(gchi_r.channel), copy=False)
+    )
 
 
 def create_auxiliary_chi(gamma_r: LocalFourPoint, gchi0_inv: LocalFourPoint, u_loc: LocalInteraction) -> LocalFourPoint:
@@ -90,7 +102,14 @@ def create_auxiliary_chi(gamma_r: LocalFourPoint, gchi0_inv: LocalFourPoint, u_l
     :param u_loc: The bare local interaction :math:`U`.
     :return: The auxiliary susceptibility :math:`\chi^{*}_{r}` as a :class:`LocalFourPoint`.
     """
-    return (gchi0_inv + (gamma_r - u_loc.as_channel(gamma_r.channel)).scale(1.0 / config.sys.beta**2)).invert()
+    # single-block assembly: (gamma - U) is the only allocation, the diagonal bubble adds in place and the
+    # inversion consumes the block (the former expression held the extended bubble and the sum alongside)
+    return (
+        gamma_r.sub(u_loc.as_channel(gamma_r.channel))
+        .scale(1.0 / config.sys.beta**2)
+        .add_on_vn_diagonal(gchi0_inv)
+        .invert(copy=False)
+    )
 
 
 def create_generalized_chi_with_shell_correction(
@@ -116,15 +135,45 @@ def create_full_vertex_from_gamma(gamma_r, gchi0, u_loc):
     Returns the local full vertex in the ``niv_full`` region from the irreducible vertex,
     :math:`F = \Gamma [1 + \frac{1}{\beta^2} \chi_0 \Gamma]^{-1}` (with :math:`\Gamma` padded with :math:`U` beyond the core box).
 
+    Every bosonic slice is independent, so the solve runs one :math:`\omega` at a time in compound space and writes
+    the result back into the padded vertex: only compound ``[x1, x2]``-sized workspaces accompany the single
+    ``niv_full``-sized block, where the former batched identity/matmul/invert chain held ~4 such blocks (plus the
+    fully materialized compound identity) at its peak. The linear system is solved directly
+    (``F^T = (A^T)^{-1} \Gamma^T``) instead of inverting and multiplying.
+
     :param gamma_r: The irreducible vertex :math:`\Gamma_{r}` (core box).
     :param gchi0: The bare bubble :math:`\chi_0` (with its fermionic axis taken on the diagonal).
     :param u_loc: The bare local interaction :math:`U`, used to pad the shell.
     :return: The full vertex :math:`F_{r}` as a :class:`LocalFourPoint`.
     """
     gamma_urange = gamma_r.pad_with_u(u_loc.as_channel(gamma_r.channel), config.box.niv_full)
-    return gamma_urange @ (
-        LocalFourPoint.identity_like(gamma_urange) + 1.0 / config.sys.beta**2 * gchi0 @ gamma_urange
-    ).invert(False)
+
+    n = gamma_urange.n_bands
+    niv2 = gamma_urange.current_shape[-1]
+    size = n * n * niv2
+    w_dim = gamma_urange.current_shape[-3]
+    diag = np.arange(size)
+    # the bubble arrives in the full bosonic range while gamma is half-range: align via a half-range view (the
+    # w >= 0 block), exactly what the former matmul's internal to_half_niw_range did
+    chi0_mat = gchi0.mat
+    if gchi0.full_niw_range:
+        chi0_mat = chi0_mat[..., chi0_mat.shape[-2] // 2 :, :]
+    chi0_scaled = chi0_mat * (1.0 / config.sys.beta**2)
+
+    path = None
+    for iw in range(w_dim):
+        gamma_w = gamma_urange.mat[..., iw, :, :]
+        if path is None:  # identical shapes across the loop -> compute the contraction path once
+            path = np.einsum_path("abcdv,dcefvp->abefvp", chi0_scaled[..., 0, :], gamma_w, optimize="optimal")[0]
+        a_w = np.einsum("abcdv,dcefvp->abefvp", chi0_scaled[..., iw, :], gamma_w, optimize=path)
+        # compound pairing (rows {1, 2, v}, cols {4, 3, v'}, as in to_compound_indices) + identity on the diagonal
+        a_w = a_w.transpose(0, 1, 4, 3, 2, 5).reshape(size, size)
+        a_w[diag, diag] += 1.0
+        gamma_w = gamma_w.transpose(0, 1, 4, 3, 2, 5).reshape(size, size)
+        f_w = np.linalg.solve(a_w.T, gamma_w.T).T
+        gamma_urange.mat[..., iw, :, :] = f_w.reshape(n, n, niv2, n, n, niv2).transpose(0, 1, 4, 3, 2, 5)
+
+    return gamma_urange
 
 
 def create_full_vertex(gchi_r: LocalFourPoint, gchi0_inv: LocalFourPoint) -> LocalFourPoint:
