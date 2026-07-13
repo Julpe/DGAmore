@@ -10,7 +10,7 @@ non-local SDE step), this module assembles the particle-particle pairing vertex 
 :math:`\lambda \Delta = \pm\frac{1}{2\beta N_q}\, \Gamma^{pp}\, \chi_0^{pp}\, \Delta` with a matrix-free
 ARPACK/Lanczos eigensolver (two variants: an in-memory one and a memory-lean frequency-distributed one). The leading
 eigenvalue :math:`\lambda` signals the pairing instability and the eigenvector is the gap function
-:math:`\Delta(k, \nu)`. Requires ``nq == nk``. Equation numbers refer to the author's master's thesis (Chapter 4).
+:math:`\Delta(k, \nu)`. Equation numbers refer to the author's master's thesis (Chapter 4).
 """
 
 import os
@@ -126,7 +126,7 @@ def transform_vertex_q_frequencies_w0(f_q_r: FourPoint, niv_pp: int) -> FourPoin
     :return: The transformed vertex as a :class:`FourPoint` (pp notation, no bosonic axis, compressed q).
     """
     mat = _transform_vertex_frequencies_w0(f_q_r, niv_pp)
-    return FourPoint(mat, f_q_r.channel, config.lattice.q_grid.nk, 0, 2, True, True, True, FrequencyNotation.PP)
+    return FourPoint(mat, f_q_r.channel, config.lattice.k_grid.nk, 0, 2, True, True, True, FrequencyNotation.PP)
 
 
 # --- Full q-dependent vertex creation and transformation ---
@@ -370,7 +370,7 @@ def create_full_vertex_q_r_pp_w0_v2(
 
     logger.info(f"Loaded vrg_q_{gamma_r.channel.value} and chi_phys_q_{gamma_r.channel.value} from files.")
 
-    irrk_q_list = config.lattice.q_grid.get_irrq_list()
+    irrk_q_list = config.lattice.k_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrk.my_slice]
 
     if config.eliashberg.save_fq:
@@ -411,7 +411,7 @@ def create_full_vertex_q_r_pp_w0_v2(
 
     if not config.eliashberg.save_fq:
         f_q_r = FourPoint(
-            f_q_r_mat, gamma_r.channel, config.lattice.q_grid.nk, 0, 2, False, True, True, FrequencyNotation.PP
+            f_q_r_mat, gamma_r.channel, config.lattice.k_grid.nk, 0, 2, False, True, True, FrequencyNotation.PP
         )
         logger.log_memory_usage(
             f"Full ladder-vertex ({f_q_r.channel.value})",
@@ -421,7 +421,7 @@ def create_full_vertex_q_r_pp_w0_v2(
         return f_q_r
 
     f_q_r = FourPoint(
-        f_q_r_mat, gamma_r.channel, config.lattice.q_grid.nk, 1, 2, False, True, True, FrequencyNotation.PP
+        f_q_r_mat, gamma_r.channel, config.lattice.k_grid.nk, 1, 2, False, True, True, FrequencyNotation.PP
     )
     logger.log_memory_usage(f"Full ladder-vertex ({f_q_r.channel.value})", f_q_r, mpi_dist_irrk.comm.size)
     f_q_r.mat = mpi_dist_irrk.gather(f_q_r.mat)
@@ -823,7 +823,7 @@ def solve_eliashberg_lanczos(
         allowed_ranks=ranks,
     )
 
-    gamma_r_pp = gamma_r_pp.map_to_full_bz(config.lattice.q_grid, config.lattice.q_grid.nk).decompress_q_dimension()
+    gamma_r_pp = gamma_r_pp.map_to_full_bz(config.lattice.k_grid, config.lattice.k_grid.nk).decompress_q_dimension()
     logger.log_memory_usage(f"Gamma_pp_{gamma_r_pp.channel.value}", gamma_r_pp, 1, allowed_ranks=ranks)
 
     sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
@@ -845,7 +845,7 @@ def solve_eliashberg_lanczos(
     )
 
     n_bands = gamma_r_pp.n_bands
-    norm = 0.5 / config.lattice.q_grid.nk_tot / config.sys.beta
+    norm = 0.5 / config.lattice.k_grid.nk_tot / config.sys.beta
 
     chi0_mm = _chi0_to_matmul_layout(gchi0_q0_pp.mat)
     # The pairing vertex arrives in w2dynamics G2 leg order (c cdag c cdag), whereas _apply_gamma_pp expects the
@@ -969,7 +969,7 @@ def solve_eliashberg_lanczos_v2(
     )
 
     n_bands = gamma_r_pp.n_bands
-    norm = 0.5 / config.lattice.q_grid.nk_tot / config.sys.beta
+    norm = 0.5 / config.lattice.k_grid.nk_tot / config.sys.beta
 
     # Batched-matmul layout (see solve_eliashberg_lanczos): chi0 on the root rank (a view), the frequency-sliced
     # pairing vertex materialized once per rank; the flipped vertex is never stored (matvec reuses the direct array).
@@ -1117,9 +1117,9 @@ def solve(
     logger = config.logger
 
     mpi_dist_irrk = MpiDistributor.create_distributor(
-        ntasks=config.lattice.q_grid.nk_irr, comm=comm, name="Q", output_path=config.output.output_path
+        ntasks=config.lattice.k_grid.nk_irr, comm=comm, name="Q", output_path=config.output.output_path
     )
-    irrk_q_list = config.lattice.q_grid.get_irrq_list()
+    irrk_q_list = config.lattice.k_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrk.my_slice]
 
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
@@ -1207,7 +1207,7 @@ def solve(
         gamma_trip_pp.mat = mpi_dist_irrk.gather(gamma_trip_pp.mat, root=rank_trip)
 
         if mpi_dist_irrk.my_rank == rank_sing:
-            gchi0_q_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(giwk_dga, niv_pp, config.lattice.q_grid)
+            gchi0_q_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(giwk_dga, niv_pp, config.lattice.k_grid)
             logger.info("Created the bare bubble susceptibility in pp notation.", allowed_ranks=(rank_sing,))
 
         if mpi_dist_irrk.my_rank == rank_sing and mpi_dist_irrk.mpi_size > 1:
@@ -1236,7 +1236,7 @@ def solve(
 
         logger.info("Distributing Gamma_sing_pp along v equally to ranks/nodes.")
         gamma_sing_pp = mpi_utils.gather_full_ibz_for_vslice(
-            gamma_sing_pp, mpi_dist_irrk, mpi_dist_v, config.lattice.q_grid
+            gamma_sing_pp, mpi_dist_irrk, mpi_dist_v, config.lattice.k_grid
         )
         logger.info("Gamma_sing_pp distributed. Starting with singlet Lanczos solver.")
 
@@ -1251,7 +1251,7 @@ def solve(
             # calculating gchi0 in the full BZ only once
             # in the lanczos step only active_rank[0] will perform chi0 * delta due to memory reasons
             gchi0_q_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(
-                giwk_dga, niv_pp, config.lattice.q_grid
+                giwk_dga, niv_pp, config.lattice.k_grid
             ).decompress_q_dimension()
         else:
             gchi0_q_pp = None
@@ -1264,7 +1264,7 @@ def solve(
 
         logger.info("Distributing Gamma_trip_pp along v equally to ranks/nodes.")
         gamma_trip_pp = mpi_utils.gather_full_ibz_for_vslice(
-            gamma_trip_pp, mpi_dist_irrk, mpi_dist_v, config.lattice.q_grid
+            gamma_trip_pp, mpi_dist_irrk, mpi_dist_v, config.lattice.k_grid
         )
         logger.info("Gamma_trip_pp distributed. Starting with triplet Lanczos solver.")
 

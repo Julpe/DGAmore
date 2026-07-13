@@ -45,7 +45,6 @@ The next section describes the Hamiltonian and the lattice symmetries of the sys
      interaction_type: "one_band_from_dmft" # str
      interaction_input: ""                  # str
      nk: [ 16, 16, 1 ]                      # list[int]
-     # nq: [ 16, 16, 1 ]                    # list[int]
 
 The ``symmetries`` field controls how the irreducible Brillouin zone is built. Entering ``auto`` enables the
 automatic symmetry discovery, which probes a large number of combined momentum and orbital transformations,
@@ -75,9 +74,8 @@ the code read the interaction from the file referenced in ``interaction_input``,
 real-space Hamiltonian file but with four orbital indices instead of two and may also encode non-local
 interactions.
 
-Finally, ``nk`` and ``nq`` set the sizes of the momentum grid for the one-particle quantities and for the
-ladder, respectively. The ``nq`` field may be left unset, in which case ``nk`` is reused for the q-grid. Note that
-the Eliashberg equation can only be solved when the two grids have the same size.
+Finally, ``nk`` sets the size of the momentum grid, which is shared by the one-particle quantities and the
+ladder (the q-grid always equals the k-grid).
 
 Self-consistency
 ----------------

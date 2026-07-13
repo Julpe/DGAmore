@@ -47,10 +47,13 @@ def load_local_four_point(lc_type: str, filename: str, channel: SpinChannel) -> 
 
 
 def test_lambda_correction_spch():
-    """spch-type single lambda correction reproduces reference chi and lambdas for dens and magn channels."""
-    config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    """spch-type single lambda correction reproduces reference chi and lambdas for dens and magn channels; the dens
+    channel stalls at the divergence bound and warns, so the logger must be mocked for a standalone run."""
+    from unittest.mock import MagicMock
+
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
+    config.logger = MagicMock()
 
     def perform_lc(channel: SpinChannel):
         chi_r_before_lambda = load_four_point("spch", f"chi_phys_q_{channel.value}_before_lambda", channel)
@@ -73,7 +76,7 @@ def test_lambda_correction_spch():
 
 def test_lambda_correction_sp():
     """sp-type single lambda correction (magn only) reproduces reference chi and lambda."""
-    config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
 
     chi_dens_q_before_lambda = load_four_point(
@@ -88,7 +91,7 @@ def test_lambda_correction_sp():
     chi_loc_sum = (
         chi_dens_loc_sum
         + chi_magn_loc_sum
-        - 1.0 / 16 * (config.lattice.q_grid.irrk_count[:, None, None, None, None, None] * chi_phys_q_dens.mat).sum()
+        - 1.0 / 16 * (config.lattice.k_grid.irrk_count[:, None, None, None, None, None] * chi_phys_q_dens.mat).sum()
     )
 
     chi_magn_q_before_lambda = load_four_point("sp", f"chi_phys_q_magn_before_lambda", SpinChannel.MAGN)
@@ -106,7 +109,7 @@ def test_lambda_correction_sp():
 @pytest.mark.parametrize("lc_type", ["sp", "spch"])
 def test_lambda_correction_in_sde_sp(lc_type):
     """LambdaCorrection.perform reproduces reference chi for both sp and spch types."""
-    config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.lambda_correction.type = lc_type
     config.output.output_path = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/lambda_correction/{lc_type}"
@@ -134,11 +137,11 @@ def test_find_lambda_warns_on_non_convergence():
     """find_lambda warns and returns a finite value when the target is unreachable within maxiter."""
     from unittest.mock import MagicMock
 
-    config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.logger = MagicMock()
 
-    n_irrk = config.lattice.q_grid.irrk_count.shape[0]
+    n_irrk = config.lattice.k_grid.irrk_count.shape[0]
     chi = np.full((n_irrk, 5), 0.5, dtype=np.complex64)  # [irrk, w], finite -> lambda_start finite
     result = LambdaCorrection.find_lambda(chi, 1e6 + 0j, maxiter=1)  # unreachable target in one iteration
 
@@ -247,7 +250,6 @@ def test_find_lambda_matrix_falls_back_to_lstsq_on_singular_hessian():
 def test_multiorbital_perform_single_matches_single_band_for_magn():
     """For the cleanly-converging magnetic channel, the No=1 matrix correction coincides with the scalar
     LambdaCorrection (same lambda and corrected chi on the spch reference data)."""
-    config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.sys.n_bands = 1
@@ -267,7 +269,6 @@ def test_multiorbital_perform_single_matches_single_band_for_magn():
 def test_multiorbital_perform_single_satisfies_sum_rule(channel):
     """The corrected susceptibility's full-BZ frequency sum matches the local target for BOTH channels - including
     density, where the scalar single-band solver stalls at the divergence bound instead of the true root."""
-    config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.sys.n_bands = 1
@@ -278,7 +279,7 @@ def test_multiorbital_perform_single_satisfies_sum_rule(channel):
 
     corrected, _ = MultiOrbitalLambdaCorrection.perform_single(chi_before.copy(), s_r)
 
-    q_grid = config.lattice.q_grid
+    q_grid = config.lattice.k_grid
     lhs = corrected.to_full_niw_range().map_to_full_bz(q_grid).mat.sum() / (config.sys.beta * q_grid.nk_tot)
     assert np.allclose(lhs, s_r[0, 0], atol=1e-6)
 
@@ -286,10 +287,9 @@ def test_multiorbital_perform_single_satisfies_sum_rule(channel):
 def _multiorbital_chi_fourpoint(n_bands: int, nq_grid: tuple, nw_half: int, seed: int) -> FourPoint:
     """Physical two-index-per-leg chi^q FourPoint on the IBZ (no fermionic frequencies): its compound inverse is a
     real-symmetric SPD block with omega^2 growth, so the sum-rule root is unique."""
-    config.lattice.q_grid = bz.KGrid(nk=nq_grid, symmetries=bz.two_dimensional_square_symmetries())
-    config.lattice.k_grid = config.lattice.q_grid
+    config.lattice.k_grid = bz.KGrid(nk=nq_grid, symmetries=bz.two_dimensional_square_symmetries())
     rng = np.random.default_rng(seed)
-    n_irr = config.lattice.q_grid.irrk_count.shape[0]
+    n_irr = config.lattice.k_grid.irrk_count.shape[0]
     no2, nw = n_bands**2, 2 * nw_half + 1
     mat = np.empty((n_irr, n_bands, n_bands, n_bands, n_bands, nw), dtype=np.complex128)
     for q in range(n_irr):
@@ -309,7 +309,7 @@ def test_multiorbital_perform_single_recovers_matrix_mass_and_sum_rule():
     config.sys.beta = 8.0
     config.sys.n_bands = 2
     chi = _multiorbital_chi_fourpoint(2, (4, 4, 1), 3, seed=7)
-    q_grid = config.lattice.q_grid
+    q_grid = config.lattice.k_grid
     no2 = 4
     a = np.random.default_rng(9).standard_normal((no2, no2))
     lambda_star = 0.2 * 0.5 * (a + a.T)
@@ -331,7 +331,6 @@ def test_multiorbital_perform_loads_target_writes_lambda_and_corrects(tmp_path):
     import shutil
     from unittest.mock import MagicMock
 
-    config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.sys.n_bands = 1
@@ -351,10 +350,9 @@ def test_multiorbital_perform_loads_target_writes_lambda_and_corrects(tmp_path):
 
 def test_density_diagonal_sum_reduces_to_frequency_sum_for_q_constant_chi():
     """C_{r;a} = (1/(beta N_q)) sum_qw chi_aaaa reduces to (1/beta) sum_w chi_aaaa when chi is momentum-constant."""
-    config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
-    config.lattice.k_grid = config.lattice.q_grid
+    config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 5.0
-    n_irr, nw, n_bands = config.lattice.q_grid.irrk_count.shape[0], 5, 2
+    n_irr, nw, n_bands = config.lattice.k_grid.irrk_count.shape[0], 5, 2
     single_q = np.random.default_rng(3).standard_normal((n_bands, n_bands, n_bands, n_bands, nw)) + 0.5
     mat = np.broadcast_to(single_q, (n_irr, *single_q.shape)).astype(np.complex128).copy()
     chi = FourPoint(
@@ -476,7 +474,6 @@ def test_multiorbital_perform_quiet_writes_nothing_and_skips_pauli(tmp_path):
     import shutil
     from unittest.mock import MagicMock
 
-    config.lattice.q_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.sys.n_bands = 1
@@ -535,7 +532,7 @@ def test_expand_compound_slice_is_exact_gather_without_auto_data():
     """Without auto-symmetry data the FBZ expansion is the plain irrk_inv gather, bit-identical per bosonic
     frequency to what map_to_full_bz produces."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
-    config.lattice.q_grid = grid
+    config.lattice.k_grid = grid
     chi = _chi_on_grid(grid, 2, 2, seed=5)
     expected = chi.copy().map_to_full_bz(grid).to_compound_indices().mat
     irr = chi.copy().to_compound_indices().mat
@@ -568,7 +565,7 @@ def test_find_lambda_matrix_ibz_resident_matches_full_bz_reference(auto):
     transform-noise level on an auto grid with genuine orbital rotations."""
     beta, n_bands = 5.0, 2
     grid = _synthetic_auto_grid() if auto else bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
-    config.lattice.q_grid = grid
+    config.lattice.k_grid = grid
     chi = _chi_on_grid(grid, n_bands, 2, seed=7)
     no2 = n_bands**2
     a = np.random.default_rng(8).standard_normal((no2, no2))

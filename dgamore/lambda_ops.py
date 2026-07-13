@@ -90,13 +90,13 @@ class LambdaCorrection:
         """
         lambda_start = LambdaCorrection.get_lambda_start(chi_r_mat)
         lambda_: float = lambda_start + delta
-        factor = 1 / config.sys.beta / config.lattice.q_grid.nk_tot
+        factor = 1 / config.sys.beta / config.lattice.k_grid.nk_tot
 
         for _ in range(maxiter):
             chi_lam = LambdaCorrection.apply_lambda(chi_r_mat, lambda_)
-            chir_sum = (config.lattice.q_grid.irrk_count[:, None] * chi_lam).sum() * factor
+            chir_sum = (config.lattice.k_grid.irrk_count[:, None] * chi_lam).sum() * factor
             f_lam = chir_sum - chi_r_loc_sum
-            fp_lam = -(config.lattice.q_grid.irrk_count[:, None] * chi_lam**2).sum() * factor
+            fp_lam = -(config.lattice.k_grid.irrk_count[:, None] * chi_lam**2).sum() * factor
             # NB: a vanishing fp_lam is intentional here - the resulting (inf) Newton step is what triggers the
             # delta-halving reset branch below, so it must NOT be guarded against.
             lambda_new = lambda_ - (f_lam / fp_lam).real
@@ -200,8 +200,8 @@ class LambdaCorrection:
             for channel in [SpinChannel.DENS, SpinChannel.MAGN]
         ]
 
-        chi_magn_loc_sum = (chi_dens_loc.mat + chi_magn_loc.mat).sum() - 1 / config.lattice.q_grid.nk_tot * (
-            config.lattice.q_grid.irrk_count[:, None, None, None, None, None] * chi_phys_q_dens.mat
+        chi_magn_loc_sum = (chi_dens_loc.mat + chi_magn_loc.mat).sum() - 1 / config.lattice.k_grid.nk_tot * (
+            config.lattice.k_grid.irrk_count[:, None, None, None, None, None] * chi_phys_q_dens.mat
         ).sum()
         chi_phys_q_r, lambda_r = LambdaCorrection.perform_single(chi_phys_q_r, chi_magn_loc_sum / config.sys.beta)
         logger.info(f"Lambda correction 'sp' applied. Lambda for magn channel is: {lambda_r:.6f}.")
@@ -530,7 +530,7 @@ class MultiOrbitalLambdaCorrection:
             and (ii) the determined mass matrix :math:`\Lambda_r`.
         """
         beta = config.sys.beta
-        q_grid = config.lattice.q_grid
+        q_grid = config.lattice.k_grid
         chi_r = chi_r.to_full_niw_range()
 
         # The complex128 susceptibility is cached on the irreducible wedge only (never inverted - the calibration
@@ -597,7 +597,7 @@ class MultiOrbitalLambdaCorrection:
         :return: The real array :math:`C_{r;a}`, shape ``[n_bands]``.
         """
         n_bands = chi_r.n_bands
-        q_grid = config.lattice.q_grid
+        q_grid = config.lattice.k_grid
         summed = chi_r.copy().to_full_niw_range().map_to_full_bz(q_grid).to_compound_indices().mat.sum(axis=(0, 1)) / (
             config.sys.beta * q_grid.nk_tot
         )

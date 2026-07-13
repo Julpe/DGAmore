@@ -99,7 +99,7 @@ def load_from_dmft_file_and_update_config() -> (
 
     output_format = "LDGA_Nk{}_Nq{}_wc{}_vc{}_vs{}".format(
         config.lattice.k_grid.nk_tot,
-        config.lattice.q_grid.nk_tot,
+        config.lattice.k_grid.nk_tot,
         config.box.niw_core,
         config.box.niv_core,
         config.box.niv_shell,
@@ -208,11 +208,9 @@ def set_hamiltonian(er_type: str, er_input: str | list, int_type: str, int_input
         ham, k_points = ham.read_hk_w2k(er_input)
         if config.lattice.nk is None:
             # ATTENTION: This is currently only available for 2D square lattices.
-            config.logger.info("Using q- and k-grid from wannier.hk file.")
+            config.logger.info("Using k-grid from wannier.hk file.")
             config.lattice.nk = (int(np.sqrt(k_points[:, 0].size)), int(np.sqrt(k_points[:, 0].size)), 1)
-            config.lattice.nq = config.lattice.nk
             config.lattice.k_grid = bz.KGrid(config.lattice.nk, config.lattice.symmetries)
-            config.lattice.q_grid = bz.KGrid(config.lattice.nq, config.lattice.symmetries)
         ham = ham.set_ek(ham.get_ek().reshape(*config.lattice.nk, config.sys.n_bands, config.sys.n_bands))
     else:
         raise NotImplementedError(f"Hamiltonian type {er_type} not supported.")

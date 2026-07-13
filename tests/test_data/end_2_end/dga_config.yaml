@@ -16,7 +16,6 @@ lattice:
   interaction_input: [1, 0, 0, 0]     # Full path to the interaction file or list of interaction parameters [n_bands, U, J, U'] (U' is optional; if left empty, U' is set to U-2J)
   # this parameter will only be used if interaction_type is either 'kanamori' or 'custom'
   nk: [4, 4, 1]     # Number of k-points in x, y and z-direction. Default: [ 16, 16, 1 ]
-  #nq: [ 16, 16, 1 ] # Number of q-points in x, y and z-direction. Default: [ 16, 16, 1 ]. If left empty, nq is set to nk
 
 self_consistency:
   max_iter: 1 # Maximum number of iterations

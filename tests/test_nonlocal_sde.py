@@ -71,7 +71,6 @@ def test_nonlocal_hartree_fock_matches_local_reference():
     nq_tot = int(np.prod(nk))
 
     config.lattice.nk = nk
-    config.lattice.nq = nk
     config.sys.n_bands = nb
 
     occ = np.load(f"{LOCAL_SDE_DATA}/occ.npy", allow_pickle=False)
@@ -386,7 +385,6 @@ def test_unused_qloop_sigma_variants_agree():
     nk, o, niw, niv = (4, 4, 1), 2, 3, 4
     config.lattice.nk = nk
     config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
-    config.lattice.q_grid = config.lattice.k_grid
     config.box.niw_core = niw
     config.box.niv_core = niv
     config.sys.n_bands = o
@@ -400,7 +398,7 @@ def test_unused_qloop_sigma_variants_agree():
     g_mat = (rng.standard_normal(g_shape) + 1j * rng.standard_normal(g_shape)).astype(np.complex64)
     kernel_mat = (rng.standard_normal(k_shape) + 1j * rng.standard_normal(k_shape)).astype(np.complex64)
     giwk = GreensFunction(g_mat, calc_filling=False, nk=nk, beta=config.sys.beta)
-    q_list = config.lattice.q_grid.get_q_list()
+    q_list = config.lattice.k_grid.get_q_list()
 
     def make_kernel():
         return FourPoint(
@@ -530,7 +528,6 @@ def test_sde_fft_rspace_greens_function_node_sharing_matches_private_build():
     nk, o, niw, niv = (4, 4, 1), 2, 3, 4
     config.lattice.nk = nk
     config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
-    config.lattice.q_grid = config.lattice.k_grid
     config.box.niw_core = niw
     config.box.niv_core = niv
     config.sys.n_bands = o
@@ -1323,7 +1320,6 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     from types import SimpleNamespace
 
     config.lattice.k_grid = bz.KGrid((1, 1, 1), symmetries=[])
-    config.lattice.q_grid = config.lattice.k_grid
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
     config.box.niw_core, config.box.niv_core, config.box.niv_full, config.box.niv_dmft = 1, 2, 2, 8
     config.sys.beta, config.sys.mu, config.sys.n = 10.0, 0.5, 1.0

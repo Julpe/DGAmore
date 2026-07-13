@@ -99,9 +99,7 @@ def create_default_config(config, folder: str):
     config.box.niv_shell = 10
     config.output.do_plotting = False
     config.lattice.nk = (4, 4, 1)
-    config.lattice.nq = config.lattice.nk
     config.lattice.k_grid = bz.KGrid(config.lattice.nk, symmetries=bz.two_dimensional_square_symmetries())
-    config.lattice.q_grid = config.lattice.k_grid
     config.lattice.type = "from_wannierHK"
     config.lattice.interaction_type = "kanamori_from_dmft"
     config.lattice.er_input = f"{folder}/wannier.hk"

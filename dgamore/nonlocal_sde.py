@@ -76,7 +76,7 @@ def get_hartree_fock(
 
     nb = config.sys.n_bands
     nk_tot = np.prod(config.lattice.nk)
-    nq_tot = np.prod(config.lattice.nq)
+    nq_tot = np.prod(config.lattice.nk)
 
     uq = (u_loc + v_nonloc.reduce_q(q_list)).permute_orbitals("abcd->adcb")  # (nq,a,d,c,b)
 
@@ -194,7 +194,7 @@ def create_auxiliary_chi_r_q_sum_v2(
     :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q}_{r}` as a :class:`FourPoint`.
     """
-    irrk_q_list = config.lattice.q_grid.get_irrq_list()
+    irrk_q_list = config.lattice.k_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrq.my_slice]
     chi_r_q_sum_mat = np.zeros_like(gchi0_q_inv.mat)
 
@@ -205,7 +205,7 @@ def create_auxiliary_chi_r_q_sum_v2(
             .invert_and_sum_over_last_vn(config.sys.beta)
             .mat
         )
-    return FourPoint(chi_r_q_sum_mat, gamma_r.channel, config.lattice.nq, 1, 1, False, has_compressed_q_dimension=True)
+    return FourPoint(chi_r_q_sum_mat, gamma_r.channel, config.lattice.nk, 1, 1, False, has_compressed_q_dimension=True)
 
 
 def create_auxiliary_chi_r_q_sum_v3(
@@ -229,7 +229,7 @@ def create_auxiliary_chi_r_q_sum_v3(
     :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q}_{r}` as a :class:`FourPoint`.
     """
-    irrk_q_list = config.lattice.q_grid.get_irrq_list()
+    irrk_q_list = config.lattice.k_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrq.my_slice]
     chi_r_q_sum_mat = np.zeros_like(gchi0_q_inv.mat)
 
@@ -240,7 +240,7 @@ def create_auxiliary_chi_r_q_sum_v3(
             .invert_and_sum_over_last_vn_v2(config.sys.beta)
             .mat
         )
-    return FourPoint(chi_r_q_sum_mat, gamma_r.channel, config.lattice.nq, 1, 1, False, has_compressed_q_dimension=True)
+    return FourPoint(chi_r_q_sum_mat, gamma_r.channel, config.lattice.nk, 1, 1, False, has_compressed_q_dimension=True)
 
 
 def create_vrg_r_q(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint) -> FourPoint:
@@ -456,7 +456,7 @@ def perform_ornstein_zernike_fit(chi_phys_q_r: FourPoint) -> None:
         return opt.curve_fit(oz_spin_w0, q_grid, mat, p0=initial_guess)[0]
 
     chi = chi_phys_q_r.copy()
-    chi_mat = chi.map_to_full_bz(config.lattice.q_grid).to_half_niw_range().take_first_wn().mat.real
+    chi_mat = chi.map_to_full_bz(config.lattice.k_grid).to_half_niw_range().take_first_wn().mat.real
     orb_shape = (config.sys.n_bands,) * 4
     oz_coeffs = np.zeros(orb_shape + (2,), dtype=float)
     failed_orbitals = []
@@ -464,7 +464,7 @@ def perform_ornstein_zernike_fit(chi_phys_q_r: FourPoint) -> None:
     for idx in np.ndindex(orb_shape):
         mat_slice = chi_mat[..., idx[0], idx[1], idx[2], idx[3]].flatten()
         try:
-            coeffs = fit_oz_spin(config.lattice.q_grid, mat_slice) if not np.all(mat_slice == 0) else [0.0, 0.0]
+            coeffs = fit_oz_spin(config.lattice.k_grid, mat_slice) if not np.all(mat_slice == 0) else [0.0, 0.0]
         except (ValueError, RuntimeError, opt.OptimizeWarning):
             failed_orbitals.append(idx)
             coeffs = [-1.0, -1.0]
@@ -687,7 +687,7 @@ def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full
             k_slice = kernel[idx_q, ..., idx_w, config.box.niv_core :]
             mat += np.einsum("aijdv,xyzadv->xyzijv", k_slice, g_qk, optimize=path)
 
-    mat *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
+    mat *= -0.5 / config.sys.beta / config.lattice.k_grid.nk_tot
     return SelfEnergy(mat, config.lattice.nk, False, beta=config.sys.beta).compress_q_dimension().to_full_niv_range()
 
 
@@ -736,7 +736,7 @@ def calculate_sigma_from_kernel_cpu(
             np.einsum("xyzadv,aijdv->xyzijv", g_slice, k_slice, out=acc, optimize=True)
             np.add(mat, acc, out=mat)
 
-    mat *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
+    mat *= -0.5 / config.sys.beta / config.lattice.k_grid.nk_tot
     return (
         SelfEnergy(np.ascontiguousarray(mat), config.lattice.nk, False, beta=config.sys.beta)
         .compress_q_dimension()
@@ -787,7 +787,7 @@ def calculate_sigma_from_kernel_gpu(
             k_slice = kernel[iq, ..., iw, :]
             mat_gpu += cp.einsum("xyzadv,aijdv->xyzijv", g_slice, k_slice, optimize=True)
 
-    mat_gpu *= -0.5 / config.sys.beta / config.lattice.q_grid.nk_tot
+    mat_gpu *= -0.5 / config.sys.beta / config.lattice.k_grid.nk_tot
     return (
         SelfEnergy(np.ascontiguousarray(cp.asnumpy(mat_gpu)), config.lattice.nk, False, beta=config.sys.beta)
         .compress_q_dimension()
@@ -869,7 +869,7 @@ def calculate_sigma_from_kernel_fft_cpu(
     rank = comm.Get_rank()
     size = comm.Get_size()
     nkx, nky, nkz = config.lattice.k_grid.nk
-    nk_tot = config.lattice.q_grid.nk_tot
+    nk_tot = config.lattice.k_grid.nk_tot
     nb = config.sys.n_bands
     niv_core = config.box.niv_core
     beta = config.sys.beta
@@ -946,7 +946,7 @@ def calculate_sigma_from_kernel_fft_gpu(
     rank = comm.Get_rank()
     size = comm.Get_size()
     nkx, nky, nkz = config.lattice.k_grid.nk
-    nk_tot = config.lattice.q_grid.nk_tot
+    nk_tot = config.lattice.k_grid.nk_tot
     nb = config.sys.n_bands
     niv_core = config.box.niv_core
     beta = config.sys.beta
@@ -1402,7 +1402,7 @@ def calculate_sigma_proposal(
             config.box.niw_core,
             config.box.niv_full,
             my_irr_q_list,
-            config.lattice.q_grid,
+            config.lattice.k_grid,
             config.sys.beta,
             config.logger,
         )
@@ -1943,14 +1943,14 @@ def calculate_self_energy_q(
 
     # MPI distributor for the irreducible BZ
     mpi_dist_irrk = MpiDistributor.create_distributor(
-        ntasks=config.lattice.q_grid.nk_irr, comm=comm, name="Q", output_path=config.output.output_path
+        ntasks=config.lattice.k_grid.nk_irr, comm=comm, name="Q", output_path=config.output.output_path
     )
-    full_q_list = config.lattice.q_grid.get_q_list()
-    irrk_q_list = config.lattice.q_grid.get_irrq_list()
+    full_q_list = config.lattice.k_grid.get_q_list()
+    irrk_q_list = config.lattice.k_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrk.my_slice]
 
     mpi_dist_fullbz = MpiDistributor.create_distributor(
-        ntasks=config.lattice.q_grid.nk_tot, comm=comm, name="FBZ", output_path=config.output.output_path
+        ntasks=config.lattice.k_grid.nk_tot, comm=comm, name="FBZ", output_path=config.output.output_path
     )
     my_full_q_list = full_q_list[mpi_dist_fullbz.my_slice]
 

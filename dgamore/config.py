@@ -72,9 +72,9 @@ class BoxConfig:
 
 class LatticeConfig:
     """
-    Stores the lattice parameters: the symmetries, lattice type, input Hamiltonian and input interaction. The k and
-    q grids are built from the number of k/q points and the lattice symmetries. See ``dga_config.yaml`` or the
-    author's master's thesis for details.
+    Stores the lattice parameters: the symmetries, lattice type, input Hamiltonian and input interaction. The
+    momentum grid is built from the number of k-points and the lattice symmetries and is shared by the k- and
+    q-dependent quantities. See ``dga_config.yaml`` or the author's master's thesis for details.
 
     :ivar list symmetries: The lattice symmetries (a list of :class:`KnownSymmetries` or the auto sentinel).
     :ivar str type: How the kinetic Hamiltonian is provided (e.g. ``"from_wannier90"``).
@@ -84,11 +84,9 @@ class LatticeConfig:
     :ivar interaction_input: Path(s) to the interaction input.
     :vartype interaction_input: str | list
     :ivar tuple nk: Number of k-points per spatial direction.
-    :ivar tuple nq: Number of q-points per spatial direction (defaults to ``nk``).
     :ivar InteractionConfig interaction: The :class:`InteractionConfig`.
     :ivar Hamiltonian hamiltonian: The :class:`Hamiltonian` instance.
-    :ivar KGrid k_grid: The k-space :class:`KGrid`.
-    :ivar KGrid q_grid: The q-space :class:`KGrid`.
+    :ivar KGrid k_grid: The momentum-space :class:`KGrid`.
     """
 
     def __init__(self):
@@ -98,12 +96,10 @@ class LatticeConfig:
         self.interaction_type: str = "one_band_from_dmft"
         self.interaction_input: str | list = ""
         self.nk: tuple[int, int, int] = (16, 16, 1)
-        self.nq: tuple[int, int, int] = self.nk
 
         self.interaction: InteractionConfig = InteractionConfig()
         self.hamiltonian: Hamiltonian = Hamiltonian()
         self.k_grid: bz.KGrid = bz.KGrid(self.nk, self.symmetries)
-        self.q_grid: bz.KGrid = bz.KGrid(self.nq, self.symmetries)
 
 
 class SelfConsistencyConfig:

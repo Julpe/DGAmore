@@ -30,7 +30,7 @@ def fake_system(monkeypatch):
     config.memory.save_memory_for_chiq_aux = False
     config.memory.save_memory_for_fq = False
     config.memory.save_memory_for_lanczos = False
-    config.lattice.q_grid = SimpleNamespace(nk_tot=FIXTURE_PARAMS["nk_tot"], nk_irr=FIXTURE_PARAMS["nk_irr"])
+    config.lattice.k_grid = SimpleNamespace(nk_tot=FIXTURE_PARAMS["nk_tot"], nk_irr=FIXTURE_PARAMS["nk_irr"])
     config.logger = MagicMock()
 
     monkeypatch.setattr(dgamore_main.MPI, "Get_processor_name", lambda: "node0", raising=False)

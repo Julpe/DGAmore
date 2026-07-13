@@ -41,9 +41,7 @@ def setup_srvo3_cubic():
         c.box.niv_shell = 0
         c.output.do_plotting = False
         c.lattice.nk = (12, 12, 12)
-        c.lattice.nq = config.lattice.nk
         c.lattice.k_grid = bz.KGrid(c.lattice.nk, [KnownSymmetries.AUTO])
-        c.lattice.q_grid = c.lattice.k_grid
         c.lattice.symmetries = [KnownSymmetries.AUTO]
         c.lattice.type = "from_wannier90"
         c.lattice.interaction_type = "kanamori_from_dmft"
@@ -172,7 +170,7 @@ def test_calculates_nonlocal_sde_correctly(setup, niw_core, niv_core, niv_shell,
     config.output.output_path = folder
 
     u_loc = config.lattice.hamiltonian.get_local_u()
-    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
 
     *_, s_loc = local_sde.perform_local_schwinger_dyson(g_dmft, g2_dens, g2_magn, u_loc)
 
@@ -209,7 +207,6 @@ def test_calculates_srvo3_correctly(setup_srvo3_cubic, save_memory):
     config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
 
     config.lattice.k_grid.specify_auto_symmetries(ek, atol=1e-12)
-    config.lattice.q_grid.specify_auto_symmetries(ek, atol=1e-12)
 
     s_dmft_ref = np.load(f"{folder_cubic}/sigma_dmft.npy")
     assert np.allclose(s_dmft_ref, s_dmft_ref)
@@ -217,7 +214,7 @@ def test_calculates_srvo3_correctly(setup_srvo3_cubic, save_memory):
     assert np.allclose(g_dmft_ref, g_dmft_ref)
 
     u_loc = config.lattice.hamiltonian.get_local_u()
-    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
 
     *_, s_loc = local_sde.perform_local_schwinger_dyson(g_dmft, g2_dens, g2_magn, u_loc)
 

@@ -119,8 +119,8 @@ class ConfigParser:
 
     def _build_lattice_config(self, config_file) -> LatticeConfig:
         """
-        Builds the lattice config from the ``lattice`` section (defaults if absent): grid sizes, symmetries, k/q grids,
-        and the lattice/interaction input.
+        Builds the lattice config from the ``lattice`` section (defaults if absent): grid size, symmetries, the
+        momentum grid, and the lattice/interaction input.
 
         :param config_file: The parsed YAML mapping.
         :return: The populated :class:`LatticeConfig`.
@@ -134,17 +134,13 @@ class ConfigParser:
 
         conf.nk = self._try_parse(section, "nk", conf.nk)
 
-        if "nq" not in section:
-            config.logger.info("'nq' not set in config. Setting 'nq' = 'nk'.")
-            conf.nq = conf.nk
-        else:
-            conf.nq = self._try_parse(section, "nq", conf.nq)
+        if "nq" in section:
+            config.logger.info("'nq' has been removed - the q-grid always equals the k-grid ('nk'); it is ignored.")
 
         symmetries = self._try_parse(section, "symmetries", "two_dimensional_square")
         conf.symmetries = bz.get_lattice_symmetries_from_string(symmetries)
 
         conf.k_grid = bz.KGrid(conf.nk, conf.symmetries)
-        conf.q_grid = bz.KGrid(conf.nq, conf.symmetries)
 
         conf.type = self._try_parse(section, "type", conf.type)
         conf.er_input = section["hr_input"]  # can be multiple types
