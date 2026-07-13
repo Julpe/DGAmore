@@ -126,7 +126,7 @@ def test_transform_vertex_q_frequencies_w0_matches_untrimmed_reference():
 
     rng = np.random.default_rng(33)
     o, nqi, niw, niv, niv_pp = 2, 2, 9, 4, 2
-    config.lattice.q_grid = bz.KGrid((nqi, 1, 1), symmetries=[])
+    config.lattice.k_grid = bz.KGrid((nqi, 1, 1), symmetries=[])
     shape = (nqi, o, o, o, o, niw + 1, 2 * niv, 2 * niv)
     mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
     vertex = FourPoint(mat, SpinChannel.DENS, (nqi, 1, 1), 1, 2, False, True, True)
@@ -424,9 +424,7 @@ def test_degenerate_decoupled_bands_reproduce_single_band_kernel(channel, o):
     nq, niv_pp, beta = (2, 2, 1), 2, 10.0
     nq_tot, n2 = int(np.prod(nq)), 2 * niv_pp
     config.lattice.nk = nq
-    config.lattice.nq = nq
-    config.lattice.q_grid = bz.KGrid(nq, symmetries=[])
-    config.lattice.k_grid = config.lattice.q_grid
+    config.lattice.k_grid = bz.KGrid(nq, symmetries=[])
     config.sys.beta = beta
     config.eliashberg.n_eig = 2
     config.eliashberg.epsilon = 1e-10

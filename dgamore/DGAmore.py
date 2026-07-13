@@ -130,20 +130,10 @@ def main():
             f"{config.lattice.k_grid.nk_irr}/{config.lattice.k_grid.nk_tot} elements."
         )
 
-        if config.lattice.k_grid.nk == config.lattice.q_grid.nk:
-            config.lattice.q_grid = config.lattice.k_grid
-        else:
-            config.lattice.q_grid.specify_auto_symmetries(ek)
-
-        logger.info(
-            f"Automatically determined symmetries for the q-grid. The irreducible BZ has "
-            f"{config.lattice.q_grid.nk_irr}/{config.lattice.q_grid.nk_tot} elements."
-        )
-
     autodetect_memory_settings(comm)
 
     u_loc = config.lattice.hamiltonian.get_local_u()
-    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
 
     if comm.rank == 0:
         (
@@ -503,8 +493,6 @@ def main():
     logger.info("DGA routine finished.")
 
     if config.eliashberg.perform_eliashberg:
-        if not np.allclose(config.lattice.q_grid.nk, config.lattice.k_grid.nk):
-            raise ValueError("Eliashberg equation can only be solved when nq = nk.")
         logger.info("Starting with Eliashberg equation.")
         # sigma_dga is already saved to disk and never consumed by the Eliashberg step - drop the replicated
         # full-grid copy on every rank before the memory-heavy vertex construction
@@ -546,7 +534,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
     Sets the four ``config.memory.save_memory_*`` switches automatically from the host memory available on every node
     the job runs on and an analytic estimate of the peak memory each affected operation consumes; the flag-less
     Schwinger-Dyson contraction (always the two-pass FFT path) is verified to fit as well. Must be called only after
-    the irreducible BZ is known (i.e. after auto-symmetry discovery), as the estimate depends on ``q_grid.nk_irr``.
+    the irreducible BZ is known (i.e. after auto-symmetry discovery), as the estimate depends on ``k_grid.nk_irr``.
 
     The budget is a **node total**: on a node with ``r`` ranks the memory held by all of them at a branch's peak is
     ``r * (baseline + distributed) + single`` (every rank holds the branch's persistent baseline; a *distributed*
@@ -584,8 +572,8 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
     niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
     peaks = memory_estimator.estimate_peaks(
         n_bands=config.sys.n_bands,
-        nk_tot=config.lattice.q_grid.nk_tot,
-        nk_irr=config.lattice.q_grid.nk_irr,
+        nk_tot=config.lattice.k_grid.nk_tot,
+        nk_irr=config.lattice.k_grid.nk_irr,
         niw_core=config.box.niw_core,
         niv_core=config.box.niv_core,
         niv_full=config.box.niv_full,

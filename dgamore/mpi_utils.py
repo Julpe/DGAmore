@@ -892,7 +892,7 @@ def map_irrbz_fullbz(obj, mpi_dist_irrk, mpi_dist_fullbz):
     """
     obj.mat = mpi_dist_irrk.gather(obj.mat)
     if mpi_dist_irrk.comm.rank == 0:
-        obj = obj.map_to_full_bz(config.lattice.q_grid)
+        obj = obj.map_to_full_bz(config.lattice.k_grid)
     obj.mat = mpi_dist_fullbz.scatter(obj.mat)
     return obj
 
@@ -909,7 +909,7 @@ def exchange_and_map_irrbz_fullbz(
     over the full BZ (shape [q_full_rank, ...]), with symmetry-equivalent points correctly
     replicated according to the ``irrk_inv`` mapping.
 
-    If ``config.lattice.q_grid`` is in auto-discovered symmetry mode (its
+    If ``config.lattice.k_grid`` is in auto-discovered symmetry mode (its
     ``specify_auto_symmetries`` has been called), the per-k orbital transformation
     ``(sigma_k, U_k, conj_k)`` is also applied locally on each rank, using only the
     transformation arrays sliced to that rank's FBZ range. No global gather is needed.
@@ -932,7 +932,7 @@ def exchange_and_map_irrbz_fullbz(
     rank = comm.rank
     size = comm.size
 
-    q_grid = config.lattice.q_grid
+    q_grid = config.lattice.k_grid
 
     # 1. Global mapping setup
     # irrk_inv[fbz_idx] = irrbz_idx

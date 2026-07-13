@@ -15,7 +15,6 @@ lattice:
   # this parameter will only be used if interaction_type is either 'kanamori' or 'custom'
   orbital_basis: "t2g"
   nk: [ 4,4,4 ] # Number of k-points in x, y and z-direction. Default: [ 16, 16, 1 ]
-  #nq: [ 16, 16, 1 ] # Number of q-points in x, y and z-direction. Default: [ 16, 16, 1 ]. If left empty, nq is set to nk
 
 self_consistency:
   max_iter: 1 # Maximum number of iterations

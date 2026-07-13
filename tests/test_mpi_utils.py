@@ -164,7 +164,7 @@ def test_map_irrbz_fullbz():
     """map_irrbz_fullbz expands the distributed IBZ object to the full BZ."""
 
     def fn(comm, rank):
-        config.lattice.q_grid = _q_grid()
+        config.lattice.k_grid = _q_grid()
         d_irr = MpiDistributor(ntasks=N_IRR, comm=comm)
         d_full = MpiDistributor(ntasks=N_FULL, comm=comm)
         obj = FourPoint(G_IRR[d_irr.my_slice].copy(), nq=Q_NK, has_compressed_q_dimension=True)
@@ -180,7 +180,7 @@ def test_exchange_and_map_matches_reference():
     """exchange_and_map_irrbz_fullbz reproduces the reference full-BZ expansion."""
 
     def fn(comm, rank):
-        config.lattice.q_grid = _q_grid()
+        config.lattice.k_grid = _q_grid()
         d_irr = MpiDistributor(ntasks=N_IRR, comm=comm)
         d_full = MpiDistributor(ntasks=N_FULL, comm=comm)
         obj = FourPoint(
@@ -196,7 +196,7 @@ def test_exchange_and_map_matches_reference():
 
 def test_exchange_and_map_single_rank():
     """exchange_and_map_irrbz_fullbz works on a single rank and propagates metadata."""
-    config.lattice.q_grid = _q_grid()
+    config.lattice.k_grid = _q_grid()
     comm = MPI.Comm(1)
     d_irr = MpiDistributor(ntasks=N_IRR, comm=comm)
     d_full = MpiDistributor(ntasks=N_FULL, comm=comm)
@@ -241,7 +241,7 @@ def test_exchange_and_map_auto_orbital_transform(monkeypatch):
         return g
 
     def fn(comm, rank):
-        config.lattice.q_grid = _auto_grid()
+        config.lattice.k_grid = _auto_grid()
         d_irr = MpiDistributor(ntasks=N_IRR, comm=comm)
         d_full = MpiDistributor(ntasks=N_FULL, comm=comm)
         obj = FourPoint(G_IRR[d_irr.my_slice].copy(), nq=Q_NK, has_compressed_q_dimension=True)
@@ -285,7 +285,7 @@ def test_exchange_and_map_data_exchange_is_chunked(monkeypatch):
         monkeypatch.setattr(mu, "MAX_MPI_BYTES", limit)
 
         def fn(comm, rank):
-            config.lattice.q_grid = KGrid(nk, syms)
+            config.lattice.k_grid = KGrid(nk, syms)
             d_irr = MpiDistributor(ntasks=n_irr, comm=comm)
             d_full = MpiDistributor(ntasks=n_full, comm=comm)
             obj = FourPoint(g_irr[d_irr.my_slice].copy(), nq=nk, has_compressed_q_dimension=True)
@@ -443,7 +443,7 @@ def test_gather_full_ibz_for_vslice():
     G = (np.arange(n_irrq * norb * n_v * n_vp).reshape(n_irrq, norb, n_v, n_vp) + 1j).astype(np.complex128)
 
     def fn(comm, rank):
-        config.lattice.q_grid = q_grid
+        config.lattice.k_grid = q_grid
         d_irrq = MpiDistributor(ntasks=n_irrq, comm=comm)
         d_v = MpiDistributor(ntasks=n_v, comm=comm)
         gamma = FourPoint(G[d_irrq.my_slice].copy(), nq=(2, 2, 1), has_compressed_q_dimension=True)
@@ -471,7 +471,7 @@ def test_gather_full_ibz_for_vslice_tags_stay_below_mpi_tag_ub_minimum():
     seen_tags = []
 
     def fn(comm, rank):
-        config.lattice.q_grid = q_grid
+        config.lattice.k_grid = q_grid
         orig_isend, orig_irecv = comm.Isend, comm.Irecv
 
         def isend(buf, dest, tag=0):
@@ -505,7 +505,7 @@ def test_gather_full_ibz_for_vslice_empty_rank_returns_none():
     G = (np.arange(n_irrq * norb * n_v * n_vp).reshape(n_irrq, norb, n_v, n_vp) + 1j).astype(np.complex128)
 
     def fn(comm, rank):
-        config.lattice.q_grid = q_grid
+        config.lattice.k_grid = q_grid
         d_irrq = MpiDistributor(ntasks=n_irrq, comm=comm)
         d_v = MpiDistributor(ntasks=n_v, comm=comm)
         gamma = FourPoint(G[d_irrq.my_slice].copy(), nq=(3, 1, 1), has_compressed_q_dimension=True)

@@ -13,7 +13,6 @@ lattice:
   # (similar to how a wannier_hr.dat file is structured, but with 4 orbital indices).
   interaction_input: "" # Full path to the interaction file if interaction_type is 'custom', otherwise the interaction data will be taken from DMFT
   nk: [ 16, 16, 1 ] # Number of k-points in x, y and z-direction. Default: [ 16, 16, 1 ]
-  #nq: [ 16, 16, 1 ] # Number of q-points in x, y and z-direction. Default: [ 16, 16, 1 ]. If left empty, nq is set to nk
 
 self_consistency:
   max_iter: 20 # Maximum number of iterations

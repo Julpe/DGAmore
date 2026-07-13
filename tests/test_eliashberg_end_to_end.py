@@ -83,7 +83,7 @@ def test_eliashberg_equation_without_local_part(setup, save_fq, save_memory):
     config.memory.save_memory_for_lanczos = save_memory
 
     u_loc = config.lattice.hamiltonian.get_local_u()
-    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
 
     g_dga = GreensFunction(np.load(f"{folder}/giwk_dga.npy"), nk=config.lattice.nk)
 
@@ -114,7 +114,7 @@ def test_eliashberg_equation_with_local_part(setup, save_fq, save_memory):
     config.memory.save_memory_for_lanczos = save_memory
 
     u_loc = config.lattice.hamiltonian.get_local_u()
-    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
 
     g_dga = GreensFunction(np.load(f"{folder}/giwk_dga.npy"), nk=config.lattice.nk)
 
@@ -162,7 +162,7 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup):
     config.memory.save_memory_for_lanczos = False
 
     u_loc = config.lattice.hamiltonian.get_local_u()
-    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
     g_dga = GreensFunction(np.load(f"{folder}/giwk_dga.npy"), nk=config.lattice.nk)
 
     captured = {}
@@ -182,7 +182,7 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup):
         # the solver consumes the passed vertex (in-place BZ map, fft, sign fold, free), so the momentum-space
         # full-BZ vertex is captured from a copy before the solve
         gamma_full = (
-            gamma_r_pp.copy().map_to_full_bz(config.lattice.q_grid, config.lattice.q_grid.nk).decompress_q_dimension()
+            gamma_r_pp.copy().map_to_full_bz(config.lattice.k_grid, config.lattice.k_grid.nk).decompress_q_dimension()
         )
         captured[channel] = {"gamma": gamma_full.mat.copy()}
         gamma_full.free()
@@ -194,7 +194,7 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup):
     with patch("dgamore.eliashberg_solver.solve_eliashberg_lanczos", side_effect=capture_solver):
         eliashberg_solver.solve(g_dga, g_dmft, u_loc, v_nonloc, comm_mock)
 
-    nq = config.lattice.q_grid.nk
+    nq = config.lattice.k_grid.nk
     nq_tot, o, beta = int(np.prod(nq)), config.sys.n_bands, config.sys.beta
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
     n2 = 2 * niv_pp

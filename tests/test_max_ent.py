@@ -145,9 +145,7 @@ def _build_giwk_mat(nk, n_bands, niv, seed=1):
 
 def _setup_maxent_config(tmp_path, nk, n_bands, niv_core=3, w_count=7, seed=0):
     config.lattice.nk = nk
-    config.lattice.nq = nk
     config.lattice.k_grid = bz.KGrid(nk, symmetries=bz.two_dimensional_square_symmetries())
-    config.lattice.q_grid = config.lattice.k_grid
     config.box.niv_core = niv_core
     config.sys.beta = 10.0
     config.sys.n_bands = n_bands

@@ -112,7 +112,7 @@ def test_extracts_dmft_quantities_correctly(setup, niw_core, niv_core, niv_shell
     mask[indices, indices, indices, indices] = False
     assert np.all(u_loc.mat[mask] == 0)
 
-    vq = config.lattice.hamiltonian.get_vq(config.lattice.q_grid)
+    vq = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
     assert vq.mat.shape == (4, 4, 1, 2, 2, 2, 2)
     assert np.allclose(vq.mat, np.zeros_like(vq.mat))
 
