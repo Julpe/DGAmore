@@ -25,6 +25,8 @@ class KnownSymmetries(Enum):
     :cvar X_Z_SYM: Exchange symmetry between :math:`k_x` and :math:`k_z`.
     :cvar Y_Z_SYM: Exchange symmetry between :math:`k_y` and :math:`k_z`.
     :cvar X_Y_INV: Simultaneous inversion of :math:`k_x` and :math:`k_y`.
+    :cvar AUTO: Deferral flag - discover the symmetry group from a Hamiltonian ``H(k)`` at runtime via
+        :meth:`KGrid.specify_auto_symmetries`, rather than a fixed spatial operation.
     """
 
     X_INV = "x-inv"
@@ -34,6 +36,7 @@ class KnownSymmetries(Enum):
     X_Z_SYM = "x-z-sym"
     Y_Z_SYM = "y-z-sym"
     X_Y_INV = "x-y-inv"
+    AUTO = "auto"
 
 
 class KnownKPoints(Enum):
@@ -275,6 +278,8 @@ def apply_symmetry(mat: np.ndarray, sym: KnownSymmetries) -> None:
     :return: None.
     """
     assert sym in KnownSymmetries, f"sym = {sym} not in known symmetries {KnownSymmetries}."
+    if sym == KnownSymmetries.AUTO:
+        return  # deferral flag, not a spatial operation (symmetries are discovered by specify_auto_symmetries)
     if sym == KnownSymmetries.X_INV:
         inv_sym(mat, 0)
     if sym == KnownSymmetries.Y_INV:
@@ -311,12 +316,13 @@ def get_lattice_symmetries_from_string(symmetry_string: str | tuple | list) -> l
     Returns the lattice symmetries from a string.
 
     The special string ``"auto"`` signals that symmetries should be auto-detected from a Hamiltonian ``H(k)`` at
-    runtime via :meth:`specify_auto_symmetries`. In that case an empty list is returned here, but a marker is set so
-    that the KGrid defers building ``fbz2irrk`` until :meth:`specify_auto_symmetries` is called.
+    runtime via :meth:`specify_auto_symmetries`; it resolves to ``[KnownSymmetries.AUTO]``, which the KGrid recognizes
+    to defer building ``fbz2irrk`` until :meth:`specify_auto_symmetries` is called.
 
     :param symmetry_string: A named preset (e.g. ``"two_dimensional_square"``), the special ``"auto"``, an empty
         string/``"none"``, or a list/tuple (or its string repr) of :class:`KnownSymmetries` values.
-    :return: The corresponding list of :class:`KnownSymmetries`, an empty list, or the :data:`AUTO_SYMMETRIES_SENTINEL`.
+    :return: The corresponding list of :class:`KnownSymmetries` (``[KnownSymmetries.AUTO]`` for ``"auto"``, empty for
+        none).
     :raises ValueError: If the string cannot be parsed as a known preset or a Python literal.
     :raises NotImplementedError: If a listed symmetry is not a known symmetry.
     """
@@ -336,9 +342,8 @@ def get_lattice_symmetries_from_string(symmetry_string: str | tuple | list) -> l
         elif symmetry_string == "quasi_two_dimensional_square_symmetries":
             return quasi_two_dimensional_square_symmetries()
         elif symmetry_string == "auto":
-            # Sentinel: KGrid will recognize this and defer symmetry reduction
-            # until specify_auto_symmetries(hk) is called with a Hamiltonian.
-            return AUTO_SYMMETRIES_SENTINEL
+            # KGrid recognizes the AUTO flag and defers symmetry reduction until specify_auto_symmetries(hk) is called.
+            return [KnownSymmetries.AUTO]
         elif symmetry_string == "" or symmetry_string == "none":
             return []
     try:
@@ -360,47 +365,14 @@ def get_lattice_symmetries_from_string(symmetry_string: str | tuple | list) -> l
         raise NotImplementedError(f"Symmetry {symmetry_string} not supported.")
 
 
-# Sentinel object returned by get_lattice_symmetries_from_string for "auto".
-# Identity-checked, so it must be a unique singleton - a small dedicated object.
-class _AutoSymmetriesSentinel:
-    """Marker indicating that lattice symmetries are to be detected automatically
-    from a Hamiltonian, via KGrid.specify_auto_symmetries()."""
-
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    def __repr__(self):
-        return "<auto-symmetries>"
-
-    # Behave like an empty list for code that iterates over symmetries before
-    # auto-detection has populated the real data (e.g. apply_symmetries(...)).
-    def __iter__(self):
-        return iter(())
-
-    def __len__(self):
-        return 0
-
-    def __bool__(self):
-        # Truthy so that "if symmetries:" enters the branch (it indicates intent),
-        # but iteration still yields nothing.
-        return True
-
-
-AUTO_SYMMETRIES_SENTINEL = _AutoSymmetriesSentinel()
-
-
 def is_auto_symmetries(symmetries) -> bool:
     """
-    Tests whether a symmetries value requests auto-detection.
+    Tests whether a symmetries value requests auto-detection (i.e. carries the :attr:`KnownSymmetries.AUTO` flag).
 
-    :param symmetries: A symmetries value (list, sentinel, etc.).
-    :return: True if ``symmetries`` is the :data:`AUTO_SYMMETRIES_SENTINEL`.
+    :param symmetries: A symmetries value (a list/tuple of :class:`KnownSymmetries`, or anything else).
+    :return: True if ``symmetries`` is a list/tuple containing :attr:`KnownSymmetries.AUTO`.
     """
-    return symmetries is AUTO_SYMMETRIES_SENTINEL
+    return isinstance(symmetries, (list, tuple)) and KnownSymmetries.AUTO in symmetries
 
 
 class KGrid:
@@ -408,10 +380,10 @@ class KGrid:
     Class to build the k-grid for the Brillouin zone.
 
     The ``symmetries`` argument accepts the usual list of ``KnownSymmetries`` *and* the special "auto" mode (passed as
-    the ``AUTO_SYMMETRIES_SENTINEL``, typically obtained from ``get_lattice_symmetries_from_string("auto")``). In auto
-    mode the symmetry group is discovered from a Hamiltonian ``H(k)`` at runtime: instantiate the grid with the
-    sentinel, then call :meth:`specify_auto_symmetries` with the Hamiltonian. Until that call the grid behaves as if
-    no symmetries were applied (full BZ = IBZ).
+    ``[KnownSymmetries.AUTO]``, typically obtained from ``get_lattice_symmetries_from_string("auto")``). In auto mode
+    the symmetry group is discovered from a Hamiltonian ``H(k)`` at runtime: instantiate the grid with the AUTO flag,
+    then call :meth:`specify_auto_symmetries` with the Hamiltonian. Until that call the grid behaves as if no
+    symmetries were applied (full BZ = IBZ).
     """
 
     def __init__(self, nk: tuple = None, symmetries: list[KnownSymmetries] = None):
@@ -419,8 +391,8 @@ class KGrid:
         Builds the k-axes and the irreducible-BZ maps from the grid size and symmetries.
 
         :param nk: Number of k-points per spatial direction, as a tuple ``(nx, ny, nz)``.
-        :param symmetries: A list of :class:`KnownSymmetries` defining the irreducible BZ, or the
-            :data:`AUTO_SYMMETRIES_SENTINEL` to defer symmetry discovery to :meth:`specify_auto_symmetries`.
+        :param symmetries: A list of :class:`KnownSymmetries` defining the irreducible BZ, or
+            ``[KnownSymmetries.AUTO]`` to defer symmetry discovery to :meth:`specify_auto_symmetries`.
         """
         self.kx = None  # kx-grid
         self.ky = None  # ky-grid
@@ -434,9 +406,8 @@ class KGrid:
         self.symmetries = symmetries
         self.ind = None
 
-        # Auto-discovered symmetry data, populated by specify_auto_symmetries().
-        # When set, _map_to_full_bz uses these to apply the per-k orbital
-        # transformation.
+        # Auto-discovered symmetry data, populated by specify_auto_symmetries(); when set, _map_to_full_bz uses these
+        # to apply the per-k orbital transformation.
         self._auto_mode = is_auto_symmetries(symmetries)
         self._auto_us = None  # shape (nx, ny, nz, nb, nb), complex
         self._auto_sigmas = None  # shape (nx, ny, nz), float (+/-1)
@@ -482,7 +453,7 @@ class KGrid:
         the IBZ reduction onto this grid.
 
         Only applicable when this ``KGrid`` was constructed in auto mode
-        (``symmetries`` is the ``AUTO_SYMMETRIES_SENTINEL``). Discovers all
+        (``symmetries`` contains ``KnownSymmetries.AUTO``). Discovers all
         operations ``(M, q, U, sigma, conj)`` that leave H(k) invariant, then
         repopulates ``fbz2irrk``, ``irrk_ind``, ``irrk_inv``, ``irrk_count``,
         ``irr_kmesh``, and stores per-k transformation data used by
@@ -524,10 +495,8 @@ class KGrid:
             include_antiunitary=include_antiunitary,
         )
 
-        # Refresh the IBZ maps based on the discovered orbits.
-        # ``fbz2irrk`` is the (nx,ny,nz) flat-index field; we use ``np.unique``
-        # on it to recover irrk_ind/irrk_inv/irrk_count exactly as the rest of
-        # the code expects.
+        # Refresh the IBZ maps from the discovered orbits. ``fbz2irrk`` is the (nx,ny,nz) flat-index field; np.unique
+        # on it recovers irrk_ind/irrk_inv/irrk_count exactly as the rest of the code expects.
         self.fbz2irrk = res["fbz2irrk"].astype(self.fbz2irrk.dtype, copy=True)
         _, self.irrk_ind, self.irrk_inv, self.irrk_count = np.unique(
             self.fbz2irrk, return_index=True, return_inverse=True, return_counts=True
@@ -539,9 +508,8 @@ class KGrid:
         self._auto_sigmas = res["sigmas"]
         self._auto_conjs = res["conjs"]
 
-        # fbz2sym is kept as built by the trivial set_fbz2irrk path on the
-        # auto sentinel; it is not consumed by _map_to_full_bz in auto mode
-        # and remains here for backwards compatibility only.
+        # fbz2sym is kept as built by the trivial set_fbz2irrk path on the auto sentinel; it is not consumed by
+        # _map_to_full_bz in auto mode and remains for backwards compatibility only.
 
     @property
     def is_auto(self) -> bool:

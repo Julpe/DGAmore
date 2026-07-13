@@ -19,9 +19,8 @@ from dgamore.matsubara_frequencies import MFHelper
 from dgamore.self_energy import SelfEnergy
 from dgamore.two_point import TwoPoint
 
-# Element budget for one [k, band, v-chunk] temporary of the analytic potential-energy tail (~256 MB complex128).
-# The default asymptotic box (niv_asympt = 50000) would otherwise materialize [nk_tot, n_bands, 2*niv_asympt]
-# arrays - several GB on production grids - for a plain frequency sum.
+# Element budget for one [k, band, v-chunk] temporary of the analytic potential-energy tail (~256 MB complex128); the
+# default niv_asympt = 50000 would otherwise materialize [nk_tot, n_bands, 2*niv_asympt] - several GB - per plain sum.
 _MODEL_EPOT_CHUNK_ELEMENTS: int = 2**24
 
 
@@ -111,6 +110,7 @@ def update_mu(
     beta: float,
     smom0: np.ndarray,
     logger=None,
+    tol: float = 1e-6,
 ) -> float:
     r"""
     Updates the chemical potential to match the target filling by using Newton's method to find the optimal
@@ -123,12 +123,14 @@ def update_mu(
     :param beta: Inverse temperature :math:`\beta`.
     :param smom0: Zeroth moment :math:`\Sigma_\infty` of the self-energy.
     :param logger: Optional logger; if given, a failed root search is logged at debug level.
+    :param tol: Newton tolerance for the root search (tightened by the stabilizer's Jacobian probes so the
+        :math:`\mu` feedback enters the finite differences as signal, not noise).
     :return: The updated (real) chemical potential, or ``mu0`` if the root search did not converge.
     :raises ValueError: If the converged chemical potential has a non-negligible imaginary part.
     """
     mu = mu0
     try:
-        mu = opt.newton(root_fun, mu, args=(target_filling, ek, sigma_mat, beta, smom0), tol=1e-6)
+        mu = opt.newton(root_fun, mu, args=(target_filling, ek, sigma_mat, beta, smom0), tol=tol)
     except RuntimeError:
         if logger is not None:
             logger.debug("Root finding for chemical potential failed.")
@@ -356,10 +358,8 @@ class GreensFunction(TwoPoint):
         # 1) Hartree: physical (tail-corrected) occupation, convergence factor exact.
         e_hartree = np.sum(smom0[None, None, None] * self._occ_k.swapaxes(-1, -2)).real
 
-        # 2) In-box correlation part: Tr[(Sigma - Sigma_inf) G], Sigma_inf already counted above. Contract the orbital
-        # trace directly with einsum (g transposed in orbitals) instead of materializing the transposed copy -- this
-        # avoids the GreensFunction deepcopy in ``transpose_orbitals`` (which duplicates ``_ek``/``_sigma``) and the
-        # full [k, o, o, v] product temporary.
+        # 2) In-box correlation Tr[(Sigma - Sigma_inf) G] (Sigma_inf counted above): contract the orbital trace with
+        # einsum (g orbital-transposed) to avoid the transpose_orbitals deepcopy of _ek/_sigma + a [k,o,o,v] temp.
         dsigma = self._sigma.decompress_q_dimension().mat - smom0[..., None]
         g = self.decompress_q_dimension().mat
         e_corr = np.einsum("...abv,...bav->...", dsigma, g).sum().real / self._beta

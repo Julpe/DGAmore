@@ -65,7 +65,7 @@ The ``type`` field selects the form in which the kinetic part of the Hamiltonian
 ``from_wannier90`` the ``hr_input`` field points to a real-space Hamiltonian file holding the hopping elements,
 whereas ``from_wannierHK`` expects a file giving the Hamiltonian directly in momentum space. The third option,
 ``t_tp_tpp``, is available for single-band input only and reads a list of three floating-point values for the
-nearest, next-nearest and third-nearest neighbour hoppings from ``hr_input``, for example ``[1.0, -0.25, 0.12]``.
+nearest, next-nearest and third-nearest neighbor hoppings from ``hr_input``, for example ``[1.0, -0.25, 0.12]``.
 
 Because DGAmore supports multi-orbital calculations with non-local interactions, an interaction type and input must
 be specified as well. With ``one_band_from_dmft`` a single-band calculation is assumed and the local interaction
@@ -94,16 +94,14 @@ This section controls the self-consistency cycle.
      mixing_history_length: 3      # int
      previous_sc_path: ""          # str
      use_interpolated_sigma: False # bool
-     use_lambda_correction: False  # bool
-     restrict_chi_phys: False      # bool
 
 The ``max_iter`` field puts an upper limit on the number of iterations; if the self-energy has not converged by
 then, the loop stops and the program exits. The non-local self-energy is written to the output folder for every
-iteration. Convergence itself is judged by ``epsilon`` through the relative residual of the Schwinger-Dyson iteration: the
-norm of the change in the self-energy between consecutive iterations, divided by the norm of the previous one, taken
-over the full momentum grid, all orbital combinations and the positive fermionic frequencies of the core box. The cycle is
-considered converged once this residual drops below ``epsilon``; in addition, the chemical potential is required to
-change by less than a small temperature-dependent threshold between iterations.
+iteration. Convergence itself is judged by ``epsilon`` through the relative *step* residual of the Schwinger-Dyson
+iteration - the norm of the change of the mixed self-energy between consecutive iterations, divided by the norm of
+the previous one - taken over the full momentum grid, all orbital combinations and the positive fermionic
+frequencies of the core box (reported in the log every iteration); in addition, the chemical potential is required
+to change by less than a small temperature-dependent threshold between iterations.
 
 The ``mixing`` parameter is a floating-point number between zero and one that sets the weight of the new
 self-energy in the update. The accompanying ``mixing_strategy`` selects between ``linear``, ``pulay`` and
@@ -115,16 +113,51 @@ iterations are available. Enabling ``use_interpolated_sigma`` makes the cycle st
 self-energy of the previous run, with the interpolation itself configured in the
 :ref:`self-energy interpolation section <self-energy-interpolation>`.
 
-Setting ``use_lambda_correction`` to ``True`` applies the lambda correction throughout the entire self-consistency
-cycle for single-band data, which can help stabilise convergence or reveal how a lambda-corrected cycle changes the
-results. The correction scheme is taken from the ``type`` field of the
-:ref:`lambda correction section <lambda-correction>`, and ``perform_lambda_correction`` is enabled automatically for
-every iteration. Lastly, ``restrict_chi_phys`` regularizes the physical
+.. _stabilization:
+
+Stabilization
+-------------
+
+This section collects the convergence-stabilization options of the self-consistency cycle.
+
+.. code-block:: yaml
+
+   stabilization:
+     use_lambda_correction: False      # bool
+     use_chi_phys_restriction: False   # bool
+     use_jacobian_stabilization: False # bool
+     use_lambda_annealing: False       # bool
+
+Setting ``use_lambda_correction`` to ``True`` applies the lambda correction to the physical susceptibilities
+in every iteration of the cycle. The correction is dispatched by the band count (and the choice is logged):
+single-band data uses the scalar Moriya correction with the scheme taken from the ``type`` field of the
+:ref:`lambda correction section <lambda-correction>`. The Moriya lambda correction has formally only been derived
+for single-band models; for multi-band data the code therefore applies the similar, heuristic scheme described
+below purely to stabilize convergence (it always corrects both channels). In both cases the correction acts as a
+*releasing scaffold*: the loop converges at a relaxed
+(tenfold) threshold with the correction on, then automatically disables it, resets the mixing history and converges
+the *uncorrected* self-consistent solution to the full ``epsilon``, so the corrected susceptibilities never enter
+the final result. It is independent of the one-shot ``perform_lambda_correction`` of the
+:ref:`lambda correction section <lambda-correction>`, which takes precedence when both are enabled.
+
+The multi-band scheme mimics the scalar correction without being derived from it: instead of one
+scalar per channel it calibrates a full :math:`N_o^2 \times N_o^2` real-symmetric mass matrix :math:`\Lambda_r` per
+channel (both density and magnetic), added to the compound inverse susceptibility so that the momentum- and
+frequency-summed corrected susceptibility matches the local (impurity) sum rule component by component. The number
+of conditions matches the number of parameters exactly, so the calibration is a well-posed matrix root problem
+solved by a damped Newton iteration (in the physically relevant regime the map is strictly monotone, hence the root
+is unique); it runs in double precision and is line-searched to keep the static susceptibility gap positive. The
+momentum sum is taken over the *full* Brillouin zone rather than by weighting the irreducible-zone value with its
+multiplicity, because symmetry-related momenta carry orbitally-rotated susceptibility matrices that only combine
+correctly once the star is summed explicitly. For a single band the matrix collapses to a scalar and the scheme
+reduces to the ordinary lambda correction.
+
+The option ``use_chi_phys_restriction`` regularizes the physical
 susceptibilities: per momentum and bosonic frequency, the eigenvalues of the Hermitian part of the inverse
 susceptibility are floored at a small positive value (a negative eigenvalue of the inverse marks a crossed pole of
 the Bethe-Salpeter equation), while healthy eigenpairs - including legitimately negative off-diagonal matrix
 elements - pass through unchanged.
-This stabilises cycles that would otherwise converge onto an unphysical branch, but the floored blocks are a
+This stabilizes cycles that would otherwise converge onto an unphysical branch, but the floored blocks are a
 regularization rather than physics, so once the self-energy converges with this option enabled and iterations
 remain, the option is switched off automatically and the cycle continues until convergence is reached again or
 ``max_iter`` is hit. The restricted phase only serves as a scaffold for the unrestricted one, so it is converged to
@@ -132,16 +165,57 @@ a relaxed threshold of ten times ``epsilon``; at the release the mixing history 
 must not extrapolate across the discontinuity) and the unrestricted phase then converges to the full ``epsilon``.
 The log reports the number of floored eigenvalues per iteration - releasing is only promising once that count has
 decayed to zero - and the minimum static eigenvalue of every channel's susceptibility, which certifies whether the
-final state is physical. Combining ``restrict_chi_phys`` with the lambda correction is not recommended (the lambda
+final state is physical. Combining ``use_chi_phys_restriction`` with the lambda correction is not recommended (the lambda
 correction would calibrate its sum rule on eigenvalue-floored susceptibilities); if both are enabled, the lambda
-correction takes precedence and ``restrict_chi_phys`` is disabled automatically with a warning.
+correction takes precedence and ``use_chi_phys_restriction`` is disabled automatically with a warning.
+
+Setting ``use_jacobian_stabilization`` to ``True`` arms the modified iterative scheme of arXiv:2502.01420, which
+repairs cycles whose *physical* fixed point has become unstable under damped iteration (the generic situation past a
+vertex divergence or pseudo-divergence, where plain mixing slides into an unphysical solution no matter how small the
+mixing parameter is chosen). Armed means watching, not acting: as long as plain iteration makes progress the cycle
+runs exactly as without the flag, and a run that converges plainly is never touched. Only when plain iteration
+demonstrably cannot reach the physical fixed point - the residual grows well above its best value for several
+consecutive iterations, or it plateaus for an extended stretch while still far above ``epsilon`` - is the Jacobian
+of the self-energy proposal map built (once, matrix-free, at the warm-start self-energy, costing a handful of
+additional self-energy evaluations with an automatically adapted Arnoldi length), and from then on the damping sign
+is flipped on the detected unstable directions, which makes the physical fixed point attractive again without moving
+it. A do-no-harm watchdog then verifies that the reflection actually improves the stalled residual; if it does not,
+the reflection is reverted and plain mixing resumes with a loud warning. All detection thresholds and subspace sizes
+are chosen automatically and are deliberately not exposed as configuration options. The method requires a warm start
+close to the physical solution, e.g. a converged higher-temperature run supplied via ``previous_sc_path``
+(interpolated down in temperature); building far from a fixed point would linearize the wrong map, so the build
+aborts on a cold (DMFT or local) start by design. While ``use_chi_phys_restriction`` or ``use_lambda_annealing`` is active
+the stabilizer stays dormant (the scaffolded cycle is a convergence aid, not the physical map) and may only build
+after the scaffold has been released. It therefore reshapes the iteration map, not the susceptibility, and may
+coexist with those two releasing scaffolds - but it is mutually exclusive with the lambda correction (per-iteration
+or one-shot), whose corrected map the stabilizer must not linearize (it does not engage on the released pure phase
+either); a lambda correction takes
+precedence and the stabilizer is disabled with a warning. If the build detects an instability that the sign flip
+cannot cure, it lowers ``mixing`` automatically to the largest contractive value and reports the change in the log.
+
+Setting ``use_lambda_annealing`` to ``True`` protects the cycle with the *lambda-annealing scaffold*: a bosonic
+mass :math:`\lambda` is added to the inverse physical susceptibility of every channel, which damps the
+susceptibility and keeps the Bethe-Salpeter pole at bay - a sum-rule-free alternative to the lambda
+correction. A single *shared* mass is used for all channels (they are coupled through the self-energy,
+so per-channel masses would chase each other to unphysical values); it is sized automatically from the worst
+channel's static (:math:`\omega=0`) gap, raised toward its target with damping so it tracks the self-energy's own
+relaxation, and clamped at a ceiling past which the pole is too deep for the scaffold (the log then advises a warmer
+start). The mass is never chosen by the user: a healthy susceptibility leaves the scaffold inert, and the mass is
+halved between converged phases and re-armed automatically if a pole reopens mid-run. Phases converge at ten times ``epsilon``; only a converged phase with **all masses at exactly zero**
+counts as the final result, so the returned self-energy is always pure self-consistency - the scaffold merely
+guides the iteration there. If the pure phase cannot converge, the run stops at ``max_iter`` with the honest
+verdict that no stable physical fixed point was found. It is mutually exclusive with the other
+susceptibility-reshaping options - the lambda correction and ``use_chi_phys_restriction`` (the sum rule must not be
+calibrated on mass-shifted susceptibilities, and the two scaffolds would fight); if combined, a lambda correction
+or ``use_chi_phys_restriction`` takes precedence and the annealing scaffold is disabled with a warning. It may, however,
+be combined with ``use_jacobian_stabilization`` (which waits for the scaffold to anneal away before it engages).
 
 .. _lambda-correction:
 
 Lambda correction
 ------------------
 
-DGAmore implements two lambda-correction schemes, both restricted to the single-band case.
+This section controls the one-shot lambda correction.
 
 .. code-block:: yaml
 
@@ -149,8 +223,14 @@ DGAmore implements two lambda-correction schemes, both restricted to the single-
      perform_lambda_correction: False # bool
      type: "spch"                     # str
 
-When ``perform_lambda_correction`` is ``True``, the code applies the correction selected in ``type``: ``spch``
-corrects both the density and the magnetic susceptibility, whereas ``sp`` corrects only the magnetic one.
+When ``perform_lambda_correction`` is ``True``, the code performs a one-shot DGA with lambda correction:
+``max_iter`` is overridden to 1 and ``mixing`` to 1.0, and the correction is applied once, dispatched by the band
+count exactly like ``stabilization.use_lambda_correction`` (over which it takes precedence when both are enabled);
+recall that for multi-band data this is the heuristic stabilization scheme of the
+:ref:`stabilization section <stabilization>`, not a derived lambda correction.
+For single-band data the ``type`` field selects the correction scheme: ``spch`` corrects both the density and the
+magnetic susceptibility, whereas ``sp`` corrects only the magnetic one; the multi-band scheme always
+corrects both channels.
 
 DMFT input
 ----------
@@ -164,20 +244,21 @@ This section specifies the DMFT result files and the structure of the vertex.
      input_path: "./"          # str
      fname_1p: "1p-data.hdf5"  # str
      fname_2p: "g4iw_sym.hdf5" # str
-     do_sym_v_vp: True         # bool
      symmetrize_orbitals: []   # list[int] | list[list[int]]
      n_ineq: 1                 # int
      ineq_ordering: [ 1 ]      # list[int]
 
 Currently only w2dynamics output is supported, though support for further DMFT solvers is planned. The result files
 are expected in the folder given by ``input_path``, with ``fname_1p`` and ``fname_2p`` naming the one- and
-two-particle results. Because the two-particle Green's function is symmetric under the exchange of its two fermionic
-frequencies, this symmetrisation is enforced explicitly when ``do_sym_v_vp`` is ``True``.
+two-particle results. The two-particle Green's function is always symmetrized under the exchange of its two
+fermionic frequencies :math:`(\nu, \nu')` on load: this is the time-reversal-plus-inversion symmetry that makes the
+right three-leg vertex the first-frequency-summed transpose of the left one, so both are obtained from a single
+auxiliary susceptibility sum.
 
 The ``symmetrize_orbitals`` field allows the local DMFT quantities, namely the self-energy and the one- and
-two-particle Green's functions, to be symmetrised over orbitals, which is well defined because these quantities are
+two-particle Green's functions, to be symmetrized over orbitals, which is well defined because these quantities are
 purely local. For the three orbitals of a material such as :math:`\mathrm{SrVO}_3`, entering ``[1, 2, 3]``
-symmetrises all three with respect to one another. Subsets and multiple subsets are equally possible: for a
+symmetrizes all three with respect to one another. Subsets and multiple subsets are equally possible: for a
 four-orbital case in which orbitals one and three as well as orbitals two and four are locally equivalent, one
 enters ``[[1, 3], [2, 4]]``.
 
@@ -194,7 +275,7 @@ Hamiltonian input.
 Eliashberg equation
 -------------------
 
-Superconducting properties are obtained by solving the linearised Eliashberg equation, configured here.
+Superconducting properties are obtained by solving the linearized Eliashberg equation, configured here.
 
 .. code-block:: yaml
 
@@ -291,7 +372,7 @@ plots.
 Memory efficiency
 -----------------
 
-For very large parameter sets memory becomes the main bottleneck, owing to the vectorised nature of the implemented
+For very large parameter sets memory becomes the main bottleneck, owing to the vectorized nature of the implemented
 equations. This section therefore exposes more memory-efficient algorithms for four of the heaviest steps.
 
 .. code-block:: yaml
@@ -321,10 +402,10 @@ distributed across the MPI ranks that share a node. Whenever
 the default, faster variant of a step would not fit, the corresponding switch is turned on automatically. The
 estimate is evaluated as a node total: it sums, over all ranks placed on a node, the data that each rank keeps
 resident throughout the calculation plus the transient peak of the step in question, and requires the result to stay
-below ninety percent of that node's available memory. Because the switches act process-wide, the most constrained
+below ninety-seven percent of that node's available memory. Because the switches act process-wide, the most constrained
 node decides whether a given switch is enabled.
 
-A switch that is explicitly set to ``True`` in the configuration is always honoured: the automatic detection can
+A switch that is explicitly set to ``True`` in the configuration is always honored: the automatic detection can
 only enable additional switches, never turn off one that was requested. Conversely, if the variant of a step that is
 about to run does not fit on some node - because neither of its variants fits, or because a switch forced by the
 configuration selects a variant that does not - the run stops immediately with a ``MemoryError`` that recommends

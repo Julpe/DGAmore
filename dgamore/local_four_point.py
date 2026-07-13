@@ -451,9 +451,8 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         channel = self.channel if self.channel != SpinChannel.NONE else other.channel
 
         if self.num_vn_dimensions in (0, 1) or other.num_vn_dimensions in (0, 1):
-            # special cases if both objects do not have two fermionic frequency dimensions each. Straightforward
-            # contraction is saving memory as we do not have to add fermionic frequency dimensions to artificially
-            # create compound indices
+            # special case if either object lacks two fermionic frequency dimensions: straightforward contraction saves
+            # memory (no need to add fermionic dimensions to artificially create compound indices)
             self.to_half_niw_range()
             other.to_half_niw_range()
 
@@ -837,9 +836,8 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         if copy.frequency_notation == FrequencyNotation.PP:
             return copy
 
-        # the w0 pp map samples only |w| <= 2*min(niw//2, niv) ph slices, so the bosonic axis is trimmed to that
-        # (even, so the map's fermionic box min(niw//2, niv) is preserved) window before to_full_niw_range doubles
-        # it (cut_niw cannot be used here - its no-op guard misjudges half-range objects)
+        # the w0 pp map samples only |w| <= 2*min(niw//2, niv) ph slices, so the bosonic axis is trimmed to that (even,
+        # preserving the map's fermionic box) before to_full_niw_range doubles it (cut_niw's no-op guard misjudges here)
         w_axis = -(copy.num_vn_dimensions + 1)
         niw_stored = copy.current_shape[w_axis] // 2 if copy.full_niw_range else copy.current_shape[w_axis] - 1
         niw_window = min(niw_stored, 2 * min(niw_stored // 2, copy.niv))

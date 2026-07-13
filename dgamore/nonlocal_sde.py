@@ -18,13 +18,14 @@ master's thesis (Chapters 3 & 4).
 import glob
 import os
 import re
+from contextlib import contextmanager
 
 import mpi4py.MPI as MPI
 import numpy as np
 from scipy import optimize as opt
 
 import dgamore.config as config
-import dgamore.lambda_correction as lc
+import dgamore.jacobian_stabilization as jstab
 import dgamore.mpi_utils as mpi_utils
 from dgamore.brillouin_zone import KGrid
 from dgamore.bubble_gen import BubbleGenerator
@@ -32,10 +33,18 @@ from dgamore.four_point import FourPoint
 from dgamore.greens_function import GreensFunction, update_mu
 from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.local_four_point import LocalFourPoint
+from dgamore.lambda_ops import LambdaAnnealer, LambdaCorrection, MultiOrbitalLambdaCorrection
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel
 from dgamore.self_energy import SelfEnergy
+
+# Trigger/watchdog tuning of the physical-solution stabilizer (see _update_stabilizer_probe/_watchdog). Deliberately
+# NOT user-configurable: the stabilizer must only engage when plain iteration cannot reach the physical solution.
+_STAB_GROWTH_FACTOR = 3.0  # residual this far above its best counts as divergence
+_STAB_FAR_RESIDUAL_FACTOR = 100.0  # a plateau only counts when still this far above epsilon
+_STAB_PLATEAU_WINDOW_FACTOR = 3  # plateau window, in units of the probe window
+_STAB_WATCH_WINDOW_FACTOR = 3  # post-arming do-no-harm window, in units of the probe window
 
 
 def get_hartree_fock(
@@ -321,15 +330,23 @@ def restrict_chi_phys_to_positive_eigenvalues(chi_phys_q_r: FourPoint, floor: fl
     return chi_inv.invert(copy=False), n_floored
 
 
-def _effective_epsilon() -> float:
+def _effective_epsilon(annealer: "LambdaAnnealer | None" = None) -> float:
     """
     Returns the effective self-energy convergence threshold of the self-consistency loop: ten times the configured
-    epsilon while the susceptibility restriction is active (the restricted phase is only a scaffold for the
-    subsequent unrestricted phase, so full precision there is wasted iterations), and the plain epsilon otherwise.
+    epsilon while the susceptibility restriction, the per-iteration lambda correction, or the lambda-annealing
+    scaffold is active (those phases are only scaffolds for the subsequent pure phase, so full precision there is
+    wasted iterations), and the plain epsilon otherwise. The one-shot lambda correction never relaxes the threshold
+    (it runs a single iteration).
 
+    :param annealer: The active :class:`LambdaAnnealer`, or ``None`` when annealing is off.
     :return: The effective convergence threshold.
     """
-    return (10.0 if config.self_consistency.restrict_chi_phys else 1.0) * config.self_consistency.epsilon
+    relaxed = (
+        config.stabilization.use_chi_phys_restriction
+        or config.stabilization.use_lambda_correction
+        or (annealer is not None and annealer.active)
+    )
+    return (10.0 if relaxed else 1.0) * config.self_consistency.epsilon
 
 
 def min_static_compound_eigenvalue(chi_phys_q_r: FourPoint) -> float:
@@ -495,6 +512,25 @@ def calculate_and_save_chi_q_r_rpa(
         config.logger.info(f"Calculated RPA susceptibility ({channel.value}).")
 
 
+def _select_and_apply_lambda_correction(chi_phys_q_r: FourPoint, quiet: bool) -> FourPoint:
+    r"""
+    Applies the configured lambda correction to the (rank-0 gathered) physical susceptibility and returns it. The
+    correction runs when either the one-shot ``config.lambda_correction.perform_lambda_correction`` or the
+    per-iteration ``config.stabilization.use_lambda_correction`` is enabled and is dispatched by the band count:
+    single-band input uses the scalar Moriya correction, multi-band input the multi-orbital matrix correction (the
+    dispatch is logged once at setup). If neither flag is enabled the susceptibility is returned unchanged.
+
+    :param chi_phys_q_r: The rank-0 gathered physical susceptibility :math:`\chi^{q}_{r}` in the irreducible BZ.
+    :param quiet: Forwarded to the correction (suppresses the lambda text-file write during stabilizer probes).
+    :return: The (possibly corrected) physical susceptibility.
+    """
+    if config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction:
+        if config.sys.n_bands == 1:
+            return LambdaCorrection.perform(chi_phys_q_r, quiet=quiet)
+        return MultiOrbitalLambdaCorrection.perform(chi_phys_q_r, quiet=quiet)
+    return chi_phys_q_r
+
+
 def calculate_sigma_kernel_r_q(
     gamma_r: LocalFourPoint,
     gchi0_q_inv: FourPoint,
@@ -503,12 +539,14 @@ def calculate_sigma_kernel_r_q(
     u_loc: LocalInteraction,
     v_nonloc: Interaction,
     mpi_dist_irrq: MpiDistributor,
+    quiet: bool = False,
+    annealer: "LambdaAnnealer | None" = None,
 ) -> FourPoint:
     r"""
     Returns the kernel for the self-energy calculation in a specific spin channel. Calculates the auxiliary
     susceptibility, the three-leg vertex and the physical susceptibility with shell correction. Also performs a
-    :math:`\lambda`-correction on the physical susceptibility if specified in the config for single-band input.
-    Saves the physical susceptibility (and, if Eliashberg is enabled, the intermediate vertices) to file.
+    :math:`\lambda`-correction on the physical susceptibility if specified in the config (dispatched by the band
+    count). Saves the physical susceptibility (and, if Eliashberg is enabled, the intermediate vertices) to file.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
@@ -517,6 +555,11 @@ def calculate_sigma_kernel_r_q(
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{q}`.
     :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :param quiet: If ``True``, suppresses every file write (Eliashberg vertex dumps, susceptibility saves, the
+        Ornstein-Zernike fit and the lambda text file) - used by the stabilizer's Jacobian probes, which must not
+        pollute the run directory. The physics (including the lambda correction itself) is evaluated unchanged.
+    :param annealer: The active :class:`LambdaAnnealer` (its boson mass is applied to the physical susceptibility),
+        or ``None`` when annealing is off. Quiet probes apply the current mass but skip the gap measurement.
     :return: The self-energy kernel for this channel as a :class:`FourPoint`.
     """
     logger = config.logger
@@ -535,7 +578,7 @@ def calculate_sigma_kernel_r_q(
     )
     logger.info(f"Non-Local auxiliary susceptibility ({gchi_aux_q_r_sum.channel.value}) calculated.")
 
-    if config.eliashberg.perform_eliashberg:
+    if config.eliashberg.perform_eliashberg and not quiet:
         vrg_q_r_right = create_vrg_r_q_right(gchi_aux_q_r_sum, gchi0_q_inv)
         vrg_q_r_right.save(
             name=f"vrg_q_{vrg_q_r_right.channel.value}_right_rank_{mpi_dist_irrq.comm.rank}",
@@ -548,7 +591,7 @@ def calculate_sigma_kernel_r_q(
     logger.info(f"Non-local three-leg vertex gamma^wv ({vrg_q_r.channel.value}) done.")
     logger.log_memory_usage(f"Three-leg vertex ({vrg_q_r.channel.value})", vrg_q_r, mpi_dist_irrq.comm.size)
 
-    if config.eliashberg.perform_eliashberg:
+    if config.eliashberg.perform_eliashberg and not quiet:
         vrg_q_r.save(
             name=f"vrg_q_{vrg_q_r.channel.value}_rank_{mpi_dist_irrq.comm.rank}",
             output_dir=config.output.eliashberg_path,
@@ -563,7 +606,10 @@ def calculate_sigma_kernel_r_q(
 
     logger.info(f"Updated non-local susceptibility chi^q ({chi_phys_q_r.channel.value}) with asymptotic correction.")
 
-    if config.self_consistency.restrict_chi_phys:
+    if annealer is not None:
+        chi_phys_q_r = annealer.apply(chi_phys_q_r, mpi_dist_irrq, measure=not quiet)
+
+    if config.stabilization.use_chi_phys_restriction:
         chi_phys_q_r, n_floored = restrict_chi_phys_to_positive_eigenvalues(chi_phys_q_r)
         if mpi_dist_irrq.comm.size > 1:
             n_floored = mpi_dist_irrq.comm.allreduce(n_floored)
@@ -578,13 +624,13 @@ def calculate_sigma_kernel_r_q(
 
     chi_phys_q_r.mat = mpi_dist_irrq.gather(chi_phys_q_r.mat)
     if mpi_dist_irrq.comm.rank == 0:
-        if config.lambda_correction.perform_lambda_correction:
-            chi_phys_q_r = perform_lambda_correction(chi_phys_q_r)
-        chi_phys_q_r.save(name=f"chi_phys_q_{chi_phys_q_r.channel.value}", output_dir=config.output.output_path)
+        chi_phys_q_r = _select_and_apply_lambda_correction(chi_phys_q_r, quiet)
+        if not quiet:
+            chi_phys_q_r.save(name=f"chi_phys_q_{chi_phys_q_r.channel.value}", output_dir=config.output.output_path)
 
-        # perform Ornstein-Zernike fit
-        if chi_phys_q_r.channel == SpinChannel.MAGN:
-            perform_ornstein_zernike_fit(chi_phys_q_r)
+            # perform Ornstein-Zernike fit
+            if chi_phys_q_r.channel == SpinChannel.MAGN:
+                perform_ornstein_zernike_fit(chi_phys_q_r)
 
     chi_phys_q_r.mat = mpi_dist_irrq.scatter(chi_phys_q_r.mat)
     logger.info(f"Saved physical susceptibility ({chi_phys_q_r.channel.value}) to file.")
@@ -600,84 +646,13 @@ def calculate_sigma_kernel_r_q(
             "quantities (self-energy, Eliashberg eigenvalues) might be unreliable."
         )
 
-    if config.eliashberg.perform_eliashberg:
+    if config.eliashberg.perform_eliashberg and not quiet:
         chi_phys_q_r.save(
             name=f"chi_phys_q_{chi_phys_q_r.channel.value}_rank_{mpi_dist_irrq.comm.rank}",
             output_dir=config.output.eliashberg_path,
         )
 
     return calculate_kernel_r_q(vrg_q_r, chi_phys_q_r, v_nonloc, u_loc)
-
-
-def perform_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
-    r"""
-    Performs the :math:`\lambda`-correction on the physical susceptibility. If 'spch' is specified, the lambda
-    correction will be performed on both the density and magnetic channel whereas only the magnetic channel will be
-    corrected if 'sp' is specified as :math:`\lambda`-correction type in the corresponding config. The local
-    susceptibility sum-rule target is read from the saved local susceptibilities, and the determined :math:`\lambda`
-    is appended to a text file.
-
-    :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{q}_{r}` to correct.
-    :return: The :math:`\lambda`-corrected physical susceptibility (unchanged for the 'sp' type in non-magnetic channels).
-    :raises ValueError: If the configured lambda-correction type is neither 'spch' nor 'sp'.
-    """
-    logger = config.logger
-
-    if config.lambda_correction.type.lower() not in ["spch", "sp"]:
-        raise ValueError("Lambda correction type must be either 'spch' or 'sp'.")
-
-    logger.info(f"Lambda correction type set to '{config.lambda_correction.type}'.")
-
-    if config.lambda_correction.type.lower() == "spch":
-        logger.info(f"Performing lambda correction for {chi_phys_q_r.channel.value} channel.")
-        chi_r_loc = LocalFourPoint.load(
-            os.path.join(config.output.output_path, f"chi_{chi_phys_q_r.channel.value}_loc.npy"),
-            chi_phys_q_r.channel,
-            num_vn_dimensions=0,
-        ).to_full_niw_range()
-        chi_phys_q_r, lambda_r = lc.perform_single_lambda_correction(
-            chi_phys_q_r, chi_r_loc.mat.sum() / config.sys.beta
-        )
-        chi_r_loc.free()
-        logger.info(
-            f"Lambda correction for the {chi_phys_q_r.channel.value} channel applied with lambda = {lambda_r:.6f}."
-        )
-
-        with open(os.path.join(config.output.output_path, f"lambda_{config.lambda_correction.type}.txt"), "a") as f:
-            f.write(f"lambda_{chi_phys_q_r.channel.value}: {lambda_r}\n")
-
-        return chi_phys_q_r
-
-    # else: "sp"
-    if chi_phys_q_r.channel != SpinChannel.MAGN:
-        return chi_phys_q_r
-
-    logger.info(f"Performing lambda correction for magn channel.")
-    chi_phys_q_dens = FourPoint.load(
-        os.path.join(config.output.output_path, f"chi_phys_q_dens.npy"),
-        SpinChannel.DENS,
-        num_vn_dimensions=0,
-    ).to_full_niw_range()
-
-    chi_dens_loc, chi_magn_loc = [
-        LocalFourPoint.load(
-            os.path.join(config.output.output_path, f"chi_{channel.value}_loc.npy"),
-            channel,
-            num_vn_dimensions=0,
-        ).to_full_niw_range()
-        for channel in [SpinChannel.DENS, SpinChannel.MAGN]
-    ]
-
-    chi_magn_loc_sum = (chi_dens_loc.mat + chi_magn_loc.mat).sum() - 1 / config.lattice.q_grid.nk_tot * (
-        config.lattice.q_grid.irrk_count[:, None, None, None, None, None] * chi_phys_q_dens.mat
-    ).sum()
-    chi_phys_q_r, lambda_r = lc.perform_single_lambda_correction(chi_phys_q_r, chi_magn_loc_sum / config.sys.beta)
-    logger.info(f"Lambda correction 'sp' applied. Lambda for magn channel is: {lambda_r:.6f}.")
-
-    with open(os.path.join(config.output.output_path, f"lambda_{config.lambda_correction.type}.txt"), "a") as f:
-        f.write(f"lambda_{chi_phys_q_r.channel.value}: {lambda_r}\n")
-
-    return chi_phys_q_r
 
 
 def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full_q_list: np.ndarray) -> SelfEnergy:
@@ -900,8 +875,7 @@ def calculate_sigma_from_kernel_fft_cpu(
     beta = config.sys.beta
 
     # G(k) -> F[G](R), forward FFT: built once per node in a shared window when available, else privately per rank.
-    # Each rank keeps only its R-pencil slice (the fancy indexing copies), so the full R-space object is released
-    # before the kernel FFT below.
+    # Each rank keeps only its R-pencil slice (a copy), so the R-space object frees before the kernel FFT.
     if node_comm is not None and config.memory.use_shared_memory_common_obj:
         g_r_mat, g_r_win = mpi_utils.build_node_shared_array(node_comm, lambda: giwk.fft().mat)
     else:
@@ -1361,6 +1335,591 @@ def _free_shared_window(win, node_comm) -> None:
     win.Free()
 
 
+def calculate_sigma_proposal(
+    sigma_in: SelfEnergy,
+    mu: float,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    v_nonloc_full: Interaction,
+    sigma_dmft: SelfEnergy,
+    delta_sigma: SelfEnergy,
+    my_irr_q_list: np.ndarray,
+    my_full_q_list: np.ndarray,
+    mpi_dist_irrk: MpiDistributor,
+    mpi_dist_fullbz: MpiDistributor,
+    comm: MPI.Comm,
+    current_iter: int,
+    quiet: bool = False,
+    annealer: "LambdaAnnealer | None" = None,
+) -> SelfEnergy:
+    r"""
+    Returns the raw (un-mixed) DGA self-energy proposal :math:`S(\Sigma_{\mathrm{in}})` at chemical potential
+    :math:`\mu`: Hartree/Fock, the Dyson Green's function, the bubble, the double-counting, density and magnetic
+    kernels, and the FFT Schwinger-Dyson contraction, finished with the noise-removal term and the DMFT tail.
+
+    Single source of truth for the proposal map: it is called once per self-consistency iteration by
+    :func:`calculate_self_energy_q` and repeatedly by the matrix-free Jacobian probes of the physical-fixed-point
+    stabilizer (see :func:`build_stabilization_projector`). The local irreducible vertex is frozen, so every
+    evaluation rebuilds the bubble, the ladder susceptibilities and the SDE self-energy. The Hartree/Fock term reads
+    ``config.sys.occ`` / ``occ_k``, which the caller sets consistently with :math:`\Sigma_{\mathrm{in}}`.
+
+    :param sigma_in: The input self-energy (full-BZ or local first-iteration, DMFT tail attached).
+    :param mu: The chemical potential the Green's function is built with.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`, reduced to this rank's irreducible q-points.
+    :param v_nonloc_full: The non-local interaction on the full q-grid (for the Hartree/Fock term).
+    :param sigma_dmft: The DMFT self-energy (cut to the loop's niv), providing the high-frequency tail.
+    :param delta_sigma: The DMFT-minus-local noise-removal term on the core box.
+    :param my_irr_q_list: This rank's irreducible q-point list.
+    :param my_full_q_list: This rank's full-BZ q-point list.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points.
+    :param mpi_dist_fullbz: MPI distributor over the full BZ.
+    :param comm: The MPI communicator.
+    :param current_iter: The current iteration number (the RPA susceptibility is saved only on iteration 1).
+    :param quiet: If ``True``, every file write and one-shot side effect (Eliashberg dumps, RPA/susceptibility
+        saves, lambda text file, Ornstein-Zernike fit) is suppressed - used by the stabilizer's Jacobian probes.
+        Pipeline logging is not gated here; the probes silence it wholesale via :func:`_suppressed_logging`.
+    :param annealer: The active :class:`LambdaAnnealer` threaded into the kernel step, or ``None`` when annealing
+        is off. Quiet probes apply the current boson mass but skip the gap measurement.
+    :return: The raw full-BZ proposal :class:`SelfEnergy` (replicated on every rank, DMFT tail attached).
+    """
+    logger = config.logger
+
+    hartree, fock = get_hartree_fock(u_loc, v_nonloc_full, my_full_q_list)
+    fock = mpi_dist_fullbz.allreduce(fock)
+    logger.info("Calculated Hartree and Fock terms.")
+
+    giwk_full, giwk_win, shared_node_comm = _build_giwk_full(
+        comm, sigma_in, mu, config.lattice.hamiltonian.get_ek(), config.sys.beta
+    )
+
+    logger.log_memory_usage("giwk", giwk_full, comm.size)
+
+    if config.memory.save_memory_for_chi0q:
+        gchi0_q = BubbleGenerator.create_generalized_chi0_q_auto(
+            mpi_dist_irrk,
+            giwk_full,
+            config.box.niw_core,
+            config.box.niv_full,
+            my_irr_q_list,
+            config.lattice.q_grid,
+            config.sys.beta,
+            config.logger,
+        )
+    else:
+        gchi0_q = BubbleGenerator.create_generalized_chi0_q_fft_auto(
+            mpi_dist_irrk,
+            giwk_full,
+            config.box.niw_core,
+            config.box.niv_full,
+            config.lattice.k_grid,
+            config.sys.beta,
+            config.logger,
+            node_comm=shared_node_comm,
+        )
+
+    if config.eliashberg.perform_eliashberg and not quiet:
+        gchi0_q.save(name=f"gchi0_q_rank_{comm.rank}", output_dir=config.output.output_path)
+
+    logger.log_memory_usage("Gchi0_q_full", gchi0_q, comm.size)
+    # Cut giwk to the core box for the self-energy step. When node-shared, the node root cuts into a new, smaller
+    # per-node window and the large full-niv window is freed; the cut giwk stays one copy per node through the SDE.
+    old_giwk_win = giwk_win
+    giwk_full, giwk_win = _cut_and_reshare_giwk(
+        giwk_full, giwk_win, shared_node_comm, config.box.niv_core + config.box.niw_core
+    )
+    _free_shared_window(old_giwk_win, shared_node_comm)
+
+    # the local vertices are identical on every rank, so they are loaded once per node into shared windows
+    f_dc_loc, f_dc_win = _load_node_shared_local_vertex(
+        shared_node_comm,
+        os.path.join(config.output.output_path, "f_magn_loc.npy"),
+        SpinChannel.NONE,
+        transform=lambda obj: obj.permute_orbitals("abcd->cbad", copy=False).scale(2.0),
+    )
+    kernel = calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc).scale(-1.0)
+    f_dc_loc.mat = None
+    if f_dc_win is None:
+        f_dc_loc.free()
+    _free_shared_window(f_dc_win, shared_node_comm)
+    logger.info("Calculated double-counting kernel.")
+
+    gchi0_q_full_sum = gchi0_q.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
+    gchi0_q_core = gchi0_q.cut_niv(config.box.niv_core)
+    gchi0_q.free()
+    logger.log_memory_usage("Gchi0_q_core", gchi0_q_core, comm.size)
+
+    gchi0_q_core_sum = gchi0_q_core.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
+    gchi0_q_core_inv = gchi0_q_core.invert(copy=False)
+    del gchi0_q_core
+    logger.log_memory_usage("Gchi0_q_inv", gchi0_q_core_inv, comm.size)
+
+    if current_iter == 1 and not quiet:
+        calculate_and_save_chi_q_r_rpa(gchi0_q_core_inv, u_loc, v_nonloc, mpi_dist_irrk)
+
+    if config.eliashberg.perform_eliashberg and not quiet:
+        gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
+
+    gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
+        shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
+    )
+    kernel.add(
+        calculate_sigma_kernel_r_q(
+            gamma_dens,
+            gchi0_q_core_inv,
+            gchi0_q_full_sum,
+            gchi0_q_core_sum,
+            u_loc,
+            v_nonloc,
+            mpi_dist_irrk,
+            quiet,
+            annealer,
+        ),
+        copy=False,
+    )
+    gamma_dens.mat = None
+    if gamma_dens_win is None:
+        gamma_dens.free()
+    _free_shared_window(gamma_dens_win, shared_node_comm)
+    mpi_dist_irrk.barrier()
+    logger.info("Calculated kernel for density channel.")
+
+    gamma_magn, gamma_magn_win = _load_node_shared_local_vertex(
+        shared_node_comm, os.path.join(config.output.output_path, "gamma_magn_loc.npy"), SpinChannel.MAGN
+    )
+    kernel.add(
+        calculate_sigma_kernel_r_q(
+            gamma_magn,
+            gchi0_q_core_inv,
+            gchi0_q_full_sum,
+            gchi0_q_core_sum,
+            u_loc,
+            v_nonloc,
+            mpi_dist_irrk,
+            quiet,
+            annealer,
+        ).scale(3.0),
+        copy=False,
+    )
+    gchi0_q_core_inv.free()
+    gchi0_q_full_sum.free()
+    gchi0_q_core_sum.free()
+    gamma_magn.mat = None
+    if gamma_magn_win is None:
+        gamma_magn.free()
+    _free_shared_window(gamma_magn_win, shared_node_comm)
+    logger.info("Calculated kernel for magnetic channel.")
+
+    logger.info("Starting calculation of DGA self-energy.")
+
+    # FFT contraction (the only production path - the q-loop variant peaks HIGHER, see calculate_sigma_from_kernel):
+    # split the bosonic sum into positive- and negative-w passes, so only one half-niw full-BZ kernel exists at a time.
+    niw = config.box.niw_core
+    kernel_irr = kernel  # the (small) irreducible-BZ positive-w kernel, mapped to the full BZ once per pass
+    # Decide CPU/GPU (and select the GPU) once
+    use_gpu = select_sigma_fft_device(mpi_dist_fullbz)
+
+    sigma_prop = _run_fft_sde_pass(
+        kernel_irr.copy(),
+        mpi_dist_irrk,
+        mpi_dist_fullbz,
+        giwk_full,
+        [(i, i) for i in range(niw + 1)],
+        use_gpu,
+        negative_w=False,
+        node_comm=shared_node_comm,
+    )
+    sigma_neg = _run_fft_sde_pass(
+        kernel_irr,
+        mpi_dist_irrk,
+        mpi_dist_fullbz,
+        giwk_full,
+        [(i, -i) for i in range(1, niw + 1)],
+        use_gpu,
+        negative_w=True,
+        node_comm=shared_node_comm,
+    )
+
+    sigma_prop.mat += sigma_neg.mat  # accumulate the rank-local R-space partial self-energies (in place)
+    sigma_neg.free()
+
+    sigma_prop.mat = mpi_dist_fullbz.gather(sigma_prop.mat)
+    if comm.rank == 0:
+        sigma_prop = sigma_prop.ifft().to_full_niv_range()
+    sigma_prop = mpi_dist_fullbz.bcast_npoint(sigma_prop)
+
+    logger.info("Self-energy calculated from kernel.")
+    logger.log_memory_usage("Non-local sigma", sigma_prop, comm.size)
+
+    # giwk's momentum-space data is no longer needed (only its dispersion ek is used below); drop the shared view
+    # on every rank, then release the per-node cut-giwk window and its node communicator.
+    if giwk_win is not None:
+        giwk_full.mat = None
+    _release_shared_giwk(giwk_win, shared_node_comm)
+
+    sigma_prop = sigma_prop + hartree + fock
+    logger.info("Full non-local self-energy calculated.")
+
+    # This is done to minimize noise. We remove some fluctuations from dmft that are included in the local self-energy
+    # calculated in this code and add the smooth dmft self-energy
+    sigma_prop += delta_sigma
+    sigma_prop = sigma_prop.concatenate_self_energies(sigma_dmft)
+    return sigma_prop
+
+
+@contextmanager
+def _suppressed_logging():
+    """
+    Temporarily silences info/debug/memory logging on ``config.logger`` for the duration of a block. Used around
+    the proposal evaluations of the Jacobian build so the (otherwise per-step) pipeline logging from the bubble,
+    kernel and SDE helpers is not emitted dozens of times. Saves and restores the original methods, so it is
+    robust to the logger internals; warnings stay audible.
+    """
+    logger = config.logger
+    saved = (logger.info, logger.log_memory_usage, logger.debug)
+
+    def _mute(*a, **k):
+        return None
+
+    logger.info = logger.log_memory_usage = logger.debug = _mute
+    try:
+        yield
+    finally:
+        logger.info, logger.log_memory_usage, logger.debug = saved
+
+
+def build_stabilization_projector(
+    sigma_star: SelfEnergy,
+    mu_star: float,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    v_nonloc_full: Interaction,
+    sigma_dmft: SelfEnergy,
+    sigma_dmft_full: SelfEnergy,
+    delta_sigma: SelfEnergy,
+    my_irr_q_list: np.ndarray,
+    my_full_q_list: np.ndarray,
+    mpi_dist_irrk: MpiDistributor,
+    mpi_dist_fullbz: MpiDistributor,
+    comm: MPI.Comm,
+) -> "jstab.PhysicalSolutionStabilizer | None":
+    r"""
+    Builds the :class:`~dgamore.jacobian_stabilization.PhysicalSolutionStabilizer` for the modified iterative
+    scheme (arXiv:2502.01420; the :math:`\Sigma`-mixing analog of :math:`\mathrm{Eq.~(9)}`, with the sign rule of
+    :math:`\mathrm{Eq.~(6)}` and the Arnoldi projector of :math:`\mathrm{SM~Sec.~VI}`) by linearizing the proposal
+    map at ``sigma_star``.
+
+    ``sigma_star`` is taken as the (assumed) physical solution - in practice the warm-start self-energy from
+    ``previous_sc_path``. A purely local starting self-energy (:math:`n_k = 1`) is broadcast to the full Brillouin
+    zone so it matches the proposal output. The Jacobian is restricted to the inner
+    :math:`n_{\nu,\mathrm{jac}} \sim n_{\nu,\mathrm{core}}/2` (:math:`\geq 15`) Matsubara window (the unstable
+    eigenvectors are low-frequency localized), and each finite-difference probe re-solves :math:`\mu` and the
+    occupation for the perturbed self-energy, so the rank-one :math:`\mu` feedback and the Hartree-Fock occupation
+    feedback enter the Jacobian exactly. The constraint state (:math:`\mu`, filling, occupation) is snapshotted and
+    restored around the build. Returns ``None`` if no reflection-curable unstable direction is found. If the build
+    reduces the mixing (reflection-uncurable overshoot mode), the reduced value is written back to
+    ``config.self_consistency.mixing`` so the loop damps consistently with the projector.
+
+    Cost: one proposal evaluation for the base point plus one per Arnoldi step (adaptive, capped; see the
+    stabilizer class), all paid once here; the loop never re-evaluates the proposal for stabilization.
+
+    :param sigma_star: The warm-start self-energy to linearize at (assumed close to the physical solution).
+    :param mu_star: The chemical potential belonging to ``sigma_star``.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{q}`, reduced to this rank's irreducible q-points.
+    :param v_nonloc_full: The non-local interaction on the full q-grid.
+    :param sigma_dmft: The DMFT self-energy cut to the loop's niv (tail for the proposal).
+    :param sigma_dmft_full: The uncut DMFT self-energy (tail for the occupation Green's function).
+    :param delta_sigma: The DMFT-minus-local noise-removal term on the core box.
+    :param my_irr_q_list: This rank's irreducible q-point list.
+    :param my_full_q_list: This rank's full-BZ q-point list.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points.
+    :param mpi_dist_fullbz: MPI distributor over the full BZ.
+    :param comm: The MPI communicator (the probes are collective; the recurrence is replicated on every rank).
+    :return: The built stabilizer, or ``None`` when the captured spectrum needs no reflection.
+    :raises ValueError: If ``sigma_star`` lives on a different (non-local) k-grid than the current one.
+    """
+    logger = config.logger
+
+    p = float(config.self_consistency.mixing)
+    niv_core = config.box.niv_core
+
+    # Inner Matsubara window for the Jacobian: about half the DGA core, but never fewer than 15 frequencies
+    # (or the whole core if it is smaller).
+    niv_jac = max(niv_core // 2, min(15, niv_core))
+
+    mu_tol = 1e-10  # tight mu Newton solve so the finite difference is not contaminated
+
+    ek = config.lattice.hamiltonian.get_ek()
+
+    # The iterated quantity is the full-BZ self-energy. Broadcast a purely local starting self-energy to the
+    # full BZ so the base matches the (full-BZ) proposal output.
+    sigma_star = sigma_star.compress_q_dimension()
+    nk_tot = config.lattice.k_grid.nk_tot
+    if sigma_star.nq_tot != nk_tot:
+        if sigma_star.nq_tot == 1:
+            tiled = np.tile(sigma_star.mat, (nk_tot, 1, 1, 1))
+            sigma_star = SelfEnergy(
+                tiled, config.lattice.k_grid.nk, sigma_star.full_niv_range, True, False, True, beta=config.sys.beta
+            )
+        else:
+            raise ValueError(
+                f"Starting self-energy has {sigma_star.nq_tot} k-points but the current grid has "
+                f"{nk_tot}; interpolate it to the current k-grid before enabling stabilization."
+            )
+    niv = sigma_star.niv
+    sl = slice(niv - niv_jac, niv + niv_jac)
+    base_inner = np.ascontiguousarray(sigma_star.mat[..., sl])
+
+    # Snapshot the constraint state so the loop resumes from the correct physical values.
+    mu0, n0 = mu_star, config.sys.n
+    occ0, occ_k0 = config.sys.occ, config.sys.occ_k
+
+    def proposal_fn(inner_mat: np.ndarray) -> np.ndarray:
+        with _suppressed_logging():
+            sig = sigma_star.copy().compress_q_dimension()
+            sig.mat[..., sl] = inner_mat.astype(sig.mat.dtype, copy=False)
+
+            if comm.rank == 0:
+                mu = update_mu(mu0, n0, ek, sig.mat, config.sys.beta, sig.fit_smom()[0], logger=logger, tol=mu_tol)
+                config.sys.mu = mu
+                sig_occ = sig.copy().concatenate_self_energies(sigma_dmft_full)
+                giwk_occ = GreensFunction.get_g_full(sig_occ, mu, ek, config.sys.beta)
+                _, occ, occ_k = giwk_occ.get_fill_nonlocal()
+            else:
+                occ, occ_k = None, None
+            config.sys.mu = comm.bcast(config.sys.mu, root=0)
+            config.sys.occ, config.sys.occ_k = comm.bcast((occ, occ_k), root=0)
+
+            # No annealer is threaded here: probes only run once the scaffold released (mass exactly zero) and quiet
+            # probes skip the gap measurement anyway, so passing it would be a no-op on the probed map.
+            prop = calculate_sigma_proposal(
+                sig,
+                config.sys.mu,
+                u_loc,
+                v_nonloc,
+                v_nonloc_full,
+                sigma_dmft,
+                delta_sigma,
+                my_irr_q_list,
+                my_full_q_list,
+                mpi_dist_irrk,
+                mpi_dist_fullbz,
+                comm,
+                current_iter=0,
+                quiet=True,
+            )
+        return np.ascontiguousarray(prop.compress_q_dimension().mat[..., sl])
+
+    try:
+        logger.info(
+            f"Building stabilizer at the starting self-energy (inner window niv_jac={niv_jac} of core={niv_core})."
+        )
+        logger.info(
+            "This requires evaluating the DGA self-energy several times to construct the Jacobian; "
+            "this step will take a while."
+        )
+        stabilizer = jstab.PhysicalSolutionStabilizer(
+            proposal_fn,
+            base_inner,
+            p,
+            niv_jac,
+            n_modes=config.stabilization.stabilizer_n_modes,
+            max_residual=config.stabilization.max_stabilizer_base_residual,
+            logger=logger,
+        )
+        if stabilizer.mixing_reduced:
+            # A reflection-uncurable instability forced the stabilizer to a smaller, contractive mixing. Adopt it for
+            # the loop (apply_mixing_strategy reads config.self_consistency.mixing) so damping matches the projector.
+            logger.warning(
+                f"Mixing parameter changed: config.self_consistency.mixing "
+                f"{config.self_consistency.mixing:.3f} -> {stabilizer.p:.2f} "
+                f"(stabilizer required stronger damping to make the physical fixed point attractive)."
+            )
+            config.self_consistency.mixing = stabilizer.p
+        if stabilizer.n_unstable == 0:
+            logger.info(
+                "No reflection-curable unstable directions remaining at the starting self-energy; "
+                "using conventional mixing (at the possibly reduced mixing parameter)."
+            )
+            return None
+        logger.info(f"Stabilizer built with {stabilizer.n_unstable} unstable direction(s).")
+    finally:
+        config.sys.mu, config.sys.n = mu0, n0
+        config.sys.occ, config.sys.occ_k = occ0, occ_k0
+
+    return stabilizer
+
+
+def _relative_sigma_residual(sigma_new: SelfEnergy, sigma_old: SelfEnergy) -> float:
+    r"""
+    Returns the relative L2 residual :math:`\lVert\Sigma_{\mathrm{new}} - \Sigma_{\mathrm{old}}\rVert /
+    \lVert\Sigma_{\mathrm{old}}\rVert` over the positive fermionic core frequencies (all momenta and orbitals,
+    real and imaginary parts stacked). Evaluated on the raw proposal it measures the mixing-independent distance
+    to the fixed point, :math:`\lVert S(\Sigma)-\Sigma\rVert/\lVert\Sigma\rVert`; evaluated on the mixed iterate
+    it measures the per-iteration step size (which shrinks with the mixing parameter). A local (single-k)
+    self-energy is broadcast against a full-BZ one. Layout-safe: the two iterates may arrive with different
+    momentum layouts (compressed vs decompressed) and are normalized before comparing.
+
+    :param sigma_new: The new self-energy (raw proposal or mixed iterate).
+    :param sigma_old: The previous iterate the residual is measured against.
+    :return: The relative residual as a float.
+    """
+    new_core = sigma_new.mat[..., sigma_new.niv : sigma_new.niv + config.box.niv_core]
+    old_core = sigma_old.mat[..., sigma_old.niv : sigma_old.niv + config.box.niv_core]
+    # Normalize both to the compressed [q, o1, o2, v] layout before comparing: mismatched layouts (rank 0's iterate is
+    # left decompressed by the save path) would pair wrong momenta; a local iterate is broadcast to the full BZ.
+    new_core = new_core.reshape(-1, *new_core.shape[-3:])
+    old_core = old_core.reshape(-1, *old_core.shape[-3:])
+    if old_core.shape[0] != new_core.shape[0]:
+        old_core = np.broadcast_to(old_core, new_core.shape)
+    return float(np.linalg.norm(new_core - old_core) / np.linalg.norm(old_core))
+
+
+def _mixing_history_cap(
+    current_iter: int, release_iter: int | None, stab_arm_iter: int | None, anneal_reset_iter: int | None = None
+) -> int | None:
+    """
+    Returns the accelerated-mixing history cap for this iteration: the number of iterations since the most recent
+    map-switching event - the susceptibility-restriction release, the arming of the stabilizer's reflection, or a
+    change of the lambda-annealing mass. Anderson/Pulay must not extrapolate across any of these discontinuities,
+    so their usable history is capped to the post-event iterations (``None`` when no event has occurred).
+
+    :param current_iter: The current self-consistency iteration number.
+    :param release_iter: The iteration the susceptibility restriction was released on (``None`` if never).
+    :param stab_arm_iter: The iteration the stabilizer's reflection was armed on (``None`` if never).
+    :param anneal_reset_iter: The iteration the annealing mass last changed on (``None`` if never).
+    :return: The history cap, or ``None`` for no cap.
+    """
+    events = (release_iter, stab_arm_iter, anneal_reset_iter)
+    last_reset_iter = max((it for it in events if it is not None), default=None)
+    return None if last_reset_iter is None else max(0, current_iter - last_reset_iter - 1)
+
+
+def _stabilizer_probe_active(
+    stab_armed: bool, stab_projector, converged: bool, annealer: "LambdaAnnealer | None"
+) -> bool:
+    """
+    Returns whether the stall detector of the armed stabilizer may run this iteration. It is paused when the
+    stabilizer is disarmed or already deployed, when the cycle just converged, and - crucially - while
+    ``use_chi_phys_restriction`` or the lambda-annealing scaffold is active: the scaffolded map is a convergence aid,
+    and linearizing it would target the wrong Jacobian, so the projector may only be built in the pure phase.
+
+    :param stab_armed: Whether the stabilizer is armed (config flag, not yet deployed or given up).
+    :param stab_projector: The deployed stabilizer (``None`` while not built).
+    :param converged: Whether this iteration satisfied the convergence criterion.
+    :param annealer: The active :class:`LambdaAnnealer`, or ``None`` when annealing is off.
+    :return: Whether the stall detector should be updated this iteration.
+    """
+    return (
+        stab_armed
+        and stab_projector is None
+        and not converged
+        and not config.stabilization.use_chi_phys_restriction
+        and not (annealer is not None and annealer.active)
+    )
+
+
+def _update_stabilizer_probe(
+    relative_residual: float, best_residual: float, growth_count: int, stall_count: int, probe_iters: int
+) -> tuple[float, int, int, bool]:
+    r"""
+    Stall detector for the *armed* physical-solution stabilizer. Deliberately conservative: the stabilizer must
+    only engage when plain iteration demonstrably *cannot* reach the physical solution - applying the reflection
+    to a run that would have converged on its own steers it onto a different (typically unphysical) branch. Two
+    trigger paths, both requiring sustained evidence:
+
+    1. **Divergence**: the residual sits a factor :data:`_STAB_GROWTH_FACTOR` above the best seen for
+       ``probe_iters`` consecutive iterations - the iterate is escaping a repelling fixed point.
+    2. **Far plateau**: no meaningful improvement (a relative drop of at least :math:`10^{-3}`) for
+       :data:`_STAB_PLATEAU_WINDOW_FACTOR` ``* probe_iters`` consecutive iterations while the residual is still
+       :data:`_STAB_FAR_RESIDUAL_FACTOR` times above the convergence epsilon - a limit cycle around a repelling
+       fixed point. A plateau *near* epsilon (slow tail of a converging run) never triggers.
+
+    The detector cannot fire when plain iteration converges (even to an unphysical branch): a decreasing residual
+    resets both counters. Distinguishing physical from unphysical *convergence* is not possible from the residual
+    trend alone; the remedy for that regime is a warm start inside the physical basin (temperature continuation).
+
+    :param relative_residual: The current iteration's relative self-energy residual.
+    :param best_residual: The lowest residual seen so far.
+    :param growth_count: Consecutive iterations spent a factor :data:`_STAB_GROWTH_FACTOR` above the best.
+    :param stall_count: Consecutive iterations without meaningful improvement.
+    :param probe_iters: The base probe window (the divergence path fires after this many growth iterations).
+    :return: The updated ``(best_residual, growth_count, stall_count, trigger)`` tuple.
+    """
+    if not np.isfinite(relative_residual):
+        # an overflowed/NaN residual is the strongest divergence evidence there is; NaN comparisons below would
+        # otherwise all evaluate False and silently reset the growth counter
+        return best_residual, growth_count + 1, stall_count + 1, growth_count + 1 >= probe_iters
+    if relative_residual < best_residual * (1.0 - 1e-3):
+        return relative_residual, 0, 0, False
+    stall_count += 1
+    growth_count = growth_count + 1 if relative_residual >= _STAB_GROWTH_FACTOR * best_residual else 0
+    diverging = growth_count >= probe_iters
+    far_plateau = (
+        stall_count >= _STAB_PLATEAU_WINDOW_FACTOR * probe_iters
+        and relative_residual > _STAB_FAR_RESIDUAL_FACTOR * config.self_consistency.epsilon
+    )
+    return best_residual, growth_count, stall_count, diverging or far_plateau
+
+
+def _update_stabilizer_watchdog(
+    relative_residual: float, arming_residual: float, watch_count: int, probe_iters: int
+) -> tuple[int, bool, bool]:
+    r"""
+    Do-no-harm watchdog for the *deployed* reflection: if the modified scheme has not meaningfully improved on the
+    residual level it was armed at within :data:`_STAB_WATCH_WINDOW_FACTOR` ``* probe_iters`` iterations, the
+    reflection is to be reverted (plain mixing resumes) - the projector is evidently not curing this run and must
+    not be allowed to steer it onto a different branch. A genuinely repelling-but-flipped fixed point improves the
+    residual within the window even at slow post-flip rates.
+
+    :param relative_residual: The current iteration's relative self-energy residual.
+    :param arming_residual: The residual level at which the reflection was armed.
+    :param watch_count: Consecutive reflected iterations observed so far.
+    :param probe_iters: The base probe window (the watchdog allows ``_STAB_WATCH_WINDOW_FACTOR`` times this).
+    :return: The updated ``(watch_count, passed, revert)`` tuple; ``passed`` ends the watch, ``revert`` disables
+        the reflection.
+    """
+    if relative_residual < arming_residual * (1.0 - 1e-3):
+        return watch_count, True, False
+    watch_count += 1
+    return watch_count, False, watch_count >= _STAB_WATCH_WINDOW_FACTOR * probe_iters
+
+
+def apply_modified_preconditioner(
+    sigma_new: SelfEnergy, sigma_old: SelfEnergy, stabilizer: "jstab.PhysicalSolutionStabilizer"
+) -> SelfEnergy:
+    r"""
+    Reflects the unstable component of the inner-window residual *before* the normal mixing (arXiv:2502.01420).
+    This realizes the modified iterative scheme while preserving the configured mixing: the subsequent
+    :func:`apply_mixing_strategy` then linearly mixes or Anderson/Pulay-accelerates the *modified* fixed-point map
+    :math:`\Sigma_{n+1} = \Sigma_n + \mathcal{P}\,(S(\Sigma_n) - \Sigma_n)`. Only the inner Jacobian window is
+    touched; outside it the proposal is unchanged.
+
+    :param sigma_new: The raw self-energy proposal :math:`S(\Sigma_n)`.
+    :param sigma_old: The previous iterate :math:`\Sigma_n`.
+    :param stabilizer: The built :class:`~dgamore.jacobian_stabilization.PhysicalSolutionStabilizer`.
+    :return: The proposal with the reflected inner window (same object, modified in place on the window).
+    """
+    sigma_new = sigma_new.compress_q_dimension()
+    sigma_old = sigma_old.compress_q_dimension()
+
+    niv = sigma_new.niv
+    niv_jac = stabilizer.niv_jac
+    sl = slice(niv - niv_jac, niv + niv_jac)
+    new_inner = sigma_new.mat[..., sl]
+    old_inner = sigma_old.mat[..., sl]
+    if old_inner.shape != new_inner.shape:
+        # First iteration without a warm start: ``sigma_old`` is the local (n_k = 1) DMFT self-energy, the proposal
+        # full-BZ. It is k-independent, so broadcast it before reflecting (the 1-D residual needs matching shapes).
+        old_inner = np.broadcast_to(old_inner, new_inner.shape)
+    reflected = stabilizer.reflect_proposal(new_inner, old_inner)
+    sigma_new.mat[..., sl] = reflected.astype(sigma_new.mat.dtype, copy=False)
+
+    config.logger.info(f"Modified-scheme residual reflection applied (n_unstable={stabilizer.n_unstable}).")
+    return sigma_new
+
+
 def calculate_self_energy_q(
     comm: MPI.Comm, u_loc: LocalInteraction, v_nonloc: Interaction, sigma_dmft: SelfEnergy, sigma_local: SelfEnergy
 ) -> SelfEnergy:
@@ -1403,9 +1962,8 @@ def calculate_self_energy_q(
 
     mu_history = _init_mu_history(starting_iter)
 
-    # rank 0 keeps the accelerated-mixing self-energy history in memory (seeded once from the saved files for
-    # resumed runs): every rank used to re-read and re-interpolate the last n sigma files each iteration -
-    # identical data on every rank, pure redundant IO at scale
+    # rank 0 keeps the accelerated-mixing self-energy history in memory (seeded once from files for resumed runs):
+    # every rank used to re-read/re-interpolate the last n sigma files each iteration - identical data, redundant IO.
     sigma_history = None
     if comm.rank == 0 and config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson"):
         sigma_history = read_last_n_sigmas_from_files(
@@ -1430,7 +1988,7 @@ def calculate_self_energy_q(
             sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek(), config.sys.beta
         )
         config.sys.n, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
-        giwk_full.cut_niv(niv_cut)
+        giwk_full.free()
 
     config.sys.n, config.sys.occ, config.sys.occ_k = comm.bcast(
         (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
@@ -1447,183 +2005,56 @@ def calculate_self_energy_q(
     v_nonloc_full = v_nonloc.copy()
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
 
+    # The modified iterative scheme (arXiv:2502.01420) is only needed once the physical fixed point turns *repelling*
+    # (plain iteration stops contracting); so the stabilizer is *armed*, engaging only after the residual stalls.
+    stab_armed = config.stabilization.use_jacobian_stabilization
+    stab_projector = None
+    sigma_warm = sigma_old.copy() if stab_armed else None
+    stab_probe_iters = max(int(config.stabilization.stabilizer_probe_iters), 1)
+    stab_best_residual = float("inf")
+    stab_growth_count = 0
+    stab_stall_count = 0
+    stab_arm_iter = None
+    stab_arm_residual = None
+    stab_watch_count = 0
+    stab_watch_passed = False
+
+    annealer = LambdaAnnealer() if config.stabilization.use_lambda_annealing else None
+    anneal_reset_iter = None
     release_iter = None
     for current_iter in range(starting_iter + 1, starting_iter + config.self_consistency.max_iter + 1):
         logger.info("----------------------------------------")
         logger.info(f"Starting iteration {current_iter}.")
         logger.info("----------------------------------------")
 
-        hartree, fock = get_hartree_fock(u_loc, v_nonloc_full, my_full_q_list)
-        fock = mpi_dist_fullbz.allreduce(fock)
-        logger.info("Calculated Hartree and Fock terms.")
-
-        giwk_full, giwk_win, shared_node_comm = _build_giwk_full(
-            comm, sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek(), config.sys.beta
+        sigma_new = calculate_sigma_proposal(
+            sigma_old,
+            mu_history[-1],
+            u_loc,
+            v_nonloc,
+            v_nonloc_full,
+            sigma_dmft,
+            delta_sigma,
+            my_irr_q_list,
+            my_full_q_list,
+            mpi_dist_irrk,
+            mpi_dist_fullbz,
+            comm,
+            current_iter,
+            annealer=annealer,
         )
+        # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
 
-        logger.log_memory_usage("giwk", giwk_full, comm.size)
-
-        if config.memory.save_memory_for_chi0q:
-            gchi0_q = BubbleGenerator.create_generalized_chi0_q_auto(
-                mpi_dist_irrk,
-                giwk_full,
-                config.box.niw_core,
-                config.box.niv_full,
-                my_irr_q_list,
-                config.lattice.q_grid,
-                config.sys.beta,
-                config.logger,
-            )
-        else:
-            gchi0_q = BubbleGenerator.create_generalized_chi0_q_fft_auto(
-                mpi_dist_irrk,
-                giwk_full,
-                config.box.niw_core,
-                config.box.niv_full,
-                config.lattice.k_grid,
-                config.sys.beta,
-                config.logger,
-                node_comm=shared_node_comm,
-            )
-
-        if config.eliashberg.perform_eliashberg:
-            gchi0_q.save(name=f"gchi0_q_rank_{comm.rank}", output_dir=config.output.output_path)
-
-        logger.log_memory_usage("Gchi0_q_full", gchi0_q, comm.size)
-        # Cut giwk to the core box for the self-energy step. When node-shared, the node root cuts into a new, smaller
-        # per-node window and the large full-niv window is freed; the cut giwk stays one copy per node through the SDE.
-        old_giwk_win = giwk_win
-        giwk_full, giwk_win = _cut_and_reshare_giwk(
-            giwk_full, giwk_win, shared_node_comm, config.box.niv_core + config.box.niw_core
-        )
-        _free_shared_window(old_giwk_win, shared_node_comm)
+        # Modified iterative scheme: reflect the proposal residual on the unstable subspace so the physical fixed point
+        # becomes attractive. Applied before the usual mixing, which still sees a consistent (preconditioned) proposal.
+        if stab_projector is not None:
+            sigma_new = apply_modified_preconditioner(sigma_new, sigma_old, stab_projector)
 
         sigma_old = sigma_old.cut_niv(config.box.niv_core)
 
-        # the local vertices are identical on every rank, so they are loaded once per node into shared windows
-        f_dc_loc, f_dc_win = _load_node_shared_local_vertex(
-            shared_node_comm,
-            os.path.join(config.output.output_path, "f_magn_loc.npy"),
-            SpinChannel.NONE,
-            transform=lambda obj: obj.permute_orbitals("abcd->cbad", copy=False).scale(2.0),
-        )
-        kernel = calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc).scale(-1.0)
-        f_dc_loc.mat = None
-        if f_dc_win is None:
-            f_dc_loc.free()
-        _free_shared_window(f_dc_win, shared_node_comm)
-        logger.info("Calculated double-counting kernel.")
-
-        gchi0_q_full_sum = gchi0_q.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
-        gchi0_q_core = gchi0_q.cut_niv(config.box.niv_core)
-        gchi0_q.free()
-        logger.log_memory_usage("Gchi0_q_core", gchi0_q_core, comm.size)
-
-        gchi0_q_core_sum = gchi0_q_core.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
-        gchi0_q_core_inv = gchi0_q_core.invert(copy=False)
-        del gchi0_q_core
-        logger.log_memory_usage("Gchi0_q_inv", gchi0_q_core_inv, comm.size)
-
-        if current_iter == 1:
-            calculate_and_save_chi_q_r_rpa(gchi0_q_core_inv, u_loc, v_nonloc, mpi_dist_irrk)
-
-        if config.eliashberg.perform_eliashberg:
-            gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
-
-        gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
-            shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
-        )
-        kernel.add(
-            calculate_sigma_kernel_r_q(
-                gamma_dens, gchi0_q_core_inv, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc, mpi_dist_irrk
-            ),
-            copy=False,
-        )
-        gamma_dens.mat = None
-        if gamma_dens_win is None:
-            gamma_dens.free()
-        _free_shared_window(gamma_dens_win, shared_node_comm)
-        mpi_dist_irrk.barrier()
-        logger.info("Calculated kernel for density channel.")
-
-        gamma_magn, gamma_magn_win = _load_node_shared_local_vertex(
-            shared_node_comm, os.path.join(config.output.output_path, "gamma_magn_loc.npy"), SpinChannel.MAGN
-        )
-        kernel.add(
-            calculate_sigma_kernel_r_q(
-                gamma_magn, gchi0_q_core_inv, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc, mpi_dist_irrk
-            ).scale(3.0),
-            copy=False,
-        )
-        gchi0_q_core_inv.free()
-        gchi0_q_full_sum.free()
-        gchi0_q_core_sum.free()
-        gamma_magn.mat = None
-        if gamma_magn_win is None:
-            gamma_magn.free()
-        _free_shared_window(gamma_magn_win, shared_node_comm)
-        logger.info("Calculated kernel for magnetic channel.")
-
-        logger.info("Starting calculation of DGA self-energy.")
-
-        # FFT contraction (the only production path - the q-loop variant peaks HIGHER in memory, see
-        # calculate_sigma_from_kernel): split the bosonic-frequency sum into a positive- and a negative-w pass so the
-        # full-BZ kernel is only ever materialized over half the niw range AND only one niw half exists at a time.
-        niw = config.box.niw_core
-        kernel_irr = kernel  # the (small) irreducible-BZ positive-w kernel, mapped to the full BZ once per pass
-        # Decide CPU/GPU (and select the GPU) once
-        use_gpu = select_sigma_fft_device(mpi_dist_fullbz)
-
-        sigma_new = _run_fft_sde_pass(
-            kernel_irr.copy(),
-            mpi_dist_irrk,
-            mpi_dist_fullbz,
-            giwk_full,
-            [(i, i) for i in range(niw + 1)],
-            use_gpu,
-            negative_w=False,
-            node_comm=shared_node_comm,
-        )
-        sigma_neg = _run_fft_sde_pass(
-            kernel_irr,
-            mpi_dist_irrk,
-            mpi_dist_fullbz,
-            giwk_full,
-            [(i, -i) for i in range(1, niw + 1)],
-            use_gpu,
-            negative_w=True,
-            node_comm=shared_node_comm,
-        )
-
-        sigma_new.mat += sigma_neg.mat  # accumulate the rank-local R-space partial self-energies (in place)
-        sigma_neg.free()
-
-        sigma_new.mat = mpi_dist_fullbz.gather(sigma_new.mat)
-        if comm.rank == 0:
-            sigma_new = sigma_new.ifft().to_full_niv_range()
-        sigma_new = mpi_dist_fullbz.bcast_npoint(sigma_new)
-
-        logger.info("Self-energy calculated from kernel.")
-        logger.log_memory_usage("Non-local sigma", sigma_new, comm.size)
-
-        # giwk's momentum-space data is no longer needed (only its dispersion ek is used below); drop the shared view
-        # on every rank, then release the per-node cut-giwk window and its node communicator.
-        if giwk_win is not None:
-            giwk_full.mat = None
-        _release_shared_giwk(giwk_win, shared_node_comm)
-
-        sigma_new = sigma_new + hartree + fock
-        logger.info("Full non-local self-energy calculated.")
-
-        # This is done to minimize noise. We remove some fluctuations from dmft that are included in the local self-energy
-        # calculated in this code and add the smooth dmft self-energy
-        sigma_new += delta_sigma
-        sigma_new = sigma_new.concatenate_self_energies(sigma_dmft)
-        # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
-
         logger.info("Applying mixing strategy to the self-energy.")
         sigma_old = sigma_old.concatenate_self_energies(sigma_dmft)
-        history_cap = None if release_iter is None else max(0, current_iter - release_iter - 1)
+        history_cap = _mixing_history_cap(current_iter, release_iter, stab_arm_iter, anneal_reset_iter)
         # mixing runs on rank 0 only (all ranks computed identical results before) and the mixed sigma is broadcast
         if comm.rank == 0:
             sigma_new = apply_mixing_strategy(
@@ -1631,26 +2062,22 @@ def calculate_self_energy_q(
             )
         sigma_new = mpi_dist_fullbz.bcast_npoint(sigma_new)
         if sigma_history is not None:
-            # the in-memory analogue of what read_last_n_sigmas_from_files reproduced from the file just saved below
+            # the in-memory analog of what read_last_n_sigmas_from_files reproduced from the file just saved below
             sigma_history.append(sigma_new.decompress_q_dimension().cut_niv(config.box.niv_core).mat)
             del sigma_history[: -config.self_consistency.mixing_history_length]
 
         sigma_new = sigma_new.compress_q_dimension()
         sigma_old = sigma_old.compress_q_dimension()
 
-        # Canonical self-consistency residual. This is the relative (L2) residual used for the convergence check
-        sigma_new_test = sigma_new.mat[..., sigma_new.niv : sigma_new.niv + config.box.niv_core]
-        sigma_old_test = sigma_old.mat[..., sigma_new.niv : sigma_old.niv + config.box.niv_core]
-        diff = (sigma_new_test - sigma_old_test).ravel()
-        norm_x = np.linalg.norm(np.concatenate([sigma_old_test.real.ravel(), sigma_old_test.imag.ravel()]))
-        relative_residual = np.linalg.norm(np.concatenate([diff.real, diff.imag])) / norm_x
+        # Post-mixing step residual (the historical convergence measure; shrinks with the mixing parameter)
+        relative_residual = _relative_sigma_residual(sigma_new, sigma_old)
 
         old_mu = mu_history[-1]
         if comm.rank == 0:
             config.sys.mu = update_mu(
                 old_mu,
                 config.sys.n,
-                giwk_full.ek,
+                config.lattice.hamiltonian.get_ek(),
                 sigma_new.mat,
                 config.sys.beta,
                 sigma_new.fit_smom()[0],
@@ -1663,7 +2090,7 @@ def calculate_self_energy_q(
 
         if comm.rank == 0:
             sigma_occ = sigma_new.copy().concatenate_self_energies(sigma_dmft_full)
-            giwk_occ = giwk_full.get_g_full(
+            giwk_occ = GreensFunction.get_g_full(
                 sigma_occ, config.sys.mu, config.lattice.hamiltonian.get_ek(), config.sys.beta
             )
             # calculate new occupation matrix from new Green's function (outside asympt region it is the DMFT
@@ -1700,10 +2127,13 @@ def calculate_self_energy_q(
 
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
-            sigma_converged = abs(relative_residual) < _effective_epsilon()
+            # Convergence is declared on the post-mixing step residual (the returned iterate). The un-mixed proposal
+            # residual is deliberately not used: it can plateau above epsilon and would block convergence forever.
+            eps = _effective_epsilon(annealer)
+            sigma_converged = abs(relative_residual) < eps
             logger.info(
                 f"Self-energy convergence: {sigma_converged} "
-                f"(relative residual={relative_residual:.3e}, epsilon={_effective_epsilon():.3e})."
+                f"(relative step residual={relative_residual:.3e}, epsilon={eps:.3e})."
             )
 
             mu_converged = abs(mu_history[-1] - mu_history[-2]) < np.pi / (10 * config.sys.beta)
@@ -1714,11 +2144,89 @@ def calculate_self_energy_q(
             converged = False
         converged = comm.bcast(converged)
 
+        # Lambda-annealing schedule (single owner): init/bump/halve the shared mass once per iteration, resetting the
+        # mixing history on any change; a change means the converged verdict belongs to the OLD (scaffolded) map.
+        anneal_blocks_break = False
+        if annealer is not None:
+            anneal_mass_changed = annealer.update(converged)
+            if anneal_mass_changed:
+                anneal_reset_iter = current_iter
+            anneal_blocks_break = anneal_mass_changed or annealer.mass_present
+
+        # Arm-and-trigger: deploy the modified scheme only once plain iteration stops contracting (the residual stalls);
+        # decided on rank 0 (authoritative residual) and broadcast so the collective projector build runs in lock-step.
+        if _stabilizer_probe_active(stab_armed, stab_projector, converged, annealer):
+            # the detectors watch the post-mixing step residual (growth is ratio-based and mixing-invariant; the
+            # plateau threshold is measured against epsilon on the same step residual the convergence check uses)
+            if comm.rank == 0:
+                stab_best_residual, stab_growth_count, stab_stall_count, trigger = _update_stabilizer_probe(
+                    relative_residual, stab_best_residual, stab_growth_count, stab_stall_count, stab_probe_iters
+                )
+            else:
+                trigger = False
+            trigger = comm.bcast(trigger)
+            if trigger:
+                logger.info(
+                    "Plain iteration is demonstrably not reaching the physical fixed point (sustained residual "
+                    "growth or a long plateau far above epsilon): it appears repelling. Arming the modified "
+                    "iterative scheme (building the projector at the warm-start self-energy)."
+                )
+                mixing_before_build = config.self_consistency.mixing
+                try:
+                    stab_projector = build_stabilization_projector(
+                        sigma_warm,
+                        mu_history[-1],
+                        u_loc,
+                        v_nonloc,
+                        v_nonloc_full,
+                        sigma_dmft,
+                        sigma_dmft_full,
+                        delta_sigma,
+                        my_irr_q_list,
+                        my_full_q_list,
+                        mpi_dist_irrk,
+                        mpi_dist_fullbz,
+                        comm,
+                    )
+                except jstab.PhysicalSolutionStabilizerError as exc:
+                    # deliberately non-fatal inside the loop: the guard means the starting point (typically a cold
+                    # DMFT start) is unusable for the linearization, not that the run itself is lost
+                    stab_projector = None
+                    logger.warning(
+                        f"Stabilizer build aborted; continuing with plain mixing. Reason: {exc} "
+                        f"If this run converges, verify the result is physical (minimum static compound "
+                        f"eigenvalue lines)."
+                    )
+                stab_armed = False
+                sigma_warm = None  # the linearization point is no longer needed; free the full-BZ copy
+                if stab_projector is not None or config.self_consistency.mixing != mixing_before_build:
+                    # the reflection switches the iterated map (and a mixing-only build changes it too); the accelerated
+                    # mixing history must not extrapolate across either switch (as at the restriction release)
+                    stab_arm_iter = current_iter
+                if stab_projector is not None:
+                    stab_arm_residual = relative_residual
+        elif stab_projector is not None and not stab_watch_passed and not converged:
+            # Do-no-harm watchdog on the deployed reflection: if it has not improved on its arming residual within the
+            # window, revert to plain mixing (another history reset) rather than let a bad projector steer the run.
+            if comm.rank == 0:
+                stab_watch_count, stab_watch_passed, revert = _update_stabilizer_watchdog(
+                    relative_residual, stab_arm_residual, stab_watch_count, stab_probe_iters
+                )
+            else:
+                revert = False
+            stab_watch_passed, revert = comm.bcast((stab_watch_passed, revert))
+            if revert:
+                stab_projector = None
+                stab_arm_iter = current_iter
+                logger.warning(
+                    "The modified scheme did not improve its arming residual within its watch window; reverted. "
+                    "Verify the converged result is physical (min static compound eigenvalue), else warm-start."
+                )
+
         sigma_old = sigma_new
         if converged:
-            if config.self_consistency.restrict_chi_phys:
-                config.self_consistency.restrict_chi_phys = False
-                config.self_consistency.anderson_prev_res = None
+            if config.stabilization.use_chi_phys_restriction:
+                config.stabilization.use_chi_phys_restriction = False
                 release_iter = current_iter
                 logger.info(
                     "ATTENTION: Self-consistency with restricted susceptibility reached (at 10x epsilon). "
@@ -1728,6 +2236,27 @@ def calculate_self_energy_q(
                     logger.warning(
                         "The restriction was released on the final iteration - no unrestricted iterations remain, "
                         "so the returned self-energy is the restricted-phase result."
+                    )
+            elif config.stabilization.use_lambda_correction:
+                config.stabilization.use_lambda_correction = False
+                release_iter = current_iter
+                logger.info(
+                    "ATTENTION: Self-consistency with the lambda correction reached (at 10x epsilon). "
+                    "Disabling the correction and continuing to the pure fixed point with a reset mixing history."
+                )
+                if current_iter == starting_iter + config.self_consistency.max_iter:
+                    logger.warning(
+                        "The lambda correction was released on the final iteration - no uncorrected iterations "
+                        "remain, so the returned self-energy is the lambda-corrected result, NOT pure self-consistency."
+                    )
+            elif anneal_blocks_break:
+                # an annealing phase converged at the relaxed epsilon; the schedule above already advanced (or
+                # bumped) the masses - only a converged phase with all masses at exactly zero counts as final
+                if current_iter == starting_iter + config.self_consistency.max_iter:
+                    logger.warning(
+                        "The annealing mass is still nonzero on the final iteration - no further iterations "
+                        "remain, so the returned self-energy is a scaffolded-phase result, NOT pure "
+                        "self-consistency."
                     )
             else:
                 logger.info(f"Self-consistency of sigma and mu reached at iteration {current_iter}.")
@@ -1873,9 +2402,8 @@ def apply_mixing_strategy(
         f_vec = np.concatenate([f_curr.real, f_curr.imag])
         norm_f = np.linalg.norm(f_vec)
 
-        # Build dX and dF matrices (n_hist columns)
-        # dX[:,i] = x_{n-i} - x_{n-i-1}  (proposal differences)
-        # dF[:,i] = f_{n-i} - f_{n-i-1}  (residual differences)
+        # Build dX and dF matrices (n_hist columns): dX[:,i] = x_{n-i} - x_{n-i-1} (proposal differences),
+        # dF[:,i] = f_{n-i} - f_{n-i-1} (residual differences).
         dx_cols = []
         df_cols = []
         for i in range(n_hist):

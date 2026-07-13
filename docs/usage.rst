@@ -5,12 +5,12 @@ Preparing the input
 -------------------
 
 DGAmore takes as input the result of a DMFT calculation, which currently must be produced with w2dynamics, a
-continuous-time quantum Monte Carlo solver based on the hybridisation expansion. A w2dynamics run yields both the
+continuous-time quantum Monte Carlo solver based on the hybridization expansion. A w2dynamics run yields both the
 one-particle quantities and a two-particle output containing the four-point Green's functions. The two-particle
 output first has to be converted into the format DGAmore expects. This is done by running the ``symmetrize``
 script, which is installed alongside the main entry point; it prompts for the input and output file names and writes
 only the density and magnetic spin components of the two-particle Green's function to the output file. The original,
-unsymmetrised vertex file is not needed afterwards.
+unsymmetrized vertex file is not needed afterwards.
 
 In addition to the processed two-particle file, a run requires a configuration file, which describes all run-time
 parameters, as well as a Hamiltonian. The Hamiltonian can be supplied either as a real-space (Wannier) Hamiltonian or as a
@@ -67,7 +67,7 @@ On a SLURM-based cluster, a typical job submission script looks as follows:
    module purge
    source <path to miniconda>/miniconda3/bin/activate <your conda env>
 
-   # Use MPI for parallelisation, so restrict each task to a single thread.
+   # Use MPI for parallelization, so restrict each task to a single thread.
    export OMP_NUM_THREADS=1
 
    # Recommended on SLURM-based clusters:

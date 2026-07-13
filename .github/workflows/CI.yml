@@ -1,19 +1,15 @@
 name: CI
-
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   test:
     name: Test on ${{ matrix.os }} / Python ${{ matrix.python-version }}
@@ -23,47 +19,56 @@ jobs:
       matrix:
         os: [ ubuntu-latest, macos-latest ]
         python-version: [ "3.12", "3.13" , "3.14" ]
-
     steps:
       # 1. Checkout repository
       - name: Checkout code
         uses: actions/checkout@v7
-
       # 2. Set up Python
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
-
       # 3. Install build tools
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
           pip install build wheel pytest pytest-cov
           pip install mpich mpi4py
-
       # 4. Install project dependencies (cached via setup-python)
       - name: Install project requirements
         run: |
           pip install -r requirements.txt
-
       # 5. Build wheel (ensures package is installable)
       - name: Build wheel
         run: |
           python -m build --wheel
-
       # 6. Install wheel
       - name: Install wheel
         run: |
           pip install $(python -c "import glob; print(glob.glob('dist/*.whl')[0])")
-
-      # 7. Run tests with coverage
+      # 7. Run tests with coverage.
+      #    Retries ONLY if the process was killed with SIGTERM (exit 143).
+      #    Any other exit code is passed through immediately without retrying.
       - name: Run tests
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
-          pytest tests --runslow --cov=dgamore --cov-report=term-missing --cov-report=xml --cov-fail-under=85 -vv
-        # pytest tests --runslow --cov=dgamore --cov-report=xml --cov-report=term
-
+          max_attempts=3
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
+            set +e
+            pytest tests --runslow --cov=dgamore --cov-report=term-missing --cov-report=xml --cov-fail-under=85 -vv
+            code=$?
+            set -e
+            if [ "$code" -eq 143 ] && [ "$attempt" -lt "$max_attempts" ]; then
+              echo "::warning::pytest was killed with SIGTERM (exit 143) on attempt ${attempt}/${max_attempts} — retrying"
+              continue
+            fi
+            exit "$code"
+          done
       # 8. Upload coverage to Codecov (requires CODECOV_TOKEN for private repos)
       - name: Upload test results to Codecov
         uses: codecov/codecov-action@v7

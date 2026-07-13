@@ -16,7 +16,7 @@ A paper describing the method and the implementation is currently being written 
 is available. For the full derivations of the implemented equations, please refer to the author's Master's thesis,
 `available online <https://doi.org/10.34726/hss.2025.130528>`_ (see in particular Chapters 3 and 4).
 
-Citation and acknowledgements
+Citation and acknowledgments
 -----------------------------
 
 If you use this code, please consider citing it together with the author's

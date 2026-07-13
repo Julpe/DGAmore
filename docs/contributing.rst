@@ -103,6 +103,10 @@ author's `Master's thesis <https://doi.org/10.34726/hss.2025.130528>`_), documen
 type hints, and applying the Black formatting described above. It is also easier to review changes that stay focused on
 one thing, so where possible please avoid reformatting or restructuring unrelated code in the same pull request.
 
+All prose and identifiers use **American English** (``normalize``, ``color``, ``behavior``, ``parallelization``), in
+the code, in docstrings and comments, and in the documentation. The spell-checking job in CI runs with the ``en-us``
+locale, so British spellings are reported as typos.
+
 A final word
 ------------
 

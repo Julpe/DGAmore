@@ -78,11 +78,8 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
     logger.info(f"Starting analytic continuation of the {name} Green's function using the maximum entropy method.")
     giwk_maxent = giwk.cut_niv(config.box.niv_core).to_half_niv_range()
 
-    # Rotate the Green's function into the band (H(k)-eigen) basis before the continuation, so that the
-    # band-diagonal taken below is the band-resolved spectral function rather than the orbital-diagonal one. This
-    # is also what makes the naive irrk_inv unfold to the full BZ correct: the band-diagonal spectrum is invariant
-    # under the lattice symmetries (eigenvalues of H(k) and H(k_rep) coincide). Done on the full BZ here so it
-    # matches the shape of H(k) from get_ek; the diagonalization is reused across all frequencies.
+    # Rotate G into the band (H(k)-eigen) basis first, so the band-diagonal below is the band-resolved spectral function
+    # (invariant under lattice symmetries, so the naive irrk_inv unfold is correct); done on the full BZ.
     hk = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
     giwk_maxent = giwk_maxent.decompress_q_dimension()
     orbital_to_band_basis(hk, giwk_maxent.mat)

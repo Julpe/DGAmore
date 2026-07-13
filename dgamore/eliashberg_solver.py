@@ -79,9 +79,8 @@ def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp:
     omega = vn[:, None] - vn[None, :]
 
     vertex = vertex.cut_niv(niv_pp)
-    # only the |w| <= 2*niv_pp - 1 anti-diagonals (omega = v - v') are read below, so the bosonic axis is trimmed
-    # to that window before to_full_niw_range doubles it (cut_niw cannot be used here - its no-op guard misjudges
-    # half-range objects)
+    # only the |w| <= 2*niv_pp - 1 anti-diagonals (omega = v - v') are read below, so the bosonic axis is trimmed to
+    # that window before to_full_niw_range doubles it (cut_niw's no-op guard misjudges half-range objects here)
     w_axis = -3
     niw_stored = vertex.current_shape[w_axis] // 2 if vertex.full_niw_range else vertex.current_shape[w_axis] - 1
     niw_window = min(niw_stored, 2 * niv_pp - 1)
@@ -620,7 +619,7 @@ def create_local_ud_diagrams_pp_w0(
     return f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0
 
 
-# --- Gap initialisation ---
+# --- Gap initialization ---
 def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
     """
     Generates the initial gap-function guess for the power iteration, seeded with the configured momentum symmetry
@@ -849,9 +848,8 @@ def solve_eliashberg_lanczos(
     norm = 0.5 / config.lattice.q_grid.nk_tot / config.sys.beta
 
     chi0_mm = _chi0_to_matmul_layout(gchi0_q0_pp.mat)
-    # The pairing vertex arrives in the w2dynamics G2 leg order (c cdag c cdag), whereas the contraction in
-    # _apply_gamma_pp expects the TRIQS order (cdag c cdag c), see
-    # https://triqs.github.io/tprf/latest/theory/eliashberg.html
+    # The pairing vertex arrives in w2dynamics G2 leg order (c cdag c cdag), whereas _apply_gamma_pp expects the
+    # TRIQS order (cdag c cdag c), see https://triqs.github.io/tprf/latest/theory/eliashberg.html
     gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.permute_orbitals("abcd->badc", False).mat)
     gamma_r_pp.free()
 
@@ -973,15 +971,11 @@ def solve_eliashberg_lanczos_v2(
     n_bands = gamma_r_pp.n_bands
     norm = 0.5 / config.lattice.q_grid.nk_tot / config.sys.beta
 
-    # Batched-matmul layout (see :func:`solve_eliashberg_lanczos`): chi0 on the root rank (a view), the
-    # frequency-sliced pairing vertex materialized once per rank. The flipped vertex is never stored - its
-    # contraction reuses the direct array via gap-sized index shuffles in the matvec (the crossing map touches only
-    # the row orbitals, the column frequency and the momentum, so it holds per v-slice).
+    # Batched-matmul layout (see solve_eliashberg_lanczos): chi0 on the root rank (a view), the frequency-sliced
+    # pairing vertex materialized once per rank; the flipped vertex is never stored (matvec reuses the direct array).
     chi0_mm = _chi0_to_matmul_layout(gchi0_q0_pp.mat) if mpi_dist_v.comm.rank == root else None
-    # The pairing vertex arrives in the w2dynamics G2 leg order (c cdag c cdag), whereas the contraction in
-    # _apply_gamma_pp expects the TRIQS order (cdag c cdag c). The two differ by the "abcd->badc" swap
-    # (o1<->o2, o3<->o4); applying it makes the gap's creation legs contract with the vertex's creation legs.
-    # This is a no-op for a single band.
+    # w2dynamics G2 leg order (c cdag c cdag) vs the TRIQS order (cdag c cdag c) that _apply_gamma_pp expects: they
+    # differ by the "abcd->badc" swap (o1<->o2, o3<->o4), which aligns the gap's creation legs; no-op for one band.
     gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.permute_orbitals("abcd->badc", False).mat)
     gamma_r_pp.free()
 
@@ -1130,9 +1124,8 @@ def solve(
 
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
 
-    # giwk_dga is consumed only by the pp-bubble build on a single rank (the singlet solver rank of the in-memory
-    # variant, or rank 0 = the root of the frequency-distributed one), so every other rank drops its replicated
-    # full-grid copy for the whole vertex-construction and solver phase.
+    # giwk_dga is consumed only by the pp-bubble build on a single rank (the in-memory singlet solver rank, or rank 0
+    # of the frequency-distributed variant), so every other rank drops its replicated full-grid copy for this phase.
     if config.memory.save_memory_for_lanczos:
         rank_sing = rank_trip = bubble_rank = 0
     else:
@@ -1182,9 +1175,8 @@ def solve(
         f_ud_loc_transf_w0 = transform_vertex_loc_frequencies_w0(f_ud_loc, niv_pp)
         del f_dens_loc, f_magn_loc, f_ud_loc
 
-        # Eqs. (4.49)-(4.52): the assembled vertex holds the negative crossed slot, so the local full vertex enters
-        # with a relative minus (the transform already carries one minus) and the local pp-reducible diagrams phi
-        # enter with a plus, both in crossed-slot form (frequencies (v, -v'), orbitals 1432).
+        # Eqs. (4.49)-(4.52): the assembled vertex holds the negative crossed slot, so the local full vertex enters with
+        # a relative minus and the pp-reducible diagrams phi with a plus, both in crossed-slot form ((v, -v'), 1432).
         phi_ud_loc_pp_w0 = phi_ud_loc_pp_w0.flip_frequency_axis(-1, copy=False).permute_orbitals(
             "abcd->adcb", copy=False
         )

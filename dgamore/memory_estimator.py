@@ -13,9 +13,11 @@ config singleton: every input is passed as an argument, which keeps the formulas
 
 All heavy quantities are backed by a single :data:`~dgamore.n_point_base.DTYPE` array, and q-points are distributed
 across MPI ranks, so per-rank arrays scale with the per-rank q-count rather than the total. Only the dominant large
-arrays of each branch are modeled; a single global ``OVERHEAD_FACTOR`` accounts for the un-modeled transients (known
-un-modeled costs: the mixing history of ``apply_mixing_strategy`` and the pp pairing-vertex assembly in
-``eliashberg_solver.solve``, both dominated by the modeled branch peaks).
+arrays of each branch are modeled; a single global ``OVERHEAD_FACTOR`` scales every estimate to absorb un-modeled
+transients (known un-modeled costs: the mixing history of ``apply_mixing_strategy`` and the pp pairing-vertex assembly
+in ``eliashberg_solver.solve``, both dominated by the modeled branch peaks). It defaults to ``1.0`` (no extra margin,
+since those costs are dominated by the modeled peaks); the residual headroom for OS/allocator overhead lives in the
+driver's node-memory fraction (``NODE_MEMORY_FRACTION`` in :mod:`dgamore.DGAmore`), so the two margins do not compound.
 
 Each branch carries its **own** persistent per-rank ``baseline`` (the full-grid two-point objects resident at that
 branch's peak) and the portion of it (``giwk_shareable``) that ``config.memory.use_shared_memory_common_obj`` deduplicates
@@ -29,43 +31,33 @@ import numpy as np
 
 from dgamore.n_point_base import DTYPE
 
-# Bytes per stored array element, taken from the global storage precision so this stays correct if DTYPE is switched
-# (e.g. to complex128).
+# Bytes per stored element (from the global DTYPE, so it tracks a switch to e.g. complex128).
 DTYPE_BYTES: int = np.dtype(DTYPE).itemsize
-OVERHEAD_FACTOR: float = 1.1
+OVERHEAD_FACTOR: float = 1.0
 
-# chiq_aux assembles its two-fermion Bethe-Salpeter block in a SINGLE allocation (broadcast gamma fill + in-place
-# diagonal bubble add + in-place interaction subtract, see nonlocal_sde._assemble_bse_matrix), and the following
-# invert_and_sum_over_last_vn keeps that block resident while looping over q (the per-q inversion transient is
-# single-q, hence negligible). The peak is therefore ~1x the rank-local block.
+# chiq_aux builds its BSE block in ONE allocation (nonlocal_sde._assemble_bse_matrix), then holds it resident across
+# the per-q invert_and_sum_over_last_vn (per-q inversion transient negligible). Peak ~1x the rank-local block.
 CHIQ_AUX_INVERT_FACTOR: int = 1
 
-# fq combines the (single-block) BSE assembly with eagerly rebound compound-index matmuls
-# (f = gchi0_q_inv @ f; f = f @ gchi0_q_inv; in-place scale + diagonal add), holding ~2 full blocks live at the
-# matmul peak.
+# fq: single-block BSE assembly + eagerly rebound matmuls (f = gchi0_q_inv @ f, then f @ gchi0_q_inv), ~2 blocks live.
 FQ_MATMUL_FACTOR: int = 2
 
-# The fast (FFT) SDE holds the mapped full-BZ niw-half kernel plus its half-niv copy in flight through the conj /
-# distributed-FFT round trip (in- and output buffers of half the kernel each), so ~2 kernel-sized blocks are live.
+# FFT SDE holds the full-BZ niw-half kernel + its half-niv copy through the conj/distributed-FFT round trip, ~2 blocks.
 SDE_FFT_KERNEL_FACTOR: int = 2
 
-# ``numpy.fft.ifftn`` on the complex64 full-grid bubble buffer transiently allocates ~2x the buffer beyond it
-# (the returned array plus internal work arrays; measured 2026-07-03 on numpy 2.x, dtype preserved), so the per-iw
-# FFT moment holds the multiply buffer plus this transient.
+# numpy.fft.ifftn on the c64 full-grid bubble transiently allocates ~2x the buffer beyond it (returned array + work
+# arrays; numpy 2.x, dtype preserved). Per-iw peak = multiply buffer + this transient.
 CHI0Q_IFFTN_TRANSIENT_FACTOR: int = 2
 
-# The in-memory Eliashberg solver holds the direct vertex and its freshly materialized matmul-layout copy at the
-# layout-build peak (the flipped vertex is never stored - its contraction reuses the direct array via gap-sized
-# index shuffles in the matvec), so the peak is 2 vertices, the residency 1.
+# In-memory Eliashberg solver holds the direct vertex + its matmul-layout copy at the layout-build peak (the flipped
+# vertex is never stored - the matvec reuses the direct array via gap-sized index shuffles). Peak 2, residency 1.
 LANCZOS_VERTEX_FACTOR: int = 2
 
-# Gap-vector-sized matvec temporaries live beyond the ARPACK Lanczos basis (chi0*gap, its flipped copy, the
-# contracted output) in both solver variants.
+# Gap-sized matvec temporaries beyond the ARPACK basis (chi0*gap, its flipped copy, the output) in both variants.
 ARPACK_EXTRA_VECTORS: int = 3
 
-# The local Schwinger-Dyson step's dominant transient: the Kitatani chi-tilde shell chain at the niv_full box
-# (the diagonally extended inverted bubble carrying the frequency-coupling +U, its dense compound inversion output
-# and the LAPACK workspace) - ~3 niv_full-sized two-fermion blocks beyond the persistent outputs.
+# Local SDE dominant transient: the chi-tilde shell chain at niv_full (extended inverted bubble carrying the +U, its
+# dense compound inversion output, LAPACK workspace) - ~3 niv_full two-fermion blocks beyond the persistent outputs.
 LOCAL_SHELL_INVERT_FACTOR: int = 3
 
 
@@ -224,13 +216,8 @@ def estimate_peaks(
 
     scale = DTYPE_BYTES * overhead
 
-    # Persistent baselines (full-grid two-point objects live on every rank at the branch peak). During the bubble,
-    # giwk_full and sigma_old are both at the niv_cut window; before the kernel section giwk is cut (and re-shared)
-    # to the niv_core + niw_core window and sigma_old to the core box. The sde step additionally builds a full
-    # R-space Green's-function copy (giwk.fft()), which is node-shared alongside giwk itself when the shared-giwk
-    # window is active. The remaining self-energies (sigma_dmft, sigma_dmft_full, delta_sigma) are local (a single
-    # k-point) and negligible. The Eliashberg step runs after the loop with sigma_dga freed on every rank and
-    # giwk_dga surviving on the bubble-building rank only (a single-rank term, not a per-rank baseline).
+    # Persistent per-rank baselines: giwk_full + sigma_old at niv_cut (bubble), cut to niv_core+niw_core / core box for
+    # the kernel section; sde adds a node-shared giwk.fft() copy; Eliashberg frees sigma_dga, keeps one giwk_dga.
     giwk_bubble = scale * _giwk_rspace(nk_tot, nb, 2 * niv_cut)
     giwk_sde = scale * _giwk_rspace(nk_tot, nb, 2 * niv_sde)
     baseline_bubble = giwk_bubble + scale * _giwk_rspace(nk_tot, nb, 2 * niv_cut)  # + sigma_old at niv_cut
@@ -240,15 +227,8 @@ def estimate_peaks(
 
     peaks: dict[str, BranchPeak] = {}
 
-    # chi0q: on a multi-rank run the fast (FFT) path splits the (w, v) frequency columns across the ranks
-    # (_create_generalized_chi0_q_fft_distributed): every rank holds its irr-BZ result slice plus one bounded
-    # sub-chunk group (the full-grid column buffer with its ifftn transient, the irr-selected chunk and the exchange
-    # staging, together capped at ~half a result slice) - DISTRIBUTED - while the two R-space Green's functions
-    # (direct and momentum-flipped/orbital-transposed) are node-shared windows accounted in the baseline. On a
-    # single rank it is the former rank-0 build: the WHOLE irreducible-BZ bubble plus the full-grid B^4 multiply
-    # buffer AND the ~2x-buffer-sized ``xp.fft.ifftn`` transient each iw, plus the replicated real-space Green's
-    # functions. The lean per-q einsum builds only this rank's q-slice of the bubble plus its two shared-backing
-    # Green's-function buffers (g_full + g_r_buf), so it is DISTRIBUTED.
+    # Fast (FFT) path: multi-rank splits (w, v) columns (DISTRIBUTED, R-space G node-shared); single-rank builds the
+    # whole irr-BZ bubble + B^4 multiply buffer + ~2x ifftn transient per iw. Lean per-q einsum is DISTRIBUTED.
     gf_window_bubble = 2 * (niv_full + niw_core)
     if n_ranks == 1:
         chi0q_baseline = baseline_bubble
@@ -275,12 +255,8 @@ def estimate_peaks(
         on_single=0.0,
     )
 
-    # chiq_aux: fast path (v1) materializes the whole rank-local two-fermion block on every rank (DISTRIBUTED) and
-    # inverts it one q at a time. The lean path (v3) builds one q at a time and accumulates the (1-fermion) summed
-    # result, also DISTRIBUTED. The irr-to-full-BZ kernel map is always the p2p exchange (no rank-0 full-BZ
-    # assembly remains in the loop), so neither path carries a single-rank term.
-    # one node-shared local vertex is resident through the kernel section (f_dc_loc at niv_full during the
-    # double-counting kernel, one gamma at the core box during the BSE assembly - never both, hence the max)
+    # Fast holds the whole rank-local two-fermion block, lean accumulates the 1-fermion result (both DISTRIBUTED; map
+    # always p2p, no single-rank term). One node-shared local vertex (f_dc_loc at niv_full or core-box gamma) resident.
     local_vertex_shared = scale * max(_two_fermion_block(1, nb, wp, vf), _two_fermion_block(1, nb, wp, vc))
     peaks["chiq_aux"] = BranchPeak(
         baseline=baseline_kernel_section + local_vertex_shared,
@@ -292,14 +268,8 @@ def estimate_peaks(
         on_single=0.0,
     )
 
-    # sde: a single (flag-less) path - the two-pass FFT contraction. It keeps the mapped full-BZ niw-half kernel
-    # plus its half-niv copy in flight through the conj/distributed-FFT round trip (~SDE_FFT_KERNEL_FACTOR kernel
-    # blocks), retains the irreducible-BZ kernel across both passes, and makes one private real-space
-    # Green's-function copy (giwk.fft(copy=True)) per rank at the SDE window; rank 0 additionally finalizes the
-    # gathered self-energy (ifft + to_full_niv_range, ~2 full-grid nb^2 objects at the core box). The old q-loop
-    # path is unused (it restored the FULL bosonic range on the kernel and peaked HIGHER - see
-    # nonlocal_sde.calculate_sigma_from_kernel), so no save_memory switch exists and both path slots carry the FFT
-    # path; the driver only verifies the fit.
+    # Single flag-less two-pass FFT contraction: full-BZ niw-half kernel + its half-niv copy (~SDE_FFT_KERNEL_FACTOR
+    # blocks) + one private giwk.fft() copy/rank; rank 0 finalizes. The old q-loop path is unused (peaked HIGHER).
     sde_distributed = scale * (SDE_FFT_KERNEL_FACTOR * _bubble_block(qt, nb, wp, vc) + _bubble_block(qi, nb, wp, vc))
     sde_single = scale * 2 * _giwk_rspace(nk_tot, nb, vc)
     peaks["sde"] = BranchPeak(
@@ -312,13 +282,8 @@ def estimate_peaks(
     )
 
     if with_eliashberg:
-        # fq: both paths hold ~FQ_MATMUL_FACTOR two-fermion blocks at the matmul-chain peak (per rank for the fast
-        # path, per q for the lean one) plus the loaded 1-fermion inputs (gchi0_q_inv for the fast path; gchi0_q_inv,
-        # vrg_left and vrg_right for the lean one, which keeps all three alive through its q-loop) and, for the lean
-        # path, the rank-local accumulator. ``construct_fq_cheap`` shrinks every per-q construction block from vc to
-        # vpp; the accumulator keeps the full ph box [wn, vc, vc] when ``save_fq`` is set, otherwise the small pp box
-        # [vpp, vpp]. ``save_fq`` additionally gathers the WHOLE irreducible-BZ two-fermion vertex on one rank for
-        # saving - a single-rank peak in BOTH paths (usually the largest single object of a save_fq run).
+        # ~FQ_MATMUL_FACTOR two-fermion blocks at the matmul peak (per rank fast, per q lean) + 1-fermion inputs + the
+        # lean accumulator. construct_fq_cheap shrinks vc->vpp; save_fq gathers the whole irr-BZ vertex on one rank.
         vc_fq = vpp if construct_fq_cheap else vc
         fq_accumulator = _two_fermion_block(qi, nb, wp, vc) if save_fq else _two_fermion_block(qi, nb, 1, vpp)
         fq_gather_single = scale * _two_fermion_block(nk_irr, nb, wp, vc) if save_fq else 0.0
@@ -337,17 +302,8 @@ def estimate_peaks(
             on_single=fq_gather_single + giwk_dga_single,
         )
 
-        # lanczos: the fast (in-memory) path assembles the entire-BZ pairing vertex on ONE solving rank and holds
-        # LANCZOS_VERTEX_FACTOR copies of it at the matmul-layout build (direct + flipped + one layout copy), plus
-        # the full-BZ pp bubble and the ARPACK workspace (the ncv-column Lanczos basis + gap-sized matvec
-        # temporaries). The singlet and triplet solves run CONCURRENTLY on two ranks - the driver doubles this
-        # single-rank peak when both land on the same node; a single-rank run solves sequentially but holds the
-        # waiting channel's gathered irreducible-BZ vertex alongside. The lean path (gather_full_ibz_for_vslice)
-        # hands every active rank the FULL BZ with only its slice of the second fermionic frequency (the v-axis has
-        # only 2*niv_pp tasks, hence the ceil-based share), also LANCZOS_VERTEX_FACTOR copies at the layout build,
-        # plus the same per-rank ARPACK workspace (every active rank runs its own full-length eigsh); the root rank
-        # additionally holds the full-BZ pp bubble. ``save_pairing_vertex`` gathers both irreducible-BZ pp vertices
-        # on rank 0 before the solve (sequential, hence max() against the solver single-rank peak).
+        # Fast: whole-BZ pairing vertex on ONE rank (LANCZOS_VERTEX_FACTOR copies + full-BZ pp bubble + ARPACK ws;
+        # sing/trip concurrent, driver doubles). Lean: full BZ per rank on its v'-slice, each with its own ARPACK ws.
         vertex_pp_full = _two_fermion_block(nk_tot, nb, 1, vpp)
         chi0_pp_full = _bubble_block(nk_tot, nb, 1, vpp)
         ncv = max(2 * n_eig + 1, 20)
@@ -367,11 +323,8 @@ def estimate_peaks(
             on_single=scale * max(chi0_pp_full, pairing_gather) + giwk_dga_single,
         )
 
-    # local: the rank-0-serial local Schwinger-Dyson step (flag-less, verify-only like "sde"; runs before the
-    # loop while every other rank idles). Modeled per the full band count: both channels' persistent outputs
-    # (gamma + generalized chi at the core box, the full vertex at niv_full) + the two halved two-particle inputs
-    # + the dominant chi-tilde shell transient at niv_full. Per-atom multi-ineq assembly and the (unchanged) dense
-    # two-fermion invert internals ride on the shell-transient/overhead allowance.
+    # Rank-0-serial local SDE (flag-less, verify-only): both channels' outputs (gamma + chi at the core box, full
+    # vertex at niv_full) + the two halved inputs + the dominant chi-tilde shell transient at niv_full.
     l_core = _two_fermion_block(1, nb, wp, vc)
     l_full = _two_fermion_block(1, nb, wp, vf)
     local_single = scale * (2 * (2 * l_core + l_full) + 2 * l_core + LOCAL_SHELL_INVERT_FACTOR * l_full)

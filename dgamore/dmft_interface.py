@@ -18,7 +18,7 @@ import h5py
 import numpy as np
 
 import dgamore.config as config
-import dgamore.symmetrize_new as sym
+import dgamore.symmetrize as sym
 from dgamore.greens_function import GreensFunction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.n_point_base import SpinChannel

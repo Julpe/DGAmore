@@ -25,19 +25,30 @@ self_consistency:
   previous_sc_path: "" # Path to the previous self-consistency folder. If not specified, the code will start a new calculation from scratch. If specified,
   # the code will start from the last iteration of the previous calculation and does max_iter steps on top
   use_interpolated_sigma: False # If True, the code will use the interpolated self-energy from the previous iteration
-  use_lambda_correction: False # If True, the code will perform a lambda correction for each iteration, and it will automatically set perform_lambda_correction in the settings below to True.
-  restrict_chi_phys: False # If True, the physical susceptibilities are restricted to positive-semidefinite compound blocks (eigenvalue floor on the inverse) during the self-consistency cycle.
+
+stabilization:
+  use_lambda_correction: False # If True, applies the Moriya lambda correction in every iteration as a releasing scaffold (correction on until convergence at 10x epsilon,
+  # then disabled so the run converges the uncorrected solution). Dispatched by the band count: single-band input uses the scalar correction (honoring lambda_correction.type
+  # below), multi-band input the multi-orbital matrix correction (always both channels). Mutually exclusive with use_chi_phys_restriction, use_lambda_annealing and
+  # use_jacobian_stabilization; the one-shot perform_lambda_correction below takes precedence when both are enabled.
+  use_chi_phys_restriction: False # If True, the physical susceptibilities are restricted to positive-semidefinite compound blocks (eigenvalue floor on the inverse) during the self-consistency cycle.
+  use_jacobian_stabilization: False # If True, arms the modified iterative scheme of arXiv:2502.01420: only when plain iteration demonstrably cannot reach the physical
+  # fixed point (sustained residual growth or a long plateau far above epsilon), the Jacobian of the proposal map is built once at the warm-start self-energy and the
+  # damping sign is flipped on the unstable directions (needs a warm start via previous_sc_path; everything else is detected automatically).
+  use_lambda_annealing: False # If True, protects the cycle with the lambda-annealing scaffold: a bosonic mass (measured automatically from the susceptibility
+  # spectrum) is added to 1/chi per channel, held constant per convergence phase and halved between phases until it is exactly zero - the final result is always
+  # pure self-consistency. Multi-orbital-safe, like the matrix lambda correction (with which it must not be combined).
 
 lambda_correction:
-  perform_lambda_correction: False # If True, the code will perform a lambda correction. This is only possible for single-orbital systems!
-  type: "spch" # available types of lambda correction: 'spch' (both density and magnetic channel) or 'sp' (magnetic channel only)
+  perform_lambda_correction: False # If True, the code will perform a one-shot DGA with lambda correction: max_iter is overridden to 1 and mixing to 1.0. Dispatched by the
+  # band count like stabilization.use_lambda_correction above, over which it takes precedence.
+  type: "spch" # available types of the single-band scalar lambda correction: 'spch' (both density and magnetic channel) or 'sp' (magnetic channel only)
 
 dmft_input:
   type: "w2dyn" # Input format. Currently available is 'w2dyn'
   input_path: "./" # Folder containing the input files
   fname_1p: "1p-data.hdf5" # Filename of the one-particle DMFT calculation
   fname_2p: "g4iw_sym.hdf5" # Filename of the two-particle DMFT calculation
-  do_sym_v_vp: True # If True, the code will symmetrize G2 from DMFT in the v and vp indices
   symmetrize_orbitals: [] # List of orbitals that will be symmetrized, starting from 1 (first orbital is 1, second orbital is 2, etc.).
   # If left empty, no symmetrization will be performed in the orbital indices. This is only relevant for multi-orbital systems.
   # Can be [1,2] or [[1,2]] for a two-orbital system with degenerate orbitals, for example. Also possible are statements like
@@ -84,7 +95,7 @@ ana_cont:
 memory:
   # These flags are auto-detected at startup from each node's available RAM.
   # A value left False may still be switched ON automatically if the fast path would not fit in memory;
-  # an explicit True is always honoured (auto-detection only ever enables a flag, never disables it).
+  # an explicit True is always honored (auto-detection only ever enables a flag, never disables it).
   save_memory_for_chi0q: False # If True, the code will construct chi0(q) in a way that is more memory efficient,
   # but much slower. If False, the code will use FFT, which requires larger intermediate arrays, but is much faster.
   save_memory_for_chiq_aux: False # If True, the code will construct the auxiliary susceptibility chi(q) (equal in size

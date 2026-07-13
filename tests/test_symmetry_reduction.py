@@ -585,9 +585,8 @@ def test_discover_symmetries_dedups_identical_M_grid_actions():
                         ops, n_found = sr._discover_symmetries(H, atol=1e-12, verbose=False)
 
     assert n_found == len(ops)
-    # M is enumerated twice but the second copy has the same grid action and is deduped:
-    # one unique M times {sigma=+1, sigma=-1} times {conj=False, conj=True} = 4 ops.
-    # (Each (sigma, conj) yields a distinct action_key tuple since they enter the key.)
+    # M is enumerated twice but the second copy has the same grid action and is deduped: one unique M times
+    # {sigma=+1,-1} times {conj=False,True} = 4 ops (each (sigma, conj) yields a distinct action_key).
     assert n_found == 4
 
 
@@ -859,7 +858,7 @@ def test_auto_discovery_matches_legacy_for_12cubed_cubic_hamiltonian():
     H = _require_hamiltonian(fname, shape)
     nx, ny, nz, _, _ = shape
 
-    kg_auto = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    kg_auto = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     kg_auto.specify_auto_symmetries(H, atol=1e-8)
 
     kg_legacy = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.three_dimensional_cubic_symmetries())
@@ -877,7 +876,7 @@ def test_auto_discovery_matches_legacy_for_20cubed_cubic_hamiltonian():
     H = _require_hamiltonian(fname, shape)
     nx, ny, nz, _, _ = shape
 
-    kg_auto = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    kg_auto = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     kg_auto.specify_auto_symmetries(H, atol=1e-8)
 
     kg_legacy = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.three_dimensional_cubic_symmetries())
@@ -1013,7 +1012,7 @@ def _make_real_cubic_h(nx=4, ny=4, nz=4, nb=1):
 
 
 def test_get_symmetry_reduction_default_excludes_antiunitary_ops():
-    """The default behaviour must drop anti-unitary operations; therefore no FBZ point should carry conj=True. This is the safe semantics for frequency- dependent quantities."""
+    """The default behavior must drop anti-unitary operations; therefore no FBZ point should carry conj=True. This is the safe semantics for frequency- dependent quantities."""
     H = _make_real_cubic_h(4, 4, 4, 1)
     result = sr.get_symmetry_reduction(H, atol=1e-8)
     assert result["conjs"].any() == False  # noqa: E712 - explicit bool check

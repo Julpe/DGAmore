@@ -31,7 +31,7 @@ work across cores with MPI, and exploits lattice and frequency symmetries togeth
 the vertex functions to keep the memory footprint manageable. Throughout a run it emits detailed logs, so that
 progress and any problems are easy to follow both in a terminal and in cluster job output.
 
-The toolbox is organised as a pipeline of focused modules. A run is orchestrated by the entry point
+The toolbox is organized as a pipeline of focused modules. A run is orchestrated by the entry point
 :mod:`~dgamore.DGAmore` and configured through a process-wide configuration object in :mod:`~dgamore.config`,
 populated from a YAML file by :mod:`~dgamore.config_parser`. Input handling lives in :mod:`~dgamore.dga_io` and
 :mod:`~dgamore.dmft_interface`, which read the one- and two-particle quantities from the DMFT output, while
@@ -49,14 +49,14 @@ momentum bookkeeping for the rest of the code.
 
 The local vertices and the local self-energy are assembled in :mod:`~dgamore.local_sde`, the bare bubble in
 :mod:`~dgamore.bubble_gen`, and the momentum-dependent ladder self-energy in :mod:`~dgamore.nonlocal_sde`, with an
-optional Moriya correction in :mod:`~dgamore.lambda_correction`. Pairing properties are obtained in
+optional Moriya correction in :mod:`~dgamore.lambda_ops`. Pairing properties are obtained in
 :mod:`~dgamore.eliashberg_solver`, and an optional continuation to real frequencies is provided by
 :mod:`~dgamore.max_ent`. The remaining modules support the computation: :mod:`~dgamore.matsubara_frequencies`
 handles frequency-index arithmetic, :mod:`~dgamore.mpi_utils` manages the parallel work distribution (message
 chunking, the work distributor and the data-movement routines), :mod:`~dgamore.memory_estimator` predicts the peak
 host memory of the heavy steps so the driver can enable the memory-saving code paths automatically,
 :mod:`~dgamore.dga_logger` provides the structured logging, and :mod:`~dgamore.plotting` produces the diagnostic
-figures. A standalone companion console script, :mod:`~dgamore.symmetrize_new`, prepares the symmetrized
+figures. A standalone companion console script, :mod:`~dgamore.symmetrize`, prepares the symmetrized
 two-particle DMFT input that a run consumes.
 
 For the physics and the precise equations behind the implementation, see the accompanying paper and the author's

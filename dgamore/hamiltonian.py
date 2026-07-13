@@ -377,9 +377,8 @@ class Hamiltonian:
             nspins = 2
         else:
             nspins = 1
-        # GS: inside read_hamiltonian nspins is therefore equal to 1 if spin_orbit=0
-        # GS: outside nspins is however always set to 2. Right?
-        # GS: this also means that we have to set nspins internally in read_ImHyb too
+        # GS: inside read_hamiltonian nspins is therefore 1 if spin_orbit=0; outside it is however always set to 2.
+        # GS: Right? This also means we have to set nspins internally in read_ImHyb too.
 
         hk_file.flush()
 

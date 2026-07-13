@@ -58,9 +58,9 @@ def _off_node_total(bp: BranchPeak, r):
 
 
 def test_constants():
-    """DTYPE_BYTES tracks the global storage dtype and OVERHEAD_FACTOR is 1.1."""
+    """DTYPE_BYTES tracks the global storage dtype and OVERHEAD_FACTOR defaults to 1.0 (no extra margin)."""
     assert DTYPE_BYTES == np.dtype(DTYPE).itemsize  # single source of truth: derived from the global storage dtype
-    assert OVERHEAD_FACTOR == pytest.approx(1.1)
+    assert OVERHEAD_FACTOR == pytest.approx(1.0)
 
 
 def test_keys_without_eliashberg():

@@ -355,8 +355,8 @@ def plot_two_point_kx_ky(
 
     if scatter is not None:
         for ax in axes:
-            colours = plt.cm.get_cmap(cmap)(np.linspace(0, 1, np.shape(scatter)[0]))
-            ax.scatter(scatter[:, 0], scatter[:, 1], marker="o", c=colours)
+            colors = plt.cm.get_cmap(cmap)(np.linspace(0, 1, np.shape(scatter)[0]))
+            ax.scatter(scatter[:, 0], scatter[:, 1], marker="o", c=colors)
     plt.tight_layout()
     if save:
         plt.savefig(os.path.join(output_dir, f"{name}.pdf"), bbox_inches="tight", pad_inches=0.05)
@@ -559,8 +559,8 @@ def plot_gap_function(
 
     if scatter is not None:
         for ax in axes:
-            colours = plt.cm.get_cmap(cmap)(np.linspace(0, 1, np.shape(scatter)[0]))
-            ax.scatter(scatter[:, 0], scatter[:, 1], marker="o", c=colours)
+            colors = plt.cm.get_cmap(cmap)(np.linspace(0, 1, np.shape(scatter)[0]))
+            ax.scatter(scatter[:, 0], scatter[:, 1], marker="o", c=colors)
     plt.tight_layout()
     if do_save:
         plt.savefig(os.path.join(output_dir, f"{name}.pdf"), bbox_inches="tight", pad_inches=0.05)

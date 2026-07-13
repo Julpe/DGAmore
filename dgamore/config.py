@@ -6,8 +6,8 @@
 """
 Global configuration singleton. This module holds the process-wide mutable state of a DGAmore run as module-level
 instances of the ``*Config`` classes (``box``, ``lattice``, ``sys``, ``dmft``, ``eliashberg``,
-``lambda_correction``, ``self_consistency``, ``self_energy_interpolation``, ``output``, ``memory``, ``ana_cont``,
-and the ``logger``). :class:`ConfigParser` populates these from a YAML file on rank 0, after which they are
+``lambda_correction``, ``self_consistency``, ``stabilization``, ``self_energy_interpolation``, ``output``,
+``memory``, ``ana_cont``, and the ``logger``). :class:`ConfigParser` populates these from a YAML file on rank 0, after which they are
 broadcast to all MPI ranks; most modules read their parameters directly off this module rather than receiving them
 as arguments, so mutating a field changes behavior everywhere. Each ``*Config`` class documents its fields; the
 example YAML config is ``dgamore/dga_config.yaml``.
@@ -111,6 +111,7 @@ class SelfConsistencyConfig:
     Stores the self-consistency-loop parameters: the maximum iteration count, the convergence criterion, the mixing
     parameter/scheme and continuation options. If ``previous_sc_path`` is set, the loop resumes from a previous run.
     The mixing scheme can be ``"linear"``, ``"pulay"`` or ``"anderson"`` (the latter two use an iteration history).
+    The convergence-stabilization options live in :class:`StabilizationConfig`.
 
     :ivar int max_iter: Maximum number of self-consistency iterations.
     :ivar float epsilon: Relative-residual convergence threshold on the self-energy.
@@ -119,12 +120,6 @@ class SelfConsistencyConfig:
     :ivar int mixing_history_length: Number of past iterations used by the accelerated mixing schemes.
     :ivar str previous_sc_path: Path to a previous self-consistency run to resume from (empty to start fresh).
     :ivar bool use_interpolated_sigma: Whether to resume from the interpolated rather than the raw self-energy.
-    :ivar bool use_lambda_correction: Whether the self-consistency loop applies the lambda correction.
-    :ivar bool restrict_chi_phys: Whether to restrict the physical susceptibility to positive-semidefinite
-        compound blocks (eigenvalues of the inverse susceptibility floored at a small positive value, see
-        :func:`~dgamore.nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues`).
-    :ivar anderson_prev_res: Cached previous Anderson residual (internal use).
-    :vartype anderson_prev_res: float | None
     """
 
     def __init__(self):
@@ -135,9 +130,57 @@ class SelfConsistencyConfig:
         self.mixing_history_length: int = 3
         self.previous_sc_path: str = ""
         self.use_interpolated_sigma: bool = False
+
+
+class StabilizationConfig:
+    r"""
+    Stores the convergence-stabilization options of the self-consistency loop. The susceptibility-reshaping options
+    (the per-iteration lambda correction, ``use_chi_phys_restriction`` and ``use_lambda_annealing``) are mutually
+    exclusive; the Jacobian stabilizer reshapes the iteration map instead and may coexist with the restriction and
+    the annealing scaffold, but not with a lambda correction.
+
+    :ivar bool use_lambda_correction: Whether the self-consistency loop applies the Moriya lambda correction to the
+        physical susceptibility in every iteration, dispatched by the band count: single-band input uses the scalar
+        correction (:class:`~dgamore.lambda_ops.LambdaCorrection`, honoring ``lambda_correction.type``), multi-band
+        input the matrix correction (:class:`~dgamore.lambda_ops.MultiOrbitalLambdaCorrection`, always both
+        channels). Wired as a releasing scaffold: the loop converges at ten times epsilon with the correction on,
+        disables it and converges the pure map to full epsilon. Independent of the one-shot
+        ``lambda_correction.perform_lambda_correction``, which takes precedence when both are enabled.
+    :ivar bool use_chi_phys_restriction: Whether to restrict the physical susceptibility to positive-semidefinite
+        compound blocks (eigenvalues of the inverse susceptibility floored at a small positive value, see
+        :func:`~dgamore.nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues`).
+    :ivar bool use_jacobian_stabilization: Whether to arm the modified iterative scheme of arXiv:2502.01420
+        (see :class:`~dgamore.jacobian_stabilization.PhysicalSolutionStabilizer`): if plain iteration demonstrably
+        cannot reach the physical fixed point (sustained residual growth, or a long plateau far above epsilon),
+        the proposal-map Jacobian is built once at the warm-start self-energy and the damping sign is flipped on
+        the unstable directions so the physical fixed point becomes attractive again. Needs a warm start close to
+        the physical solution (e.g. a converged higher-temperature run via ``previous_sc_path``). It reshapes the
+        iteration map (not the susceptibility), so it may COEXIST with ``use_chi_phys_restriction`` or
+        ``use_lambda_annealing`` (its detector pauses while those scaffold and engages after they release), but it
+        is mutually exclusive with either lambda correction, whose corrected map it must not linearize.
+    :ivar bool use_lambda_annealing: Whether to protect the self-consistency with the lambda-annealing scaffold:
+        a single shared bosonic mass :math:`\lambda` (measured from the worst channel's static susceptibility
+        gap, never user-chosen) is added to the inverse physical susceptibility of every channel, damped toward its
+        target and annealed to exactly zero between converged phases - the final result is always pure self-consistency (the schedule and
+        state live in :class:`~dgamore.nonlocal_sde.LambdaAnnealer`, owned by the loop). Multi-orbital-safe,
+        unlike the sum-rule lambda correction.
+    :ivar int stabilizer_n_modes: Internal (not parsed from the config file): number of unstable modes the
+        stabilizer's Arnoldi subspace is sized for; the factorization length adapts automatically around it.
+    :ivar int stabilizer_probe_iters: Internal (not parsed from the config file): base window of the stabilizer's
+        trigger and watchdog detectors.
+    :ivar float max_stabilizer_base_residual: Internal (not parsed from the config file): abort threshold on the
+        relative residual :math:`\lVert S(\Sigma)-\Sigma\rVert / \lVert\Sigma\rVert` at the stabilizer's
+        linearization point; a cold (DMFT/local) start fails this guard by design.
+    """
+
+    def __init__(self):
         self.use_lambda_correction: bool = False
-        self.restrict_chi_phys: bool = False
-        self.anderson_prev_res: float | None = None
+        self.use_chi_phys_restriction: bool = False
+        self.use_jacobian_stabilization: bool = False
+        self.use_lambda_annealing: bool = False
+        self.stabilizer_n_modes: int = 4
+        self.stabilizer_probe_iters: int = 3
+        self.max_stabilizer_base_residual: float = 0.5
 
 
 class EliashbergConfig:
@@ -174,10 +217,14 @@ class EliashbergConfig:
 
 class LambdaCorrectionConfig:
     """
-    Stores the lambda-correction configuration.
+    Stores the one-shot lambda-correction configuration. Enabling ``perform_lambda_correction`` runs a one-shot DGA
+    with lambda correction: it overrides ``self_consistency.max_iter`` to 1 and ``self_consistency.mixing`` to 1.0
+    and applies the correction (dispatched by band count) once. It is independent of the per-iteration
+    ``stabilization.use_lambda_correction`` and takes precedence when both are enabled.
 
-    :ivar bool perform_lambda_correction: Whether to apply the Moriya lambda correction.
-    :ivar str type: Correction type: ``"sp"`` (magnetic channel only) or ``"spch"`` (density and magnetic channels).
+    :ivar bool perform_lambda_correction: Whether to apply the one-shot Moriya lambda correction.
+    :ivar str type: Correction type for the single-band scalar correction: ``"sp"`` (magnetic channel only) or
+        ``"spch"`` (density and magnetic channels). The multi-band matrix correction always corrects both channels.
     """
 
     def __init__(self):
@@ -194,7 +241,6 @@ class DmftConfig:
     :ivar str input_path: Directory containing the DMFT input files.
     :ivar str fname_1p: Filename of the 1-particle data.
     :ivar str fname_2p: Filename of the 2-particle data.
-    :ivar bool do_sym_v_vp: Whether to symmetrize the 2-particle data with respect to :math:`(\nu, \nu')`.
     :ivar list symmetrize_orbitals: 1-based orbital indices to symmetrize over (empty for none).
     :ivar int n_ineq: Number of inequivalent atoms.
     :ivar list ineq_ordering: Ordering of the inequivalent atoms.
@@ -206,7 +252,6 @@ class DmftConfig:
         self.input_path: str = "./"
         self.fname_1p: str = "1p-data.hdf5"
         self.fname_2p: str = "g4iw_sym.hdf5"
-        self.do_sym_v_vp: bool = True
         self.symmetrize_orbitals: list = []
         self.n_ineq: int = 1
         self.ineq_ordering: list[int] = [1]
@@ -332,6 +377,7 @@ sys: SystemConfig = SystemConfig()
 output: OutputConfig = OutputConfig()
 self_energy_interpolation: SelfEnergyInterpolationConfig = SelfEnergyInterpolationConfig()
 self_consistency: SelfConsistencyConfig = SelfConsistencyConfig()
+stabilization: StabilizationConfig = StabilizationConfig()
 eliashberg: EliashbergConfig = EliashbergConfig()
 memory: MemoryConfig = MemoryConfig()
 ana_cont: AnaContConfig = AnaContConfig()

@@ -130,10 +130,11 @@ def load_from_dmft_file_and_update_config() -> (
                 f"for atom {i+1}."
             )
 
-        if config.dmft.do_sym_v_vp:
-            g2_dens_per_ineq[i] = g2_dens_per_ineq[i].symmetrize_v_vp()
-            g2_magn_per_ineq[i] = g2_magn_per_ineq[i].symmetrize_v_vp()
-            config.logger.info(f"Symmetrized G2 with respect to v and v' for atom {i+1}.")
+        # the (v, v') symmetrization is always applied: TR + inversion symmetry makes the right three-leg vertex the
+        # first-freq-summed transpose of the left, so both vrg legs follow from one gchi_aux_sum (see nonlocal_sde.py)
+        g2_dens_per_ineq[i] = g2_dens_per_ineq[i].symmetrize_v_vp()
+        g2_magn_per_ineq[i] = g2_magn_per_ineq[i].symmetrize_v_vp()
+        config.logger.info(f"Symmetrized G2 with respect to v and v' for atom {i+1}.")
 
     return g_per_ineq, sigma_per_ineq, g2_dens_per_ineq, g2_magn_per_ineq
 

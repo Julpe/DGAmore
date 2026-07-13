@@ -60,7 +60,6 @@ import string
 
 # ============================================================================
 # Spatial ops on a discrete reciprocal grid
-# ============================================================================
 
 
 def _enumerate_integer_matrices():
@@ -168,7 +167,6 @@ def _apply_M_to_ev_field(M, ev, nk):
 
 # ============================================================================
 # FFT-based fast q-detection (eigenvalue pre-screen)
-# ============================================================================
 
 
 def _fft_find_matching_q(A, B, atol):
@@ -194,7 +192,6 @@ def _fft_find_matching_q(A, B, atol):
 
 # ============================================================================
 # Solving for U
-# ============================================================================
 
 
 def _cluster_eigvals(d, tol):
@@ -228,10 +225,10 @@ def _canonicalize_sign_gauge(U, Hk_eff, Hg, atol):
     The valid sign-diagonals D are exactly those in the centralizer of Hk_eff:
     `D Hk_eff D = Hk_eff`. For generic Hermitian Hk_eff the centralizer is just
     `{+I, -I}`, but for block-diagonal or special H it can be larger (up to
-    `{±1}^norb`). We try all `2^norb` sign-diagonals and pick the one minimising
+    `{±1}^norb`). We try all `2^norb` sign-diagonals and pick the one minimizing
     the count of negative entries in `D U` (ties broken by preferring fewer changes
     from the identity diagonal). For norb up to ~6 this is cheap; beyond that we
-    fall back to a row-major canonicalisation.
+    fall back to a row-major canonicalization.
 
     This change is purely a basis convention. It does not affect the validity of
     the symmetry: any D in the centralizer of Hk_eff yields a valid solution and
@@ -285,7 +282,7 @@ def _solve_U_for_op(Hg, Hk_eff, atol):
     """Find a unitary U such that Hg(k) = U @ Hk_eff(k) @ U^dag for every k.
     Returns U or None.
 
-    When a solution exists, the returned U is canonicalised: among all
+    When a solution exists, the returned U is canonicalized: among all
     centralizer-equivalent solutions (i.e. ``D U`` for ``D`` a sign-diagonal in
     the centralizer of ``Hk_eff``), the one with the fewest negative entries is
     returned. This makes the output independent of any global-sign choice the
@@ -303,10 +300,8 @@ def _solve_U_for_op(Hg, Hk_eff, atol):
     if not np.allclose(ev_k, ev_g, atol=10 * atol):
         return None
 
-    # Single-orbital short-circuit: U is just a 1x1 unitary (a phase). For Hermitian
-    # Hg and Hk_eff with matching spectra, U = [[1]] always works (the 1x1 unitary
-    # group is U(1), and any phase satisfies the relation; pick the canonical one).
-    # This also avoids np.diff producing an empty axis when norb == 1.
+    # Single-orbital short-circuit: U is a 1x1 unitary (a phase). For Hermitian Hg/Hk_eff with matching spectra,
+    # U = [[1]] always works (any U(1) phase satisfies it; pick the canonical one), and avoids np.diff on an empty axis.
     if norb == 1:
         U_simple = np.eye(1, dtype=complex)
         rhs = np.einsum("ij,...jk,lk->...il", U_simple, Hk_eff, U_simple.conj())
@@ -454,7 +449,6 @@ def _fix_gauge_degenerate(V, W, clusters, Hk_eff, Hg, atol):
 
 # ============================================================================
 # Symmetry discovery
-# ============================================================================
 
 
 def _discover_symmetries(H, atol, verbose=False):
@@ -474,11 +468,8 @@ def _discover_symmetries(H, atol, verbose=False):
     M_all = _enumerate_integer_matrices()
     M_candidates = [M for M in M_all if _M_preserves_grid(M, nk)]
 
-    # Dedupe M's by their grid action - when N_i = 1 for some axis, many M's
-    # produce the same k-grid index map. Use a tuple of (hash, length) plus
-    # confirmation against stored representatives to avoid keeping nktot-sized
-    # bytes for every distinct M (which costs ~nktot bytes per entry; for cubic
-    # 32^3 grids that's >1 GB across the ~7000 matrices).
+    # Dedupe M's by their grid action (when N_i = 1 many M's share the same k-grid map): key on (hash, length) plus
+    # confirmation against stored representatives, to avoid ~nktot bytes per M (>1 GB across ~7000 matrices at 32^3).
     seen_hashes: dict = {}
     M_unique = []
     for M in M_candidates:
@@ -563,10 +554,8 @@ def _discover_symmetries(H, atol, verbose=False):
                 idx_q_key = idx_q.tobytes()
                 Hg = None
                 for conj in (False, True):
-                    # Quick dedup: if for this (idx_q, sigma, conj) we already have
-                    # an op, only one U is enough (the U is determined up to the
-                    # group's commutant - finding more here is redundant for the IBZ).
-                    # But we keep distinct U's because they're truly different group elts.
+                    # Quick dedup: if this (idx_q, sigma, conj) already has an op, one U is enough (determined up to the
+                    # group's commutant - redundant for the IBZ), but we keep distinct U's as different group elts.
                     if Hg is None:
                         Hg = H_flat[idx_q].reshape(nx, ny, nz, norb, norb)
                     Hk_eff = sigma * (H.conj() if conj else H)
@@ -591,7 +580,6 @@ def _discover_symmetries(H, atol, verbose=False):
 
 # ============================================================================
 # Group elements
-# ============================================================================
 
 _grid_action_cache = {}
 
@@ -666,9 +654,8 @@ class _GroupElement:
         self.U = U_clean
         self.sigma = int(sigma)
         self.conj = bool(conj)
-        # Key: the GRID ACTION, sigma, conj, and the canonicalized U.
-        # Using the grid action (instead of raw M, q) merges operations that
-        # have different (M, q) but identical effect on the discrete grid.
+        # Key: the GRID ACTION, sigma, conj, and the canonicalized U. Using the grid action (not raw M, q) merges
+        # operations with different (M, q) but identical effect on the discrete grid.
         Ur = np.round(self.U.real, 4) + 1j * np.round(self.U.imag, 4)
         grid_key = _grid_action_bytes(self.M, self.q, self.nk)
         self._key = (grid_key, self.sigma, self.conj, Ur.tobytes())
@@ -765,7 +752,6 @@ def _close_group(ops_raw, norb, nk, max_size=10000):
 
 # ============================================================================
 # Orbit collapse and reconstruction
-# ============================================================================
 
 
 def _g_action_on_kgrid(g, nk):
@@ -804,7 +790,6 @@ def _orbit_collapse(H, group):
 
 # ============================================================================
 # Public API
-# ============================================================================
 
 
 def get_symmetry_reduction(H, atol=1e-8, verbose=False, include_antiunitary=False):
@@ -946,11 +931,8 @@ def get_symmetry_reduction(H, atol=1e-8, verbose=False, include_antiunitary=Fals
         "generators": ops_raw,
         "n_ibz": len(irrk_ind),
         "n_fbz": nktot,
-        # Per-k transformation data, exposed so callers can apply the same
-        # mapping to other tensors without going through expand_tensor.
-        # For every FBZ point k (in (nx,ny,nz) layout):
-        #   T_full(k) = sigma_k * U_k T(rep(k))^[*conj_k] U_k^dagger  (per orbital index pair)
-        # where rep(k) is given by pos_in_irrk[k_flat] -> position in irrk_ind.
+        # Per-k transformation data, so callers can map other tensors without expand_tensor. For every FBZ point k:
+        #   T_full(k) = sigma_k * U_k T(rep(k))^[*conj_k] U_k^dagger, rep(k) = pos_in_irrk[k_flat] -> irrk_ind position.
         "pos_in_irrk": pos_in_irrk,  # shape (nktot,), int - irrk_inv equivalent
         "Us": Us,  # shape (nx, ny, nz, norb, norb), complex
         "sigmas": sigmas,  # shape (nx, ny, nz), float (+/-1)

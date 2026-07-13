@@ -486,8 +486,7 @@ class MaxentSolverSVD:
                 chi.append(o.chi2)
                 alphas.append(alpha)
             except:
-                # For small alphas sometimes the optimization fails
-                # Usually this happens at values of alpha that
+                # For small alphas the optimization sometimes fails; this usually happens at values of alpha that
                 # are too small anyway, so don't worry.
                 pass
             alpha = alpha / alpha_div

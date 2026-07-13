@@ -83,7 +83,6 @@ def build_node_shared_array(node_comm, compute_fn, dtype=DTYPE):
 
 # ====================================================================================================================
 # Message-chunking primitives (split a transfer's leading axis below the 2 GB MPI per-message limit).
-# ====================================================================================================================
 def _items_per_row(shape: tuple) -> int:
     """
     Returns the number of scalars per leading-axis row (the product of the trailing dimensions, or 1 for a 1D array).
@@ -294,7 +293,6 @@ def recv_bytes(comm, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES)
 
 # ====================================================================================================================
 # Work distribution.
-# ====================================================================================================================
 class MpiDistributor:
     """
     Distributes tasks among all available cores. Uses the first (q) dimension to slice the vertex data into chunks
@@ -696,7 +694,7 @@ class MpiDistributor:
         """
         Broadcasts an N-point-like object (one exposing a ``.mat`` numpy array) from ``root`` to all ranks. The large
         ``.mat`` is broadcast as raw sub-2 GB chunks (so there is no multi-gigabyte pickle blob and no >2 GB message),
-        while the rest of the object travels as a small pickled metadata blob - the broadcast analogue of
+        while the rest of the object travels as a small pickled metadata blob - the broadcast analog of
         :meth:`send_to_rank`/:meth:`recv_from_rank`. Prefer this over :meth:`bcast` for large objects such as a
         full-BZ self-energy or gap function, both to respect the 2 GB limit and to avoid the full in-memory pickle copy.
 
@@ -780,11 +778,10 @@ class MpiDistributor:
 
 # ====================================================================================================================
 # Higher-level data-movement routines (irreducible-BZ <-> full-BZ remap, node-aware frequency split, distributed FFT).
-# ====================================================================================================================
 def _get_node_aware_v_dist(n_nu, comm):
     """
     Calculates frequency distribution based on physical node topology.
-    Frequencies are split equally amongst nodes, then assigned to ranks within those nodes.
+    Frequencies are split equally among nodes, then assigned to ranks within those nodes.
 
     Uses inverse rank-lookup to be robust against inconsistent hostname strings
     returned by the OS in local or cluster environments.
@@ -813,8 +810,7 @@ def _get_node_aware_v_dist(n_nu, comm):
     sorted_node_names = sorted(nodes_map.keys())
     n_nodes = len(sorted_node_names)
 
-    # 2. CANONICAL HOSTNAME RESOLUTION
-    # Instead of string matching, find which node list contains THIS rank.
+    # 2. CANONICAL HOSTNAME RESOLUTION: instead of string matching, find which node list contains THIS rank.
     # This guarantees we find the correct key in nodes_map.
     canonical_hostname = None
     for name, ranks in nodes_map.items():
@@ -832,7 +828,7 @@ def _get_node_aware_v_dist(n_nu, comm):
     my_node_idx = sorted_node_names.index(canonical_hostname)
     v_on_this_node = v_per_node + (1 if my_node_idx < extra_v_nodes else 0)
 
-    # 4. Split this node's frequencies amongst its local ranks
+    # 4. Split this node's frequencies among its local ranks
     ranks_on_my_node = nodes_map[canonical_hostname]
     rank_in_node = ranks_on_my_node.index(rank)
 
@@ -953,9 +949,8 @@ def exchange_and_map_irrbz_fullbz(
     # owner_ranks[i] is the rank that has the data for my_fbz_range[i]
     owner_ranks = np.searchsorted(irr_rank_starts, needed_irrk_indices, side="right") - 1
 
-    # 3. Request/Send Index Information
-    # We need to tell each rank exactly which of its LOCAL indices we need.
-    # To be efficient, we only ask for each unique index once.
+    # 3. Request/Send Index Information: tell each rank exactly which of its LOCAL indices we need,
+    # asking for each unique index only once.
 
     indices_to_send = [[] for _ in range(size)]
     # Mapping to help us rebuild the full_mat after receiving unique matrices
@@ -1040,10 +1035,9 @@ def exchange_and_map_irrbz_fullbz(
         # Duplicate the unique received matrices into their (multiple) FBZ target rows
         full_mat[info["full_mat_locations"]] = buf[info["unique_map"]]
 
-    # 6b. Apply per-k orbital transformation locally if q_grid is in auto mode.
-    # Each rank only needs the FBZ slice of (Us, sigmas, conjs) corresponding to
-    # its own my_fbz_range. No gather, no scatter.
-    if getattr(q_grid, "is_auto", False) and mpi_dist_fullbz.my_size > 0:
+    # 6b. Apply the per-k orbital transformation locally if q_grid is in auto mode. Each rank only needs the FBZ
+    # slice of (Us, sigmas, conjs) for its own my_fbz_range - no gather, no scatter.
+    if q_grid.is_auto and mpi_dist_fullbz.my_size > 0:
         # FourPoint always has 4 orbital indices contracted with the symmetry.
         num_orb_dims = 4
         nb_full = q_grid._auto_us.shape[-1]
@@ -1127,9 +1121,8 @@ def gather_full_ibz_for_vslice(
 
             for chunk_idx, i in enumerate(range(0, q_src_count, max_q_recv)):
                 j = min(q_src_count, i + max_q_recv)
-                # MPI matching is (source, tag)-scoped, so the tag only needs to distinguish the chunks of ONE
-                # pair transfer; a rank-dependent base (the former ``r_src * size + rank``) overflows the
-                # MPI-guaranteed minimum ``MPI_TAG_UB`` (32767) above ~180 ranks.
+                # MPI matching is (source, tag)-scoped, so the tag only needs to distinguish the chunks of ONE pair
+                # transfer; a rank-dependent base (former r_src*size+rank) overflows MPI_TAG_UB above ~180 ranks.
                 tag = 700 + chunk_idx
                 reqs.append(comm.Irecv(full_ibz_mat[q_offset + i : q_offset + j], source=r_src, tag=tag))
 
