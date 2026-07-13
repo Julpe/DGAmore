@@ -135,7 +135,7 @@ class LocalNPoint(IHaveMat):
     def full_niv_range(self) -> bool:
         r"""
         Specifies whether the object is stored in the full fermionic frequency range or
-        only a subset of it (only :math:`\nu\geq0`). Same reasoning as already discussed in `full_niw_range`.
+        only a subset of it (only :math:`\nu\geq0`). Same reasoning as for `full_niw_range`.
 
         :return: True if the fermionic axes span the full (signed) range.
         """

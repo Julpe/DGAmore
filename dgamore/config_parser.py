@@ -82,6 +82,7 @@ class ConfigParser:
         config.dmft = self._build_dmft_config(config_file)
         config.output = self._build_output_config(config_file)
         config.self_consistency = self._build_self_consistency_config(config_file)
+        config.stabilization = self._build_stabilization_config(config_file)
         config.eliashberg = self._build_eliashberg_config(config_file)
         config.lambda_correction = self._build_lambda_correction_config(config_file)
         config.box = self._build_box_config(config_file)
@@ -171,7 +172,6 @@ class ConfigParser:
         conf.input_path = self._try_parse(section, "input_path", conf.input_path)
         conf.fname_1p = self._try_parse(section, "fname_1p", conf.fname_1p)
         conf.fname_2p = self._try_parse(section, "fname_2p", conf.fname_2p)
-        conf.do_sym_v_vp = self._try_parse(section, "do_sym_v_vp", conf.do_sym_v_vp)
         conf.symmetrize_orbitals = self._try_parse(section, "symmetrize_orbitals", conf.symmetrize_orbitals)
         conf.n_ineq = self._try_parse(section, "n_ineq", conf.n_ineq)
         conf.ineq_ordering = self._try_parse(section, "ineq_ordering", conf.ineq_ordering)
@@ -233,8 +233,48 @@ class ConfigParser:
         conf.mixing_history_length = self._try_parse(section, "mixing_history_length", conf.mixing_history_length)
         conf.previous_sc_path = self._try_parse(section, "previous_sc_path", conf.previous_sc_path)
         conf.use_interpolated_sigma = self._try_parse(section, "use_interpolated_sigma", conf.use_interpolated_sigma)
+
+        for stale_key in (
+            "use_lambda_correction",
+            "use_chi_phys_restriction",
+            "use_jacobian_stabilization",
+            "use_lambda_annealing",
+        ):
+            if stale_key in section:
+                config.logger.warning(
+                    f"'{stale_key}' has moved from the 'self_consistency' to the 'stabilization' section - "
+                    f"the stale key is ignored."
+                )
+        if "use_trial_lambda_correction" in section:
+            config.logger.warning(
+                "'use_trial_lambda_correction' has been folded into 'stabilization.use_lambda_correction' "
+                "(dispatched by the band count) - the stale key is ignored."
+            )
+
+        return conf
+
+    def _build_stabilization_config(self, config_file) -> StabilizationConfig:
+        """
+        Builds the stabilization config from the ``stabilization`` section (defaults if absent).
+
+        :param config_file: The parsed YAML mapping.
+        :return: The populated :class:`StabilizationConfig`.
+        """
+        conf = StabilizationConfig()
+        try:
+            section = config_file["stabilization"]
+        except KeyError:
+            config.logger.info(f"'stabilization' section not found. Using default values.")
+            return conf
+
         conf.use_lambda_correction = self._try_parse(section, "use_lambda_correction", conf.use_lambda_correction)
-        conf.restrict_chi_phys = self._try_parse(section, "restrict_chi_phys", conf.restrict_chi_phys)
+        conf.use_chi_phys_restriction = self._try_parse(
+            section, "use_chi_phys_restriction", conf.use_chi_phys_restriction
+        )
+        conf.use_jacobian_stabilization = self._try_parse(
+            section, "use_jacobian_stabilization", conf.use_jacobian_stabilization
+        )
+        conf.use_lambda_annealing = self._try_parse(section, "use_lambda_annealing", conf.use_lambda_annealing)
 
         return conf
 

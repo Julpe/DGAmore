@@ -850,7 +850,7 @@ def test_loads_libc_and_calls_malloc_trim(monkeypatch):
     IHaveMat._malloc_trim()
 
     assert IHaveMat._malloc_trim_available is True
-    assert getattr(IHaveMat, "_libc") is fake_lib
+    assert IHaveMat._libc is fake_lib
     assert fake_lib.called is True
 
 
@@ -1271,7 +1271,7 @@ def _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1, hopping=1.0, include_antiunitary=F
     eps = -2.0 * hopping * (np.cos(k1) + np.cos(k2) + np.cos(k3))
     for o in range(nb):
         H[..., o, o] = eps + 0.1 * o
-    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H, include_antiunitary=include_antiunitary)
     return grid, H
 
@@ -1477,7 +1477,7 @@ def test_map_to_full_bz_auto_1x1x1_trivial_grid_is_identity():
     nb = 2
     H = np.zeros((1, 1, 1, nb, nb), dtype=complex)
     H[0, 0, 0] = np.array([[1.0, 0.3], [0.3, 2.0]])
-    grid = bz.KGrid(nk=(1, 1, 1), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(1, 1, 1), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H)
     H_ibz = H.reshape(-1, nb, nb)[grid.irrk_ind].copy()
     obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(1, 1, 1), has_compressed_q_dimension=True)
@@ -1571,9 +1571,8 @@ def test_dtype_default_is_complex64():
 
 def test_dtype_constant_drives_storage_precision(monkeypatch):
     """The DTYPE constant drives the storage precision."""
-    # The mat setter is the single enforcement point: every IHaveMat-derived object is coerced to the
-    # module-level DTYPE. (The canonical way to switch precision is editing the DTYPE constant in source,
-    # so all modules import the new value; here we patch the setter's global to verify the indirection.)
+    # The mat setter is the enforcement point: every IHaveMat-derived object is coerced to the module-level DTYPE.
+    # (The canonical switch is editing the DTYPE constant in source; here we patch the setter's global to verify it.)
     import dgamore.n_point_base as npb
 
     monkeypatch.setattr(npb, "DTYPE", np.complex128)
@@ -1635,7 +1634,7 @@ def test_reduce_q_selects_in_ascending_flat_order_regardless_of_input_order():
     mat = np.arange(64, dtype=complex).reshape((4, 4, 4))
     obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     reduced = obj.reduce_q(np.array([[2, 2, 2], [1, 1, 1]]))
-    # selection follows ascending flat index, not the order given (matches the previous mask-based behaviour)
+    # selection follows ascending flat index, not the order given (matches the previous mask-based behavior)
     assert np.allclose(reduced.mat, [mat[1, 1, 1], mat[2, 2, 2]])
 
 

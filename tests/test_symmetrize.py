@@ -6,7 +6,7 @@
 
 import pytest
 
-from dgamore.symmetrize_new import *
+from dgamore.symmetrize import *
 
 
 @pytest.mark.parametrize("num_bands", [1, 2, 3, 4])

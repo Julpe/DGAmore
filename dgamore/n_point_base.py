@@ -21,9 +21,8 @@ import scipy as sp
 
 from dgamore.brillouin_zone import KGrid
 
-# Global storage precision for all N-point quantities. Switch this single constant to np.complex128 for
-# double precision (at the cost of doubling the memory footprint). All objects deriving from IHaveMat store
-# their underlying matrix in this dtype; it is also exposed as the class attribute IHaveMat.DTYPE.
+# Global storage precision for all N-point quantities. Switch this single constant to np.complex128 for double
+# precision (doubling memory). All IHaveMat-derived objects store .mat in this dtype; also exposed as IHaveMat.DTYPE.
 DTYPE = np.complex64
 
 
@@ -646,9 +645,8 @@ class IAmNonLocal(IHaveMat, ABC):
         if copy.has_compressed_q_dimension:
             copy.decompress_q_dimension()
 
-        # Build the keep-mask via flat indices instead of a (n_q, 3, nqx, nqy, nqz) broadcast comparison. ``q_list``
-        # has shape [n_q, 3] (one momentum per row). Out-of-range momenta are silently dropped (matching the previous
-        # behaviour of yielding no match for them).
+        # Build the keep-mask via flat indices instead of a (n_q, 3, nqx, nqy, nqz) broadcast comparison. ``q_list`` has
+        # shape [n_q, 3] (one momentum per row); out-of-range momenta are silently dropped (as before, no match).
         shape3 = copy.current_shape[:3]
         q_arr = np.asarray(q_list)
         if q_arr.ndim != 2 or q_arr.shape[1] != 3:
@@ -676,7 +674,7 @@ class IAmNonLocal(IHaveMat, ABC):
         result = self.reduce_q(q_arr)  # reduce_q already returns an independent copy; no extra deepcopy needed
         result._nq = (1, 1, 1)
 
-        if getattr(result, "mat", None) is None or result.mat.size == 0 or result.current_shape[0] == 0:
+        if result.mat is None or result.mat.size == 0 or result.current_shape[0] == 0:
             raise ValueError("No matrix element found for the given momentum.")
 
         return result
@@ -815,7 +813,7 @@ class IAmNonLocal(IHaveMat, ABC):
         self.mat = expanded
 
         # Apply per-k orbital transformation if auto-mode data is present.
-        if getattr(k_grid, "is_auto", False):
+        if k_grid.is_auto:
             from dgamore import symmetry_reduction
 
             self.mat = symmetry_reduction.apply_auto_orbital_transform(

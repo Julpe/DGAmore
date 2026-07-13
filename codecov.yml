@@ -12,7 +12,7 @@ ignore:
   - "**/DGAmore.py"
   - "**/plotting.py"
   - "**/config_parser.py"
-  - "**/symmetrize_new.py"
+  - "**/symmetrize.py"
   - "**/ana_cont.py"
   - "**/dmft_interface.py"
 

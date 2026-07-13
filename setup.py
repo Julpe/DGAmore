@@ -25,7 +25,7 @@ setup(
     entry_points={
         "console_scripts": [
             "DGAmore = dgamore.DGAmore:main",
-            "symmetrize = dgamore.symmetrize_new:main",
+            "symmetrize = dgamore.symmetrize:main",
         ],
     },
     python_requires=">=3.12",

@@ -1,4 +1,6 @@
 [default]
+# American English is the project's documentation and identifier style.
+locale = "en-us"
 extend-ignore-words-re = [
     "ba",
     "nd",

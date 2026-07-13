@@ -4,7 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -253,6 +253,16 @@ def test_update_mu_with_logger_logs_on_failure():
     out = update_mu(mu, 1e9, ek, sig.mat, beta, sig.smom[0], logger=logger)
     assert out == mu
     logger.debug.assert_called_once()
+
+
+def test_update_mu_forwards_newton_tolerance():
+    """update_mu passes its tol through to the Newton solver (default 1e-6, probes tighten to 1e-10)."""
+    nk, ek, sig, beta, mu = _toy_inputs()
+    with patch("dgamore.greens_function.opt.newton", return_value=mu) as newton:
+        update_mu(mu, 1.0, ek, sig.mat, beta, sig.smom[0])
+        assert newton.call_args.kwargs["tol"] == 1e-6
+        update_mu(mu, 1.0, ek, sig.mat, beta, sig.smom[0], tol=1e-10)
+        assert newton.call_args.kwargs["tol"] == 1e-10
 
 
 def test_model_epot_chunked_matches_unchunked_reference(monkeypatch):

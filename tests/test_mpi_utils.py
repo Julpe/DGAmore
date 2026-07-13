@@ -20,9 +20,8 @@ from dgamore.n_point_base import SpinChannel
 
 from tests.conftest import run_parallel, FAKE_MPI as MPI
 
-# The shared conftest installs an autouse fixture that no-ops os.remove (so the rest of the suite never deletes real
-# files). Capture the genuine os.remove here, at import time, so the rank-file lifecycle test can opt back in to real
-# deletion for its own assertion without disturbing that fixture.
+# The shared conftest autouse-fixture no-ops os.remove (so the suite never deletes real files). Capture the genuine
+# os.remove here at import time, so the rank-file lifecycle test can opt back into real deletion without disturbing it.
 _REAL_OS_REMOVE = os.remove
 
 
@@ -146,11 +145,8 @@ def test_send_recv_in_chunks_1d():
     assert np.allclose(res[1], arr)
 
 
-# A real (2x2x1) square-lattice grid reduces 4 full-BZ q-points to 3
-# irreducible ones; its inverse map is [0, 1, 1, 2] (point 1 is duplicated, so
-# the IBZ->FBZ expansion is non-trivial). We derive the sizes and the reference
-# expansion straight from the grid so the tests stay correct against the real
-# KGrid (no hand-maintained mapping).
+# A real (2x2x1) square-lattice grid reduces 4 full-BZ q-points to 3 irreducible (inverse map [0, 1, 1, 2], point 1
+# duplicated, so IBZ->FBZ is non-trivial). Sizes and the reference expansion are derived from the grid, not hardcoded.
 Q_NK = (2, 2, 1)
 Q_SYMS = bz.two_dimensional_square_symmetries()
 IRR_INV = KGrid(Q_NK, Q_SYMS).irrk_inv.ravel()
@@ -214,9 +210,8 @@ def test_exchange_and_map_single_rank():
 
 def test_exchange_and_map_auto_orbital_transform(monkeypatch):
     """exchange_and_map_irrbz_fullbz applies the auto orbital transform per rank slice."""
-    # Record every apply_auto_orbital_transform call. Patching the function on
-    # the symmetry_reduction module works whether that module is the real one
-    # or the in-process fake (the auto branch in mpi_utils calls it by name).
+    # Record every apply_auto_orbital_transform call. Patching it on the symmetry_reduction module works whether that
+    # module is the real one or the in-process fake (the auto branch in mpi_utils calls it by name).
     calls = []
 
     def _recording_transform(full_mat, us, sigmas, conjs, num_orbital_dimensions):

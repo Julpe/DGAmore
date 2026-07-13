@@ -271,9 +271,8 @@ class SelfEnergy(TwoPoint):
         if n_fit > self.niv or n_fit < 0:
             n_fit = niv_core + 200
 
-        # Share ``self.mat`` into the metadata clone instead of deep-copying it: ``compress_q_dimension`` is a view and
-        # ``to_half_niv_range`` copies (breaking the share), and ``poly_mat``/``fit_mat`` below are independent, so
-        # ``self.mat`` is never mutated.
+        # Share ``self.mat`` into the metadata clone instead of deep-copying: ``compress_q_dimension`` is a view,
+        # ``to_half_niv_range`` copies (breaking the share), and poly_mat/fit_mat are independent, so self.mat is safe.
         copy = self._clone_without_mat()
         copy.mat = self.mat
         copy = copy.compress_q_dimension().to_half_niv_range()

@@ -76,10 +76,8 @@ def mock_logger(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def reset_config_singletons():
-    # Restore the global config singletons to fresh defaults after every test. config.py is module-level mutable state
-    # and the end-to-end tests reconfigure the whole singleton (grids, bands, symmetrize_orbitals, ...); without this
-    # reset those mutations leak into later tests (e.g. nonlocal-srvo3 -> eliashberg). Reset on teardown so it never
-    # interferes with a test's own setup.
+    # Restore the global config singletons to fresh defaults after every test: config.py is module-level mutable state
+    # that e2e tests reconfigure, so without this reset mutations would leak into later tests. Runs on teardown.
     yield
     config.box = config.BoxConfig()
     config.lattice = config.LatticeConfig()
@@ -89,6 +87,7 @@ def reset_config_singletons():
     config.output = config.OutputConfig()
     config.self_energy_interpolation = config.SelfEnergyInterpolationConfig()
     config.self_consistency = config.SelfConsistencyConfig()
+    config.stabilization = config.StabilizationConfig()
     config.eliashberg = config.EliashbergConfig()
     config.memory = config.MemoryConfig()
     config.ana_cont = config.AnaContConfig()
@@ -107,7 +106,6 @@ def create_default_config(config, folder: str):
     config.lattice.interaction_type = "kanamori_from_dmft"
     config.lattice.er_input = f"{folder}/wannier.hk"
     config.dmft.input_path = folder
-    config.dmft.do_sym_v_vp = True
     config.dmft.n_ineq = 1
     config.dmft.ineq_ordering = [1]
     config.dmft.n_bands_per_ineq = []
@@ -270,9 +268,8 @@ class Comm:
             self._barrier.abort()
 
     def Split_type(self, split_type, key=0, info=None):
-        # Group the ranks by hostname (COMM_TYPE_SHARED -> one sub-communicator per node). Threads share memory, so
-        # same-node ranks receive the SAME cached Comm instance and therefore a shared barrier/store, which is what
-        # makes the shared-memory window below genuinely shared.
+        # Group ranks by host (COMM_TYPE_SHARED -> one sub-communicator per node). Threads share memory, so same-node
+        # ranks receive the SAME cached Comm (shared barrier/store), which makes the shared-memory window shared.
         host = getattr(_tls, "hostname", "node0")
         hosts = list(self._collective(host))
         group = tuple(self._members[i] for i in range(self._size) if hosts[i] == host)
@@ -302,6 +299,15 @@ class Comm:
         if self.rank != root:
             _assign(buf, store[root])
         return buf
+
+    def allreduce(self, obj, op=None):
+        # Object-level allreduce over scalars: MPI.MIN/MAX map to min/max, everything else (incl. None) sums.
+        values = list(self._collective(obj))
+        if op is not None and op == MPI.MIN:
+            return min(values)
+        if op is not None and op == MPI.MAX:
+            return max(values)
+        return sum(values)
 
     def Allreduce(self, sendbuf, recvbuf=None):
         buf = recvbuf
@@ -376,9 +382,8 @@ class Comm:
 
 
 class Win:
-    # Minimal MPI shared-memory window over the threaded fake Comm. Because threads share an address space, the node
-    # root (local rank 0) allocates one bytearray and every rank of the (node) communicator receives the SAME object
-    # via bcast, so a numpy view over it is genuinely shared - writes by the root are visible to all.
+    # Minimal MPI shared-memory window over the threaded fake Comm. Threads share an address space, so the node root
+    # allocates one bytearray and bcasts the SAME object to every node rank - a numpy view over it is genuinely shared.
     @staticmethod
     def Allocate_shared(size, disp_unit=1, info=None, comm=None):
         win = Win()

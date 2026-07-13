@@ -70,7 +70,7 @@ def setup(tmp_path, monkeypatch):
     config.eliashberg.construct_fq_cheap = False
     config.memory.save_memory_for_chiq_aux = False
     config.lambda_correction.perform_lambda_correction = False
-    config.self_consistency.restrict_chi_phys = False
+    config.stabilization.use_chi_phys_restriction = False
 
     yield tmp_path
 

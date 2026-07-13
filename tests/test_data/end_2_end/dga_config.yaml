@@ -38,7 +38,6 @@ dmft_input:
     /home/julpe/Documents/repos/MultiorbitalDGApy/tests/test_data/end_2_end/             # Folder containing the input files. Default: current directory
   fname_1p: 1p-data.hdf5   # Filename of the one-particle DMFT calculation; default: 1p_data.hdf5
   fname_2p: g4iw_sym.hdf5   # Name of the two-particle DMFT calculation; default: g4iw_sym.hdf5
-  do_sym_v_vp: true # If True, the code will symmetrize G2 in the v and vp indices
 
 eliashberg:
   perform_eliashberg: true # If True, the code will perform a power iteration to solve the linearized Eliashberg equation

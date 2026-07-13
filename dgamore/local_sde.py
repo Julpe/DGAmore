@@ -74,9 +74,8 @@ def create_gamma_r_with_shell_correction(
     :param u_loc: The bare local interaction :math:`U`.
     :return: The shell-corrected irreducible vertex :math:`\Gamma_{r}` as a :class:`LocalFourPoint`.
     """
-    # the +U below must couple ALL fermionic frequencies (the Kitatani shell ladder with the constant-U vertex),
-    # so the block-diagonally inverted bubble is explicitly extended to the two-fermion layout first - keeping it
-    # 1-vn would put U on the nu-diagonal only (wrong physics). The first inversion is still per (w, v) block.
+    # the +U below must couple ALL fermionic frequencies, so the block-diagonally inverted bubble is explicitly extended
+    # to the two-fermion layout first (keeping it 1-vn would put U on the nu-diagonal only - wrong physics).
     chi_tilde_shell = (
         gchi0.invert().extend_vn_to_diagonal() + 1.0 / config.sys.beta**2 * u_loc.as_channel(gchi_r.channel)
     ).invert()
@@ -364,12 +363,9 @@ def perform_local_schwinger_dyson(
 
 
 # ----------------------------------------------- AbinitioDGA algorithms -----------------------------------------------
-#
-# DEVELOPMENT / TESTING ONLY. The functions below are an alternative ("ab-initio DGA") rewriting of the local
-# Schwinger-Dyson cross-check: they build the local self-energy from the full vertex F and the density three-leg
-# vertex derived from it (density channel only, by design), as opposed to the auxiliary-susceptibility (Hedin)
-# form used by the production routine above. They are NOT part of the production routine (``DGAmore.py`` calls
-# :func:`perform_local_schwinger_dyson`) and exist only as an internal consistency check, hence are left untested.
+
+# DEVELOPMENT / TESTING ONLY: an alternative ("ab-initio DGA") local Schwinger-Dyson cross-check building the local
+# self-energy from F and its density three-leg vertex (density only), not the Hedin form used in production. Untested.
 
 
 def get_loc_self_energy_gamma_abinitio_dga(
@@ -425,9 +421,8 @@ def perform_local_schwinger_dyson_abinitio_dga(
     logger.info("Local bare susceptibility chi_0^wv calculated.")
     gchi0_core = gchi0_loc_full.cut_niv(config.box.niv_core)
 
-    # 1 + chi0 * F_r = gchi_r * (chi0)^(-1) = 1 + gamma_r or
-    # F_r = -beta^2 * [chi0^(-1) - chi0^(-1) chi_r chi0^(-1)]
-    # gamma_r is NOT the irreducible vertex in channel r but rather the three-point vertex from AbinitioDGA
+    # 1 + chi0 * F_r = gchi_r * chi0^(-1) = 1 + gamma_r, i.e. F_r = -beta^2 [chi0^(-1) - chi0^(-1) chi_r chi0^(-1)];
+    # gamma_r is NOT the irreducible vertex in channel r but the three-point vertex from AbinitioDGA.
     gchi0_inv_core = gchi0_core.invert()
     f_dens_loc = (gchi0_inv_core - gchi0_inv_core @ gchi_dens_loc @ gchi0_inv_core).scale(-config.sys.beta**2)
     logger.info("Local full vertex F^wvv' (dens) calculated.")

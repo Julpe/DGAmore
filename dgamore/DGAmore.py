@@ -17,9 +17,8 @@ import itertools as it
 import logging
 import os
 
-# OpenMPI: exclude the UCX one-sided (RMA) component before MPI is initialised. On some OpenMPI 5.x builds it fails its
-# own component-query and prints a benign "OSC UCX component priority set inside component query failed" warning when
-# the per-node shared-memory giwk window is created.
+# OpenMPI: exclude the UCX one-sided (RMA) component before MPI init. Some OpenMPI 5.x builds fail its own
+# component-query and print a benign "OSC UCX component priority set inside component query failed" warning otherwise.
 os.environ.setdefault("OMPI_MCA_osc", "^ucx")
 
 import matplotlib.pyplot as plt
@@ -36,7 +35,7 @@ import dgamore.memory_estimator as memory_estimator
 import dgamore.nonlocal_sde as nonlocal_sde
 import dgamore.plotting as plotting
 from dgamore import max_ent
-from dgamore.brillouin_zone import AUTO_SYMMETRIES_SENTINEL
+from dgamore.brillouin_zone import is_auto_symmetries
 from dgamore.config_parser import ConfigParser
 from dgamore.greens_function import GreensFunction
 from dgamore.interaction import LocalInteraction
@@ -44,6 +43,10 @@ from dgamore.local_four_point import LocalFourPoint
 from dgamore.self_energy import SelfEnergy
 
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
+
+# Fraction of a node's ``psutil.virtual_memory().available`` a run may occupy at any branch's peak. The remainder is the
+# sole overhead margin (OS/allocator/transients); the estimator's OVERHEAD_FACTOR is 1.0, so the two do not compound.
+NODE_MEMORY_FRACTION: float = 0.97
 
 
 def main():
@@ -78,6 +81,7 @@ def main():
         config.output,
         config.sys,
         config.self_consistency,
+        config.stabilization,
         config.eliashberg,
         config.lambda_correction,
         config.self_energy_interpolation,
@@ -91,6 +95,7 @@ def main():
             config.output,
             config.sys,
             config.self_consistency,
+            config.stabilization,
             config.eliashberg,
             config.lambda_correction,
             config.self_energy_interpolation,
@@ -100,7 +105,7 @@ def main():
         root=0,
     )
 
-    setup_lambda_correction_settings(comm)
+    setup_lambda_correction_settings()
 
     config_parser.save_config_file(path=config.output.output_path, name="dga_config.yaml")
 
@@ -118,7 +123,7 @@ def main():
 
     ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
 
-    if isinstance(config.lattice.k_grid.symmetries, type(AUTO_SYMMETRIES_SENTINEL)):
+    if is_auto_symmetries(config.lattice.k_grid.symmetries):
         config.lattice.k_grid.specify_auto_symmetries(ek)
         logger.info(
             f"Automatically determined symmetries for the k-grid. The irreducible BZ has "
@@ -306,12 +311,13 @@ def main():
             sigma_loc_full = write_smom(sigma_loc_full, sigma_loc_per_ineq[ineq - 1], s)
             sigma_dmft_full = write_smom(sigma_dmft_full, sigma_dmft_per_ineq[ineq - 1], s)
 
-    if config.lambda_correction.perform_lambda_correction and comm.rank == 0:
+    if comm.rank == 0:
+        # saved unconditionally (like every sibling local quantity): the scalar and matrix lambda corrections
+        # load chi_*_loc.npy under different flags, so it must exist whenever either consumer may run
         chi_d_full.save(name="chi_dens_loc", output_dir=config.output.output_path)
         chi_m_full.save(name="chi_magn_loc", output_dir=config.output.output_path)
         del chi_d, chi_m
 
-    if comm.rank == 0:
         g2_dens_full.save(name="g2_dens_loc", output_dir=config.output.output_path)
         g2_magn_full.save(name="g2_magn_loc", output_dir=config.output.output_path)
         del g2_dens_per_ineq, g2_magn_per_ineq
@@ -546,7 +552,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
     ``r * (baseline + distributed) + single`` (every rank holds the branch's persistent baseline; a *distributed*
     transient is held by every rank at once, a *single-rank* transient by one rank while the others idle), minus
     ``(r - 1) * giwk_shareable`` when ``config.memory.use_shared_memory_common_obj`` deduplicates the branch's ``giwk_full``
-    to one copy per node, and this must not exceed ``psutil.virtual_memory().available * 0.9`` for that node. Each
+    to one copy per node, and this must not exceed ``psutil.virtual_memory().available * NODE_MEMORY_FRACTION`` for that node. Each
     node's rank count and available memory are collected with a single ``allgather`` of
     ``(hostname, available_bytes)``; a branch's path is judged to "fit" only if it fits on **every** node (the flags
     are process-wide, so the tightest node governs, and a single-rank transient may land on any node). The
@@ -607,8 +613,10 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
         return total
 
     def fits_everywhere(bp: memory_estimator.BranchPeak, distributed: float, single: float) -> bool:
-        """Whether a transient (per-rank ``distributed`` + one-off ``single``) fits the 90% budget on every node."""
-        return all(node_total(bp, distributed, single, r) <= avail * 0.9 for r, avail in nodes.values())
+        """Whether a transient (per-rank ``distributed`` + one-off ``single``) fits the node budget on every node."""
+        return all(
+            node_total(bp, distributed, single, r) <= avail * NODE_MEMORY_FRACTION for r, avail in nodes.values()
+        )
 
     flag_to_key = {
         "save_memory_for_chi0q": "chi0q",
@@ -632,8 +640,9 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
         if not fits_everywhere(bp_sde, bp_sde.off_distributed, bp_sde.off_single):
             worst = max(node_total(bp_sde, bp_sde.off_distributed, bp_sde.off_single, r) for r, _ in nodes.values())
             raise MemoryError(
-                f"The Schwinger-Dyson equation needs {worst / 1024**3:.3f} GB on a node, which exceeds 90% of that "
-                f"node's available memory. Use more nodes, fewer ranks per node, a smaller frequency box or k-grid."
+                f"The Schwinger-Dyson equation needs {worst / 1024**3:.3f} GB on a node, which exceeds "
+                f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory. Use more nodes, fewer ranks per node, a "
+                f"smaller frequency box or k-grid."
             )
         worst_sde = max(node_total(bp_sde, bp_sde.off_distributed, bp_sde.off_single, r) for r, _ in nodes.values())
         logger.info(
@@ -649,8 +658,8 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
                 node_total(bp_local, bp_local.off_distributed, bp_local.off_single, r) for r, _ in nodes.values()
             )
             raise MemoryError(
-                f"The local Schwinger-Dyson step needs {worst / 1024**3:.3f} GB on rank 0's node, which exceeds 90% "
-                f"of that node's available memory. Use a smaller frequency box or fewer bands."
+                f"The local Schwinger-Dyson step needs {worst / 1024**3:.3f} GB on rank 0's node, which exceeds "
+                f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory. Use a smaller frequency box or fewer bands."
             )
         logger.info(
             f"Local Schwinger-Dyson step: rank-0 single peak {bp_local.off_single / 1024**3:.3f} GB "
@@ -669,8 +678,8 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
         if final and not fits_on:
             worst = max(node_total(bp, bp.on_distributed, bp.on_single, r) for r, _ in nodes.values())
             raise MemoryError(
-                f"The memory-saving path for '{label}' needs {worst / 1024**3:.3f} GB on a node, which exceeds 90% "
-                f"of that node's available memory"
+                f"The memory-saving path for '{label}' needs {worst / 1024**3:.3f} GB on a node, which exceeds "
+                f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory"
                 + (
                     " (and its fast path does not fit either)"
                     if autodetect_on
@@ -686,69 +695,98 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
         )
 
 
-def _disable_restrict_chi_phys_with_lambda_correction() -> None:
+def _resolve_option_exclusivity() -> None:
     """
-    Disables the susceptibility restriction when the lambda correction is active: the lambda correction calibrates
-    its sum rule on the physical susceptibility, which must not contain eigenvalue-floored blocks. The combination
-    is not recommended and the lambda correction takes precedence.
+    Resolves the mutual exclusivity of the stabilization options with a fixed precedence. The
+    susceptibility-reshaping options - the lambda correction (one-shot or per-iteration),
+    ``use_chi_phys_restriction`` and the lambda-annealing scaffold - all modify the physical susceptibility and cannot run
+    together (a sum-rule calibration must not see a floored or mass-shifted chi, and the two scaffolds would fight).
+    The Jacobian stabilizer instead reshapes the iteration map, not chi, so it may COEXIST with ``use_chi_phys_restriction``
+    or ``use_lambda_annealing`` (its stall detector pauses while those scaffold and engages after they release), but
+    it is mutually exclusive with either lambda correction, whose corrected map the stabilizer must not linearize
+    (it must also not engage on the released pure phase). Precedence: lambda correction >
+    use_chi_phys_restriction > lambda annealing. Conflicting options are disabled with a warning.
 
     :return: None.
     """
-    if config.self_consistency.restrict_chi_phys:
-        config.self_consistency.restrict_chi_phys = False
-        config.logger.warning(
-            "Both the lambda correction and restrict_chi_phys were enabled - this combination is not recommended "
-            "since the lambda correction would calibrate its sum rule on eigenvalue-floored susceptibilities. "
-            "Keeping the lambda correction and disabling restrict_chi_phys."
-        )
+
+    def disable_option(name: str, kept: str) -> None:
+        """
+        Disables a stabilization option (sets it to ``False`` with a warning) when it was enabled together with a
+        higher-precedence, mutually exclusive one.
+
+        :param name: The ``config.stabilization`` attribute to disable.
+        :param kept: Human-readable description of the option that is kept and takes precedence.
+        :return: None.
+        """
+        if getattr(config.stabilization, name):
+            setattr(config.stabilization, name, False)
+            config.logger.warning(
+                f"'{name}' was enabled together with {kept} - these are mutually exclusive. Keeping {kept} and "
+                f"disabling '{name}'."
+            )
+
+    if config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction:
+        disable_option("use_chi_phys_restriction", "the lambda correction")
+        disable_option("use_lambda_annealing", "the lambda correction")
+        disable_option("use_jacobian_stabilization", "the lambda correction")
+        return
+
+    if config.stabilization.use_chi_phys_restriction and config.stabilization.use_lambda_annealing:
+        disable_option("use_lambda_annealing", "use_chi_phys_restriction")
 
 
-def setup_lambda_correction_settings(comm: MPI.Comm) -> None:
+def setup_lambda_correction_settings() -> None:
     """
-    Sets up the lambda correction settings based on the configuration provided by the user. If the user has enabled
-    the lambda correction in the self-consistency settings, it will be enabled in the lambda correction settings
-    as well. If the user has enabled the lambda correction in the lambda correction settings, but not in the
-    self-consistency settings, the self-consistency will be set to a single iteration with full mixing. Will raise
-    an error if the user tries to enable the lambda correction for multi-band systems.
+    Sets up the lambda-correction and stabilization settings based on the configuration provided by the user. The
+    one-shot ``lambda_correction.perform_lambda_correction`` overrides ``max_iter`` to 1 and ``mixing`` to 1.0 and
+    takes precedence over the per-iteration ``stabilization.use_lambda_correction`` (which is then disabled with a
+    warning). Whenever a lambda correction is active, the band-count dispatch (single-band scalar vs. multi-band
+    matrix correction) is logged.
 
-    :param comm: The MPI communicator (only rank 0 validates the multi-band restriction).
     :return: None.
-    :raises ValueError: If lambda correction is requested for a multi-band system, or the lambda/self-consistency
-        settings are inconsistent.
     """
-    if (
-        comm.rank == 0
-        and config.sys.n_bands != 1
-        and (config.lambda_correction.perform_lambda_correction or config.self_consistency.use_lambda_correction)
-    ):
-        raise ValueError(
-            "Lambda correction is not available for multi-band systems. Please disable it in the config file."
-        )
-
-    if config.self_consistency.max_iter > 1 and not config.self_consistency.use_lambda_correction:
-        config.lambda_correction.perform_lambda_correction = False
-        config.logger.info("Calculating self-consistency without lambda correction.")
-        return
-
-    if config.self_consistency.max_iter > 1 and config.self_consistency.use_lambda_correction:
-        config.lambda_correction.perform_lambda_correction = True
-        config.logger.info("Calculating self-consistency with lambda correction.")
-        _disable_restrict_chi_phys_with_lambda_correction()
-        return
+    _resolve_option_exclusivity()
 
     if config.lambda_correction.perform_lambda_correction:
+        if config.stabilization.use_lambda_correction:
+            config.stabilization.use_lambda_correction = False
+            config.logger.warning(
+                "'use_lambda_correction' was enabled together with the one-shot 'perform_lambda_correction' - the "
+                "one-shot takes precedence and 'use_lambda_correction' is disabled."
+            )
         config.self_consistency.max_iter = 1
         config.self_consistency.mixing = 1.0
-        config.logger.info("Performing one-shot DGA with lambda correction.")
-        _disable_restrict_chi_phys_with_lambda_correction()
+        config.logger.info("Performing one-shot DGA with lambda correction (max_iter and mixing overridden).")
+        _log_lambda_correction_dispatch()
         return
-    elif not config.lambda_correction.perform_lambda_correction:
-        config.self_consistency.max_iter = 1
+
+    if config.stabilization.use_lambda_correction:
+        config.logger.info("Calculating self-consistency with the releasing per-iteration lambda correction.")
+        _log_lambda_correction_dispatch()
+        return
+
+    if config.self_consistency.max_iter == 1:
         config.self_consistency.mixing = 1.0
         config.logger.info("Performing one-shot DGA without lambda correction.")
         return
 
-    raise ValueError("Invalid configuration for lambda correction and self-consistency. Please review the config file.")
+    config.logger.info("Calculating self-consistency without lambda correction.")
+
+
+def _log_lambda_correction_dispatch() -> None:
+    """
+    Logs which lambda-correction implementation the band count dispatches to: the single-band scalar Moriya
+    correction for one band, the multi-orbital matrix correction otherwise.
+
+    :return: None.
+    """
+    if config.sys.n_bands == 1:
+        config.logger.info("Lambda correction: dispatching to the single-band scalar correction (1 band).")
+    else:
+        config.logger.info(
+            f"Lambda correction: dispatching to the multi-orbital matrix correction ({config.sys.n_bands} bands)."
+        )
 
 
 def configure_matplotlib():

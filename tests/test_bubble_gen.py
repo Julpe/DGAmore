@@ -6,7 +6,7 @@
 """
 Parity tests for :class:`dgamore.bubble_gen.BubbleGenerator`. Each test compares the produced bubble against an
 independent, explicit hand-rolled reference of the documented formula (small random Green's function + small grid),
-which both validates correctness and locks the behaviour of the memory-optimized methods.
+which both validates correctness and locks the behavior of the memory-optimized methods.
 """
 
 import numpy as np

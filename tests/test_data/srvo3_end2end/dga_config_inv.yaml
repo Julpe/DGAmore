@@ -26,8 +26,10 @@ self_consistency:
   mixing_history_length: 2 # Number of previous iterations used for Pulay mixing. Default: 2
   previous_sc_path: "" # Path to the previous self-consistency folder. If not specified, the code will start a new calculation from scratch. If specified,
   # the code will start from the last iteration of the previous calculation and do max_iter steps on top
-  use_lambda_correction: False # If True, the code will perform a lambda correction for each iteration. Note that perform_lambda_correction below needs to be set to True also!
-  restrict_chi_phys: False # If True, the physical susceptibilities will be restricted to positive values during the self-consistency cycle.
+
+stabilization:
+  use_lambda_correction: False # If True, applies the Moriya lambda correction in every iteration as a releasing scaffold (band-count dispatched: scalar for one band, matrix for several).
+  use_chi_phys_restriction: False # If True, the physical susceptibilities will be restricted to positive values during the self-consistency cycle.
 
 lambda_correction:
   perform_lambda_correction: False # If True, the code will perform a lambda correction and not a self-consistency scheme. This is only possible for single-orbital systems!
@@ -38,7 +40,6 @@ dmft_input:
   input_path: "/home/julpe/Documents/repos/DGAmore/tests/test_data/srvo3_end2end/" # Folder containing the input files. Default: current directory
   fname_1p: "1p-data.hdf5" # Filename of the one-particle DMFT calculation; default: 1p_data.hdf5
   fname_2p: "g4iw_sym.hdf5" # Name of the two-particle DMFT calculation; default: g4iw_sym.hdf5
-  do_sym_v_vp: True # If True, the code will symmetrize G2 in the v and vp indices
   symmetrize_orbitals: [ 1,2,3 ] # List of orbitals that will be symmetrized, starting from 1 (first orbital is 1, second orbital is 2, etc.).
   # If left empty, no symmetrization will be performed in the orbital indices. This is only relevant for multi-orbital systems.
 

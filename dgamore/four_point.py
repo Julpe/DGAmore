@@ -681,9 +681,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         channel = self.channel if self.channel != SpinChannel.NONE else other.channel
 
         if self.num_vn_dimensions in (0, 1) or other.num_vn_dimensions in (0, 1):
-            # special cases if both objects do not have two fermionic frequency dimensions each. Straightforward
-            # contraction is saving memory as we do not have to add fermionic frequency dimensions to artificially
-            # create compound indices
+            # special case if either object lacks two fermionic frequency dimensions: straightforward contraction saves
+            # memory (no need to add fermionic dimensions to artificially create compound indices)
             q_prefix = "" if is_local else "q"
 
             self.compress_q_dimension()
@@ -787,9 +786,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         # full-index layout check: one (compressed) momentum axis + four orbital axes + the frequency axes
         full_index_ndim = 1 + 4 + self.num_wn_dimensions + self.num_vn_dimensions
         if self.num_wn_dimensions == 1 and self.num_vn_dimensions == 2 and len(self.current_shape) == full_index_ndim:
-            # per-q compound round trip for the full-index two-fermion layout: the former global
-            # to_compound_indices/to_full_indices pair materialized a second full-size layout copy; here only one
-            # [w, x1, x2] workspace per q-slice is live besides the object
+            # per-q compound round trip for the full-index two-fermion layout: the global to_compound/to_full pair
+            # materialized a second full-size copy; here only one [w, x1, x2] workspace per q-slice is live
             if self.frequency_notation == FrequencyNotation.PP:
                 self.permute_orbitals("abcd->acbd", copy=False)  # pure permutation, returns a view
 

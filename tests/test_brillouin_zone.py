@@ -545,66 +545,37 @@ def test_get_bands_returns_sorted_real_eigenvalues():
     assert np.allclose(bands, expected)
 
 
-def test_auto_symmetries_sentinel_is_singleton():
-    """``_AutoSymmetriesSentinel`` is a singleton: every instantiation returns the canonical ``AUTO_SYMMETRIES_SENTINEL`` object."""
-    a = bz._AutoSymmetriesSentinel()
-    b = bz._AutoSymmetriesSentinel()
-    assert a is b
-    assert a is bz.AUTO_SYMMETRIES_SENTINEL
-
-
-def test_auto_symmetries_sentinel_repr_is_stable():
-    """The auto-symmetries sentinel has a stable repr."""
-    assert repr(bz.AUTO_SYMMETRIES_SENTINEL) == "<auto-symmetries>"
-
-
-def test_auto_symmetries_sentinel_iterates_as_empty():
-    """The sentinel is iterable and yields nothing, so legacy ``for s in symmetries`` code paths see no operations to apply."""
-    assert list(bz.AUTO_SYMMETRIES_SENTINEL) == []
-
-
-def test_auto_symmetries_sentinel_has_length_zero():
-    """The auto-symmetries sentinel has length zero."""
-    assert len(bz.AUTO_SYMMETRIES_SENTINEL) == 0
-
-
-def test_auto_symmetries_sentinel_is_truthy():
-    """Truthy so ``if symmetries:`` branches still enter, even though iteration is empty. This is what lets KGrid detect auto-mode intent without triggering legacy code."""
-    assert bool(bz.AUTO_SYMMETRIES_SENTINEL) is True
-
-
-def test_is_auto_symmetries_true_for_sentinel_only():
-    """is_auto_symmetries is True only for the sentinel singleton."""
-    assert bz.is_auto_symmetries(bz.AUTO_SYMMETRIES_SENTINEL) is True
+def test_is_auto_symmetries_true_for_auto_flag():
+    """is_auto_symmetries is True for a list/tuple carrying the KnownSymmetries.AUTO flag."""
+    assert bz.is_auto_symmetries([bz.KnownSymmetries.AUTO]) is True
+    assert bz.is_auto_symmetries((bz.KnownSymmetries.AUTO,)) is True
 
 
 def test_is_auto_symmetries_false_for_legacy_list():
-    """is_auto_symmetries is False for a legacy symmetry list."""
+    """is_auto_symmetries is False for a symmetry list without the AUTO flag."""
     assert bz.is_auto_symmetries(bz.two_dimensional_square_symmetries()) is False
     assert bz.is_auto_symmetries(bz.three_dimensional_cubic_symmetries()) is False
 
 
 def test_is_auto_symmetries_false_for_empty_list_none_or_other():
-    """is_auto_symmetries is False for an empty list, None, or other values."""
+    """is_auto_symmetries is False for an empty list, None, or non-list values (incl. the raw "auto" string)."""
     assert bz.is_auto_symmetries([]) is False
     assert bz.is_auto_symmetries(None) is False
-    # Identity-based check: only the sentinel singleton qualifies, the string
-    # "auto" should NOT (callers must go through get_lattice_symmetries_from_string).
+    # The raw string "auto" is NOT auto - callers must go through get_lattice_symmetries_from_string.
     assert bz.is_auto_symmetries("auto") is False
     assert bz.is_auto_symmetries(0) is False
     assert bz.is_auto_symmetries({}) is False
 
 
-def test_get_lattice_symmetries_from_string_returns_sentinel_for_auto():
-    """The "auto" string is the documented public entry point for opting into auto-discovery; it must resolve to the singleton sentinel."""
-    result = bz.get_lattice_symmetries_from_string("auto")
-    assert result is bz.AUTO_SYMMETRIES_SENTINEL
+def test_get_lattice_symmetries_from_string_returns_auto_flag_for_auto():
+    """The "auto" string is the public entry point for auto-discovery; it resolves to [KnownSymmetries.AUTO]."""
+    assert bz.get_lattice_symmetries_from_string("auto") == [bz.KnownSymmetries.AUTO]
 
 
 def test_get_lattice_symmetries_from_string_auto_is_case_insensitive():
     """Lowercase normalization is applied to all string inputs; "auto" / "AUTO" / "Auto" all work."""
     for s in ("auto", "AUTO", "Auto", "AuTo"):
-        assert bz.get_lattice_symmetries_from_string(s) is bz.AUTO_SYMMETRIES_SENTINEL
+        assert bz.get_lattice_symmetries_from_string(s) == [bz.KnownSymmetries.AUTO]
 
 
 def _make_small_real_cubic_h(nx=4, ny=4, nz=4, nb=1):
@@ -625,7 +596,7 @@ def _make_small_real_cubic_h(nx=4, ny=4, nz=4, nb=1):
 
 def test_kgrid_with_auto_sentinel_sets_auto_mode_flag():
     """A KGrid built with the auto sentinel sets the auto-mode flag."""
-    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
     assert grid._auto_mode is True
 
 
@@ -644,7 +615,7 @@ def test_kgrid_with_no_symmetries_does_not_set_auto_mode():
 def test_kgrid_auto_mode_starts_with_trivial_ibz_and_no_auto_data():
     """Before specify_auto_symmetries() is called, the auto-mode KGrid behaves like the symmetry-free case: the IBZ equals the FBZ. The auto-data slots are unset."""
     nx, ny, nz = 4, 4, 4
-    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     assert grid._auto_us is None
     assert grid._auto_sigmas is None
     assert grid._auto_conjs is None
@@ -654,7 +625,7 @@ def test_kgrid_auto_mode_starts_with_trivial_ibz_and_no_auto_data():
 
 def test_kgrid_is_auto_property_is_false_before_specify_auto_symmetries():
     """``is_auto`` is the runtime indicator that auto-data has been populated. It must be False between construction and specify_auto_symmetries()."""
-    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
     assert grid.is_auto is False
 
 
@@ -668,7 +639,7 @@ def test_kgrid_is_auto_property_is_true_after_specify_auto_symmetries():
     """KGrid.is_auto becomes True after specify_auto_symmetries."""
     nx, ny, nz = 4, 4, 4
     H = _make_small_real_cubic_h(nx, ny, nz, nb=1)
-    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H)
     assert grid.is_auto is True
 
@@ -677,7 +648,7 @@ def test_specify_auto_symmetries_populates_all_expected_arrays():
     """After a successful call, every cached IBZ-related field plus the new auto-data fields must be populated and internally consistent."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
-    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H)
 
     # IBZ fields
@@ -701,7 +672,7 @@ def test_specify_auto_symmetries_produces_consistent_fbz2irrk_and_irrk_inv():
     """irrk_inv must be a true inverse of irrk_ind w.r.t. fbz2irrk: irrk_ind[irrk_inv[k]] == fbz2irrk.flat[k] for every k."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
-    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H)
 
     fbz_flat = grid.fbz2irrk.ravel()
@@ -714,7 +685,7 @@ def test_specify_auto_symmetries_irrk_count_sums_to_full_bz():
     """The duplicity counts must sum to the total number of FBZ points."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
-    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H)
 
     assert grid.irrk_count.sum() == nx * ny * nz
@@ -724,7 +695,7 @@ def test_specify_auto_symmetries_us_are_unitary():
     """Every stored per-k transformation must be unitary: U U^dag = I."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
-    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H)
     Us = grid._auto_us.reshape(-1, nb, nb)
     identity = np.eye(nb, dtype=complex)
@@ -736,7 +707,7 @@ def test_specify_auto_symmetries_sigmas_are_plus_or_minus_one():
     """specify_auto_symmetries yields sigma factors of +/-1."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
-    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H)
     sig = grid._auto_sigmas.ravel()
     assert np.all(np.isin(sig, [-1.0, +1.0]))
@@ -746,7 +717,7 @@ def test_specify_auto_symmetries_default_drops_antiunitary_ops():
     """The default ``include_antiunitary=False`` filters out time-reversal-like ops so the FBZ expansion is safe for frequency-dependent objects: no per-k transformation should carry conj=True."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
-    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H)
     assert int(grid._auto_conjs.sum()) == 0
 
@@ -755,7 +726,7 @@ def test_specify_auto_symmetries_with_include_antiunitary_admits_conj_ops():
     """Opting in via ``include_antiunitary=True`` produces a larger group; for a purely-real H, anti-unitary ops always exist (H(k) = H(k)*), so at least some FBZ k-points will carry conj=True."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
-    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H, include_antiunitary=True)
     assert int(grid._auto_conjs.sum()) > 0
 
@@ -764,9 +735,9 @@ def test_specify_auto_symmetries_with_include_antiunitary_yields_smaller_or_equa
     """Adding TR ops can only shrink the IBZ (or leave it unchanged)."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
-    g_spatial = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    g_spatial = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     g_spatial.specify_auto_symmetries(H, include_antiunitary=False)
-    g_full = bz.KGrid(nk=(nx, ny, nz), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    g_full = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     g_full.specify_auto_symmetries(H, include_antiunitary=True)
     assert g_full.nk_irr <= g_spatial.nk_irr
 
@@ -781,7 +752,7 @@ def test_specify_auto_symmetries_raises_when_kgrid_is_not_in_auto_mode():
 
 def test_specify_auto_symmetries_raises_on_grid_shape_mismatch():
     """specify_auto_symmetries raises on a grid-shape mismatch."""
-    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
     H_wrong = _make_small_real_cubic_h(4, 4, 2, 1)  # nz=2 instead of 4
     with pytest.raises(ValueError, match="k-grid shape"):
         grid.specify_auto_symmetries(H_wrong)
@@ -789,7 +760,7 @@ def test_specify_auto_symmetries_raises_on_grid_shape_mismatch():
 
 def test_specify_auto_symmetries_raises_on_wrong_ndim():
     """specify_auto_symmetries raises on the wrong number of dimensions."""
-    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
     bad = np.zeros((4, 4, 4), dtype=complex)  # missing orbital axes
     with pytest.raises(ValueError, match="must have shape"):
         grid.specify_auto_symmetries(bad)
@@ -797,7 +768,7 @@ def test_specify_auto_symmetries_raises_on_wrong_ndim():
 
 def test_specify_auto_symmetries_raises_on_non_square_orbital_axes():
     """specify_auto_symmetries raises on non-square orbital axes."""
-    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
     bad = np.zeros((4, 4, 4, 2, 3), dtype=complex)  # mismatched orbital dims
     with pytest.raises(ValueError, match="must have shape"):
         grid.specify_auto_symmetries(bad)
@@ -806,7 +777,7 @@ def test_specify_auto_symmetries_raises_on_non_square_orbital_axes():
 def test_specify_auto_symmetries_accepts_non_contiguous_input():
     """The implementation casts to complex128 explicitly; non-contiguous or non-complex128 input should be accepted without crashing."""
     H = _make_small_real_cubic_h(4, 4, 4, 1).astype(np.complex64)
-    grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
     # Should not raise
     grid.specify_auto_symmetries(H)
     assert grid.is_auto is True
@@ -832,13 +803,12 @@ def test_legacy_kgrid_three_dimensional_cubic_unchanged():
 def test_specify_auto_symmetries_finds_at_least_legacy_symmetries_for_cubic_h():
     """For a real cubic H, the auto-discovered spatial group must be at least as large as the legacy ``three_dimensional_cubic`` group, so the auto IBZ must be no larger than the legacy IBZ. (Auto can find accidental extra symmetries on small grids, so we don't insist on strict equality here.)"""
     H = _make_small_real_cubic_h(4, 4, 4, 1)
-    g_auto = bz.KGrid(nk=(4, 4, 4), symmetries=bz.AUTO_SYMMETRIES_SENTINEL)
+    g_auto = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
     g_auto.specify_auto_symmetries(H)
     g_legacy = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
     assert g_auto.nk_irr <= g_legacy.nk_irr
-    # The cubic orbit structure must be refined by auto: every legacy orbit member
-    # should map to the same auto IBZ representative (i.e., auto is a refinement).
-    # Equivalent statement: fbz2irrk_auto is constant on each legacy orbit.
+    # The cubic orbit structure must be refined by auto: every legacy orbit member maps to the same auto IBZ
+    # representative (auto is a refinement), i.e. fbz2irrk_auto is constant on each legacy orbit.
     fbz_auto = g_auto.fbz2irrk.ravel()
     fbz_legacy = g_legacy.fbz2irrk.ravel()
     for legacy_rep in np.unique(fbz_legacy):

@@ -16,7 +16,7 @@ import pytest
 import dgamore.brillouin_zone as bz
 from dgamore import config, dga_io, local_sde
 from dgamore import nonlocal_sde
-from dgamore.brillouin_zone import AUTO_SYMMETRIES_SENTINEL
+from dgamore.brillouin_zone import KnownSymmetries
 from dgamore.dga_logger import DgaLogger
 from tests import conftest
 
@@ -42,14 +42,13 @@ def setup_srvo3_cubic():
         c.output.do_plotting = False
         c.lattice.nk = (12, 12, 12)
         c.lattice.nq = config.lattice.nk
-        c.lattice.k_grid = bz.KGrid(c.lattice.nk, AUTO_SYMMETRIES_SENTINEL)
+        c.lattice.k_grid = bz.KGrid(c.lattice.nk, [KnownSymmetries.AUTO])
         c.lattice.q_grid = c.lattice.k_grid
-        c.lattice.symmetries = AUTO_SYMMETRIES_SENTINEL
+        c.lattice.symmetries = [KnownSymmetries.AUTO]
         c.lattice.type = "from_wannier90"
         c.lattice.interaction_type = "kanamori_from_dmft"
         c.lattice.er_input = f"{f}/wan_hr.dat"
         c.dmft.input_path = f
-        c.dmft.do_sym_v_vp = True
         c.dmft.symmetrize_orbitals = [1, 2, 3]
         c.dmft.n_ineq = 1
         c.dmft.ineq_ordering = [1]
