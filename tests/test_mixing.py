@@ -4,11 +4,12 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import contextlib
 from copy import deepcopy
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from unittest.mock import patch
 
 from dgamore.self_energy import SelfEnergy
 from dgamore.nonlocal_sde import apply_mixing_strategy
@@ -41,8 +42,6 @@ def make_config_mock(
     previous_sc_path: str = "./",
 ):
     """Builds a mock config object for patching dgamore.nonlocal_sde.config."""
-    from unittest.mock import MagicMock
-
     cfg = MagicMock()
     cfg.self_consistency.mixing_strategy = strategy
     cfg.self_consistency.mixing = mixing
@@ -55,8 +54,23 @@ def make_config_mock(
     return cfg
 
 
+@contextlib.contextmanager
 def patch_config(**kwargs):
-    return patch("dgamore.nonlocal_sde.config", make_config_mock(**kwargs))
+    """Installs a mock config in dgamore.nonlocal_sde for the duration of the block."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("dgamore.nonlocal_sde.config", make_config_mock(**kwargs))
+        yield
+
+
+@contextlib.contextmanager
+def patch_file_history(file_sigmas=None, side_effect=None):
+    """Replaces the sigma-history file read in dgamore.nonlocal_sde for the duration of the block."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            "dgamore.nonlocal_sde.read_last_n_sigmas_from_files",
+            MagicMock(return_value=file_sigmas, side_effect=side_effect),
+        )
+        yield
 
 
 def run_pulay(
@@ -72,7 +86,7 @@ def run_pulay(
     nk_tot = int(np.prod(NK))
     with (
         patch_config(strategy="pulay", mixing=mixing, n_hist=n_hist, niv_core=niv_core, nk_tot=nk_tot),
-        patch("dgamore.nonlocal_sde.read_last_n_sigmas_from_files", return_value=file_sigmas),
+        patch_file_history(file_sigmas),
     ):
         return apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=current_iter)
 
@@ -90,7 +104,7 @@ def run_anderson(
     nk_tot = int(np.prod(NK))
     with (
         patch_config(strategy="anderson", mixing=mixing, n_hist=n_hist, niv_core=niv_core, nk_tot=nk_tot),
-        patch("dgamore.nonlocal_sde.read_last_n_sigmas_from_files", return_value=file_sigmas),
+        patch_file_history(file_sigmas),
     ):
         return apply_mixing_strategy(sigma_new, sigma_old, sigma_dmft, current_iter=current_iter)
 
@@ -412,7 +426,7 @@ def test_history_cap_zero_falls_back_to_linear():
     file_sigmas = [make_sigma_mat(v) for v in (0.7, 0.9, 1.1)]
     with (
         patch_config(strategy="anderson", mixing=0.5, n_hist=3, niv_core=NIV_CORE, nk_tot=nk_tot),
-        patch("dgamore.nonlocal_sde.read_last_n_sigmas_from_files", return_value=file_sigmas),
+        patch_file_history(file_sigmas),
     ):
         capped = apply_mixing_strategy(
             make_sigma(2.0 + 1.0j), make_sigma(1.0), make_sigma(0.5), current_iter=10, history_cap=0
@@ -440,7 +454,7 @@ def test_in_memory_history_matches_file_history_for_pulay_and_anderson():
         ref = runner(make(1), make(2), make(3), file_sigmas)
         with (
             patch_config(strategy=strategy, mixing=0.5, n_hist=3, niv_core=NIV_CORE, nk_tot=nk_tot),
-            patch("dgamore.nonlocal_sde.read_last_n_sigmas_from_files", side_effect=AssertionError("file read!")),
+            patch_file_history(side_effect=AssertionError("file read!")),
         ):
             out = apply_mixing_strategy(make(1), make(2), make(3), current_iter=10, sigma_history=list(file_sigmas))
         assert np.array_equal(out.mat, ref.mat)

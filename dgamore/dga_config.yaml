@@ -28,12 +28,9 @@ self_consistency:
 stabilization:
   use_lambda_correction: False # If True, applies the Moriya lambda correction in every iteration as a releasing scaffold (correction on until convergence at 10x epsilon,
   # then disabled so the run converges the uncorrected solution). Dispatched by the band count: single-band input uses the scalar correction (honoring lambda_correction.type
-  # below), multi-band input the multi-orbital matrix correction (always both channels). Mutually exclusive with use_chi_phys_restriction, use_lambda_annealing and
-  # use_jacobian_stabilization; the one-shot perform_lambda_correction below takes precedence when both are enabled.
+  # below), multi-band input the multi-orbital matrix correction (always both channels). Mutually exclusive with use_chi_phys_restriction and use_lambda_annealing;
+  # the one-shot perform_lambda_correction below takes precedence when both are enabled.
   use_chi_phys_restriction: False # If True, the physical susceptibilities are restricted to positive-semidefinite compound blocks (eigenvalue floor on the inverse) during the self-consistency cycle.
-  use_jacobian_stabilization: False # If True, arms the modified iterative scheme of arXiv:2502.01420: only when plain iteration demonstrably cannot reach the physical
-  # fixed point (sustained residual growth or a long plateau far above epsilon), the Jacobian of the proposal map is built once at the warm-start self-energy and the
-  # damping sign is flipped on the unstable directions (needs a warm start via previous_sc_path; everything else is detected automatically).
   use_lambda_annealing: False # If True, protects the cycle with the lambda-annealing scaffold: a bosonic mass (measured automatically from the susceptibility
   # spectrum) is added to 1/chi per channel, held constant per convergence phase and halved between phases until it is exactly zero - the final result is always
   # pure self-consistency. Multi-orbital-safe, like the matrix lambda correction (with which it must not be combined).
@@ -61,7 +58,6 @@ eliashberg:
   perform_eliashberg: False # If True, the code will perform an ARNOLDI Lanczos to solve the linearized Eliashberg equation for the superconducting eigenvalues and gap functions
   save_pairing_vertex: False # if true, saves the s/t pairing vertices Gamma(qvv') for the irreducible BZ to files. Attention: this could be a large file!
   save_fq: False # If True, saves the full d/m vertex F(qvv') for the irreducible BZ to files. Attention: this could be a large file!
-  construct_fq_cheap: False # If True, the code will construct F(qvv') for the d/m channels in a way that is less memory intensive (only 1/4) but also less accurate. This is recommended for large frequency boxes.
   n_eig: 4 # Number of eigenvalues and eigenvectors to be calculated. Default: 4
   epsilon: 1e-6 # Convergence criterion for the eigenvalues and eigenvectors
   symmetry: "random" # Symmetry of the gap function that will be used as a starting point for the ARNOLDI Lanczos. Available: p-wave-x, p-wave-y, d-wave, random

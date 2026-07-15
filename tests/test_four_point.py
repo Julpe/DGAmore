@@ -753,7 +753,7 @@ def test_invert_num_vn1_per_q_matches_batched_reference(rng):
     ref_mat = comp.reshape((ref.current_shape[0], w_dim, 2 * ref.niv, o, o, o, o)).transpose(0, 3, 4, 6, 5, 1, 2)
 
     assert result.num_vn_dimensions == 1
-    assert not result.full_niw_range  # invert returns the half niw range
+    assert not result.full_niw_range
     assert result.mat.dtype == np.complex64
     assert np.allclose(result.mat, ref_mat)
 

@@ -4,7 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -172,7 +172,6 @@ def test_get_fill_nonlocal_caches_and_does_not_write_config(monkeypatch):
     g = GreensFunction.get_g_full(sig, mu, ek, beta)
     n, occ, occ_k = g.get_fill_nonlocal()
 
-    # results are cached on and exposed by the object
     assert g.n is n
     assert g.occ is occ
     assert g.occ_k is occ_k
@@ -192,9 +191,8 @@ def test_energies_use_injected_state_not_config(monkeypatch):
 
     g = GreensFunction.get_g_full(sig, mu, ek, beta)
     g.get_fill_nonlocal()
-    # zero dispersion -> zero kinetic energy; computed from self._occ_k, not config.sys.occ_k
+    # zero dispersion -> zero kinetic energy, computed from the injected state despite the poisoned config
     assert g.get_ekin() == 0.0
-    # potential energy is finite and does not raise despite config being poisoned
     assert np.isfinite(g.get_epot())
 
 
@@ -255,10 +253,12 @@ def test_update_mu_with_logger_logs_on_failure():
     logger.debug.assert_called_once()
 
 
-def test_update_mu_forwards_newton_tolerance():
+def test_update_mu_forwards_newton_tolerance(monkeypatch):
     """update_mu passes its tol through to the Newton solver (default 1e-6, probes tighten to 1e-10)."""
     nk, ek, sig, beta, mu = _toy_inputs()
-    with patch("dgamore.greens_function.opt.newton", return_value=mu) as newton:
+    newton = MagicMock(return_value=mu)
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.greens_function.opt.newton", newton)
         update_mu(mu, 1.0, ek, sig.mat, beta, sig.smom[0])
         assert newton.call_args.kwargs["tol"] == 1e-6
         update_mu(mu, 1.0, ek, sig.mat, beta, sig.smom[0], tol=1e-10)

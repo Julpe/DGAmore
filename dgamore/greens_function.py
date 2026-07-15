@@ -123,8 +123,7 @@ def update_mu(
     :param beta: Inverse temperature :math:`\beta`.
     :param smom0: Zeroth moment :math:`\Sigma_\infty` of the self-energy.
     :param logger: Optional logger; if given, a failed root search is logged at debug level.
-    :param tol: Newton tolerance for the root search (tightened by the stabilizer's Jacobian probes so the
-        :math:`\mu` feedback enters the finite differences as signal, not noise).
+    :param tol: Newton tolerance for the root search.
     :return: The updated (real) chemical potential, or ``mu0`` if the root search did not converge.
     :raises ValueError: If the converged chemical potential has a non-negligible imaginary part.
     """

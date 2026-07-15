@@ -582,7 +582,6 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
         n_ranks=comm.size,
         with_eliashberg=config.eliashberg.perform_eliashberg,
         save_fq=config.eliashberg.save_fq,
-        construct_fq_cheap=config.eliashberg.construct_fq_cheap,
         save_pairing_vertex=config.eliashberg.save_pairing_vertex,
         n_eig=config.eliashberg.n_eig,
     )
@@ -689,11 +688,8 @@ def _resolve_option_exclusivity() -> None:
     susceptibility-reshaping options - the lambda correction (one-shot or per-iteration),
     ``use_chi_phys_restriction`` and the lambda-annealing scaffold - all modify the physical susceptibility and cannot run
     together (a sum-rule calibration must not see a floored or mass-shifted chi, and the two scaffolds would fight).
-    The Jacobian stabilizer instead reshapes the iteration map, not chi, so it may COEXIST with ``use_chi_phys_restriction``
-    or ``use_lambda_annealing`` (its stall detector pauses while those scaffold and engages after they release), but
-    it is mutually exclusive with either lambda correction, whose corrected map the stabilizer must not linearize
-    (it must also not engage on the released pure phase). Precedence: lambda correction >
-    use_chi_phys_restriction > lambda annealing. Conflicting options are disabled with a warning.
+    Precedence: lambda correction > use_chi_phys_restriction > lambda annealing. Conflicting options are disabled
+    with a warning.
 
     :return: None.
     """
@@ -717,7 +713,6 @@ def _resolve_option_exclusivity() -> None:
     if config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction:
         disable_option("use_chi_phys_restriction", "the lambda correction")
         disable_option("use_lambda_annealing", "the lambda correction")
-        disable_option("use_jacobian_stabilization", "the lambda correction")
         return
 
     if config.stabilization.use_chi_phys_restriction and config.stabilization.use_lambda_annealing:

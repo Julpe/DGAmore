@@ -80,4 +80,16 @@ The ``-o`` and ``-e`` options set the files for the job output and errors; here 
 but separate files may be used instead. The results of a completed run are written to a subdirectory of the output
 folder, whose name encodes run-specific parameters such as the momentum-grid size and the frequency box.
 
+.. note::
+   During the in-memory Eliashberg solve only one or two ranks compute while the others wait, so DGAmore spreads
+   the solver ranks' matrix-vector products over as many threads as their CPU affinity mask allows for exactly
+   that phase (the results are bit-identical to the single-threaded ones, and ``OMP_NUM_THREADS=1`` stays correct
+   for the rest of the run). The frequency-distributed solve (``save_memory_for_lanczos``) is threaded the same
+   way, except that every rank holding a frequency slice computes at once: each rank's thread budget is its
+   affinity-mask size divided by the number of active ranks sharing its node, so the threading never
+   oversubscribes shared cores and the cores of ranks left without a frequency slice are put to work
+   automatically. This only helps if the launcher leaves the affinity mask wider than one core - with
+   a strict one-core-per-rank binding it is a no-op. On Eliashberg-heavy runs, prefer a binding that allows the
+   solver ranks to spread (e.g. ``srun --cpu-bind=sockets`` or ``mpirun --bind-to socket``/``--bind-to none``).
+
 The full set of run-time parameters is described on the :doc:`configuration` page.

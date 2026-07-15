@@ -4,7 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -361,11 +361,11 @@ def test_matvec_direct_term_matches_thesis_eq_4_40_on_physical_sector(channel):
     gamma_sym = _graded_orbital_symmetrization(gamma, [((0, 3, 2, 1), sign), ((2, 1, 0, 3), sign), ((3, 2, 1, 0), 1)])
 
     g_k = rng.standard_normal((o, o)) + 1j * rng.standard_normal((o, o))
-    g_k = (0.5 * (g_k + g_k.T)).astype(np.complex64)  # TR + inversion: G(k) = G(k)^T = G(-k)
+    g_k = (0.5 * (g_k + g_k.T)).astype(np.complex64)
 
     for _ in range(4):
         gap = rng.standard_normal((o, o)) + 1j * rng.standard_normal((o, o))
-        gap = (0.5 * (gap + sign * gap.T)).astype(np.complex64)  # SPOT-allowed static sector
+        gap = (0.5 * (gap + sign * gap.T)).astype(np.complex64)
 
         got = _matvec_direct_term_single_slice(gamma_sym, g_k, g_k, gap, o)
         ref = np.einsum("xbya,ad,cb,dc->xy", gamma_sym, g_k, g_k, gap, optimize=True)
@@ -416,7 +416,7 @@ def test_badc_permute_is_noop_for_swap_and_tr_symmetric_pairing_vertex(o):
 
 @pytest.mark.parametrize("o", [2, 3, 4, 5])
 @pytest.mark.parametrize("channel", [SpinChannel.SING, SpinChannel.TRIP])
-def test_degenerate_decoupled_bands_reproduce_single_band_kernel(channel, o):
+def test_degenerate_decoupled_bands_reproduce_single_band_kernel(monkeypatch, channel, o):
     """o decoupled, degenerate bands (same-band-only pairing vertex, orbital-diagonal Green's function) must give
     a pairing kernel that is o identical copies of the single-band kernel with vanishing inter-band blocks, so the
     eigenvalue spectrum is the single-band one, o-fold degenerate; run through the production solve_eliashberg_lanczos
@@ -454,7 +454,8 @@ def test_degenerate_decoupled_bands_reproduce_single_band_kernel(channel, o):
         order = np.argsort(lam.real)[::-1][:k]
         return lam.real[order], vec[:, order]
 
-    with patch("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", side_effect=fake_eigsh):
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
         solve_eliashberg_lanczos(
             FourPoint(gamma1.copy(), channel, nq, 0, 2, True, True, True, FrequencyNotation.PP),
             FourPoint(chi1.copy(), SpinChannel.NONE, nq, 0, 1, True, True, True, FrequencyNotation.PP),
@@ -481,6 +482,285 @@ def test_degenerate_decoupled_bands_reproduce_single_band_kernel(channel, o):
     ev2 = np.linalg.eigvals(m2)
     expected_ev = np.concatenate([np.tile(ev1, o), np.zeros(len(ev2) - o * len(ev1))])
     assert np.allclose(np.sort_complex(ev2), np.sort_complex(expected_ev), atol=1e-3)
+
+
+def test_solver_thread_budget_derives_from_affinity(monkeypatch):
+    """The solver thread budget equals the size of the process affinity mask (at least 1) and falls back to 1
+    where the affinity API does not exist."""
+    import os
+
+    import dgamore.eliashberg_solver as es
+
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1, 2, 3}, raising=False)
+    assert es._solver_thread_budget() == 4
+    monkeypatch.delattr(os, "sched_getaffinity", raising=False)
+    assert es._solver_thread_budget() == 1
+
+
+def test_apply_gamma_pp_momentum_parallel_path_is_bit_equal():
+    """The momentum-batch-parallel contraction (contiguous k-chunks, one output slice per worker) must be
+    bit-equal to the serial path, including worker counts that do not divide the batch."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    rng = np.random.default_rng(6)
+    nqx, nqy, nqz, o, n2 = 3, 5, 1, 2, 4
+    shape = (nqx, nqy, nqz, o, o, o, o, n2, n2)
+    gamma_mm = _gamma_to_matmul_layout(
+        (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    )
+    gap_gg = (
+        rng.standard_normal((nqx, nqy, nqz, o, o, n2)) + 1j * rng.standard_normal((nqx, nqy, nqz, o, o, n2))
+    ).astype(np.complex64)
+    serial = _apply_gamma_pp(gamma_mm, gap_gg, o)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        threaded = _apply_gamma_pp(gamma_mm, gap_gg, o, executor, 4)
+    assert np.array_equal(threaded, serial)
+
+
+def test_apply_gchi0_pp_momentum_parallel_path_is_bit_equal():
+    """The momentum-batch-parallel bubble multiplication (contiguous k-chunks, one output slice per worker) must
+    be bit-equal to the serial path, including worker counts that do not divide the batch."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    rng = np.random.default_rng(7)
+    nqx, nqy, nqz, o, v = 3, 5, 1, 2, 6
+    chi0 = (
+        rng.standard_normal((nqx, nqy, nqz, o, o, o, o, v)) + 1j * rng.standard_normal((nqx, nqy, nqz, o, o, o, o, v))
+    ).astype(np.complex64)
+    gap = (rng.standard_normal((nqx, nqy, nqz, o, o, v)) + 1j * rng.standard_normal((nqx, nqy, nqz, o, o, v))).astype(
+        np.complex64
+    )
+    serial = _apply_gchi0_pp(_chi0_to_matmul_layout(chi0), gap.ravel(), o)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        threaded = _apply_gchi0_pp(_chi0_to_matmul_layout(chi0), gap.ravel(), o, executor, 4)
+    assert np.array_equal(threaded, serial)
+
+
+def _make_budget_comm(size, rank, infos):
+    """Builds a communicator stub for the v2 thread-budget tests: fixed size/rank and a preset allgather result."""
+    return MagicMock(size=size, rank=rank, **{"allgather.return_value": infos})
+
+
+@pytest.mark.parametrize(
+    "rank, active_ranks, masks, hosts, expected",
+    [
+        (0, [0, 1, 2, 3], [set(range(8))] * 4, ["n0"] * 4, 2),
+        (0, [0, 1], [set(range(8))] * 4, ["n0"] * 4, 4),
+        (2, [0, 1], [set(range(8))] * 4, ["n0"] * 4, 1),
+        (0, [0, 1, 2, 3], [set(range(8))] * 2 + [set(range(8))] * 2, ["n0", "n0", "n1", "n1"], 4),
+        (0, [0, 1, 2, 3], [{0, 1, 2, 3}, {0, 1, 2, 3}, {4, 5, 6, 7}, {4, 5, 6, 7}], ["n0"] * 4, 2),
+    ],
+)
+def test_v2_thread_budget_divides_mask_among_active_node_ranks(monkeypatch, rank, active_ranks, masks, hosts, expected):
+    """The frequency-distributed solver's budget is this rank's affinity-mask size divided by the number of
+    ACTIVE ranks on its node whose masks overlap with it (1 for inactive ranks): full occupancy halves/quarters
+    the mask, idle ranks free their share, other nodes and disjoint (per-socket) masks do not count."""
+    import dgamore.eliashberg_solver as es
+
+    monkeypatch.setattr(es.os, "sched_getaffinity", lambda pid: masks[rank], raising=False)
+    infos = [(hosts[r], frozenset(masks[r])) for r in range(len(masks))]
+    comm = _make_budget_comm(len(masks), rank, infos)
+    assert es._v2_solver_thread_budget(comm, active_ranks) == expected
+
+
+def test_v2_thread_budget_falls_back_without_affinity_api_and_single_rank(monkeypatch):
+    """Without the affinity API the budget is 1; a single-rank communicator gets the whole mask (nothing else
+    runs on the node) without any collective call."""
+    import dgamore.eliashberg_solver as es
+
+    monkeypatch.delattr(es.os, "sched_getaffinity", raising=False)
+    assert es._v2_solver_thread_budget(_make_budget_comm(4, 0, None), [0, 1, 2, 3]) == 1
+    monkeypatch.setattr(es.os, "sched_getaffinity", lambda pid: set(range(6)), raising=False)
+    assert es._v2_solver_thread_budget(_make_budget_comm(1, 0, None), [0]) == 6
+
+
+def test_solve_eliashberg_lanczos_v2_threaded_matches_serial():
+    """The frequency-distributed solver with a multi-thread budget must return bit-equal eigenvalues and gap
+    functions to its serial path (per-k chunk independence, no reordered reduction), driven end to end through
+    the real eigsh on a single-rank distributor with a deterministic d-wave seed."""
+    from types import SimpleNamespace
+
+    from dgamore.mpi_utils import MpiDistributor
+    from tests.conftest import create_comm_mock
+
+    nq, niv_pp, o = (4, 4, 1), 3, 2
+    nq_tot, n2 = int(np.prod(nq)), 2 * niv_pp
+    config.lattice.nk = nq
+    config.lattice.k_grid = bz.KGrid(nq, symmetries=[])
+    config.sys.beta = 10.0
+    config.eliashberg.n_eig = 2
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetry = "d-wave"
+    config.logger = SimpleNamespace(
+        info=lambda *a, **k: None, log_memory_usage=lambda *a, **k: None, warning=lambda *a, **k: None
+    )
+
+    rng = np.random.default_rng(11)
+    shape = (nq_tot, o, o, o, o, n2, n2)
+    gamma_mat = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    chi0_shape = (nq_tot, o, o, o, o, n2)
+    chi0 = FourPoint(
+        (rng.standard_normal(chi0_shape) + 1j * rng.standard_normal(chi0_shape)),
+        SpinChannel.NONE,
+        nq,
+        0,
+        1,
+        True,
+        True,
+        True,
+        FrequencyNotation.PP,
+    ).decompress_q_dimension()
+
+    def run(n_threads):
+        gamma = FourPoint(gamma_mat.copy(), SpinChannel.SING, nq, 0, 2, True, True, True, FrequencyNotation.PP)
+        dist = MpiDistributor(ntasks=n2, comm=create_comm_mock())
+        from dgamore.eliashberg_solver import solve_eliashberg_lanczos_v2
+
+        return solve_eliashberg_lanczos_v2(gamma, chi0, dist, [0], n_threads)
+
+    lambdas_serial, gaps_serial = run(1)
+    lambdas_threaded, gaps_threaded = run(4)
+    assert np.array_equal(lambdas_threaded, lambdas_serial)
+    for g_threaded, g_serial in zip(gaps_threaded, gaps_serial):
+        assert np.array_equal(g_threaded.mat, g_serial.mat)
+
+
+def test_solve_eliashberg_lanczos_v2_with_inactive_ranks_runs_on_restricted_distributor(monkeypatch):
+    """With more ranks than frequency columns the active ranks run the solve on the sub-communicator-restricted
+    distributor (its matvec collectives span only them) while the inactive ranks skip it entirely: the solve
+    completes without collective mismatch and reproduces the single-rank matvec results (eigsh is replaced by a
+    deterministic power loop over the real matvec, since ARPACK's global lock cannot interleave with lockstep
+    collectives across threads)."""
+    from types import SimpleNamespace
+
+    import dgamore.eliashberg_solver as es
+    from dgamore.mpi_utils import MpiDistributor
+    from tests.conftest import create_comm_mock, run_parallel
+
+    nq, o, niv_pp = (2, 2, 1), 1, 1
+    nq_tot, n2 = int(np.prod(nq)), 2 * niv_pp
+    config.lattice.nk = nq
+    config.lattice.k_grid = bz.KGrid(nq, symmetries=[])
+    config.sys.beta = 10.0
+    config.eliashberg.n_eig = 3
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetry = "d-wave"
+    config.eliashberg.symmetrize_degenerate_gaps = False
+    config.logger = SimpleNamespace(
+        info=lambda *a, **k: None, log_memory_usage=lambda *a, **k: None, warning=lambda *a, **k: None
+    )
+
+    rng = np.random.default_rng(17)
+    shape = (nq_tot, o, o, o, o, n2, n2)
+    gamma_mat = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    chi0_shape = (nq_tot, o, o, o, o, n2)
+    chi0 = FourPoint(
+        (rng.standard_normal(chi0_shape) + 1j * rng.standard_normal(chi0_shape)),
+        SpinChannel.NONE,
+        nq,
+        0,
+        1,
+        True,
+        True,
+        True,
+        FrequencyNotation.PP,
+    ).decompress_q_dimension()
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter):
+        x = v0.astype(np.complex64)
+        norms = []
+        for _ in range(k):
+            x = op.matvec(x).astype(np.complex64)
+            nrm = float(np.linalg.norm(x))
+            x = x / nrm
+            norms.append(nrm)
+        return np.array(norms), np.tile(x[:, None], (1, k)).astype(np.complex64)
+
+    monkeypatch.setattr(es.sp.sparse.linalg, "eigsh", fake_eigsh)
+
+    def make_gamma(v_slice):
+        mat = gamma_mat[..., v_slice, :].copy()
+        return FourPoint(mat, SpinChannel.SING, nq, 0, 2, True, True, True, FrequencyNotation.PP)
+
+    dist_ref = MpiDistributor(ntasks=n2, comm=create_comm_mock())
+    lambdas_ref, gaps_ref = es.solve_eliashberg_lanczos_v2(make_gamma(slice(None)), chi0, dist_ref, [0], 1)
+
+    def fn(comm, rank):
+        dist_full = MpiDistributor(ntasks=n2, comm=comm)
+        active = [q for q in range(comm.size) if (dist_full.slices[q].stop - dist_full.slices[q].start) > 0]
+        sub = comm.Split(0 if rank in active else 1, rank)
+        if rank not in active:
+            return None
+        dist = dist_full.restricted_to(sub, active)
+        chi0_arg = chi0 if sub.Get_rank() == 0 else None
+        lambdas, gaps = es.solve_eliashberg_lanczos_v2(make_gamma(dist.my_slice), chi0_arg, dist, active, 1)
+        return lambdas, gaps[0].mat
+
+    _, res = run_parallel(4, fn)
+    assert res[0] is None and res[1] is None
+    for out in res[2:]:
+        assert np.allclose(out[0], lambdas_ref, atol=1e-5)
+        assert np.allclose(out[1], gaps_ref[0].mat, atol=1e-6)
+
+
+def test_solve_eliashberg_lanczos_runs_eigsh_inside_thread_budget(monkeypatch):
+    """With a multi-core budget the in-memory solver pins the live BLAS pool to one thread around the eigsh call
+    via threadpool_limits (the momentum-batch executor threads must not nest BLAS threads underneath; a
+    mid-process environment-variable change would be ignored by the already-initialized pool)."""
+    import dgamore.eliashberg_solver as es
+
+    nq, niv_pp = (2, 2, 1), 2
+    nq_tot, n2 = int(np.prod(nq)), 2 * niv_pp
+    config.lattice.nk = nq
+    config.lattice.k_grid = bz.KGrid(nq, symmetries=[])
+    config.sys.beta = 10.0
+    config.eliashberg.n_eig = 1
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetry = "random"
+    config.logger = MagicMock()
+
+    rng = np.random.default_rng(4)
+    shape = (nq_tot, 1, 1, 1, 1, n2, n2)
+    gamma = FourPoint(
+        (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)),
+        SpinChannel.SING,
+        nq,
+        0,
+        2,
+        True,
+        True,
+        True,
+        FrequencyNotation.PP,
+    )
+    chi0 = FourPoint(
+        (rng.standard_normal(shape[:-1]) + 1j * rng.standard_normal(shape[:-1])),
+        SpinChannel.NONE,
+        nq,
+        0,
+        1,
+        True,
+        True,
+        True,
+        FrequencyNotation.PP,
+    )
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter):
+        return np.ones(k), np.ones((op.shape[0], k), dtype=np.complex64)
+
+    limits_seen = []
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_limits(limits):
+        limits_seen.append(limits)
+        yield
+
+    with monkeypatch.context() as mp:
+        mp.setattr(es, "_solver_thread_budget", MagicMock(return_value=3))
+        mp.setattr(es, "threadpool_limits", fake_limits)
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        solve_eliashberg_lanczos(gamma, chi0, (0, 0))
+    assert limits_seen == [1]
 
 
 def _make_p_wave_doublet(nk: int = 6, n2: int = 4) -> tuple[np.ndarray, np.ndarray, tuple]:

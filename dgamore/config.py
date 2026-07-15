@@ -132,8 +132,7 @@ class StabilizationConfig:
     r"""
     Stores the convergence-stabilization options of the self-consistency loop. The susceptibility-reshaping options
     (the per-iteration lambda correction, ``use_chi_phys_restriction`` and ``use_lambda_annealing``) are mutually
-    exclusive; the Jacobian stabilizer reshapes the iteration map instead and may coexist with the restriction and
-    the annealing scaffold, but not with a lambda correction.
+    exclusive.
 
     :ivar bool use_lambda_correction: Whether the self-consistency loop applies the Moriya lambda correction to the
         physical susceptibility in every iteration, dispatched by the band count: single-band input uses the scalar
@@ -145,38 +144,18 @@ class StabilizationConfig:
     :ivar bool use_chi_phys_restriction: Whether to restrict the physical susceptibility to positive-semidefinite
         compound blocks (eigenvalues of the inverse susceptibility floored at a small positive value, see
         :func:`~dgamore.nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues`).
-    :ivar bool use_jacobian_stabilization: Whether to arm the modified iterative scheme of arXiv:2502.01420
-        (see :class:`~dgamore.jacobian_stabilization.PhysicalSolutionStabilizer`): if plain iteration demonstrably
-        cannot reach the physical fixed point (sustained residual growth, or a long plateau far above epsilon),
-        the proposal-map Jacobian is built once at the warm-start self-energy and the damping sign is flipped on
-        the unstable directions so the physical fixed point becomes attractive again. Needs a warm start close to
-        the physical solution (e.g. a converged higher-temperature run via ``previous_sc_path``). It reshapes the
-        iteration map (not the susceptibility), so it may COEXIST with ``use_chi_phys_restriction`` or
-        ``use_lambda_annealing`` (its detector pauses while those scaffold and engages after they release), but it
-        is mutually exclusive with either lambda correction, whose corrected map it must not linearize.
     :ivar bool use_lambda_annealing: Whether to protect the self-consistency with the lambda-annealing scaffold:
         a single shared bosonic mass :math:`\lambda` (measured from the worst channel's static susceptibility
         gap, never user-chosen) is added to the inverse physical susceptibility of every channel, damped toward its
         target and annealed to exactly zero between converged phases - the final result is always pure self-consistency (the schedule and
         state live in :class:`~dgamore.nonlocal_sde.LambdaAnnealer`, owned by the loop). Multi-orbital-safe,
         unlike the sum-rule lambda correction.
-    :ivar int stabilizer_n_modes: Internal (not parsed from the config file): number of unstable modes the
-        stabilizer's Arnoldi subspace is sized for; the factorization length adapts automatically around it.
-    :ivar int stabilizer_probe_iters: Internal (not parsed from the config file): base window of the stabilizer's
-        trigger and watchdog detectors.
-    :ivar float max_stabilizer_base_residual: Internal (not parsed from the config file): abort threshold on the
-        relative residual :math:`\lVert S(\Sigma)-\Sigma\rVert / \lVert\Sigma\rVert` at the stabilizer's
-        linearization point; a cold (DMFT/local) start fails this guard by design.
     """
 
     def __init__(self):
         self.use_lambda_correction: bool = False
         self.use_chi_phys_restriction: bool = False
-        self.use_jacobian_stabilization: bool = False
         self.use_lambda_annealing: bool = False
-        self.stabilizer_n_modes: int = 4
-        self.stabilizer_probe_iters: int = 3
-        self.max_stabilizer_base_residual: float = 0.5
 
 
 class EliashbergConfig:
@@ -187,7 +166,6 @@ class EliashbergConfig:
     :ivar bool perform_eliashberg: Whether to solve the Eliashberg equation.
     :ivar bool save_pairing_vertex: Whether to save the singlet/triplet pairing vertices.
     :ivar bool save_fq: Whether to save the full ladder vertex (in ph notation) in the irreducible BZ.
-    :ivar bool construct_fq_cheap: Whether to build the full vertex on the smaller pp frequency box (cheaper).
     :ivar int n_eig: Number of leading eigenvalues/gap functions to compute per channel.
     :ivar float epsilon: Convergence tolerance for the Lanczos eigensolver.
     :ivar str symmetry: Initial gap-function symmetry (``"d-wave"``, ``"p-wave-x"``, ``"p-wave-y"``, or ``"random"``).
@@ -202,7 +180,6 @@ class EliashbergConfig:
         self.perform_eliashberg: bool = False
         self.save_pairing_vertex: bool = False
         self.save_fq: bool = False
-        self.construct_fq_cheap: bool = False
         self.n_eig: int = 4
         self.epsilon: float = 1e-6
         self.symmetry: str = "random"

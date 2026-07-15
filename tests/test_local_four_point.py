@@ -4,7 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 
@@ -303,16 +303,17 @@ def test_raises_error_when_contracting_legs_with_invalid_vn_dimensions():
         obj.contract_legs(beta)
 
 
-def test_calls_sum_over_all_vn_and_sum_over_orbitals():
+def test_calls_sum_over_all_vn_and_sum_over_orbitals(monkeypatch):
     """contract_legs calls sum_over_all_vn and sum_over_orbitals."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     beta = 10.0
 
-    with (
-        patch.object(LocalFourPoint, "sum_over_all_vn", autospec=True) as mock_sum_vn,
-        patch.object(LocalFourPoint, "sum_over_orbitals", autospec=True) as mock_sum_orb,
-    ):
+    mock_sum_vn = create_autospec(LocalFourPoint.sum_over_all_vn)
+    mock_sum_orb = create_autospec(LocalFourPoint.sum_over_orbitals)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "sum_over_all_vn", mock_sum_vn)
+        mp.setattr(LocalFourPoint, "sum_over_orbitals", mock_sum_orb)
         mock_sum_vn.return_value = obj
         mock_sum_orb.return_value = obj
 
@@ -339,13 +340,13 @@ def test_converts_to_compound_indices_with_one_vn_dimension():
     assert result.mat.shape == (5, 16, 16)
 
 
-def test_calls_extend_vn_to_diagonal_with_one_vn_dimension_and_executes_original():
+def test_calls_extend_vn_to_diagonal_with_one_vn_dimension_and_executes_original(monkeypatch):
     """to_compound_indices extends a single fermionic dimension to the diagonal."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=1)
-    with patch.object(
-        LocalFourPoint, "extend_vn_to_diagonal", autospec=True, wraps=LocalFourPoint.extend_vn_to_diagonal
-    ) as mock_extend:
+    mock_extend = create_autospec(LocalFourPoint.extend_vn_to_diagonal, wraps=LocalFourPoint.extend_vn_to_diagonal)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "extend_vn_to_diagonal", mock_extend)
         result = obj.to_compound_indices()
         mock_extend.assert_called_once_with(obj)
         assert result.mat.shape == (5, 16, 16)
@@ -452,46 +453,42 @@ def test_raises_error_for_invalid_bosonic_frequency_dimensions():
 
 
 @pytest.mark.parametrize("full_niw_range", [True, False])
-def test_assures_invert_calls_to_half_niw_range_to_compound_indices_and_to_full_indices(full_niw_range):
+def test_assures_invert_calls_to_half_niw_range_to_compound_indices_and_to_full_indices(monkeypatch, full_niw_range):
     """invert routes through to_half_niw_range, to_compound_indices and to_full_indices."""
     mat = np.random.rand(2, 2, 2, 2, 11, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2, full_niw_range=full_niw_range)
-    with (
-        patch.object(
-            LocalFourPoint, "to_half_niw_range", autospec=True, wraps=LocalFourPoint.to_half_niw_range
-        ) as mock_half_niw,
-        patch.object(
-            LocalFourPoint, "to_compound_indices", autospec=True, wraps=LocalFourPoint.to_compound_indices
-        ) as mock_compound,
-        patch.object(
-            LocalFourPoint, "to_full_indices", autospec=True, wraps=LocalFourPoint.to_full_indices
-        ) as mock_full,
-    ):
+    mock_half_niw = create_autospec(LocalFourPoint.to_half_niw_range, wraps=LocalFourPoint.to_half_niw_range)
+    mock_compound = create_autospec(LocalFourPoint.to_compound_indices, wraps=LocalFourPoint.to_compound_indices)
+    mock_full = create_autospec(LocalFourPoint.to_full_indices, wraps=LocalFourPoint.to_full_indices)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "to_half_niw_range", mock_half_niw)
+        mp.setattr(LocalFourPoint, "to_compound_indices", mock_compound)
+        mp.setattr(LocalFourPoint, "to_full_indices", mock_full)
         obj.invert()
         mock_half_niw.assert_called_once()
         mock_compound.assert_called_once()
         mock_full.assert_called_once()
 
 
-def test_assures_invert_always_returns_half_niw_range():
+def test_assures_invert_always_returns_half_niw_range(monkeypatch):
     """invert always returns a half bosonic range."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
-    with patch.object(
-        LocalFourPoint, "to_half_niw_range", autospec=True, wraps=LocalFourPoint.to_half_niw_range
-    ) as mock_half_niw:
+    mock_half_niw = create_autospec(LocalFourPoint.to_half_niw_range, wraps=LocalFourPoint.to_half_niw_range)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "to_half_niw_range", mock_half_niw)
         result = obj.invert()
         mock_half_niw.assert_called()
         assert not result.full_niw_range
 
 
-def test_assures_invert_calls_to_full_indices_with_default_shape():
+def test_assures_invert_calls_to_full_indices_with_default_shape(monkeypatch):
     """invert calls to_full_indices with the default shape."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
-    with patch.object(
-        LocalFourPoint, "to_full_indices", autospec=True, wraps=LocalFourPoint.to_full_indices
-    ) as mock_full:
+    mock_full = create_autospec(LocalFourPoint.to_full_indices, wraps=LocalFourPoint.to_full_indices)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "to_full_indices", mock_full)
         obj.invert()
         args, kwargs = mock_full.call_args
         # shape=None is default
@@ -529,28 +526,24 @@ def test_multiplies_two_objects_with_one_vn_dimension_correctly():
 @pytest.mark.parametrize(
     "full_niw_range1,full_niw_range2", [(False, False), (True, True), (False, True), (True, False)]
 )
-def test_assures_matmul_calls_to_compound_indices_for_two_vn_dimensions(full_niw_range1, full_niw_range2):
+def test_assures_matmul_calls_to_compound_indices_for_two_vn_dimensions(monkeypatch, full_niw_range1, full_niw_range2):
     """matmul routes through to_compound_indices for two fermionic dimensions."""
     mat1 = np.random.rand(2, 2, 2, 2, 21 if full_niw_range1 else 11, 4, 4)
     mat2 = np.random.rand(2, 2, 2, 2, 21 if full_niw_range2 else 11, 4, 4)
     count_full_niw_range = [full_niw_range1, full_niw_range2].count(True)
     obj1 = LocalFourPoint(mat1, num_vn_dimensions=2, full_niw_range=full_niw_range1)
     obj2 = LocalFourPoint(mat2, num_vn_dimensions=2, full_niw_range=full_niw_range2)
-    with (
-        patch.object(
-            LocalFourPoint, "to_compound_indices", autospec=True, wraps=LocalFourPoint.to_compound_indices
-        ) as mock_compound,
-        patch.object(
-            LocalFourPoint, "to_half_niw_range", autospec=True, wraps=LocalFourPoint.to_half_niw_range
-        ) as mock_half_niw,
-        patch.object(
-            LocalFourPoint, "to_full_niw_range", autospec=True, wraps=LocalFourPoint.to_full_niw_range
-        ) as mock_full_niw,
-        patch.object(
-            LocalFourPoint, "to_full_indices", autospec=True, wraps=LocalFourPoint.to_full_indices
-        ) as mock_to_full_indices,
-        patch("numpy.matmul", autospec=True, wraps=np.matmul) as mock_matmul,
-    ):
+    mock_compound = create_autospec(LocalFourPoint.to_compound_indices, wraps=LocalFourPoint.to_compound_indices)
+    mock_half_niw = create_autospec(LocalFourPoint.to_half_niw_range, wraps=LocalFourPoint.to_half_niw_range)
+    mock_full_niw = create_autospec(LocalFourPoint.to_full_niw_range, wraps=LocalFourPoint.to_full_niw_range)
+    mock_to_full_indices = create_autospec(LocalFourPoint.to_full_indices, wraps=LocalFourPoint.to_full_indices)
+    mock_matmul = create_autospec(np.matmul, wraps=np.matmul)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "to_compound_indices", mock_compound)
+        mp.setattr(LocalFourPoint, "to_half_niw_range", mock_half_niw)
+        mp.setattr(LocalFourPoint, "to_full_niw_range", mock_full_niw)
+        mp.setattr(LocalFourPoint, "to_full_indices", mock_to_full_indices)
+        mp.setattr("numpy.matmul", mock_matmul)
         obj1 @ obj2
         assert mock_half_niw.call_count == 2
         mock_matmul.assert_called_once()
@@ -737,7 +730,7 @@ def test_adds_two_local_four_point_objects_correctly():
     assert np.allclose(result.mat, expected[..., 10:, :, :], atol=1e-4)
 
 
-def test_adds_two_local_four_point_objects_with_different_vn_dimensions():
+def test_adds_two_local_four_point_objects_with_different_vn_dimensions(monkeypatch):
     """Adding LocalFourPoint objects with different fermionic dimensions promotes correctly."""
     mat1 = np.random.rand(2, 2, 2, 2, 21, 4, 4)
     mat2 = np.random.rand(2, 2, 2, 2, 21, 4)
@@ -747,9 +740,9 @@ def test_adds_two_local_four_point_objects_with_different_vn_dimensions():
     obj2 = LocalFourPoint(mat2, num_vn_dimensions=1)
     obj3 = LocalFourPoint(mat3, num_vn_dimensions=0)
 
-    with patch.object(
-        LocalFourPoint, "extend_vn_to_diagonal", autospec=True, wraps=LocalFourPoint.extend_vn_to_diagonal
-    ) as mock_extend:
+    mock_extend = create_autospec(LocalFourPoint.extend_vn_to_diagonal, wraps=LocalFourPoint.extend_vn_to_diagonal)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "extend_vn_to_diagonal", mock_extend)
         result1 = obj1 + obj2
         assert mock_extend.call_count == 1
         result2 = obj1 + obj3
@@ -963,32 +956,36 @@ def test_identity_like_works_for_vn_1():
     assert ident.mat.shape == other.mat.shape
 
 
-def test_add_dunder_calls_add():
+def test_add_dunder_calls_add(monkeypatch):
     """__add__ delegates to add."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj1 = LocalFourPoint(mat, num_vn_dimensions=2)
     obj2 = LocalFourPoint(mat, num_vn_dimensions=2)
-    with patch.object(LocalFourPoint, "add", wraps=obj1.add) as mock_add:
+    mock_add = MagicMock(wraps=obj1.add)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "add", mock_add)
         _ = obj1 + obj2
         mock_add.assert_called_once_with(obj2)
 
 
-def test_sub_method_and_dunder():
+def test_sub_method_and_dunder(monkeypatch):
     """sub and __sub__ subtract correctly, delegating to _add with subtract=True (no negated copy)."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj1 = LocalFourPoint(mat, num_vn_dimensions=2)
     obj2 = LocalFourPoint(mat, num_vn_dimensions=2)
-    with (
-        patch.object(LocalFourPoint, "sub", wraps=obj1.sub) as mock_sub,
-        patch.object(LocalFourPoint, "_add", wraps=obj1._add) as mock_add,
-    ):
+    mock_sub = MagicMock(wraps=obj1.sub)
+    mock_add = MagicMock(wraps=obj1._add)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "sub", mock_sub)
+        mp.setattr(LocalFourPoint, "_add", mock_add)
         _ = obj1.sub(obj2)
         mock_sub.assert_called_once_with(obj2)
         mock_add.assert_called_once_with(obj2, subtract=True, copy=True)
-    with (
-        patch.object(LocalFourPoint, "sub", wraps=obj1.sub) as mock_sub,
-        patch.object(LocalFourPoint, "_add", wraps=obj1._add) as mock_add,
-    ):
+    mock_sub = MagicMock(wraps=obj1.sub)
+    mock_add = MagicMock(wraps=obj1._add)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "sub", mock_sub)
+        mp.setattr(LocalFourPoint, "_add", mock_add)
         _ = obj1 - obj2
         mock_sub.assert_called_once_with(obj2)
         mock_add.assert_called_once_with(obj2, subtract=True, copy=True)
@@ -1005,44 +1002,54 @@ def test_sub_operator():
     assert np.allclose(res2.mat, 1.0 - fp.mat)
 
 
-def test_mul_dunder_calls_mul():
+def test_mul_dunder_calls_mul(monkeypatch):
     """__mul__ delegates to mul."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     scalar = 2.0
-    with patch.object(LocalFourPoint, "mul", wraps=obj.mul) as mock_mul:
+    mock_mul = MagicMock(wraps=obj.mul)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "mul", mock_mul)
         _ = obj * scalar
         mock_mul.assert_called_once_with(scalar)
 
 
-def test_matmul_dunder_calls_matmul():
+def test_matmul_dunder_calls_matmul(monkeypatch):
     """__matmul__ delegates to matmul."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj1 = LocalFourPoint(mat, num_vn_dimensions=2)
     obj2 = LocalFourPoint(mat, num_vn_dimensions=2)
-    with patch.object(LocalFourPoint, "matmul", wraps=obj1.matmul) as mock_matmul:
+    mock_matmul = MagicMock(wraps=obj1.matmul)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "matmul", mock_matmul)
         _ = obj1 @ obj2
         mock_matmul.assert_called_once_with(obj2, left_hand_side=True)
-    with patch.object(LocalFourPoint, "matmul", wraps=obj1.matmul) as mock_matmul:
+    mock_matmul = MagicMock(wraps=obj1.matmul)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "matmul", mock_matmul)
         _ = obj1.__rmatmul__(obj2)
         mock_matmul.assert_called_once_with(obj2, left_hand_side=False)
 
 
-def test_pow_dunder_calls_pow():
+def test_pow_dunder_calls_pow(monkeypatch):
     """__pow__ delegates to pow."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
     exponent = 2
-    with patch.object(LocalFourPoint, "pow", wraps=obj.pow) as mock_pow:
+    mock_pow = MagicMock(wraps=obj.pow)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "pow", mock_pow)
         _ = obj**exponent
         mock_pow.assert_called_once()
 
 
-def test_neg_dunder_calls_neg():
+def test_neg_dunder_calls_neg(monkeypatch):
     """__neg__ negates the matrix."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)
     obj = LocalFourPoint(mat, num_vn_dimensions=2)
-    with patch.object(LocalFourPoint, "__neg__", wraps=obj.__neg__) as mock_neg:
+    mock_neg = MagicMock(wraps=obj.__neg__)
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "__neg__", mock_neg)
         result = -obj
         mock_neg.assert_called()
         assert np.allclose(result.mat, -obj.mat, atol=1e-4)
@@ -1135,7 +1142,7 @@ def test_pad_with_u_noop_returns_independent_copy():
     result = obj.pad_with_u(u, 4)  # niv_pad == niv -> no-op branch
     assert result is not obj
     result.mat[0, 0, 0, 0, 0, 0, 0] = -999.0
-    assert obj.mat[0, 0, 0, 0, 0, 0, 0] != -999.0  # no-op must still hand back an independent copy
+    assert obj.mat[0, 0, 0, 0, 0, 0, 0] != -999.0
 
 
 def test_pad_with_u_does_not_mutate_self():

@@ -5,8 +5,7 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
-from contextlib import ExitStack
-from unittest.mock import patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -19,52 +18,41 @@ from tests import conftest
 
 
 @pytest.fixture
-def setup():
+def setup(monkeypatch):
     folder = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/end_2_end"
     comm_mock = conftest.create_comm_mock()
 
-    # 1. Create a mutable Python-native replacement for the immutable C-extension class
-    class MockRequest:
-        @staticmethod
-        def Waitall(reqs):
-            return None
+    # patch the MPI reference inside each module that calls MPI.Request.Waitall,
+    # keeping the real constants for logic checks
+    for module_path in ("dgamore.mpi_utils", "dgamore.eliashberg_solver"):
+        mock_mpi = MagicMock(
+            COMM_WORLD=comm_mock,
+            Request=MagicMock(Waitall=MagicMock(return_value=None)),
+            IN_PLACE=RealMPI.IN_PLACE,
+            SUM=RealMPI.SUM,
+        )
+        monkeypatch.setattr(f"{module_path}.MPI", mock_mpi)
+    monkeypatch.setattr("mpi4py.MPI.COMM_WORLD", comm_mock)
 
-    # 2. Identify all modules that call MPI.Request.Waitall
-    # We must patch the 'MPI' name inside these specific modules to bypass the C-extension
-    modules_to_patch = ["dgamore.mpi_utils", "dgamore.eliashberg_solver"]
+    config.logger = DgaLogger(comm_mock, "./")
+    conftest.create_default_config(config, folder)
 
-    with ExitStack() as stack:
-        # Patch the MPI module reference in each relevant file
-        for module_path in modules_to_patch:
-            mock_mpi = stack.enter_context(patch(f"{module_path}.MPI"))
+    config.eliashberg.perform_eliashberg = False
+    config.eliashberg.symmetry = "random"
+    config.eliashberg.epsilon = 1e-12
+    config.eliashberg.n_eig = 4
 
-            # Re-bind the necessary parts to our mocks
-            mock_mpi.COMM_WORLD = comm_mock
-            mock_mpi.Request = MockRequest
-            mock_mpi.IN_PLACE = RealMPI.IN_PLACE  # Keep real constants for logic checks
-            mock_mpi.SUM = RealMPI.SUM
+    # the comm mock returns itself for chained calls and node logic
+    comm_mock.Split.return_value = comm_mock
+    comm_mock.allgather.return_value = ["node1"]
 
-        # 3. Apply the global COMM_WORLD patch for general use
-        stack.enter_context(patch("mpi4py.MPI.COMM_WORLD", comm_mock))
-
-        # 4. Standard DGAmore Configuration
-        config.logger = DgaLogger(comm_mock, "./")
-        conftest.create_default_config(config, folder)
-
-        config.eliashberg.perform_eliashberg = False
-        config.eliashberg.symmetry = "random"
-        config.eliashberg.epsilon = 1e-12
-        config.eliashberg.n_eig = 4
-
-        # Ensure mocks return themselves for chained calls or node logic
-        comm_mock.Split.return_value = comm_mock
-        comm_mock.allgather.return_value = ["node1"]
-
-        yield folder, comm_mock
+    yield folder, comm_mock
 
 
 @pytest.mark.parametrize("save_fq, save_memory", [(True, True), (False, True), (True, False), (False, False)])
 def test_eliashberg_equation_without_local_part(setup, save_fq, save_memory):
+    """The Eliashberg solve without the local vertex part reproduces the reference eigenvalues in all four
+    save_fq x save_memory flag combinations."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20
@@ -78,7 +66,6 @@ def test_eliashberg_equation_without_local_part(setup, save_fq, save_memory):
     config.output.eliashberg_path = config.output.output_path
     config.eliashberg.include_local_part = False
     config.eliashberg.save_fq = save_fq
-    config.eliashberg.construct_fq_cheap = False
     config.memory.save_memory_for_fq = save_memory
     config.memory.save_memory_for_lanczos = save_memory
 
@@ -96,6 +83,8 @@ def test_eliashberg_equation_without_local_part(setup, save_fq, save_memory):
 
 @pytest.mark.parametrize("save_fq, save_memory", [(True, True), (False, True), (True, False), (False, False)])
 def test_eliashberg_equation_with_local_part(setup, save_fq, save_memory):
+    """The Eliashberg solve including the local vertex part reproduces the reference eigenvalues in all four
+    save_fq x save_memory flag combinations."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20
@@ -109,7 +98,6 @@ def test_eliashberg_equation_with_local_part(setup, save_fq, save_memory):
     config.output.eliashberg_path = config.output.output_path
     config.eliashberg.include_local_part = True
     config.eliashberg.save_fq = save_fq
-    config.eliashberg.construct_fq_cheap = False
     config.memory.save_memory_for_fq = save_memory
     config.memory.save_memory_for_lanczos = save_memory
 
@@ -136,7 +124,7 @@ def _fft_index_map(nq: tuple, f) -> np.ndarray:
     return m
 
 
-def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup):
+def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeypatch):
     """Locks the full multi-orbital pairing kernel on the real two-band vertex against thesis Eq. (4.63): the
     densified production matvec must equal the transparent index formula norm * sum_{ef} [sign
     Gamma^{K-Q;vv'}_{e1f2} + Gamma^{(-K)-Q;v(-v')}_{e2f1}] G_{eh}(Q, v') conj(G_{gf}(Q, v')) Delta_{gh}(Q, v')
@@ -157,7 +145,6 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup):
     config.output.eliashberg_path = folder
     config.eliashberg.include_local_part = True
     config.eliashberg.save_fq = False
-    config.eliashberg.construct_fq_cheap = False
     config.memory.save_memory_for_fq = False
     config.memory.save_memory_for_lanczos = False
 
@@ -186,13 +173,14 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup):
         )
         captured[channel] = {"gamma": gamma_full.mat.copy()}
         gamma_full.free()
-        with patch("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", side_effect=fake_eigsh):
+        with monkeypatch.context() as m:
+            m.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
             out = real_solver(gamma_r_pp, gchi0_q0_pp, ranks)
         captured[channel]["dense"] = dense_holder[0]
         return out
 
-    with patch("dgamore.eliashberg_solver.solve_eliashberg_lanczos", side_effect=capture_solver):
-        eliashberg_solver.solve(g_dga, g_dmft, u_loc, v_nonloc, comm_mock)
+    monkeypatch.setattr(eliashberg_solver, "solve_eliashberg_lanczos", capture_solver)
+    eliashberg_solver.solve(g_dga, g_dmft, u_loc, v_nonloc, comm_mock)
 
     nq = config.lattice.k_grid.nk
     nq_tot, o, beta = int(np.prod(nq)), config.sys.n_bands, config.sys.beta

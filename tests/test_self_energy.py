@@ -512,7 +512,6 @@ def test_beta_is_stored_and_used_not_config(monkeypatch):
     se = SelfEnergy(mat_decompressed, nk=nk, beta=2.0)
     assert se._beta == 2.0
 
-    # The moments must depend only on the injected beta, independent of the global config.
     monkeypatch.setattr(sys, "beta", 0.001)
     se_ref = SelfEnergy(mat_decompressed, nk=nk, beta=2.0)
     assert np.allclose(se.smom[0], se_ref.smom[0])

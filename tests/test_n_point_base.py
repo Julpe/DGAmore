@@ -7,13 +7,14 @@
 import os
 import sys
 import types
-from unittest.mock import patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import scipy as sp
 from scipy.signal import resample
 
+import dgamore.n_point_base as npb
 import dgamore.symmetry_reduction as sr
 from dgamore import brillouin_zone as bz
 from dgamore.interaction import LocalInteraction, Interaction
@@ -657,7 +658,8 @@ def test_compresses_other_when_self_is_compressed():
 
 
 def test_filter_small_values_sets_tiny_entries_to_zero():
-    """filter_small_values zeroes tiny entries."""
+    """filter_small_values (default threshold 1e-12) zeroes exactly the entries whose real and imaginary parts
+    are both below the threshold, preserves entries with any component above it, and returns self."""
     mat = np.array(
         [
             [1e-13 + 1e-13j, 1e-11 + 1e-13j],
@@ -666,28 +668,26 @@ def test_filter_small_values_sets_tiny_entries_to_zero():
         dtype=np.complex128,
     )
     obj = IHaveMat(mat)
-    returned = obj.filter_small_values()  # default threshold 1e-12
+    returned = obj.filter_small_values()
 
-    # method returns self
     assert returned is obj
 
     res = obj.mat
-    assert res[0, 0] == 0.0 + 0.0j  # both real and imag below threshold -> zeroed
-    assert res[0, 1] != 0.0 + 0.0j  # imag above threshold -> not zeroed
-    assert res[1, 0] != 0.0 + 0.0j  # imag above threshold -> not zeroed
-    assert res[1, 1] == 1.0 + 0.0j  # large value preserved
+    assert res[0, 0] == 0.0 + 0.0j
+    assert res[0, 1] != 0.0 + 0.0j
+    assert res[1, 0] != 0.0 + 0.0j
+    assert res[1, 1] == 1.0 + 0.0j
 
 
 def test_filter_small_values_respects_custom_threshold():
-    """filter_small_values respects a custom threshold."""
+    """filter_small_values zeroes entries with both components below a custom threshold and preserves entries
+    with one component above it."""
     mat = np.array([1e-6 + 1e-6j, 2e-6 + 0.0j, 5e-5 + 1e-8j], dtype=np.complex128)
     obj = IHaveMat(mat)
     obj.filter_small_values(threshold=1e-5)
 
-    # first two entries have both components < 1e-5 -> zeroed
     assert obj.mat[0] == 0.0 + 0.0j
     assert obj.mat[1] == 0.0 + 0.0j
-    # last entry has real component above threshold -> preserved
     assert not (obj.mat[2].real == 0.0 and obj.mat[2].imag == 0.0)
 
 
@@ -703,60 +703,41 @@ def test_filter_small_values_preserves_values_with_one_large_component():
 
 
 def test_free_releases_underlying_matrix():
-    """free releases the underlying matrix."""
+    """free without trim releases the underlying matrix."""
     mat = np.array([[1, 2], [3, 4]])
     obj = IHaveMat(mat)
 
-    # ensure matrix is set initially
     assert obj.mat is not None
 
-    # free without trim should release the array
     obj.free(trim=False)
     assert obj.mat is None
 
 
 def test_free_with_trim_calls_malloc_trim(monkeypatch):
-    """free with trim calls malloc_trim."""
+    """free with trim invokes malloc_trim on the class-level libc when it is marked available."""
     mat = np.array([[1, 2], [3, 4]])
     obj = IHaveMat(mat)
 
-    # prepare a fake libc with a malloc_trim that records calls
-    class FakeLibc:
-        def __init__(self):
-            self.called = False
-
-        def malloc_trim(self, arg):
-            # record that the function was invoked
-            self.called = True
-
-    fake = FakeLibc()
-
-    # make the class think malloc_trim is available and supply our fake libc
+    fake_libc = MagicMock()
     monkeypatch.setattr(IHaveMat, "_malloc_trim_available", True)
-    monkeypatch.setattr(IHaveMat, "_libc", fake)
+    monkeypatch.setattr(IHaveMat, "_libc", fake_libc)
 
-    # call free with trim and ensure the libc's malloc_trim was invoked
     obj.free(trim=True)
-    assert fake.called is True
+    fake_libc.malloc_trim.assert_called()
     assert obj.mat is None
 
 
 def test__malloc_trim_is_noop_when_unavailable(monkeypatch):
-    """_malloc_trim is a no-op when malloc_trim is unavailable."""
-    # ensure that when _malloc_trim_available is False, calling _malloc_trim does nothing
+    """_malloc_trim is a no-op when malloc_trim is unavailable: neither _malloc_trim() nor free(trim=True)
+    touches the libc."""
     monkeypatch.setattr(IHaveMat, "_malloc_trim_available", False)
 
-    # set a libc that would raise if called to ensure it's not invoked
-    class ExplodingLibc:
-        def malloc_trim(self, arg):
-            raise RuntimeError("should not be called")
+    # a libc that raises if called, proving it is never invoked
+    exploding_libc = MagicMock(malloc_trim=MagicMock(side_effect=RuntimeError("should not be called")))
+    monkeypatch.setattr(IHaveMat, "_libc", exploding_libc)
 
-    monkeypatch.setattr(IHaveMat, "_libc", ExplodingLibc())
-
-    # should not raise
     IHaveMat._malloc_trim()
 
-    # also ensure free(trim=True) will not try to call malloc_trim when availability is False
     mat = np.array([1.0, 2.0, 3.0])
     obj = IHaveMat(mat)
     obj.free(trim=True)
@@ -827,18 +808,9 @@ def test_skip_on_non_posix_or_no_proc(monkeypatch):
 
 
 def test_loads_libc_and_calls_malloc_trim(monkeypatch):
-    """malloc_trim loads libc and calls malloc_trim when available."""
-
-    # simulate posix with /proc and a working ctypes.CDLL returning a libc with malloc_trim
-    class FakeLib:
-        def __init__(self):
-            self.called = False
-
-        def malloc_trim(self, arg):
-            self.called = True
-            return 1
-
-    fake_lib = FakeLib()
+    """On POSIX with /proc present, _malloc_trim loads the libc via ctypes.CDLL, stores it on the class and
+    invokes its malloc_trim."""
+    fake_lib = MagicMock()
     fake_ctypes = types.ModuleType("ctypes")
     fake_ctypes.CDLL = lambda name: fake_lib
 
@@ -851,7 +823,7 @@ def test_loads_libc_and_calls_malloc_trim(monkeypatch):
 
     assert IHaveMat._malloc_trim_available is True
     assert IHaveMat._libc is fake_lib
-    assert fake_lib.called is True
+    fake_lib.malloc_trim.assert_called()
 
 
 def test_ctypes_cdll_failure_sets_unavailable(monkeypatch):
@@ -875,25 +847,19 @@ def test_ctypes_cdll_failure_sets_unavailable(monkeypatch):
 
 
 def test_malloc_trim_exception_is_suppressed(monkeypatch):
-    """An exception from malloc_trim is suppressed."""
-
-    # simulate libc present but malloc_trim itself raises -> should be suppressed (no exception)
-    class BadLib:
-        def malloc_trim(self, arg):
-            raise RuntimeError("boom")
-
+    """An exception from malloc_trim itself is suppressed, and availability stays True since ctypes loaded the
+    libc successfully."""
+    bad_lib = MagicMock(malloc_trim=MagicMock(side_effect=RuntimeError("boom")))
     fake_ctypes = types.ModuleType("ctypes")
-    fake_ctypes.CDLL = lambda name: BadLib()
+    fake_ctypes.CDLL = lambda name: bad_lib
 
     monkeypatch.setattr(os, "name", "posix")
     monkeypatch.setattr(os.path, "exists", lambda p: True)
     monkeypatch.setitem(sys.modules, "ctypes", fake_ctypes)
     monkeypatch.setattr(IHaveMat, "_malloc_trim_available", None, raising=False)
 
-    # must not raise
     IHaveMat._malloc_trim()
 
-    # when ctypes loaded successfully, availability should be True even if malloc_trim raised
     assert IHaveMat._malloc_trim_available is True
 
 
@@ -1064,93 +1030,93 @@ def _rng_payload(shape, seed=0):
     return rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
 
 
-def test_interpolate_q_grid_same_grid_returns_unchanged_copy():
+def test_interpolate_q_grid_same_grid_returns_unchanged_copy(c128_storage):
     """interpolate_q_grid on the same grid returns an unchanged copy."""
     mat = _rng_payload((4, 4, 4, 1, 1, 3))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     out = obj.interpolate_q_grid((4, 4, 4))
     assert out is not obj
     assert np.array_equal(out.mat, mat)
     assert out.nq == (4, 4, 4)
 
 
-def test_interpolate_q_grid_same_grid_no_copy_returns_self():
+def test_interpolate_q_grid_same_grid_no_copy_returns_self(c128_storage):
     """interpolate_q_grid on the same grid with copy=False returns self."""
     mat = _rng_payload((4, 4, 4, 1, 1, 2))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     out = obj.interpolate_q_grid((4, 4, 4), copy=False)
     assert out is obj
 
 
-def test_interpolate_q_grid_commensurate_downsample_is_exact_slice():
+def test_interpolate_q_grid_commensurate_downsample_is_exact_slice(c128_storage):
     """interpolate_q_grid commensurate downsampling is an exact slice."""
     mat = _rng_payload((4, 4, 4, 2, 2, 3))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     out = obj.interpolate_q_grid((2, 2, 2))
     assert out.current_shape == (2, 2, 2, 2, 2, 3)
     assert np.array_equal(out.mat, mat[::2, ::2, ::2])
     assert out.nq == (2, 2, 2)
 
 
-def test_interpolate_q_grid_collapse_z_takes_kz0_plane():
+def test_interpolate_q_grid_collapse_z_takes_kz0_plane(c128_storage):
     """interpolate_q_grid collapsing z takes the kz=0 plane."""
     mat = _rng_payload((4, 4, 16, 1, 1, 2))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 16))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 16))
     out = obj.interpolate_q_grid((4, 4, 1))
     assert out.current_shape == (4, 4, 1, 1, 1, 2)
     assert np.array_equal(out.mat, mat[:, :, 0:1])
     assert out.nq == (4, 4, 1)
 
 
-def test_interpolate_q_grid_upsample_shape_and_nq():
+def test_interpolate_q_grid_upsample_shape_and_nq(c128_storage):
     """interpolate_q_grid upsampling gives the right shape and nq."""
     mat = _rng_payload((4, 4, 4, 1, 1, 3))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     out = obj.interpolate_q_grid((8, 8, 8))
     assert out.current_shape == (8, 8, 8, 1, 1, 3)
     assert out.nq == (8, 8, 8)
 
 
-def test_interpolate_q_grid_upsample_preserves_values_at_shared_points():
+def test_interpolate_q_grid_upsample_preserves_values_at_shared_points(c128_storage):
     """interpolate_q_grid upsampling preserves values at shared grid points."""
     mat = _rng_payload((4, 4, 4, 1, 1, 2))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     out = obj.interpolate_q_grid((8, 8, 8))
     assert np.allclose(out.mat[::2, ::2, ::2], mat, atol=1e-10)
 
 
-def test_interpolate_q_grid_up_then_commensurate_down_round_trips():
+def test_interpolate_q_grid_up_then_commensurate_down_round_trips(c128_storage):
     """interpolate_q_grid up- then commensurate down-sampling round-trips."""
     mat = _rng_payload((4, 4, 4, 2, 2, 3))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     out = obj.interpolate_q_grid((8, 8, 8)).interpolate_q_grid((4, 4, 4))
     assert np.allclose(out.mat, mat, atol=1e-10)
     assert out.nq == (4, 4, 4)
 
 
-def test_interpolate_q_grid_incommensurate_matches_scipy_resample():
+def test_interpolate_q_grid_incommensurate_matches_scipy_resample(c128_storage):
     """interpolate_q_grid incommensurate resampling matches scipy.signal.resample."""
     mat = _rng_payload((12, 12, 4, 1, 1, 2))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (12, 12, 4))
+    obj = IAmNonLocal(mat.copy(), (12, 12, 4))
     out = obj.interpolate_q_grid((8, 8, 4))
     ref = resample(resample(mat, 8, axis=0), 8, axis=1)
     assert out.current_shape == (8, 8, 4, 1, 1, 2)
     assert np.allclose(out.mat, ref, atol=1e-10)
 
 
-def test_interpolate_q_grid_incommensurate_is_not_a_slice():
+def test_interpolate_q_grid_incommensurate_is_not_a_slice(c128_storage):
     """interpolate_q_grid incommensurate resampling is not a plain slice."""
     mat = _rng_payload((12, 4, 4, 1, 1, 1))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (12, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (12, 4, 4))
     out = obj.interpolate_q_grid((8, 4, 4))
     # no integer stride from 12 -> 8; the band-limited result must differ from a naive slice
     assert not np.allclose(out.mat[:, 0, 0, 0, 0, 0], mat[:8, 0, 0, 0, 0, 0])
 
 
-def test_interpolate_q_grid_mixed_axes_slice_and_resample():
+def test_interpolate_q_grid_mixed_axes_slice_and_resample(c128_storage):
     """interpolate_q_grid mixes slicing and resampling across axes."""
     mat = _rng_payload((8, 6, 4, 1, 1, 2))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (8, 6, 4))
+    obj = IAmNonLocal(mat.copy(), (8, 6, 4))
     out = obj.interpolate_q_grid((4, 12, 4))
     assert out.current_shape == (4, 12, 4, 1, 1, 2)
     assert out.nq == (4, 12, 4)
@@ -1159,63 +1125,63 @@ def test_interpolate_q_grid_mixed_axes_slice_and_resample():
     assert np.allclose(out.mat, ref, atol=1e-10)
 
 
-def test_interpolate_q_grid_compressed_in_compressed_out():
+def test_interpolate_q_grid_compressed_in_compressed_out(c128_storage):
     """interpolate_q_grid keeps a compressed input compressed."""
     mat = _rng_payload((64, 2, 2, 3))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4), has_compressed_q_dimension=True)
     out = obj.interpolate_q_grid((2, 2, 2))
     assert out.has_compressed_q_dimension is True
     assert out.current_shape == (8, 2, 2, 3)
     assert out.nq == (2, 2, 2)
 
 
-def test_interpolate_q_grid_compressed_values_match_decompressed_path():
+def test_interpolate_q_grid_compressed_values_match_decompressed_path(c128_storage):
     """interpolate_q_grid compressed and decompressed paths agree."""
     mat = _rng_payload((4, 4, 4, 1, 1, 2))
-    dec = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
-    comp = _DoublePrecisionNonLocal(mat.reshape(64, 1, 1, 2).copy(), (4, 4, 4), has_compressed_q_dimension=True)
+    dec = IAmNonLocal(mat.copy(), (4, 4, 4))
+    comp = IAmNonLocal(mat.reshape(64, 1, 1, 2).copy(), (4, 4, 4), has_compressed_q_dimension=True)
     out_dec = dec.interpolate_q_grid((2, 2, 2))
     out_comp = comp.interpolate_q_grid((2, 2, 2))
     assert np.array_equal(out_comp.mat, out_dec.mat.reshape(8, 1, 1, 2))
 
 
-def test_interpolate_q_grid_decompressed_in_decompressed_out():
+def test_interpolate_q_grid_decompressed_in_decompressed_out(c128_storage):
     """interpolate_q_grid keeps a decompressed input decompressed."""
     mat = _rng_payload((4, 4, 4, 1, 1, 2))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     out = obj.interpolate_q_grid((2, 2, 2))
     assert out.has_compressed_q_dimension is False
 
 
-def test_interpolate_q_grid_updates_original_shape():
+def test_interpolate_q_grid_updates_original_shape(c128_storage):
     """interpolate_q_grid updates the original shape."""
     mat = _rng_payload((4, 4, 4, 1, 1, 2))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     out = obj.interpolate_q_grid((2, 2, 2))
     assert out.original_shape == out.current_shape == (2, 2, 2, 1, 1, 2)
 
 
-def test_interpolate_q_grid_leaves_trailing_axes_untouched():
+def test_interpolate_q_grid_leaves_trailing_axes_untouched(c128_storage):
     """interpolate_q_grid leaves the trailing axes untouched."""
     mat = _rng_payload((4, 4, 4, 2, 3, 5))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     out = obj.interpolate_q_grid((8, 8, 8))
     assert out.current_shape[3:] == (2, 3, 5)
 
 
-def test_interpolate_q_grid_copy_true_leaves_original_intact():
+def test_interpolate_q_grid_copy_true_leaves_original_intact(c128_storage):
     """interpolate_q_grid with copy=True leaves the original intact."""
     mat = _rng_payload((4, 4, 4, 1, 1, 2))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     obj.interpolate_q_grid((2, 2, 2))
     assert obj.current_shape == (4, 4, 4, 1, 1, 2)
     assert obj.nq == (4, 4, 4)
 
 
-def test_interpolate_q_grid_copy_false_mutates_self():
+def test_interpolate_q_grid_copy_false_mutates_self(c128_storage):
     """interpolate_q_grid with copy=False mutates self."""
     mat = _rng_payload((4, 4, 4, 1, 1, 2))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     out = obj.interpolate_q_grid((2, 2, 2), copy=False)
     assert out is obj
     assert obj.current_shape == (2, 2, 2, 1, 1, 2)
@@ -1230,30 +1196,30 @@ def test_interpolate_q_grid_production_class_returns_complex64():
     assert out.mat.dtype == np.complex64
 
 
-def test_interpolate_q_grid_rejects_non_positive_sizes():
+def test_interpolate_q_grid_rejects_non_positive_sizes(c128_storage):
     """interpolate_q_grid rejects non-positive grid sizes."""
     mat = _rng_payload((4, 4, 4, 1, 1, 2))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4))
     with pytest.raises(ValueError):
         obj.interpolate_q_grid((4, 4, 0))
     with pytest.raises(ValueError):
         obj.interpolate_q_grid((4, -2, 4))
 
 
-def test_interpolate_q_grid_rejects_ibz_reduced_input():
+def test_interpolate_q_grid_rejects_ibz_reduced_input(c128_storage):
     """interpolate_q_grid rejects an IBZ-reduced input."""
     # compressed first dim (10) != prod(nq) = 64 -> IBZ-like, must be rejected
     mat = _rng_payload((10, 1, 1, 2))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 4), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat.copy(), (4, 4, 4), has_compressed_q_dimension=True)
     with pytest.raises(ValueError, match="full-BZ"):
         obj.interpolate_q_grid((2, 2, 2))
 
 
-def test_interpolate_q_grid_single_kpoint_axis_upsamples_constant():
+def test_interpolate_q_grid_single_kpoint_axis_upsamples_constant(c128_storage):
     """interpolate_q_grid upsamples a single-k-point axis as a constant."""
     # n_old = 1 -> resample replicates the constant along that axis
     mat = _rng_payload((4, 4, 1, 1, 1, 2))
-    obj = _DoublePrecisionNonLocal(mat.copy(), (4, 4, 1))
+    obj = IAmNonLocal(mat.copy(), (4, 4, 1))
     out = obj.interpolate_q_grid((4, 4, 3))
     assert out.current_shape == (4, 4, 3, 1, 1, 2)
     assert np.allclose(out.mat[:, :, 0], out.mat[:, :, 1], atol=1e-10)
@@ -1276,93 +1242,85 @@ def _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1, hopping=1.0, include_antiunitary=F
     return grid, H
 
 
-class _DoublePrecisionNonLocal(IAmNonLocal):
-    """IAmNonLocal subclass that preserves the input matrix dtype instead of
-    casting to complex64. Lets us verify the mapping logic against double-precision
-    references; the production class deliberately downcasts for memory savings."""
-
-    @IAmNonLocal.mat.setter
-    def mat(self, value):
-        if value is None:
-            self._mat = None
-            return
-        self._mat = np.asarray(value)
+@pytest.fixture
+def c128_storage(monkeypatch):
+    """Runs the test with complex128 object storage: patches the module-level DTYPE that the mat setter
+    enforces, so plain production objects keep double precision for exact mapping references."""
+    monkeypatch.setattr(npb, "DTYPE", np.complex128)
 
 
-def test_map_to_full_bz_legacy_kgrid_pure_replication():
-    """With a legacy (non-auto) KGrid, ``_map_to_full_bz`` reduces to a bare IBZ→FBZ index expansion via ``irrk_inv``: each FBZ point gets the IBZ value at the index pointed to by ``irrk_inv``, with no orbital transformation."""
+def test_map_to_full_bz_plain_symmetry_kgrid_pure_replication(c128_storage):
+    """With a plain-symmetry (non-auto) KGrid, ``_map_to_full_bz`` reduces to a bare IBZ→FBZ index expansion via ``irrk_inv``: each FBZ point gets the IBZ value at the index pointed to by ``irrk_inv``, with no orbital transformation."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     nb = 1
     nq_tot = 16
-    # Make a clearly-non-trivial IBZ payload
+    # a clearly-non-trivial IBZ payload so wrong index expansions cannot cancel
     ibz_payload = (np.arange(grid.nk_irr) + 1).astype(np.complex128).reshape(grid.nk_irr, nb, nb)
-    obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
     obj._map_to_full_bz(grid, num_orbital_dimensions=2)
 
     assert obj.mat.shape == (nq_tot, nb, nb)
-    # Every FBZ k must hold the IBZ value at irrk_inv[k]
     inv = grid.irrk_inv.ravel()
     expected = ibz_payload[inv]
     assert np.array_equal(obj.mat, expected)
 
 
-def test_map_to_full_bz_auto_2idx_reconstructs_H_exactly():
+def test_map_to_full_bz_auto_2idx_reconstructs_H_exactly(c128_storage):
     """End-to-end: pick auto IBZ slice of H, _map_to_full_bz should reproduce H."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
     nb = 1
     H_flat = H.reshape(-1, nb, nb)
     H_ibz = H_flat[grid.irrk_ind].copy()
-    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
     obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     H_rec = obj.mat.reshape(4, 4, 4, nb, nb)
     assert np.allclose(H_rec, H, atol=1e-12)
 
 
-def test_map_to_full_bz_auto_2idx_reconstructs_H_for_multiorbital_case():
+def test_map_to_full_bz_auto_2idx_reconstructs_H_for_multiorbital_case(c128_storage):
     """Same as above but with multiple orbitals - exercises the orbital einsum path."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=2)
     nb = 2
     H_flat = H.reshape(-1, nb, nb)
     H_ibz = H_flat[grid.irrk_ind].copy()
-    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
     obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     H_rec = obj.mat.reshape(4, 4, 4, nb, nb)
     assert np.allclose(H_rec, H, atol=1e-12)
 
 
-def test_map_to_full_bz_auto_4idx_reconstructs_HotimesH_exactly():
+def test_map_to_full_bz_auto_4idx_reconstructs_HotimesH_exactly(c128_storage):
     """For Γ = H ⊗ H (which inherits H's symmetry trivially), reconstruction must be exact under the 4-orbital-index code path."""
     grid, H = _build_auto_kgrid(nx=3, ny=3, nz=3, nb=2)
     nb = 2
     Gamma_full = np.einsum("...ab,...cd->...abcd", H, H)
     Gamma_flat = Gamma_full.reshape(-1, nb, nb, nb, nb)
     Gamma_ibz = Gamma_flat[grid.irrk_ind].copy()
-    obj = _DoublePrecisionNonLocal(mat=Gamma_ibz, nq=(3, 3, 3), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=Gamma_ibz, nq=(3, 3, 3), has_compressed_q_dimension=True)
     obj._map_to_full_bz(grid, num_orbital_dimensions=4)
     G_rec = obj.mat.reshape(3, 3, 3, nb, nb, nb, nb)
     assert np.allclose(G_rec, Gamma_full, atol=1e-12)
 
 
-def test_map_to_full_bz_auto_preserves_trailing_frequency_dimensions():
-    """The mapping is shape-polymorphic in the trailing axes (e.g. frequency axes). A 1-band IBZ payload with 2 frequency axes after the orbital pair must come back to the full BZ unmodified beyond the index expansion."""
+def test_map_to_full_bz_auto_preserves_trailing_frequency_dimensions(c128_storage):
+    """The mapping is shape-polymorphic in the trailing axes (e.g. frequency axes). A 1-band IBZ payload with 2 frequency axes after the orbital pair must come back to the full BZ unmodified beyond the index expansion; the payload is distinct at every IBZ slot so missing or wrong indices show up."""
     grid, _ = _build_auto_kgrid(nx=4, ny=4, nz=1, nb=1)
     nb = 1
     n_freq = 5
-    # Distinct payload at every IBZ slot so missing/wrong indices show up
     rng = np.random.default_rng(0)
     ibz_payload = rng.standard_normal((grid.nk_irr, nb, nb, n_freq)) + 1j * rng.standard_normal(
         (grid.nk_irr, nb, nb, n_freq)
     )
-    obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
     obj._map_to_full_bz(grid, num_orbital_dimensions=2)
-    # For 1-band the orbital transform is identity, so the result is pure replication
+    # for 1 band the orbital transform is the identity, so the result is pure replication
     inv = grid.irrk_inv.ravel()
     expected = ibz_payload[inv]
     assert obj.mat.shape == expected.shape
     assert np.allclose(obj.mat, expected, atol=1e-14)
 
 
-def test_map_to_full_bz_auto_default_no_antiunitary_does_no_conjugation():
+def test_map_to_full_bz_auto_default_no_antiunitary_does_no_conjugation(c128_storage):
     """Default (include_antiunitary=False): no FBZ point should ever be conjugated, so a complex IBZ payload reconstructs as a pure index replication. This is the safe semantics for frequency-dependent objects."""
     nb = 1
     grid, _ = _build_auto_kgrid(nx=4, ny=4, nz=1, nb=nb, include_antiunitary=False)
@@ -1370,7 +1328,7 @@ def test_map_to_full_bz_auto_default_no_antiunitary_does_no_conjugation():
 
     rng = np.random.default_rng(2)
     ibz_payload = rng.standard_normal((grid.nk_irr, nb, nb)) + 1j * rng.standard_normal((grid.nk_irr, nb, nb))
-    obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
     obj._map_to_full_bz(grid, num_orbital_dimensions=2)
 
     inv = grid.irrk_inv.ravel()
@@ -1378,101 +1336,102 @@ def test_map_to_full_bz_auto_default_no_antiunitary_does_no_conjugation():
     assert np.allclose(obj.mat, expected, atol=1e-14)
 
 
-def test_map_to_full_bz_auto_delegates_to_apply_auto_orbital_transform():
+def test_map_to_full_bz_auto_delegates_to_apply_auto_orbital_transform(c128_storage, monkeypatch):
     """The auto branch must call ``symmetry_reduction.apply_auto_orbital_transform`` with the correctly-sliced (Us, sigmas, conjs) arrays and the right ndim."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=2)
     nb = 2
     nktot = 4 * 4 * 4
     H_flat = H.reshape(-1, nb, nb)
     H_ibz = H_flat[grid.irrk_ind].copy()
-    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
 
-    # Patch so we can assert it gets called with the right shapes and args
-    with patch.object(sr, "apply_auto_orbital_transform", wraps=sr.apply_auto_orbital_transform) as spy:
-        obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+    spy = MagicMock(wraps=sr.apply_auto_orbital_transform)
+    monkeypatch.setattr(sr, "apply_auto_orbital_transform", spy)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     assert spy.call_count == 1
     _, kwargs = spy.call_args
-    # The function was called with keyword arguments matching the signature
     assert kwargs["num_orbital_dimensions"] == 2
     assert kwargs["us"].shape == (nktot, nb, nb)
     assert kwargs["sigmas"].shape == (nktot,)
     assert kwargs["conjs"].shape == (nktot,)
 
 
-def test_map_to_full_bz_auto_passes_num_orbital_dimensions_4_for_vertex():
+def test_map_to_full_bz_auto_passes_num_orbital_dimensions_4_for_vertex(c128_storage, monkeypatch):
     """map_to_full_bz auto mode passes num_orbital_dimensions=4 for a vertex."""
     grid, H = _build_auto_kgrid(nx=3, ny=3, nz=3, nb=2)
     nb = 2
     Gamma_full = np.einsum("...ab,...cd->...abcd", H, H)
     Gamma_ibz = Gamma_full.reshape(-1, nb, nb, nb, nb)[grid.irrk_ind].copy()
-    obj = _DoublePrecisionNonLocal(mat=Gamma_ibz, nq=(3, 3, 3), has_compressed_q_dimension=True)
-    with patch.object(sr, "apply_auto_orbital_transform", wraps=sr.apply_auto_orbital_transform) as spy:
-        obj._map_to_full_bz(grid, num_orbital_dimensions=4)
+    obj = IAmNonLocal(mat=Gamma_ibz, nq=(3, 3, 3), has_compressed_q_dimension=True)
+    spy = MagicMock(wraps=sr.apply_auto_orbital_transform)
+    monkeypatch.setattr(sr, "apply_auto_orbital_transform", spy)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=4)
     _, kwargs = spy.call_args
     assert kwargs["num_orbital_dimensions"] == 4
 
 
-def test_map_to_full_bz_legacy_kgrid_does_not_call_orbital_transform():
-    """For a legacy KGrid (not auto-mode), the orbital transform helper must NOT be called: only the IBZ→FBZ replication runs."""
+def test_map_to_full_bz_plain_symmetry_kgrid_does_not_call_orbital_transform(c128_storage, monkeypatch):
+    """For a plain-symmetry (non-auto) KGrid, the orbital transform helper must NOT be called: only the IBZ→FBZ replication runs."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     nb = 1
     ibz_payload = np.arange(grid.nk_irr).astype(np.complex128).reshape(grid.nk_irr, nb, nb)
-    obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
-    with patch.object(sr, "apply_auto_orbital_transform", wraps=sr.apply_auto_orbital_transform) as spy:
-        obj._map_to_full_bz(grid, num_orbital_dimensions=2)
+    obj = IAmNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
+    spy = MagicMock(wraps=sr.apply_auto_orbital_transform)
+    monkeypatch.setattr(sr, "apply_auto_orbital_transform", spy)
+    obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     assert spy.call_count == 0
 
 
-def test_map_to_full_bz_raises_for_invalid_num_orbital_dimensions():
+def test_map_to_full_bz_raises_for_invalid_num_orbital_dimensions(c128_storage):
     """Only ``num_orbital_dimensions`` in {2, 4} are supported."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
     H_ibz = H.reshape(-1, 1, 1)[grid.irrk_ind].copy()
-    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
     with pytest.raises(AssertionError, match="2 or 4"):
         obj._map_to_full_bz(grid, num_orbital_dimensions=3)
     with pytest.raises(AssertionError, match="2 or 4"):
         obj._map_to_full_bz(grid, num_orbital_dimensions=1)
 
 
-def test_map_to_full_bz_raises_when_not_compressed():
+def test_map_to_full_bz_raises_when_not_compressed(c128_storage):
     """The compressed-q convention is required: an already-expanded matrix is not a valid input to ``_map_to_full_bz``."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
-    obj = _DoublePrecisionNonLocal(mat=H, nq=(4, 4, 4), has_compressed_q_dimension=False)
+    obj = IAmNonLocal(mat=H, nq=(4, 4, 4), has_compressed_q_dimension=False)
     with pytest.raises(ValueError, match="compressed momentum dimension"):
         obj._map_to_full_bz(grid, num_orbital_dimensions=2)
 
 
-def test_map_to_full_bz_auto_uses_supplied_nq_override():
+def test_map_to_full_bz_auto_uses_supplied_nq_override(c128_storage):
     """The optional ``nq`` argument must override the object's stored ``nq``."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
     H_ibz = H.reshape(-1, 1, 1)[grid.irrk_ind].copy()
-    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(2, 2, 16), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=H_ibz, nq=(2, 2, 16), has_compressed_q_dimension=True)
     obj._map_to_full_bz(grid, num_orbital_dimensions=2, nq=(4, 4, 4))
     assert obj.nq == (4, 4, 4)
     H_rec = obj.mat.reshape(4, 4, 4, 1, 1)
     assert np.allclose(H_rec, H, atol=1e-12)
 
 
-def test_map_to_full_bz_auto_returns_self_for_method_chaining():
+def test_map_to_full_bz_auto_returns_self_for_method_chaining(c128_storage):
     """For ergonomic chaining the method returns ``self``."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
     H_ibz = H.reshape(-1, 1, 1)[grid.irrk_ind].copy()
-    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=H_ibz, nq=(4, 4, 4), has_compressed_q_dimension=True)
     result = obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     assert result is obj
 
 
-def test_map_to_full_bz_legacy_returns_self_for_method_chaining():
-    """map_to_full_bz legacy mode returns self for chaining."""
+def test_map_to_full_bz_plain_symmetry_returns_self_for_method_chaining(c128_storage):
+    """map_to_full_bz plain-symmetry mode returns self for chaining."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     nb = 1
     ibz_payload = np.arange(grid.nk_irr).astype(np.complex128).reshape(grid.nk_irr, nb, nb)
-    obj = _DoublePrecisionNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=ibz_payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
     result = obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     assert result is obj
 
 
-def test_map_to_full_bz_auto_1x1x1_trivial_grid_is_identity():
+def test_map_to_full_bz_auto_1x1x1_trivial_grid_is_identity(c128_storage):
     """Edge case: a 1×1×1 grid has a single k-point, so the FBZ trivially equals the IBZ and the mapping returns the input unchanged in value."""
     nb = 2
     H = np.zeros((1, 1, 1, nb, nb), dtype=complex)
@@ -1480,7 +1439,7 @@ def test_map_to_full_bz_auto_1x1x1_trivial_grid_is_identity():
     grid = bz.KGrid(nk=(1, 1, 1), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H)
     H_ibz = H.reshape(-1, nb, nb)[grid.irrk_ind].copy()
-    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(1, 1, 1), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=H_ibz, nq=(1, 1, 1), has_compressed_q_dimension=True)
     obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     assert np.allclose(obj.mat.reshape(1, 1, 1, nb, nb), H, atol=1e-14)
 
@@ -1489,18 +1448,18 @@ def test_map_to_full_bz_auto_preserves_dtype():
     """The output matrix has the same dtype as the input (the function does not silently cast within the auto branch - the cast to complex64 happens elsewhere in ``IHaveMat.mat = value``)."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
     H_ibz_64 = H.reshape(-1, 1, 1)[grid.irrk_ind].astype(np.complex64).copy()
-    obj = _DoublePrecisionNonLocal(mat=H_ibz_64, nq=(4, 4, 4), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=H_ibz_64, nq=(4, 4, 4), has_compressed_q_dimension=True)
     obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     assert obj.mat.dtype == np.complex64
 
 
-def test_map_to_full_bz_auto_irrk_inv_consistency_at_every_fbz_point():
+def test_map_to_full_bz_auto_irrk_inv_consistency_at_every_fbz_point(c128_storage):
     """Every FBZ k must end up with the value at irrk_inv[k] transformed by the stored (U_k, sigma_k, conj_k). Check this explicitly point-by-point."""
     grid, H = _build_auto_kgrid(nx=3, ny=3, nz=3, nb=2)
     nb = 2
     H_flat = H.reshape(-1, nb, nb)
     H_ibz = H_flat[grid.irrk_ind].copy()
-    obj = _DoublePrecisionNonLocal(mat=H_ibz, nq=(3, 3, 3), has_compressed_q_dimension=True)
+    obj = IAmNonLocal(mat=H_ibz, nq=(3, 3, 3), has_compressed_q_dimension=True)
     obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     H_rec = obj.mat.reshape(-1, nb, nb)
 
@@ -1573,8 +1532,6 @@ def test_dtype_constant_drives_storage_precision(monkeypatch):
     """The DTYPE constant drives the storage precision."""
     # The mat setter is the enforcement point: every IHaveMat-derived object is coerced to the module-level DTYPE.
     # (The canonical switch is editing the DTYPE constant in source; here we patch the setter's global to verify it.)
-    import dgamore.n_point_base as npb
-
     monkeypatch.setattr(npb, "DTYPE", np.complex128)
     u = LocalInteraction(np.ones((2, 2, 2, 2)))
     assert u.mat.dtype == np.complex128
@@ -1664,41 +1621,42 @@ def _filter_reference(mat: np.ndarray, threshold: float) -> np.ndarray:
 
 
 def test_filter_small_values_chunked_path_matches_single_pass(monkeypatch):
-    """filter_small_values chunked path matches the single-pass result."""
+    """filter_small_values under a tiny chunk budget (step == 1, one element per chunk) matches the single-pass
+    reference on a mask spanning several chunks, and stays chainable."""
     rng = np.random.default_rng(7)
     mat = (rng.standard_normal((50, 4)) + 1j * rng.standard_normal((50, 4))).astype(np.complex64)
-    mat[::3] = 1e-15 + 1e-15j  # make the mask non-trivial and span several chunks
+    mat[::3] = 1e-15 + 1e-15j
     reference = _filter_reference(mat, 1e-12)
 
     obj = IHaveMat(mat.copy())
-    # Tiny budget forces step == 1, i.e. the multi-chunk branch (one element per chunk).
     monkeypatch.setattr(IHaveMat, "_FILTER_CHUNK_BYTES", 8)
     returned = obj.filter_small_values(threshold=1e-12)
 
-    assert returned is obj  # chainable
+    assert returned is obj
     assert np.array_equal(obj.mat, reference)
 
 
 def test_filter_small_values_handles_non_contiguous_input(monkeypatch):
-    """filter_small_values handles a non-contiguous input."""
+    """filter_small_values handles a non-contiguous (transposed) input: the already-complex64 view is kept by
+    the setter and the tiny chunk budget forces axis-0 chunking on the non-contiguous branch."""
     rng = np.random.default_rng(11)
     base = (rng.standard_normal((6, 8)) + 1j * rng.standard_normal((6, 8))).astype(np.complex64)
     base[:, ::2] = 1e-15 + 1e-15j
-    non_contiguous = base.T  # transpose -> non-contiguous, axis-0 length 8
+    non_contiguous = base.T
     assert not non_contiguous.flags["C_CONTIGUOUS"]
     reference = _filter_reference(non_contiguous, 1e-12)
 
-    obj = IHaveMat(non_contiguous)  # already complex64, so the setter keeps the non-contiguous view
+    obj = IHaveMat(non_contiguous)
     assert not obj.mat.flags["C_CONTIGUOUS"]
-    monkeypatch.setattr(IHaveMat, "_FILTER_CHUNK_BYTES", 8)  # force axis-0 chunking on the non-contiguous branch
+    monkeypatch.setattr(IHaveMat, "_FILTER_CHUNK_BYTES", 8)
     obj.filter_small_values(threshold=1e-12)
 
     assert np.array_equal(obj.mat, reference)
 
 
 def test_fft_ifft_preserve_complex64_dtype():
-    """fft and ifft preserve the complex64 dtype."""
-    # the BZ FFTs must keep complex64 (scipy.fft + overwrite_x); a regression to np.fft would upcast/spike.
+    """fft and ifft preserve the complex64 dtype and round-trip the input: the BZ FFTs must keep complex64
+    (scipy.fft + overwrite_x); a regression to np.fft would upcast and spike memory."""
     rng = np.random.default_rng(3)
     shape = (4, 4, 2, 1, 1, 6)
     mat = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
@@ -1708,7 +1666,7 @@ def test_fft_ifft_preserve_complex64_dtype():
     assert forward.mat.dtype == np.complex64
     back = forward.ifft()
     assert back.mat.dtype == np.complex64
-    assert np.allclose(back.mat, mat, atol=1e-4)  # round-trip recovers the input
+    assert np.allclose(back.mat, mat, atol=1e-4)
 
 
 def test_q_mean_preserves_complex64_dtype():

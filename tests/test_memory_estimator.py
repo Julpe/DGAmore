@@ -294,13 +294,6 @@ def test_fq_save_fq_gathers_whole_irr_vertex_on_one_rank():
     assert no_save["fq"].on_single == pytest.approx(giwk_dga)
 
 
-def test_fq_cheap_construction_shrinks_per_q_block():
-    """construct_fq_cheap cuts the inputs to niv_pp, shrinking every per-q two-fermion block."""
-    normal = _peaks(with_eliashberg=True, construct_fq_cheap=False)["fq"].on_distributed
-    cheap = _peaks(with_eliashberg=True, construct_fq_cheap=True)["fq"].on_distributed
-    assert cheap < normal
-
-
 def test_lanczos_fast_counts_layout_build_vertices_bubble_and_arpack_basis():
     """The lanczos fast single-rank peak holds LANCZOS_VERTEX_FACTOR full-BZ vertices (direct + its matmul-layout
     copy at the build peak; the flipped vertex is never stored), the pp bubble and the ARPACK workspace."""

@@ -123,7 +123,6 @@ This section collects the convergence-stabilization options of the self-consiste
    stabilization:
      use_lambda_correction: False      # bool
      use_chi_phys_restriction: False   # bool
-     use_jacobian_stabilization: False # bool
      use_lambda_annealing: False       # bool
 
 Setting ``use_lambda_correction`` to ``True`` applies the lambda correction to the physical susceptibilities
@@ -167,30 +166,6 @@ final state is physical. Combining ``use_chi_phys_restriction`` with the lambda 
 correction would calibrate its sum rule on eigenvalue-floored susceptibilities); if both are enabled, the lambda
 correction takes precedence and ``use_chi_phys_restriction`` is disabled automatically with a warning.
 
-Setting ``use_jacobian_stabilization`` to ``True`` arms the modified iterative scheme of arXiv:2502.01420, which
-repairs cycles whose *physical* fixed point has become unstable under damped iteration (the generic situation past a
-vertex divergence or pseudo-divergence, where plain mixing slides into an unphysical solution no matter how small the
-mixing parameter is chosen). Armed means watching, not acting: as long as plain iteration makes progress the cycle
-runs exactly as without the flag, and a run that converges plainly is never touched. Only when plain iteration
-demonstrably cannot reach the physical fixed point - the residual grows well above its best value for several
-consecutive iterations, or it plateaus for an extended stretch while still far above ``epsilon`` - is the Jacobian
-of the self-energy proposal map built (once, matrix-free, at the warm-start self-energy, costing a handful of
-additional self-energy evaluations with an automatically adapted Arnoldi length), and from then on the damping sign
-is flipped on the detected unstable directions, which makes the physical fixed point attractive again without moving
-it. A do-no-harm watchdog then verifies that the reflection actually improves the stalled residual; if it does not,
-the reflection is reverted and plain mixing resumes with a loud warning. All detection thresholds and subspace sizes
-are chosen automatically and are deliberately not exposed as configuration options. The method requires a warm start
-close to the physical solution, e.g. a converged higher-temperature run supplied via ``previous_sc_path``
-(interpolated down in temperature); building far from a fixed point would linearize the wrong map, so the build
-aborts on a cold (DMFT or local) start by design. While ``use_chi_phys_restriction`` or ``use_lambda_annealing`` is active
-the stabilizer stays dormant (the scaffolded cycle is a convergence aid, not the physical map) and may only build
-after the scaffold has been released. It therefore reshapes the iteration map, not the susceptibility, and may
-coexist with those two releasing scaffolds - but it is mutually exclusive with the lambda correction (per-iteration
-or one-shot), whose corrected map the stabilizer must not linearize (it does not engage on the released pure phase
-either); a lambda correction takes
-precedence and the stabilizer is disabled with a warning. If the build detects an instability that the sign flip
-cannot cure, it lowers ``mixing`` automatically to the largest contractive value and reports the change in the log.
-
 Setting ``use_lambda_annealing`` to ``True`` protects the cycle with the *lambda-annealing scaffold*: a bosonic
 mass :math:`\lambda` is added to the inverse physical susceptibility of every channel, which damps the
 susceptibility and keeps the Bethe-Salpeter pole at bay - a sum-rule-free alternative to the lambda
@@ -205,8 +180,7 @@ guides the iteration there. If the pure phase cannot converge, the run stops at 
 verdict that no stable physical fixed point was found. It is mutually exclusive with the other
 susceptibility-reshaping options - the lambda correction and ``use_chi_phys_restriction`` (the sum rule must not be
 calibrated on mass-shifted susceptibilities, and the two scaffolds would fight); if combined, a lambda correction
-or ``use_chi_phys_restriction`` takes precedence and the annealing scaffold is disabled with a warning. It may, however,
-be combined with ``use_jacobian_stabilization`` (which waits for the scaffold to anneal away before it engages).
+or ``use_chi_phys_restriction`` takes precedence and the annealing scaffold is disabled with a warning.
 
 .. _lambda-correction:
 
@@ -281,7 +255,6 @@ Superconducting properties are obtained by solving the linearized Eliashberg equ
      perform_eliashberg: False    # bool
      save_pairing_vertex: False   # bool
      save_fq: False               # bool
-     construct_fq_cheap: False    # bool
      n_eig: 4                     # int
      epsilon: 1e-6                # float
      symmetry: "random"           # str
@@ -290,11 +263,7 @@ Superconducting properties are obtained by solving the linearized Eliashberg equ
      subfolder_name: "Eliashberg" # str
 
 The equation is solved only when ``perform_eliashberg`` is ``True``. Enabling ``save_pairing_vertex`` or ``save_fq``
-writes the pairing vertex or the full ladder vertex on the irreducible Brillouin zone to the output folder. Since
-assembling the full ladder vertex is very memory-intensive, ``construct_fq_cheap`` offers a variant that builds it
-on a reduced fermionic frequency box and needs only a quarter of the memory; this slightly changes the eigenvalues
-and gap functions but remains qualitatively reliable, as verified across many test cases, and is recommended only
-for datasets that push the memory limits.
+writes the pairing vertex or the full ladder vertex on the irreducible Brillouin zone to the output folder.
 
 The equation is solved with a Lanczos algorithm based on the ARPACK routines, retrieving the ``n_eig`` largest
 eigenvalues and the corresponding gap functions to an accuracy of ``epsilon``. The ``symmetry`` field sets the

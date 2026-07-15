@@ -78,9 +78,8 @@ def test_local_permute_and_transpose():
 
     transposed = obj.transpose_orbitals()
     assert np.allclose(transposed.mat, np.swapaxes(mat, 0, 1))
-    # copy semantics: source untouched
+    # copy semantics: the source stays untouched and the identity permutation returns self
     assert np.allclose(obj.mat, mat)
-    # identity permutation returns self
     assert obj.permute_orbitals("ab->ab") is obj
 
 
@@ -161,7 +160,6 @@ def test_invert_last_orbital_block_matches_manual_inverse(shape):
     """_invert_last_orbital_block matches a manual per-frequency matrix inverse across layouts."""
     rng = np.random.default_rng(2)
     mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
-    # make the orbital blocks well-conditioned
     nb = shape[-2]
     mat = mat + (np.eye(nb) * 5.0)[..., None]
 

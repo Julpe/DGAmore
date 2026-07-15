@@ -276,6 +276,16 @@ class Comm:
                 self._split_cache[host] = Comm(members=group)
         return self._split_cache[host]
 
+    def Split(self, color, key=0):
+        # MPI_Comm_split: one sub-communicator per color, member order by (key, member) as in the standard.
+        pairs = list(self._collective((color, key)))
+        group = tuple(m for (c, k), m in sorted(zip(pairs, self._members), key=lambda t: (t[0][1], t[1])) if c == color)
+        cache_key = ("split", color)
+        with self._lock:
+            if cache_key not in self._split_cache:
+                self._split_cache[cache_key] = Comm(members=group)
+        return self._split_cache[cache_key]
+
     def Free(self):
         pass
 
