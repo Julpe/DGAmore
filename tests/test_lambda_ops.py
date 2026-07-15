@@ -5,7 +5,7 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock
 
 import mpi4py
 import numpy as np
@@ -49,8 +49,6 @@ def load_local_four_point(lc_type: str, filename: str, channel: SpinChannel) -> 
 def test_lambda_correction_spch():
     """spch-type single lambda correction reproduces reference chi and lambdas for dens and magn channels; the dens
     channel stalls at the divergence bound and warns, so the logger must be mocked for a standalone run."""
-    from unittest.mock import MagicMock
-
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.logger = MagicMock()
@@ -107,14 +105,16 @@ def test_lambda_correction_sp():
 
 
 @pytest.mark.parametrize("lc_type", ["sp", "spch"])
-def test_lambda_correction_in_sde_sp(lc_type):
+def test_lambda_correction_in_sde_sp(monkeypatch, lc_type):
     """LambdaCorrection.perform reproduces reference chi for both sp and spch types."""
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.lambda_correction.type = lc_type
     config.output.output_path = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/lambda_correction/{lc_type}"
 
-    with patch("mpi4py.MPI.COMM_WORLD", wraps=mpi4py.MPI.COMM_WORLD) as comm_mock:
+    comm_mock = MagicMock(wraps=mpi4py.MPI.COMM_WORLD)
+    with monkeypatch.context() as mp:
+        mp.setattr("mpi4py.MPI.COMM_WORLD", comm_mock)
         config.logger = DgaLogger(comm_mock, "./")
 
         chi_dens_q_before_lambda = load_four_point(lc_type, f"chi_phys_q_dens_before_lambda", SpinChannel.DENS)
@@ -135,8 +135,6 @@ def test_lambda_correction_in_sde_sp(lc_type):
 
 def test_find_lambda_warns_on_non_convergence():
     """find_lambda warns and returns a finite value when the target is unreachable within maxiter."""
-    from unittest.mock import MagicMock
-
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.logger = MagicMock()
@@ -219,8 +217,6 @@ def test_matrix_jacobian_is_negative_definite_on_symmetric_subspace():
 
 def test_find_lambda_matrix_warns_on_non_convergence():
     """An unreachable target makes the Newton solver exhaust its steps, warn and return a finite symmetric mass."""
-    from unittest.mock import MagicMock
-
     config.logger = MagicMock()
     beta, nq, nw, n_bands = 5.0, 6, 5, 2
     chi_qw = _synthetic_chi_qw(n_bands, nq, nw)
@@ -233,7 +229,7 @@ def test_find_lambda_matrix_warns_on_non_convergence():
     assert config.logger.warning.called
 
 
-def test_find_lambda_matrix_falls_back_to_lstsq_on_singular_hessian():
+def test_find_lambda_matrix_falls_back_to_lstsq_on_singular_hessian(monkeypatch):
     """When the Newton solve reports a singular Hessian the step is recovered by least squares (same root)."""
     beta, nq, nw, n_bands = 5.0, 6, 5, 2
     chi_inv_qw = _synthetic_chi_inv_qw(n_bands, nq, nw)
@@ -241,7 +237,8 @@ def test_find_lambda_matrix_falls_back_to_lstsq_on_singular_hessian():
     lambda_star = 0.1 * np.eye(no2)
     s_r = np.linalg.inv(chi_inv_qw + lambda_star).sum(axis=(0, 1)).real / (beta * nq)
 
-    with patch("numpy.linalg.solve", side_effect=np.linalg.LinAlgError("singular")):
+    with monkeypatch.context() as mp:
+        mp.setattr(np.linalg, "solve", MagicMock(side_effect=np.linalg.LinAlgError("singular")))
         lam = MultiOrbitalLambdaCorrection.find_lambda_matrix(_synthetic_chi_qw(n_bands, nq, nw), s_r, beta, nq)
 
     assert np.allclose(lam, lambda_star, atol=1e-4)
@@ -329,7 +326,6 @@ def test_multiorbital_perform_loads_target_writes_lambda_and_corrects(tmp_path):
     """perform loads the channel's local sum-rule target, corrects the susceptibility and appends ||Lambda|| to the
     lambda file (single-band spch reference data in an isolated run directory)."""
     import shutil
-    from unittest.mock import MagicMock
 
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
@@ -365,10 +361,8 @@ def test_density_diagonal_sum_reduces_to_frequency_sum_for_q_constant_chi():
     assert np.allclose(result, expected, atol=1e-5)
 
 
-def test_log_pauli_diagnostic_logs_largest_diagonal_deviation():
+def test_log_pauli_diagnostic_logs_largest_diagonal_deviation(monkeypatch):
     """The Pauli diagnostic logs only the largest-magnitude diagonal deviation 1/2(C_d+C_m)_1 - n/2(1-n/2), one line."""
-    from unittest.mock import MagicMock
-
     config.sys.beta = 5.0
     config.sys.n_bands = 2
     config.dmft.ineq_ordering = [1]
@@ -382,9 +376,9 @@ def test_log_pauli_diagnostic_logs_largest_diagonal_deviation():
     c_d = MultiOrbitalLambdaCorrection._density_diagonal_sum(chi_dens)
     c_m = MultiOrbitalLambdaCorrection._density_diagonal_sum(chi_magn)
 
-    with patch("dgamore.lambda_ops.os.path.exists", return_value=True), patch.object(
-        FourPoint, "load", return_value=chi_dens
-    ):
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.lambda_ops.os.path.exists", MagicMock(return_value=True))
+        mp.setattr(FourPoint, "load", MagicMock(return_value=chi_dens))
         MultiOrbitalLambdaCorrection._log_pauli_diagnostic(chi_magn)
 
     deviations = [0.5 * (c_d[a] + c_m[a]) - 0.5 * occ * (1.0 - 0.5 * occ) for a, occ in enumerate((0.8, 1.2))]
@@ -395,8 +389,6 @@ def test_log_pauli_diagnostic_logs_largest_diagonal_deviation():
 
 def test_log_pauli_diagnostic_skips_without_occupation_metadata():
     """The Pauli diagnostic is skipped (no logging) when the per-inequivalent occupation metadata is absent."""
-    from unittest.mock import MagicMock
-
     config.sys.occ_dmft_per_ineq = []
     config.output.output_path = "/run/dir"
     config.logger = MagicMock()
@@ -409,8 +401,6 @@ def test_log_pauli_diagnostic_skips_without_occupation_metadata():
 
 def test_lambda_correction_perform_raises_on_unknown_type():
     """LambdaCorrection.perform rejects a lambda-correction type that is neither 'spch' nor 'sp'."""
-    from unittest.mock import MagicMock
-
     config.logger = MagicMock()
     config.lambda_correction.type = "bogus"
     with pytest.raises(ValueError):
@@ -437,11 +427,9 @@ def test_find_lambda_matrix_feasibility_binds_at_omega_zero_only():
     assert float(np.linalg.eigvalsh(herm_all_w).min()) < 0.0
 
 
-def test_log_pauli_diagnostic_scans_multiple_inequivalent_atoms():
+def test_log_pauli_diagnostic_scans_multiple_inequivalent_atoms(monkeypatch):
     """With two single-band inequivalent atoms the diagnostic reports the single worst deviation across atoms,
     labeled with the correct inequivalent-atom index and global orbital offset."""
-    from unittest.mock import MagicMock
-
     config.sys.beta = 5.0
     config.sys.n_bands = 2
     config.dmft.ineq_ordering = [1, 2]
@@ -455,9 +443,9 @@ def test_log_pauli_diagnostic_scans_multiple_inequivalent_atoms():
     c_d = MultiOrbitalLambdaCorrection._density_diagonal_sum(chi_dens)
     c_m = MultiOrbitalLambdaCorrection._density_diagonal_sum(chi_magn)
 
-    with patch("dgamore.lambda_ops.os.path.exists", return_value=True), patch.object(
-        FourPoint, "load", return_value=chi_dens
-    ):
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.lambda_ops.os.path.exists", MagicMock(return_value=True))
+        mp.setattr(FourPoint, "load", MagicMock(return_value=chi_dens))
         MultiOrbitalLambdaCorrection._log_pauli_diagnostic(chi_magn)
 
     deviations = [0.5 * (c_d[a] + c_m[a]) - 0.5 * occ * (1.0 - 0.5 * occ) for a, occ in enumerate((0.8, 1.6))]
@@ -468,11 +456,9 @@ def test_log_pauli_diagnostic_scans_multiple_inequivalent_atoms():
     assert f"ineq {worst_orbital + 1}, orbital {worst_orbital}" in message
 
 
-def test_multiorbital_perform_quiet_writes_nothing_and_skips_pauli(tmp_path):
-    """quiet=True (a stabilizer Jacobian probe) evaluates the correction unchanged but writes no lambda file and
-    skips the Pauli diagnostic."""
+def test_multiorbital_perform_quiet_writes_nothing_and_skips_pauli(monkeypatch, tmp_path):
+    """quiet=True evaluates the correction unchanged but writes no lambda file and skips the Pauli diagnostic."""
     import shutil
-    from unittest.mock import MagicMock
 
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
@@ -483,7 +469,9 @@ def test_multiorbital_perform_quiet_writes_nothing_and_skips_pauli(tmp_path):
     config.output.output_path = str(tmp_path)
 
     chi_before = load_four_point("spch", "chi_phys_q_magn_before_lambda", SpinChannel.MAGN)
-    with patch.object(MultiOrbitalLambdaCorrection, "_log_pauli_diagnostic") as pauli:
+    pauli = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(MultiOrbitalLambdaCorrection, "_log_pauli_diagnostic", pauli)
         corrected = MultiOrbitalLambdaCorrection.perform(chi_before, quiet=True)
 
     assert corrected.channel == SpinChannel.MAGN

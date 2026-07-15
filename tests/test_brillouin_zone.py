@@ -4,7 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
-from unittest.mock import patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -112,88 +112,108 @@ def test_raises_error_for_insufficient_dimensions_on_x_y_inv():
         bz.x_y_inv(mat)
 
 
-def test_applies_x_inversion_symmetry_correctly_with_mock():
+def test_applies_x_inversion_symmetry_correctly_with_mock(monkeypatch):
     """apply_symmetry dispatches the x inversion to the correct helper."""
     mat = np.random.rand(6, 4, 4)
-    with patch("dgamore.brillouin_zone.inv_sym") as mock_inv_sym:
+    mock_inv_sym = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(bz, "inv_sym", mock_inv_sym)
         bz.apply_symmetry(mat, bz.KnownSymmetries.X_INV)
-        mock_inv_sym.assert_called_once_with(mat, 0)
+    mock_inv_sym.assert_called_once_with(mat, 0)
 
 
-def test_applies_y_inversion_symmetry_correctly_with_mock():
+def test_applies_y_inversion_symmetry_correctly_with_mock(monkeypatch):
     """apply_symmetry dispatches the y inversion to the correct helper."""
     mat = np.random.rand(4, 6, 4)
-    with patch("dgamore.brillouin_zone.inv_sym") as mock_inv_sym:
+    mock_inv_sym = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(bz, "inv_sym", mock_inv_sym)
         bz.apply_symmetry(mat, bz.KnownSymmetries.Y_INV)
-        mock_inv_sym.assert_called_once_with(mat, 1)
+    mock_inv_sym.assert_called_once_with(mat, 1)
 
 
-def test_applies_z_inversion_symmetry_correctly_with_mock():
+def test_applies_z_inversion_symmetry_correctly_with_mock(monkeypatch):
     """apply_symmetry dispatches the z inversion to the correct helper."""
     mat = np.random.rand(4, 4, 6)
-    with patch("dgamore.brillouin_zone.inv_sym") as mock_inv_sym:
+    mock_inv_sym = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(bz, "inv_sym", mock_inv_sym)
         bz.apply_symmetry(mat, bz.KnownSymmetries.Z_INV)
-        mock_inv_sym.assert_called_once_with(mat, 2)
+    mock_inv_sym.assert_called_once_with(mat, 2)
 
 
-def test_applies_x_y_symmetry_correctly_with_mock():
+def test_applies_x_y_symmetry_correctly_with_mock(monkeypatch):
     """apply_symmetry dispatches the x-y exchange to the correct helper."""
     mat = np.random.rand(4, 4, 6)
-    with patch("dgamore.brillouin_zone.x_y_sym") as mock_x_y_sym:
+    mock_x_y_sym = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(bz, "x_y_sym", mock_x_y_sym)
         bz.apply_symmetry(mat, bz.KnownSymmetries.X_Y_SYM)
-        mock_x_y_sym.assert_called_once_with(mat)
+    mock_x_y_sym.assert_called_once_with(mat)
 
 
-def test_applies_x_z_symmetry_correctly_with_mock():
+def test_applies_x_z_symmetry_correctly_with_mock(monkeypatch):
     """apply_symmetry dispatches the x-z exchange to the correct helper."""
     mat = np.random.rand(4, 6, 4)
-    with patch("dgamore.brillouin_zone.x_z_sym") as mock_x_z_sym:
+    mock_x_z_sym = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(bz, "x_z_sym", mock_x_z_sym)
         bz.apply_symmetry(mat, bz.KnownSymmetries.X_Z_SYM)
-        mock_x_z_sym.assert_called_once_with(mat)
+    mock_x_z_sym.assert_called_once_with(mat)
 
 
-def test_applies_y_z_symmetry_correctly_with_mock():
+def test_applies_y_z_symmetry_correctly_with_mock(monkeypatch):
     """apply_symmetry dispatches the y-z exchange to the correct helper."""
     mat = np.random.rand(6, 4, 4)
-    with patch("dgamore.brillouin_zone.y_z_sym") as mock_y_z_sym:
+    mock_y_z_sym = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(bz, "y_z_sym", mock_y_z_sym)
         bz.apply_symmetry(mat, bz.KnownSymmetries.Y_Z_SYM)
-        mock_y_z_sym.assert_called_once_with(mat)
+    mock_y_z_sym.assert_called_once_with(mat)
 
 
-def test_applies_x_y_inversion_symmetry_correctly_with_mock():
+def test_applies_x_y_inversion_symmetry_correctly_with_mock(monkeypatch):
     """apply_symmetry dispatches the simultaneous x-y inversion to the correct helper."""
     mat = np.random.rand(6, 6, 4)
-    with patch("dgamore.brillouin_zone.x_y_inv") as mock_x_y_inv:
+    mock_x_y_inv = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(bz, "x_y_inv", mock_x_y_inv)
         bz.apply_symmetry(mat, bz.KnownSymmetries.X_Y_INV)
-        mock_x_y_inv.assert_called_once_with(mat)
+    mock_x_y_inv.assert_called_once_with(mat)
 
 
-def test_raises_error_for_unknown_symmetry_with_mock():
+def test_raises_error_for_unknown_symmetry_with_mock(monkeypatch):
     """apply_symmetry raises for an unknown symmetry."""
     mat = np.random.rand(4, 4, 4)
-    with patch("dgamore.brillouin_zone.KnownSymmetries") as mock_known_symmetries:
+    mock_known_symmetries = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(bz, "KnownSymmetries", mock_known_symmetries)
         with pytest.raises(AssertionError, match="sym = .* not in known symmetries .*"):
             bz.apply_symmetry(mat, "unknown_symmetry")
-        mock_known_symmetries.__contains__.assert_called()
+    mock_known_symmetries.__contains__.assert_called()
 
 
-def test_applies_multiple_symmetries_in_order():
+def test_applies_multiple_symmetries_in_order(monkeypatch):
     """apply_symmetries applies multiple symmetries in order."""
     mat = np.random.rand(6, 6, 6)
-    with patch("dgamore.brillouin_zone.apply_symmetry") as mock_apply_symmetry:
+    mock_apply_symmetry = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(bz, "apply_symmetry", mock_apply_symmetry)
         bz.apply_symmetries(mat, [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV, bz.KnownSymmetries.Z_INV])
-        mock_apply_symmetry.assert_any_call(mat, bz.KnownSymmetries.X_INV)
-        mock_apply_symmetry.assert_any_call(mat, bz.KnownSymmetries.Y_INV)
-        mock_apply_symmetry.assert_any_call(mat, bz.KnownSymmetries.Z_INV)
-        assert mock_apply_symmetry.call_count == 3
+    mock_apply_symmetry.assert_any_call(mat, bz.KnownSymmetries.X_INV)
+    mock_apply_symmetry.assert_any_call(mat, bz.KnownSymmetries.Y_INV)
+    mock_apply_symmetry.assert_any_call(mat, bz.KnownSymmetries.Z_INV)
+    assert mock_apply_symmetry.call_count == 3
 
 
-def test_does_nothing_when_no_symmetries_provided():
+def test_does_nothing_when_no_symmetries_provided(monkeypatch):
     """apply_symmetries does nothing when no symmetries are provided."""
     mat = np.random.rand(6, 6, 6)
-    with patch("dgamore.brillouin_zone.apply_symmetry") as mock_apply_symmetry:
+    mock_apply_symmetry = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(bz, "apply_symmetry", mock_apply_symmetry)
         bz.apply_symmetries(mat, [])
-        mock_apply_symmetry.assert_not_called()
+    mock_apply_symmetry.assert_not_called()
 
 
 def test_raises_error_for_insufficient_dimensions_on_apply_symmetries():
@@ -259,33 +279,39 @@ def test_returns_correct_symmetries_for_list_of_valid_symmetries():
     assert result == [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV]
 
 
-def test_maps_full_bz_to_irreducible_correctly():
+def test_maps_full_bz_to_irreducible_correctly(monkeypatch):
     """The full BZ is mapped to the irreducible BZ correctly."""
     nk = (4, 4, 4)
     symmetries = [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV]
     kgrid = bz.KGrid(nk=nk, symmetries=symmetries)
-    with patch("dgamore.brillouin_zone.apply_symmetries") as mock_apply_symmetries:
+    mock_apply_symmetries = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(bz, "apply_symmetries", mock_apply_symmetries)
         kgrid.set_fbz2irrk()
-        mock_apply_symmetries.assert_called_once_with(kgrid.fbz2irrk, symmetries)
+    mock_apply_symmetries.assert_called_once_with(kgrid.fbz2irrk, symmetries)
 
 
-def test_handles_empty_symmetry_list_without_error():
+def test_handles_empty_symmetry_list_without_error(monkeypatch):
     """Mapping handles an empty symmetry list without error."""
     nk = (4, 4, 4)
     symmetries = []
     kgrid = bz.KGrid(nk=nk, symmetries=symmetries)
-    with patch("dgamore.brillouin_zone.apply_symmetries") as mock_apply_symmetries:
+    mock_apply_symmetries = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr(bz, "apply_symmetries", mock_apply_symmetries)
         kgrid.set_fbz2irrk()
-        mock_apply_symmetries.assert_called_once_with(kgrid.fbz2irrk, symmetries)
+    mock_apply_symmetries.assert_called_once_with(kgrid.fbz2irrk, symmetries)
 
 
-def test_maps_unique_elements_correctly_to_indices():
+def test_maps_unique_elements_correctly_to_indices(monkeypatch):
     """Unique elements are mapped correctly to indices."""
     kgrid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
-    with patch("numpy.unique", wraps=np.unique) as mock_unique:
+    mock_unique = MagicMock(wraps=np.unique)
+    with monkeypatch.context() as mp:
+        mp.setattr(np, "unique", mock_unique)
         kgrid.set_fbz2irrk()
         kgrid.set_irrk_maps()
-        mock_unique.assert_called_once_with(kgrid.fbz2irrk, return_index=True, return_inverse=True, return_counts=True)
+    mock_unique.assert_called_once_with(kgrid.fbz2irrk, return_index=True, return_inverse=True, return_counts=True)
 
 
 def test_handles_empty_input_without_error():
@@ -480,13 +506,11 @@ def test_nk_seg_returns_diff_of_cind():
 
 
 def test_k_axis_normalized_positions_and_length():
-    """The k-axis normalizes positions to [0,1] by cumulative distance."""
+    """The k-axis normalizes positions to [0,1] by cumulative distance: four consecutive k-points with equal
+    step lengths of 1 give cumulative positions [0,1,2,3], normalized by 3 to [0, 1/3, 2/3, 1]."""
     kp = KPath(nk=(4, 4, 4), path="gamma-x")
-    # create 4 consecutive k-points with equal step lengths of 1
     kp.kpts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]])
-    kp.nkp = [2, 2]  # total points = 4
-    # distances between consecutive points: [1, 1, 1] -> cumulative [1,2,3]
-    # k_axis_pos = [0,1,2,3] -> normalized by 3 -> [0, 1/3, 2/3, 1]
+    kp.nkp = [2, 2]
     expected = np.array([0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0])
     assert np.allclose(kp.k_axis, expected, atol=1e-12)
     assert kp.k_axis.size == kp.nk_tot
@@ -518,27 +542,16 @@ def test_get_kpath_val_reads_each_axis_for_its_own_column():
     assert np.array_equal(kz_vals, np.array([32.0, 31.0]))
 
 
-def test_get_bands_returns_sorted_real_eigenvalues():
-    """Patch KPath.map_to_kpath to return an object that yields 2x2 matrices. Ensure get_bands returns sorted real eigenvalues for each k-point."""
-
-    class MockEKPath:
-        def __init__(self, mats):
-            self.mats = mats
-            # emulate an array with shape (n_kpoints, nbands, nbands)
-            self.current_shape = (len(mats), mats[0].shape[0], mats[0].shape[0])
-
-        def __iter__(self):
-            return iter(self.mats)
-
+def test_get_bands_returns_sorted_real_eigenvalues(monkeypatch):
+    """get_bands returns sorted real eigenvalues for each k-point of the object KPath.map_to_kpath yields."""
     kp = KPath(nk=(4, 4, 4), path="gamma-x")
-    # create two diagonal matrices with known eigenvalues
-    mats = [
-        np.array([[2.0, 0.0], [0.0, 1.0]]),  # eigenvalues [2,1] -> sorted [1,2]
-        np.array([[4.0, 0.0], [0.0, 3.0]]),  # eigenvalues [4,3] -> sorted [3,4]
-    ]
-    mock_ek = MockEKPath(mats)
+    # two diagonal 2x2 matrices with eigenvalues [2, 1] and [4, 3], expected sorted to [1, 2] and [3, 4]
+    mats = [np.array([[2.0, 0.0], [0.0, 1.0]]), np.array([[4.0, 0.0], [0.0, 3.0]])]
+    mock_ek = MagicMock(current_shape=(len(mats), mats[0].shape[0], mats[0].shape[0]))
+    mock_ek.__iter__.side_effect = lambda: iter(mats)
 
-    with patch.object(KPath, "map_to_kpath", return_value=mock_ek):
+    with monkeypatch.context() as mp:
+        mp.setattr(KPath, "map_to_kpath", MagicMock(return_value=mock_ek))
         bands = kp.get_bands(ek=None)
 
     expected = np.array([[1.0, 2.0], [3.0, 4.0]])
@@ -551,7 +564,7 @@ def test_is_auto_symmetries_true_for_auto_flag():
     assert bz.is_auto_symmetries((bz.KnownSymmetries.AUTO,)) is True
 
 
-def test_is_auto_symmetries_false_for_legacy_list():
+def test_is_auto_symmetries_false_for_plain_symmetry_list():
     """is_auto_symmetries is False for a symmetry list without the AUTO flag."""
     assert bz.is_auto_symmetries(bz.two_dimensional_square_symmetries()) is False
     assert bz.is_auto_symmetries(bz.three_dimensional_cubic_symmetries()) is False
@@ -600,7 +613,7 @@ def test_kgrid_with_auto_sentinel_sets_auto_mode_flag():
     assert grid._auto_mode is True
 
 
-def test_kgrid_with_legacy_symmetries_does_not_set_auto_mode():
+def test_kgrid_with_plain_symmetries_does_not_set_auto_mode():
     """A KGrid built with predefined symmetries must NOT enter auto mode."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
     assert grid._auto_mode is False
@@ -629,8 +642,8 @@ def test_kgrid_is_auto_property_is_false_before_specify_auto_symmetries():
     assert grid.is_auto is False
 
 
-def test_kgrid_is_auto_property_is_false_for_legacy_grid():
-    """KGrid.is_auto is False for a legacy grid."""
+def test_kgrid_is_auto_property_is_false_for_plain_symmetry_grid():
+    """KGrid.is_auto is False for a plain-symmetry grid."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
     assert grid.is_auto is False
 
@@ -651,7 +664,6 @@ def test_specify_auto_symmetries_populates_all_expected_arrays():
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H)
 
-    # IBZ fields
     assert grid.fbz2irrk.shape == (nx, ny, nz)
     assert grid.irrk_ind is not None
     assert grid.irrk_inv is not None
@@ -660,7 +672,6 @@ def test_specify_auto_symmetries_populates_all_expected_arrays():
     assert grid.nk_irr == len(grid.irrk_ind)
     assert grid.nk_irr <= nx * ny * nz
 
-    # Auto-data fields
     assert grid._auto_us.shape == (nx, ny, nz, nb, nb)
     assert grid._auto_sigmas.shape == (nx, ny, nz)
     assert grid._auto_conjs.shape == (nx, ny, nz)
@@ -743,7 +754,7 @@ def test_specify_auto_symmetries_with_include_antiunitary_yields_smaller_or_equa
 
 
 def test_specify_auto_symmetries_raises_when_kgrid_is_not_in_auto_mode():
-    """Calling specify_auto_symmetries on a legacy KGrid must fail loudly so users don't accidentally clobber a non-auto setup."""
+    """Calling specify_auto_symmetries on a plain-symmetry (non-auto) KGrid must fail loudly so users don't accidentally clobber a non-auto setup."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
     H = _make_small_real_cubic_h(4, 4, 4, 1)
     with pytest.raises(RuntimeError, match="auto mode"):
@@ -783,35 +794,32 @@ def test_specify_auto_symmetries_accepts_non_contiguous_input():
     assert grid.is_auto is True
 
 
-def test_legacy_kgrid_two_dimensional_square_unchanged():
-    """Legacy code paths must continue to produce the same IBZ they always did."""
+def test_plain_symmetry_kgrid_two_dimensional_square_unchanged():
+    """The plain-symmetry code path must keep producing the same IBZ it always did: 4x4x1 with the full square
+    symmetry group has a small IBZ (Γ, X, M, and one interior point) whose counts sum to the full grid."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
-    # Known: 4x4x1 with full square symmetry has a small IBZ (Γ, X, M, and one interior)
     assert grid.nk_irr <= 16
-    # Sanity-consistent IBZ
     assert grid.irrk_count.sum() == 16
     assert grid.fbz2irrk.shape == (4, 4, 1)
 
 
-def test_legacy_kgrid_three_dimensional_cubic_unchanged():
-    """A legacy 3D cubic KGrid behaves unchanged."""
+def test_plain_symmetry_kgrid_three_dimensional_cubic_unchanged():
+    """A plain-symmetry 3D cubic KGrid behaves unchanged."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
     assert grid.nk_irr <= 64
     assert grid.irrk_count.sum() == 64
 
 
-def test_specify_auto_symmetries_finds_at_least_legacy_symmetries_for_cubic_h():
-    """For a real cubic H, the auto-discovered spatial group must be at least as large as the legacy ``three_dimensional_cubic`` group, so the auto IBZ must be no larger than the legacy IBZ. (Auto can find accidental extra symmetries on small grids, so we don't insist on strict equality here.)"""
+def test_specify_auto_symmetries_finds_at_least_explicit_cubic_symmetries_for_cubic_h():
+    """For a real cubic H, the auto-discovered spatial group must be at least as large as the explicit ``three_dimensional_cubic`` group, so the auto IBZ must be no larger than the explicit-group IBZ. (Auto can find accidental extra symmetries on small grids, so we don't insist on strict equality here.)"""
     H = _make_small_real_cubic_h(4, 4, 4, 1)
     g_auto = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
     g_auto.specify_auto_symmetries(H)
-    g_legacy = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    assert g_auto.nk_irr <= g_legacy.nk_irr
-    # The cubic orbit structure must be refined by auto: every legacy orbit member maps to the same auto IBZ
-    # representative (auto is a refinement), i.e. fbz2irrk_auto is constant on each legacy orbit.
+    g_explicit = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
+    assert g_auto.nk_irr <= g_explicit.nk_irr
+    # auto refines the cubic orbits: fbz2irrk_auto must be constant on each explicit-group orbit
     fbz_auto = g_auto.fbz2irrk.ravel()
-    fbz_legacy = g_legacy.fbz2irrk.ravel()
-    for legacy_rep in np.unique(fbz_legacy):
-        members = np.where(fbz_legacy == legacy_rep)[0]
-        # All members of the legacy orbit should be in the same auto orbit
+    fbz_explicit = g_explicit.fbz2irrk.ravel()
+    for explicit_rep in np.unique(fbz_explicit):
+        members = np.where(fbz_explicit == explicit_rep)[0]
         assert len(np.unique(fbz_auto[members])) == 1

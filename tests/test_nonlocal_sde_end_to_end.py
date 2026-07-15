@@ -6,9 +6,9 @@
 
 import contextlib
 import os
+import sys
 import types
-from unittest import mock
-from unittest.mock import patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -22,19 +22,19 @@ from tests import conftest
 
 
 @pytest.fixture
-def setup():
+def setup(monkeypatch):
     folder = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/end_2_end"
 
     comm_mock = conftest.create_comm_mock()
 
-    with patch("mpi4py.MPI.COMM_WORLD", comm_mock):
-        config.logger = DgaLogger(comm_mock, "./")
-        conftest.create_default_config(config, folder)
-        yield folder, comm_mock
+    monkeypatch.setattr("mpi4py.MPI.COMM_WORLD", comm_mock)
+    config.logger = DgaLogger(comm_mock, "./")
+    conftest.create_default_config(config, folder)
+    yield folder, comm_mock
 
 
 @pytest.fixture
-def setup_srvo3_cubic():
+def setup_srvo3_cubic(monkeypatch):
     def create_srvo3_cubic_config(c, f: str):
         c.box.niw_core = -1
         c.box.niv_core = -1
@@ -60,13 +60,14 @@ def setup_srvo3_cubic():
 
     comm_mock = conftest.create_comm_mock()
 
-    with patch("mpi4py.MPI.COMM_WORLD", comm_mock):
-        config.logger = DgaLogger(comm_mock, "./")
-        create_srvo3_cubic_config(config, folder)
-        yield folder, comm_mock
+    monkeypatch.setattr("mpi4py.MPI.COMM_WORLD", comm_mock)
+    config.logger = DgaLogger(comm_mock, "./")
+    create_srvo3_cubic_config(config, folder)
+    yield folder, comm_mock
 
 
 def make_cupy_mock():
+    """Builds a numpy-backed cupy module stand-in with a single available (no-op) GPU device."""
     cp = types.ModuleType("cupy")
 
     cp.asarray = np.asarray
@@ -80,52 +81,28 @@ def make_cupy_mock():
     cp.arange = np.arange
     cp.take = np.take
 
-    def multiply(*args, **kwargs):
-        return np.multiply(*args, **kwargs)
-
-    def einsum(*args, **kwargs):
-        return np.einsum(*args, **kwargs)
-
-    cp.einsum = mock.Mock(side_effect=einsum)
-    cp.multiply = mock.Mock(side_effect=multiply)
+    cp.einsum = np.einsum
+    cp.multiply = np.multiply
 
     cp.fft = types.ModuleType("cupy.fft")
-
-    def ifftn(*args, **kwargs):
-        return np.fft.ifftn(*args, **kwargs)
-
-    def ifft(*args, **kwargs):
-        return np.fft.ifft(*args, **kwargs)
-
-    cp.fft.ifftn = mock.Mock(side_effect=ifftn)
-    cp.fft.fftn = mock.Mock(side_effect=ifft)
+    cp.fft.ifftn = np.fft.ifftn
+    cp.fft.fftn = np.fft.ifft
 
     cp.cuda = types.ModuleType("cupy.cuda")
-    cp.cuda.is_available = mock.Mock(return_value=True)
+    cp.cuda.is_available = MagicMock(return_value=True)
 
     cp.cuda.runtime = types.ModuleType("cupy.cuda.runtime")
-    cp.cuda.runtime.getDeviceCount = mock.Mock(return_value=1)
+    cp.cuda.runtime.getDeviceCount = MagicMock(return_value=1)
 
-    class DummyDevice:
-        def __init__(self, device_id):
-            self.device_id = device_id
-
-        def use(self):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            pass
-
-    cp.cuda.Device = DummyDevice
+    cp.cuda.Device = MagicMock()
 
     return cp
 
 
 @contextlib.contextmanager
-def gpu_cpu_context(use_gpu: bool):
+def gpu_cpu_context(use_gpu: bool, monkeypatch):
+    """Yields whether the GPU is mocked: real cupy if available, the numpy-backed stand-in otherwise; a
+    disabled cupy import when the CPU path is forced."""
     mock_gpu = False
     if use_gpu:
         try:  # real GPU is available
@@ -135,17 +112,14 @@ def gpu_cpu_context(use_gpu: bool):
         except:  # fallback to mocked GPU
             mock_gpu = True
             mock_cupy = make_cupy_mock()
-            with mock.patch.dict(
-                "sys.modules",
-                {
-                    "cupy": mock_cupy,
-                    "cupy.cuda": mock_cupy.cuda,
-                    "cupy.cuda.runtime": mock_cupy.cuda.runtime,
-                },
-            ):
+            with monkeypatch.context() as m:
+                m.setitem(sys.modules, "cupy", mock_cupy)
+                m.setitem(sys.modules, "cupy.cuda", mock_cupy.cuda)
+                m.setitem(sys.modules, "cupy.cuda.runtime", mock_cupy.cuda.runtime)
                 yield mock_gpu
     else:  # force CPU path
-        with mock.patch.dict("sys.modules", {"cupy": None}):
+        with monkeypatch.context() as m:
+            m.setitem(sys.modules, "cupy", None)
             yield mock_gpu
 
 
@@ -153,7 +127,9 @@ def gpu_cpu_context(use_gpu: bool):
     "niw_core, niv_core, niv_shell, use_gpu, save_memory",
     [(20, 20, 10, True, True), (20, 20, 10, False, True), (20, 20, 10, True, False), (20, 20, 10, False, False)],
 )
-def test_calculates_nonlocal_sde_correctly(setup, niw_core, niv_core, niv_shell, use_gpu, save_memory):
+def test_calculates_nonlocal_sde_correctly(setup, monkeypatch, niw_core, niv_core, niv_shell, use_gpu, save_memory):
+    """The non-local SDE reproduces the reference self-energy on the CPU and (mocked) GPU paths in both memory
+    modes."""
     folder, comm_mock = setup
 
     config.box.niw_core = niw_core
@@ -174,7 +150,7 @@ def test_calculates_nonlocal_sde_correctly(setup, niw_core, niv_core, niv_shell,
 
     *_, s_loc = local_sde.perform_local_schwinger_dyson(g_dmft, g2_dens, g2_magn, u_loc)
 
-    with gpu_cpu_context(use_gpu) as mock_gpu:
+    with gpu_cpu_context(use_gpu, monkeypatch) as mock_gpu:
         sigma_dga = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft, s_loc)
 
     sigma_dga_mat = sigma_dga.decompress_q_dimension().cut_niv(50).mat
@@ -185,6 +161,9 @@ def test_calculates_nonlocal_sde_correctly(setup, niw_core, niv_core, niv_shell,
 
 @pytest.mark.parametrize("save_memory", [True, False])
 def test_calculates_srvo3_correctly(setup_srvo3_cubic, save_memory):
+    """The SrVO3 cubic run reproduces the cubic point-group symmetry of the self-energy: kx<->ky leaves dxy
+    invariant and swaps dxz<->dyz, kx<->kz leaves dxz invariant and swaps dxy<->dyz, ky<->kz leaves dyz
+    invariant and swaps dxy<->dxz."""
     folder_cubic, comm_mock = setup_srvo3_cubic
 
     g_dmft, s_dmft, g2_dens, g2_magn = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
@@ -200,8 +179,9 @@ def test_calculates_srvo3_correctly(setup_srvo3_cubic, save_memory):
     config.output.output_path = folder_cubic
 
     ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
-    perm = [1, 0, 2]  # swap orbital 0 and 1 because wan_hr.dat has ordering dxz, dxy and dyz instead of alphabetical
-    ek = ek[..., perm, :][..., perm]  # permute both row and column indices
+    # swap orbitals 0 and 1 in rows and columns because wan_hr.dat orders dxz, dxy, dyz instead of alphabetical
+    perm = [1, 0, 2]
+    ek = ek[..., perm, :][..., perm]
     ek.imag[np.abs(ek.imag) < 1e-9] = 0
     config.lattice.hamiltonian._ek = ek
     config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
@@ -221,9 +201,7 @@ def test_calculates_srvo3_correctly(setup_srvo3_cubic, save_memory):
     sigma_dga_cubic = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft, s_loc)
 
     niv = sigma_dga_cubic.current_shape[-1] // 2
-    s_cubic = sigma_dga_cubic.compress_q_dimension().mat.reshape(
-        12, 12, 12, 3, 3, 2 * niv
-    )  # (nkx, nky, nkz, nb, nb, niv)
+    s_cubic = sigma_dga_cubic.compress_q_dimension().mat.reshape(12, 12, 12, 3, 3, 2 * niv)
 
     s_xy_cub = np.swapaxes(s_cubic, 0, 1)
     s_xz_cub = np.swapaxes(s_cubic, 0, 2)
@@ -231,14 +209,11 @@ def test_calculates_srvo3_correctly(setup_srvo3_cubic, save_memory):
 
     atol = 1e-6
 
-    # X_Y_SYM (kx<->ky): dxy(0) invariant, dxz(1)<->dyz(2) swap
     assert np.allclose(s_cubic[..., 0, 0, :], s_xy_cub[..., 0, 0, :], atol=atol), "X_Y_SYM dxy failed"
     assert np.allclose(s_cubic[..., 1, 1, :], s_xy_cub[..., 2, 2, :], atol=atol), "X_Y_SYM dxz<->dyz failed"
 
-    # X_Z_SYM (kx<->kz): dxz(1) invariant, dxy(0)<->dyz(2) swap
     assert np.allclose(s_cubic[..., 1, 1, :], s_xz_cub[..., 1, 1, :], atol=atol), "X_Z_SYM dxz failed"
     assert np.allclose(s_cubic[..., 0, 0, :], s_xz_cub[..., 2, 2, :], atol=atol), "X_Z_SYM dxy<->dyz failed"
 
-    # Y_Z_SYM (ky<->kz): dyz(2) invariant, dxy(0)<->dxz(1) swap
     assert np.allclose(s_cubic[..., 2, 2, :], s_yz_cub[..., 2, 2, :], atol=atol), "Y_Z_SYM dyz failed"
     assert np.allclose(s_cubic[..., 0, 0, :], s_yz_cub[..., 1, 1, :], atol=atol), "Y_Z_SYM dxy<->dxz failed"

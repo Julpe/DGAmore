@@ -154,7 +154,6 @@ def estimate_peaks(
     n_ranks: int,
     with_eliashberg: bool,
     save_fq: bool = False,
-    construct_fq_cheap: bool = False,
     save_pairing_vertex: bool = False,
     n_eig: int = 1,
     overhead: float = OVERHEAD_FACTOR,
@@ -195,8 +194,6 @@ def estimate_peaks(
     :param save_fq: Whether the full ladder vertex is kept in the full ph box (``config.eliashberg.save_fq``); when
         True the per-rank ``fq`` accumulator spans the full ``[wn, vc, vc]`` block instead of the small pp box AND the
         whole irreducible-BZ vertex is gathered on one rank for saving (a single-rank peak in both paths).
-    :param construct_fq_cheap: Whether the ``fq`` per-q blocks are built on the smaller pp frequency box
-        (``config.eliashberg.construct_fq_cheap``), shrinking every per-q two-fermion block from ``vc`` to ``vpp``.
     :param save_pairing_vertex: Whether both pp pairing vertices are gathered on one rank for saving
         (``config.eliashberg.save_pairing_vertex``); a single-rank peak of the ``lanczos`` branch.
     :param n_eig: Number of requested eigenpairs (``config.eliashberg.n_eig``); sets the ARPACK Lanczos basis size
@@ -283,8 +280,8 @@ def estimate_peaks(
 
     if with_eliashberg:
         # ~FQ_MATMUL_FACTOR two-fermion blocks at the matmul peak (per rank fast, per q lean) + 1-fermion inputs + the
-        # lean accumulator. construct_fq_cheap shrinks vc->vpp; save_fq gathers the whole irr-BZ vertex on one rank.
-        vc_fq = vpp if construct_fq_cheap else vc
+        # lean accumulator. save_fq gathers the whole irr-BZ vertex on one rank.
+        vc_fq = vc
         fq_accumulator = _two_fermion_block(qi, nb, wp, vc) if save_fq else _two_fermion_block(qi, nb, 1, vpp)
         fq_gather_single = scale * _two_fermion_block(nk_irr, nb, wp, vc) if save_fq else 0.0
         peaks["fq"] = BranchPeak(

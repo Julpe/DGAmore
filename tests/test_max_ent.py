@@ -98,8 +98,8 @@ def test_orbital_to_band_basis_band_diagonal_is_symmetry_invariant():
     g_rep = rng.standard_normal((2, 2, niv)) + 1j * rng.standard_normal((2, 2, niv))
     g_img = np.einsum("ai,ijv,jb->abv", u_g, g_rep, u_g.conj().T)
 
-    hk = np.stack([hk_rep, hk_img])[:, None, None]  # [2, 1, 1, 2, 2]
-    data = np.stack([g_rep, g_img])[:, None, None]  # [2, 1, 1, 2, 2, niv]
+    hk = np.stack([hk_rep, hk_img])[:, None, None]
+    data = np.stack([g_rep, g_img])[:, None, None]
 
     result = orbital_to_band_basis(hk.copy(), data.copy())
 
@@ -108,21 +108,23 @@ def test_orbital_to_band_basis_band_diagonal_is_symmetry_invariant():
     assert np.allclose(diag_rep, diag_img, atol=1e-10)
 
 
-class _FakeResult:
-    def __init__(self, a_opt):
-        self.A_opt = a_opt
+def _fake_problem(im_axis, re_axis, im_data, beta):
+    """AnalyticContinuationProblem stand-in: encodes the first im-axis value of the data it is handed into a
+    constant real-frequency spectrum, so the continued 'spectral function' carries the band-diagonal Green's
+    function it was fed."""
+    a_opt = np.full(len(re_axis), float(np.imag(im_data[0])))
+    return MagicMock(solve=MagicMock(side_effect=lambda *args, **kwargs: [SimpleNamespace(A_opt=a_opt.copy())]))
 
 
-class _FakeProblem:
-    """Stand-in for AnalyticContinuationProblem: encodes the first im-axis value of
-    the data it is handed into a constant real-frequency spectrum, so the continued
-    'spectral function' carries the band-diagonal Green's function it was fed."""
+def _problem_from_solve(solve):
+    """Builds an AnalyticContinuationProblem stand-in whose instances delegate solve() to the given callable."""
+    return lambda *args, **kwargs: MagicMock(solve=MagicMock(side_effect=solve))
 
-    def __init__(self, im_axis, re_axis, im_data, beta):
-        self._a_opt = np.full(len(re_axis), float(np.imag(im_data[0])))
 
-    def solve(self, model=None, stdev=None):
-        return [_FakeResult(self._a_opt.copy())]
+def _fake_real_freq_two_point(spectrum=None, wgrid=None, kind=""):
+    """RealFreqTwoPoint stand-in whose kkt() returns a zero real part, so the continued self-energy reduces to
+    the (restored) Hartree shift."""
+    return MagicMock(kkt=MagicMock(return_value=np.zeros(len(wgrid))))
 
 
 def _build_hk(nk, n_bands, seed=0):
@@ -181,12 +183,14 @@ def _orbital_diag_spectrum(mat, nk, n_bands, niv_core, k_grid):
 @pytest.fixture
 def patch_maxent_mpi(monkeypatch):
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
-    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _FakeProblem)
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _fake_problem)
 
 
 @pytest.mark.parametrize("size", [1, 2])
 def test_perform_maxent_giwk_continues_band_diagonal_and_unfolds(tmp_path, patch_maxent_mpi, size):
-    """perform_maxent_giwk continues the band-diagonal Green's function and unfolds it over the full BZ."""
+    """perform_maxent_giwk continues the band-diagonal Green's function and unfolds it over the full BZ; since
+    H(k) has off-diagonal coupling the result must differ from the orbital-diagonal continuation, which proves
+    the band rotation is applied."""
     nk, n_bands, niv_core, w_count = (4, 4, 1), 2, 3, 7
     hk = _setup_maxent_config(tmp_path, nk, n_bands, niv_core, w_count, seed=7)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=11)
@@ -203,8 +207,6 @@ def test_perform_maxent_giwk_continues_band_diagonal_and_unfolds(tmp_path, patch
     # The mock spreads the band-diagonal value across all real frequencies.
     assert np.allclose(spectrum, expected[:, :, None], atol=1e-5)
 
-    # Discriminator: the result must NOT match the orbital-diagonal (old) behavior,
-    # since H(k) has off-diagonal coupling -- this proves the rotation is applied.
     orbital = _orbital_diag_spectrum(mat, nk, n_bands, niv_core, k_grid)
     assert not np.allclose(spectrum, orbital[:, :, None], atol=1e-5)
 
@@ -223,7 +225,6 @@ def test_perform_maxent_giwk_unfolds_symmetry_equivalent_kpoints(tmp_path, patch
     nk_tot = int(np.prod(nk))
     spectrum = results[0].reshape(nk_tot, n_bands, -1)
 
-    # Every full-BZ k-point must carry exactly its IBZ representative's spectrum.
     flat_rep = k_grid.irrk_ind[k_grid.irrk_inv].reshape(-1)  # representative flat index per FBZ point
     for k in range(nk_tot):
         assert np.allclose(spectrum[k], spectrum[flat_rep[k]], atol=1e-6)
@@ -235,12 +236,10 @@ def test_perform_maxent_giwk_failed_continuation_logs_kpoint_and_yields_zeros(tm
     _setup_maxent_config(tmp_path, nk, n_bands, w_count=w_count, seed=4)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=19)
 
-    class _RaisingProblem:
-        def __init__(self, *args, **kwargs):
-            raise RuntimeError("continuation failed")
-
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
-    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _RaisingProblem)
+    monkeypatch.setattr(
+        max_ent, "AnalyticContinuationProblem", MagicMock(side_effect=RuntimeError("continuation failed"))
+    )
 
     def fn(comm, rank):
         return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
@@ -264,16 +263,12 @@ def test_perform_maxent_giwk_reroutes_solver_prints_to_logger(tmp_path, monkeypa
     _setup_maxent_config(tmp_path, nk, n_bands, seed=6)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=23)
 
-    class _PrintingProblem:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def solve(self, *args, **kwargs):
-            print("Fermi fit failed.")
-            return (SimpleNamespace(A_opt=np.zeros(config.ana_cont.w_count)),)
+    def solve(*args, **kwargs):
+        print("Fermi fit failed.")
+        return (SimpleNamespace(A_opt=np.zeros(config.ana_cont.w_count)),)
 
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
-    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _PrintingProblem)
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _problem_from_solve(solve))
 
     def fn(comm, rank):
         return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
@@ -289,16 +284,12 @@ def test_perform_maxent_giwk_runtime_warning_is_treated_as_failure(tmp_path, mon
     _setup_maxent_config(tmp_path, nk, n_bands, seed=8)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=29)
 
-    class _WarningProblem:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def solve(self, *args, **kwargs):
-            warnings.warn("overflow encountered", RuntimeWarning)
-            return (SimpleNamespace(A_opt=np.ones(config.ana_cont.w_count)),)
+    def solve(*args, **kwargs):
+        warnings.warn("overflow encountered", RuntimeWarning)
+        return (SimpleNamespace(A_opt=np.ones(config.ana_cont.w_count)),)
 
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
-    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _WarningProblem)
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _problem_from_solve(solve))
 
     def fn(comm, rank):
         return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
@@ -317,16 +308,12 @@ def test_perform_maxent_giwk_optimize_warning_is_suppressed(tmp_path, monkeypatc
     _setup_maxent_config(tmp_path, nk, n_bands, seed=10)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=31)
 
-    class _OptimizeWarningProblem:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def solve(self, *args, **kwargs):
-            warnings.warn("Covariance of the parameters could not be estimated", OptimizeWarning)
-            return (SimpleNamespace(A_opt=np.ones(config.ana_cont.w_count)),)
+    def solve(*args, **kwargs):
+        warnings.warn("Covariance of the parameters could not be estimated", OptimizeWarning)
+        return (SimpleNamespace(A_opt=np.ones(config.ana_cont.w_count)),)
 
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
-    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _OptimizeWarningProblem)
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _problem_from_solve(solve))
 
     def fn(comm, rank):
         return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
@@ -356,16 +343,12 @@ def test_perform_maxent_dmft_optimize_warning_is_suppressed(tmp_path, monkeypatc
     sig[0, 0, 0, 0, 0] = 0.2 - 0.1j * np.ones(2 * niv)
     sigma_dmft = SelfEnergy(sig, nk=(1, 1, 1), full_niv_range=True, calc_smom=False, beta=config.sys.beta)
 
-    class _OptimizeWarningProblem:
-        def __init__(self, *args, **kwargs):
-            pass
+    def solve(*args, **kwargs):
+        warnings.warn("Covariance of the parameters could not be estimated", OptimizeWarning)
+        return (SimpleNamespace(A_opt=np.ones(w_count)),)
 
-        def solve(self, *args, **kwargs):
-            warnings.warn("Covariance of the parameters could not be estimated", OptimizeWarning)
-            return (SimpleNamespace(A_opt=np.ones(w_count)),)
-
-    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _OptimizeWarningProblem)
-    monkeypatch.setattr(max_ent, "RealFreqTwoPoint", _FakeRealFreqTwoPoint)
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _problem_from_solve(solve))
+    monkeypatch.setattr(max_ent, "RealFreqTwoPoint", _fake_real_freq_two_point)
 
     with warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("always")
@@ -394,17 +377,6 @@ def test_perform_maxent_giwk_single_band(tmp_path, patch_maxent_mpi):
     assert np.allclose(spectrum, expected[:, :, None], atol=1e-5)
 
 
-class _FakeRealFreqTwoPoint:
-    """Stand-in for RealFreqTwoPoint whose kkt() returns a zero real part, so the
-    continued self-energy reduces to the (restored) Hartree shift."""
-
-    def __init__(self, spectrum=None, wgrid=None, kind=""):
-        self._n = len(wgrid)
-
-    def kkt(self):
-        return np.zeros(self._n)
-
-
 def test_perform_maxent_dmft_builds_full_bz_spectral_function(tmp_path, monkeypatch):
     """perform_maxent_dmft builds a real, non-negative full-BZ spectral function."""
     nk, n_bands, w_count, niv = (3, 3, 1), 2, 9, 4
@@ -422,8 +394,8 @@ def test_perform_maxent_dmft_builds_full_bz_spectral_function(tmp_path, monkeypa
         sig[0, 0, 0, b, b] = (0.2 * (b + 1)) - 0.1j * np.ones(2 * niv)
     sigma_dmft = SelfEnergy(sig, nk=(1, 1, 1), full_niv_range=True, calc_smom=False, beta=config.sys.beta)
 
-    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _FakeProblem)
-    monkeypatch.setattr(max_ent, "RealFreqTwoPoint", _FakeRealFreqTwoPoint)
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _fake_problem)
+    monkeypatch.setattr(max_ent, "RealFreqTwoPoint", _fake_real_freq_two_point)
 
     spectrum = max_ent.perform_maxent_dmft(sigma_dmft, hk)
 

@@ -6,7 +6,7 @@
 
 import logging
 import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -21,15 +21,15 @@ from tests import conftest
 
 
 @pytest.fixture
-def setup():
+def setup(monkeypatch):
     folder = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/end_2_end"
 
     comm_mock = conftest.create_comm_mock()
 
-    with patch("mpi4py.MPI.COMM_WORLD", comm_mock):
-        config.logger = DgaLogger(comm_mock, "./")
-        conftest.create_default_config(config, folder)
-        yield folder
+    monkeypatch.setattr("mpi4py.MPI.COMM_WORLD", comm_mock)
+    config.logger = DgaLogger(comm_mock, "./")
+    conftest.create_default_config(config, folder)
+    yield folder
 
 
 @pytest.fixture(autouse=True)
@@ -58,6 +58,7 @@ def mock_logger(monkeypatch):
     ],
 )
 def test_extracts_dmft_quantities_correctly(setup, niw_core, niv_core, niv_shell):
+    """The DMFT loader reproduces the reference 1- and 2-particle quantities for several frequency boxes."""
     folder = setup
 
     config.box.niw_core = niw_core
@@ -132,6 +133,7 @@ def test_extracts_dmft_quantities_correctly(setup, niw_core, niv_core, niv_shell
     ],
 )
 def test_extracts_dmft_quantities_correctly_with_symmetrization(setup, niw_core, niv_core, niv_shell):
+    """The DMFT loader with orbital symmetrization reproduces the reference quantities for several boxes."""
     folder = setup
 
     config.box.niw_core = niw_core
@@ -183,6 +185,7 @@ def test_extracts_dmft_quantities_correctly_with_symmetrization(setup, niw_core,
 
 @pytest.mark.parametrize("niw_core, niv_core, niv_shell", [(20, 20, 10)])
 def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
+    """The local Schwinger-Dyson equation reproduces the reference vertices and self-energy."""
     folder = setup
 
     config.box.niw_core = niw_core
@@ -242,6 +245,7 @@ def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
 
 
 def test_create_gamma_r_requires_explicit_beta():
+    """create_gamma_r takes beta as a required explicit parameter (no config fallback)."""
     import inspect
     from dgamore.local_sde import create_gamma_r
 

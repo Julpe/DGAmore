@@ -141,10 +141,9 @@ class LambdaCorrection:
         appended to a text file.
 
         :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{q}_{r}` to correct.
-        :param quiet: If ``True``, the determined :math:`\lambda` is not appended to the lambda text file (used by
-            the stabilizer's Jacobian probes). Note the 'sp' type reads the *saved* density susceptibility from
-            file, so quiet probes evaluate it with the last really-saved one - the lambda background is frozen
-            during a build.
+        :param quiet: If ``True``, the determined :math:`\lambda` is not appended to the lambda text file. Note the
+            'sp' type reads the *saved* density susceptibility from file, so quiet evaluations use the last
+            really-saved one.
         :return: The :math:`\lambda`-corrected physical susceptibility (unchanged for 'sp' in non-magnetic
             channels).
         :raises ValueError: If the configured lambda-correction type is neither 'spch' nor 'sp'.
@@ -555,8 +554,8 @@ class MultiOrbitalLambdaCorrection:
         :meth:`LambdaCorrection.perform` this works for any number of orbitals.
 
         :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{q}_{r}` to correct.
-        :param quiet: If ``True``, the determined mass is not appended to the lambda text file (used by the
-            stabilizer's Jacobian probes, which must not pollute the run directory).
+        :param quiet: If ``True``, the determined mass is not appended to the lambda text file (no file writes
+            outside the run's regular per-iteration output).
         :return: The :math:`\lambda`-corrected physical susceptibility.
         """
         logger = config.logger
@@ -669,9 +668,7 @@ class LambdaAnnealer:
     The gap is measured on the STATIC (:math:`\omega=0`) compound blocks only: the physical positivity statement
     (and the pole danger) lives there, while the full-frequency spectrum of the inverse carries the large
     negative shell-truncation baseline that would inflate the mass by orders of magnitude. It is measured on
-    every non-probe iteration (also when the mass is zero) so a pole opening mid-run re-arms the scaffold; the
-    stabilizer's quiet Jacobian probes skip the measurement, since their perturbed states must not steer the
-    schedule.
+    every iteration (also when the mass is zero) so a pole opening mid-run re-arms the scaffold.
 
     The mass is raised toward its target with damping :data:`_BUMP_DAMPING` per iteration rather than jumped, so
     it changes on the self-energy's own relaxation timescale and each measured gap tracks a settled
@@ -709,14 +706,13 @@ class LambdaAnnealer:
 
     def apply(self, chi_phys_q_r: FourPoint, mpi_dist_irrq: MpiDistributor, measure: bool = True) -> FourPoint:
         r"""
-        Measures the channel's static boson gap (unless ``measure`` is False, i.e. a quiet Jacobian probe) and,
-        if the shared mass is nonzero, adds it to the compound diagonal of the inverse susceptibility at all
-        bosonic frequencies.
+        Measures the channel's static boson gap (unless ``measure`` is False) and, if the shared mass is nonzero,
+        adds it to the compound diagonal of the inverse susceptibility at all bosonic frequencies.
 
         :param chi_phys_q_r: The physical susceptibility :math:`\chi^{q\omega}_{r;1234}` (no fermionic frequency
             dimensions).
         :param mpi_dist_irrq: The irreducible-BZ distributor (the measured gap is reduced over ranks).
-        :param measure: If ``True``, (re-)measure and store the static gap; probes pass ``False``.
+        :param measure: If ``True``, (re-)measure and store the static gap; ``False`` applies the mass only.
         :return: The (possibly mass-shifted) physical susceptibility as a :class:`FourPoint`.
         """
         channel = chi_phys_q_r.channel.value

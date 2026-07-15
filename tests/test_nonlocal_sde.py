@@ -6,17 +6,23 @@
 
 import itertools
 import os
-from unittest import mock
+import sys
+import types
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
+import dgamore.brillouin_zone as bz
 import dgamore.config as config
+import dgamore.mpi_utils as mpi_utils
 import dgamore.nonlocal_sde as nonlocal_sde
+from dgamore.four_point import FourPoint
 from dgamore.greens_function import GreensFunction
 from dgamore.hamiltonian import Hamiltonian
-from dgamore.jacobian_stabilization import PhysicalSolutionStabilizer
-from dgamore.interaction import Interaction
+from dgamore.interaction import Interaction, LocalInteraction
+from dgamore.local_four_point import LocalFourPoint
 from dgamore.local_sde import get_local_hartree_fock
 from dgamore.n_point_base import SpinChannel
 from dgamore.nonlocal_sde import (
@@ -29,7 +35,7 @@ from dgamore.nonlocal_sde import (
     perform_ornstein_zernike_fit,
 )
 from dgamore.self_energy import SelfEnergy
-from tests.conftest import create_comm_mock
+from tests.conftest import FAKE_MPI, create_comm_mock, run_parallel
 
 LOCAL_SDE_DATA = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/local_sde"
 
@@ -46,8 +52,9 @@ def test_init_mu_history_fresh_uses_current_mu():
 
 
 def test_init_mu_history_from_previous_syncs_global_mu(monkeypatch, tmp_path):
-    """Resuming from a previous run seeds the history with, and syncs config.sys.mu to, that run's last mu."""
-    config.sys.mu = 0.3  # stale DMFT value that must be overwritten
+    """Resuming from a previous run seeds the history with, and syncs the stale global config.sys.mu to, that
+    run's last converged mu."""
+    config.sys.mu = 0.3
     config.self_consistency.previous_sc_path = str(tmp_path)
     previous_mu = 1.5
     monkeypatch.setattr(np, "load", lambda *args, **kwargs: np.array([0.9, 1.2, previous_mu]))
@@ -55,7 +62,7 @@ def test_init_mu_history_from_previous_syncs_global_mu(monkeypatch, tmp_path):
     mu_history = _init_mu_history(3)
 
     assert mu_history == [previous_mu]
-    assert config.sys.mu == previous_mu  # global synced to the previous run's converged mu
+    assert config.sys.mu == previous_mu
 
 
 def test_nonlocal_hartree_fock_matches_local_reference():
@@ -75,7 +82,7 @@ def test_nonlocal_hartree_fock_matches_local_reference():
 
     occ = np.load(f"{LOCAL_SDE_DATA}/occ.npy", allow_pickle=False)
     config.sys.occ = occ
-    config.sys.occ_k = np.broadcast_to(occ, nk + (nb, nb)).copy()  # k-independent occupation
+    config.sys.occ_k = np.broadcast_to(occ, nk + (nb, nb)).copy()
 
     u_loc = Hamiltonian().read_umatrix(f"{LOCAL_SDE_DATA}/u_matrix.dat").get_local_u()
     v_nonloc = Interaction(
@@ -87,7 +94,7 @@ def test_nonlocal_hartree_fock_matches_local_reference():
     q_list = np.array(list(itertools.product(*[range(n) for n in nk])))
 
     hartree, fock = get_hartree_fock(u_loc, v_nonloc, q_list)
-    hf_nonlocal = (hartree + fock)[..., 0]  # [nk_tot, nb, nb]
+    hf_nonlocal = (hartree + fock)[..., 0]
 
     sigma_hf_ref = np.load(f"{LOCAL_SDE_DATA}/sigma_HF.npy", allow_pickle=False)
     assert hf_nonlocal.shape == (nq_tot, nb, nb)
@@ -96,43 +103,22 @@ def test_nonlocal_hartree_fock_matches_local_reference():
     assert np.allclose(hf_nonlocal, get_local_hartree_fock(u_loc, occ)[None, ...])
 
 
-class _ConstantChi:
-    """Minimal physical-susceptibility stand-in whose BZ and frequency reductions are identities."""
-
-    def __init__(self, mat: np.ndarray):
-        """Stores the orbital-resolved matrix that the reduction chain returns unchanged."""
-        self._mat = mat
-
-    def copy(self):
-        """Identity copy; the reduction chain is non-mutating so a fresh wrapper suffices."""
-        return _ConstantChi(self._mat)
-
-    def map_to_full_bz(self, grid):
-        """Identity unfolding to the full BZ."""
-        return self
-
-    def to_half_niw_range(self):
-        """Identity reduction to the half niw range."""
-        return self
-
-    def take_first_wn(self):
-        """Identity selection of the first bosonic frequency."""
-        return self
-
-    @property
-    def mat(self) -> np.ndarray:
-        """The backing orbital-resolved matrix."""
-        return self._mat
+def _constant_chi(mat: np.ndarray):
+    """Builds a physical-susceptibility stand-in whose copy and BZ/frequency reductions are identities."""
+    chi = MagicMock(mat=mat)
+    for name in ("copy", "map_to_full_bz", "to_half_niw_range", "take_first_wn"):
+        getattr(chi, name).return_value = chi
+    return chi
 
 
 def test_ornstein_zernike_fit_aggregates_nonconverged_warnings(monkeypatch):
     """All non-converging OZ fits collapse into a single aggregated warning instead of one log per orbital."""
     config.sys.n_bands = 2
-    logger = mock.Mock()
+    logger = MagicMock()
     monkeypatch.setattr(config, "logger", logger, raising=False)
-    monkeypatch.setattr(nonlocal_sde.opt, "curve_fit", mock.Mock(side_effect=RuntimeError("forced non-convergence")))
+    monkeypatch.setattr(nonlocal_sde.opt, "curve_fit", MagicMock(side_effect=RuntimeError("forced non-convergence")))
 
-    perform_ornstein_zernike_fit(_ConstantChi(np.ones((2, 2, 1, 2, 2, 2, 2), dtype=np.complex64)))
+    perform_ornstein_zernike_fit(_constant_chi(np.ones((2, 2, 1, 2, 2, 2, 2), dtype=np.complex64)))
 
     logger.warning.assert_called_once()
     msg = logger.warning.call_args.args[0]
@@ -143,11 +129,11 @@ def test_ornstein_zernike_fit_aggregates_nonconverged_warnings(monkeypatch):
 def test_ornstein_zernike_fit_logs_no_warning_when_all_converge(monkeypatch):
     """A fully converging set of OZ fits emits no warning at all (the aggregation guard stays silent)."""
     config.sys.n_bands = 2
-    logger = mock.Mock()
+    logger = MagicMock()
     monkeypatch.setattr(config, "logger", logger, raising=False)
-    monkeypatch.setattr(nonlocal_sde.opt, "curve_fit", mock.Mock(return_value=(np.array([1.0, 2.0]), None)))
+    monkeypatch.setattr(nonlocal_sde.opt, "curve_fit", MagicMock(return_value=(np.array([1.0, 2.0]), None)))
 
-    perform_ornstein_zernike_fit(_ConstantChi(np.ones((2, 2, 1, 2, 2, 2, 2), dtype=np.complex64)))
+    perform_ornstein_zernike_fit(_constant_chi(np.ones((2, 2, 1, 2, 2, 2, 2), dtype=np.complex64)))
 
     logger.warning.assert_not_called()
 
@@ -180,7 +166,7 @@ def test_build_giwk_full_shared_single_rank_matches_direct_dyson():
 
     giwk, win, node_comm = _build_giwk_full(comm, sigma, 0.3, ek, 10.0)
 
-    assert win is None  # a single-rank node needs no shared window
+    assert win is None
     assert np.array_equal(giwk.mat, GreensFunction.get_g_full(sigma, 0.3, ek, 10.0).mat)
     _release_shared_giwk(win, node_comm)  # must not raise on the single-rank / mock path
 
@@ -192,7 +178,7 @@ def test_release_shared_giwk_without_sharing_is_noop():
 
 def test_release_shared_giwk_frees_window_and_communicator():
     """With a window allocated, _release barriers (so no rank still reads), frees the window, then the node comm."""
-    win, node_comm = mock.Mock(), mock.Mock()
+    win, node_comm = MagicMock(), MagicMock()
     _release_shared_giwk(win, node_comm)
     node_comm.Barrier.assert_called_once()
     win.Free.assert_called_once()
@@ -201,7 +187,7 @@ def test_release_shared_giwk_frees_window_and_communicator():
 
 def test_free_shared_window_frees_window_but_keeps_communicator():
     """_free_shared_window barriers and frees the window but leaves the node communicator alive (reused for the cut)."""
-    win, node_comm = mock.Mock(), mock.Mock()
+    win, node_comm = MagicMock(), MagicMock()
     _free_shared_window(win, node_comm)
     node_comm.Barrier.assert_called_once()
     win.Free.assert_called_once()
@@ -230,10 +216,6 @@ def test_cut_and_reshare_giwk_shared_single_rank_matches_plain_cut():
 
 def _bse_assembly_inputs(rng, o=2, nqi=3, nw=3, niv=2, beta=12.5):
     """Builds (gamma [full niw], gchi0_q_inv [half niw, 1 vn], u_loc, v_nonloc) for the BSE-matrix assembly tests."""
-    from dgamore.four_point import FourPoint
-    from dgamore.interaction import Interaction, LocalInteraction
-    from dgamore.local_four_point import LocalFourPoint
-
     config.sys.beta = beta
     gamma_shape = (o, o, o, o, 2 * nw - 1, 2 * niv, 2 * niv)
     gamma_mat = rng.standard_normal(gamma_shape) + 1j * rng.standard_normal(gamma_shape)
@@ -306,8 +288,6 @@ def test_calculate_kernel_r_q_matches_identity_like_reference():
     """The self-energy kernel U_r (gamma - gamma U_r chi - 2/3 identity)_magn must equal the explicit expression
     built with the full identity_like block, locking the in-place orbital-diagonal subtraction (the identity is
     nonzero at o1 == o4, o2 == o3 for every frequency); the density channel carries no identity term."""
-    from dgamore.four_point import FourPoint
-
     rng = np.random.default_rng(25)
     o, nqi, nw, niv, beta = 2, 3, 3, 2, 12.5
     config.sys.beta = beta
@@ -350,9 +330,6 @@ def test_vrg_right_is_first_frequency_summed_three_leg_vertex():
     chi*^{q v_1 v}_{12ab} (chi^{qv}_{0;ba34})^{-1}, which the dcba orbital permutation of the last-frequency-summed
     chi* provides for a time-reversal-symmetric chi* (chi*^{q v v'}_{1234} = chi*^{q v' v}_{4321}); the left vertex
     gamma^{qv}_{1234} = beta sum_{ab} sum_{v'} (chi^{qv}_{0;12ab})^{-1} chi*^{q v v'}_{ba34} is locked alongside."""
-    from dgamore.four_point import FourPoint
-    from dgamore.n_point_base import SpinChannel
-
     o, nqi, nw, n2, beta = 2, 3, 3, 4, 12.5
     config.sys.beta = beta
     rng = np.random.default_rng(11)
@@ -373,15 +350,10 @@ def test_vrg_right_is_first_frequency_summed_three_leg_vertex():
     assert np.allclose(vrg_right.mat, ref_right, atol=1e-10)
 
 
-def test_unused_qloop_sigma_variants_agree():
+def test_unused_qloop_sigma_variants_agree(monkeypatch):
     """The unused q-loop self-energy contraction variants - the plain reference, the Fortran-buffered CPU one, the
     GPU one (run through a numpy-backed cupy stub) and the auto dispatcher (falling back to the CPU) - produce
     matching self-energies on synthetic full-BZ kernel and Green's-function data, locking the kept functions."""
-    import types
-
-    import dgamore.brillouin_zone as bz
-    from dgamore.four_point import FourPoint
-
     nk, o, niw, niv = (4, 4, 1), 2, 3, 4
     config.lattice.nk = nk
     config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
@@ -389,7 +361,7 @@ def test_unused_qloop_sigma_variants_agree():
     config.box.niv_core = niv
     config.sys.n_bands = o
     config.sys.beta = 12.5
-    config.logger = mock.MagicMock()
+    config.logger = MagicMock()
 
     rng = np.random.default_rng(7)
     niv_g = niv + niw + 2
@@ -411,10 +383,12 @@ def test_unused_qloop_sigma_variants_agree():
     cupy_stub = types.ModuleType("cupy")
     cupy_stub.zeros, cupy_stub.asarray, cupy_stub.arange = np.zeros, np.asarray, np.arange
     cupy_stub.einsum, cupy_stub.asnumpy = np.einsum, lambda x: x
-    with mock.patch.dict("sys.modules", {"cupy": cupy_stub}):
+    with monkeypatch.context() as mp:
+        mp.setitem(sys.modules, "cupy", cupy_stub)
         sigma_gpu = nonlocal_sde.calculate_sigma_from_kernel_gpu(make_kernel(), giwk, q_list)
-    with mock.patch.dict("sys.modules", {"cupy": None}):
-        sigma_auto = nonlocal_sde.calculate_sigma_from_kernel_auto(mock.MagicMock(), make_kernel(), giwk, q_list)
+    with monkeypatch.context() as mp:
+        mp.setitem(sys.modules, "cupy", None)
+        sigma_auto = nonlocal_sde.calculate_sigma_from_kernel_auto(MagicMock(), make_kernel(), giwk, q_list)
 
     assert np.allclose(sigma_cpu.mat, sigma_ref.mat, atol=1e-6)
     assert np.allclose(sigma_gpu.mat, sigma_ref.mat, atol=1e-6)
@@ -423,8 +397,6 @@ def test_unused_qloop_sigma_variants_agree():
 
 def _chi_from_compound(comp: np.ndarray, o: int):
     """Builds a 0-vn FourPoint [q, o, o, o, o, w] from a compound array [q, w, o^2, o^2] (rows (12), cols (43))."""
-    from dgamore.four_point import FourPoint
-
     nq, nw = comp.shape[:2]
     mat = np.transpose(comp.reshape(nq, nw, o, o, o, o), (0, 2, 3, 5, 4, 1))
     return FourPoint(mat.copy(), SpinChannel.DENS, (nq, 1, 1), 1, 0, False, True, True)
@@ -474,8 +446,6 @@ def test_restrict_chi_phys_matches_scalar_clamp_for_single_band():
     behavior: negative chi maps to 1/floor, positive chi is unchanged."""
     floor = 1e-4
     mat = np.array([-0.5, 0.3], dtype=complex).reshape(2, 1, 1, 1, 1, 1)
-    from dgamore.four_point import FourPoint
-
     chi = FourPoint(mat.copy(), SpinChannel.DENS, (2, 1, 1), 1, 0, False, True, True)
     out, n_floored = nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues(chi, floor=floor)
     assert n_floored == 1
@@ -521,10 +491,6 @@ def test_effective_epsilon_is_relaxed_while_lambda_correction_is_active():
 def test_sde_fft_rspace_greens_function_node_sharing_matches_private_build():
     """calculate_sigma_from_kernel_fft_cpu with a node communicator routes the R-space Green's function through the
     node-shared window builder and reproduces the private per-rank build bit-identically."""
-    import dgamore.brillouin_zone as bz
-    from dgamore.four_point import FourPoint
-    from tests import conftest
-
     nk, o, niw, niv = (4, 4, 1), 2, 3, 4
     config.lattice.nk = nk
     config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
@@ -533,7 +499,7 @@ def test_sde_fft_rspace_greens_function_node_sharing_matches_private_build():
     config.sys.n_bands = o
     config.sys.beta = 12.5
     config.memory.use_shared_memory_common_obj = True
-    config.logger = mock.MagicMock()
+    config.logger = MagicMock()
 
     rng = np.random.default_rng(9)
     g_shape = (*nk, o, o, 2 * (niv + niw + 2))
@@ -541,8 +507,8 @@ def test_sde_fft_rspace_greens_function_node_sharing_matches_private_build():
     g_mat = (rng.standard_normal(g_shape) + 1j * rng.standard_normal(g_shape)).astype(np.complex64)
     kernel_mat = (rng.standard_normal(k_shape) + 1j * rng.standard_normal(k_shape)).astype(np.complex64)
     giwk = GreensFunction(g_mat, calc_filling=False, nk=nk, beta=config.sys.beta)
-    mpi_dist = mock.MagicMock()
-    mpi_dist.comm = conftest.create_comm_mock()
+    mpi_dist = MagicMock()
+    mpi_dist.comm = create_comm_mock()
     pairs = [(i, i) for i in range(niw + 1)]
 
     def make_kernel():
@@ -550,18 +516,10 @@ def test_sde_fft_rspace_greens_function_node_sharing_matches_private_build():
             kernel_mat.copy(), SpinChannel.NONE, nk, 1, 1, full_niw_range=False, has_compressed_q_dimension=True
         )
 
-    class _SingleRankComm:
-        @staticmethod
-        def Get_rank():
-            return 0
-
-        @staticmethod
-        def Get_size():
-            return 1
-
+    node_comm = MagicMock(**{"Get_rank.return_value": 0, "Get_size.return_value": 1})
     sigma_plain = nonlocal_sde.calculate_sigma_from_kernel_fft_cpu(mpi_dist, make_kernel(), giwk, pairs)
     sigma_shared = nonlocal_sde.calculate_sigma_from_kernel_fft_cpu(
-        mpi_dist, make_kernel(), giwk, pairs, node_comm=_SingleRankComm()
+        mpi_dist, make_kernel(), giwk, pairs, node_comm=node_comm
     )
     assert np.array_equal(sigma_shared.mat, sigma_plain.mat)
 
@@ -569,8 +527,6 @@ def test_sde_fft_rspace_greens_function_node_sharing_matches_private_build():
 def test_load_node_shared_local_vertex_private_path_applies_transform(monkeypatch):
     """Without a node communicator the helper loads privately, applies the transform and returns win=None, matching
     the former per-rank load + permute + scale chain."""
-    from dgamore.local_four_point import LocalFourPoint
-
     rng = np.random.default_rng(81)
     mat = (rng.standard_normal((2, 2, 2, 2, 3, 4, 4)) + 1j * rng.standard_normal((2, 2, 2, 2, 3, 4, 4))).astype(
         np.complex64
@@ -590,10 +546,7 @@ def test_load_node_shared_local_vertex_private_path_applies_transform(monkeypatc
 
 def test_load_node_shared_local_vertex_loads_once_per_node(monkeypatch):
     """With a node communicator the file is read once per node (the root) and every rank maps the same values."""
-    import dgamore.mpi_utils as mpi_utils_mod
-    from tests.conftest import FAKE_MPI, run_parallel
-
-    monkeypatch.setattr(mpi_utils_mod, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     config.memory.use_shared_memory_common_obj = True
     rng = np.random.default_rng(82)
     mat = (rng.standard_normal((2, 2, 2, 2, 3, 4, 4)) + 1j * rng.standard_normal((2, 2, 2, 2, 3, 4, 4))).astype(
@@ -620,419 +573,22 @@ def test_load_node_shared_local_vertex_loads_once_per_node(monkeypatch):
     assert np.array_equal(res[0], mat) and np.array_equal(res[1], mat)
 
 
-class FakeSelfEnergyWindow:
-    """Duck-typed SelfEnergy stand-in exposing only what apply_modified_preconditioner touches."""
-
-    def __init__(self, mat, niv):
-        self.mat = mat
-        self.niv = niv
-        self.compress_calls = 0
-
-    def compress_q_dimension(self):
-        self.compress_calls += 1
-        return self
-
-
-class RecordingStabLogger:
-    """Counting logger stub for the stabilizer glue tests."""
-
-    def __init__(self):
-        self.calls = {"info": 0, "debug": 0, "log_memory_usage": 0, "warning": 0}
-
-    def info(self, *a, **k):
-        self.calls["info"] += 1
-
-    def debug(self, *a, **k):
-        self.calls["debug"] += 1
-
-    def log_memory_usage(self, *a, **k):
-        self.calls["log_memory_usage"] += 1
-
-    def warning(self, *a, **k):
-        self.calls["warning"] += 1
-
-
-def _vec_inner(m):
-    """Flattens a complex window tensor into the stabilizer's real [Re; Im] vector."""
-    f = m.reshape(-1)
-    return np.concatenate((f.real, f.imag))
-
-
-def _build_window_stabilizer(inner_shape, p, *, unstable):
-    """Builds a real PhysicalSolutionStabilizer on an affine inner-window map with or without one unstable mode."""
-    nc = int(np.prod(inner_shape))
-    n = 2 * nc
-
-    def to_mat(v):
-        return (v[:nc] + 1j * v[nc:]).reshape(inner_shape)
-
-    rng = np.random.default_rng(0)
-    q_mat, _ = np.linalg.qr(rng.standard_normal((n, n)))
-    s = rng.uniform(-0.4, 0.4, n)
-    if unstable:
-        s[0] = (1.30 - (1.0 - p)) / p
-    jac = q_mat @ np.diag(s) @ q_mat.T
-    b = rng.standard_normal(n)
-
-    def proposal(mat):
-        return to_mat(jac @ _vec_inner(mat) + b)
-
-    xstar = np.linalg.solve(np.eye(n) - jac, b)
-    return PhysicalSolutionStabilizer(proposal, to_mat(xstar), p, inner_shape[-1] // 2, n_modes=6)
-
-
 @pytest.fixture
 def stab_logger(monkeypatch):
-    """Installs a RecordingStabLogger as config.logger for the duration of a test."""
-    rec = RecordingStabLogger()
-    monkeypatch.setattr(config, "logger", rec, raising=False)
-    return rec
-
-
-def test_preconditioner_reflects_inner_window_only(stab_logger):
-    """The reflection changes exactly the inner Jacobian window of the proposal and leaves the rest untouched."""
-    nk, nb, niv, niv_jac = 4, 2, 10, 4
-    stab = _build_window_stabilizer((nk, nb, nb, 2 * niv_jac), p=0.3, unstable=True)
-    assert stab.n_unstable >= 1
-    rng = np.random.default_rng(1)
-    full = (nk, nb, nb, 2 * niv)
-    new_mat = rng.standard_normal(full) + 1j * rng.standard_normal(full)
-    old_mat = rng.standard_normal(full) + 1j * rng.standard_normal(full)
-    sig_new = FakeSelfEnergyWindow(new_mat.copy(), niv)
-    sig_old = FakeSelfEnergyWindow(old_mat.copy(), niv)
-    sl = slice(niv - niv_jac, niv + niv_jac)
-    expected_inner = stab.reflect_proposal(new_mat[..., sl], old_mat[..., sl])
-
-    out = nonlocal_sde.apply_modified_preconditioner(sig_new, sig_old, stab)
-
-    assert np.allclose(out.mat[..., sl], expected_inner)
-    assert not np.allclose(out.mat[..., sl], new_mat[..., sl])
-    assert np.allclose(out.mat[..., : niv - niv_jac], new_mat[..., : niv - niv_jac])
-    assert np.allclose(out.mat[..., niv + niv_jac :], new_mat[..., niv + niv_jac :])
-    assert sig_new.compress_calls == 1 and sig_old.compress_calls == 1
-
-
-def test_preconditioner_is_identity_when_no_unstable_modes(stab_logger):
-    """With an empty projector the whole proposal passes through unchanged."""
-    nk, nb, niv, niv_jac = 4, 2, 10, 4
-    stab = _build_window_stabilizer((nk, nb, nb, 2 * niv_jac), p=0.3, unstable=False)
-    assert stab.n_unstable == 0
-    rng = np.random.default_rng(2)
-    full = (nk, nb, nb, 2 * niv)
-    new_mat = rng.standard_normal(full) + 1j * rng.standard_normal(full)
-    old_mat = rng.standard_normal(full) + 1j * rng.standard_normal(full)
-
-    out = nonlocal_sde.apply_modified_preconditioner(
-        FakeSelfEnergyWindow(new_mat.copy(), niv), FakeSelfEnergyWindow(old_mat.copy(), niv), stab
-    )
-    assert np.allclose(out.mat, new_mat)
-
-
-def test_preconditioner_preserves_dtype_and_shape(stab_logger):
-    """The reflected window is written back in the proposal's own dtype (no silent upcast of complex64)."""
-    nk, nb, niv, niv_jac = 4, 2, 10, 4
-    stab = _build_window_stabilizer((nk, nb, nb, 2 * niv_jac), p=0.3, unstable=True)
-    rng = np.random.default_rng(3)
-    full = (nk, nb, nb, 2 * niv)
-    new_mat = (rng.standard_normal(full) + 1j * rng.standard_normal(full)).astype(np.complex64)
-    old_mat = (rng.standard_normal(full) + 1j * rng.standard_normal(full)).astype(np.complex64)
-
-    out = nonlocal_sde.apply_modified_preconditioner(
-        FakeSelfEnergyWindow(new_mat.copy(), niv), FakeSelfEnergyWindow(old_mat.copy(), niv), stab
-    )
-    assert out.mat.dtype == np.complex64
-    assert out.mat.shape == full
-
-
-def test_preconditioner_broadcasts_local_old_to_full_bz(stab_logger):
-    """A local (nq=1) previous iterate is broadcast across the BZ before reflecting against the full-BZ proposal."""
-    nk, nb, niv, niv_jac = 8, 2, 10, 4
-    stab = _build_window_stabilizer((nk, nb, nb, 2 * niv_jac), p=0.3, unstable=True)
-    assert stab.n_unstable >= 1
-    rng = np.random.default_rng(7)
-    full = (nk, nb, nb, 2 * niv)
-    new_mat = rng.standard_normal(full) + 1j * rng.standard_normal(full)
-    old_mat = rng.standard_normal((1, nb, nb, 2 * niv)) + 1j * rng.standard_normal((1, nb, nb, 2 * niv))
-
-    out = nonlocal_sde.apply_modified_preconditioner(
-        FakeSelfEnergyWindow(new_mat.copy(), niv), FakeSelfEnergyWindow(old_mat.copy(), niv), stab
-    )
-
-    sl = slice(niv - niv_jac, niv + niv_jac)
-    old_bcast = np.broadcast_to(old_mat[..., sl], (nk, nb, nb, 2 * niv_jac))
-    expected_inner = stab.reflect_proposal(new_mat[..., sl], old_bcast)
-    assert out.mat.shape == full
-    assert np.allclose(out.mat[..., sl], expected_inner)
-    assert np.allclose(out.mat[..., : niv - niv_jac], new_mat[..., : niv - niv_jac])
-
-
-def test_preconditioner_logs_n_unstable(stab_logger):
-    """Applying the reflection emits exactly one info line stating the unstable-subspace dimension."""
-    nk, nb, niv, niv_jac = 4, 2, 10, 4
-    stab = _build_window_stabilizer((nk, nb, nb, 2 * niv_jac), p=0.3, unstable=True)
-    z = np.zeros((nk, nb, nb, 2 * niv), dtype=np.complex128)
-    nonlocal_sde.apply_modified_preconditioner(
-        FakeSelfEnergyWindow(z.copy(), niv), FakeSelfEnergyWindow(z.copy(), niv), stab
-    )
-    assert stab_logger.calls["info"] == 1
-
-
-def test_suppressed_logging_silences_info_debug_memory(stab_logger):
-    """Inside the context, info/debug/memory logging is a no-op."""
-    with nonlocal_sde._suppressed_logging():
-        config.logger.info("x")
-        config.logger.debug("x")
-        config.logger.log_memory_usage("x")
-    assert stab_logger.calls["info"] == 0
-    assert stab_logger.calls["debug"] == 0
-    assert stab_logger.calls["log_memory_usage"] == 0
-
-
-def test_suppressed_logging_preserves_warning(stab_logger):
-    """Warnings stay audible inside the suppression context."""
-    with nonlocal_sde._suppressed_logging():
-        config.logger.warning("kept")
-    assert stab_logger.calls["warning"] == 1
-
-
-def test_suppressed_logging_restores_after_block(stab_logger):
-    """The original logger methods are restored once the context exits."""
-    with nonlocal_sde._suppressed_logging():
-        config.logger.info("suppressed")
-    config.logger.info("counted")
-    config.logger.debug("counted")
-    assert stab_logger.calls["info"] == 1
-    assert stab_logger.calls["debug"] == 1
-
-
-def test_suppressed_logging_restores_on_exception(stab_logger):
-    """The logger is restored even when the suppressed block raises."""
-    with pytest.raises(RuntimeError):
-        with nonlocal_sde._suppressed_logging():
-            raise RuntimeError("boom")
-    config.logger.info("after")
-    assert stab_logger.calls["info"] == 1
-
-
-def _run_probe(residuals, probe_iters=3):
-    """Drives the trigger detector over a residual sequence; returns the 1-based trigger iteration or None."""
-    best, growth, stall = float("inf"), 0, 0
-    for i, r in enumerate(residuals, start=1):
-        best, growth, stall, trig = nonlocal_sde._update_stabilizer_probe(r, best, growth, stall, probe_iters)
-        if trig:
-            return i
-    return None
-
-
-def test_probe_never_triggers_while_residual_decreases():
-    """A contracting (converging) run must never arm the stabilizer."""
-    assert _run_probe([1e-1, 3e-2, 8e-3, 2e-3, 5e-4, 1e-4], probe_iters=3) is None
-
-
-def test_probe_triggers_on_sustained_divergence():
-    """Sustained residual growth (a factor 3 above the best for probe_iters iterations) arms the stabilizer."""
-    assert _run_probe([1e-1, 2e-1, 4e-1, 8e-1, 1.6], probe_iters=3) == 5
-
-
-def test_probe_short_plateau_does_not_trigger():
-    """A plateau shorter than three probe windows is not enough evidence to arm."""
-    assert _run_probe([5e-2] * 9, probe_iters=3) is None
-
-
-def test_probe_triggers_on_long_plateau_far_above_epsilon():
-    """A plateau of three probe windows far above epsilon signals a repelling fixed point and arms."""
-    config.self_consistency.epsilon = 1e-4
-    assert _run_probe([5e-2] * 10, probe_iters=3) == 10
-
-
-def test_probe_plateau_near_epsilon_never_triggers():
-    """A plateau close to the convergence threshold is a slowly converging run, never a trigger."""
-    config.self_consistency.epsilon = 1e-4
-    assert _run_probe([5e-4] * 20, probe_iters=3) is None
-
-
-def test_probe_resets_on_renewed_improvement():
-    """An improvement after some stalling resets both counters, so a run that recovers never triggers."""
-    assert _run_probe([1e-1, 2e-1, 3e-1, 1e-2, 1e-3, 1e-4], probe_iters=3) is None
-
-
-def test_probe_growth_must_be_consecutive():
-    """Growth iterations interleaved with mere stalls do not accumulate toward the divergence trigger."""
-    config.self_consistency.epsilon = 1e-4
-    assert _run_probe([1e-1, 4e-1, 1.5e-1, 4e-1, 1.5e-1, 4e-1, 1.5e-1], probe_iters=3) is None
-
-
-def test_probe_respects_probe_iters_setting():
-    """A larger probe window requires more sustained growth iterations before arming."""
-    residuals = [1e-1, 4e-1, 5e-1, 6e-1, 7e-1, 8e-1, 9e-1]
-    assert _run_probe(residuals, probe_iters=1) == 2
-    assert _run_probe(residuals, probe_iters=5) == 6
-
-
-def _run_watchdog(residuals, arming_residual, probe_iters=3):
-    """Drives the watchdog over post-arming residuals; returns ('passed'|'revert', 1-based iteration) or None."""
-    count, passed = 0, False
-    for i, r in enumerate(residuals, start=1):
-        count, passed, revert = nonlocal_sde._update_stabilizer_watchdog(r, arming_residual, count, probe_iters)
-        if passed:
-            return "passed", i
-        if revert:
-            return "revert", i
-    return None
-
-
-def test_watchdog_passes_on_improvement():
-    """The watchdog ends as soon as the reflected iteration improves on the arming residual."""
-    assert _run_watchdog([6e-2, 5.5e-2, 4e-2], arming_residual=5e-2, probe_iters=3) == ("passed", 3)
-
-
-def test_watchdog_reverts_when_reflection_does_not_help():
-    """Without any improvement over the arming level within three probe windows, the reflection is reverted."""
-    assert _run_watchdog([6e-2] * 12, arming_residual=5e-2, probe_iters=3) == ("revert", 9)
-
-
-def test_watchdog_requires_meaningful_improvement():
-    """A sub-0.1-percent dip below the arming residual does not count as improvement."""
-    assert _run_watchdog([5e-2 * (1.0 - 1e-5)] * 12, arming_residual=5e-2, probe_iters=3) == ("revert", 9)
-
-
-def test_stabilizer_probe_paused_while_restriction_active():
-    """The stall detector must not run while use_chi_phys_restriction is active: the restricted map is a scaffold."""
-    config.stabilization.use_chi_phys_restriction = True
-    assert nonlocal_sde._stabilizer_probe_active(True, None, False, None) is False
-    config.stabilization.use_chi_phys_restriction = False
-    assert nonlocal_sde._stabilizer_probe_active(True, None, False, None) is True
-
-
-def test_stabilizer_probe_inactive_when_disarmed_deployed_or_converged():
-    """The stall detector is off when the stabilizer is disarmed, already deployed, or the cycle converged."""
-    config.stabilization.use_chi_phys_restriction = False
-    assert nonlocal_sde._stabilizer_probe_active(False, None, False, None) is False
-    assert nonlocal_sde._stabilizer_probe_active(True, object(), False, None) is False
-    assert nonlocal_sde._stabilizer_probe_active(True, None, True, None) is False
+    """Installs a MagicMock logger as config.logger for the duration of a test (stabilization glue tests)."""
+    logger = MagicMock()
+    monkeypatch.setattr(config, "logger", logger, raising=False)
+    return logger
 
 
 def test_mixing_history_cap_uses_most_recent_reset_event():
-    """The history cap counts iterations since the later of the restriction release and the stabilizer arming."""
+    """The history cap counts iterations since the later of the restriction release and the annealing-mass change,
+    and is None while no map-switching event has occurred."""
     assert nonlocal_sde._mixing_history_cap(10, None, None) is None
     assert nonlocal_sde._mixing_history_cap(10, 7, None) == 2
     assert nonlocal_sde._mixing_history_cap(10, None, 8) == 1
     assert nonlocal_sde._mixing_history_cap(10, 7, 9) == 0
     assert nonlocal_sde._mixing_history_cap(9, 4, 9) == 0
-
-
-def _setup_stabilizer_build(monkeypatch, nk=(2, 1, 1), nb=1, niv_core=4, niv=6, unstable=True, sigma_nq=None):
-    """
-    Prepares config, a window-affine fake proposal map with a known fixed point and the sigma_star whose inner
-    window sits exactly on it; returns (sigma_star, build_kwargs) for build_stabilization_projector.
-    """
-    import dgamore.brillouin_zone as bz
-    from types import SimpleNamespace
-
-    p = 0.3
-    nk_tot = int(np.prod(nk))
-    config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
-    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda k_grid=None: np.zeros((*nk, nb, nb)))
-    config.box.niv_core = niv_core
-    config.sys.beta = 10.0
-    config.sys.n = 1.0
-    config.sys.occ, config.sys.occ_k = np.eye(nb), np.zeros((*nk, nb, nb))
-    config.self_consistency.mixing = p
-    config.stabilization.stabilizer_n_modes = 4
-    config.stabilization.max_stabilizer_base_residual = 0.5
-    monkeypatch.setattr(config, "logger", RecordingStabLogger())
-
-    niv_jac = max(niv_core // 2, min(15, niv_core))
-    sl = slice(niv - niv_jac, niv + niv_jac)
-    n_real = 2 * nk_tot * nb * nb * 2 * niv_jac
-    rng = np.random.default_rng(0)
-    q_mat, _ = np.linalg.qr(rng.standard_normal((n_real, n_real)))
-    s = rng.uniform(-0.4, 0.4, n_real)
-    if unstable:
-        s[0] = (1.30 - (1.0 - p)) / p
-    jac = q_mat @ np.diag(s) @ q_mat.T
-    b = rng.standard_normal(n_real)
-    xstar = np.linalg.solve(np.eye(n_real) - jac, b)
-    nc = n_real // 2
-
-    def fake_proposal(sigma_in, *args, **kwargs):
-        out = sigma_in.copy().compress_q_dimension()
-        win = out.mat[..., sl]
-        v = np.concatenate((win.reshape(-1).real, win.reshape(-1).imag))
-        v = jac @ v + b
-        out.mat[..., sl] = (v[:nc] + 1j * v[nc:]).reshape(win.shape).astype(out.mat.dtype)
-        return out
-
-    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", fake_proposal)
-    monkeypatch.setattr(nonlocal_sde, "update_mu", lambda *a, **k: 0.5)
-    fill = SimpleNamespace(get_fill_nonlocal=lambda: (1.0, np.eye(nb), np.zeros((*nk, nb, nb))))
-    monkeypatch.setattr(nonlocal_sde, "GreensFunction", SimpleNamespace(get_g_full=lambda *a, **k: fill))
-
-    star_nq = nk_tot if sigma_nq is None else sigma_nq
-    mat = np.zeros((star_nq, nb, nb, 2 * niv), dtype=np.complex64)
-    if star_nq == nk_tot:
-        mat[..., sl] = (xstar[:nc] + 1j * xstar[nc:]).reshape((nk_tot, nb, nb, 2 * niv_jac)).astype(np.complex64)
-    star_nk = (star_nq, 1, 1)
-    sigma_star = SelfEnergy(mat, star_nk, has_compressed_q_dimension=True, beta=10.0)
-    sigma_dmft_full = SelfEnergy(mat.copy(), star_nk, has_compressed_q_dimension=True, beta=10.0)
-
-    build_kwargs = dict(
-        sigma_star=sigma_star,
-        mu_star=0.5,
-        u_loc=None,
-        v_nonloc=None,
-        v_nonloc_full=None,
-        sigma_dmft=None,
-        sigma_dmft_full=sigma_dmft_full,
-        delta_sigma=None,
-        my_irr_q_list=None,
-        my_full_q_list=None,
-        mpi_dist_irrk=None,
-        mpi_dist_fullbz=None,
-        comm=create_comm_mock(),
-    )
-    return sigma_star, build_kwargs
-
-
-def test_build_stabilization_projector_returns_none_for_stable_map(monkeypatch):
-    """A stable proposal map yields no projector and the constraint state is restored after the build."""
-    _, kwargs = _setup_stabilizer_build(monkeypatch, unstable=False)
-    config.sys.mu = 0.123
-    out = nonlocal_sde.build_stabilization_projector(**kwargs)
-    assert out is None
-    assert config.sys.mu == 0.5 and config.sys.n == 1.0
-
-
-def test_build_stabilization_projector_detects_unstable_mode(monkeypatch):
-    """An unstable window map produces a projector with the expected window size and no mixing change."""
-    _, kwargs = _setup_stabilizer_build(monkeypatch, unstable=True)
-    out = nonlocal_sde.build_stabilization_projector(**kwargs)
-    assert out is not None and out.n_unstable >= 1
-    assert out.niv_jac == 4
-    assert config.self_consistency.mixing == 0.3
-
-
-def test_build_stabilization_projector_raises_on_kgrid_mismatch(monkeypatch):
-    """A non-local warm start on a different k-grid must raise instead of being silently tiled."""
-    _, kwargs = _setup_stabilizer_build(monkeypatch, unstable=False, sigma_nq=3)
-    with pytest.raises(ValueError):
-        nonlocal_sde.build_stabilization_projector(**kwargs)
-
-
-def test_build_stabilization_projector_tiles_local_start(monkeypatch):
-    """A purely local (nq=1) warm start is broadcast to the full BZ and the build runs through the guard."""
-    _, kwargs = _setup_stabilizer_build(monkeypatch, unstable=False, sigma_nq=1)
-    config.stabilization.max_stabilizer_base_residual = 1e9
-    out = nonlocal_sde.build_stabilization_projector(**kwargs)
-    assert out is None
-
-
-def test_build_stabilization_projector_aborts_on_cold_start(monkeypatch):
-    """A warm start far from any fixed point trips the base-residual guard by design."""
-    _, kwargs = _setup_stabilizer_build(monkeypatch, unstable=False)
-    kwargs["sigma_star"].mat[:] = 0.0
-    with pytest.raises(nonlocal_sde.jstab.PhysicalSolutionStabilizerError):
-        nonlocal_sde.build_stabilization_projector(**kwargs)
 
 
 def _make_resid_sigma(mat):
@@ -1087,13 +643,9 @@ def test_relative_sigma_residual_scales_with_mixing_step():
     assert np.allclose(step, alpha * raw, atol=1e-12)
 
 
-class _SingleRankDist:
-    """Minimal single-rank distributor stand-in for the annealing shift (only .comm.size is read)."""
-
-    def __init__(self):
-        from types import SimpleNamespace
-
-        self.comm = SimpleNamespace(size=1)
+def _single_rank_dist():
+    """Builds a minimal single-rank distributor stand-in for the annealing shift (only .comm.size is read)."""
+    return SimpleNamespace(comm=SimpleNamespace(size=1))
 
 
 def _seeded_annealer(mass=0.0, gaps=None, initialized=True):
@@ -1114,7 +666,7 @@ def test_annealer_apply_shifts_inverse_by_shared_mass(stab_logger):
     comp_inv = np.tile((q_mat * np.array([-0.5, 0.5, 1.0, 2.0])) @ q_mat.conj().T, (nq, nw, 1, 1))
     chi = _chi_from_compound(np.linalg.inv(comp_inv), o)
     annealer = _seeded_annealer(mass=lam)
-    out = annealer.apply(chi, _SingleRankDist())
+    out = annealer.apply(chi, _single_rank_dist())
     assert np.allclose(_compound_of(out, o), np.linalg.inv(comp_inv + lam * np.eye(4)), atol=1e-4)
     assert np.allclose(annealer._gaps["dens"], -0.5, atol=1e-5)
 
@@ -1128,20 +680,20 @@ def test_annealer_apply_measures_without_shift_at_zero_mass():
     chi = _chi_from_compound(np.linalg.inv(comp_inv), o)
     ref = chi.mat.copy()
     annealer = _seeded_annealer(mass=0.0, initialized=False)
-    out = annealer.apply(chi, _SingleRankDist())
+    out = annealer.apply(chi, _single_rank_dist())
     assert np.array_equal(out.mat, ref)
     assert np.allclose(annealer._gaps["dens"], 0.3, atol=1e-5)
 
 
-def test_annealer_apply_quiet_probe_skips_measurement():
-    """Quiet Jacobian probes apply the current shared mass but never (re-)measure the gap."""
+def test_annealer_apply_measure_false_skips_measurement():
+    """apply(measure=False) applies the current shared mass but never (re-)measures the gap."""
     rng = np.random.default_rng(14)
     o, nq, nw, lam = 2, 2, 2, 0.3
     q_mat = np.linalg.qr(rng.standard_normal((4, 4)) + 1j * rng.standard_normal((4, 4)))[0]
     comp_inv = np.tile((q_mat * np.array([0.4, 0.5, 1.0, 2.0])) @ q_mat.conj().T, (nq, nw, 1, 1))
     chi = _chi_from_compound(np.linalg.inv(comp_inv), o)
     annealer = _seeded_annealer(mass=lam, gaps={"dens": None})
-    out = annealer.apply(chi, _SingleRankDist(), measure=False)
+    out = annealer.apply(chi, _single_rank_dist(), measure=False)
     assert annealer._gaps["dens"] is None
     assert np.allclose(_compound_of(out, o), np.linalg.inv(comp_inv + lam * np.eye(4)), atol=1e-4)
 
@@ -1191,7 +743,7 @@ def test_annealer_mass_capped_at_ceiling_with_warning(stab_logger):
     annealer = _seeded_annealer(mass=0.0, gaps={"dens": -1e6, "magn": 0.0})
     assert annealer.update(converged=False) is True
     assert annealer._mass == nonlocal_sde.LambdaAnnealer._MAX_LAMBDA
-    assert stab_logger.calls["warning"] == 1
+    assert stab_logger.warning.call_count == 1
 
 
 def test_annealer_active_and_mass_present_flags():
@@ -1210,21 +762,6 @@ def test_effective_epsilon_relaxed_while_annealing_active():
     assert np.allclose(nonlocal_sde._effective_epsilon(_seeded_annealer(mass=0.1)), 1e-4, atol=1e-15)
     assert np.allclose(nonlocal_sde._effective_epsilon(_seeded_annealer(mass=0.0)), 1e-5, atol=1e-15)
     assert np.allclose(nonlocal_sde._effective_epsilon(None), 1e-5, atol=1e-15)
-
-
-def test_stabilizer_probe_paused_while_annealing_active():
-    """The stabilizer stall detector must not run while the annealing scaffold shapes the map."""
-    config.stabilization.use_chi_phys_restriction = False
-    assert nonlocal_sde._stabilizer_probe_active(True, None, False, _seeded_annealer(mass=0.1)) is False
-    assert nonlocal_sde._stabilizer_probe_active(True, None, False, _seeded_annealer(mass=0.0)) is True
-    assert nonlocal_sde._stabilizer_probe_active(True, None, False, None) is True
-
-
-def test_mixing_history_cap_includes_anneal_reset():
-    """The history cap also counts from the most recent annealing-mass change."""
-    assert nonlocal_sde._mixing_history_cap(10, None, None, 9) == 0
-    assert nonlocal_sde._mixing_history_cap(10, 7, None, 5) == 2
-    assert nonlocal_sde._mixing_history_cap(10, None, None, None) is None
 
 
 def test_relative_sigma_residual_layout_mismatch_is_normalized():
@@ -1252,73 +789,54 @@ def test_relative_sigma_residual_local_old_normalization_is_k_count_independent(
         assert np.allclose(out, 1.0, atol=1e-12)
 
 
-def test_probe_triggers_on_nonfinite_residual():
-    """Inf/NaN residuals count as divergence evidence instead of silently resetting the growth counter."""
-    assert _run_probe([1e-1, np.inf, np.nan, np.nan], probe_iters=3) == 4
-
-
-def test_select_and_apply_lambda_correction_dispatch():
+def test_select_and_apply_lambda_correction_dispatch(monkeypatch):
     """The rank-0 lambda selector dispatches by the band count (single-band scalar vs. multi-orbital matrix
     correction) for both the one-shot and the per-iteration flag, and returns the susceptibility unchanged when
     neither is enabled."""
     sentinel, chi = object(), object()
     config.lambda_correction.perform_lambda_correction = False
     config.stabilization.use_lambda_correction = False
-    assert nonlocal_sde._select_and_apply_lambda_correction(chi, quiet=False) is chi
+    assert nonlocal_sde._select_and_apply_lambda_correction(chi) is chi
 
-    with mock.patch.object(nonlocal_sde.LambdaCorrection, "perform", return_value=sentinel) as single:
+    with monkeypatch.context() as mp:
+        single = MagicMock(return_value=sentinel)
+        mp.setattr(nonlocal_sde.LambdaCorrection, "perform", single)
         config.stabilization.use_lambda_correction = True
         config.sys.n_bands = 1
-        assert nonlocal_sde._select_and_apply_lambda_correction(chi, quiet=True) is sentinel
-        single.assert_called_once_with(chi, quiet=True)
+        assert nonlocal_sde._select_and_apply_lambda_correction(chi) is sentinel
+        single.assert_called_once_with(chi)
 
-    with mock.patch.object(nonlocal_sde.MultiOrbitalLambdaCorrection, "perform", return_value=sentinel) as multi:
+    with monkeypatch.context() as mp:
+        multi = MagicMock(return_value=sentinel)
+        mp.setattr(nonlocal_sde.MultiOrbitalLambdaCorrection, "perform", multi)
         config.sys.n_bands = 2
-        assert nonlocal_sde._select_and_apply_lambda_correction(chi, quiet=True) is sentinel
-        multi.assert_called_once_with(chi, quiet=True)
+        assert nonlocal_sde._select_and_apply_lambda_correction(chi) is sentinel
+        multi.assert_called_once_with(chi)
 
     config.stabilization.use_lambda_correction = False
     config.lambda_correction.perform_lambda_correction = True
-    with mock.patch.object(nonlocal_sde.LambdaCorrection, "perform", return_value=sentinel) as single:
+    with monkeypatch.context() as mp:
+        single = MagicMock(return_value=sentinel)
+        mp.setattr(nonlocal_sde.LambdaCorrection, "perform", single)
         config.sys.n_bands = 1
-        assert nonlocal_sde._select_and_apply_lambda_correction(chi, quiet=False) is sentinel
-        single.assert_called_once_with(chi, quiet=False)
-    with mock.patch.object(nonlocal_sde.MultiOrbitalLambdaCorrection, "perform", return_value=sentinel) as multi:
+        assert nonlocal_sde._select_and_apply_lambda_correction(chi) is sentinel
+        single.assert_called_once_with(chi)
+    with monkeypatch.context() as mp:
+        multi = MagicMock(return_value=sentinel)
+        mp.setattr(nonlocal_sde.MultiOrbitalLambdaCorrection, "perform", multi)
         config.sys.n_bands = 2
-        assert nonlocal_sde._select_and_apply_lambda_correction(chi, quiet=False) is sentinel
-        multi.assert_called_once_with(chi, quiet=False)
-
-
-class _RecordingTextLogger:
-    """Logger stub recording full info/warning texts for the loop sequencing tests."""
-
-    def __init__(self):
-        self.infos, self.warnings = [], []
-
-    def info(self, msg, *a, **k):
-        self.infos.append(str(msg))
-
-    def warning(self, msg, *a, **k):
-        self.warnings.append(str(msg))
-
-    def debug(self, *a, **k):
-        pass
-
-    def log_memory_usage(self, *a, **k):
-        pass
+        assert nonlocal_sde._select_and_apply_lambda_correction(chi) is sentinel
+        multi.assert_called_once_with(chi)
 
 
 def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, epsilon=1e-3):
     """
     Minimal single-k single-band environment for calculate_self_energy_q: the heavy pipeline is replaced by the
     synthetic per-iteration map ``proposal_step(sigma_in, n_call, annealer)`` and the mu/occupation solves are
-    frozen, so the tests exercise exactly the loop sequencing (mixing, convergence gate, scaffold releases and the
-    stabilizer arm/watchdog wiring). Returns ``(run, calls, logger)`` with ``run()`` executing the loop and
-    ``calls`` the proposal invocation list.
+    frozen, so the tests exercise exactly the loop sequencing (mixing, convergence gate and the scaffold
+    releases). Returns ``(run, calls, logger)`` with ``run()`` executing the loop, ``calls`` the proposal
+    invocation list and ``logger`` the installed MagicMock logger.
     """
-    import dgamore.brillouin_zone as bz
-    from types import SimpleNamespace
-
     config.lattice.k_grid = bz.KGrid((1, 1, 1), symmetries=[])
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
     config.box.niw_core, config.box.niv_core, config.box.niv_full, config.box.niv_dmft = 1, 2, 2, 8
@@ -1330,7 +848,7 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     config.self_consistency.epsilon = epsilon
     config.self_consistency.max_iter = max_iter
     config.self_energy_interpolation.do_interpolation = False
-    logger = _RecordingTextLogger()
+    logger = MagicMock()
     monkeypatch.setattr(config, "logger", logger, raising=False)
 
     gf_stub = SimpleNamespace(
@@ -1345,7 +863,7 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
 
     calls = []
 
-    def fake_proposal(sigma_in, *args, quiet=False, annealer=None, **kwargs):
+    def fake_proposal(sigma_in, *args, annealer=None, **kwargs):
         calls.append(len(calls) + 1)
         return proposal_step(sigma_in, len(calls), annealer)
 
@@ -1354,15 +872,12 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     mat = np.full((1, 1, 1, 16), 1.0 + 0.1j, dtype=np.complex64)
     sigma_dmft = SelfEnergy(mat, (1, 1, 1), has_compressed_q_dimension=True, beta=10.0)
 
-    class _VStub:
-        def copy(self):
-            return self
-
-        def reduce_q(self, q_list):
-            return self
+    v_nonloc = MagicMock()
+    v_nonloc.copy.return_value = v_nonloc
+    v_nonloc.reduce_q.return_value = v_nonloc
 
     def run():
-        return nonlocal_sde.calculate_self_energy_q(create_comm_mock(), None, _VStub(), sigma_dmft, sigma_dmft.copy())
+        return nonlocal_sde.calculate_self_energy_q(create_comm_mock(), None, v_nonloc, sigma_dmft, sigma_dmft.copy())
 
     return run, calls, logger
 
@@ -1400,7 +915,9 @@ def test_loop_lambda_correction_release_runs_pure_phase_before_finishing(monkeyp
 
     assert len(calls) == 3
     assert config.stabilization.use_lambda_correction is False
-    assert any("Self-consistency with the lambda correction reached" in m for m in logger.infos)
+    assert any(
+        "Self-consistency with the lambda correction reached" in str(c.args[0]) for c in logger.info.call_args_list
+    )
 
 
 def test_loop_one_shot_lambda_correction_never_fires_release(monkeypatch, tmp_path):
@@ -1416,38 +933,7 @@ def test_loop_one_shot_lambda_correction_never_fires_release(monkeypatch, tmp_pa
 
     assert len(calls) == 2
     assert config.lambda_correction.perform_lambda_correction is True
-    assert not any("lambda correction reached" in m for m in logger.infos)
-
-
-def test_loop_stabilizer_plateau_triggers_build_and_watchdog_reverts(monkeypatch, tmp_path):
-    """A far-above-epsilon residual plateau (constant relative step on the map S(x) = 1.1 x) triggers exactly one
-    projector build at the warm-start sigma after three probe windows; the deployed (here inert) reflection fails
-    to improve the arming residual, so the watchdog reverts it after three more windows and plain mixing resumes."""
-
-    def step(sigma_in, n_call, annealer):
-        out = sigma_in.copy()
-        out.mat = out.mat * 1.1
-        return out
-
-    run, calls, logger = _setup_self_energy_loop(monkeypatch, tmp_path, step, max_iter=22, epsilon=1e-8)
-    config.stabilization.use_jacobian_stabilization = True
-    config.stabilization.stabilizer_probe_iters = 3
-    build_calls = []
-    monkeypatch.setattr(
-        nonlocal_sde,
-        "build_stabilization_projector",
-        lambda sigma_star, *a, **k: build_calls.append(sigma_star.mat.copy()) or mock.MagicMock(n_unstable=1),
-    )
-    precond_calls = []
-    monkeypatch.setattr(
-        nonlocal_sde, "apply_modified_preconditioner", lambda new, old, stab: precond_calls.append(1) or new
-    )
-    run()
-
-    assert len(calls) == 22
-    assert len(build_calls) == 1 and np.allclose(build_calls[0], 1.0 + 0.1j, atol=1e-6)
-    assert len(precond_calls) == 9
-    assert any("did not improve its arming residual" in w for w in logger.warnings)
+    assert not any("lambda correction reached" in str(c.args[0]) for c in logger.info.call_args_list)
 
 
 def test_annealer_update_without_measured_gaps_is_inert():
@@ -1476,17 +962,14 @@ def test_annealer_static_gap_uses_omega_zero_slice_in_both_niw_ranges():
     comp_full = np.tile(np.linalg.inv(np.stack([poled, healthy, poled])), (nq, 1, 1, 1))
     chi_full = _chi_from_compound(comp_full, o)
     chi_full._full_niw_range = True
-    assert np.allclose(nonlocal_sde.LambdaAnnealer._static_gap(chi_full, _SingleRankDist()), 0.7, atol=1e-5)
+    assert np.allclose(nonlocal_sde.LambdaAnnealer._static_gap(chi_full, _single_rank_dist()), 0.7, atol=1e-5)
     comp_half = np.tile(np.linalg.inv(np.stack([healthy, poled])), (nq, 1, 1, 1))
     chi_half = _chi_from_compound(comp_half, o)
-    assert np.allclose(nonlocal_sde.LambdaAnnealer._static_gap(chi_half, _SingleRankDist()), 0.7, atol=1e-5)
+    assert np.allclose(nonlocal_sde.LambdaAnnealer._static_gap(chi_half, _single_rank_dist()), 0.7, atol=1e-5)
 
 
 def test_annealer_static_gap_reduces_min_across_ranks():
     """The measured static gap is the MPI.MIN of the per-rank q-slice minima, identical on every rank."""
-    from types import SimpleNamespace
-
-    from tests.conftest import run_parallel
 
     def fn(comm, rank):
         eigs = np.array([0.5, 1.0, 2.0, 3.0]) if rank == 0 else np.array([-0.7, 1.0, 2.0, 3.0])

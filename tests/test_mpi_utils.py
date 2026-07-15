@@ -5,6 +5,8 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -39,11 +41,9 @@ def _default_no_output_path(monkeypatch):
     monkeypatch.setattr(config.output, "output_path", None)
 
 
-# A picklable object carrying a `.mat` array, matching what MpiDistributor.send_to_rank expects.
-class Holder:
-    def __init__(self, mat, label="obj"):
-        self.mat = mat
-        self.label = label
+def _holder(mat, label="obj"):
+    """Builds a picklable object carrying a .mat array, matching what MpiDistributor.send_to_rank expects."""
+    return SimpleNamespace(mat=mat, label=label)
 
 
 def comm1():
@@ -66,9 +66,8 @@ def test_node_aware_single_node():
 
 
 def test_node_aware_multi_node():
-    """_get_node_aware_v_dist splits frequencies per node and agrees across ranks."""
-    # 4 ranks split across 2 nodes (2 ranks each); 6 frequencies.
-    # 3 freqs per node; within a node, excess on first local rank -> [2,1].
+    """_get_node_aware_v_dist splits frequencies per node and agrees across ranks: 4 ranks over 2 nodes with 6
+    frequencies gives 3 per node, and within a node the excess lands on the first local rank."""
     hostnames = ["n0", "n1", "n0", "n1"]
 
     def fn(comm, rank):
@@ -78,7 +77,6 @@ def test_node_aware_multi_node():
     _, res = run_parallel(4, fn, hostnames=hostnames)
     sizes = res[0]
     assert sum(sizes) == 6
-    # Every rank agrees on the global distribution.
     assert all(s == sizes for s in res)
 
 
@@ -209,9 +207,10 @@ def test_exchange_and_map_single_rank():
 
 
 def test_exchange_and_map_auto_orbital_transform(monkeypatch):
-    """exchange_and_map_irrbz_fullbz applies the auto orbital transform per rank slice."""
-    # Record every apply_auto_orbital_transform call. Patching it on the symmetry_reduction module works whether that
-    # module is the real one or the in-process fake (the auto branch in mpi_utils calls it by name).
+    """exchange_and_map_irrbz_fullbz applies the auto orbital transform per rank slice: the identity transform is
+    recorded on every rank with a non-empty slice, the rank-local slice sizes sum to the full BZ and the mapped
+    result is unchanged. Patching on the symmetry_reduction module works whether that module is the real one or
+    the in-process fake (the auto branch in mpi_utils calls it by name)."""
     calls = []
 
     def _recording_transform(full_mat, us, sigmas, conjs, num_orbital_dimensions):
@@ -221,7 +220,7 @@ def test_exchange_and_map_auto_orbital_transform(monkeypatch):
                 "num_orbital_dimensions": num_orbital_dimensions,
             }
         )
-        return full_mat  # identity, so the mapped result is unchanged
+        return full_mat
 
     monkeypatch.setattr(symmetry_reduction, "apply_auto_orbital_transform", _recording_transform)
 
@@ -231,8 +230,7 @@ def test_exchange_and_map_auto_orbital_transform(monkeypatch):
     auto_conjs = np.zeros(N_FULL, dtype=bool)
 
     def _auto_grid():
-        # Force a real KGrid into auto mode with controlled transform data,
-        # without needing a Hamiltonian / specify_auto_symmetries().
+        # force a real KGrid into auto mode with controlled transform data (no specify_auto_symmetries needed)
         g = _q_grid()
         g._auto_mode = True
         g._auto_us = auto_us
@@ -250,10 +248,7 @@ def test_exchange_and_map_auto_orbital_transform(monkeypatch):
 
     _, res = run_parallel(3, fn)
     rebuilt = np.concatenate([m for m, _ in res], axis=0)
-    # Fake transform is the identity, so the mapping result is unchanged.
     assert np.allclose(rebuilt, FULL_MAPPED)
-    # The orbital transform was applied on each rank with my_size > 0, with the
-    # rank-local slice sizes summing to the full BZ.
     applied_sizes = [c["n_us"] for c in calls]
     expected_sizes = [sz for _, sz in res if sz > 0]
     assert sorted(applied_sizes) == sorted(expected_sizes)
@@ -297,10 +292,11 @@ def test_exchange_and_map_data_exchange_is_chunked(monkeypatch):
         return counter["n"], rebuilt
 
     n_huge, rebuilt_huge = run(2**31 - 1)
-    n_tiny, rebuilt_tiny = run(16)  # one (2,2) complex row is 64 B > 16 -> one row per chunk
+    # one (2,2) complex row is 64 B > 16, so the tiny limit forces one row per chunk and more Isend calls
+    n_tiny, rebuilt_tiny = run(16)
     assert np.allclose(rebuilt_huge, full_mapped)
     assert np.allclose(rebuilt_tiny, full_mapped)
-    assert n_tiny > n_huge  # chunking split at least one multi-row peer payload into several messages
+    assert n_tiny > n_huge
 
 
 @pytest.mark.parametrize("layout", ["flat", "z_pencil", "y_pencil", "x_pencil"])
@@ -440,6 +436,7 @@ def test_gather_full_ibz_for_vslice():
     norb = 2
     # identity irr->full map so map_to_full_bz is a no-op
     q_grid = KGrid((n_irrq, 1, 1), [])
+
     G = (np.arange(n_irrq * norb * n_v * n_vp).reshape(n_irrq, norb, n_v, n_vp) + 1j).astype(np.complex128)
 
     def fn(comm, rank):
@@ -455,9 +452,8 @@ def test_gather_full_ibz_for_vslice():
 
     _, res = run_parallel(2, fn, hostnames=["h", "h"])
     for r in res:
-        assert r is not None  # both ranks own frequencies here
+        assert r is not None
         mat, (vs, ve) = r
-        # full IBZ q for this rank's v-slice
         assert np.allclose(mat, G[:, :, vs:ve, :])
 
 
@@ -496,7 +492,7 @@ def test_gather_full_ibz_for_vslice_tags_stay_below_mpi_tag_ub_minimum():
 
 
 def test_gather_full_ibz_for_vslice_empty_rank_returns_none():
-    """gather_full_ibz_for_vslice returns None for a rank with no frequencies."""
+    """gather_full_ibz_for_vslice returns None for exactly the rank(s) with no frequencies."""
     n_irrq = 3
     n_v = 1  # fewer frequencies than ranks -> rank 1 gets none
     n_vp = 2
@@ -513,7 +509,6 @@ def test_gather_full_ibz_for_vslice_empty_rank_returns_none():
         return rank, (out is None), d_v.my_size
 
     _, res = run_parallel(2, fn, hostnames=["h", "h"])
-    # exactly one rank owns the single frequency; the other returns None
     none_flags = [is_none for _, is_none, _ in res]
     assert none_flags.count(True) == 1
     for _, is_none, my_v in res:
@@ -572,11 +567,9 @@ def test_rankfile_created_and_context_manager(tmp_path, monkeypatch):
     """MpiDistributor creates a rank file and supports the context-manager and delete cycle."""
     d = MpiDistributor(ntasks=3, comm=comm1(), name="green", output_path=str(tmp_path))
     assert d._fname.endswith("green_Rank00000.hdf5")
-    # context manager opens then closes the file
     with d as f:
         assert f is not None
-    # explicit open/close/delete cycle (opt back in to real deletion, since the
-    # shared conftest's autouse fixture otherwise no-ops os.remove)
+    # opt back in to real deletion; the shared conftest's autouse fixture otherwise no-ops os.remove
     monkeypatch.setattr(os, "remove", _REAL_OS_REMOVE)
     d.open_file()
     d.close_file()
@@ -585,13 +578,13 @@ def test_rankfile_created_and_context_manager(tmp_path, monkeypatch):
 
 
 def test_open_close_delete_are_safe_without_file():
-    """MpiDistributor file ops are no-ops without an output path."""
-    # No output_path -> no _fname attribute; all file ops must swallow errors.
+    """MpiDistributor file ops are no-ops without an output path: no _fname attribute exists, so open swallows
+    the AttributeError, close swallows the None.close() and delete swallows the os.remove of a missing file."""
     d = MpiDistributor(ntasks=2, comm=comm1())
     assert d._file is None
-    d.open_file()  # AttributeError on missing _fname -> swallowed
-    d.close_file()  # None.close() -> swallowed
-    d.delete_file()  # os.remove(missing) -> swallowed
+    d.open_file()
+    d.close_file()
+    d.delete_file()
 
 
 def test_output_path_is_injected_not_read_from_config(tmp_path, monkeypatch):
@@ -783,9 +776,9 @@ def test_gather_chunked(monkeypatch):
 
 
 def test_gather_chunked_multidim_trailing(monkeypatch):
-    """MpiDistributor.gather writes chunks directly into multi-dimensional destination slices."""
-    # Regression: the chunked receive writes directly into the contiguous axis-0 destination slice
-    # (no staging buffer). Use a multi-dimensional trailing shape and force many small chunks.
+    """MpiDistributor.gather writes chunks directly into multi-dimensional destination slices: the chunked
+    receive fills the contiguous axis-0 destination slice with no staging buffer, exercised with a
+    multi-dimensional trailing shape and many small chunks."""
     full = (np.arange(5 * 2 * 3).reshape(5, 2, 3) + 1j).astype(np.complex128)
     monkeypatch.setattr(mu, "MAX_MPI_BYTES", 16)  # 1 row per chunk -> exercises the per-chunk Recv path
 
@@ -873,9 +866,9 @@ def test_send_recv_object_roundtrip():
     def fn(comm, rank):
         d = MpiDistributor(ntasks=5, comm=comm)
         if rank == 0:
-            h = Holder(arr.copy(), label="hello")
+            h = _holder(arr.copy(), label="hello")
             d.send_to_rank(h, dest=1)
-            return ("sent", h.mat)  # mat must be restored after send
+            return ("sent", h.mat)  # mat must be restored on the sender after the send
         if rank == 1:
             h = d.recv_from_rank(source=0)
             return ("recv", h.label, h.mat)
@@ -883,7 +876,7 @@ def test_send_recv_object_roundtrip():
 
     _, res = run_parallel(2, fn)
     assert res[0][0] == "sent"
-    assert np.allclose(res[0][1], arr)  # restored on sender
+    assert np.allclose(res[0][1], arr)
     assert res[1][1] == "hello"
     assert np.allclose(res[1][2], arr)
 
@@ -896,7 +889,7 @@ def test_send_recv_object_chunked(monkeypatch):
     def fn(comm, rank):
         d = MpiDistributor(ntasks=6, comm=comm)
         if rank == 0:
-            d.send_to_rank(Holder(arr.copy(), "chunky"), dest=1)
+            d.send_to_rank(_holder(arr.copy(), "chunky"), dest=1)
             return "sent"
         if rank == 1:
             h = d.recv_from_rank(source=0)
@@ -955,7 +948,7 @@ def test_bcast_npoint_roundtrips_object_and_mat():
 
     def fn(comm, rank):
         d = MpiDistributor(ntasks=5, comm=comm)
-        obj = Holder(arr.copy(), label="hello") if rank == 0 else Holder(np.empty((1, 1), np.complex128), label="x")
+        obj = _holder(arr.copy(), label="hello") if rank == 0 else _holder(np.empty((1, 1), np.complex128), label="x")
         out = d.bcast_npoint(obj, root=0)
         return out.label, out.mat
 
@@ -972,7 +965,7 @@ def test_bcast_npoint_chunked(monkeypatch):
 
     def fn(comm, rank):
         d = MpiDistributor(ntasks=6, comm=comm)
-        obj = Holder(arr.copy(), label="chunky") if rank == 0 else Holder(None, label="x")
+        obj = _holder(arr.copy(), label="chunky") if rank == 0 else _holder(None, label="x")
         out = d.bcast_npoint(obj, root=0)
         return out.label, out.mat
 
@@ -985,7 +978,7 @@ def test_bcast_npoint_chunked(monkeypatch):
 def test_bcast_npoint_single_rank_returns_object():
     """bcast_npoint short-circuits on a single rank (no collective, works on a minimal comm)."""
     d = MpiDistributor(ntasks=3, comm=comm1())
-    obj = Holder((np.arange(6).reshape(3, 2) + 1j).astype(np.complex128), label="solo")
+    obj = _holder((np.arange(6).reshape(3, 2) + 1j).astype(np.complex128), label="solo")
     out = d.bcast_npoint(obj, root=0)
     assert out is obj
     assert out.label == "solo"
@@ -1057,20 +1050,15 @@ def test_create_distributor_defaults_to_comm_world():
 
 
 def test_close_file_propagates_non_os_errors():
-    """close_file swallows OSError but propagates other errors."""
-    # File ops swallow only OSError; programming errors propagate.
+    """close_file swallows OSError but propagates other (programming) errors."""
     dist = MpiDistributor.__new__(MpiDistributor)
 
-    class Boom:
-        def close(self):
-            raise ValueError("not an OSError")
-
-    dist._file = Boom()
+    dist._file = MagicMock(close=MagicMock(side_effect=ValueError("not an OSError")))
     try:
         with pytest.raises(ValueError):
             dist.close_file()
     finally:
-        dist._file = None  # avoid Boom.close() raising again during __del__ on GC
+        dist._file = None  # avoid the mocked close() raising again during __del__ on GC
 
 
 def test_chunk_step_floors_to_one_and_divides():
@@ -1078,7 +1066,7 @@ def test_chunk_step_floors_to_one_and_divides():
     assert mu.chunk_step(16, 3, limit=16) == 1  # one row (48 B) exceeds the limit -> floor to 1
     assert mu.chunk_step(1, 1, limit=10) == 10
     assert mu.chunk_step(2, 1, limit=10) == 5
-    assert mu.chunk_step(4, 0, limit=100) >= 1  # items_per_row == 0 must not divide by zero
+    assert mu.chunk_step(4, 0, limit=100) >= 1
 
 
 @pytest.mark.parametrize(
@@ -1298,3 +1286,32 @@ def test_build_node_shared_array_view_is_live_shared_memory():
     _, res = run_parallel(2, fn, hostnames=["h", "h"])
     for seen in res:
         assert np.array_equal(seen, np.arange(4).astype(np.complex64))
+
+
+def test_restricted_to_rebases_slices_to_sub_communicator():
+    """restricted_to keeps only the member ranks' sizes and slices (in sub-communicator rank order) and
+    re-derives the calling rank's own slice from the sub-communicator rank, so the returned distributor's
+    collectives span exactly the members."""
+    from types import SimpleNamespace
+
+    full = SimpleNamespace(Get_rank=lambda: 2, Get_size=lambda: 4, size=4, rank=2)
+    dist = MpiDistributor(ntasks=6, comm=full)
+    dist._sizes = np.array([3, 0, 2, 1])
+    dist._slices = [slice(0, 3), slice(3, 3), slice(3, 5), slice(5, 6)]
+    sub = SimpleNamespace(Get_rank=lambda: 1, Get_size=lambda: 3, size=3, rank=1)
+    restricted = dist.restricted_to(sub, [0, 2, 3])
+    assert np.array_equal(restricted.sizes, [3, 2, 1])
+    assert list(restricted.slices) == [slice(0, 3), slice(3, 5), slice(5, 6)]
+    assert restricted.my_slice == slice(3, 5) and restricted.my_size == 2
+
+
+def test_fake_comm_split_groups_by_color_ordered_by_key():
+    """The fake Comm's Split mirrors MPI_Comm_split: one sub-communicator per color, shared by its members,
+    with ranks ordered by key (the production usage keys on the original rank)."""
+
+    def fn(comm, rank):
+        sub = comm.Split(0 if rank in (1, 3) else 1, rank)
+        return sub.Get_size(), sub.Get_rank()
+
+    _, res = run_parallel(4, fn)
+    assert res == [(2, 0), (2, 0), (2, 1), (2, 1)]

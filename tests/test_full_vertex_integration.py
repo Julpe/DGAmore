@@ -6,6 +6,7 @@
 
 import os
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -23,22 +24,12 @@ from tests import conftest
 _real_np_save = np.save
 
 
-class _SingleRankDistributor:
-    """Minimal stand-in for MpiDistributor on one rank: identity gather/scatter, no-op barrier."""
-
-    def __init__(self):
-        self.comm = SimpleNamespace(rank=0, size=1)
-        self.my_rank = 0
-        self.my_slice = slice(None)
-
-    def barrier(self):
-        pass
-
-    def gather(self, mat, root=0):
-        return mat
-
-    def scatter(self, mat, root=0):
-        return mat
+def _make_single_rank_distributor():
+    """Builds a minimal MpiDistributor stand-in on one rank: identity gather/scatter, no-op barrier."""
+    dist = MagicMock(comm=SimpleNamespace(rank=0, size=1), my_rank=0, my_slice=slice(None))
+    dist.gather.side_effect = lambda mat, root=0: mat
+    dist.scatter.side_effect = lambda mat, root=0: mat
+    return dist
 
 
 def _to_mat(x: np.ndarray, nv: int, no: int) -> np.ndarray:
@@ -67,7 +58,6 @@ def setup(tmp_path, monkeypatch):
     config.output.eliashberg_path = str(tmp_path)
     config.eliashberg.perform_eliashberg = True
     config.eliashberg.save_fq = True  # keep the result in ph notation for the comparison
-    config.eliashberg.construct_fq_cheap = False
     config.memory.save_memory_for_chiq_aux = False
     config.lambda_correction.perform_lambda_correction = False
     config.stabilization.use_chi_phys_restriction = False
@@ -77,13 +67,14 @@ def setup(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("no", [2, 3, 4, 5])
 def test_create_full_vertex_q_r_matches_exact_bse_inversion(setup, no):
-    """The production F^q chain (calculate_sigma_kernel_r_q + create_full_vertex_q_r) reproduces
-    the exact BSE inversion."""
+    """The production F^q chain (calculate_sigma_kernel_r_q + create_full_vertex_q_r) reproduces the exact BSE
+    inversion. Inputs: reversal-symmetric invertible bubble slices -beta (A(x)B + A^T(x)B^T), a local irreducible
+    vertex with the physical (nu, nu') time-reversal symmetry, a reversal-symmetric TR-projected local interaction
+    with vanishing non-local part, and zero shell terms so the dressing reduces to [(sum chi*)^{-1} + U_r]^{-1}."""
     rng = np.random.default_rng(0)
     beta = config.sys.beta
     n_q, n_w, niv = 2, 3, 3
 
-    # reversal-symmetric, invertible bubble slices: -beta (A(x)B + A^T(x)B^T)
     chi0_mat = np.zeros((n_q, no, no, no, no, n_w, 2 * niv), complex)
     for iq in range(n_q):
         for iw in range(n_w):
@@ -98,14 +89,12 @@ def test_create_full_vertex_q_r_matches_exact_bse_inversion(setup, no):
     gchi0_q_inv = gchi0_q.invert()
     gchi0_q_inv.save(name="gchi0_q_inv_rank_0", output_dir=config.output.eliashberg_path)
 
-    # local irreducible vertex with the physical (nu, nu') time-reversal symmetry
     gamma_mat = 0.3 * (
         rng.standard_normal((no, no, no, no, n_w, 2 * niv, 2 * niv))
         + 1j * rng.standard_normal((no, no, no, no, n_w, 2 * niv, 2 * niv))
     )
     gamma_r = LocalFourPoint(gamma_mat, SpinChannel.DENS, 1, 2, full_niw_range=False).symmetrize_v_vp()
 
-    # reversal-symmetric local interaction, vanishing non-local interaction
     u_mat = rng.standard_normal((no, no, no, no))
     u_mat = 0.5 * (u_mat + u_mat.transpose(1, 0, 3, 2))
     u_mat = 0.5 * (u_mat + u_mat.transpose(3, 2, 1, 0))
@@ -113,12 +102,11 @@ def test_create_full_vertex_q_r_matches_exact_bse_inversion(setup, no):
     v_nonloc = Interaction(np.zeros((n_q, no, no, no, no)), SpinChannel.NONE, (n_q, 1, 1), True)
 
     u_r = u_loc.as_channel(SpinChannel.DENS).mat
-    assert np.allclose(u_r, u_r.transpose(3, 2, 1, 0))  # precondition: TR-symmetric projected interaction
+    assert np.allclose(u_r, u_r.transpose(3, 2, 1, 0))
 
-    # zero shell terms: the dressing reduces to [(sum chi*)^{-1} + U_r]^{-1}
     zero_sum = FourPoint(np.zeros((n_q, no, no, no, no, n_w)), SpinChannel.NONE, (n_q, 1, 1), 1, 0, False, True, True)
 
-    dist = _SingleRankDistributor()
+    dist = _make_single_rank_distributor()
     nonlocal_sde.calculate_sigma_kernel_r_q(gamma_r, gchi0_q_inv, zero_sum, zero_sum, u_loc, v_nonloc, dist)
 
     f_q = eliashberg_solver.create_full_vertex_q_r(u_loc, v_nonloc, gamma_r, niv, dist)

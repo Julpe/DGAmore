@@ -14,10 +14,12 @@ eigenvalue :math:`\lambda` signals the pairing instability and the eigenvector i
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import mpi4py.MPI as MPI
 import numpy as np
 import scipy as sp
+from threadpoolctl import threadpool_limits
 
 import dgamore.config as config
 from dgamore import nonlocal_sde, mpi_utils
@@ -152,10 +154,6 @@ def create_full_vertex_q_r(
         os.path.join(config.output.eliashberg_path, f"gchi0_q_inv_rank_{mpi_dist.my_rank}.npy"), num_vn_dimensions=1
     )
 
-    if config.eliashberg.construct_fq_cheap:
-        gamma_r = gamma_r.cut_niv(niv_pp)
-        gchi0_q_inv = gchi0_q_inv.cut_niv(niv_pp)
-
     logger.info(f"Loaded gchi0_q_inv from file.")
     f_q_r = nonlocal_sde.create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_loc, v_nonloc)
     logger.info(f"Non-Local auxiliary susceptibility ({gamma_r.channel.value}) calculated.")
@@ -180,9 +178,6 @@ def create_full_vertex_q_r(
         num_vn_dimensions=1,
     )
 
-    if config.eliashberg.construct_fq_cheap:
-        vrg_q_r_left = vrg_q_r_left.cut_niv(niv_pp)
-
     chi_phys_q_r = FourPoint.load(
         os.path.join(config.output.eliashberg_path, f"chi_phys_q_{gamma_r.channel.value}_rank_{mpi_dist.my_rank}.npy"),
         channel=gamma_r.channel,
@@ -200,9 +195,6 @@ def create_full_vertex_q_r(
         channel=gamma_r.channel,
         num_vn_dimensions=1,
     )
-
-    if config.eliashberg.construct_fq_cheap:
-        vrg_q_r_right = vrg_q_r_right.cut_niv(niv_pp)
 
     f_q_r_2 = f_q_r_2 * vrg_q_r_right
     vrg_q_r_right.free()
@@ -361,12 +353,6 @@ def create_full_vertex_q_r_pp_w0_v2(
         channel=gamma_r.channel,
         num_vn_dimensions=0,
     )
-
-    if config.eliashberg.construct_fq_cheap:
-        gamma_r = gamma_r.cut_niv(niv_pp)
-        gchi0_q_inv = gchi0_q_inv.cut_niv(niv_pp)
-        vrg_q_r_left = vrg_q_r_left.cut_niv(niv_pp)
-        vrg_q_r_right = vrg_q_r_right.cut_niv(niv_pp)
 
     logger.info(f"Loaded vrg_q_{gamma_r.channel.value} and chi_phys_q_{gamma_r.channel.value} from files.")
 
@@ -664,6 +650,56 @@ def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
 
 
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
+def _solver_thread_budget() -> int:
+    r"""
+    Returns the BLAS/FFT thread budget for the in-memory Lanczos solve: the size of this process's CPU affinity
+    mask (at least 1). During that solve only the one or two solver ranks work while the other ranks of the node
+    wait at the post-solve broadcast, so the solver may use every core its affinity mask allows - the launcher's
+    binding stays the single source of truth (under a strict one-core-per-rank binding this is 1 and the threading
+    is a no-op). Falls back to 1 where the affinity API does not exist (non-Linux platforms).
+
+    :return: The thread budget as an int.
+    """
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return 1
+
+
+def _v2_solver_thread_budget(comm: MPI.Comm, active_ranks: list) -> int:
+    r"""
+    Returns the momentum-batch/FFT thread budget of THIS rank for the frequency-distributed Lanczos solve. Unlike
+    the in-memory solve (where all other ranks of the node wait and the one solver rank may claim its whole
+    affinity mask, see :func:`_solver_thread_budget`), every rank with a non-empty frequency slice computes
+    simultaneously here, so this rank's mask is divided by the number of active ranks on its node whose affinity
+    masks overlap with it - threading them all at full mask would oversubscribe the shared cores. Under a strict
+    one-core-per-rank binding the budget is 1 and the threading is a no-op; idle cores are only picked up when the
+    launcher binding leaves masks wider than one core (e.g. socket binding) and some of the node's ranks hold
+    empty frequency slices. This is a collective call - every rank of ``comm`` must enter it, active or not.
+
+    :param comm: The full MPI communicator.
+    :param active_ranks: The ranks holding non-empty frequency slices (see :func:`solve_eliashberg_lanczos_v2`).
+    :return: The thread budget of this rank as an int (1 for inactive ranks and where no affinity API exists).
+    """
+    try:
+        my_mask = frozenset(os.sched_getaffinity(0))
+    except AttributeError:
+        my_mask = None
+
+    if comm.size == 1:
+        return max(1, len(my_mask)) if my_mask else 1
+
+    infos = comm.allgather((str(MPI.Get_processor_name()).strip(), my_mask))
+    if my_mask is None or comm.rank not in active_ranks:
+        return 1
+
+    my_host = infos[comm.rank][0]
+    sharing = sum(
+        1 for r in active_ranks if infos[r][0] == my_host and infos[r][1] is not None and infos[r][1] & my_mask
+    )
+    return max(1, len(my_mask) // max(1, sharing))
+
+
 def _chi0_to_matmul_layout(chi0_mat: np.ndarray) -> np.ndarray:
     r"""
     Returns the bare pp bubble in batched-matmul layout ``[x, y, z, v, o2, o2]`` (a view, no copy) for use with
@@ -748,22 +784,40 @@ def symmetrize_degenerate_gaps(
     return gaps
 
 
-def _apply_gchi0_pp(chi0_mm: np.ndarray, gap: np.ndarray, n_bands: int) -> np.ndarray:
+def _apply_gchi0_pp(
+    chi0_mm: np.ndarray, gap: np.ndarray, n_bands: int, executor: ThreadPoolExecutor = None, n_workers: int = 1
+) -> np.ndarray:
     r"""
     Batched-matmul equivalent of ``np.einsum("xyzabcdv,xyzcdv->xyzabv", chi0, gap)`` (multiply the gap by the bare pp
     bubble per momentum and frequency). ``np.matmul`` is both faster than ``np.einsum`` and far leaner here: einsum
-    materializes a vertex-sized internal temporary, the matmul allocates only the gap-sized output.
+    materializes a vertex-sized internal temporary, the matmul allocates only the gap-sized output. With an
+    ``executor`` the batch is split into up to ``n_workers`` contiguous chunks of the leading momentum axis and
+    contracted concurrently: the chunks are pure slices of ``chi0_mm`` (no reshape of the bubble that could
+    silently copy it) and every worker writes its own slice of the one gap-sized output buffer, so the threaded
+    path allocates exactly what the serial path does and the result is bit-equal to it.
 
     :param chi0_mm: The bubble in matmul layout from :func:`_chi0_to_matmul_layout`, shape ``[x, y, z, v, o2, o2]``.
     :param gap: The gap vector, reshapeable to ``[x, y, z, o, o, v]``.
     :param n_bands: Number of orbitals ``o``.
+    :param executor: Optional thread pool for the momentum-batch parallel path (``None`` runs serially).
+    :param n_workers: Number of contiguous momentum chunks when ``executor`` is given.
     :return: ``chi0 @ gap`` in shape ``[x, y, z, o, o, v]``.
     """
     nqx, nqy, nqz, v = chi0_mm.shape[0], chi0_mm.shape[1], chi0_mm.shape[2], chi0_mm.shape[3]
     oo = n_bands * n_bands
     gap_r = np.moveaxis(gap.reshape(nqx, nqy, nqz, oo, v), -1, 3)[..., None]  # [x, y, z, v, o2, 1]
-    out = np.matmul(chi0_mm, gap_r)[..., 0]  # [x, y, z, v, o2]
-    return np.moveaxis(out, 3, -1).reshape(nqx, nqy, nqz, n_bands, n_bands, v)
+    if executor is None:
+        out = np.matmul(chi0_mm, gap_r)[..., 0]  # [x, y, z, v, o2]
+        return np.moveaxis(out, 3, -1).reshape(nqx, nqy, nqz, n_bands, n_bands, v)
+
+    out = np.empty((nqx, nqy, nqz, v, oo, 1), dtype=np.result_type(chi0_mm.dtype, gap_r.dtype))
+    bounds = np.linspace(0, nqx, n_workers + 1).astype(int)
+    futures = [
+        executor.submit(np.matmul, chi0_mm[i:j], gap_r[i:j], out[i:j]) for i, j in zip(bounds[:-1], bounds[1:]) if j > i
+    ]
+    for future in futures:
+        future.result()
+    return np.moveaxis(out[..., 0], 3, -1).reshape(nqx, nqy, nqz, n_bands, n_bands, v)
 
 
 def _gamma_to_matmul_layout(gamma_mat: np.ndarray) -> np.ndarray:
@@ -782,14 +836,22 @@ def _gamma_to_matmul_layout(gamma_mat: np.ndarray) -> np.ndarray:
     return transposed.reshape(nqx, nqy, nqz, nb * nb * nv, nb * nb * npp)
 
 
-def _apply_gamma_pp(gamma_mm: np.ndarray, gap_gg: np.ndarray, n_bands: int) -> np.ndarray:
+def _apply_gamma_pp(
+    gamma_mm: np.ndarray, gap_gg: np.ndarray, n_bands: int, executor: ThreadPoolExecutor = None, n_workers: int = 1
+) -> np.ndarray:
     r"""
     Batched-matmul equivalent of ``np.einsum("xyzacbdvp,xyzcdp->xyzabv", gamma, gap_gg)`` (contract the pairing vertex
-    with the gap over ``(c, d, p)``). Faster and leaner than ``np.einsum`` (see :func:`_apply_gchi0_pp`).
+    with the gap over ``(c, d, p)``). Faster and leaner than ``np.einsum`` (see :func:`_apply_gchi0_pp`). With an
+    ``executor`` the momentum batch is split into ``n_workers`` contiguous chunks contracted concurrently (each
+    worker writes its own output slice, so the result is bit-equal to the serial path): the contraction is a batch
+    of many small per-k GEMV products, which parallelizes over the batch but not inside one product (a raised BLAS
+    thread pool pays per-call synchronization on every small GEMV and runs slower).
 
     :param gamma_mm: The vertex in matmul layout from :func:`_gamma_to_matmul_layout`, shape ``[x, y, z, o2*nv, o2*np]``.
     :param gap_gg: The transformed gap, shape ``[x, y, z, c, d, p]``.
     :param n_bands: Number of orbitals ``o``.
+    :param executor: Optional thread pool for the momentum-batch parallel path (``None`` runs serially).
+    :param n_workers: Number of contiguous momentum chunks when ``executor`` is given.
     :return: ``gamma @ gap_gg`` in shape ``[x, y, z, o, o, nv]``.
     """
     nqx, nqy, nqz = gamma_mm.shape[:3]
@@ -797,8 +859,23 @@ def _apply_gamma_pp(gamma_mm: np.ndarray, gap_gg: np.ndarray, n_bands: int) -> n
     npp = gap_gg.shape[-1]
     nv = gamma_mm.shape[3] // oo
     gg_r = gap_gg.reshape(nqx, nqy, nqz, oo * npp)[..., None]  # [x, y, z, o2*np, 1]
-    out = np.matmul(gamma_mm, gg_r)[..., 0]  # [x, y, z, o2*nv]
-    return out.reshape(nqx, nqy, nqz, n_bands, n_bands, nv)
+    if executor is None:
+        out = np.matmul(gamma_mm, gg_r)[..., 0]  # [x, y, z, o2*nv]
+        return out.reshape(nqx, nqy, nqz, n_bands, n_bands, nv)
+
+    nk = nqx * nqy * nqz
+    mm_flat = gamma_mm.reshape(nk, oo * nv, oo * npp)
+    gg_flat = gg_r.reshape(nk, oo * npp, 1)
+    out = np.empty((nk, oo * nv, 1), dtype=gamma_mm.dtype)
+    bounds = np.linspace(0, nk, n_workers + 1).astype(int)
+    futures = [
+        executor.submit(np.matmul, mm_flat[i:j], gg_flat[i:j], out[i:j])
+        for i, j in zip(bounds[:-1], bounds[1:])
+        if j > i
+    ]
+    for future in futures:
+        future.result()
+    return out[..., 0].reshape(nqx, nqy, nqz, n_bands, n_bands, nv)
 
 
 def solve_eliashberg_lanczos(
@@ -846,6 +923,10 @@ def solve_eliashberg_lanczos(
 
     n_bands = gamma_r_pp.n_bands
     norm = 0.5 / config.lattice.k_grid.nk_tot / config.sys.beta
+    # the other ranks idle at the post-solve broadcast during this in-memory solve, so the solver rank may spread
+    # the bandwidth-bound matvec over every core its affinity mask allows (momentum-batch threads, BLAS kept at 1)
+    n_threads = _solver_thread_budget()
+    executor = ThreadPoolExecutor(max_workers=n_threads) if n_threads > 1 else None
 
     chi0_mm = _chi0_to_matmul_layout(gchi0_q0_pp.mat)
     # The pairing vertex arrives in w2dynamics G2 leg order (c cdag c cdag), whereas _apply_gamma_pp expects the
@@ -859,20 +940,22 @@ def solve_eliashberg_lanczos(
         multiplies by :math:`\chi_0^{pp}`, FFTs to real space, contracts with the pairing vertex (direct plus the
         crossed term, the latter reusing the direct vertex via gap-sized index shuffles), and transforms back. The
         orbital contractions are batched ``np.matmul`` products and the BZ transforms run in place through
-        ``scipy.fft``.
+        ``scipy.fft`` (both threaded up to the solver thread budget).
 
         :param gap: The flattened gap vector.
         :return: The flattened result of applying the pairing kernel to ``gap``.
         """
-        gap_gg = sp.fft.fftn(_apply_gchi0_pp(chi0_mm, gap, n_bands), axes=(0, 1, 2), overwrite_x=True)
-        gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands)
+        gap_gg = sp.fft.fftn(
+            _apply_gchi0_pp(chi0_mm, gap, n_bands), axes=(0, 1, 2), overwrite_x=True, workers=n_threads
+        )
+        gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands, executor, n_threads)
         # crossed term: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]
-        crossed = _apply_gamma_pp(gamma_mm, np.flip(gap_gg, axis=-1), n_bands)
+        crossed = _apply_gamma_pp(gamma_mm, np.flip(gap_gg, axis=-1), n_bands, executor, n_threads)
         crossed = np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
         if sign != 1:
             crossed *= sign
         gap_new += crossed
-        gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True)
+        gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True, workers=n_threads)
         gap_new *= norm
         return gap_new.flatten()
 
@@ -887,9 +970,16 @@ def solve_eliashberg_lanczos(
         allowed_ranks=ranks,
     )
 
-    lambdas, gaps = sp.sparse.linalg.eigsh(
-        mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0.flatten(), which="LA", maxiter=10000
-    )
+    # BLAS is pinned to one thread for the solve (threadpool_limits resizes the live pool; an environment change
+    # would be ignored) so the momentum-batch threads never nest BLAS threads underneath.
+    try:
+        with threadpool_limits(limits=1 if executor is not None else None):
+            lambdas, gaps = sp.sparse.linalg.eigsh(
+                mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0.flatten(), which="LA", maxiter=10000
+            )
+    finally:
+        if executor is not None:
+            executor.shutdown()
 
     logger.info(
         f"Finished Lanczos method for the largest{eig_label} eigenvalue{plural} and eigenvector{plural} "
@@ -925,7 +1015,11 @@ def solve_eliashberg_lanczos(
 
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
 def solve_eliashberg_lanczos_v2(
-    gamma_r_pp: FourPoint, gchi0_q0_pp: FourPoint, mpi_dist_v: MpiDistributor, active_ranks: list
+    gamma_r_pp: FourPoint,
+    gchi0_q0_pp: FourPoint,
+    mpi_dist_v: MpiDistributor,
+    active_ranks: list,
+    n_threads: int = 1,
 ) -> tuple[list[float], list[GapFunction]]:
     r"""
     Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using
@@ -937,12 +1031,21 @@ def solve_eliashberg_lanczos_v2(
     :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (frequency-distributed) for one channel; consumed
         by the solve.
     :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{pp}` at :math:`\omega = 0` (held on the root rank).
-    :param mpi_dist_v: MPI distributor over the fermionic frequency axis (see :class:`MpiDistributor`).
-    :param active_ranks: The ranks participating in this solve; the first is used as root.
+    :param mpi_dist_v: MPI distributor over the fermionic frequency axis (see :class:`MpiDistributor`). Its
+        communicator must span exactly the participating ranks - when some ranks hold empty frequency slices the
+        caller passes the restricted distributor (see :meth:`~dgamore.mpi_utils.MpiDistributor.restricted_to`),
+        whose rank 0 is the first active rank; ranks outside it must not enter this function.
+    :param active_ranks: The original-communicator ranks participating in this solve (used for logging); the
+        first is the root that owns the bubble.
+    :param n_threads: This rank's momentum-batch/FFT thread budget (see :func:`_v2_solver_thread_budget`); the
+        default 1 runs the serial path, results are bit-equal either way.
     :return: A tuple ``(lambdas, gaps)`` of the leading eigenvalues and the corresponding :class:`GapFunction` objects.
     """
     logger = config.logger
     root = active_ranks[0]
+    # distributor operations are rooted at rank 0 of ITS communicator: the first active rank, whether the
+    # distributor spans all ranks (all active) or the Split sub-communicator (keyed on the original rank)
+    dist_root = 0
 
     logger.info(
         f"Starting to solve the Eliashberg equation for the {gamma_r_pp.channel.value}let channel.",
@@ -960,7 +1063,7 @@ def solve_eliashberg_lanczos_v2(
     gap_shape = gamma_r_pp.nq + 2 * (gamma_r_pp.n_bands,) + (gamma_r_pp.current_shape[-1],)
 
     gap0 = get_initial_gap_function(gap_shape, gamma_r_pp.channel)
-    gap0 = mpi_dist_v.bcast_chunked(gap0, root=root)
+    gap0 = mpi_dist_v.bcast_chunked(gap0, root=dist_root)
 
     symmetry_label = config.eliashberg.symmetry.lower() if config.eliashberg.symmetry else "random"
     logger.info(
@@ -970,10 +1073,13 @@ def solve_eliashberg_lanczos_v2(
 
     n_bands = gamma_r_pp.n_bands
     norm = 0.5 / config.lattice.k_grid.nk_tot / config.sys.beta
+    # every active rank computes simultaneously here, so the budget divides this rank's affinity mask among the
+    # node's active ranks (see _v2_solver_thread_budget); 1 under one-core-per-rank binding = serial path
+    executor = ThreadPoolExecutor(max_workers=n_threads) if n_threads > 1 else None
 
     # Batched-matmul layout (see solve_eliashberg_lanczos): chi0 on the root rank (a view), the frequency-sliced
     # pairing vertex materialized once per rank; the flipped vertex is never stored (matvec reuses the direct array).
-    chi0_mm = _chi0_to_matmul_layout(gchi0_q0_pp.mat) if mpi_dist_v.comm.rank == root else None
+    chi0_mm = _chi0_to_matmul_layout(gchi0_q0_pp.mat) if mpi_dist_v.comm.rank == dist_root else None
     # w2dynamics G2 leg order (c cdag c cdag) vs the TRIQS order (cdag c cdag c) that _apply_gamma_pp expects: they
     # differ by the "abcd->badc" swap (o1<->o2, o3<->o4), which aligns the gap's creation legs; no-op for one band.
     gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.permute_orbitals("abcd->badc", False).mat)
@@ -983,26 +1089,29 @@ def solve_eliashberg_lanczos_v2(
         r"""
         Applies the pairing kernel to a flattened gap vector in the frequency-distributed scheme: the root rank
         multiplies by :math:`\chi_0^{pp}` and broadcasts, all ranks FFT and contract with their frequency slice of the
-        pairing vertex, then the result is reassembled across the frequency axis via all-gather.
+        pairing vertex, then the result is reassembled across the frequency axis via all-gather. The orbital
+        contractions and the BZ transforms are threaded up to this rank's budget (serial for a budget of 1).
 
         :param gap: The flattened gap vector (full on root, sliced elsewhere).
         :return: The flattened result of applying the pairing kernel to ``gap``.
         """
         # 1. multiply chi0 * gap for the full BZ (only done by one rank, since memory would be an issue)
-        gap_gg = _apply_gchi0_pp(chi0_mm, gap, n_bands) if mpi_dist_v.comm.rank == root else None
-        gap_gg = mpi_dist_v.bcast_chunked(gap_gg, root=root)
+        gap_gg = (
+            _apply_gchi0_pp(chi0_mm, gap, n_bands, executor, n_threads) if mpi_dist_v.comm.rank == dist_root else None
+        )
+        gap_gg = mpi_dist_v.bcast_chunked(gap_gg, root=dist_root)
         # 2. perform Fourier transform for the full chi0 * gap quantity
-        gap_gg = sp.fft.fftn(gap_gg, axes=(0, 1, 2), overwrite_x=True)
+        gap_gg = sp.fft.fftn(gap_gg, axes=(0, 1, 2), overwrite_x=True, workers=n_threads)
         # 3. contract with the pairing vertex over (c, d, p) -> the gap for this rank's v slice; the crossed term
         #    reuses the direct vertex: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]
-        gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands)
-        crossed = _apply_gamma_pp(gamma_mm, np.flip(gap_gg, axis=-1), n_bands)
+        gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands, executor, n_threads)
+        crossed = _apply_gamma_pp(gamma_mm, np.flip(gap_gg, axis=-1), n_bands, executor, n_threads)
         crossed = np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
         if sign != 1:
             crossed *= sign
         gap_new += crossed
         # 4. perform fourier transform on the local v slice
-        gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True)
+        gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True, workers=n_threads)
         gap_new *= norm
         # 5. assemble gap_new for the full v range through mpi_dist_v and allgather (remember we distributed v)
         gap_new = np.moveaxis(gap_new, -1, 0)  # (v_local, nq_tot, orb, orb)
@@ -1020,9 +1129,16 @@ def solve_eliashberg_lanczos_v2(
         allowed_ranks=root,
     )
 
-    lambdas, gaps = sp.sparse.linalg.eigsh(
-        mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0.flatten(), which="LA", maxiter=10000
-    )
+    # BLAS is pinned to one thread for the solve (threadpool_limits resizes the live pool; an environment change
+    # would be ignored) so the momentum-batch threads never nest BLAS threads underneath.
+    try:
+        with threadpool_limits(limits=1 if executor is not None else None):
+            lambdas, gaps = sp.sparse.linalg.eigsh(
+                mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0.flatten(), which="LA", maxiter=10000
+            )
+    finally:
+        if executor is not None:
+            executor.shutdown()
 
     logger.info(
         f"Finished Lanczos method for the largest{eig_label} eigenvalue{plural} and eigenvector{plural} "
@@ -1142,7 +1258,6 @@ def solve(
     f_magn_pp = dispatch_full_vertex_calculation(SpinChannel.MAGN, u_loc, v_nonloc, niv_pp, mpi_dist_irrk)
 
     delete_files(config.output.eliashberg_path, f"gchi0_q_inv_rank_{comm.rank}.npy")
-    delete_files(config.output.output_path, f"gchi0_q_rank_{comm.rank}.npy")
 
     mpi_dist_irrk.delete_file()
 
@@ -1247,6 +1362,16 @@ def solve(
         ]
 
         root = active_ranks[0]
+        # collective on the full comm (inactive ranks included): splits each active rank's affinity mask among the
+        # active ranks of its node, so the matvec threading never oversubscribes shared cores
+        v2_n_threads = _v2_solver_thread_budget(comm, active_ranks)
+        # the matvec collectives must span exactly the ranks that enter the solve: with empty frequency slices
+        # present, the active ranks run on a Split sub-communicator carrying only their slices
+        if len(active_ranks) < comm.size:
+            active_comm = comm.Split(0 if comm.rank in active_ranks else 1, comm.rank)
+            solver_dist_v = mpi_dist_v.restricted_to(active_comm, active_ranks) if comm.rank in active_ranks else None
+        else:
+            solver_dist_v = mpi_dist_v
         if comm.rank == root:
             # calculating gchi0 in the full BZ only once
             # in the lanczos step only active_rank[0] will perform chi0 * delta due to memory reasons
@@ -1257,7 +1382,9 @@ def solve(
             gchi0_q_pp = None
 
         if comm.rank in active_ranks:
-            lambdas_sing, gaps_sing = solve_eliashberg_lanczos_v2(gamma_sing_pp, gchi0_q_pp, mpi_dist_v, active_ranks)
+            lambdas_sing, gaps_sing = solve_eliashberg_lanczos_v2(
+                gamma_sing_pp, gchi0_q_pp, solver_dist_v, active_ranks, v2_n_threads
+            )
             gamma_sing_pp.free()
         else:
             lambdas_sing = None
@@ -1269,7 +1396,9 @@ def solve(
         logger.info("Gamma_trip_pp distributed. Starting with triplet Lanczos solver.")
 
         if comm.rank in active_ranks:
-            lambdas_trip, gaps_trip = solve_eliashberg_lanczos_v2(gamma_trip_pp, gchi0_q_pp, mpi_dist_v, active_ranks)
+            lambdas_trip, gaps_trip = solve_eliashberg_lanczos_v2(
+                gamma_trip_pp, gchi0_q_pp, solver_dist_v, active_ranks, v2_n_threads
+            )
             gamma_trip_pp.free()
         else:
             lambdas_trip = None

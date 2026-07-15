@@ -756,6 +756,24 @@ class MpiDistributor:
             comm = MPI.COMM_WORLD
         return MpiDistributor(ntasks=ntasks, comm=comm, name=name, output_path=output_path)
 
+    def restricted_to(self, sub_comm, member_ranks: list) -> "MpiDistributor":
+        """
+        Returns a new distributor over ``sub_comm`` carrying only ``member_ranks``' task slices of this
+        distributor, in the given order, which must match the sub-communicator's rank order (e.g. from a
+        ``comm.Split`` keyed on the original rank). Collectives of the returned distributor then span exactly the
+        member ranks, so ranks with an empty task slice need not enter them. No per-rank spill file is opened.
+
+        :param sub_comm: The sub-communicator containing exactly the ``member_ranks``.
+        :param member_ranks: The original-communicator ranks to keep, ordered like the sub-communicator's ranks.
+        :return: The restricted :class:`MpiDistributor`.
+        """
+        restricted = MpiDistributor(ntasks=self.ntasks, comm=sub_comm)
+        restricted._sizes = np.array([self._sizes[r] for r in member_ranks], dtype=int)
+        restricted._slices = [self._slices[r] for r in member_ranks]
+        restricted._my_size = restricted._sizes[restricted.my_rank]
+        restricted._my_slice = restricted._slices[restricted.my_rank]
+        return restricted
+
     def _distribute_tasks(self):
         """
         Computes the per-rank chunk sizes and slices, distributing the tasks as evenly as possible (excess tasks go to

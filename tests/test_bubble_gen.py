@@ -40,7 +40,7 @@ def test_create_generalized_chi0_matches_reference():
     """create_generalized_chi0 matches an explicit hand-rolled reference of the documented formula."""
     nb, niv, niw, beta = 2, 1, 1, 2.0
     g = _make_local_g(nb, niv + niw + 1, seed=1)
-    gm = g.mat  # complex64 backing array, used as the reference source
+    gm = g.mat
     nivd = g.niv
 
     res = BubbleGenerator.create_generalized_chi0(g, niw, niv, beta)
@@ -145,7 +145,7 @@ def test_create_generalized_chi0_q_pp_w0_matches_reference():
 
     res = BubbleGenerator.create_generalized_chi0_q_pp_w0(g, niv_pp, q_grid)
 
-    gm = g.cut_niv(niv_pp).compress_q_dimension().mat  # [k, o, o, 2*niv_pp]
+    gm = g.cut_niv(niv_pp).compress_q_dimension().mat
     nkt, n = gm.shape[0], 2 * niv_pp
     ref = np.zeros((nkt, nb, nb, nb, nb, n), dtype=np.complex128)
     for k in range(nkt):

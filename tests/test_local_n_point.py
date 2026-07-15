@@ -5,7 +5,7 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import itertools
-from unittest.mock import patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -436,30 +436,32 @@ def test_raises_error_when_swapping_with_less_than_two_fermionic_dimensions(num_
         obj.swap_fermionic_frequency_axes()
 
 
-def test_saves_matrix_calls_to_full_niw_range_when_full_range():
+def test_saves_matrix_calls_to_full_niw_range_when_full_range(monkeypatch):
     """save converts to full then half niw range before writing for a full-range object."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=True)
-    with patch.object(obj, "to_full_niw_range") as mock_full, patch.object(
-        obj, "to_half_niw_range"
-    ) as mock_half, patch("numpy.save") as mock_save:
-        obj.save(output_dir="dir", name="full_range")
-        mock_full.assert_called_once()
-        mock_half.assert_called_once()
-        mock_save.assert_called_once()
+    mock_full, mock_half, mock_save = MagicMock(), MagicMock(), MagicMock()
+    monkeypatch.setattr(obj, "to_full_niw_range", mock_full)
+    monkeypatch.setattr(obj, "to_half_niw_range", mock_half)
+    monkeypatch.setattr(np, "save", mock_save)
+    obj.save(output_dir="dir", name="full_range")
+    mock_full.assert_called_once()
+    mock_half.assert_called_once()
+    mock_save.assert_called_once()
 
 
-def test_saves_matrix_calls_to_half_niw_range_when_half_range():
+def test_saves_matrix_calls_to_half_niw_range_when_half_range(monkeypatch):
     """save only converts to half niw range before writing for a half-range object."""
     mat = np.zeros((4, 4, 10))
     obj = LocalNPoint(mat, 2, 1, 1, full_niw_range=False)
-    with patch.object(obj, "to_full_niw_range") as mock_full, patch.object(
-        obj, "to_half_niw_range"
-    ) as mock_half, patch("numpy.save") as mock_save:
-        obj.save(output_dir="dir", name="half_range")
-        mock_full.assert_not_called()
-        mock_half.assert_called_once()
-        mock_save.assert_called_once()
+    mock_full, mock_half, mock_save = MagicMock(), MagicMock(), MagicMock()
+    monkeypatch.setattr(obj, "to_full_niw_range", mock_full)
+    monkeypatch.setattr(obj, "to_half_niw_range", mock_half)
+    monkeypatch.setattr(np, "save", mock_save)
+    obj.save(output_dir="dir", name="half_range")
+    mock_full.assert_not_called()
+    mock_half.assert_called_once()
+    mock_save.assert_called_once()
 
 
 def test_symmetrizes_orbitals_correctly():
@@ -530,7 +532,9 @@ def test_symmetrize_single_orbital_is_noop_and_returns_self():
 
 @pytest.mark.parametrize("orbitals", [[1], [1, 2], [1, 3], [1, 2, 3], [1, 2, 3, 4]])
 def test_symmetrize_multiple_orbital_sets(orbitals):
-    """_symmetrize_orbitals enforces the expected degeneracies on four-orbital-axis tensors."""
+    """_symmetrize_orbitals enforces the expected degeneracies on four-orbital-axis tensors: the fully diagonal
+    [i,i,i,i], the pair patterns [i,i,j,j], [i,j,j,i] and [i,j,i,j], and all 3-1 permutations [i,j,j,j] must each
+    collapse onto a single value within the symmetrized set."""
     nb = 4
     mat = np.random.rand(nb, nb, nb, nb)
 
@@ -545,13 +549,11 @@ def test_symmetrize_multiple_orbital_sets(orbitals):
     if len(orbitals_idx) <= 1:
         return
 
-    # 1) Fully diagonal [i,i,i,i]
     ref = sym_mat[orbitals_idx[0], orbitals_idx[0], orbitals_idx[0], orbitals_idx[0]]
 
     for o in orbitals_idx[1:]:
         assert np.allclose(sym_mat[o, o, o, o], ref)
 
-    # 2) [i,i,j,j]
     vals = []
     for i in orbitals_idx:
         for j in orbitals_idx:
@@ -562,7 +564,6 @@ def test_symmetrize_multiple_orbital_sets(orbitals):
     for v in vals:
         assert np.allclose(v, ref)
 
-    # 3) [i,j,j,i]
     vals = []
     for i in orbitals_idx:
         for j in orbitals_idx:
@@ -574,7 +575,6 @@ def test_symmetrize_multiple_orbital_sets(orbitals):
         for v in vals:
             assert np.allclose(v, ref)
 
-    # 4) [i,j,i,j]
     vals = []
     for i in orbitals_idx:
         for j in orbitals_idx:
@@ -586,7 +586,6 @@ def test_symmetrize_multiple_orbital_sets(orbitals):
         for v in vals:
             assert np.allclose(v, ref)
 
-    # 5) 3–1 patterns
     vals = []
 
     for i in orbitals_idx:
@@ -606,7 +605,9 @@ def test_symmetrize_multiple_orbital_sets(orbitals):
     "orbital_groups", [[[1, 2], [3, 4]], [[1, 2, 3], [4]], [[1, 3], [2, 4]], [[1, 2, 3, 4]], [[1], [2], [3], [4]]]
 )
 def test_symmetrize_multiple_groups(orbital_groups):
-    """_symmetrize_orbitals symmetrizes within each group without coupling different groups."""
+    """_symmetrize_orbitals symmetrizes within each group without coupling different groups: per group the fully
+    diagonal, [i,i,j,j], [i,j,j,i], [i,j,i,j] and 3-1 permutation patterns collapse onto one value each, while
+    representatives of two distinct groups must not be forced equal."""
     nb = 4
     mat = np.random.rand(nb, nb, nb, nb)
 
@@ -616,21 +617,18 @@ def test_symmetrize_multiple_groups(orbital_groups):
     sym_obj = obj._symmetrize_orbitals(orbital_groups, orbital_axes)
     sym_mat = sym_obj.mat
 
-    # Check symmetry inside each group
     for group in orbital_groups:
         group_idx = np.array(group) - 1
 
         if len(group_idx) <= 1:
             continue
 
-        # 1) Fully diagonal
         ref = sym_mat[group_idx[0], group_idx[0], group_idx[0], group_idx[0]]
 
         for o in group_idx[1:]:
             assert np.allclose(sym_mat[o, o, o, o], ref)
 
-        # 2) [i,i,j,j]
-        vals = []
+            vals = []
         for i in group_idx:
             for j in group_idx:
                 if i != j:
@@ -640,8 +638,7 @@ def test_symmetrize_multiple_groups(orbital_groups):
         for v in vals:
             assert np.allclose(v, ref)
 
-        # 3) [i,j,j,i]
-        vals = []
+            vals = []
         for i in group_idx:
             for j in group_idx:
                 if i != j:
@@ -652,8 +649,7 @@ def test_symmetrize_multiple_groups(orbital_groups):
             for v in vals:
                 assert np.allclose(v, ref)
 
-        # 4) [i,j,i,j]
-        vals = []
+            vals = []
         for i in group_idx:
             for j in group_idx:
                 if i != j:
@@ -664,7 +660,6 @@ def test_symmetrize_multiple_groups(orbital_groups):
             for v in vals:
                 assert np.allclose(v, ref)
 
-        # 5) 3–1 permutations
         vals = []
         for i in group_idx:
             for j in group_idx:
@@ -678,14 +673,12 @@ def test_symmetrize_multiple_groups(orbital_groups):
             for v in vals:
                 assert np.allclose(v, ref)
 
-    # Ensure no forced equality between different groups
     nontrivial_groups = [g for g in orbital_groups if len(g) > 1]
 
     if len(nontrivial_groups) >= 2:
         g1 = nontrivial_groups[0][0] - 1
         g2 = nontrivial_groups[1][0] - 1
 
-        # Should not be deterministically equal
         assert not np.array_equal(
             sym_mat[g1, g1, g1, g1],
             sym_mat[g2, g2, g2, g2],
@@ -693,24 +686,22 @@ def test_symmetrize_multiple_groups(orbital_groups):
 
 
 def test_orbital_symmetrization_patterns():
-    """_symmetrize_orbitals produces the expected diagonal and pair patterns."""
+    """_symmetrize_orbitals equalizes the diagonal entries and the pair patterns [i,i,j,j] and [i,j,j,i] over the
+    (1-based) symmetrized orbital set."""
     mat = np.random.rand(3, 3, 3, 3)
     obj = LocalNPoint(mat.copy(), 4, 0, 0)
 
-    orbitals = [[1, 2, 3]]  # 1-based
+    orbitals = [[1, 2, 3]]
     obj._symmetrize_orbitals(orbitals, orbital_axes=(0, 1, 2, 3))
 
-    # Diagonal entries should be equal
     assert obj.mat[0, 0, 0, 0] == obj.mat[1, 1, 1, 1] == obj.mat[2, 2, 2, 2]
 
     orbitals = [0, 1, 2]
-    # Pair pattern [i,i,j,j]
     vals_iijj = [obj.mat[i, i, j, j] for i in orbitals for j in orbitals if i != j]
     ref_iijj = vals_iijj[0]
     for v in vals_iijj:
         assert np.allclose(v, ref_iijj)
 
-    # Pair pattern [i,j,j,i]
     vals_ijji = [obj.mat[i, j, j, i] for i in orbitals for j in orbitals if i != j]
     ref_ijji = vals_ijji[0]
     for v in vals_ijji:
@@ -729,7 +720,8 @@ def test_symmetrize_raises_for_orbitals_out_of_range_negative_and_large():
 
 @pytest.mark.parametrize("orbitals", [[1], [1, 2], [1, 3], [1, 2, 3], [1, 2, 3, 4]])
 def test_symmetrize_two_orbital_axes_single_set(orbitals):
-    """_symmetrize_orbitals enforces degeneracies on two-orbital-axis tensors."""
+    """_symmetrize_orbitals enforces degeneracies on two-orbital-axis tensors: the diagonal elements and the
+    off-diagonal elements of the symmetrized set each collapse onto a single value."""
     nb = 4
     mat = np.random.rand(nb, nb)
 
@@ -744,13 +736,11 @@ def test_symmetrize_two_orbital_axes_single_set(orbitals):
     if len(orbitals_idx) <= 1:
         return
 
-    # 1) Diagonal elements equal
     ref = sym_mat[orbitals_idx[0], orbitals_idx[0]]
 
     for o in orbitals_idx[1:]:
         assert np.allclose(sym_mat[o, o], ref)
 
-    # 2) Off-diagonal equal
     vals = []
     for i in orbitals_idx:
         for j in orbitals_idx:
@@ -767,7 +757,8 @@ def test_symmetrize_two_orbital_axes_single_set(orbitals):
     "orbital_groups", [[[1, 2], [3, 4]], [[1, 2, 3], [4]], [[1, 3], [2, 4]], [[1, 2, 3, 4]], [[1], [2], [3], [4]]]
 )
 def test_symmetrize_two_orbital_axes_multiple_groups(orbital_groups):
-    """_symmetrize_orbitals symmetrizes within each group on two-orbital-axis tensors."""
+    """_symmetrize_orbitals symmetrizes within each group on two-orbital-axis tensors - per group the diagonal
+    and off-diagonal degeneracies hold - without forcing equality between distinct groups."""
     nb = 4
     mat = np.random.rand(nb, nb)
 
@@ -777,20 +768,17 @@ def test_symmetrize_two_orbital_axes_multiple_groups(orbital_groups):
     sym_obj = obj._symmetrize_orbitals(orbital_groups, orbital_axes)
     sym_mat = sym_obj.mat
 
-    # Check symmetry inside each group
     for group in orbital_groups:
         group_idx = np.array(group) - 1
 
         if len(group_idx) <= 1:
             continue
 
-        # Diagonal degeneracy
         ref = sym_mat[group_idx[0], group_idx[0]]
 
         for o in group_idx[1:]:
             assert np.allclose(sym_mat[o, o], ref)
 
-        # Off-diagonal degeneracy
         vals = []
         for i in group_idx:
             for j in group_idx:
@@ -802,7 +790,6 @@ def test_symmetrize_two_orbital_axes_multiple_groups(orbital_groups):
             for v in vals:
                 assert np.allclose(v, ref)
 
-    # Ensure no enforced equality between distinct groups
     nontrivial_groups = [g for g in orbital_groups if len(g) > 1]
 
     if len(nontrivial_groups) >= 2:
@@ -873,9 +860,8 @@ def test_cut_niv_releases_parent_array_and_preserves_values():
     obj = LocalNPoint(mat.copy(), 2, 0, 2, full_niv_range=True)
     result = obj.cut_niv(2)
     assert result.mat.base is None
-    # niv goes 4 -> 2, keeping the central [2:6, 2:6] block.
+    # niv goes 4 -> 2, keeping the central [2:6, 2:6] block; the original stays untouched (copy=True default)
     assert np.array_equal(result.mat, mat[..., 2:6, 2:6])
-    # original object is untouched (copy=True default)
     assert obj.niv == 4
 
 
@@ -944,34 +930,33 @@ def test_to_half_niv_range_releases_parent_and_keeps_positive_half():
 
 def test_take_vn_diagonal_is_writeable_and_releases_parent():
     """take_vn_diagonal returns a writeable array that releases the parent."""
-    mat = np.arange(2 * 2 * 3 * 4 * 4).reshape(2, 2, 3, 4, 4).astype(complex)  # [o,o,w,v,v]
+    mat = np.arange(2 * 2 * 3 * 4 * 4).reshape(2, 2, 3, 4, 4).astype(complex)
     obj = LocalNPoint(mat.copy(), 2, 1, 2)
     result = obj.take_vn_diagonal()
     assert result.num_vn_dimensions == 1
     assert result.mat.flags.writeable  # diagonal() alone would yield a read-only view
     assert result.mat.base is None
     assert np.array_equal(result.mat, np.diagonal(mat, axis1=-2, axis2=-1))
-    # the result must be writeable in practice
     result.mat[0, 0, 0, 0] = 123.0
     assert result.mat[0, 0, 0, 0] == 123.0
 
 
 @pytest.mark.parametrize("num_vn", [0, 1, 2])
 def test_to_negative_niw_range_twice_returns_original(num_vn):
-    """to_negative_niw_range is its own inverse and leaves self unchanged."""
-    # to_negative_niw_range is its own inverse: applying it twice recovers the original object.
+    """to_negative_niw_range is its own inverse and leaves self unchanged: it always returns a new object,
+    preserves the niw+1 half-range entries (w=0 included) and applying it twice recovers the original values."""
     nb, niw, niv = 2, 3, 2
-    shape = (nb, nb, niw + 1) + (2 * niv,) * num_vn  # half (positive) niw range -> w-axis has niw+1 entries
+    shape = (nb, nb, niw + 1) + (2 * niv,) * num_vn
     mat = np.random.rand(*shape) + 1j * np.random.rand(*shape)
     obj = LocalNPoint(mat.copy(), 2, 1, num_vn, full_niw_range=False)
 
     once = obj.to_negative_niw_range()
     twice = once.to_negative_niw_range()
 
-    assert twice is not obj  # always a new object, never self
-    assert once.mat.shape == obj.mat.shape  # niw+1 entries preserved (w=0 included)
-    assert np.allclose(twice.mat, obj.mat)  # double application recovers the original
-    assert np.allclose(obj.mat, mat)  # self is left unchanged (non-destructive)
+    assert twice is not obj
+    assert once.mat.shape == obj.mat.shape
+    assert np.allclose(twice.mat, obj.mat)
+    assert np.allclose(obj.mat, mat)
 
 
 def test_to_negative_niw_range_raises_when_in_full_bosonic_range():
@@ -992,18 +977,17 @@ def test_to_negative_niw_range_raises_without_bosonic_dimension():
 
 @pytest.mark.parametrize("num_vn", [0, 1])
 def test_to_negative_niw_range_matches_full_niw_range_negative_block(num_vn):
-    """to_negative_niw_range matches the full object's negative bosonic block."""
-    # Keystone: index k of the negative block (w = -k) must equal the full object's w = -k slot, for k = 1..niw.
+    """to_negative_niw_range matches the full object's negative bosonic block: index k of the negative block
+    (w = -k) must equal the symmetry-consistent full-range object's slot at index niw - k, for k = 1..niw."""
     nb, niw, niv = 2, 3, 2
     shape = (nb, nb, niw + 1) + (2 * niv,) * num_vn
     mat = np.random.rand(*shape) + 1j * np.random.rand(*shape)
 
-    # build a symmetry-consistent full-range object from the same half-range data
     full = LocalNPoint(mat.copy(), 2, 1, num_vn, full_niw_range=False).to_full_niw_range()
     neg = LocalNPoint(mat.copy(), 2, 1, num_vn, full_niw_range=False).to_negative_niw_range()
 
     w_axis = -(1 + num_vn)
     for k in range(1, niw + 1):
-        neg_slice = np.take(neg.mat, k, axis=w_axis)  # w = -k at index k
-        full_slice = np.take(full.mat, niw - k, axis=w_axis)  # full index niw-k <-> w = -k
+        neg_slice = np.take(neg.mat, k, axis=w_axis)
+        full_slice = np.take(full.mat, niw - k, axis=w_axis)
         assert np.allclose(neg_slice, full_slice)

@@ -133,10 +133,6 @@ class ConfigParser:
             return conf
 
         conf.nk = self._try_parse(section, "nk", conf.nk)
-
-        if "nq" in section:
-            config.logger.info("'nq' has been removed - the q-grid always equals the k-grid ('nk'); it is ignored.")
-
         symmetries = self._try_parse(section, "symmetries", "two_dimensional_square")
         conf.symmetries = bz.get_lattice_symmetries_from_string(symmetries)
 
@@ -230,23 +226,6 @@ class ConfigParser:
         conf.previous_sc_path = self._try_parse(section, "previous_sc_path", conf.previous_sc_path)
         conf.use_interpolated_sigma = self._try_parse(section, "use_interpolated_sigma", conf.use_interpolated_sigma)
 
-        for stale_key in (
-            "use_lambda_correction",
-            "use_chi_phys_restriction",
-            "use_jacobian_stabilization",
-            "use_lambda_annealing",
-        ):
-            if stale_key in section:
-                config.logger.warning(
-                    f"'{stale_key}' has moved from the 'self_consistency' to the 'stabilization' section - "
-                    f"the stale key is ignored."
-                )
-        if "use_trial_lambda_correction" in section:
-            config.logger.warning(
-                "'use_trial_lambda_correction' has been folded into 'stabilization.use_lambda_correction' "
-                "(dispatched by the band count) - the stale key is ignored."
-            )
-
         return conf
 
     def _build_stabilization_config(self, config_file) -> StabilizationConfig:
@@ -266,9 +245,6 @@ class ConfigParser:
         conf.use_lambda_correction = self._try_parse(section, "use_lambda_correction", conf.use_lambda_correction)
         conf.use_chi_phys_restriction = self._try_parse(
             section, "use_chi_phys_restriction", conf.use_chi_phys_restriction
-        )
-        conf.use_jacobian_stabilization = self._try_parse(
-            section, "use_jacobian_stabilization", conf.use_jacobian_stabilization
         )
         conf.use_lambda_annealing = self._try_parse(section, "use_lambda_annealing", conf.use_lambda_annealing)
 
@@ -291,7 +267,6 @@ class ConfigParser:
         conf.perform_eliashberg = self._try_parse(section, "perform_eliashberg", conf.perform_eliashberg)
         conf.save_pairing_vertex = self._try_parse(section, "save_pairing_vertex", conf.save_pairing_vertex)
         conf.save_fq = self._try_parse(section, "save_fq", conf.save_fq)
-        conf.construct_fq_cheap = self._try_parse(section, "construct_fq_cheap", conf.construct_fq_cheap)
         conf.n_eig = self._try_parse(section, "n_eig", conf.n_eig)
         conf.epsilon = self._try_parse(section, "epsilon", conf.epsilon)
         conf.symmetry = self._try_parse(section, "symmetry", conf.symmetry)
