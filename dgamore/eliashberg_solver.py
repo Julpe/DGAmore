@@ -15,11 +15,12 @@ eigenvalue :math:`\lambda` signals the pairing instability and the eigenvector i
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
 import mpi4py.MPI as MPI
 import numpy as np
 import scipy as sp
-from threadpoolctl import threadpool_limits
+from threadpoolctl import ThreadpoolController, threadpool_limits
 
 import dgamore.config as config
 from dgamore import nonlocal_sde, mpi_utils
@@ -650,20 +651,57 @@ def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
 
 
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
+@lru_cache(maxsize=1)
+def _openblas_thread_slot_cap() -> int | None:
+    r"""
+    Returns the build-time thread capacity (``NUM_THREADS``) of the loaded OpenBLAS libraries, or ``None`` when no
+    OpenBLAS is loaded. OpenBLAS reserves working-buffer slots for at most that many calling threads at build time;
+    a process calling into it from more threads than that overflows into an auxiliary bookkeeping path
+    ("precompiled NUM_THREADS exceeded" warning) that is unreliable under concurrency and crashes ("Bad memory
+    unallocation!", segmentation faults), so every solver thread budget must stay at or below this capacity.
+    ``openblas_set_num_threads`` clamps its argument to the build maximum, so probing with an oversized limit and
+    reading the value back yields that maximum; the previous thread settings are restored afterwards. The result is
+    cached - the capacity is a fixed property of the loaded libraries. Other BLAS implementations (MKL, BLIS) size
+    their buffers per calling thread and need no cap.
+
+    :return: The smallest build-time thread capacity among the loaded OpenBLAS libraries, ``None`` without OpenBLAS.
+    """
+    openblas_libs = ThreadpoolController().select(internal_api="openblas")
+    if not openblas_libs.lib_controllers:
+        return None
+    with openblas_libs.limit(limits=1 << 15):
+        return min(lib.num_threads for lib in openblas_libs.lib_controllers)
+
+
+def _clamp_to_openblas_slot_cap(budget: int) -> int:
+    r"""
+    Clamps a thread budget to the loaded OpenBLAS build's thread capacity (see :func:`_openblas_thread_slot_cap`);
+    a larger budget would call OpenBLAS from more threads than it has buffer slots for and crash. The budget passes
+    through unchanged when no OpenBLAS is loaded.
+
+    :param budget: The thread budget to clamp.
+    :return: The budget, clamped to the OpenBLAS thread capacity if OpenBLAS is loaded.
+    """
+    cap = _openblas_thread_slot_cap()
+    return budget if cap is None else min(budget, cap)
+
+
 def _solver_thread_budget() -> int:
     r"""
     Returns the BLAS/FFT thread budget for the in-memory Lanczos solve: the size of this process's CPU affinity
-    mask (at least 1). During that solve only the one or two solver ranks work while the other ranks of the node
-    wait at the post-solve broadcast, so the solver may use every core its affinity mask allows - the launcher's
-    binding stays the single source of truth (under a strict one-core-per-rank binding this is 1 and the threading
-    is a no-op). Falls back to 1 where the affinity API does not exist (non-Linux platforms).
+    mask (at least 1), clamped to the OpenBLAS thread capacity (see :func:`_clamp_to_openblas_slot_cap`). During
+    that solve only the one or two solver ranks work while the other ranks of the node wait at the post-solve
+    broadcast, so the solver may use every core its affinity mask allows - the launcher's binding stays the single
+    source of truth (under a strict one-core-per-rank binding this is 1 and the threading is a no-op). Falls back
+    to 1 where the affinity API does not exist (non-Linux platforms).
 
     :return: The thread budget as an int.
     """
     try:
-        return max(1, len(os.sched_getaffinity(0)))
+        budget = max(1, len(os.sched_getaffinity(0)))
     except AttributeError:
         return 1
+    return _clamp_to_openblas_slot_cap(budget)
 
 
 def _v2_solver_thread_budget(comm: MPI.Comm, active_ranks: list) -> int:
@@ -672,7 +710,8 @@ def _v2_solver_thread_budget(comm: MPI.Comm, active_ranks: list) -> int:
     the in-memory solve (where all other ranks of the node wait and the one solver rank may claim its whole
     affinity mask, see :func:`_solver_thread_budget`), every rank with a non-empty frequency slice computes
     simultaneously here, so this rank's mask is divided by the number of active ranks on its node whose affinity
-    masks overlap with it - threading them all at full mask would oversubscribe the shared cores. Under a strict
+    masks overlap with it - threading them all at full mask would oversubscribe the shared cores. The result is
+    clamped to the OpenBLAS thread capacity (see :func:`_clamp_to_openblas_slot_cap`). Under a strict
     one-core-per-rank binding the budget is 1 and the threading is a no-op; idle cores are only picked up when the
     launcher binding leaves masks wider than one core (e.g. socket binding) and some of the node's ranks hold
     empty frequency slices. This is a collective call - every rank of ``comm`` must enter it, active or not.
@@ -687,7 +726,7 @@ def _v2_solver_thread_budget(comm: MPI.Comm, active_ranks: list) -> int:
         my_mask = None
 
     if comm.size == 1:
-        return max(1, len(my_mask)) if my_mask else 1
+        return _clamp_to_openblas_slot_cap(max(1, len(my_mask))) if my_mask else 1
 
     infos = comm.allgather((str(MPI.Get_processor_name()).strip(), my_mask))
     if my_mask is None or comm.rank not in active_ranks:
@@ -697,7 +736,7 @@ def _v2_solver_thread_budget(comm: MPI.Comm, active_ranks: list) -> int:
     sharing = sum(
         1 for r in active_ranks if infos[r][0] == my_host and infos[r][1] is not None and infos[r][1] & my_mask
     )
-    return max(1, len(my_mask) // max(1, sharing))
+    return _clamp_to_openblas_slot_cap(max(1, len(my_mask) // max(1, sharing)))
 
 
 def _chi0_to_matmul_layout(chi0_mat: np.ndarray) -> np.ndarray:
