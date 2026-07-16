@@ -574,6 +574,44 @@ def test_v2_thread_budget_falls_back_without_affinity_api_and_single_rank(monkey
     assert es._v2_solver_thread_budget(_make_budget_comm(1, 0, None), [0]) == 6
 
 
+def test_openblas_thread_slot_cap_reads_back_compiled_maximum(monkeypatch):
+    """The slot-cap probe reads an oversized clamped limit back as the smallest compiled OpenBLAS capacity."""
+    import dgamore.eliashberg_solver as es
+
+    selection = MagicMock(lib_controllers=[MagicMock(num_threads=64), MagicMock(num_threads=128)])
+    monkeypatch.setattr(
+        es, "ThreadpoolController", MagicMock(return_value=MagicMock(**{"select.return_value": selection}))
+    )
+    assert es._openblas_thread_slot_cap.__wrapped__() == 64
+    assert selection.limit.call_args.kwargs["limits"] > 8192
+
+
+def test_openblas_thread_slot_cap_is_none_without_openblas(monkeypatch):
+    """The slot-cap probe returns None (no clamp) when no loaded library exposes the OpenBLAS API."""
+    import dgamore.eliashberg_solver as es
+
+    selection = MagicMock(lib_controllers=[])
+    monkeypatch.setattr(
+        es, "ThreadpoolController", MagicMock(return_value=MagicMock(**{"select.return_value": selection}))
+    )
+    assert es._openblas_thread_slot_cap.__wrapped__() is None
+    assert selection.limit.call_count == 0
+    monkeypatch.setattr(es, "_openblas_thread_slot_cap", MagicMock(return_value=None))
+    assert es._clamp_to_openblas_slot_cap(96) == 96
+
+
+def test_solver_thread_budgets_clamp_to_openblas_slot_cap(monkeypatch):
+    """Both solver thread budgets are clamped to the compiled OpenBLAS thread capacity on wide affinity masks."""
+    import dgamore.eliashberg_solver as es
+
+    monkeypatch.setattr(es.os, "sched_getaffinity", lambda pid: set(range(256)), raising=False)
+    monkeypatch.setattr(es, "_openblas_thread_slot_cap", MagicMock(return_value=64))
+    assert es._solver_thread_budget() == 64
+    assert es._v2_solver_thread_budget(_make_budget_comm(1, 0, None), [0]) == 64
+    infos = [("n0", frozenset(range(256)))] * 2
+    assert es._v2_solver_thread_budget(_make_budget_comm(2, 0, infos), [0, 1]) == 64
+
+
 def test_solve_eliashberg_lanczos_v2_threaded_matches_serial():
     """The frequency-distributed solver with a multi-thread budget must return bit-equal eigenvalues and gap
     functions to its serial path (per-k chunk independence, no reordered reduction), driven end to end through
