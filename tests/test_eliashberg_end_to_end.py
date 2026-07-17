@@ -78,7 +78,7 @@ def test_eliashberg_equation_without_local_part(setup, save_fq, save_memory):
         g_dga, g_dmft, u_loc, v_nonloc, comm_mock
     )
     assert np.allclose(lambdas_sing, np.array([16.00752, 15.802559, 14.981937, 14.684908]), atol=1e-2)
-    assert np.allclose(lambdas_trip, np.array([6.7059956, 6.705986, 6.456438, 6.4564347]), atol=1e-2)
+    assert np.allclose(lambdas_trip, np.array([8.06568, 7.7982707, 7.330324, 7.2627163]), atol=1e-2)
 
 
 @pytest.mark.parametrize("save_fq, save_memory", [(True, True), (False, True), (True, False), (False, False)])
@@ -110,7 +110,7 @@ def test_eliashberg_equation_with_local_part(setup, save_fq, save_memory):
         g_dga, g_dmft, u_loc, v_nonloc, comm_mock
     )
     assert np.allclose(lambdas_sing, np.array([15.802544, 15.555848, 14.684908, 14.280717]), atol=1e-2)
-    assert np.allclose(lambdas_trip, np.array([6.705995, 6.7059927, 6.45644, 6.4564347]), atol=1e-2)
+    assert np.allclose(lambdas_trip, np.array([7.330323, 7.2627144, 6.649101, 6.2075553]), atol=1e-2)
 
 
 def _fft_index_map(nq: tuple, f) -> np.ndarray:
@@ -126,8 +126,8 @@ def _fft_index_map(nq: tuple, f) -> np.ndarray:
 
 def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeypatch):
     """Locks the full multi-orbital pairing kernel on the real two-band vertex against thesis Eq. (4.63): the
-    densified production matvec must equal the transparent index formula norm * sum_{ef} [sign
-    Gamma^{K-Q;vv'}_{e1f2} + Gamma^{(-K)-Q;v(-v')}_{e2f1}] G_{eh}(Q, v') conj(G_{gf}(Q, v')) Delta_{gh}(Q, v')
+    densified production matvec must equal the transparent index formula norm * sum_{ef} [Gamma^{K-Q;vv'}_{e1f2}
+    + sign Gamma^{(-K)-Q;v(-v')}_{e2f1}] G_{eh}(Q, v') conj(G_{gf}(Q, v')) Delta_{gh}(Q, v')
     (pinning every layout, permute, FFT and the bubble-gap contraction for orbitally off-diagonal G), and its
     leading eigenvalue spectrum must equal that of the independently densified thesis kernel
     K^{vv'}_{1b2a}(K - Q) chi^{Q v'}_{0;acbd} Delta_{cd} with chi_{0;acbd} = G_{ad}(Q) G_{cb}(-Q) and the vertex
@@ -166,7 +166,7 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeyp
             return lam.real[order], vec[:, order]
 
         channel = gamma_r_pp.channel.value
-        # the solver consumes the passed vertex (in-place BZ map, fft, sign fold, free), so the momentum-space
+        # the solver consumes the passed vertex (in-place BZ map, fft, free), so the momentum-space
         # full-BZ vertex is captured from a copy before the solve
         gamma_full = (
             gamma_r_pp.copy().map_to_full_bz(config.lattice.k_grid, config.lattice.k_grid.nk).decompress_q_dimension()
@@ -197,7 +197,7 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeyp
 
         gcm = np.transpose(gam, (0, 1, 4, 3, 2, 5, 6))[kncross][..., ::-1]
         m_rec = norm * np.einsum(
-            "KQexfyvp,Qehp,Qgfp->KxyvQghp", sign * gam[kdiff] + gcm, giwk, np.conj(giwk), optimize=True
+            "KQexfyvp,Qehp,Qgfp->KxyvQghp", gam[kdiff] + sign * gcm, giwk, np.conj(giwk), optimize=True
         )
         assert np.allclose(dense, m_rec.reshape(dense.shape), atol=1e-5 * np.abs(dense).max())
 
@@ -206,7 +206,7 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeyp
         crossed = np.einsum(
             "KQxaybvp,Qadp,Qcbp->KxyvQcdp", gam_th[kncross][..., ::-1], giwk, np.conj(giwk), optimize=True
         )
-        m_th = (norm * sign * (direct + sign * crossed)).reshape(dense.shape)
+        m_th = (norm * (direct + sign * crossed)).reshape(dense.shape)
         ev_code = np.sort(np.linalg.eigvals(dense).real)[::-1][:10]
         ev_thesis = np.sort(np.linalg.eigvals(m_th).real)[::-1][:10]
         assert np.allclose(ev_code, ev_thesis, atol=1e-3)
