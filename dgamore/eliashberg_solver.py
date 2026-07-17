@@ -924,7 +924,7 @@ def solve_eliashberg_lanczos(
     Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using
     an ARPACK/Lanczos eigensolver, with the pairing kernel applied matrix-free via FFTs over the BZ. This in-memory
     variant holds the full-BZ pairing vertex on the solving rank. The passed pairing vertex is **consumed** (mapped
-    to the full BZ, Fourier transformed and sign-folded in place, then freed once its matmul-layout copy is built).
+    to the full BZ and Fourier transformed in place, then freed once its matmul-layout copy is built).
 
     :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (irreducible BZ, pp notation) for one channel;
         consumed by the solve.
@@ -942,13 +942,7 @@ def solve_eliashberg_lanczos(
     gamma_r_pp = gamma_r_pp.map_to_full_bz(config.lattice.k_grid, config.lattice.k_grid.nk).decompress_q_dimension()
     logger.log_memory_usage(f"Gamma_pp_{gamma_r_pp.channel.value}", gamma_r_pp, 1, allowed_ranks=ranks)
 
-    sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
-
-    # in-place sign fold: the former ``sign * fft`` deep-copied the full-BZ vertex and left the pre-copy original
-    # alive (still referenced by the caller) for the entire solve
     gamma_r_pp = gamma_r_pp.fft(False)
-    if sign != 1:
-        gamma_r_pp.scale(sign)
 
     gap_shape = gamma_r_pp.nq + 2 * (gamma_r_pp.n_bands,) + (2 * gamma_r_pp.niv,)
     gchi0_q0_pp = gchi0_q0_pp.decompress_q_dimension()
@@ -972,6 +966,8 @@ def solve_eliashberg_lanczos(
     # TRIQS order (cdag c cdag c), see https://triqs.github.io/tprf/latest/theory/eliashberg.html
     gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.permute_orbitals("abcd->badc", False).mat)
     gamma_r_pp.free()
+
+    sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
 
     def mv(gap: np.ndarray):
         r"""
@@ -1065,7 +1061,7 @@ def solve_eliashberg_lanczos_v2(
     an ARPACK/Lanczos eigensolver. This variant distributes the gap function along the fermionic frequency axis across
     ranks (and performs the :math:`\chi_0^{pp}` multiplication only on the root rank), so it is more memory-efficient
     but slower than :func:`solve_eliashberg_lanczos`. The passed pairing vertex is **consumed** (Fourier transformed
-    and sign-folded in place, then freed once its matmul-layout copy is built).
+    in place, then freed once its matmul-layout copy is built).
 
     :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (frequency-distributed) for one channel; consumed
         by the solve.
@@ -1092,12 +1088,7 @@ def solve_eliashberg_lanczos_v2(
     )
     logger.log_memory_usage(f"Gamma_pp_{gamma_r_pp.channel.value}", gamma_r_pp, len(active_ranks), allowed_ranks=root)
 
-    sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
-
-    # in-place sign fold (see solve_eliashberg_lanczos): avoids the deep copy and the orphaned pre-copy vertex
     gamma_r_pp = gamma_r_pp.fft(False).decompress_q_dimension()
-    if sign != 1:
-        gamma_r_pp.scale(sign)
 
     gap_shape = gamma_r_pp.nq + 2 * (gamma_r_pp.n_bands,) + (gamma_r_pp.current_shape[-1],)
 
@@ -1123,6 +1114,8 @@ def solve_eliashberg_lanczos_v2(
     # differ by the "abcd->badc" swap (o1<->o2, o3<->o4), which aligns the gap's creation legs; no-op for one band.
     gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.permute_orbitals("abcd->badc", False).mat)
     gamma_r_pp.free()
+
+    sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
 
     def mv(gap: np.ndarray):
         r"""
