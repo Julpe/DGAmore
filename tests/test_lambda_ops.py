@@ -11,7 +11,7 @@ import mpi4py
 import numpy as np
 import pytest
 
-from dgamore.lambda_ops import LambdaCorrection, MultiOrbitalLambdaCorrection
+from dgamore.lambda_ops import LambdaCorrection, MultiOrbitalLambdaCorrection, select_and_apply_lambda_correction
 from dgamore.dga_logger import DgaLogger
 from dgamore.four_point import FourPoint
 from dgamore.local_four_point import LocalFourPoint
@@ -47,8 +47,7 @@ def load_local_four_point(lc_type: str, filename: str, channel: SpinChannel) -> 
 
 
 def test_lambda_correction_spch():
-    """spch-type single lambda correction reproduces reference chi and lambdas for dens and magn channels; the dens
-    channel stalls at the divergence bound and warns, so the logger must be mocked for a standalone run."""
+    """spch single-band lambda correction reproduces the reference chi and lambdas; dens stalls and warns."""
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.logger = MagicMock()
@@ -245,8 +244,7 @@ def test_find_lambda_matrix_falls_back_to_lstsq_on_singular_hessian(monkeypatch)
 
 
 def test_multiorbital_perform_single_matches_single_band_for_magn():
-    """For the cleanly-converging magnetic channel, the No=1 matrix correction coincides with the scalar
-    LambdaCorrection (same lambda and corrected chi on the spch reference data)."""
+    """For the cleanly-converging magnetic channel the No=1 matrix correction matches the scalar LambdaCorrection."""
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.sys.n_bands = 1
@@ -264,8 +262,7 @@ def test_multiorbital_perform_single_matches_single_band_for_magn():
 
 @pytest.mark.parametrize("channel", [SpinChannel.DENS, SpinChannel.MAGN])
 def test_multiorbital_perform_single_satisfies_sum_rule(channel):
-    """The corrected susceptibility's full-BZ frequency sum matches the local target for BOTH channels - including
-    density, where the scalar single-band solver stalls at the divergence bound instead of the true root."""
+    """The corrected chi's full-BZ frequency sum matches the local target for both channels, including density."""
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.sys.n_bands = 1
@@ -301,8 +298,7 @@ def _multiorbital_chi_fourpoint(n_bands: int, nq_grid: tuple, nw_half: int, seed
 
 
 def test_multiorbital_perform_single_recovers_matrix_mass_and_sum_rule():
-    """Two-band object path: perform_single recovers a planted matrix mass and its corrected chi satisfies the
-    full-BZ sum rule (exercises map_to_full_bz + compound inversion for No > 1)."""
+    """Two-band perform_single recovers a planted matrix mass and its corrected chi satisfies the full-BZ sum rule."""
     config.sys.beta = 8.0
     config.sys.n_bands = 2
     chi = _multiorbital_chi_fourpoint(2, (4, 4, 1), 3, seed=7)
@@ -323,8 +319,7 @@ def test_multiorbital_perform_single_recovers_matrix_mass_and_sum_rule():
 
 
 def test_multiorbital_perform_loads_target_writes_lambda_and_corrects(tmp_path):
-    """perform loads the channel's local sum-rule target, corrects the susceptibility and appends ||Lambda|| to the
-    lambda file (single-band spch reference data in an isolated run directory)."""
+    """perform loads the local sum-rule target, corrects the susceptibility and appends the lambda norm to the file."""
     import shutil
 
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
@@ -408,9 +403,7 @@ def test_lambda_correction_perform_raises_on_unknown_type():
 
 
 def test_find_lambda_matrix_feasibility_binds_at_omega_zero_only():
-    """A high-|w| ladder-tail slice with a deeply negative Hermitian eigenvalue must not inflate the feasibility
-    bound: the planted mass violates the all-frequency bound but is still recovered because only the static
-    (w=0) slice binds (regression: an all-w bound pushed lambda_start orders of magnitude above the true root)."""
+    """A deep negative high-|w| slice must not inflate the feasibility bound: only the static (w=0) slice binds."""
     beta, nq, nw, n_bands = 5.0, 6, 5, 2
     chi_inv_qw = _synthetic_chi_inv_qw(n_bands, nq, nw)
     no2 = n_bands**2
@@ -428,8 +421,7 @@ def test_find_lambda_matrix_feasibility_binds_at_omega_zero_only():
 
 
 def test_log_pauli_diagnostic_scans_multiple_inequivalent_atoms(monkeypatch):
-    """With two single-band inequivalent atoms the diagnostic reports the single worst deviation across atoms,
-    labeled with the correct inequivalent-atom index and global orbital offset."""
+    """With two inequivalent atoms the diagnostic reports the worst deviation with correct atom and orbital labels."""
     config.sys.beta = 5.0
     config.sys.n_bands = 2
     config.dmft.ineq_ordering = [1, 2]
@@ -517,8 +509,7 @@ def _chi_on_grid(grid, n_bands: int, nw_half: int, seed: int) -> FourPoint:
 
 
 def test_expand_compound_slice_is_exact_gather_without_auto_data():
-    """Without auto-symmetry data the FBZ expansion is the plain irrk_inv gather, bit-identical per bosonic
-    frequency to what map_to_full_bz produces."""
+    """Without auto-symmetry data the FBZ expansion is the plain irrk_inv gather, bit-identical to map_to_full_bz."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.lattice.k_grid = grid
     chi = _chi_on_grid(grid, 2, 2, seed=5)
@@ -530,9 +521,7 @@ def test_expand_compound_slice_is_exact_gather_without_auto_data():
 
 
 def test_expand_compound_slice_matches_object_map_and_commutes_with_inversion():
-    """In auto mode the raw-array FBZ expansion reproduces map_to_full_bz (gather + per-k orbital rotation incl.
-    the antiunitary member) and commutes with the compound inversion to complex128 accuracy, so expanding the
-    cached irreducible-wedge inverse is exact."""
+    """In auto mode the raw FBZ expansion reproduces map_to_full_bz and commutes with the compound inversion."""
     grid = _synthetic_auto_grid()
     chi = _chi_on_grid(grid, 2, 1, seed=6)
     expected = chi.copy().map_to_full_bz(grid).to_compound_indices().mat
@@ -548,9 +537,7 @@ def test_expand_compound_slice_matches_object_map_and_commutes_with_inversion():
 
 @pytest.mark.parametrize("auto", [False, True])
 def test_find_lambda_matrix_ibz_resident_matches_full_bz_reference(auto):
-    """The IBZ-resident calibration (q_grid passed, inverse cached on the wedge, per-w expansion) yields the same
-    mass as the reference full-BZ-stack path: near-bit-exact on a plain-symmetry grid, and at the complex64
-    transform-noise level on an auto grid with genuine orbital rotations."""
+    """The IBZ-resident calibration matches the full-BZ-stack reference on plain-symmetry and auto grids."""
     beta, n_bands = 5.0, 2
     grid = _synthetic_auto_grid() if auto else bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.lattice.k_grid = grid
@@ -568,3 +555,38 @@ def test_find_lambda_matrix_ibz_resident_matches_full_bz_reference(auto):
 
     assert np.allclose(lam_ibz, lam_reference, atol=1e-5 if auto else 1e-10)
     assert np.allclose(lam_ibz, lambda_star, atol=1e-4)
+
+
+def test_select_and_apply_lambda_correction_dispatch(monkeypatch):
+    """The dispatcher picks the scalar or matrix correction by band count, passing through when neither flag is set."""
+    sentinel, chi = object(), object()
+    config.lambda_correction.perform_lambda_correction = False
+    assert select_and_apply_lambda_correction(chi, False) is chi
+
+    with monkeypatch.context() as mp:
+        single = MagicMock(return_value=sentinel)
+        mp.setattr(LambdaCorrection, "perform", single)
+        config.sys.n_bands = 1
+        assert select_and_apply_lambda_correction(chi, True) is sentinel
+        single.assert_called_once_with(chi)
+
+    with monkeypatch.context() as mp:
+        multi = MagicMock(return_value=sentinel)
+        mp.setattr(MultiOrbitalLambdaCorrection, "perform", multi)
+        config.sys.n_bands = 2
+        assert select_and_apply_lambda_correction(chi, True) is sentinel
+        multi.assert_called_once_with(chi)
+
+    config.lambda_correction.perform_lambda_correction = True
+    with monkeypatch.context() as mp:
+        single = MagicMock(return_value=sentinel)
+        mp.setattr(LambdaCorrection, "perform", single)
+        config.sys.n_bands = 1
+        assert select_and_apply_lambda_correction(chi, False) is sentinel
+        single.assert_called_once_with(chi)
+    with monkeypatch.context() as mp:
+        multi = MagicMock(return_value=sentinel)
+        mp.setattr(MultiOrbitalLambdaCorrection, "perform", multi)
+        config.sys.n_bands = 2
+        assert select_and_apply_lambda_correction(chi, False) is sentinel
+        multi.assert_called_once_with(chi)

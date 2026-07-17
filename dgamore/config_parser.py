@@ -16,8 +16,22 @@ import os
 from mpi4py import MPI
 from ruamel.yaml import YAML
 
+import dgamore.brillouin_zone as bz
 import dgamore.config as config
-from dgamore.config import *
+from dgamore.config import (
+    AnaContConfig,
+    BoxConfig,
+    DmftConfig,
+    EliashbergConfig,
+    LambdaCorrectionConfig,
+    LatticeConfig,
+    MemoryConfig,
+    OutputConfig,
+    SelfConsistencyConfig,
+    SelfEnergyInterpolationConfig,
+    StabilizationConfig,
+    SystemConfig,
+)
 from dgamore.dga_logger import DgaLogger
 
 
@@ -34,7 +48,7 @@ class ConfigParser:
         """
         self._config_file = None
 
-    def parse_config(self, comm: MPI.Comm = None, path: str = "./", name: str = "dga_config.yaml"):
+    def parse_config(self, comm: MPI.Comm = None, path: str = "./", name: str = "dga_config.yaml") -> "ConfigParser":
         """
         Parses the config file on rank 0, broadcasts it to all ranks, and populates the global config singletons. The
         ``-c``/``-p`` command-line arguments override the ``name``/``path`` defaults.
@@ -72,7 +86,7 @@ class ConfigParser:
         with open(os.path.join(path, name), "w+") as file:
             YAML().dump(self._config_file, file)
 
-    def _build_config_from_file(self, config_file):
+    def _build_config_from_file(self, config_file: dict) -> None:
         """
         Populates every global config singleton from the parsed YAML content.
 
@@ -92,7 +106,7 @@ class ConfigParser:
         config.memory = self._build_memory_config(config_file)
         config.ana_cont = self._build_ana_cont_config(config_file)
 
-    def _build_box_config(self, config_file) -> BoxConfig:
+    def _build_box_config(self, config_file: dict) -> BoxConfig:
         """
         Builds the frequency-box config from the ``box_sizes`` section (defaults if absent), deriving ``niv_full``
         from the core and shell sizes.
@@ -117,7 +131,7 @@ class ConfigParser:
 
         return conf
 
-    def _build_lattice_config(self, config_file) -> LatticeConfig:
+    def _build_lattice_config(self, config_file: dict) -> LatticeConfig:
         """
         Builds the lattice config from the ``lattice`` section (defaults if absent): grid size, symmetries, the
         momentum grid, and the lattice/interaction input.
@@ -146,7 +160,7 @@ class ConfigParser:
 
         return conf
 
-    def _build_dmft_config(self, config_file) -> DmftConfig:
+    def _build_dmft_config(self, config_file: dict) -> DmftConfig:
         """
         Builds the DMFT input config from the ``dmft_input`` section (defaults if absent).
 
@@ -170,7 +184,7 @@ class ConfigParser:
 
         return conf
 
-    def _build_system_config(self, _) -> SystemConfig:
+    def _build_system_config(self, _: dict) -> SystemConfig:
         """
         Returns an empty system config; its fields are filled later by the main routine from the DMFT input.
 
@@ -179,7 +193,7 @@ class ConfigParser:
         """
         return SystemConfig()
 
-    def _build_output_config(self, config_file) -> OutputConfig:
+    def _build_output_config(self, config_file: dict) -> OutputConfig:
         """
         Builds the output config from the ``output`` section (defaults if absent), defaulting ``output_path`` to the
         DMFT input path when unset.
@@ -204,7 +218,7 @@ class ConfigParser:
 
         return conf
 
-    def _build_self_consistency_config(self, config_file) -> SelfConsistencyConfig:
+    def _build_self_consistency_config(self, config_file: dict) -> SelfConsistencyConfig:
         """
         Builds the self-consistency config from the ``self_consistency`` section (defaults if absent).
 
@@ -228,7 +242,7 @@ class ConfigParser:
 
         return conf
 
-    def _build_stabilization_config(self, config_file) -> StabilizationConfig:
+    def _build_stabilization_config(self, config_file: dict) -> StabilizationConfig:
         """
         Builds the stabilization config from the ``stabilization`` section (defaults if absent).
 
@@ -250,7 +264,7 @@ class ConfigParser:
 
         return conf
 
-    def _build_eliashberg_config(self, config_file) -> EliashbergConfig:
+    def _build_eliashberg_config(self, config_file: dict) -> EliashbergConfig:
         """
         Builds the Eliashberg config from the ``eliashberg`` section (defaults if absent).
 
@@ -278,7 +292,7 @@ class ConfigParser:
 
         return conf
 
-    def _build_lambda_correction_config(self, config_file):
+    def _build_lambda_correction_config(self, config_file: dict) -> LambdaCorrectionConfig:
         """
         Builds the lambda-correction config from the ``lambda_correction`` section (defaults if absent).
 
@@ -299,7 +313,7 @@ class ConfigParser:
 
         return conf
 
-    def _build_self_energy_interpolation_config(self, config_file):
+    def _build_self_energy_interpolation_config(self, config_file: dict) -> SelfEnergyInterpolationConfig:
         """
         Builds the self-energy interpolation config from the ``self_energy_interpolation`` section (defaults if absent).
 
@@ -319,7 +333,7 @@ class ConfigParser:
 
         return conf
 
-    def _build_memory_config(self, config_file):
+    def _build_memory_config(self, config_file: dict) -> MemoryConfig:
         """
         Builds the memory config from the ``memory`` section (defaults if absent).
 
@@ -345,7 +359,7 @@ class ConfigParser:
 
         return conf
 
-    def _build_ana_cont_config(self, config_file):
+    def _build_ana_cont_config(self, config_file: dict) -> AnaContConfig:
         """
         Builds the analytic-continuation config from the ``ana_cont`` section (defaults if absent).
 
@@ -368,7 +382,7 @@ class ConfigParser:
 
         return conf
 
-    def _try_parse(self, config_section, key: str, default_value):
+    def _try_parse(self, config_section: dict, key: str, default_value: object) -> object:
         """
         Reads ``key`` from a config section and coerces it to the type of ``default_value``, returning the default if
         the key is missing or cannot be coerced.

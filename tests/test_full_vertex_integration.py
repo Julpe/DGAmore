@@ -4,7 +4,6 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
-import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -67,10 +66,7 @@ def setup(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("no", [2, 3, 4, 5])
 def test_create_full_vertex_q_r_matches_exact_bse_inversion(setup, no):
-    """The production F^q chain (calculate_sigma_kernel_r_q + create_full_vertex_q_r) reproduces the exact BSE
-    inversion. Inputs: reversal-symmetric invertible bubble slices -beta (A(x)B + A^T(x)B^T), a local irreducible
-    vertex with the physical (nu, nu') time-reversal symmetry, a reversal-symmetric TR-projected local interaction
-    with vanishing non-local part, and zero shell terms so the dressing reduces to [(sum chi*)^{-1} + U_r]^{-1}."""
+    """The production F^q chain of kernel step plus create_full_vertex_q_r reproduces the exact BSE inversion."""
     rng = np.random.default_rng(0)
     beta = config.sys.beta
     n_q, n_w, niv = 2, 3, 3

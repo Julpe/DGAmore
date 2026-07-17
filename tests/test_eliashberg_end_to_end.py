@@ -51,8 +51,7 @@ def setup(monkeypatch):
 
 @pytest.mark.parametrize("save_fq, save_memory", [(True, True), (False, True), (True, False), (False, False)])
 def test_eliashberg_equation_without_local_part(setup, save_fq, save_memory):
-    """The Eliashberg solve without the local vertex part reproduces the reference eigenvalues in all four
-    save_fq x save_memory flag combinations."""
+    """The solve without the local vertex part reproduces the reference eigenvalues in all four flag combinations."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20
@@ -83,8 +82,7 @@ def test_eliashberg_equation_without_local_part(setup, save_fq, save_memory):
 
 @pytest.mark.parametrize("save_fq, save_memory", [(True, True), (False, True), (True, False), (False, False)])
 def test_eliashberg_equation_with_local_part(setup, save_fq, save_memory):
-    """The Eliashberg solve including the local vertex part reproduces the reference eigenvalues in all four
-    save_fq x save_memory flag combinations."""
+    """The solve including the local vertex part reproduces the reference eigenvalues in all four flag combinations."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20
@@ -125,13 +123,7 @@ def _fft_index_map(nq: tuple, f) -> np.ndarray:
 
 
 def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeypatch):
-    """Locks the full multi-orbital pairing kernel on the real two-band vertex against thesis Eq. (4.63): the
-    densified production matvec must equal the transparent index formula norm * sum_{ef} [Gamma^{K-Q;vv'}_{e1f2}
-    + sign Gamma^{(-K)-Q;v(-v')}_{e2f1}] G_{eh}(Q, v') conj(G_{gf}(Q, v')) Delta_{gh}(Q, v')
-    (pinning every layout, permute, FFT and the bubble-gap contraction for orbitally off-diagonal G), and its
-    leading eigenvalue spectrum must equal that of the independently densified thesis kernel
-    K^{vv'}_{1b2a}(K - Q) chi^{Q v'}_{0;acbd} Delta_{cd} with chi_{0;acbd} = G_{ad}(Q) G_{cb}(-Q) and the vertex
-    legs read as Gamma-thesis_{1234} = Gamma-stored_{2341}."""
+    """The densified two-band production matvec matches the explicit index formula and the Eq. (4.63) spectrum."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20

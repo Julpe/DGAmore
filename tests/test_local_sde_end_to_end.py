@@ -14,7 +14,6 @@ import pytest
 import dgamore.config as config
 from dgamore import local_sde, dga_io
 from dgamore.dga_logger import DgaLogger
-from dgamore.greens_function import GreensFunction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.n_point_base import SpinChannel
 from tests import conftest

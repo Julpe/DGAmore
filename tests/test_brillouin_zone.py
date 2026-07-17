@@ -506,8 +506,7 @@ def test_nk_seg_returns_diff_of_cind():
 
 
 def test_k_axis_normalized_positions_and_length():
-    """The k-axis normalizes positions to [0,1] by cumulative distance: four consecutive k-points with equal
-    step lengths of 1 give cumulative positions [0,1,2,3], normalized by 3 to [0, 1/3, 2/3, 1]."""
+    """The k-axis normalizes cumulative distances to [0, 1]: four equal unit steps give [0, 1/3, 2/3, 1]."""
     kp = KPath(nk=(4, 4, 4), path="gamma-x")
     kp.kpts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]])
     kp.nkp = [2, 2]
@@ -795,8 +794,7 @@ def test_specify_auto_symmetries_accepts_non_contiguous_input():
 
 
 def test_plain_symmetry_kgrid_two_dimensional_square_unchanged():
-    """The plain-symmetry code path must keep producing the same IBZ it always did: 4x4x1 with the full square
-    symmetry group has a small IBZ (Γ, X, M, and one interior point) whose counts sum to the full grid."""
+    """The plain-symmetry 4x4x1 square-group IBZ is (Gamma, X, M, one interior point) summing to the grid."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     assert grid.nk_irr <= 16
     assert grid.irrk_count.sum() == 16

@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from dgamore.self_energy import SelfEnergy
-from dgamore.nonlocal_sde import apply_mixing_strategy
+from dgamore.mixing import apply_mixing_strategy
 
 BETA = 10.0
 NB = 1
@@ -41,7 +41,7 @@ def make_config_mock(
     output_path: str = "./",
     previous_sc_path: str = "./",
 ):
-    """Builds a mock config object for patching dgamore.nonlocal_sde.config."""
+    """Builds a mock config object for patching dgamore.mixing.config."""
     cfg = MagicMock()
     cfg.self_consistency.mixing_strategy = strategy
     cfg.self_consistency.mixing = mixing
@@ -56,18 +56,18 @@ def make_config_mock(
 
 @contextlib.contextmanager
 def patch_config(**kwargs):
-    """Installs a mock config in dgamore.nonlocal_sde for the duration of the block."""
+    """Installs a mock config in dgamore.mixing for the duration of the block."""
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("dgamore.nonlocal_sde.config", make_config_mock(**kwargs))
+        mp.setattr("dgamore.mixing.config", make_config_mock(**kwargs))
         yield
 
 
 @contextlib.contextmanager
 def patch_file_history(file_sigmas=None, side_effect=None):
-    """Replaces the sigma-history file read in dgamore.nonlocal_sde for the duration of the block."""
+    """Replaces the sigma-history file read in dgamore.mixing for the duration of the block."""
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(
-            "dgamore.nonlocal_sde.read_last_n_sigmas_from_files",
+            "dgamore.mixing.read_last_n_sigmas_from_files",
             MagicMock(return_value=file_sigmas, side_effect=side_effect),
         )
         yield
@@ -420,8 +420,7 @@ def test_anderson_history_ordering_matters():
 
 
 def test_history_cap_zero_falls_back_to_linear():
-    """With history_cap=0 (the mixing-history reset right after the susceptibility-restriction release) the
-    accelerated schemes must ignore the on-file history and reproduce the plain linear-mixing result."""
+    """With history_cap=0 the accelerated schemes ignore the on-file history and reproduce plain linear mixing."""
     nk_tot = int(np.prod(NK))
     file_sigmas = [make_sigma_mat(v) for v in (0.7, 0.9, 1.1)]
     with (
@@ -437,9 +436,7 @@ def test_history_cap_zero_falls_back_to_linear():
 
 
 def test_in_memory_history_matches_file_history_for_pulay_and_anderson():
-    """apply_mixing_strategy with an in-memory sigma_history produces bit-identical results to the file-read path
-    on the same history arrays, for both accelerated schemes (the rank-0 ring buffer replaces the per-rank file
-    re-reads without changing a single value)."""
+    """An in-memory sigma_history reproduces the file-read path bit-identically for both accelerated schemes."""
     rng = np.random.default_rng(91)
     nk_tot = int(np.prod(NK))
     shape = (nk_tot, 1, 1, 2 * NIV_CORE)

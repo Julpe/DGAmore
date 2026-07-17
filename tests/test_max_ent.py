@@ -188,9 +188,7 @@ def patch_maxent_mpi(monkeypatch):
 
 @pytest.mark.parametrize("size", [1, 2])
 def test_perform_maxent_giwk_continues_band_diagonal_and_unfolds(tmp_path, patch_maxent_mpi, size):
-    """perform_maxent_giwk continues the band-diagonal Green's function and unfolds it over the full BZ; since
-    H(k) has off-diagonal coupling the result must differ from the orbital-diagonal continuation, which proves
-    the band rotation is applied."""
+    """perform_maxent_giwk continues band-diagonally and unfolds, differing from the orbital-diagonal continuation."""
     nk, n_bands, niv_core, w_count = (4, 4, 1), 2, 3, 7
     hk = _setup_maxent_config(tmp_path, nk, n_bands, niv_core, w_count, seed=7)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=11)

@@ -658,8 +658,7 @@ def test_compresses_other_when_self_is_compressed():
 
 
 def test_filter_small_values_sets_tiny_entries_to_zero():
-    """filter_small_values (default threshold 1e-12) zeroes exactly the entries whose real and imaginary parts
-    are both below the threshold, preserves entries with any component above it, and returns self."""
+    """filter_small_values zeroes exactly the entries with both components below the threshold and returns self."""
     mat = np.array(
         [
             [1e-13 + 1e-13j, 1e-11 + 1e-13j],
@@ -680,8 +679,7 @@ def test_filter_small_values_sets_tiny_entries_to_zero():
 
 
 def test_filter_small_values_respects_custom_threshold():
-    """filter_small_values zeroes entries with both components below a custom threshold and preserves entries
-    with one component above it."""
+    """filter_small_values honors a custom threshold and keeps entries with one component above it."""
     mat = np.array([1e-6 + 1e-6j, 2e-6 + 0.0j, 5e-5 + 1e-8j], dtype=np.complex128)
     obj = IHaveMat(mat)
     obj.filter_small_values(threshold=1e-5)
@@ -728,8 +726,7 @@ def test_free_with_trim_calls_malloc_trim(monkeypatch):
 
 
 def test__malloc_trim_is_noop_when_unavailable(monkeypatch):
-    """_malloc_trim is a no-op when malloc_trim is unavailable: neither _malloc_trim() nor free(trim=True)
-    touches the libc."""
+    """_malloc_trim is a no-op when malloc_trim is unavailable, from both _malloc_trim() and free(trim=True)."""
     monkeypatch.setattr(IHaveMat, "_malloc_trim_available", False)
 
     # a libc that raises if called, proving it is never invoked
@@ -808,8 +805,7 @@ def test_skip_on_non_posix_or_no_proc(monkeypatch):
 
 
 def test_loads_libc_and_calls_malloc_trim(monkeypatch):
-    """On POSIX with /proc present, _malloc_trim loads the libc via ctypes.CDLL, stores it on the class and
-    invokes its malloc_trim."""
+    """On POSIX with /proc present, _malloc_trim loads libc via ctypes, caches it on the class and calls malloc_trim."""
     fake_lib = MagicMock()
     fake_ctypes = types.ModuleType("ctypes")
     fake_ctypes.CDLL = lambda name: fake_lib
@@ -847,8 +843,7 @@ def test_ctypes_cdll_failure_sets_unavailable(monkeypatch):
 
 
 def test_malloc_trim_exception_is_suppressed(monkeypatch):
-    """An exception from malloc_trim itself is suppressed, and availability stays True since ctypes loaded the
-    libc successfully."""
+    """An exception from malloc_trim is suppressed and availability stays True since the libc loaded."""
     bad_lib = MagicMock(malloc_trim=MagicMock(side_effect=RuntimeError("boom")))
     fake_ctypes = types.ModuleType("ctypes")
     fake_ctypes.CDLL = lambda name: bad_lib
@@ -1621,8 +1616,7 @@ def _filter_reference(mat: np.ndarray, threshold: float) -> np.ndarray:
 
 
 def test_filter_small_values_chunked_path_matches_single_pass(monkeypatch):
-    """filter_small_values under a tiny chunk budget (step == 1, one element per chunk) matches the single-pass
-    reference on a mask spanning several chunks, and stays chainable."""
+    """filter_small_values under a one-element chunk budget matches the single-pass reference and stays chainable."""
     rng = np.random.default_rng(7)
     mat = (rng.standard_normal((50, 4)) + 1j * rng.standard_normal((50, 4))).astype(np.complex64)
     mat[::3] = 1e-15 + 1e-15j
@@ -1637,8 +1631,7 @@ def test_filter_small_values_chunked_path_matches_single_pass(monkeypatch):
 
 
 def test_filter_small_values_handles_non_contiguous_input(monkeypatch):
-    """filter_small_values handles a non-contiguous (transposed) input: the already-complex64 view is kept by
-    the setter and the tiny chunk budget forces axis-0 chunking on the non-contiguous branch."""
+    """filter_small_values handles a non-contiguous input via axis-0 chunking without copying the complex64 view."""
     rng = np.random.default_rng(11)
     base = (rng.standard_normal((6, 8)) + 1j * rng.standard_normal((6, 8))).astype(np.complex64)
     base[:, ::2] = 1e-15 + 1e-15j
@@ -1655,8 +1648,7 @@ def test_filter_small_values_handles_non_contiguous_input(monkeypatch):
 
 
 def test_fft_ifft_preserve_complex64_dtype():
-    """fft and ifft preserve the complex64 dtype and round-trip the input: the BZ FFTs must keep complex64
-    (scipy.fft + overwrite_x); a regression to np.fft would upcast and spike memory."""
+    """fft and ifft preserve the complex64 dtype and round-trip the input (an np.fft regression would upcast)."""
     rng = np.random.default_rng(3)
     shape = (4, 4, 2, 1, 1, 6)
     mat = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)

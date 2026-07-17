@@ -28,6 +28,8 @@ import numpy as np
 from mpi4py import MPI
 
 from dgamore import config
+from dgamore import output_files
+from dgamore.brillouin_zone import KGrid
 from dgamore.four_point import FourPoint
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.mpi_utils import MpiDistributor
@@ -158,7 +160,9 @@ class LambdaCorrection:
         if config.lambda_correction.type.lower() == "spch":
             logger.info(f"Performing lambda correction for {chi_phys_q_r.channel.value} channel.")
             chi_r_loc = LocalFourPoint.load(
-                os.path.join(config.output.output_path, f"chi_{chi_phys_q_r.channel.value}_loc.npy"),
+                output_files.npy_path(
+                    config.output.output_path, output_files.local_vertex_name("chi", chi_phys_q_r.channel)
+                ),
                 chi_phys_q_r.channel,
                 num_vn_dimensions=0,
             ).to_full_niw_range()
@@ -185,14 +189,14 @@ class LambdaCorrection:
 
         logger.info(f"Performing lambda correction for magn channel.")
         chi_phys_q_dens = FourPoint.load(
-            os.path.join(config.output.output_path, f"chi_phys_q_dens.npy"),
+            output_files.npy_path(config.output.output_path, output_files.chi_phys_q_name(SpinChannel.DENS)),
             SpinChannel.DENS,
             num_vn_dimensions=0,
         ).to_full_niw_range()
 
         chi_dens_loc, chi_magn_loc = [
             LocalFourPoint.load(
-                os.path.join(config.output.output_path, f"chi_{channel.value}_loc.npy"),
+                output_files.npy_path(config.output.output_path, output_files.local_vertex_name("chi", channel)),
                 channel,
                 num_vn_dimensions=0,
             ).to_full_niw_range()
@@ -289,7 +293,7 @@ class MultiOrbitalLambdaCorrection:
         return float(np.linalg.eigvalsh(herm).min())
 
     @staticmethod
-    def _expand_compound_slice_to_full_bz(slice_irr: np.ndarray, q_grid) -> np.ndarray:
+    def _expand_compound_slice_to_full_bz(slice_irr: np.ndarray, q_grid: KGrid) -> np.ndarray:
         r"""
         Expands one compound bosonic-frequency slice from the irreducible wedge to the full Brillouin zone on the
         raw array, applying exactly the transformation of :meth:`~dgamore.n_point_base.IAmNonLocal.map_to_full_bz`:
@@ -341,7 +345,14 @@ class MultiOrbitalLambdaCorrection:
         return np.stack(mats, axis=1)
 
     @staticmethod
-    def _residual(chi_qw: np.ndarray, lambda_mat: np.ndarray, s_r: np.ndarray, beta: float, nk_tot: int, q_grid=None):
+    def _residual(
+        chi_qw: np.ndarray,
+        lambda_mat: np.ndarray,
+        s_r: np.ndarray,
+        beta: float,
+        nk_tot: int,
+        q_grid: "KGrid | None" = None,
+    ) -> np.ndarray:
         r"""
         Returns the real-symmetric sum-rule residual :math:`G(\Lambda) = (\beta N_q)^{-1}\sum_{q\omega}
         (\chi^{q\omega}_r{}^{-1} + \Lambda)^{-1} - S_r` (Hermitian part, real), with the corrected susceptibility
@@ -372,8 +383,13 @@ class MultiOrbitalLambdaCorrection:
 
     @staticmethod
     def residual_and_jacobian(
-        chi_qw: np.ndarray, lambda_mat: np.ndarray, s_r: np.ndarray, beta: float, nk_tot: int, q_grid=None
-    ):
+        chi_qw: np.ndarray,
+        lambda_mat: np.ndarray,
+        s_r: np.ndarray,
+        beta: float,
+        nk_tot: int,
+        q_grid: "KGrid | None" = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         r"""
         Returns the sum-rule residual and its closed-form Newton Jacobian. With the compound
         :math:`N_o^2\times N_o^2` object :math:`\chi^{\Lambda,q\omega} = (\chi^{q\omega}{}^{-1} + \Lambda)^{-1}`,
@@ -424,7 +440,7 @@ class MultiOrbitalLambdaCorrection:
         delta: float = None,
         eps: float = None,
         maxiter: int = None,
-        q_grid=None,
+        q_grid: "KGrid | None" = None,
     ) -> np.ndarray:
         r"""
         Solves the matrix sum rule :math:`G(\Lambda_r) = 0` for the real-symmetric mass :math:`\Lambda_r` by a damped
@@ -563,7 +579,7 @@ class MultiOrbitalLambdaCorrection:
         logger.info(f"Performing multi-orbital lambda correction for {channel.value} channel.")
 
         chi_r_loc = LocalFourPoint.load(
-            os.path.join(config.output.output_path, f"chi_{channel.value}_loc.npy"),
+            output_files.npy_path(config.output.output_path, output_files.local_vertex_name("chi", channel)),
             channel,
             num_vn_dimensions=0,
         ).to_full_niw_range()
@@ -818,3 +834,83 @@ class LambdaAnnealer:
                 f"(worst static gap of 1/chi: {worst_gap:.6f})."
             )
         return True
+
+
+class StabilizationState:
+    r"""
+    Owns the mutable per-run state of the self-consistency stabilization scaffolds. The self-consistency loop
+    creates it from the (immutable) config flags via :meth:`from_config`, threads it through the proposal map into
+    the per-channel kernel step, and flips the releasing flags itself when a scaffolded phase converges - the
+    config sections are never written back (they are frozen during the loop).
+
+    :ivar bool chi_phys_restriction_active: Whether the susceptibility restriction
+        (:func:`~dgamore.nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues`) is applied this iteration;
+        cleared by the loop on the restricted phase's (relaxed) convergence.
+    :ivar bool lambda_correction_active: Whether the per-iteration lambda correction is applied this iteration;
+        cleared by the loop on the corrected phase's (relaxed) convergence. The one-shot
+        ``lambda_correction.perform_lambda_correction`` is independent of this flag and is read from the config.
+    :ivar annealer: The loop-owned :class:`LambdaAnnealer` (``None`` when annealing is off).
+    :vartype annealer: LambdaAnnealer | None
+    """
+
+    def __init__(
+        self,
+        chi_phys_restriction_active: bool = False,
+        lambda_correction_active: bool = False,
+        annealer: "LambdaAnnealer | None" = None,
+    ):
+        self.chi_phys_restriction_active = chi_phys_restriction_active
+        self.lambda_correction_active = lambda_correction_active
+        self.annealer = annealer
+
+    @classmethod
+    def from_config(cls) -> "StabilizationState":
+        """
+        Builds the loop's stabilization state from the ``config.stabilization`` flags (constructing the
+        :class:`LambdaAnnealer` when annealing is enabled).
+
+        :return: The freshly initialized :class:`StabilizationState`.
+        """
+        return cls(
+            chi_phys_restriction_active=config.stabilization.use_chi_phys_restriction,
+            lambda_correction_active=config.stabilization.use_lambda_correction,
+            annealer=LambdaAnnealer() if config.stabilization.use_lambda_annealing else None,
+        )
+
+    def effective_epsilon(self) -> float:
+        """
+        Returns the effective self-energy convergence threshold of the self-consistency loop: ten times the
+        configured epsilon while the susceptibility restriction, the per-iteration lambda correction, or the
+        lambda-annealing scaffold is active (those phases are only scaffolds for the subsequent pure phase, so
+        full precision there is wasted iterations), and the plain epsilon otherwise. The one-shot lambda
+        correction never relaxes the threshold (it runs a single iteration).
+
+        :return: The effective convergence threshold.
+        """
+        relaxed = (
+            self.chi_phys_restriction_active
+            or self.lambda_correction_active
+            or (self.annealer is not None and self.annealer.active)
+        )
+        return (10.0 if relaxed else 1.0) * config.self_consistency.epsilon
+
+
+def select_and_apply_lambda_correction(chi_phys_q_r: FourPoint, lambda_correction_active: bool) -> FourPoint:
+    r"""
+    Applies the configured lambda correction to the (rank-0 gathered) physical susceptibility and returns it. The
+    correction runs when either the one-shot ``config.lambda_correction.perform_lambda_correction`` or the
+    per-iteration scaffold (the loop-owned ``lambda_correction_active`` flag of the :class:`StabilizationState`)
+    is enabled and is dispatched by the band count: single-band input uses the scalar Moriya correction
+    (:class:`LambdaCorrection`), multi-band input the multi-orbital matrix correction
+    (:class:`MultiOrbitalLambdaCorrection`); the dispatch is logged once at setup. If neither flag is enabled the
+    susceptibility is returned unchanged.
+
+    :param chi_phys_q_r: The rank-0 gathered physical susceptibility :math:`\chi^{q}_{r}` in the irreducible BZ.
+    :param lambda_correction_active: Whether the per-iteration lambda-correction scaffold is currently active.
+    :return: The (possibly corrected) physical susceptibility.
+    """
+    if config.lambda_correction.perform_lambda_correction or lambda_correction_active:
+        if config.sys.n_bands == 1:
+            return LambdaCorrection.perform(chi_phys_q_r)
+        return MultiOrbitalLambdaCorrection.perform(chi_phys_q_r)
+    return chi_phys_q_r

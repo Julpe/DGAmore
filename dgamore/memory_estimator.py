@@ -35,8 +35,8 @@ from dgamore.n_point_base import DTYPE
 DTYPE_BYTES: int = np.dtype(DTYPE).itemsize
 OVERHEAD_FACTOR: float = 1.0
 
-# chiq_aux builds its BSE block in ONE allocation (nonlocal_sde._assemble_bse_matrix), then holds it resident across
-# the per-q invert_and_sum_over_last_vn (per-q inversion transient negligible). Peak ~1x the rank-local block.
+# chiq_aux builds its BSE block in ONE allocation (sde_kernels.create_inverse_auxiliary_chi_r_q), then holds it
+# resident across the per-q invert_and_sum_over_last_vn (per-q inversion transient negligible). Peak ~1x the block.
 CHIQ_AUX_INVERT_FACTOR: int = 1
 
 # fq: single-block BSE assembly + eagerly rebound matmuls (f = gchi0_q_inv @ f, then f @ gchi0_q_inv), ~2 blocks live.

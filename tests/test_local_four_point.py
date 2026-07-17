@@ -1272,8 +1272,7 @@ def _extend_to_vn_diagonal(mat: np.ndarray) -> np.ndarray:
 
 @pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
 def test_matmul_propagates_frequency_notation_and_compound_pairing(notation):
-    """Matmul contracts in the compound space of the operands' notation and the result carries the frequency
-    notation of self, so pp results unravel with the acbd back-permute."""
+    """Matmul contracts in the operands' compound notation and the result keeps self's frequency notation."""
     rng = np.random.default_rng(12)
     o, niv = 2, 3
     shape = (o, o, o, o, 1, 2 * niv, 2 * niv)
@@ -1291,8 +1290,7 @@ def test_matmul_propagates_frequency_notation_and_compound_pairing(notation):
 
 @pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
 def test_matmul_mixed_vn_respects_frequency_notation(notation):
-    """The memory-saving 2vn @ 1vn matmul branch contracts with the notation's orbital pairing (the 1vn operand
-    acts nu-diagonally on the result's second frequency) and the result carries the frequency notation of self."""
+    """The 2vn @ 1vn matmul contracts with the notation's orbital pairing and keeps the frequency notation of self."""
     rng = np.random.default_rng(14)
     o, niv = 2, 3
     shape2 = (o, o, o, o, 1, 2 * niv, 2 * niv)
@@ -1314,8 +1312,7 @@ def test_matmul_mixed_vn_respects_frequency_notation(notation):
 
 @pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
 def test_matmul_with_interaction_respects_frequency_notation(notation):
-    """4pt @ LocalInteraction (and the reversed order) contracts the frequency-constant bare interaction with the
-    notation's orbital pairing and keeps the frequency notation of the four-point operand."""
+    """4pt @ LocalInteraction in either order contracts with the notation's pairing and keeps the 4pt's notation."""
     rng = np.random.default_rng(15)
     o, niv = 2, 3
     shape = (o, o, o, o, 1, 2 * niv, 2 * niv)
@@ -1344,8 +1341,7 @@ def test_matmul_rejects_mismatched_frequency_notations():
 
 
 def test_pow_pp_squares_in_pp_compound_space_without_explicit_identity():
-    """obj ** 2 on a pp object squares in the pp compound space (rows {1,3,v}, cols {4,2,v'}) and keeps the PP
-    notation, with the matching identity derived internally via identity_like."""
+    """obj ** 2 on a pp object squares in pp compound space, keeps PP notation and derives the identity internally."""
     rng = np.random.default_rng(18)
     o, niv = 2, 3
     shape = (o, o, o, o, 1, 2 * niv, 2 * niv)
@@ -1359,8 +1355,7 @@ def test_pow_pp_squares_in_pp_compound_space_without_explicit_identity():
 
 
 def test_pow_zero_returns_identity_in_own_frequency_notation():
-    """obj ** 0 without an explicit identity returns the compound-space identity carrying the object's frequency
-    notation (the identity tensor delta_14 delta_23 delta_vv' is the same for both notations)."""
+    """obj ** 0 without an explicit identity returns the compound identity carrying the object's frequency notation."""
     rng = np.random.default_rng(19)
     o, niv = 2, 3
     shape = (o, o, o, o, 1, 2 * niv, 2 * niv)
@@ -1373,8 +1368,7 @@ def test_pow_zero_returns_identity_in_own_frequency_notation():
 
 
 def test_pow_rejects_identity_with_mismatched_frequency_notation():
-    """pow with an explicitly passed identity in a different frequency notation raises instead of silently
-    returning or contracting a mislabeled object."""
+    """pow raises on an explicitly passed identity whose frequency notation differs from the object's."""
     mat = np.random.rand(2, 2, 2, 2, 1, 6, 6) + 1j * np.random.rand(2, 2, 2, 2, 1, 6, 6)
     obj = LocalFourPoint(mat, SpinChannel.DENS, 1, 2, True, True, FrequencyNotation.PP)
     identity_ph = LocalFourPoint.identity(2, 0, 3, num_vn_dimensions=2, full_niw_range=True)
@@ -1383,8 +1377,7 @@ def test_pow_rejects_identity_with_mismatched_frequency_notation():
 
 
 def test_change_frequency_notation_ph_to_pp_w0_trims_unread_bosonic_window():
-    """The w0 pp map samples only |w| <= 2*min(niw//2, niv) ph slices, so the trimmed-window conversion must equal
-    the untrimmed reference gather bit-for-bit, for half- and full-range inputs and both parities of the window."""
+    """The trimmed-window w0 pp conversion equals the untrimmed reference bit-for-bit for both ranges and parities."""
     from dgamore.matsubara_frequencies import MFHelper
 
     rng = np.random.default_rng(41)
@@ -1449,9 +1442,7 @@ def test_add_inplace_rejects_extension_scalar_and_zero_vn():
 
 
 def test_invert_one_vn_keeps_single_fermionic_dimension_and_matches_dense_reference():
-    """The ph 1-vn invert inverts per (w, v) orbital block and keeps one fermionic dimension; its values must equal
-    the fermionic diagonal of the former dense route (diagonal extension + compound inversion), whose off-diagonal
-    blocks are exactly zero for a block-diagonal matrix. Inverting twice returns the original."""
+    """The ph 1-vn invert keeps one fermionic dimension, equals the dense route's diagonal and is self-inverse."""
     rng = np.random.default_rng(97)
     o, nw, niv = 3, 4, 3
     shape = (o, o, o, o, nw, 2 * niv)

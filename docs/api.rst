@@ -27,10 +27,13 @@ API Reference
    dgamore.matsubara_frequencies
    dgamore.max_ent
    dgamore.memory_estimator
+   dgamore.mixing
    dgamore.mpi_utils
    dgamore.n_point_base
    dgamore.nonlocal_sde
+   dgamore.output_files
    dgamore.plotting
+   dgamore.sde_kernels
    dgamore.self_energy
    dgamore.symmetrize
    dgamore.symmetry_reduction

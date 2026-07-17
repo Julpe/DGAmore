@@ -33,6 +33,7 @@ import dgamore.eliashberg_solver as eliashberg_solver
 import dgamore.local_sde as local_sde
 import dgamore.memory_estimator as memory_estimator
 import dgamore.nonlocal_sde as nonlocal_sde
+import dgamore.output_files as output_files
 import dgamore.plotting as plotting
 from dgamore import max_ent
 from dgamore.brillouin_zone import is_auto_symmetries
@@ -40,6 +41,7 @@ from dgamore.config_parser import ConfigParser
 from dgamore.greens_function import GreensFunction
 from dgamore.interaction import LocalInteraction
 from dgamore.local_four_point import LocalFourPoint
+from dgamore.n_point_base import SpinChannel
 from dgamore.self_energy import SelfEnergy
 
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
@@ -49,7 +51,7 @@ logging.getLogger("matplotlib").setLevel(logging.WARNING)
 NODE_MEMORY_FRACTION: float = 0.97
 
 
-def main():
+def main() -> None:
     """
     Runs the complete DGA pipeline end to end: config parsing and folder setup, DMFT input loading, the local
     Schwinger-Dyson step (per inequivalent atom, assembled into full multi-band quantities), the non-local
@@ -212,7 +214,9 @@ def main():
 
             logger.info(f"Local Schwinger-Dyson equation (SDE) for atom {ineq} done.")
 
-        def write_to_full_4pt_quantity(obj_full, obj_ineq: LocalFourPoint, sl: slice):
+        def write_to_full_4pt_quantity(
+            obj_full: "LocalFourPoint | None", obj_ineq: LocalFourPoint, sl: slice
+        ) -> LocalFourPoint:
             """
             Writes a single inequivalent atom's four-point quantity into the orbital-diagonal block of the assembled
             full multi-band quantity (allocating the full object on the first call).
@@ -232,8 +236,11 @@ def main():
             return obj_full
 
         def write_to_full_2pt_quantity(
-            obj_full, obj_ineq: SelfEnergy | GreensFunction, sl: slice, has_momentum: bool = True
-        ):
+            obj_full: "SelfEnergy | GreensFunction | None",
+            obj_ineq: SelfEnergy | GreensFunction,
+            sl: slice,
+            has_momentum: bool = True,
+        ) -> SelfEnergy | GreensFunction:
             """
             Writes a single inequivalent atom's two-point quantity into the orbital-diagonal block of the assembled
             full multi-band quantity (allocating the full object on the first call), resetting the self-energy moments.
@@ -260,7 +267,7 @@ def main():
                 obj_full[sl, sl] = obj_ineq.mat
             return obj_full
 
-        def write_smom(obj_full: SelfEnergy, obj_ineq: SelfEnergy, sl: slice):
+        def write_smom(obj_full: SelfEnergy, obj_ineq: SelfEnergy, sl: slice) -> SelfEnergy:
             """
             Writes a single inequivalent atom's self-energy high-frequency moments into the orbital-diagonal block of
             the assembled full self-energy.
@@ -304,25 +311,45 @@ def main():
     if comm.rank == 0:
         # saved unconditionally (like every sibling local quantity): the scalar and matrix lambda corrections
         # load chi_*_loc.npy under different flags, so it must exist whenever either consumer may run
-        chi_d_full.save(name="chi_dens_loc", output_dir=config.output.output_path)
-        chi_m_full.save(name="chi_magn_loc", output_dir=config.output.output_path)
+        chi_d_full.save(
+            name=output_files.local_vertex_name("chi", SpinChannel.DENS), output_dir=config.output.output_path
+        )
+        chi_m_full.save(
+            name=output_files.local_vertex_name("chi", SpinChannel.MAGN), output_dir=config.output.output_path
+        )
         del chi_d, chi_m
 
-        g2_dens_full.save(name="g2_dens_loc", output_dir=config.output.output_path)
-        g2_magn_full.save(name="g2_magn_loc", output_dir=config.output.output_path)
+        g2_dens_full.save(
+            name=output_files.local_vertex_name("g2", SpinChannel.DENS), output_dir=config.output.output_path
+        )
+        g2_magn_full.save(
+            name=output_files.local_vertex_name("g2", SpinChannel.MAGN), output_dir=config.output.output_path
+        )
         del g2_dens_per_ineq, g2_magn_per_ineq
 
-        gamma_d_full.save(name="gamma_dens_loc", output_dir=config.output.output_path)
-        gamma_m_full.save(name="gamma_magn_loc", output_dir=config.output.output_path)
+        gamma_d_full.save(
+            name=output_files.local_vertex_name("gamma", SpinChannel.DENS), output_dir=config.output.output_path
+        )
+        gamma_m_full.save(
+            name=output_files.local_vertex_name("gamma", SpinChannel.MAGN), output_dir=config.output.output_path
+        )
 
-        vrg_d_full.save(name="vrg_dens_loc", output_dir=config.output.output_path)
-        vrg_m_full.save(name="vrg_magn_loc", output_dir=config.output.output_path)
+        vrg_d_full.save(
+            name=output_files.local_vertex_name("vrg", SpinChannel.DENS), output_dir=config.output.output_path
+        )
+        vrg_m_full.save(
+            name=output_files.local_vertex_name("vrg", SpinChannel.MAGN), output_dir=config.output.output_path
+        )
         del vrg_d_full, vrg_m_full
 
-        gchi_d_full.save(name="gchi_dens_loc", output_dir=config.output.output_path)
-        gchi_m_full.save(name="gchi_magn_loc", output_dir=config.output.output_path)
-        f_d_full.save(name="f_dens_loc", output_dir=config.output.output_path)
-        f_m_full.save(name="f_magn_loc", output_dir=config.output.output_path)
+        gchi_d_full.save(
+            name=output_files.local_vertex_name("gchi", SpinChannel.DENS), output_dir=config.output.output_path
+        )
+        gchi_m_full.save(
+            name=output_files.local_vertex_name("gchi", SpinChannel.MAGN), output_dir=config.output.output_path
+        )
+        f_d_full.save(name=output_files.local_vertex_name("f", SpinChannel.DENS), output_dir=config.output.output_path)
+        f_m_full.save(name=output_files.local_vertex_name("f", SpinChannel.MAGN), output_dir=config.output.output_path)
         del f_d_full, f_m_full
         logger.info("Saved all relevant quantities as numpy files.")
 
@@ -392,6 +419,10 @@ def main():
     sigma_dmft_full = comm.bcast(sigma_dmft_full, root=0)
     g_dmft_full = comm.bcast(g_dmft_full, root=0)
 
+    # the configuration is fully resolved here (parse, broadcast, autodetect, exclusivity, local SDE); freeze every
+    # section except the runtime-state sys section so the compute stages can never mutate configuration mid-run
+    config.freeze()
+
     logger.info("Starting non-local ladder-DGA routine.")
     sigma_dga = nonlocal_sde.calculate_self_energy_q(comm, u_loc, v_nonloc, sigma_dmft_full, sigma_loc_full)
     del sigma_dmft_full, sigma_loc_full
@@ -422,7 +453,7 @@ def main():
         g_latt = None
         if comm.rank == 0:
             g_latt = GreensFunction(
-                np.load(os.path.join(config.output.output_path, "g_latt_dmft.npy")),
+                np.load(output_files.npy_path(config.output.output_path, output_files.G_LATT_DMFT_NAME)),
                 nk=config.lattice.nk,
                 beta=config.sys.beta,
             ).cut_niv(config.box.niv_core)
@@ -772,7 +803,7 @@ def _log_lambda_correction_dispatch() -> None:
         )
 
 
-def configure_matplotlib():
+def configure_matplotlib() -> None:
     """
     Configures matplotlib to use the Euler font for mathematical expressions if it is available on the system. This is
     done because the Euler font is the default math font in my thesis.

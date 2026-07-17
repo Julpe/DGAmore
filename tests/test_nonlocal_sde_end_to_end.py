@@ -128,8 +128,7 @@ def gpu_cpu_context(use_gpu: bool, monkeypatch):
     [(20, 20, 10, True, True), (20, 20, 10, False, True), (20, 20, 10, True, False), (20, 20, 10, False, False)],
 )
 def test_calculates_nonlocal_sde_correctly(setup, monkeypatch, niw_core, niv_core, niv_shell, use_gpu, save_memory):
-    """The non-local SDE reproduces the reference self-energy on the CPU and (mocked) GPU paths in both memory
-    modes."""
+    """The non-local SDE reproduces the reference self-energy on the CPU and mocked GPU paths in both memory modes."""
     folder, comm_mock = setup
 
     config.box.niw_core = niw_core
@@ -161,9 +160,7 @@ def test_calculates_nonlocal_sde_correctly(setup, monkeypatch, niw_core, niv_cor
 
 @pytest.mark.parametrize("save_memory", [True, False])
 def test_calculates_srvo3_correctly(setup_srvo3_cubic, save_memory):
-    """The SrVO3 cubic run reproduces the cubic point-group symmetry of the self-energy: kx<->ky leaves dxy
-    invariant and swaps dxz<->dyz, kx<->kz leaves dxz invariant and swaps dxy<->dyz, ky<->kz leaves dyz
-    invariant and swaps dxy<->dxz."""
+    """The SrVO3 run reproduces the cubic point-group symmetry of the self-energy under all axis swaps."""
     folder_cubic, comm_mock = setup_srvo3_cubic
 
     g_dmft, s_dmft, g2_dens, g2_magn = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())

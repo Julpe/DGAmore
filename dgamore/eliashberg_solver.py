@@ -23,7 +23,7 @@ import scipy as sp
 from threadpoolctl import ThreadpoolController, threadpool_limits
 
 import dgamore.config as config
-from dgamore import nonlocal_sde, mpi_utils
+from dgamore import mpi_utils, output_files, sde_kernels
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.four_point import FourPoint
 from dgamore.gap_function import GapFunction
@@ -152,11 +152,12 @@ def create_full_vertex_q_r(
     logger.info(f"Starting to calculate the full {gamma_r.channel.value} vertex.")
 
     gchi0_q_inv = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"gchi0_q_inv_rank_{mpi_dist.my_rank}.npy"), num_vn_dimensions=1
+        output_files.npy_path(config.output.eliashberg_path, output_files.gchi0_q_inv_rank_name(mpi_dist.my_rank)),
+        num_vn_dimensions=1,
     )
 
     logger.info(f"Loaded gchi0_q_inv from file.")
-    f_q_r = nonlocal_sde.create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_loc, v_nonloc)
+    f_q_r = sde_kernels.create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_loc, v_nonloc)
     logger.info(f"Non-Local auxiliary susceptibility ({gamma_r.channel.value}) calculated.")
 
     # eager rebinding releases chi* right after the first matmul, and the bubble term enters on the fermionic
@@ -174,13 +175,17 @@ def create_full_vertex_q_r(
     logger.info(f"Calculated first part of full {gamma_r.channel.value} vertex.")
 
     vrg_q_r_left = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"vrg_q_{gamma_r.channel.value}_rank_{mpi_dist.my_rank}.npy"),
+        output_files.npy_path(
+            config.output.eliashberg_path, output_files.vrg_q_rank_name(gamma_r.channel, mpi_dist.my_rank)
+        ),
         channel=gamma_r.channel,
         num_vn_dimensions=1,
     )
 
     chi_phys_q_r = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"chi_phys_q_{gamma_r.channel.value}_rank_{mpi_dist.my_rank}.npy"),
+        output_files.npy_path(
+            config.output.eliashberg_path, output_files.chi_phys_q_rank_name(gamma_r.channel, mpi_dist.my_rank)
+        ),
         channel=gamma_r.channel,
         num_vn_dimensions=0,
     )
@@ -192,7 +197,9 @@ def create_full_vertex_q_r(
     chi_phys_q_r.free()
 
     vrg_q_r_right = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"vrg_q_{gamma_r.channel.value}_right_rank_{mpi_dist.my_rank}.npy"),
+        output_files.npy_path(
+            config.output.eliashberg_path, output_files.vrg_q_right_rank_name(gamma_r.channel, mpi_dist.my_rank)
+        ),
         channel=gamma_r.channel,
         num_vn_dimensions=1,
     )
@@ -211,9 +218,9 @@ def create_full_vertex_q_r(
 
     delete_files(
         config.output.eliashberg_path,
-        f"vrg_q_{gamma_r.channel.value}_rank_{mpi_dist.my_rank}.npy",
-        f"vrg_q_{gamma_r.channel.value}_right_rank_{mpi_dist.my_rank}.npy",
-        f"chi_phys_q_{gamma_r.channel.value}_rank_{mpi_dist.my_rank}.npy",
+        output_files.npy_filename(output_files.vrg_q_rank_name(gamma_r.channel, mpi_dist.my_rank)),
+        output_files.npy_filename(output_files.vrg_q_right_rank_name(gamma_r.channel, mpi_dist.my_rank)),
+        output_files.npy_filename(output_files.chi_phys_q_rank_name(gamma_r.channel, mpi_dist.my_rank)),
     )
 
     return f_q_r
@@ -221,7 +228,7 @@ def create_full_vertex_q_r(
 
 def create_full_vertex_q_r_pp_w0(
     u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist_irrk: MpiDistributor
-):
+) -> FourPoint:
     r"""
     Builds the full ladder vertex (see :func:`create_full_vertex_q_r`), optionally gathers and saves it in ph
     notation in the irreducible BZ, and returns it transformed to pp notation at :math:`\omega' = 0`.
@@ -290,7 +297,7 @@ def create_full_vertex_q_r_v2(
 
     u = u_loc.as_channel(gamma_r.channel) + v_nonloc_idx.as_channel(gamma_r.channel)
 
-    f_q_r_idx = nonlocal_sde.create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv_idx, u_loc, v_nonloc_idx)
+    f_q_r_idx = sde_kernels.create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv_idx, u_loc, v_nonloc_idx)
     # same eager-rebinding / diagonal-add construction as in create_full_vertex_q_r, per q-point
     f_q_r_idx = gchi0_q_inv_idx @ f_q_r_idx
     f_q_r_idx = f_q_r_idx @ gchi0_q_inv_idx
@@ -312,7 +319,7 @@ def create_full_vertex_q_r_v2(
 
 def create_full_vertex_q_r_pp_w0_v2(
     u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist_irrk: MpiDistributor
-):
+) -> FourPoint:
     r"""
     Builds the full ladder vertex as a memory-lean variant of :func:`create_full_vertex_q_r_pp_w0`, looping over the
     rank-local q-points (see :func:`create_full_vertex_q_r_v2`), optionally saving it in ph notation, and returning it
@@ -328,28 +335,32 @@ def create_full_vertex_q_r_pp_w0_v2(
     logger = config.logger
 
     gchi0_q_inv = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"gchi0_q_inv_rank_{mpi_dist_irrk.my_rank}.npy"),
+        output_files.npy_path(config.output.eliashberg_path, output_files.gchi0_q_inv_rank_name(mpi_dist_irrk.my_rank)),
         num_vn_dimensions=1,
     )
     logger.info(f"Loaded gchi0_q_inv from file.")
 
     vrg_q_r_left = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"vrg_q_{gamma_r.channel.value}_rank_{mpi_dist_irrk.my_rank}.npy"),
+        output_files.npy_path(
+            config.output.eliashberg_path, output_files.vrg_q_rank_name(gamma_r.channel, mpi_dist_irrk.my_rank)
+        ),
         channel=gamma_r.channel,
         num_vn_dimensions=1,
     )
 
     vrg_q_r_right = FourPoint.load(
-        os.path.join(
-            config.output.eliashberg_path, f"vrg_q_{gamma_r.channel.value}_right_rank_{mpi_dist_irrk.my_rank}.npy"
+        output_files.npy_path(
+            config.output.eliashberg_path,
+            output_files.vrg_q_right_rank_name(gamma_r.channel, mpi_dist_irrk.my_rank),
         ),
         channel=gamma_r.channel,
         num_vn_dimensions=1,
     )
 
     chi_phys_q_r = FourPoint.load(
-        os.path.join(
-            config.output.eliashberg_path, f"chi_phys_q_{gamma_r.channel.value}_rank_{mpi_dist_irrk.my_rank}.npy"
+        output_files.npy_path(
+            config.output.eliashberg_path,
+            output_files.chi_phys_q_rank_name(gamma_r.channel, mpi_dist_irrk.my_rank),
         ),
         channel=gamma_r.channel,
         num_vn_dimensions=0,
@@ -391,9 +402,9 @@ def create_full_vertex_q_r_pp_w0_v2(
 
     delete_files(
         config.output.eliashberg_path,
-        f"vrg_q_{gamma_r.channel.value}_rank_{mpi_dist_irrk.my_rank}.npy",
-        f"vrg_q_{gamma_r.channel.value}_right_rank_{mpi_dist_irrk.my_rank}.npy",
-        f"chi_phys_q_{gamma_r.channel.value}_rank_{mpi_dist_irrk.my_rank}.npy",
+        output_files.npy_filename(output_files.vrg_q_rank_name(gamma_r.channel, mpi_dist_irrk.my_rank)),
+        output_files.npy_filename(output_files.vrg_q_right_rank_name(gamma_r.channel, mpi_dist_irrk.my_rank)),
+        output_files.npy_filename(output_files.chi_phys_q_rank_name(gamma_r.channel, mpi_dist_irrk.my_rank)),
     )
 
     if not config.eliashberg.save_fq:
@@ -579,8 +590,14 @@ def create_local_ud_diagrams_pp_w0(
     :return: The tuple ``(f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0)`` of local pp diagrams at
         :math:`\omega = 0`.
     """
-    gchi_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"gchi_dens_loc.npy"), SpinChannel.DENS)
-    gchi_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"gchi_magn_loc.npy"), SpinChannel.MAGN)
+    gchi_dens_loc = LocalFourPoint.load(
+        output_files.npy_path(config.output.output_path, output_files.local_vertex_name("gchi", SpinChannel.DENS)),
+        SpinChannel.DENS,
+    )
+    gchi_magn_loc = LocalFourPoint.load(
+        output_files.npy_path(config.output.output_path, output_files.local_vertex_name("gchi", SpinChannel.MAGN)),
+        SpinChannel.MAGN,
+    )
     gchi_ud_loc = (gchi_dens_loc - gchi_magn_loc).set_channel(SpinChannel.UD).scale(0.5)
     # the fermionic cut commutes with the w0 pp map (it samples only the retained window), so cutting first shrinks
     # the transform transient from the full box to the pp box
@@ -592,8 +609,14 @@ def create_local_ud_diagrams_pp_w0(
 
     gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
 
-    f_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_dens_loc.npy"), SpinChannel.DENS)
-    f_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_magn_loc.npy"), SpinChannel.MAGN)
+    f_dens_loc = LocalFourPoint.load(
+        output_files.npy_path(config.output.output_path, output_files.local_vertex_name("f", SpinChannel.DENS)),
+        SpinChannel.DENS,
+    )
+    f_magn_loc = LocalFourPoint.load(
+        output_files.npy_path(config.output.output_path, output_files.local_vertex_name("f", SpinChannel.MAGN)),
+        SpinChannel.MAGN,
+    )
     f_ud_loc = (f_dens_loc - f_magn_loc).set_channel(SpinChannel.UD).scale(0.5)
     f_ud_loc_pp_w0 = f_ud_loc.cut_niv(niv_pp).change_frequency_notation_ph_to_pp_w0()
 
@@ -969,7 +992,7 @@ def solve_eliashberg_lanczos(
 
     sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
 
-    def mv(gap: np.ndarray):
+    def mv(gap: np.ndarray) -> np.ndarray:
         r"""
         Applies the pairing kernel to a flattened gap vector (the matrix-vector product for the eigensolver):
         multiplies by :math:`\chi_0^{pp}`, FFTs to real space, contracts with the pairing vertex (direct plus the
@@ -1117,7 +1140,7 @@ def solve_eliashberg_lanczos_v2(
 
     sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
 
-    def mv(gap: np.ndarray):
+    def mv(gap: np.ndarray) -> np.ndarray:
         r"""
         Applies the pairing kernel to a flattened gap vector in the frequency-distributed scheme: the root rank
         multiplies by :math:`\chi_0^{pp}` and broadcasts, all ranks FFT and contract with their frequency slice of the
@@ -1220,7 +1243,7 @@ def dispatch_full_vertex_calculation(
     :math:`\tilde\gamma_{r;1234}^{q\nu}=\beta \sum_{ab}\sum_{\nu'} \chi^{*;q\nu'\nu}_{r;12ab} (\chi^{q\nu}_{0;ba34})^{-1}
     =\beta \sum_{ab}\sum_{\nu'} \chi^{*;q\nu\nu'}_{r;ab21} (\chi^{q\nu}_{0;ab34})^{-1}`, i.e. the sum over the first
     frequency argument equals the sum over the last one only up to the orbital reversal dictated by
-    time-reversal symmetry, see :meth:`~dgamore.nonlocal_sde.create_vrg_r_q_right`. No explicit factors of
+    time-reversal symmetry, see :func:`~dgamore.sde_kernels.create_vrg_r_q_right`. No explicit factors of
     :math:`\beta` appear in :math:`F^{(2)}` because they are absorbed into the stored objects:
     :math:`\chi^{q}_{r}` is the (:math:`U`-dressed, shell- (and sometimes :math:`\lambda`-corrected)) physical
     susceptibility normalized as :math:`\frac{1}{\beta^2}\sum_{\nu\nu'}\chi^{q\nu\nu'}_{r}`, and the three-leg
@@ -1235,7 +1258,10 @@ def dispatch_full_vertex_calculation(
     :param mpi_dist: MPI distributor over the irreducible BZ q-points.
     :return: The full ladder pp vertex :math:`F^{q}_{r}` as a :class:`FourPoint`.
     """
-    gamma_r = LocalFourPoint.load(os.path.join(config.output.output_path, f"gamma_{channel.value}_loc.npy"), channel)
+    gamma_r = LocalFourPoint.load(
+        output_files.npy_path(config.output.output_path, output_files.local_vertex_name("gamma", channel)),
+        channel,
+    )
     if config.memory.save_memory_for_fq:
         f_q_r = create_full_vertex_q_r_pp_w0_v2(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist)
     else:
@@ -1247,7 +1273,7 @@ def dispatch_full_vertex_calculation(
 
 def solve(
     giwk_dga: GreensFunction, g_dmft: GreensFunction, u_loc: LocalInteraction, v_nonloc: Interaction, comm: MPI.Comm
-):
+) -> tuple[list[float], list[float], list[GapFunction], list[GapFunction]]:
     r"""
     Drives the Eliashberg step: assembles the singlet and triplet pairing vertices from the saved
     ladder-DGA full vertices (optionally adding the local reducible diagrams), then solves the linearized gap equation
@@ -1289,7 +1315,9 @@ def solve(
     f_dens_pp = dispatch_full_vertex_calculation(SpinChannel.DENS, u_loc, v_nonloc, niv_pp, mpi_dist_irrk)
     f_magn_pp = dispatch_full_vertex_calculation(SpinChannel.MAGN, u_loc, v_nonloc, niv_pp, mpi_dist_irrk)
 
-    delete_files(config.output.eliashberg_path, f"gchi0_q_inv_rank_{comm.rank}.npy")
+    delete_files(
+        config.output.eliashberg_path, output_files.npy_filename(output_files.gchi0_q_inv_rank_name(comm.rank))
+    )
 
     mpi_dist_irrk.delete_file()
 
@@ -1316,8 +1344,14 @@ def solve(
 
         # special treatment of local full vertex that is subtracted with a different frequency notation and is
         # different from the regular pp
-        f_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_dens_loc.npy"), SpinChannel.DENS)
-        f_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_magn_loc.npy"), SpinChannel.MAGN)
+        f_dens_loc = LocalFourPoint.load(
+            output_files.npy_path(config.output.output_path, output_files.local_vertex_name("f", SpinChannel.DENS)),
+            SpinChannel.DENS,
+        )
+        f_magn_loc = LocalFourPoint.load(
+            output_files.npy_path(config.output.output_path, output_files.local_vertex_name("f", SpinChannel.MAGN)),
+            SpinChannel.MAGN,
+        )
         f_ud_loc = (f_dens_loc - f_magn_loc).set_channel(SpinChannel.UD).scale(0.5)
         f_ud_loc_transf_w0 = transform_vertex_loc_frequencies_w0(f_ud_loc, niv_pp)
         del f_dens_loc, f_magn_loc, f_ud_loc

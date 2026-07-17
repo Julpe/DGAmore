@@ -84,10 +84,7 @@ def _j_conjugate(mat: np.ndarray) -> np.ndarray:
 
 
 def test_crossed_term_reuses_direct_vertex_via_index_shuffles():
-    """The flipped-vertex contraction Gamma_flip[K] @ gap_flip[K] (Gamma_flip = momentum-flip + v'-flip + adcb of
-    the direct vertex, sign-folded) must equal the K-flipped, row-orbital-swapped image of the DIRECT vertex applied
-    to the p-flipped gap: sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]] - the identity that lets the matvec drop
-    the second stored vertex."""
+    """Gamma_flip @ gap_flip = sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]], so no second vertex is ever stored."""
     from dgamore.n_point_base import FrequencyNotation
 
     rng = np.random.default_rng(37)
@@ -119,8 +116,7 @@ def test_crossed_term_reuses_direct_vertex_via_index_shuffles():
 
 
 def test_transform_vertex_q_frequencies_w0_matches_untrimmed_reference():
-    """The trimmed-bosonic-window pp transform must equal the untrimmed reference gather (full niw restoration plus
-    the omega = v - v' selection over wn(niw)) for niw far larger than the read window 2*niv_pp - 1."""
+    """The trimmed-bosonic-window pp transform equals the untrimmed reference for niw far above the read window."""
     from dgamore.eliashberg_solver import transform_vertex_q_frequencies_w0
     from dgamore.matsubara_frequencies import MFHelper
 
@@ -149,9 +145,7 @@ def test_transform_vertex_q_frequencies_w0_matches_untrimmed_reference():
 
 
 def test_full_vertex_first_term_restructure_matches_original_expression():
-    """The eager-rebound first term of the full ladder vertex, F_1 = -beta^2 (chi0^-1 chi* chi0^-1) plus beta^2
-    chi0^-1 added on the fermionic diagonal, must equal the original single-expression form
-    beta^2 (chi0^-1 delta - chi0^-1 chi* chi0^-1) within complex64 rounding, without mutating the bubble."""
+    """The eager-rebound full-vertex first term equals the single-expression form without mutating the bubble."""
     rng = np.random.default_rng(31)
     o, nqi, nw, niv, beta = 2, 3, 2, 2, 12.5
     config.sys.beta = beta
@@ -171,8 +165,7 @@ def test_full_vertex_first_term_restructure_matches_original_expression():
 
 
 def test_local_gamma_ud_pp_w0_matches_b26_for_single_band():
-    """For one band and crossing-symmetric chi the J-decorated BSE inversion is identical to the old flipped-bubble
-    B.26 form, locking backwards compatibility of the single-orbital results."""
+    """For one band and crossing-symmetric chi the J-decorated BSE inversion equals the old flipped-bubble B.26 form."""
     beta, niv_pp = 12.5, 4
     chi, chi0, _ = _make_pp_chi_and_bubble(1, niv_pp, beta, seed=7)
     chi0_flipped = chi0.flip_frequency_axis(-1)
@@ -184,9 +177,7 @@ def test_local_gamma_ud_pp_w0_matches_b26_for_single_band():
 
 @pytest.mark.parametrize("o", [2, 3, 4, 5])
 def test_local_gamma_ud_pp_w0_multiorbital_preserves_crossing_symmetry(o):
-    """For more than one band the J-decorated inversion keeps Gamma crossing-symmetric (J Gamma J = Gamma) and
-    deviates from the old flipped-bubble form, whose bubble misses the orbital pair permutation of the crossing
-    operator."""
+    """For several bands the J-decorated inversion keeps J Gamma J = Gamma and leaves the old flipped-bubble form."""
     beta, niv_pp = 10.0, 3
     chi, chi0, _ = _make_pp_chi_and_bubble(o, niv_pp, beta, seed=8)
     gamma_new = create_local_gamma_ud_pp_w0(chi, chi0, beta)
@@ -199,10 +190,7 @@ def test_local_gamma_ud_pp_w0_multiorbital_preserves_crossing_symmetry(o):
 
 @pytest.mark.parametrize("o", [2, 3, 4, 5])
 def test_local_gamma_ud_pp_w0_satisfies_pp_bse(o):
-    """Locks every orbital and frequency index of create_local_gamma_ud_pp_w0: the helper matches a float64 compound
-    reference of Gamma^{vv'}_1234 = beta^2 [chi0 J - chi0 chi^{-1} chi0]^{-1;vv'}_1234, the reference F (leg-amputated
-    chi) rebuilds chi through the raw leg einsum, and (Gamma, F) satisfy the crossing-decoupled pp BSE written with
-    explicit indices (free orbital indices 1234, summed indices alphabetical from the left-most object)."""
+    """create_local_gamma_ud_pp_w0 matches a float64 reference and (Gamma, F) fulfill the crossing-decoupled BSE."""
     beta, niv_pp = 10.0, 3
     chi_obj, chi0_obj, g = _make_pp_chi_and_bubble(o, niv_pp, beta, seed=11)
     n2 = 2 * niv_pp
@@ -233,9 +221,7 @@ def test_local_gamma_ud_pp_w0_satisfies_pp_bse(o):
 
 @pytest.mark.parametrize("o", [5, 4, 3, 2, 1])
 def test_local_gamma_ud_pp_w0_satisfies_decoupled_singlet_triplet_bse(o):
-    """Gamma from create_local_gamma_ud_pp_w0 fulfills the decoupled singlet/triplet pp BSEs of thesis Eqs.
-    (3.51)/(3.52) on the J-even/odd blocks, F_s/t = Gamma_s/t +/- 1/(2 beta^2) Gamma_s/t chi0 F_s/t, in compound
-    pp space (rows {1,3,v}, cols {4,2,v'}); J is the crossing operator, chi0*J its exact matrix realization."""
+    """Gamma's J-even/odd blocks fulfill the decoupled singlet/triplet pp BSEs of thesis Eqs. (3.51) and (3.52)."""
     beta, niv_pp = 10.0, 3
     chi_obj, chi0_obj, _ = _make_pp_chi_and_bubble(o, niv_pp, beta, seed=23)
     n2 = 2 * niv_pp
@@ -269,8 +255,7 @@ def test_local_gamma_ud_pp_w0_satisfies_decoupled_singlet_triplet_bse(o):
 
 @pytest.mark.parametrize("o", [5, 4, 3, 2, 1])
 def test_transform_vertex_loc_frequencies_w0_is_crossed_slot_form(o):
-    """transform_vertex_loc_frequencies_w0 returns -F^{(v-v')v(-v')}_{1432} (crossed slot of thesis Eq. 4.49); the
-    orbital permutation to 1432 only shows up for more than one band."""
+    """transform_vertex_loc_frequencies_w0 returns -F^{(v-v')v(-v')}_{1432}, the crossed slot of thesis Eq. (4.49)."""
     rng = np.random.default_rng(6)
     niw, niv, niv_pp = 6, 5, 3
     config.box.niw_core = niw
@@ -291,8 +276,7 @@ def test_transform_vertex_loc_frequencies_w0_is_crossed_slot_form(o):
 
 @pytest.mark.parametrize("o", [2, 1])
 def test_pairing_vertex_contraction_uses_triqs_leg_order(o):
-    """The 'abcd->badc' permute makes the vertex contraction implement Delta_ab = sum_cd Gamma_cadb X_cd (TRIQS leg
-    order); the raw w2dynamics-order layout only agrees for a single band."""
+    """The badc permute yields the TRIQS-leg-order contraction; the raw w2dynamics layout matches only for one band."""
     rng = np.random.default_rng(3)
     nq, nv = (2, 2, 1), 4
     shape = (*nq, o, o, o, o, nv, nv)
@@ -348,11 +332,7 @@ def _matvec_direct_term_single_slice(
 
 @pytest.mark.parametrize("channel", [SpinChannel.SING, SpinChannel.TRIP])
 def test_matvec_direct_term_matches_thesis_eq_4_40_on_physical_sector(channel):
-    """On the physical symmetry class -- pairing vertex with its particle-swap (1432, 3214) and static time-reversal
-    (dcba) symmetries, G(k) symmetric (time reversal plus inversion) and the gap in the SPOT sector (Delta = +/-
-    Delta^T for singlet/triplet) -- the matvec direct term is identical to Eq. (4.40) of the thesis and preserves the
-    sector. For a generic (unsymmetrized) vertex the two wirings differ, so the equivalence is a property of the
-    symmetry class, not of the contraction pattern."""
+    """On the physical symmetry class the matvec direct term equals thesis Eq. (4.40) and preserves the SPOT sector."""
     rng = np.random.default_rng(4)
     o = 3
     sign = 1 if channel == SpinChannel.SING else -1
@@ -379,9 +359,7 @@ def test_matvec_direct_term_matches_thesis_eq_4_40_on_physical_sector(channel):
 
 @pytest.mark.parametrize("o", [2, 1])
 def test_badc_permute_is_noop_for_swap_and_tr_symmetric_pairing_vertex(o):
-    """'abcd->badc' composes from the physical vertex symmetries (badc = dcba composed with cdab), so for a pairing
-    vertex carrying the particle-swap (1432, 3214) and static time-reversal (dcba) symmetries the w2dynamics and TRIQS
-    leg orders give identical contractions for any gap; for a generic tensor they differ (except for a single band)."""
+    """badc composes from the vertex symmetries: swap- and TR-symmetric vertices contract equally in both leg orders."""
     rng = np.random.default_rng(5)
     nq, nv = (1, 1, 1), 1
 
@@ -417,10 +395,7 @@ def test_badc_permute_is_noop_for_swap_and_tr_symmetric_pairing_vertex(o):
 @pytest.mark.parametrize("o", [2, 3, 4, 5])
 @pytest.mark.parametrize("channel", [SpinChannel.SING, SpinChannel.TRIP])
 def test_degenerate_decoupled_bands_reproduce_single_band_kernel(monkeypatch, channel, o):
-    """o decoupled, degenerate bands (same-band-only pairing vertex, orbital-diagonal Green's function) must give
-    a pairing kernel that is o identical copies of the single-band kernel with vanishing inter-band blocks, so the
-    eigenvalue spectrum is the single-band one, o-fold degenerate; run through the production solve_eliashberg_lanczos
-    matvec (eigsh is intercepted and densified)."""
+    """Decoupled degenerate bands give copies of the single-band kernel and an o-fold degenerate spectrum."""
     nq, niv_pp, beta = (2, 2, 1), 2, 10.0
     nq_tot, n2 = int(np.prod(nq)), 2 * niv_pp
     config.lattice.nk = nq
@@ -485,8 +460,7 @@ def test_degenerate_decoupled_bands_reproduce_single_band_kernel(monkeypatch, ch
 
 
 def test_solver_thread_budget_derives_from_affinity(monkeypatch):
-    """The solver thread budget equals the size of the process affinity mask (at least 1) and falls back to 1
-    where the affinity API does not exist."""
+    """The solver thread budget is the affinity-mask size (at least 1), falling back to 1 without the affinity API."""
     import os
 
     import dgamore.eliashberg_solver as es
@@ -498,8 +472,7 @@ def test_solver_thread_budget_derives_from_affinity(monkeypatch):
 
 
 def test_apply_gamma_pp_momentum_parallel_path_is_bit_equal():
-    """The momentum-batch-parallel contraction (contiguous k-chunks, one output slice per worker) must be
-    bit-equal to the serial path, including worker counts that do not divide the batch."""
+    """The momentum-batch-parallel contraction is bit-equal to the serial path, including non-dividing worker counts."""
     from concurrent.futures import ThreadPoolExecutor
 
     rng = np.random.default_rng(6)
@@ -518,8 +491,7 @@ def test_apply_gamma_pp_momentum_parallel_path_is_bit_equal():
 
 
 def test_apply_gchi0_pp_momentum_parallel_path_is_bit_equal():
-    """The momentum-batch-parallel bubble multiplication (contiguous k-chunks, one output slice per worker) must
-    be bit-equal to the serial path, including worker counts that do not divide the batch."""
+    """The momentum-batch-parallel bubble multiply is bit-equal to serial, including non-dividing worker counts."""
     from concurrent.futures import ThreadPoolExecutor
 
     rng = np.random.default_rng(7)
@@ -552,9 +524,7 @@ def _make_budget_comm(size, rank, infos):
     ],
 )
 def test_v2_thread_budget_divides_mask_among_active_node_ranks(monkeypatch, rank, active_ranks, masks, hosts, expected):
-    """The frequency-distributed solver's budget is this rank's affinity-mask size divided by the number of
-    ACTIVE ranks on its node whose masks overlap with it (1 for inactive ranks): full occupancy halves/quarters
-    the mask, idle ranks free their share, other nodes and disjoint (per-socket) masks do not count."""
+    """The v2 budget divides the affinity mask among active same-node ranks with overlapping masks (1 when inactive)."""
     import dgamore.eliashberg_solver as es
 
     monkeypatch.setattr(es.os, "sched_getaffinity", lambda pid: masks[rank], raising=False)
@@ -564,8 +534,7 @@ def test_v2_thread_budget_divides_mask_among_active_node_ranks(monkeypatch, rank
 
 
 def test_v2_thread_budget_falls_back_without_affinity_api_and_single_rank(monkeypatch):
-    """Without the affinity API the budget is 1; a single-rank communicator gets the whole mask (nothing else
-    runs on the node) without any collective call."""
+    """Without the affinity API the v2 budget is 1; a single-rank communicator gets the whole mask collective-free."""
     import dgamore.eliashberg_solver as es
 
     monkeypatch.delattr(es.os, "sched_getaffinity", raising=False)
@@ -613,9 +582,7 @@ def test_solver_thread_budgets_clamp_to_openblas_slot_cap(monkeypatch):
 
 
 def test_solve_eliashberg_lanczos_v2_threaded_matches_serial():
-    """The frequency-distributed solver with a multi-thread budget must return bit-equal eigenvalues and gap
-    functions to its serial path (per-k chunk independence, no reordered reduction), driven end to end through
-    the real eigsh on a single-rank distributor with a deterministic d-wave seed."""
+    """The frequency-distributed solver with a multi-thread budget returns bit-equal eigenpairs to its serial path."""
     from types import SimpleNamespace
 
     from dgamore.mpi_utils import MpiDistributor
@@ -664,11 +631,7 @@ def test_solve_eliashberg_lanczos_v2_threaded_matches_serial():
 
 
 def test_solve_eliashberg_lanczos_v2_with_inactive_ranks_runs_on_restricted_distributor(monkeypatch):
-    """With more ranks than frequency columns the active ranks run the solve on the sub-communicator-restricted
-    distributor (its matvec collectives span only them) while the inactive ranks skip it entirely: the solve
-    completes without collective mismatch and reproduces the single-rank matvec results (eigsh is replaced by a
-    deterministic power loop over the real matvec, since ARPACK's global lock cannot interleave with lockstep
-    collectives across threads)."""
+    """With more ranks than columns the active ranks solve on the restricted distributor and inactive ranks skip it."""
     from types import SimpleNamespace
 
     import dgamore.eliashberg_solver as es
@@ -742,9 +705,7 @@ def test_solve_eliashberg_lanczos_v2_with_inactive_ranks_runs_on_restricted_dist
 
 
 def test_solve_eliashberg_lanczos_runs_eigsh_inside_thread_budget(monkeypatch):
-    """With a multi-core budget the in-memory solver pins the live BLAS pool to one thread around the eigsh call
-    via threadpool_limits (the momentum-batch executor threads must not nest BLAS threads underneath; a
-    mid-process environment-variable change would be ignored by the already-initialized pool)."""
+    """The in-memory solver pins BLAS to one thread around eigsh via threadpool_limits under a multi-core budget."""
     import dgamore.eliashberg_solver as es
 
     nq, niv_pp = (2, 2, 1), 2
@@ -820,9 +781,7 @@ def _mirror_y_column(column: np.ndarray, gap_shape: tuple) -> np.ndarray:
 
 
 def test_symmetrize_degenerate_gaps_recovers_mirror_partners():
-    """An obliquely mixed, complex-phased degenerate doublet is orthonormalized and rotated back to the
-    mirror-adapted p_x-like (even) and p_y-like (odd) partners with deterministic phases; the vector of the
-    non-degenerate eigenvalue is only phase-fixed."""
+    """An obliquely mixed degenerate doublet is rotated to the mirror-adapted partners with deterministic phases."""
     px, py, gap_shape = _make_p_wave_doublet()
     rng = np.random.default_rng(24)
     extra = rng.standard_normal(px.size) + 1j * rng.standard_normal(px.size)
@@ -875,9 +834,7 @@ def _assemble_two_atom_system(niv_pp: int, beta: float) -> tuple:
 
 
 def test_local_gamma_ud_pp_w0_per_ineq_assembles_block_structure():
-    """For two inequivalent atoms the full multi-band chi is block-structured and its compound pp matrix singular
-    (the La3Ni2O7 crash); the per-ineq driver inverts each atom's block separately, reproduces the direct per-block
-    result, and leaves all cross-atom components zero."""
+    """Per-ineq inversion handles the compound-singular multi-atom chi per block, leaving cross-atom parts zero."""
     beta, niv_pp = 10.0, 3
     config.dmft.n_ineq = 2
     config.dmft.ineq_ordering = [1, 2]
@@ -898,8 +855,7 @@ def test_local_gamma_ud_pp_w0_per_ineq_assembles_block_structure():
 
 
 def test_local_gamma_ud_pp_w0_per_ineq_reuses_repeated_atoms():
-    """Repeated entries in ineq_ordering (the same inequivalent atom at several positions) are computed once and
-    written identically into every position."""
+    """Repeated ineq_ordering entries are computed once and written identically into every position."""
     beta, niv_pp = 10.0, 3
     config.dmft.n_ineq = 1
     config.dmft.ineq_ordering = [1, 1]

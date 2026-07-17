@@ -18,22 +18,24 @@ import dgamore.brillouin_zone as bz
 import dgamore.config as config
 import dgamore.mpi_utils as mpi_utils
 import dgamore.nonlocal_sde as nonlocal_sde
+import dgamore.sde_kernels as sde_kernels
 from dgamore.four_point import FourPoint
 from dgamore.greens_function import GreensFunction
 from dgamore.hamiltonian import Hamiltonian
 from dgamore.interaction import Interaction, LocalInteraction
 from dgamore.local_four_point import LocalFourPoint
+from dgamore.lambda_ops import LambdaAnnealer, StabilizationState
 from dgamore.local_sde import get_local_hartree_fock
 from dgamore.n_point_base import SpinChannel
+from dgamore.mpi_utils import free_shared_window
 from dgamore.nonlocal_sde import (
     _build_giwk_full,
     _cut_and_reshare_giwk,
-    _free_shared_window,
     _init_mu_history,
     _release_shared_giwk,
-    get_hartree_fock,
     perform_ornstein_zernike_fit,
 )
+from dgamore.sde_kernels import get_hartree_fock
 from dgamore.self_energy import SelfEnergy
 from tests.conftest import FAKE_MPI, create_comm_mock, run_parallel
 
@@ -52,8 +54,7 @@ def test_init_mu_history_fresh_uses_current_mu():
 
 
 def test_init_mu_history_from_previous_syncs_global_mu(monkeypatch, tmp_path):
-    """Resuming from a previous run seeds the history with, and syncs the stale global config.sys.mu to, that
-    run's last converged mu."""
+    """Resuming seeds the history with the previous run's last mu and syncs the stale global config.sys.mu to it."""
     config.sys.mu = 0.3
     config.self_consistency.previous_sc_path = str(tmp_path)
     previous_mu = 1.5
@@ -66,13 +67,7 @@ def test_init_mu_history_from_previous_syncs_global_mu(monkeypatch, tmp_path):
 
 
 def test_nonlocal_hartree_fock_matches_local_reference():
-    """
-    The non-local Hartree-Fock term must reduce to the (DMFT-validated) local Hartree-Fock at every k when the
-    non-local interaction vanishes (V=0) and the occupation is k-independent. This covers the same orbital-index
-    convention as the local test (:func:`dgamore.local_sde.get_local_hartree_fock`): the Hartree must pick up the
-    inter-orbital density U' (stored at U_{abab}), not U_{aabb}. Reverting the ``qacbd`` contraction in
-    ``get_hartree_fock`` makes this fail.
-    """
+    """With V=0 and k-independent occupation the non-local Hartree-Fock reduces to the local reference at every k."""
     nb = 2
     nk = (2, 2, 1)
     nq_tot = int(np.prod(nk))
@@ -186,9 +181,9 @@ def test_release_shared_giwk_frees_window_and_communicator():
 
 
 def test_free_shared_window_frees_window_but_keeps_communicator():
-    """_free_shared_window barriers and frees the window but leaves the node communicator alive (reused for the cut)."""
+    """free_shared_window barriers and frees the window but leaves the node communicator alive (reused for the cut)."""
     win, node_comm = MagicMock(), MagicMock()
-    _free_shared_window(win, node_comm)
+    free_shared_window(win, node_comm)
     node_comm.Barrier.assert_called_once()
     win.Free.assert_called_once()
     node_comm.Free.assert_not_called()
@@ -237,15 +232,13 @@ def _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc):
 
 
 def test_assemble_bse_matrix_matches_two_block_expression():
-    """The fused single-block BSE-matrix assembly must be bit-equal to the former add/extend/subtract chain
-    (broadcast gamma fill + diagonal chi0^-1 add + in-place interaction subtract commute elementwise with it)
-    and must leave gamma and gchi0_q_inv untouched."""
+    """The fused single-block BSE assembly is bit-equal to the former add/extend/subtract chain and mutates no input."""
     rng = np.random.default_rng(21)
     gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
     gamma_before, chi0_before = gamma.mat.copy(), gchi0_q_inv.mat.copy()
     ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc)
     u_r = v_nonloc.as_channel(gamma.channel) + u_loc.as_channel(gamma.channel)
-    fused = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
+    fused = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
     assert np.array_equal(fused.mat, ref.mat)
     assert fused.channel == SpinChannel.DENS
     assert not fused.full_niw_range and fused.num_vn_dimensions == 2
@@ -258,36 +251,32 @@ def test_assemble_bse_matrix_accepts_half_niw_gamma():
     rng = np.random.default_rng(22)
     gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
     u_r = v_nonloc.as_channel(gamma.channel) + u_loc.as_channel(gamma.channel)
-    full = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
-    half = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma.copy().to_half_niw_range(), gchi0_q_inv, u_r)
+    full = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
+    half = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma.copy().to_half_niw_range(), gchi0_q_inv, u_r)
     assert np.array_equal(full.mat, half.mat)
 
 
 def test_create_auxiliary_chi_r_q_sum_v1_matches_explicit_reference():
-    """The fused-assembly v1 auxiliary susceptibility must reproduce the explicit two-block expression followed by
-    the fused invert-and-sum, locking the rewired create_auxiliary_chi_r_q_sum_v1 against the pre-fusion result."""
+    """The fused-assembly v1 auxiliary susceptibility reproduces the explicit two-block reference expression."""
     rng = np.random.default_rng(23)
     gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
     ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc).invert_and_sum_over_last_vn(config.sys.beta)
-    out = nonlocal_sde.create_auxiliary_chi_r_q_sum_v1(gamma, gchi0_q_inv, u_loc, v_nonloc)
+    out = sde_kernels.create_auxiliary_chi_r_q_sum_v1(gamma, gchi0_q_inv, u_loc, v_nonloc)
     assert np.allclose(out.mat, ref.mat, atol=1e-10)
     assert out.channel == SpinChannel.DENS
 
 
 def test_create_auxiliary_chi_r_q_matches_explicit_reference():
-    """The fused-assembly full inversion variant must reproduce the explicit two-block expression inverted in
-    compound space, locking the rewired create_auxiliary_chi_r_q (also used by the Eliashberg vertex build)."""
+    """The fused-assembly full inversion reproduces the explicit two-block expression inverted in compound space."""
     rng = np.random.default_rng(24)
     gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
     ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc).invert(False)
-    out = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc, v_nonloc)
+    out = sde_kernels.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc, v_nonloc)
     assert np.allclose(out.mat, ref.mat, atol=1e-10)
 
 
 def test_calculate_kernel_r_q_matches_identity_like_reference():
-    """The self-energy kernel U_r (gamma - gamma U_r chi - 2/3 identity)_magn must equal the explicit expression
-    built with the full identity_like block, locking the in-place orbital-diagonal subtraction (the identity is
-    nonzero at o1 == o4, o2 == o3 for every frequency); the density channel carries no identity term."""
+    """The magnetic kernel with in-place orbital-diagonal subtraction equals the explicit identity_like reference."""
     rng = np.random.default_rng(25)
     o, nqi, nw, niv, beta = 2, 3, 3, 2, 12.5
     config.sys.beta = beta
@@ -326,10 +315,7 @@ def test_calculate_kernel_r_q_matches_identity_like_reference():
 
 
 def test_vrg_right_is_first_frequency_summed_three_leg_vertex():
-    """The right-sided three-leg vertex must equal its definition gamma-tilde^{qv}_{1234} = beta sum_{ab} sum_{v_1}
-    chi*^{q v_1 v}_{12ab} (chi^{qv}_{0;ba34})^{-1}, which the dcba orbital permutation of the last-frequency-summed
-    chi* provides for a time-reversal-symmetric chi* (chi*^{q v v'}_{1234} = chi*^{q v' v}_{4321}); the left vertex
-    gamma^{qv}_{1234} = beta sum_{ab} sum_{v'} (chi^{qv}_{0;12ab})^{-1} chi*^{q v v'}_{ba34} is locked alongside."""
+    """The right three-leg vertex equals its first-frequency-summed definition via dcba under TR symmetry."""
     o, nqi, nw, n2, beta = 2, 3, 3, 4, 12.5
     config.sys.beta = beta
     rng = np.random.default_rng(11)
@@ -351,9 +337,7 @@ def test_vrg_right_is_first_frequency_summed_three_leg_vertex():
 
 
 def test_unused_qloop_sigma_variants_agree(monkeypatch):
-    """The unused q-loop self-energy contraction variants - the plain reference, the Fortran-buffered CPU one, the
-    GPU one (run through a numpy-backed cupy stub) and the auto dispatcher (falling back to the CPU) - produce
-    matching self-energies on synthetic full-BZ kernel and Green's-function data, locking the kept functions."""
+    """The unused q-loop sigma variants (plain, CPU, stubbed GPU, auto) produce matching self-energies."""
     nk, o, niw, niv = (4, 4, 1), 2, 3, 4
     config.lattice.nk = nk
     config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
@@ -377,18 +361,18 @@ def test_unused_qloop_sigma_variants_agree(monkeypatch):
             kernel_mat.copy(), SpinChannel.NONE, nk, 1, 1, full_niw_range=False, has_compressed_q_dimension=True
         )
 
-    sigma_ref = nonlocal_sde.calculate_sigma_from_kernel(make_kernel(), giwk, q_list)
-    sigma_cpu = nonlocal_sde.calculate_sigma_from_kernel_cpu(make_kernel(), giwk, q_list)
+    sigma_ref = sde_kernels.calculate_sigma_from_kernel(make_kernel(), giwk, q_list)
+    sigma_cpu = sde_kernels.calculate_sigma_from_kernel_cpu(make_kernel(), giwk, q_list)
 
     cupy_stub = types.ModuleType("cupy")
     cupy_stub.zeros, cupy_stub.asarray, cupy_stub.arange = np.zeros, np.asarray, np.arange
     cupy_stub.einsum, cupy_stub.asnumpy = np.einsum, lambda x: x
     with monkeypatch.context() as mp:
         mp.setitem(sys.modules, "cupy", cupy_stub)
-        sigma_gpu = nonlocal_sde.calculate_sigma_from_kernel_gpu(make_kernel(), giwk, q_list)
+        sigma_gpu = sde_kernels.calculate_sigma_from_kernel_gpu(make_kernel(), giwk, q_list)
     with monkeypatch.context() as mp:
         mp.setitem(sys.modules, "cupy", None)
-        sigma_auto = nonlocal_sde.calculate_sigma_from_kernel_auto(MagicMock(), make_kernel(), giwk, q_list)
+        sigma_auto = sde_kernels.calculate_sigma_from_kernel_auto(MagicMock(), make_kernel(), giwk, q_list)
 
     assert np.allclose(sigma_cpu.mat, sigma_ref.mat, atol=1e-6)
     assert np.allclose(sigma_gpu.mat, sigma_ref.mat, atol=1e-6)
@@ -408,8 +392,7 @@ def _compound_of(chi, o: int) -> np.ndarray:
 
 
 def test_restrict_chi_phys_floors_negative_inverse_eigenvalues():
-    """A compound block of chi^{qw} with a negative eigenvalue must come back with that eigenvalue replaced by
-    1/floor (the inverse eigenvalue is floored at +floor) while all positive eigenpairs are preserved exactly."""
+    """A negative compound eigenvalue comes back as 1/floor while all positive eigenpairs are preserved exactly."""
     rng = np.random.default_rng(4)
     o, nq, nw, floor = 2, 2, 3, 1e-4
     q_mat = np.linalg.qr(rng.standard_normal((4, 4)) + 1j * rng.standard_normal((4, 4)))[0]
@@ -428,8 +411,7 @@ def test_restrict_chi_phys_floors_negative_inverse_eigenvalues():
 
 
 def test_restrict_chi_phys_leaves_positive_definite_input_unchanged():
-    """A Hermitian positive-definite chi with negative real off-diagonal ENTRIES must pass through unchanged - the
-    eigenvalue floor must not clamp legitimately negative matrix elements like the old elementwise version did."""
+    """A positive-definite chi with negative off-diagonal entries passes through unchanged (no elementwise clamping)."""
     rng = np.random.default_rng(5)
     o, nq, nw = 2, 2, 3
     a = rng.standard_normal((nq, nw, 4, 4)) + 1j * rng.standard_normal((nq, nw, 4, 4))
@@ -442,8 +424,7 @@ def test_restrict_chi_phys_leaves_positive_definite_input_unchanged():
 
 
 def test_restrict_chi_phys_matches_scalar_clamp_for_single_band():
-    """For a single band the compound block is a scalar, so the eigenvalue floor must reproduce the elementwise
-    behavior: negative chi maps to 1/floor, positive chi is unchanged."""
+    """For a single band the eigenvalue floor reduces to the scalar clamp: negative chi maps to 1/floor."""
     floor = 1e-4
     mat = np.array([-0.5, 0.3], dtype=complex).reshape(2, 1, 1, 1, 1, 1)
     chi = FourPoint(mat.copy(), SpinChannel.DENS, (2, 1, 1), 1, 0, False, True, True)
@@ -453,8 +434,7 @@ def test_restrict_chi_phys_matches_scalar_clamp_for_single_band():
 
 
 def test_min_static_compound_eigenvalue_reports_definiteness():
-    """The static (w = 0) compound blocks of a positive-definite chi give a positive minimum eigenvalue, and a
-    single negative eigenvalue planted in one w = 0 block is reported exactly."""
+    """The static compound minimum eigenvalue is positive for definite chi and reports a planted negative exactly."""
     rng = np.random.default_rng(6)
     o, nq, nw = 2, 3, 4
     a = rng.standard_normal((nq, nw, 4, 4)) + 1j * rng.standard_normal((nq, nw, 4, 4))
@@ -466,31 +446,41 @@ def test_min_static_compound_eigenvalue_reports_definiteness():
 
 
 def test_effective_epsilon_is_relaxed_while_restriction_is_active():
-    """The self-energy convergence threshold is 10x epsilon while the susceptibility restriction is active (the
-    restricted phase is only a scaffold for the released phase) and the plain epsilon after the release."""
+    """The convergence threshold is 10x epsilon while the restriction is active and the plain epsilon after release."""
     config.self_consistency.epsilon = 1e-5
-    config.stabilization.use_chi_phys_restriction = True
-    assert np.allclose(nonlocal_sde._effective_epsilon(), 1e-4, atol=1e-18)
-    config.stabilization.use_chi_phys_restriction = False
-    assert np.allclose(nonlocal_sde._effective_epsilon(), 1e-5, atol=1e-18)
+    stab = StabilizationState(chi_phys_restriction_active=True)
+    assert np.allclose(stab.effective_epsilon(), 1e-4, atol=1e-18)
+    stab.chi_phys_restriction_active = False
+    assert np.allclose(stab.effective_epsilon(), 1e-5, atol=1e-18)
 
 
 def test_effective_epsilon_is_relaxed_while_lambda_correction_is_active():
-    """The convergence threshold is 10x epsilon while the per-iteration lambda correction is active (a releasing
-    scaffold, like use_chi_phys_restriction), the plain epsilon once it is disabled, and never relaxed by the
-    one-shot perform_lambda_correction."""
+    """The threshold is 10x epsilon while the per-iteration lambda correction is active and never for the one-shot."""
     config.self_consistency.epsilon = 1e-5
-    config.stabilization.use_chi_phys_restriction = False
-    config.stabilization.use_lambda_correction = True
-    assert np.allclose(nonlocal_sde._effective_epsilon(), 1e-4, atol=1e-18)
-    config.stabilization.use_lambda_correction = False
+    stab = StabilizationState(lambda_correction_active=True)
+    assert np.allclose(stab.effective_epsilon(), 1e-4, atol=1e-18)
+    stab.lambda_correction_active = False
     config.lambda_correction.perform_lambda_correction = True
-    assert np.allclose(nonlocal_sde._effective_epsilon(), 1e-5, atol=1e-18)
+    assert np.allclose(stab.effective_epsilon(), 1e-5, atol=1e-18)
+
+
+def test_stabilization_state_from_config_reads_the_flags_once():
+    """from_config seeds the loop-owned state from the config flags and later state flips leave the config untouched."""
+    config.stabilization.use_chi_phys_restriction = True
+    config.stabilization.use_lambda_correction = False
+    config.stabilization.use_lambda_annealing = True
+    stab = StabilizationState.from_config()
+    assert stab.chi_phys_restriction_active is True
+    assert stab.lambda_correction_active is False
+    assert isinstance(stab.annealer, LambdaAnnealer)
+    stab.chi_phys_restriction_active = False
+    assert config.stabilization.use_chi_phys_restriction is True
+    config.stabilization.use_lambda_annealing = False
+    assert StabilizationState.from_config().annealer is None
 
 
 def test_sde_fft_rspace_greens_function_node_sharing_matches_private_build():
-    """calculate_sigma_from_kernel_fft_cpu with a node communicator routes the R-space Green's function through the
-    node-shared window builder and reproduces the private per-rank build bit-identically."""
+    """The FFT SDE with a node communicator routes G(R) through the shared window and matches the private build."""
     nk, o, niw, niv = (4, 4, 1), 2, 3, 4
     config.lattice.nk = nk
     config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
@@ -517,16 +507,15 @@ def test_sde_fft_rspace_greens_function_node_sharing_matches_private_build():
         )
 
     node_comm = MagicMock(**{"Get_rank.return_value": 0, "Get_size.return_value": 1})
-    sigma_plain = nonlocal_sde.calculate_sigma_from_kernel_fft_cpu(mpi_dist, make_kernel(), giwk, pairs)
-    sigma_shared = nonlocal_sde.calculate_sigma_from_kernel_fft_cpu(
+    sigma_plain = sde_kernels.calculate_sigma_from_kernel_fft_cpu(mpi_dist, make_kernel(), giwk, pairs)
+    sigma_shared = sde_kernels.calculate_sigma_from_kernel_fft_cpu(
         mpi_dist, make_kernel(), giwk, pairs, node_comm=node_comm
     )
     assert np.array_equal(sigma_shared.mat, sigma_plain.mat)
 
 
 def test_load_node_shared_local_vertex_private_path_applies_transform(monkeypatch):
-    """Without a node communicator the helper loads privately, applies the transform and returns win=None, matching
-    the former per-rank load + permute + scale chain."""
+    """Without a node communicator the helper loads privately, applies the transform and returns win=None."""
     rng = np.random.default_rng(81)
     mat = (rng.standard_normal((2, 2, 2, 2, 3, 4, 4)) + 1j * rng.standard_normal((2, 2, 2, 2, 3, 4, 4))).astype(
         np.complex64
@@ -565,7 +554,7 @@ def test_load_node_shared_local_vertex_loads_once_per_node(monkeypatch):
         out, win = nonlocal_sde._load_node_shared_local_vertex(node_comm, "unused.npy", SpinChannel.DENS)
         res = out.mat.copy()
         out.mat = None
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
         return res
 
     _, res = run_parallel(2, fn, hostnames=["n0", "n0"])
@@ -582,8 +571,7 @@ def stab_logger(monkeypatch):
 
 
 def test_mixing_history_cap_uses_most_recent_reset_event():
-    """The history cap counts iterations since the later of the restriction release and the annealing-mass change,
-    and is None while no map-switching event has occurred."""
+    """The history cap counts iterations since the most recent reset event and is None before any event."""
     assert nonlocal_sde._mixing_history_cap(10, None, None) is None
     assert nonlocal_sde._mixing_history_cap(10, 7, None) == 2
     assert nonlocal_sde._mixing_history_cap(10, None, 8) == 1
@@ -650,7 +638,7 @@ def _single_rank_dist():
 
 def _seeded_annealer(mass=0.0, gaps=None, initialized=True):
     """Builds a LambdaAnnealer with a prescribed shared mass and per-channel gaps for the schedule tests."""
-    annealer = nonlocal_sde.LambdaAnnealer()
+    annealer = LambdaAnnealer()
     annealer._initialized = initialized
     annealer._mass = mass
     if gaps:
@@ -719,7 +707,7 @@ def test_annealer_converged_phase_halves_and_snaps_to_zero(stab_logger):
     annealer = _seeded_annealer(mass=0.4, gaps={"dens": 0.01, "magn": 0.02})
     assert annealer.update(converged=True) is True
     assert np.allclose(annealer._mass, 0.2, atol=1e-12)
-    annealer._mass = 1.5 * nonlocal_sde.LambdaAnnealer._LAMBDA_FLOOR
+    annealer._mass = 1.5 * LambdaAnnealer._LAMBDA_FLOOR
     assert annealer.update(converged=True) is True
     assert annealer._mass == 0.0
 
@@ -742,13 +730,13 @@ def test_annealer_mass_capped_at_ceiling_with_warning(stab_logger):
     """The shared mass never exceeds the ceiling; hitting it emits a warning (warm-start advice)."""
     annealer = _seeded_annealer(mass=0.0, gaps={"dens": -1e6, "magn": 0.0})
     assert annealer.update(converged=False) is True
-    assert annealer._mass == nonlocal_sde.LambdaAnnealer._MAX_LAMBDA
+    assert annealer._mass == LambdaAnnealer._MAX_LAMBDA
     assert stab_logger.warning.call_count == 1
 
 
 def test_annealer_active_and_mass_present_flags():
     """active is True while uninitialized or a mass is present; mass_present tracks the shared mass only."""
-    fresh = nonlocal_sde.LambdaAnnealer()
+    fresh = LambdaAnnealer()
     assert fresh.active is True and fresh.mass_present is False
     healthy = _seeded_annealer(mass=0.0)
     assert healthy.active is False and healthy.mass_present is False
@@ -758,15 +746,14 @@ def test_annealer_active_and_mass_present_flags():
 
 def test_effective_epsilon_relaxed_while_annealing_active():
     """The convergence threshold is relaxed tenfold while a mass is present and full once annealed (or off)."""
-    config.self_consistency.epsilon, config.stabilization.use_chi_phys_restriction = 1e-5, False
-    assert np.allclose(nonlocal_sde._effective_epsilon(_seeded_annealer(mass=0.1)), 1e-4, atol=1e-15)
-    assert np.allclose(nonlocal_sde._effective_epsilon(_seeded_annealer(mass=0.0)), 1e-5, atol=1e-15)
-    assert np.allclose(nonlocal_sde._effective_epsilon(None), 1e-5, atol=1e-15)
+    config.self_consistency.epsilon = 1e-5
+    assert np.allclose(StabilizationState(annealer=_seeded_annealer(mass=0.1)).effective_epsilon(), 1e-4, atol=1e-15)
+    assert np.allclose(StabilizationState(annealer=_seeded_annealer(mass=0.0)).effective_epsilon(), 1e-5, atol=1e-15)
+    assert np.allclose(StabilizationState().effective_epsilon(), 1e-5, atol=1e-15)
 
 
 def test_relative_sigma_residual_layout_mismatch_is_normalized():
-    """A decompressed previous iterate against a compressed proposal compares matching momenta (regression:
-    rank 0's iterate is left decompressed by the save path and raw broadcasting paired wrong momenta)."""
+    """A decompressed previous iterate against a compressed proposal compares matching momenta."""
     config.box.niv_core = 3
     rng = np.random.default_rng(4)
     nk = (3, 2, 1)
@@ -787,46 +774,6 @@ def test_relative_sigma_residual_local_old_normalization_is_k_count_independent(
         new_full = 2.0 * np.ones((nk_tot, 1, 1, 10), dtype=np.complex64)
         out = nonlocal_sde._relative_sigma_residual(_make_resid_sigma(new_full), _make_resid_sigma(old_local))
         assert np.allclose(out, 1.0, atol=1e-12)
-
-
-def test_select_and_apply_lambda_correction_dispatch(monkeypatch):
-    """The rank-0 lambda selector dispatches by the band count (single-band scalar vs. multi-orbital matrix
-    correction) for both the one-shot and the per-iteration flag, and returns the susceptibility unchanged when
-    neither is enabled."""
-    sentinel, chi = object(), object()
-    config.lambda_correction.perform_lambda_correction = False
-    config.stabilization.use_lambda_correction = False
-    assert nonlocal_sde._select_and_apply_lambda_correction(chi) is chi
-
-    with monkeypatch.context() as mp:
-        single = MagicMock(return_value=sentinel)
-        mp.setattr(nonlocal_sde.LambdaCorrection, "perform", single)
-        config.stabilization.use_lambda_correction = True
-        config.sys.n_bands = 1
-        assert nonlocal_sde._select_and_apply_lambda_correction(chi) is sentinel
-        single.assert_called_once_with(chi)
-
-    with monkeypatch.context() as mp:
-        multi = MagicMock(return_value=sentinel)
-        mp.setattr(nonlocal_sde.MultiOrbitalLambdaCorrection, "perform", multi)
-        config.sys.n_bands = 2
-        assert nonlocal_sde._select_and_apply_lambda_correction(chi) is sentinel
-        multi.assert_called_once_with(chi)
-
-    config.stabilization.use_lambda_correction = False
-    config.lambda_correction.perform_lambda_correction = True
-    with monkeypatch.context() as mp:
-        single = MagicMock(return_value=sentinel)
-        mp.setattr(nonlocal_sde.LambdaCorrection, "perform", single)
-        config.sys.n_bands = 1
-        assert nonlocal_sde._select_and_apply_lambda_correction(chi) is sentinel
-        single.assert_called_once_with(chi)
-    with monkeypatch.context() as mp:
-        multi = MagicMock(return_value=sentinel)
-        mp.setattr(nonlocal_sde.MultiOrbitalLambdaCorrection, "perform", multi)
-        config.sys.n_bands = 2
-        assert nonlocal_sde._select_and_apply_lambda_correction(chi) is sentinel
-        multi.assert_called_once_with(chi)
 
 
 def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, epsilon=1e-3):
@@ -863,9 +810,9 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
 
     calls = []
 
-    def fake_proposal(sigma_in, *args, annealer=None, **kwargs):
+    def fake_proposal(sigma_in, *args, stab=None, **kwargs):
         calls.append(len(calls) + 1)
-        return proposal_step(sigma_in, len(calls), annealer)
+        return proposal_step(sigma_in, len(calls), stab.annealer if stab is not None else None)
 
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", fake_proposal)
 
@@ -883,10 +830,7 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
 
 
 def test_loop_annealing_runs_pure_phase_after_mass_snaps_to_zero(monkeypatch, tmp_path):
-    """When the annealing mass snaps to zero on a converged phase the loop must not break on that same iteration:
-    the converged verdict belongs to the scaffolded map, so at least one pure (mass-zero) iteration must follow
-    before the run counts as converged. Schedule on the identity map: iteration 1 measures a poled gap (mass arms
-    at 3e-2), iterations 2 and 3 converge and halve the mass to zero, iteration 4 converges the pure map."""
+    """A mass snapping to zero on a converged phase must not break the loop; a pure iteration must follow."""
     seen = {}
 
     def step(sigma_in, n_call, annealer):
@@ -903,8 +847,7 @@ def test_loop_annealing_runs_pure_phase_after_mass_snaps_to_zero(monkeypatch, tm
 
 
 def test_loop_lambda_correction_release_runs_pure_phase_before_finishing(monkeypatch, tmp_path):
-    """The per-iteration lambda-correction scaffold releases on the first relaxed convergence (flag disabled, no
-    break) and the loop then converges the pure map at full epsilon on a later iteration."""
+    """The lambda-correction scaffold releases on the first relaxed convergence and the pure map converges later."""
 
     def step(sigma_in, n_call, annealer):
         return sigma_in.copy()
@@ -914,15 +857,14 @@ def test_loop_lambda_correction_release_runs_pure_phase_before_finishing(monkeyp
     run()
 
     assert len(calls) == 3
-    assert config.stabilization.use_lambda_correction is False
+    assert config.stabilization.use_lambda_correction is True  # release flips only the loop-owned state
     assert any(
         "Self-consistency with the lambda correction reached" in str(c.args[0]) for c in logger.info.call_args_list
     )
 
 
 def test_loop_one_shot_lambda_correction_never_fires_release(monkeypatch, tmp_path):
-    """The one-shot perform_lambda_correction neither relaxes epsilon nor triggers the release branch: the loop
-    converges at full epsilon on the identity map and the flag stays enabled."""
+    """The one-shot correction neither relaxes epsilon nor triggers the release branch; the flag stays enabled."""
 
     def step(sigma_in, n_call, annealer):
         return sigma_in.copy()
@@ -938,7 +880,7 @@ def test_loop_one_shot_lambda_correction_never_fires_release(monkeypatch, tmp_pa
 
 def test_annealer_update_without_measured_gaps_is_inert():
     """update is a no-op (and the scaffold stays uninitialized) while no channel gap has been measured yet."""
-    annealer = nonlocal_sde.LambdaAnnealer()
+    annealer = LambdaAnnealer()
     assert annealer.update(converged=True) is False
     assert annealer.active is True and annealer.mass_present is False
 
@@ -947,25 +889,24 @@ def test_annealer_steady_state_and_ceiling_pin_change_nothing(stab_logger):
     """A healthy unconverged phase keeps the mass untouched and a ceiling-pinned mass reports no change."""
     steady = _seeded_annealer(mass=0.2, gaps={"dens": 0.01, "magn": 0.3})
     assert steady.update(converged=False) is False and steady._mass == 0.2
-    pinned = _seeded_annealer(mass=nonlocal_sde.LambdaAnnealer._MAX_LAMBDA, gaps={"dens": -1e6, "magn": 0.0})
+    pinned = _seeded_annealer(mass=LambdaAnnealer._MAX_LAMBDA, gaps={"dens": -1e6, "magn": 0.0})
     pinned._capped = True
     assert pinned.update(converged=False) is False
-    assert pinned._mass == nonlocal_sde.LambdaAnnealer._MAX_LAMBDA
+    assert pinned._mass == LambdaAnnealer._MAX_LAMBDA
 
 
 def test_annealer_static_gap_uses_omega_zero_slice_in_both_niw_ranges():
-    """The static gap is read from the w=0 slice - index niw for full-range, index 0 for half-range objects - on a
-    frequency-varying susceptibility whose non-static slices carry a much deeper (pole-like) eigenvalue."""
+    """The static gap reads the w=0 slice (index niw full-range, 0 half-range) despite deeper non-static slices."""
     o, nq = 2, 2
     healthy = np.diag([0.7, 1.0, 2.0, 3.0]).astype(np.complex128)
     poled = np.diag([-5.0, 1.0, 2.0, 3.0]).astype(np.complex128)
     comp_full = np.tile(np.linalg.inv(np.stack([poled, healthy, poled])), (nq, 1, 1, 1))
     chi_full = _chi_from_compound(comp_full, o)
     chi_full._full_niw_range = True
-    assert np.allclose(nonlocal_sde.LambdaAnnealer._static_gap(chi_full, _single_rank_dist()), 0.7, atol=1e-5)
+    assert np.allclose(LambdaAnnealer._static_gap(chi_full, _single_rank_dist()), 0.7, atol=1e-5)
     comp_half = np.tile(np.linalg.inv(np.stack([healthy, poled])), (nq, 1, 1, 1))
     chi_half = _chi_from_compound(comp_half, o)
-    assert np.allclose(nonlocal_sde.LambdaAnnealer._static_gap(chi_half, _single_rank_dist()), 0.7, atol=1e-5)
+    assert np.allclose(LambdaAnnealer._static_gap(chi_half, _single_rank_dist()), 0.7, atol=1e-5)
 
 
 def test_annealer_static_gap_reduces_min_across_ranks():
@@ -975,7 +916,7 @@ def test_annealer_static_gap_reduces_min_across_ranks():
         eigs = np.array([0.5, 1.0, 2.0, 3.0]) if rank == 0 else np.array([-0.7, 1.0, 2.0, 3.0])
         comp = np.tile(np.linalg.inv(np.diag(eigs).astype(np.complex128)), (2, 2, 1, 1))
         chi = _chi_from_compound(comp, 2)
-        return nonlocal_sde.LambdaAnnealer._static_gap(chi, SimpleNamespace(comm=comm))
+        return LambdaAnnealer._static_gap(chi, SimpleNamespace(comm=comm))
 
     _, results = run_parallel(2, fn)
     assert np.allclose(results[0], -0.7, atol=1e-5)

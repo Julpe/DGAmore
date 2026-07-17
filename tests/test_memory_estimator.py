@@ -74,8 +74,7 @@ def test_keys_with_eliashberg():
 
 
 def test_every_branch_has_positive_baseline_and_off_transient():
-    """The SDE-section branches carry a positive per-rank baseline, the post-loop Eliashberg branches none (their
-    giwk_dga survives on the bubble rank only and sigma_dga is freed), and every branch has a fast-path transient."""
+    """SDE branches carry a positive per-rank baseline, Eliashberg branches none, and all have a fast-path transient."""
     peaks = _peaks(with_eliashberg=True)
     for key, bp in peaks.items():
         assert isinstance(bp, BranchPeak)
@@ -84,8 +83,7 @@ def test_every_branch_has_positive_baseline_and_off_transient():
 
 
 def test_chi0q_fast_path_is_distributed_on_multi_rank_runs():
-    """The chi0q fast path is column-distributed across the ranks on a multi-rank run and falls back to the
-    rank-0 build (a single-rank transient) only when there is one rank; the lean path is always distributed."""
+    """The chi0q fast path is column-distributed on multi-rank runs and falls back to the rank-0 build on one rank."""
     multi = _peaks()["chi0q"]
     assert multi.off_distributed > 0.0 and multi.off_single == 0.0
     single = _peaks(n_ranks=1)["chi0q"]
@@ -94,8 +92,7 @@ def test_chi0q_fast_path_is_distributed_on_multi_rank_runs():
 
 
 def test_chiq_aux_off_has_distributed_block_and_no_single_rank_gather():
-    """The chiq_aux fast path holds a per-rank two-fermion block; the irr-to-full-BZ map is always the p2p
-    exchange, so no single-rank full-BZ assembly remains."""
+    """The chiq_aux fast path holds a per-rank block; the irr-to-full-BZ map is always the p2p exchange."""
     bp = _peaks()["chiq_aux"]
     assert bp.off_distributed > 0.0  # per-rank two-fermion block
     assert bp.off_single == 0.0
@@ -166,8 +163,7 @@ def test_fq_distributed_block_heavier_than_chiq_aux_block():
 
 
 def test_bubble_baseline_is_giwk_plus_sigma_old_at_niv_cut():
-    """The chi0q baseline equals giwk_full plus sigma_old at the niv_cut window, plus (on a multi-rank run) the two
-    node-shareable R-space Green's functions of the distributed bubble at the niv_full + niw_core window."""
+    """The chi0q baseline is giwk_full plus sigma_old at niv_cut, plus shareable R-space copies on multi-rank runs."""
     two_point = SCALE * 2 * (TINY["nk_tot"] * TINY["n_bands"] ** 2 * (2 * TINY["niv_cut"]))
     g_r_windows = SCALE * 2 * TINY["nk_tot"] * TINY["n_bands"] ** 2 * (2 * (TINY["niv_full"] + TINY["niw_core"]))
     assert estimate_peaks(**TINY)["chi0q"].baseline == pytest.approx(two_point + g_r_windows)
@@ -175,8 +171,7 @@ def test_bubble_baseline_is_giwk_plus_sigma_old_at_niv_cut():
 
 
 def test_sde_section_baseline_uses_post_bubble_windows():
-    """The chiq_aux baseline holds giwk at the niv_core + niw_core window and sigma_old at the core box; the sde
-    baseline additionally holds the R-space Green's-function copy (same size as giwk), which is node-shareable."""
+    """The chiq_aux baseline holds post-bubble windows; the sde baseline adds the node-shareable R-space G copy."""
     nk, nb = TINY["nk_tot"], TINY["n_bands"]
     giwk = nk * nb**2 * 2 * (TINY["niv_core"] + TINY["niw_core"])
     sigma_old = nk * nb**2 * 2 * TINY["niv_core"]
@@ -189,8 +184,7 @@ def test_sde_section_baseline_uses_post_bubble_windows():
 
 
 def test_giwk_shareable_is_the_giwk_part_of_each_sde_section_baseline():
-    """giwk_shareable covers exactly the Green's-function part of the chi0q/chiq_aux/sde baselines (giwk_full plus,
-    for the multi-rank chi0q, the distributed bubble's R-space copy)."""
+    """giwk_shareable covers exactly the Green's-function part of the chi0q, chiq_aux and sde baselines."""
     peaks = _peaks(with_eliashberg=True)
     sigma_old = SCALE * BASE["nk_tot"] * BASE["n_bands"] ** 2 * (2 * BASE["niv_cut"])
     assert peaks["chi0q"].giwk_shareable == pytest.approx(peaks["chi0q"].baseline - sigma_old)
@@ -199,8 +193,7 @@ def test_giwk_shareable_is_the_giwk_part_of_each_sde_section_baseline():
 
 
 def test_eliashberg_branches_are_not_giwk_shareable():
-    """The fq/lanczos branches carry no per-rank baseline (sigma_dga is freed before the Eliashberg step and
-    giwk_dga survives on the bubble rank only, counted in the single-rank slot), so nothing is node-shared there."""
+    """The fq and lanczos branches carry no per-rank baseline, so nothing is node-shared there."""
     peaks = _peaks(with_eliashberg=True)
     giwk_dga = SCALE * BASE["nk_tot"] * BASE["n_bands"] ** 2 * 2 * BASE["niv_cut"]
     for key in ("fq", "lanczos"):
@@ -211,8 +204,7 @@ def test_eliashberg_branches_are_not_giwk_shareable():
 
 
 def test_bubble_baseline_depends_on_niv_cut_not_niv_full():
-    """The single-rank chi0q baseline tracks niv_cut and is independent of niv_full; the multi-rank baseline
-    additionally tracks niv_full through the node-shareable R-space Green's function."""
+    """The single-rank chi0q baseline tracks niv_cut; only the multi-rank R-space copy tracks niv_full."""
     assert _peaks(niv_full=40, n_ranks=1)["chi0q"].baseline == pytest.approx(
         _peaks(niv_full=400, n_ranks=1)["chi0q"].baseline
     )
@@ -240,8 +232,7 @@ def test_chi0q_fast_single_counts_buffer_ifftn_transient_and_g_copies():
 
 
 def test_chi0q_fast_distributed_is_bounded_by_the_result_slice():
-    """The multi-rank chi0q fast peak counts the per-rank irr-BZ result slice plus the bounded sub-chunk group
-    (column buffer + ifftn transient + irr chunk + staging, capped at half a slice)."""
+    """The multi-rank chi0q fast peak counts the per-rank result slice plus the bounded sub-chunk group."""
     nb, wp, vf = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_full"]
     qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
     expected = SCALE * 1.5 * qi * nb**4 * wp * vf
@@ -249,8 +240,7 @@ def test_chi0q_fast_distributed_is_bounded_by_the_result_slice():
 
 
 def test_sde_holds_two_kernels_plus_irr_kernel():
-    """The (single, flag-less) sde FFT path counts the pass kernel blocks and the retained irr-BZ kernel; the
-    R-space G copy lives in the (node-shareable) baseline instead."""
+    """The sde FFT path counts the pass kernels plus the retained irr-BZ kernel; the R copy sits in the baseline."""
     nb, wp, vc = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"]
     qt = -(-TINY["nk_tot"] // TINY["n_ranks"])
     qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
@@ -259,8 +249,7 @@ def test_sde_holds_two_kernels_plus_irr_kernel():
 
 
 def test_sde_off_and_on_slots_are_identical():
-    """The sde step has no save_memory switch (the q-loop variant is unused), so both path slots carry the same
-    two-pass FFT estimate."""
+    """The sde step has no save_memory switch, so both path slots carry the same two-pass FFT estimate."""
     bp = _peaks()["sde"]
     assert bp.on_distributed == pytest.approx(bp.off_distributed)
     assert bp.on_single == pytest.approx(bp.off_single)
@@ -295,8 +284,7 @@ def test_fq_save_fq_gathers_whole_irr_vertex_on_one_rank():
 
 
 def test_lanczos_fast_counts_layout_build_vertices_bubble_and_arpack_basis():
-    """The lanczos fast single-rank peak holds LANCZOS_VERTEX_FACTOR full-BZ vertices (direct + its matmul-layout
-    copy at the build peak; the flipped vertex is never stored), the pp bubble and the ARPACK workspace."""
+    """The lanczos fast peak holds the vertex-factor blocks, the pp bubble and the ARPACK workspace."""
     p = {**TINY, "with_eliashberg": True, "n_ranks": 4}
     nb, vpp = p["n_bands"], 2 * p["niv_pp"]
     vertex = p["nk_tot"] * nb**4 * vpp * vpp
@@ -350,9 +338,7 @@ def test_save_pairing_vertex_sets_the_lean_single_rank_gather():
 
 
 def test_local_step_is_flagless_single_rank_and_band_heavy():
-    """The local branch is verify-only (off == on, no distributed share, no baseline), rank-count-independent and
-    scales with nb^4; its formula counts both channels' outputs, the halved g2 inputs and the chi-tilde shell
-    transient at the niv_full box."""
+    """The local branch is verify-only, rank-count-independent and scales with nb^4 through the shell transient."""
     from dgamore.memory_estimator import LOCAL_SHELL_INVERT_FACTOR
 
     bp = _peaks()["local"]

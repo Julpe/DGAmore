@@ -10,7 +10,6 @@ which both validates correctness and locks the behavior of the memory-optimized 
 """
 
 import numpy as np
-import pytest
 
 import dgamore.config as config
 from dgamore import brillouin_zone as bz
@@ -202,9 +201,7 @@ def _fft_bubble_reference(g, niw, niv, q_grid, beta):
 
 
 def test_fft_bubble_distributed_matches_single_rank(monkeypatch):
-    """The R-scattered multi-rank FFT bubble (pointwise R product, distributed pencil ifft via the conjugation
-    trick, row exchange onto the irr-BZ distribution) must reproduce the single-rank rank-0 path on a grid with a
-    non-trivial irreducible wedge."""
+    """The distributed multi-rank FFT bubble reproduces the single-rank path on a grid with a non-trivial wedge."""
     import dgamore.mpi_utils as mpi_utils
     from dgamore.mpi_utils import MpiDistributor
     from tests.conftest import FAKE_MPI, run_parallel
@@ -226,8 +223,7 @@ def test_fft_bubble_distributed_matches_single_rank(monkeypatch):
 
 
 def test_fft_bubble_distributed_with_node_shared_greens_function(monkeypatch):
-    """With a node communicator the distributed bubble builds the R-space Green's function once per node in a
-    shared window and still reproduces the single-rank reference (two fake nodes exercise the window path)."""
+    """With a node communicator the distributed bubble builds G(R) once per node in a shared window and matches."""
     import dgamore.mpi_utils as mpi_utils
     from dgamore.mpi_utils import MpiDistributor
     from tests.conftest import FAKE_MPI, run_parallel
@@ -249,8 +245,7 @@ def test_fft_bubble_distributed_with_node_shared_greens_function(monkeypatch):
 
 
 def test_fft_bubble_distributed_with_fewer_columns_than_ranks(monkeypatch):
-    """With fewer (w, v) columns than ranks the surplus ranks compute nothing but still receive their irr-BZ
-    q-slice through the ring exchange, and the assembled bubble matches the single-rank reference."""
+    """With fewer (w, v) columns than ranks the surplus ranks still receive their irr-BZ slice of the bubble."""
     import dgamore.mpi_utils as mpi_utils
     from dgamore.mpi_utils import MpiDistributor
     from tests.conftest import FAKE_MPI, run_parallel

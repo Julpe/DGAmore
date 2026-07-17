@@ -532,9 +532,7 @@ def test_symmetrize_single_orbital_is_noop_and_returns_self():
 
 @pytest.mark.parametrize("orbitals", [[1], [1, 2], [1, 3], [1, 2, 3], [1, 2, 3, 4]])
 def test_symmetrize_multiple_orbital_sets(orbitals):
-    """_symmetrize_orbitals enforces the expected degeneracies on four-orbital-axis tensors: the fully diagonal
-    [i,i,i,i], the pair patterns [i,i,j,j], [i,j,j,i] and [i,j,i,j], and all 3-1 permutations [i,j,j,j] must each
-    collapse onto a single value within the symmetrized set."""
+    """_symmetrize_orbitals collapses the diagonal, pair and 3-1 patterns of a symmetrized set onto single values."""
     nb = 4
     mat = np.random.rand(nb, nb, nb, nb)
 
@@ -605,9 +603,7 @@ def test_symmetrize_multiple_orbital_sets(orbitals):
     "orbital_groups", [[[1, 2], [3, 4]], [[1, 2, 3], [4]], [[1, 3], [2, 4]], [[1, 2, 3, 4]], [[1], [2], [3], [4]]]
 )
 def test_symmetrize_multiple_groups(orbital_groups):
-    """_symmetrize_orbitals symmetrizes within each group without coupling different groups: per group the fully
-    diagonal, [i,i,j,j], [i,j,j,i], [i,j,i,j] and 3-1 permutation patterns collapse onto one value each, while
-    representatives of two distinct groups must not be forced equal."""
+    """_symmetrize_orbitals symmetrizes within each group without coupling distinct groups."""
     nb = 4
     mat = np.random.rand(nb, nb, nb, nb)
 
@@ -686,8 +682,7 @@ def test_symmetrize_multiple_groups(orbital_groups):
 
 
 def test_orbital_symmetrization_patterns():
-    """_symmetrize_orbitals equalizes the diagonal entries and the pair patterns [i,i,j,j] and [i,j,j,i] over the
-    (1-based) symmetrized orbital set."""
+    """_symmetrize_orbitals equalizes the diagonal and pair patterns over the 1-based symmetrized orbital set."""
     mat = np.random.rand(3, 3, 3, 3)
     obj = LocalNPoint(mat.copy(), 4, 0, 0)
 
@@ -720,8 +715,7 @@ def test_symmetrize_raises_for_orbitals_out_of_range_negative_and_large():
 
 @pytest.mark.parametrize("orbitals", [[1], [1, 2], [1, 3], [1, 2, 3], [1, 2, 3, 4]])
 def test_symmetrize_two_orbital_axes_single_set(orbitals):
-    """_symmetrize_orbitals enforces degeneracies on two-orbital-axis tensors: the diagonal elements and the
-    off-diagonal elements of the symmetrized set each collapse onto a single value."""
+    """Two-orbital-axis tensors collapse the symmetrized set's diagonal and off-diagonal entries onto single values."""
     nb = 4
     mat = np.random.rand(nb, nb)
 
@@ -757,8 +751,7 @@ def test_symmetrize_two_orbital_axes_single_set(orbitals):
     "orbital_groups", [[[1, 2], [3, 4]], [[1, 2, 3], [4]], [[1, 3], [2, 4]], [[1, 2, 3, 4]], [[1], [2], [3], [4]]]
 )
 def test_symmetrize_two_orbital_axes_multiple_groups(orbital_groups):
-    """_symmetrize_orbitals symmetrizes within each group on two-orbital-axis tensors - per group the diagonal
-    and off-diagonal degeneracies hold - without forcing equality between distinct groups."""
+    """Two-orbital-axis grouping symmetrizes within each group without forcing equality between distinct groups."""
     nb = 4
     mat = np.random.rand(nb, nb)
 
@@ -943,8 +936,7 @@ def test_take_vn_diagonal_is_writeable_and_releases_parent():
 
 @pytest.mark.parametrize("num_vn", [0, 1, 2])
 def test_to_negative_niw_range_twice_returns_original(num_vn):
-    """to_negative_niw_range is its own inverse and leaves self unchanged: it always returns a new object,
-    preserves the niw+1 half-range entries (w=0 included) and applying it twice recovers the original values."""
+    """to_negative_niw_range is its own inverse and always returns a new object with half-range entries preserved."""
     nb, niw, niv = 2, 3, 2
     shape = (nb, nb, niw + 1) + (2 * niv,) * num_vn
     mat = np.random.rand(*shape) + 1j * np.random.rand(*shape)
@@ -977,8 +969,7 @@ def test_to_negative_niw_range_raises_without_bosonic_dimension():
 
 @pytest.mark.parametrize("num_vn", [0, 1])
 def test_to_negative_niw_range_matches_full_niw_range_negative_block(num_vn):
-    """to_negative_niw_range matches the full object's negative bosonic block: index k of the negative block
-    (w = -k) must equal the symmetry-consistent full-range object's slot at index niw - k, for k = 1..niw."""
+    """Index k of the negative block (w = -k) equals the full-range object's slot at index niw - k for k = 1..niw."""
     nb, niw, niv = 2, 3, 2
     shape = (nb, nb, niw + 1) + (2 * niv,) * num_vn
     mat = np.random.rand(*shape) + 1j * np.random.rand(*shape)

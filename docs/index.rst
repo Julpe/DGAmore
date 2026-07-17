@@ -48,8 +48,10 @@ together with the :mod:`~dgamore.interaction` tensors, build on this foundation 
 momentum bookkeeping for the rest of the code.
 
 The local vertices and the local self-energy are assembled in :mod:`~dgamore.local_sde`, the bare bubble in
-:mod:`~dgamore.bubble_gen`, and the momentum-dependent ladder self-energy in :mod:`~dgamore.nonlocal_sde`, with an
-optional Moriya correction in :mod:`~dgamore.lambda_ops`. Pairing properties are obtained in
+:mod:`~dgamore.bubble_gen`, and the momentum-dependent ladder self-energy in :mod:`~dgamore.nonlocal_sde` - the
+self-consistency driver that orchestrates the numerical kernels of :mod:`~dgamore.sde_kernels`, the self-energy
+mixing schemes of :mod:`~dgamore.mixing` and an optional Moriya correction in :mod:`~dgamore.lambda_ops`, with the
+file names handed between the pipeline stages defined once in :mod:`~dgamore.output_files`. Pairing properties are obtained in
 :mod:`~dgamore.eliashberg_solver`, and an optional continuation to real frequencies is provided by
 :mod:`~dgamore.max_ent`. The remaining modules support the computation: :mod:`~dgamore.matsubara_frequencies`
 handles frequency-index arithmetic, :mod:`~dgamore.mpi_utils` manages the parallel work distribution (message

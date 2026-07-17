@@ -4,13 +4,16 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 """
-Global configuration singleton. This module holds the process-wide mutable state of a DGAmore run as module-level
+Global configuration singleton. This module holds the process-wide state of a DGAmore run as module-level
 instances of the ``*Config`` classes (``box``, ``lattice``, ``sys``, ``dmft``, ``eliashberg``,
 ``lambda_correction``, ``self_consistency``, ``stabilization``, ``self_energy_interpolation``, ``output``,
 ``memory``, ``ana_cont``, and the ``logger``). :class:`ConfigParser` populates these from a YAML file on rank 0, after which they are
 broadcast to all MPI ranks; most modules read their parameters directly off this module rather than receiving them
-as arguments, so mutating a field changes behavior everywhere. Each ``*Config`` class documents its fields; the
-example YAML config is ``dgamore/dga_config.yaml``.
+as arguments. Once the configuration is fully resolved (parse, broadcast, memory autodetect, option exclusivity,
+local SDE), the driver calls :func:`freeze` and every section except the runtime-state ``sys`` becomes read-only:
+the compute stages never mutate configuration mid-run, and state the self-consistency loop owns lives in dedicated
+objects (e.g. :class:`~dgamore.lambda_ops.StabilizationState`) instead of config fields. Each ``*Config`` class
+documents its fields; the example YAML config is ``dgamore/dga_config.yaml``.
 """
 
 import numpy as np
@@ -20,7 +23,48 @@ from dgamore.dga_logger import DgaLogger
 from dgamore.hamiltonian import Hamiltonian
 
 
-class InteractionConfig:
+class ConfigSection:
+    """
+    Base class of the ``*Config`` sections: adds an immutability latch. After :meth:`freeze`, any attribute
+    assignment on the section (and, recursively, on nested sections) raises, so configuration cannot be mutated
+    mid-run; :meth:`unfreeze` lifts the latch. Sections start out writable, and re-instantiating one always yields
+    a writable object.
+    """
+
+    _frozen: bool = False
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if self._frozen:
+            raise AttributeError(
+                f"The configuration section {type(self).__name__} is frozen - configuration must not be mutated "
+                "after setup. Keep loop-owned runtime state in a dedicated object instead."
+            )
+        object.__setattr__(self, name, value)
+
+    def freeze(self) -> None:
+        """
+        Makes every subsequent attribute assignment on this section (and on nested sections) raise.
+
+        :return: None.
+        """
+        object.__setattr__(self, "_frozen", True)
+        for value in vars(self).values():
+            if isinstance(value, ConfigSection):
+                value.freeze()
+
+    def unfreeze(self) -> None:
+        """
+        Lifts the immutability latch of this section (and of nested sections).
+
+        :return: None.
+        """
+        object.__setattr__(self, "_frozen", False)
+        for value in vars(self).values():
+            if isinstance(value, ConfigSection):
+                value.unfreeze()
+
+
+class InteractionConfig(ConfigSection):
     r"""
     Stores the interaction parameters. Currently only ``udd``, ``vdd``, ``jdd`` are used (local and Kanamori-type
     interactions); the remaining parameters are reserved for future use.
@@ -50,7 +94,7 @@ class InteractionConfig:
         self.vpp: float = 0.0
 
 
-class BoxConfig:
+class BoxConfig(ConfigSection):
     r"""
     Stores the Matsubara frequency box sizes. The main quantities live in the core region; explicit asymptotics
     correct it with shell-region quantities. The full region is the sum of core and shell and exists for convenience.
@@ -70,7 +114,7 @@ class BoxConfig:
         self.niv_dmft: int = 0
 
 
-class LatticeConfig:
+class LatticeConfig(ConfigSection):
     """
     Stores the lattice parameters: the symmetries, lattice type, input Hamiltonian and input interaction. The
     momentum grid is built from the number of k-points and the lattice symmetries and is shared by the k- and
@@ -102,7 +146,7 @@ class LatticeConfig:
         self.k_grid: bz.KGrid = bz.KGrid(self.nk, self.symmetries)
 
 
-class SelfConsistencyConfig:
+class SelfConsistencyConfig(ConfigSection):
     r"""
     Stores the self-consistency-loop parameters: the maximum iteration count, the convergence criterion, the mixing
     parameter/scheme and continuation options. If ``previous_sc_path`` is set, the loop resumes from a previous run.
@@ -128,11 +172,13 @@ class SelfConsistencyConfig:
         self.use_interpolated_sigma: bool = False
 
 
-class StabilizationConfig:
+class StabilizationConfig(ConfigSection):
     r"""
     Stores the convergence-stabilization options of the self-consistency loop. The susceptibility-reshaping options
     (the per-iteration lambda correction, ``use_chi_phys_restriction`` and ``use_lambda_annealing``) are mutually
-    exclusive.
+    exclusive. These flags are read once at loop entry into the loop-owned
+    :class:`~dgamore.lambda_ops.StabilizationState` (the section is frozen during the run); the scaffold releases
+    flip only that state, never the config.
 
     :ivar bool use_lambda_correction: Whether the self-consistency loop applies the Moriya lambda correction to the
         physical susceptibility in every iteration, dispatched by the band count: single-band input uses the scalar
@@ -148,7 +194,7 @@ class StabilizationConfig:
         a single shared bosonic mass :math:`\lambda` (measured from the worst channel's static susceptibility
         gap, never user-chosen) is added to the inverse physical susceptibility of every channel, damped toward its
         target and annealed to exactly zero between converged phases - the final result is always pure self-consistency (the schedule and
-        state live in :class:`~dgamore.nonlocal_sde.LambdaAnnealer`, owned by the loop). Multi-orbital-safe,
+        state live in :class:`~dgamore.lambda_ops.LambdaAnnealer`, owned by the loop). Multi-orbital-safe,
         unlike the sum-rule lambda correction.
     """
 
@@ -158,7 +204,7 @@ class StabilizationConfig:
         self.use_lambda_annealing: bool = False
 
 
-class EliashbergConfig:
+class EliashbergConfig(ConfigSection):
     """
     Stores the Eliashberg-step configuration: whether to run it, power-iteration settings, and saving options for the
     pairing/full vertex in pp notation.
@@ -188,7 +234,7 @@ class EliashbergConfig:
         self.subfolder_name: str = "Eliashberg"
 
 
-class LambdaCorrectionConfig:
+class LambdaCorrectionConfig(ConfigSection):
     """
     Stores the one-shot lambda-correction configuration. Enabling ``perform_lambda_correction`` runs a one-shot DGA
     with lambda correction: it overrides ``self_consistency.max_iter`` to 1 and ``self_consistency.mixing`` to 1.0
@@ -205,7 +251,7 @@ class LambdaCorrectionConfig:
         self.type: str = "spch"
 
 
-class DmftConfig:
+class DmftConfig(ConfigSection):
     r"""
     Stores the DMFT input-file parameters: the input path, the 1- and 2-particle data filenames, symmetrization
     options and the inequivalent-atom structure.
@@ -231,7 +277,7 @@ class DmftConfig:
         self.n_bands_per_ineq = []
 
 
-class SystemConfig:
+class SystemConfig(ConfigSection):
     r"""
     Stores the physical system parameters and derived quantities updated during the run.
 
@@ -258,7 +304,7 @@ class SystemConfig:
         self.occ_dmft_per_ineq: list[np.ndarray] = []
 
 
-class SelfEnergyInterpolationConfig:
+class SelfEnergyInterpolationConfig(ConfigSection):
     r"""
     Stores the self-energy interpolation parameters (re-gridding to a different temperature/frequency box).
 
@@ -273,7 +319,7 @@ class SelfEnergyInterpolationConfig:
         self.niv_target: int = 10
 
 
-class OutputConfig:
+class OutputConfig(ConfigSection):
     """
     Stores the output paths.
 
@@ -292,7 +338,7 @@ class OutputConfig:
         self.eliashberg_path: str = "./Eliashberg/"
 
 
-class MemoryConfig:
+class MemoryConfig(ConfigSection):
     """
     Stores the speed-vs-memory trade-off switches. Each flag, when True, selects a slower but more memory-lean code
     path for the corresponding quantity.
@@ -315,7 +361,7 @@ class MemoryConfig:
         self.use_shared_memory_common_obj: bool = True
 
 
-class AnaContConfig:
+class AnaContConfig(ConfigSection):
     """
     Stores the analytic-continuation (maximum-entropy) configuration.
 
@@ -354,3 +400,48 @@ stabilization: StabilizationConfig = StabilizationConfig()
 eliashberg: EliashbergConfig = EliashbergConfig()
 memory: MemoryConfig = MemoryConfig()
 ana_cont: AnaContConfig = AnaContConfig()
+
+
+def freeze() -> None:
+    """
+    Freezes every configuration section except the runtime-state ``sys`` section (and the logger), making any
+    later attribute assignment on them raise. Called by the driver once the configuration is fully resolved
+    (parse, broadcast, memory autodetect, option exclusivity, local SDE); ``sys`` stays writable because the
+    self-consistency loop updates the chemical potential and the occupation there by design.
+
+    :return: None.
+    """
+    for section in _frozen_sections():
+        section.freeze()
+
+
+def unfreeze() -> None:
+    """
+    Lifts the immutability latch from every section that :func:`freeze` froze.
+
+    :return: None.
+    """
+    for section in _frozen_sections():
+        section.unfreeze()
+
+
+def _frozen_sections() -> list[ConfigSection]:
+    """
+    Returns the sections covered by :func:`freeze`/:func:`unfreeze`: every section singleton currently bound on
+    the module except the runtime-state ``sys`` section.
+
+    :return: The list of sections to (un)freeze.
+    """
+    return [
+        box,
+        lattice,
+        lambda_correction,
+        dmft,
+        output,
+        self_energy_interpolation,
+        self_consistency,
+        stabilization,
+        eliashberg,
+        memory,
+        ana_cont,
+    ]

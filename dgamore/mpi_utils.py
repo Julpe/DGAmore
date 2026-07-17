@@ -27,6 +27,7 @@ chunked path.
 import gc
 import os
 import pickle
+from collections.abc import Callable, Iterator
 
 import h5py
 import mpi4py.MPI as MPI
@@ -37,14 +38,16 @@ import dgamore.config as config
 from dgamore import symmetry_reduction
 from dgamore.brillouin_zone import KGrid
 from dgamore.four_point import FourPoint
-from dgamore.n_point_base import DTYPE
+from dgamore.n_point_base import DTYPE, IHaveMat
 
 # Canonical 2 GB MPI per-message limit. The chunking helpers below take it as an explicit ``limit`` argument so the
 # established test hook of monkeypatching ``mpi_utils.MAX_MPI_BYTES`` to force the chunked path keeps working.
 MAX_MPI_BYTES = 2**31 - 1
 
 
-def build_node_shared_array(node_comm, compute_fn, dtype=DTYPE):
+def build_node_shared_array(
+    node_comm: MPI.Comm, compute_fn: Callable[[], np.ndarray], dtype: np.dtype | type = DTYPE
+) -> "tuple[np.ndarray, MPI.Win | None]":
     r"""
     Build an array once per node and expose it to every rank on that node through a single MPI shared-memory window,
     so a large replicated quantity (e.g. the full-grid Green's function ``giwk_full``) is stored **once per node
@@ -81,6 +84,23 @@ def build_node_shared_array(node_comm, compute_fn, dtype=DTYPE):
     return shared, win
 
 
+def free_shared_window(win: "MPI.Win | None", node_comm: "MPI.Comm | None") -> None:
+    r"""
+    Frees an MPI shared-memory window allocated by :func:`build_node_shared_array` while keeping its node
+    communicator alive (the communicator may back further windows and is released separately by its owner). A
+    barrier guarantees no rank is still reading the window's buffer when it is freed. A no-op when there is no
+    window or no node communicator (the private per-rank / single-rank-node path).
+
+    :param win: The MPI shared-memory window (or ``None``).
+    :param node_comm: The node-local communicator (or ``None``).
+    :return: None.
+    """
+    if node_comm is None or win is None:
+        return
+    node_comm.Barrier()
+    win.Free()
+
+
 # ====================================================================================================================
 # Message-chunking primitives (split a transfer's leading axis below the 2 GB MPI per-message limit).
 def _items_per_row(shape: tuple) -> int:
@@ -106,7 +126,7 @@ def chunk_step(itemsize: int, items_per_row: int, limit: int = MAX_MPI_BYTES) ->
     return max(1, limit // (itemsize * max(1, items_per_row)))
 
 
-def row_chunks(n_rows: int, itemsize: int, items_per_row: int, limit: int = MAX_MPI_BYTES):
+def row_chunks(n_rows: int, itemsize: int, items_per_row: int, limit: int = MAX_MPI_BYTES) -> Iterator[tuple[int, int]]:
     """
     Yields ``(start, stop)`` row-index pairs splitting ``n_rows`` leading-axis rows into sub-``limit``-byte chunks.
 
@@ -121,7 +141,7 @@ def row_chunks(n_rows: int, itemsize: int, items_per_row: int, limit: int = MAX_
         yield i, min(n_rows, i + step)
 
 
-def send_rows(comm, arr: np.ndarray, dest: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> None:
+def send_rows(comm: MPI.Comm, arr: np.ndarray, dest: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> None:
     """
     Sends ``arr`` to ``dest`` in sub-``limit``-byte chunks along axis 0 (``tag = base_tag + chunk_index``).
 
@@ -137,7 +157,9 @@ def send_rows(comm, arr: np.ndarray, dest: int, base_tag: int = 0, limit: int = 
         comm.Send(arr[i:j], dest=dest, tag=base_tag + idx)
 
 
-def recv_rows_into(comm, buf: np.ndarray, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> np.ndarray:
+def recv_rows_into(
+    comm: MPI.Comm, buf: np.ndarray, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES
+) -> np.ndarray:
     """
     Receives rows from ``source`` **directly into** the contiguous buffer ``buf`` (no per-chunk staging buffer). The
     buffer's axis-0 slices must be contiguous (e.g. ``buf`` is C-contiguous or an axis-0 view of such an array).
@@ -155,7 +177,7 @@ def recv_rows_into(comm, buf: np.ndarray, source: int, base_tag: int = 0, limit:
 
 
 def recv_rows_alloc(
-    comm, shape: tuple, dtype, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES
+    comm: MPI.Comm, shape: tuple, dtype: np.dtype | type, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES
 ) -> np.ndarray:
     """
     Allocates an array of the given shape/dtype and receives into it (see :func:`recv_rows_into`).
@@ -171,7 +193,7 @@ def recv_rows_alloc(
     return recv_rows_into(comm, np.empty(shape, dtype=dtype), source, base_tag=base_tag, limit=limit)
 
 
-def _isend_rows(comm, arr: np.ndarray, dest: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> list:
+def _isend_rows(comm: MPI.Comm, arr: np.ndarray, dest: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> list:
     """
     Non-blocking counterpart of :func:`send_rows`: posts one ``Isend`` per sub-``limit``-byte axis-0 chunk
     (``tag = base_tag + chunk_index``) and returns the request list for a later ``Waitall``, so transfers to
@@ -196,7 +218,9 @@ def _isend_rows(comm, arr: np.ndarray, dest: int, base_tag: int = 0, limit: int 
     return reqs
 
 
-def _irecv_rows_into(comm, buf: np.ndarray, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> list:
+def _irecv_rows_into(
+    comm: MPI.Comm, buf: np.ndarray, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES
+) -> list:
     """
     Non-blocking counterpart of :func:`recv_rows_into`: posts one ``Irecv`` per sub-``limit``-byte axis-0 chunk
     **directly into** the contiguous buffer ``buf`` (no per-chunk staging) and returns the request list for a later
@@ -215,7 +239,7 @@ def _irecv_rows_into(comm, buf: np.ndarray, source: int, base_tag: int = 0, limi
     return reqs
 
 
-def bcast_rows(comm, arr: np.ndarray, root: int, limit: int = MAX_MPI_BYTES) -> np.ndarray:
+def bcast_rows(comm: MPI.Comm, arr: np.ndarray, root: int, limit: int = MAX_MPI_BYTES) -> np.ndarray:
     """
     Broadcasts a numpy array from ``root`` to all ranks, chunked along axis 0. Non-root ranks allocate the receive
     buffer from the broadcast shape/dtype.
@@ -239,7 +263,7 @@ def bcast_rows(comm, arr: np.ndarray, root: int, limit: int = MAX_MPI_BYTES) -> 
     return arr
 
 
-def bcast_rows_into(comm, view: np.ndarray, root: int, limit: int = MAX_MPI_BYTES) -> np.ndarray:
+def bcast_rows_into(comm: MPI.Comm, view: np.ndarray, root: int, limit: int = MAX_MPI_BYTES) -> np.ndarray:
     """
     Broadcasts **into** an existing contiguous buffer view, chunked along axis 0. This is a collective call: every
     rank must pass the matching view (same shape/dtype). Used to fill one rank's slice of an all-gather target.
@@ -255,7 +279,7 @@ def bcast_rows_into(comm, view: np.ndarray, root: int, limit: int = MAX_MPI_BYTE
     return view
 
 
-def send_bytes(comm, data: bytes, dest: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> None:
+def send_bytes(comm: MPI.Comm, data: bytes, dest: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> None:
     """
     Sends a raw byte blob to ``dest`` in sub-``limit``-byte chunks, preceded by a small length message (at
     ``base_tag``); the chunks use ``base_tag + 1 + chunk_index``.
@@ -274,7 +298,7 @@ def send_bytes(comm, data: bytes, dest: int, base_tag: int = 0, limit: int = MAX
         comm.Send(arr[i:j], dest=dest, tag=base_tag + 1 + idx)
 
 
-def recv_bytes(comm, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> bytes:
+def recv_bytes(comm: MPI.Comm, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> bytes:
     """
     Receives a chunked raw byte blob sent by :func:`send_bytes`.
 
@@ -444,7 +468,7 @@ class MpiDistributor:
         """
         return self._my_slice
 
-    def open_file(self):
+    def open_file(self) -> None:
         """
         Opens this rank's hdf5 file for read/write. Silently does nothing if the file is missing.
 
@@ -455,7 +479,7 @@ class MpiDistributor:
         except (OSError, AttributeError):
             pass
 
-    def close_file(self):
+    def close_file(self) -> None:
         """
         Closes this rank's hdf5 file. Silently does nothing if it is not open.
 
@@ -466,7 +490,7 @@ class MpiDistributor:
         except (OSError, AttributeError):
             pass
 
-    def delete_file(self):
+    def delete_file(self) -> None:
         """
         Deletes this rank's hdf5 spill file. Silently does nothing if it does not exist.
 
@@ -477,7 +501,7 @@ class MpiDistributor:
         except (OSError, AttributeError):
             pass
 
-    def barrier(self):
+    def barrier(self) -> None:
         """
         Synchronizes all ranks. Forces a garbage collection first so that all ranks free their memory before the
         barrier.
@@ -562,7 +586,7 @@ class MpiDistributor:
 
         return tot_result
 
-    def scatter(self, full_data: np.ndarray = None, root: int = 0):
+    def scatter(self, full_data: np.ndarray = None, root: int = 0) -> np.ndarray:
         """
         Scatters the full array (held on ``root``) along axis 0 into the per-rank task slices. Handles the 2 GB MPI
         limit by chunking. The single-rank case where ``full_data`` already has the rank-local length is passed
@@ -624,7 +648,7 @@ class MpiDistributor:
 
         return rank_data
 
-    def send_to_rank(self, obj, dest: int, base_tag: int = 0):
+    def send_to_rank(self, obj: IHaveMat, dest: int, base_tag: int = 0) -> None:
         """
         Sends an N-point-like object to a single rank. The large ``.mat`` array is sent as raw chunks (to avoid
         holding a full pickle blob in memory), while the rest of the object is pickled into a small metadata blob.
@@ -650,7 +674,7 @@ class MpiDistributor:
         self.comm.send({"shape": mat.shape, "dtype": mat.dtype}, dest=dest, tag=base_tag + 500)
         send_rows(self.comm, mat, dest=dest, base_tag=base_tag + 501, limit=MAX_MPI_BYTES)
 
-    def recv_from_rank(self, source: int, base_tag: int = 0):
+    def recv_from_rank(self, source: int, base_tag: int = 0) -> IHaveMat:
         """
         Receives an object sent by :meth:`send_to_rank`: reconstructs the pickled metadata object and reattaches the
         chunk-received ``.mat`` array.
@@ -669,7 +693,7 @@ class MpiDistributor:
         )
         return obj
 
-    def bcast(self, data, root=0):
+    def bcast(self, data: object, root: int = 0) -> object:
         """
         Broadcasts an arbitrary (picklable) object from ``root`` to all ranks.
 
@@ -690,7 +714,7 @@ class MpiDistributor:
         """
         return bcast_rows(self.comm, arr, root, limit=MAX_MPI_BYTES)
 
-    def bcast_npoint(self, obj, root: int = 0):
+    def bcast_npoint(self, obj: IHaveMat, root: int = 0) -> IHaveMat:
         """
         Broadcasts an N-point-like object (one exposing a ``.mat`` numpy array) from ``root`` to all ranks. The large
         ``.mat`` is broadcast as raw sub-2 GB chunks (so there is no multi-gigabyte pickle blob and no >2 GB message),
@@ -721,7 +745,7 @@ class MpiDistributor:
         obj.mat = bcast_rows(self.comm, None, root, limit=MAX_MPI_BYTES)
         return obj
 
-    def allreduce(self, rank_result=None) -> np.ndarray:
+    def allreduce(self, rank_result: np.ndarray = None) -> np.ndarray:
         """
         Sums an array element-wise across all ranks in place and returns the result on every rank, chunked along axis 0
         so no single message exceeds the 2 GB MPI limit (consistent with the rest of the module).
@@ -756,7 +780,7 @@ class MpiDistributor:
             comm = MPI.COMM_WORLD
         return MpiDistributor(ntasks=ntasks, comm=comm, name=name, output_path=output_path)
 
-    def restricted_to(self, sub_comm, member_ranks: list) -> "MpiDistributor":
+    def restricted_to(self, sub_comm: MPI.Comm, member_ranks: list) -> "MpiDistributor":
         """
         Returns a new distributor over ``sub_comm`` carrying only ``member_ranks``' task slices of this
         distributor, in the given order, which must match the sub-communicator's rank order (e.g. from a
@@ -774,7 +798,7 @@ class MpiDistributor:
         restricted._my_slice = restricted._slices[restricted.my_rank]
         return restricted
 
-    def _distribute_tasks(self):
+    def _distribute_tasks(self) -> None:
         """
         Computes the per-rank chunk sizes and slices, distributing the tasks as evenly as possible (excess tasks go to
         the highest ranks), and records this rank's own size and slice.
@@ -796,7 +820,7 @@ class MpiDistributor:
 
 # ====================================================================================================================
 # Higher-level data-movement routines (irreducible-BZ <-> full-BZ remap, node-aware frequency split, distributed FFT).
-def _get_node_aware_v_dist(n_nu, comm):
+def _get_node_aware_v_dist(n_nu: int, comm: MPI.Comm) -> tuple[list[int], list[slice]]:
     """
     Calculates frequency distribution based on physical node topology.
     Frequencies are split equally among nodes, then assigned to ranks within those nodes.
@@ -868,7 +892,7 @@ def _get_node_aware_v_dist(n_nu, comm):
     return all_sizes, all_slices
 
 
-def _send_in_chunks(comm, arr, dest, base_tag=0):
+def _send_in_chunks(comm: MPI.Comm, arr: np.ndarray, dest: int, base_tag: int = 0) -> None:
     """
     Sends a numpy array to a destination rank in below-2 GB chunks along axis 0 (no handshake). Thin wrapper around
     :func:`send_rows`, passing this module's ``MAX_MPI_BYTES`` (read at call time so the test hook of monkeypatching
@@ -883,7 +907,7 @@ def _send_in_chunks(comm, arr, dest, base_tag=0):
     send_rows(comm, arr, dest, base_tag=base_tag, limit=MAX_MPI_BYTES)
 
 
-def _recv_in_chunks(comm, shape, dtype, source, base_tag=0):
+def _recv_in_chunks(comm: MPI.Comm, shape: tuple, dtype: np.dtype | type, source: int, base_tag: int = 0) -> np.ndarray:
     """
     Receives a numpy array from a source rank in below-2 GB chunks along axis 0 into a freshly allocated buffer. Thin
     wrapper around :func:`recv_rows_alloc` (see :func:`_send_in_chunks` for the ``MAX_MPI_BYTES`` handling).
@@ -898,7 +922,7 @@ def _recv_in_chunks(comm, shape, dtype, source, base_tag=0):
     return recv_rows_alloc(comm, shape, dtype, source, base_tag=base_tag, limit=MAX_MPI_BYTES)
 
 
-def map_irrbz_fullbz(obj, mpi_dist_irrk, mpi_dist_fullbz):
+def map_irrbz_fullbz(obj: FourPoint, mpi_dist_irrk: "MpiDistributor", mpi_dist_fullbz: "MpiDistributor") -> FourPoint:
     """
     Maps an object from the irreducible-BZ rank distribution to the full-BZ distribution the simple way: gather to
     rank 0, unfold to the full BZ there, then scatter back. Requires rank 0 to hold the full-BZ object transiently.
@@ -1253,7 +1277,7 @@ def get_pencil_indices(rank: int, size: int, nq: tuple[int, int, int], layout: s
         raise ValueError(f"Unknown layout: {layout}")
 
 
-def _redistribute_p2p(mat, nq, comm, source_layout, target_layout):
+def _redistribute_p2p(mat: np.ndarray, nq: tuple, comm: MPI.Comm, source_layout: str, target_layout: str) -> np.ndarray:
     """
     Peer-to-peer redistributes the rows of ``mat`` (indexed by flattened q) from one pencil/flat layout to another,
     exchanging only the rows each rank pair shares (in below-2 GB byte chunks).

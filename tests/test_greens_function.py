@@ -266,8 +266,7 @@ def test_update_mu_forwards_newton_tolerance(monkeypatch):
 
 
 def test_model_epot_chunked_matches_unchunked_reference(monkeypatch):
-    """_model_epot evaluated with a tiny chunk budget (forcing many frequency chunks) equals the single-pass
-    reference formula - the analytic 1/v^2 tail must not change when the [k, band, v] temporaries are bounded."""
+    """_model_epot with a tiny chunk budget equals the single-pass reference: chunking must not change the tail."""
     import dgamore.greens_function as gf_module
     from dgamore.matsubara_frequencies import MFHelper
 

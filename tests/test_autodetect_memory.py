@@ -85,8 +85,7 @@ def test_large_memory_keeps_all_flags_off(fake_system):
 
 
 def test_tiny_memory_forces_lean_flags_on(fake_system):
-    """A budget below chiq_aux's fast-path node total forces its lean flag on without overflowing the node (the
-    budget floor is the flag-less local step, which must always fit)."""
+    """A budget below chiq_aux's fast-path node total forces its lean flag on without overflowing the node."""
     off = _node_total("chiq_aux", "off", r=1)
     max_on = max(_all_node_totals("on", r=1, with_eliashberg=False))
     budget = max(0.5 * (max_on + off), 1.01 * _node_total("local", "off", r=1))
@@ -104,8 +103,7 @@ def test_user_true_is_preserved_as_floor(fake_system):
 
 
 def test_chi0q_single_rank_peak_fits_under_node_total(fake_system):
-    """chi0q's single-rank transient peak stays off against the node total while the heavier chiq_aux branch is
-    forced on (the budget floor is the flag-less sde step, which must always fit)."""
+    """chi0q's single-rank transient peak stays off against the node total while the heavier chiq_aux is forced on."""
     chi0q_off = _node_total("chi0q", "off", r=1)
     chiq_aux_off = _node_total("chiq_aux", "off", r=1)
     floor = max(chi0q_off, _node_total("sde", "off", r=1), _node_total("local", "off", r=1))
@@ -191,11 +189,7 @@ def test_memory_config_shares_giwk_by_default():
 
 
 def test_shared_giwk_credits_the_bubble_branch_node_total(fake_system, monkeypatch):
-    """use_shared_memory_common_obj subtracts the deduplicated giwk copies from the chi0q (bubble) node total, so the fast
-    FFT bubble fits at a budget where the replicated estimate would force the lean path on. fake_system(1) only
-    installs the fixture config (the real budget is injected below); chi0q fast is a single-rank transient and the
-    binding branch, its lean path is tiny, and the budget sits between the credited (giwk r->1) node total and the
-    uncredited replicated one."""
+    """The shared-giwk credit lets the fast bubble fit where the replicated estimate would force the lean path on."""
     fake_system(1)
     r = 4
     giwk_half = 1024.0**2
@@ -230,10 +224,7 @@ def test_shared_giwk_credits_the_bubble_branch_node_total(fake_system, monkeypat
 
 
 def test_shared_giwk_credits_a_non_bubble_sde_branch(fake_system, monkeypatch):
-    """The giwk credit applies to every SDE-section branch, not just the bubble: the heavy chiq_aux fast path fits
-    with sharing where the replicated estimate would force it onto the lean per-q path. chiq_aux fast is the
-    binding (distributed) branch, its lean path is trivially small, and the budget sits between the credited
-    (giwk r->1) node total and the uncredited one."""
+    """The giwk credit applies to every SDE-section branch: chiq_aux fast fits only with sharing."""
     fake_system(1)
     r = 4
     giwk_half = 1024.0**2
@@ -268,10 +259,7 @@ def test_shared_giwk_credits_a_non_bubble_sde_branch(fake_system, monkeypatch):
 
 
 def test_eliashberg_branch_baseline_gets_no_giwk_credit(fake_system, monkeypatch):
-    """A branch with giwk_shareable == 0 (the eliashberg ones run on the private per-rank giwk_dga) is not
-    credited: at a budget between the credited chi0q fast total and the fq fast total, chi0q stays off (the
-    uncredited chi0q total would also overflow, so it staying off shows the credit was applied) while the
-    uncredited fq baseline + transient overflows and forces the lean path on."""
+    """A branch with giwk_shareable == 0 gets no credit: fq overflows and its lean flag is forced on."""
     fake_system(1)
     r = 4
     baseline = 2.0 * 1024.0**2
@@ -296,8 +284,7 @@ def test_eliashberg_branch_baseline_gets_no_giwk_credit(fake_system, monkeypatch
 
 
 def test_heavier_lean_path_does_not_raise_when_fast_fits(fake_system, monkeypatch):
-    """A branch whose lean path peaks higher than its fast one must not raise as long as the fast path fits and the
-    user did not force the lean flag."""
+    """A lean path peaking above the fast one must not raise while the fast path fits and the flag is not forced."""
     fake_system(1)
     small, big = 1024.0**2, 100 * 1024.0**2
     peaks = {"chiq_aux": _mock_branch(baseline=small, off_distributed=small, on_distributed=big)}
@@ -323,8 +310,7 @@ def test_user_forced_lean_path_that_overflows_raises(fake_system, monkeypatch):
 
 
 def test_flagless_sde_step_is_verified_and_raises_on_overflow(fake_system, monkeypatch):
-    """The switch-less Schwinger-Dyson FFT contraction is still budget-checked: it passes silently when it fits and
-    raises a MemoryError naming the step when it overflows the node."""
+    """The flag-less SDE FFT step is budget-checked: silent when it fits, MemoryError naming the step on overflow."""
     fake_system(1)
     small, big = 1024.0**2, 100 * 1024.0**2
     peaks = {"sde": _mock_branch(baseline=small, off_distributed=big, on_distributed=big)}
@@ -339,8 +325,7 @@ def test_flagless_sde_step_is_verified_and_raises_on_overflow(fake_system, monke
 
 
 def test_lanczos_single_rank_peak_doubled_on_single_node_multi_rank(fake_system, monkeypatch):
-    """On a single-node multi-rank job the singlet and triplet solves run concurrently on the same node, so the
-    lanczos fast-path single-rank peak is doubled; spread over two nodes each carries only one solver."""
+    """On a single-node multi-rank job the concurrent singlet and triplet solves double the lanczos single-rank peak."""
     fake_system(1)
     single = 10 * 1024.0**2
     peaks = {"lanczos": _mock_branch(baseline=1.0, off_single=single, on_distributed=1.0)}
@@ -363,16 +348,14 @@ def test_lanczos_single_rank_peak_doubled_on_single_node_multi_rank(fake_system,
 
 
 def test_dgamore_excludes_osc_ucx_before_mpi_init():
-    """DGAmore defaults OMPI_MCA_osc to '^ucx' before importing mpi4py, muting the benign osc/ucx shared-window warning
-    with no user configuration; the ordering (set before MPI_Init) is what makes it take effect."""
+    """DGAmore defaults OMPI_MCA_osc to '^ucx' before the mpi4py import, so it takes effect before MPI_Init."""
     src = open(dgamore_main.__file__, encoding="utf-8").read()
     assert 'os.environ.setdefault("OMPI_MCA_osc", "^ucx")' in src
     assert src.index('os.environ.setdefault("OMPI_MCA_osc", "^ucx")') < src.index("from mpi4py import MPI")
 
 
 def test_local_step_overflow_raises_before_the_flag_loop(fake_system, monkeypatch):
-    """A budget below the flag-less local single peak raises MemoryError naming the local Schwinger-Dyson step
-    (a large shell box makes the rank-0 local step the dominant requirement)."""
+    """A budget below the flag-less local single peak raises MemoryError naming the local Schwinger-Dyson step."""
     monkeypatch.setattr(config.box, "niv_full", 100)
     params = {**FIXTURE_PARAMS, "niv_full": 100, "niv_cut": 50}  # niv_cut = min(10 + 100 + 10, niv_dmft=50)
     peaks = estimate_peaks(**params, n_ranks=1, with_eliashberg=False)
