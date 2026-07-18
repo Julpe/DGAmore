@@ -497,32 +497,50 @@ def main():
         # sigma_dga is already saved to disk and never consumed by the Eliashberg step - drop the replicated
         # full-grid copy on every rank before the memory-heavy vertex construction
         sigma_dga.free()
-        lambdas_sing, lambdas_trip, gaps_sing, gaps_trip = eliashberg_solver.solve(
-            giwk_dga, g_dmft_full, u_loc, v_nonloc, comm
-        )
+        results = eliashberg_solver.solve(giwk_dga, g_dmft_full, u_loc, v_nonloc, comm)
+
+        def gap_stem(channel, parity):
+            base = f"gap_{channel.value}"
+            return base if parity == "none" else f"{base}_{parity}"
+
+        def readable_label(channel, parity):
+            name = {"sing": "singlet", "trip": "triplet"}.get(channel.value, channel.value)
+            return name if parity == "none" else f"{name} {parity}"
 
         if comm.rank == 0:
-            np.savetxt(
-                os.path.join(config.output.eliashberg_path, "eigenvalues.txt"),
-                [lambdas_sing.real, lambdas_trip.real],
-                delimiter=",",
-                fmt="%.9f",
-            )
+            with open(os.path.join(config.output.eliashberg_path, "eigenvalues.txt"), "w") as eig_file:
+                for (channel, parity), (lambdas, _gaps) in results.items():
+                    eig_file.write(
+                        f"{readable_label(channel, parity)}: "
+                        + ",".join(f"{lam:.9f}" for lam in np.asarray(lambdas).real)
+                        + "\n"
+                    )
 
-            for i in range(len(gaps_sing)):
-                gaps_sing[i].save(name=f"gap_sing_{i+1}", output_dir=config.output.eliashberg_path)
-                gaps_trip[i].save(name=f"gap_trip_{i+1}", output_dir=config.output.eliashberg_path)
+            # one line per saved gap: the wave-symmetry label (s/d/p + frequency parity +/-) followed by the measured
+            # T/P/O/PO parity Rayleigh quotients (<Delta, X Delta>/<Delta, Delta>)
+            with open(os.path.join(config.output.eliashberg_path, "gap_parity.txt"), "w") as parity_file:
+                for (channel, parity), (_lambdas, gaps) in results.items():
+                    for i, gap in enumerate(gaps):
+                        label = eliashberg_solver.classify_gap_symmetry(gap.mat)
+                        diagnostics = eliashberg_solver.gap_parity_diagnostics(gap.mat.flatten(), gap.mat.shape)
+                        parity_file.write(
+                            f"{label} {readable_label(channel, parity)} {i+1}: "
+                            + ", ".join(f"{key}={diagnostics[key].real:+.3f}" for key in ("T", "P", "O", "PO"))
+                            + "\n"
+                        )
+
+            for (channel, parity), (_lambdas, gaps) in results.items():
+                for i, gap in enumerate(gaps):
+                    gap.save(name=f"{gap_stem(channel, parity)}_{i+1}", output_dir=config.output.eliashberg_path)
             logger.info("Saved singlet and triplet gap functions to files.")
 
         if config.output.do_plotting and comm.rank == 0:
             kx, ky = config.lattice.k_grid.kx_shift_closed, config.lattice.k_grid.ky_shift_closed
-            for i in range(len(gaps_sing)):
-                plotting.plot_gap_function(
-                    gaps_sing[i], kx, ky, name=f"gap_sing_{i+1}", output_dir=config.output.eliashberg_path
-                )
-                plotting.plot_gap_function(
-                    gaps_trip[i], kx, ky, name=f"gap_trip_{i+1}", output_dir=config.output.eliashberg_path
-                )
+            for (channel, parity), (_lambdas, gaps) in results.items():
+                for i, gap in enumerate(gaps):
+                    plotting.plot_gap_function(
+                        gap, kx, ky, name=f"{gap_stem(channel, parity)}_{i+1}", output_dir=config.output.eliashberg_path
+                    )
             logger.info("Plotted singlet and triplet gap functions.")
 
     logger.info("Exiting ...")

@@ -650,6 +650,122 @@ def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
     return gap0
 
 
+# --- Physical-gap symmetry sectors (frequency parity + forced momentum/orbital parity) ---
+def _frequency_parity_sectors(resolve_frequency_parity: bool) -> list[tuple[str, int | None]]:
+    r"""
+    Returns the list of gap sectors to solve, each a ``(label, eps_T)`` pair where ``eps_T`` is the requested
+    T-parity (:math:`+1` even, :math:`-1` odd) or ``None`` for the unprojected case. When ``resolve_frequency_parity``
+    is set, the frequency-even and frequency-odd sectors are both returned; otherwise the single unprojected sector
+    is returned. The paired momentum/orbital parity is fixed by the Pauli constraint ``eps_{P.O} = sign * eps_T``
+    inside the solver, so it is not carried here.
+
+    :param resolve_frequency_parity: Whether to split the gap into the frequency-even and frequency-odd sectors.
+    :return: The ``[(label, eps_T), ...]`` sector list.
+    """
+    return [("even", 1), ("odd", -1)] if resolve_frequency_parity else [("none", None)]
+
+
+def _project_gap_to_sector(vec: np.ndarray, gap_shape: tuple, eps_t: int, eps_po: int) -> np.ndarray:
+    r"""
+    Projects a flattened gap onto a physical symmetry sector by applying the two commuting Hermitian projectors
+    :math:`\tfrac{1}{2}(1 + \varepsilon_T T)` and :math:`\tfrac{1}{2}(1 + \varepsilon_{PO}\, P O)` in turn, where the
+    three involutions act on the orbital gap :math:`\Delta_{12}^{\nu}(k)` as
+    :math:`(T\Delta)_{12}^{\nu}(k) = \Delta_{12}^{-\nu}(k)` (fermionic-frequency flip),
+    :math:`(P\Delta)_{12}^{\nu}(k) = \Delta_{12}^{\nu}(-k)` (momentum flip) and
+    :math:`(O\Delta)_{12}^{\nu}(k) = \Delta_{21}^{\nu}(k)` (orbital transpose), realized by the same array operations
+    the pairing-kernel matvec uses. The Pauli antisymmetry :math:`\hat{S}\,P\,O\,T\,\Delta = -\Delta` with the spin
+    exchange :math:`\hat{S}` a scalar in the singlet/triplet basis fixes :math:`P\,O\,T\,\Delta = \mathrm{sign}\,\Delta`
+    (``sign`` the channel sign), so once the frequency parity :math:`\varepsilon_T` is chosen the combined
+    momentum-orbital parity is forced to :math:`\varepsilon_{PO} = \mathrm{sign}\cdot\varepsilon_T`; only the product
+    :math:`P\,O` is fixed, never :math:`P` and :math:`O` separately.
+
+    :param vec: The flattened gap vector.
+    :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
+    :param eps_t: The requested T-parity, :math:`+1` (even) or :math:`-1` (odd).
+    :param eps_po: The forced combined ``P.O`` parity, :math:`\mathrm{sign}\cdot\varepsilon_T`.
+    :return: The projected flattened gap vector (dtype preserved).
+    """
+    g = vec.reshape(gap_shape)
+    g = 0.5 * (g + eps_t * np.flip(g, axis=-1))
+    g = 0.5 * (g + eps_po * np.roll(np.flip(g.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2)))
+    return g.reshape(-1).astype(vec.dtype, copy=False)
+
+
+def gap_parity_diagnostics(gap: np.ndarray, gap_shape: tuple) -> dict[str, complex]:
+    r"""
+    Reports the parity Rayleigh quotients :math:`\langle \Delta, X \Delta \rangle / \langle \Delta, \Delta \rangle`
+    of a flattened gap for the involutions ``T`` (frequency flip), ``P`` (momentum flip), ``O`` (orbital transpose)
+    and their product ``P.O``. A pure-parity gap returns :math:`\pm 1` for the involutions it is an eigenvector of;
+    the values certify the parity of a returned gap and expose any leakage.
+
+    :param gap: The flattened gap vector.
+    :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
+    :return: A dict mapping ``"T"``, ``"P"``, ``"O"``, ``"PO"`` to the corresponding Rayleigh quotient.
+    """
+    g = gap.reshape(gap_shape)
+    ops = {
+        "T": np.flip(g, axis=-1),
+        "P": np.roll(np.flip(g, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2)),
+        "O": g.swapaxes(3, 4),
+        "PO": np.roll(np.flip(g.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2)),
+    }
+    denom = np.vdot(g, g)
+    if denom == 0:
+        return {name: 0j for name in ops}
+    return {name: complex(np.vdot(g, op) / denom) for name, op in ops.items()}
+
+
+def classify_gap_symmetry(gap: np.ndarray) -> str:
+    r"""
+    Classifies the dominant momentum wave symmetry and Matsubara-frequency parity of a gap and returns a compact
+    label of the form ``<wave><parity>``. The wave letter is ``s``, ``d`` or ``p`` (``x`` if none of these match),
+    and the parity sign is ``+`` (even in :math:`\nu`), ``-`` (odd) or empty (neither). The frequency parity is the
+    sign of the global T Rayleigh quotient :math:`\langle \Delta, T\Delta \rangle / \langle \Delta, \Delta \rangle`
+    (with :math:`T` the fermionic-frequency flip), so it is consistent with the parity diagnostics and robust for
+    multi-orbital gaps. The wave symmetry is read from the orbital-diagonal ``o1 = o2 = 0``, ``kz = 0`` block at the
+    first positive Matsubara frequency under the lattice inversions (:math:`k_x \to -k_x`, :math:`k_y \to -k_y`, the
+    full :math:`k \to -k`, realized with the ``np.roll(np.flip(...), 1)`` convention for the Gamma-at-index-0 grid)
+    and the :math:`k_x \leftrightarrow k_y` exchange: ``s`` is even under both axis inversions and symmetric under
+    exchange, ``d`` is even under both axis inversions and antisymmetric under exchange, and ``p`` is odd under the
+    full inversion.
+
+    :param gap: The gap array in the ``[kx, ky, kz, o1, o2, v]`` layout.
+    :return: The ``<wave><parity>`` label, ``"unknown"`` for an all-zero gap, or ``x<parity>`` when the wave cannot
+        be determined from the orbital-diagonal block.
+    """
+    atol = 1e-3
+    denom = np.vdot(gap, gap)
+    if denom == 0:
+        return "unknown"
+    t = (np.vdot(gap, np.flip(gap, axis=-1)) / denom).real
+    freq_label = "+" if t > 0.5 else ("-" if t < -0.5 else "")
+
+    d_plus = gap[
+        ..., 0, 0, 0, gap.shape[-1] // 2
+    ].real  # [kx, ky]: orbital-diagonal (0, 0) block at kz = 0, nu = +pi/beta
+    scale = np.max(np.abs(d_plus))
+    if scale == 0:
+        return f"x{freq_label}"
+    d_plus = d_plus / scale
+    inv_x = np.roll(np.flip(d_plus, axis=0), shift=1, axis=0)
+    inv_y = np.roll(np.flip(d_plus, axis=1), shift=1, axis=1)
+    inv_full = np.roll(np.flip(d_plus, axis=(0, 1)), shift=(1, 1), axis=(0, 1))
+    even_x = np.allclose(d_plus, inv_x, atol=atol, rtol=0)
+    even_y = np.allclose(d_plus, inv_y, atol=atol, rtol=0)
+    odd_full = np.allclose(d_plus, -inv_full, atol=atol, rtol=0)
+    square = d_plus.shape[0] == d_plus.shape[1]
+    xy_sym = square and np.allclose(d_plus, d_plus.T, atol=atol, rtol=0)
+    xy_anti = square and np.allclose(d_plus, -d_plus.T, atol=atol, rtol=0)
+
+    if even_x and even_y and xy_sym:
+        return f"s{freq_label}"
+    if even_x and even_y and xy_anti:
+        return f"d{freq_label}"
+    if odd_full:
+        return f"p{freq_label}"
+    return f"x{freq_label}"
+
+
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
 @lru_cache(maxsize=1)
 def _openblas_thread_slot_cap() -> int | None:
@@ -917,20 +1033,111 @@ def _apply_gamma_pp(
     return out[..., 0].reshape(nqx, nqy, nqz, n_bands, n_bands, nv)
 
 
+def _solve_pairing_sectors(
+    mv, gap_shape: tuple, sign: int, channel: SpinChannel, nq: tuple, executor, ranks, base_seed: np.ndarray
+) -> dict[str, tuple[np.ndarray, list[GapFunction]]]:
+    r"""
+    Runs the ARPACK/Lanczos solve of the pairing kernel ``mv`` once per physical frequency-parity sector selected by
+    ``config.eliashberg.resolve_frequency_parity`` and returns the leading ``n_eig`` eigenpairs of each. Every projected
+    sector wraps the matvec and the seed in the Hermitian sector projector :math:`\Pi` (T-parity ``eps_T`` and the
+    Pauli-forced combined parity ``eps_PO = sign * eps_T``); the ``"none"`` sector runs the raw kernel unchanged. The
+    passed ``executor`` (the momentum-batch thread pool, or ``None``) is shut down before returning.
+
+    :param mv: The flattened pairing-kernel matvec (maps a full-length gap vector to a full-length gap vector).
+    :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
+    :param sign: The channel sign (:math:`+1` singlet, :math:`-1` triplet).
+    :param channel: The pairing channel (used to label outputs).
+    :param nq: The momentum-grid shape carried onto each :class:`GapFunction`.
+    :param executor: The momentum-batch thread pool (or ``None``); shut down on return.
+    :param ranks: The ranks tuple used for logging.
+    :param base_seed: The flattened initial gap seed, identical on every rank (broadcast beforehand for the
+        frequency-distributed solve); projected into each sector, with a deterministic random fallback when the
+        projection of the seed collapses (a seed whose parity is orthogonal to the requested sector).
+    :return: ``{parity_label: (lambdas, [GapFunction, ...])}`` for each solved sector.
+    """
+    logger = config.logger
+    n_eig = config.eliashberg.n_eig
+    plural = "" if n_eig == 1 else "s"
+    shape_flat = int(np.prod(gap_shape))
+
+    def sector_matvec(eps_t: int | None, eps_po: int | None):
+        if eps_t is None:
+            return mv
+        return lambda gap: _project_gap_to_sector(
+            mv(_project_gap_to_sector(gap, gap_shape, eps_t, eps_po)), gap_shape, eps_t, eps_po
+        )
+
+    def sector_seed(eps_t: int | None, eps_po: int | None) -> np.ndarray:
+        if eps_t is None:
+            return base_seed
+        seed = _project_gap_to_sector(base_seed, gap_shape, eps_t, eps_po)
+        if np.linalg.norm(seed) >= 1e-10 * max(np.linalg.norm(base_seed), 1e-30):
+            return seed
+        # the seed's parity is orthogonal to this sector; reseed deterministically so every rank agrees
+        rng = np.random.default_rng(0)
+        fallback = (rng.standard_normal(gap_shape) + 1j * rng.standard_normal(gap_shape)).flatten()
+        fallback = _project_gap_to_sector(fallback, gap_shape, eps_t, eps_po)
+        # a sector empty on this grid (e.g. every k equals -k) leaves nothing to project onto: fall back to the
+        # nonzero base seed so the eigensolver gets a valid deterministic start (the projected operator returns ~0)
+        return fallback if np.linalg.norm(fallback) > 0 else base_seed
+
+    results: dict[str, tuple[np.ndarray, list[GapFunction]]] = {}
+    try:
+        for parity, eps_t in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity):
+            eps_po = None if eps_t is None else sign * eps_t
+            label = f"{channel.value}let/{parity}"
+            logger.info(f"Starting Lanczos method for the {label} sector.", allowed_ranks=ranks)
+            mat = sp.sparse.linalg.LinearOperator(shape=(shape_flat, shape_flat), matvec=sector_matvec(eps_t, eps_po))
+            # BLAS is pinned to one thread for the solve (threadpool_limits resizes the live pool; an environment
+            # change would be ignored) so the momentum-batch threads never nest BLAS threads underneath.
+            with threadpool_limits(limits=1 if executor is not None else None):
+                lambdas, gaps = sp.sparse.linalg.eigsh(
+                    mat,
+                    k=n_eig,
+                    tol=config.eliashberg.epsilon,
+                    v0=sector_seed(eps_t, eps_po),
+                    which="LA",
+                    maxiter=10000,
+                )
+            order = lambdas.argsort()[::-1]  # sort eigenvalues in descending order
+            lambdas = lambdas[order]
+            gaps = gaps[:, order]
+            if config.eliashberg.symmetrize_degenerate_gaps:
+                gaps = symmetrize_degenerate_gaps(lambdas, gaps, gap_shape)
+            logger.info(
+                f"Largest eigenvalue{plural} for the {label} sector: " + ", ".join(f"{lam:.6f}" for lam in lambdas),
+                allowed_ranks=ranks,
+            )
+            gap_list = [GapFunction(gaps[:, i].reshape(gap_shape), channel, nq) for i in range(n_eig)]
+            results[parity] = (lambdas, gap_list)
+    finally:
+        if executor is not None:
+            executor.shutdown()
+
+    logger.info(f"Finished solving the Eliashberg equation for the {channel.value}let channel.", allowed_ranks=ranks)
+    return results
+
+
 def solve_eliashberg_lanczos(
     gamma_r_pp: FourPoint, gchi0_q0_pp: FourPoint, ranks: tuple[int, int]
-) -> tuple[list[float], list[GapFunction]]:
+) -> dict[str, tuple[np.ndarray, list[GapFunction]]]:
     r"""
     Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using
     an ARPACK/Lanczos eigensolver, with the pairing kernel applied matrix-free via FFTs over the BZ. This in-memory
     variant holds the full-BZ pairing vertex on the solving rank. The passed pairing vertex is **consumed** (mapped
     to the full BZ and Fourier transformed in place, then freed once its matmul-layout copy is built).
 
+    When ``config.eliashberg.resolve_frequency_parity`` is set, the matvec and the starting vector are, for each
+    physical frequency-parity sector, sandwiched in the sector projector :math:`\Pi` (see
+    :func:`_project_gap_to_sector`), so the eigensolver returns the leading eigenpairs of :math:`\Pi M \Pi` restricted
+    to that sector; otherwise the raw kernel :math:`M` is run unchanged.
+
     :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (irreducible BZ, pp notation) for one channel;
         consumed by the solve.
     :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{pp}` at :math:`\omega = 0`.
     :param ranks: The ``(rank_sing, rank_trip)`` pair used for logging.
-    :return: A tuple ``(lambdas, gaps)`` of the leading eigenvalues and the corresponding :class:`GapFunction` objects.
+    :return: A dict ``{parity_label: (lambdas, gaps)}`` of the leading eigenvalues and :class:`GapFunction` objects
+        per physical frequency-parity sector (a single ``"none"`` key when no projection is requested).
     """
     logger = config.logger
 
@@ -947,7 +1154,6 @@ def solve_eliashberg_lanczos(
     gap_shape = gamma_r_pp.nq + 2 * (gamma_r_pp.n_bands,) + (2 * gamma_r_pp.niv,)
     gchi0_q0_pp = gchi0_q0_pp.decompress_q_dimension()
 
-    gap0 = get_initial_gap_function(gap_shape, gamma_r_pp.channel)
     symmetry_label = config.eliashberg.symmetry.lower() if config.eliashberg.symmetry else "random"
     logger.info(
         f"Initialized the gap function as {symmetry_label} for the {gamma_r_pp.channel.value}let channel.",
@@ -994,58 +1200,8 @@ def solve_eliashberg_lanczos(
         gap_new *= norm
         return gap_new.flatten()
 
-    mat = sp.sparse.linalg.LinearOperator(shape=(np.prod(gap_shape), np.prod(gap_shape)), matvec=mv)
-
-    n_eig = config.eliashberg.n_eig
-    eig_label = "" if n_eig > 1 else f" {n_eig}"
-    plural = "" if n_eig == 1 else "s"
-    logger.info(
-        f"Starting Lanczos method to retrieve largest{eig_label} eigenvalue{plural} and eigenvector{plural} "
-        f"for the {gamma_r_pp.channel.value}let channel.",
-        allowed_ranks=ranks,
-    )
-
-    # BLAS is pinned to one thread for the solve (threadpool_limits resizes the live pool; an environment change
-    # would be ignored) so the momentum-batch threads never nest BLAS threads underneath.
-    try:
-        with threadpool_limits(limits=1 if executor is not None else None):
-            lambdas, gaps = sp.sparse.linalg.eigsh(
-                mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0.flatten(), which="LA", maxiter=10000
-            )
-    finally:
-        if executor is not None:
-            executor.shutdown()
-
-    logger.info(
-        f"Finished Lanczos method for the largest{eig_label} eigenvalue{plural} and eigenvector{plural} "
-        f"for the {gamma_r_pp.channel.value}let channel.",
-        allowed_ranks=ranks,
-    )
-
-    order = lambdas.argsort()[::-1]  # sort eigenvalues in descending order
-    lambdas = lambdas[order]
-    gaps = gaps[:, order]
-
-    if config.eliashberg.symmetrize_degenerate_gaps:
-        gaps = symmetrize_degenerate_gaps(lambdas, gaps, gap_shape)
-
-    logger.info(
-        f"Largest{eig_label} eigenvalue{plural} for the {gamma_r_pp.channel.value}let "
-        f"channel {"is" if n_eig == 1 else "are"}: " + ", ".join(f"{lam:.6f}" for lam in lambdas),
-        allowed_ranks=ranks,
-    )
-
-    gaps = [
-        GapFunction(gaps[..., i].reshape(gap_shape), gamma_r_pp.channel, gamma_r_pp.nq)
-        for i in range(config.eliashberg.n_eig)
-    ]
-
-    logger.info(
-        f"Finished solving the Eliashberg equation for the {gamma_r_pp.channel.value}let channel.",
-        allowed_ranks=ranks,
-    )
-
-    return lambdas, gaps
+    base_seed = get_initial_gap_function(gap_shape, gamma_r_pp.channel).flatten()
+    return _solve_pairing_sectors(mv, gap_shape, sign, gamma_r_pp.channel, gamma_r_pp.nq, executor, ranks, base_seed)
 
 
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
@@ -1055,13 +1211,18 @@ def solve_eliashberg_lanczos_v2(
     mpi_dist_v: MpiDistributor,
     active_ranks: list,
     n_threads: int = 1,
-) -> tuple[list[float], list[GapFunction]]:
+) -> dict[str, tuple[np.ndarray, list[GapFunction]]]:
     r"""
     Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using
     an ARPACK/Lanczos eigensolver. This variant distributes the gap function along the fermionic frequency axis across
     ranks (and performs the :math:`\chi_0^{pp}` multiplication only on the root rank), so it is more memory-efficient
     but slower than :func:`solve_eliashberg_lanczos`. The passed pairing vertex is **consumed** (Fourier transformed
     in place, then freed once its matmul-layout copy is built).
+
+    The physical frequency-parity sectors of ``config.eliashberg.resolve_frequency_parity`` are handled exactly as in
+    :func:`solve_eliashberg_lanczos`: the sector projector :math:`\Pi` (see :func:`_project_gap_to_sector`) wraps the
+    matvec and the starting vector on the full (undistributed) gap vector the eigensolver sees, so the frequency
+    distribution is transparent to the projection.
 
     :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (frequency-distributed) for one channel; consumed
         by the solve.
@@ -1074,7 +1235,10 @@ def solve_eliashberg_lanczos_v2(
         first is the root that owns the bubble.
     :param n_threads: This rank's momentum-batch/FFT thread budget (see :func:`_v2_solver_thread_budget`); the
         default 1 runs the serial path, results are bit-equal either way.
-    :return: A tuple ``(lambdas, gaps)`` of the leading eigenvalues and the corresponding :class:`GapFunction` objects.
+    :return: A dict ``{parity_label: (lambdas, gaps)}`` of the leading eigenvalues and :class:`GapFunction` objects
+        per physical frequency-parity sector (a single ``"none"`` key when no projection is requested). The sector
+        projectors act on the full (undistributed) gap vector the eigensolver sees, so the frequency distribution is
+        transparent to them.
     """
     logger = config.logger
     root = active_ranks[0]
@@ -1150,58 +1314,9 @@ def solve_eliashberg_lanczos_v2(
         gap_new = mpi_dist_v.allgather(gap_new)  # (v_total, nq_tot, orb, orb)
         return np.moveaxis(gap_new, 0, -1).flatten()  # (nq_tot, orb, orb, v_total)
 
-    mat = sp.sparse.linalg.LinearOperator(shape=(np.prod(gap_shape), np.prod(gap_shape)), matvec=mv)
-
-    n_eig = config.eliashberg.n_eig
-    eig_label = "" if n_eig > 1 else f" {n_eig}"
-    plural = "" if n_eig == 1 else "s"
-    logger.info(
-        f"Starting Lanczos method to retrieve largest{eig_label} eigenvalue{plural} and eigenvector{plural} "
-        f"for the {gamma_r_pp.channel.value}let channel.",
-        allowed_ranks=root,
+    return _solve_pairing_sectors(
+        mv, gap_shape, sign, gamma_r_pp.channel, gamma_r_pp.nq, executor, root, gap0.flatten()
     )
-
-    # BLAS is pinned to one thread for the solve (threadpool_limits resizes the live pool; an environment change
-    # would be ignored) so the momentum-batch threads never nest BLAS threads underneath.
-    try:
-        with threadpool_limits(limits=1 if executor is not None else None):
-            lambdas, gaps = sp.sparse.linalg.eigsh(
-                mat, k=n_eig, tol=config.eliashberg.epsilon, v0=gap0.flatten(), which="LA", maxiter=10000
-            )
-    finally:
-        if executor is not None:
-            executor.shutdown()
-
-    logger.info(
-        f"Finished Lanczos method for the largest{eig_label} eigenvalue{plural} and eigenvector{plural} "
-        f"for the {gamma_r_pp.channel.value}let channel.",
-        allowed_ranks=root,
-    )
-
-    order = lambdas.argsort()[::-1]  # sort eigenvalues in descending order
-    lambdas = lambdas[order]
-    gaps = gaps[:, order]
-
-    if config.eliashberg.symmetrize_degenerate_gaps:
-        gaps = symmetrize_degenerate_gaps(lambdas, gaps, gap_shape)
-
-    logger.info(
-        f"Largest{eig_label} eigenvalue{plural} for the {gamma_r_pp.channel.value}let "
-        f"channel {"is" if n_eig == 1 else "are"}: " + ", ".join(f"{lam:.6f}" for lam in lambdas),
-        allowed_ranks=root,
-    )
-
-    gaps = [
-        GapFunction(gaps[..., i].reshape(gap_shape), gamma_r_pp.channel, gamma_r_pp.nq)
-        for i in range(config.eliashberg.n_eig)
-    ]
-
-    logger.info(
-        f"Finished solving the Eliashberg equation for the {gamma_r_pp.channel.value}let channel.",
-        allowed_ranks=root,
-    )
-
-    return lambdas, gaps
 
 
 def dispatch_full_vertex_calculation(
@@ -1259,8 +1374,10 @@ def solve(
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{q}`.
     :param comm: The MPI communicator.
-    :return: A tuple ``(lambdas_sing, lambdas_trip, gaps_sing, gaps_trip)`` of the singlet/triplet eigenvalues and
-        :class:`GapFunction` lists.
+    :return: A dict keyed by ``(channel, parity_label)`` mapping to ``(lambdas, gaps)`` of the leading eigenvalues
+        and :class:`GapFunction` objects for each solved physical frequency-parity sector. When
+        ``config.eliashberg.resolve_frequency_parity`` is set the parity labels are ``"even"`` and ``"odd"``,
+        otherwise a single unprojected ``"none"`` sector is returned.
     """
     logger = config.logger
 
@@ -1346,8 +1463,12 @@ def solve(
         gamma_trip_pp.mat = mpi_dist_irrk.scatter(gamma_trip_pp.mat)
         logger.info(f"Saved singlet and triplet pairing vertices in pp notation in the irreducible BZ to file.")
 
-    gaps_sing = [GapFunction(np.empty(0)) for _ in range(config.eliashberg.n_eig)]
-    gaps_trip = [GapFunction(np.empty(0)) for _ in range(config.eliashberg.n_eig)]
+    parities = [parity for parity, _ in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)]
+
+    def empty_sector_gaps() -> list[GapFunction]:
+        return [GapFunction(np.empty(0)) for _ in range(config.eliashberg.n_eig)]
+
+    results: dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]] = {}
 
     if not config.memory.save_memory_for_lanczos:
         gamma_sing_pp.mat = mpi_dist_irrk.gather(gamma_sing_pp.mat, root=rank_sing)
@@ -1362,20 +1483,24 @@ def solve(
         elif mpi_dist_irrk.my_rank == rank_trip and mpi_dist_irrk.mpi_size > 1:
             gchi0_q_pp = mpi_dist_irrk.recv_from_rank(source=rank_sing, base_tag=0)
 
-        lambdas_sing, lambdas_trip = (None,) * 2
+        sectors_sing = sectors_trip = None
         if mpi_dist_irrk.my_rank == rank_sing:
-            lambdas_sing, gaps_sing = solve_eliashberg_lanczos(gamma_sing_pp, gchi0_q_pp, (rank_sing, rank_trip))
+            sectors_sing = solve_eliashberg_lanczos(gamma_sing_pp, gchi0_q_pp, (rank_sing, rank_trip))
         if mpi_dist_irrk.my_rank == rank_trip:
-            lambdas_trip, gaps_trip = solve_eliashberg_lanczos(gamma_trip_pp, gchi0_q_pp, (rank_sing, rank_trip))
+            sectors_trip = solve_eliashberg_lanczos(gamma_trip_pp, gchi0_q_pp, (rank_sing, rank_trip))
 
         mpi_dist_irrk.delete_file()
 
-        lambdas_sing = mpi_dist_irrk.bcast(lambdas_sing, root=rank_sing)
-        lambdas_trip = mpi_dist_irrk.bcast(lambdas_trip, root=rank_trip)
-
-        for i in range(len(gaps_sing)):
-            gaps_sing[i] = mpi_dist_irrk.bcast_npoint(gaps_sing[i], root=rank_sing)
-            gaps_trip[i] = mpi_dist_irrk.bcast_npoint(gaps_trip[i], root=rank_trip)
+        for channel, sectors, owner in (
+            (SpinChannel.SING, sectors_sing, rank_sing),
+            (SpinChannel.TRIP, sectors_trip, rank_trip),
+        ):
+            for parity in parities:
+                local = sectors[parity] if sectors is not None else None
+                lambdas = mpi_dist_irrk.bcast(local[0] if local is not None else None, root=owner)
+                gaps = local[1] if local is not None else empty_sector_gaps()
+                gaps = [mpi_dist_irrk.bcast_npoint(gap, root=owner) for gap in gaps]
+                results[(channel, parity)] = (lambdas, gaps)
     else:
         mpi_dist_v = MpiDistributor.create_distributor(
             ntasks=gamma_sing_pp.current_shape[-2], comm=comm, name="V", output_path=config.output.output_path
@@ -1413,13 +1538,12 @@ def solve(
         else:
             gchi0_q_pp = None
 
+        sectors_sing = sectors_trip = None
         if comm.rank in active_ranks:
-            lambdas_sing, gaps_sing = solve_eliashberg_lanczos_v2(
+            sectors_sing = solve_eliashberg_lanczos_v2(
                 gamma_sing_pp, gchi0_q_pp, solver_dist_v, active_ranks, v2_n_threads
             )
             gamma_sing_pp.free()
-        else:
-            lambdas_sing = None
 
         logger.info("Distributing Gamma_trip_pp along v equally to ranks/nodes.")
         gamma_trip_pp = mpi_utils.gather_full_ibz_for_vslice(
@@ -1428,21 +1552,20 @@ def solve(
         logger.info("Gamma_trip_pp distributed. Starting with triplet Lanczos solver.")
 
         if comm.rank in active_ranks:
-            lambdas_trip, gaps_trip = solve_eliashberg_lanczos_v2(
+            sectors_trip = solve_eliashberg_lanczos_v2(
                 gamma_trip_pp, gchi0_q_pp, solver_dist_v, active_ranks, v2_n_threads
             )
             gamma_trip_pp.free()
-        else:
-            lambdas_trip = None
 
-        lambdas_sing = comm.bcast(lambdas_sing, root=root)
-        lambdas_trip = comm.bcast(lambdas_trip, root=root)
+        for channel, sectors in ((SpinChannel.SING, sectors_sing), (SpinChannel.TRIP, sectors_trip)):
+            for parity in parities:
+                local = sectors[parity] if sectors is not None else None
+                lambdas = comm.bcast(local[0] if local is not None else None, root=root)
+                gaps = local[1] if local is not None else empty_sector_gaps()
+                gaps = [mpi_dist_irrk.bcast_npoint(gap, root=root) for gap in gaps]
+                results[(channel, parity)] = (lambdas, gaps)
 
-        for i in range(len(gaps_sing)):
-            gaps_sing[i] = mpi_dist_irrk.bcast_npoint(gaps_sing[i], root=root)
-            gaps_trip[i] = mpi_dist_irrk.bcast_npoint(gaps_trip[i], root=root)
-
-    return lambdas_sing, lambdas_trip, gaps_sing, gaps_trip
+    return results
 
 
 def get_ranks_for_lanczos(comm: MPI.Comm) -> tuple[int, int]:

@@ -260,6 +260,7 @@ Superconducting properties are obtained by solving the linearized Eliashberg equ
      symmetry: "random"           # str
      include_local_part: True     # bool
      symmetrize_degenerate_gaps: True # bool
+     resolve_frequency_parity: True # bool
      subfolder_name: "Eliashberg" # str
 
 The equation is solved only when ``perform_eliashberg`` is ``True``. Enabling ``save_pairing_vertex`` or ``save_fq``
@@ -272,8 +273,65 @@ symmetry, but ``"random"`` is sufficient most of the time. The pairing vertex in
 which can be skipped by setting ``include_local_part`` to ``False``; this is only advisable when s-wave symmetry is
 not expected, as these diagrams become relevant in that case. With ``symmetrize_degenerate_gaps`` enabled (the
 default), gap functions belonging to (near-)degenerate eigenvalues are orthogonalized with a Loewdin scheme and
-degenerate doublets are rotated to their mirror-adapted (:math:`p_x`/:math:`p_y`-like) partners. Finally, the
-results are written to a subfolder named according to ``subfolder_name``.
+degenerate doublets are rotated to their mirror-adapted (:math:`p_x`/:math:`p_y`-like) partners.
+
+The ``resolve_frequency_parity`` field controls whether the physical gap-symmetry sectors are returned. The
+unprojected eigensolver leaks onto the globally dominant eigenvector, mixing frequency-even and frequency-odd modes;
+projecting the trial vector onto a fixed symmetry sector at every iteration separates them.
+
+The orbital gap :math:`\Delta_{12}(k, \nu)` (with the spin part folded into the channel) acts on three commuting
+involutions built from the same array operations as the pairing kernel: the frequency flip
+:math:`(T\Delta)_{12}(k, \nu) = \Delta_{12}(k, -\nu)`, the momentum flip
+:math:`(P\Delta)_{12}(k, \nu) = \Delta_{12}(-k, \nu)` and the orbital transpose
+:math:`(O\Delta)_{12}(k, \nu) = \Delta_{21}(k, \nu)`. The Pauli principle requires the Cooper-pair amplitude to be
+antisymmetric under the combined exchange of spin, momentum, orbital and frequency,
+
+.. math::
+
+   \hat{S}\, P\, O\, T\, \Delta = -\Delta ,
+
+where :math:`\hat{S}` is the spin exchange (a scalar :math:`s_S = -1` for the singlet, :math:`+1` for the triplet).
+Writing :math:`G \equiv P\,O\,T`, physical gaps are eigenvectors :math:`G\Delta = g_S\,\Delta` with
+:math:`g_S = -s_S`, which equals the channel sign ``sign`` (:math:`+1` singlet, :math:`-1` triplet) that the kernel
+already carries. Choosing the frequency parity :math:`\varepsilon_T \in \{+1\ (\text{even}), -1\ (\text{odd})\}`
+therefore fixes the combined momentum-orbital parity through
+:math:`\varepsilon_{PO} = \mathrm{sign}\cdot\varepsilon_T`:
+
+.. list-table::
+   :header-rows: 1
+
+   * - channel
+     - ``sign``
+     - :math:`\varepsilon_T` (even / odd)
+     - forced :math:`\varepsilon_{PO}`
+   * - singlet
+     - :math:`+1`
+     - :math:`+1` / :math:`-1`
+     - :math:`+1` / :math:`-1`
+   * - triplet
+     - :math:`-1`
+     - :math:`+1` / :math:`-1`
+     - :math:`-1` / :math:`+1`
+
+The gap is projected onto the sector with the commuting Hermitian projector (only the product :math:`P\,O` is fixed,
+never :math:`P` and :math:`O` separately)
+
+.. math::
+
+   \Pi = \tfrac{1}{2}\left(1 + \varepsilon_T\, T\right)\,\tfrac{1}{2}\left(1 + \varepsilon_{PO}\, P\,O\right) ,
+
+applied to both the matrix-vector product and the starting vector at every iteration. Setting
+``resolve_frequency_parity`` to ``True`` returns the frequency-even and frequency-odd sectors for each of the
+singlet and triplet channels, while ``False`` (the default) returns the overall leading eigenpairs without any
+projection.
+Clean frequency-parity separation additionally requires the pairing vertex to satisfy the time-reversal-plus-inversion
+symmetry :math:`\Gamma^{\nu\nu'}(q) = \Gamma^{(-\nu)(-\nu')}(-q)`. Sector-resolved gap functions are written as
+``gap_<channel>_<parity>_<i>`` (for example ``gap_sing_even_1``), while the unprojected case keeps the
+``gap_<channel>_<i>`` naming. A ``gap_parity.txt`` file is written alongside them with one line per saved gap: a
+compact wave-symmetry label (``s`` / ``d`` / ``p``, or ``x`` if unclassified, followed by ``+`` / ``-`` for the
+frequency parity) obtained from the dominant orbital-diagonal momentum structure, followed by the measured parity
+Rayleigh quotients :math:`\langle \Delta, X\Delta \rangle / \langle \Delta, \Delta \rangle` for
+:math:`X \in \{T, P, O, P O\}`. Finally, the results are written to a subfolder named according to ``subfolder_name``.
 
 .. _self-energy-interpolation:
 

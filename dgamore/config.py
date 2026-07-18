@@ -173,6 +173,10 @@ class EliashbergConfig:
     :ivar bool symmetrize_degenerate_gaps: Whether to orthonormalize the gap functions within (near-)degenerate
         eigenvalue clusters and rotate doublets to the mirror-adapted basis (see
         :func:`~dgamore.eliashberg_solver.symmetrize_degenerate_gaps`).
+    :ivar bool resolve_frequency_parity: Whether to project each channel's gap onto its physical frequency-even and
+        frequency-odd sectors (the paired momentum-orbital parity is fixed by the Pauli constraint) and return both,
+        with files named ``gap_<channel>_<parity>_<i>``. When disabled, the overall leading eigenpairs are returned
+        without projection and files are named ``gap_<channel>_<i>``.
     :ivar str subfolder_name: Output subfolder name for Eliashberg results.
     """
 
@@ -185,6 +189,7 @@ class EliashbergConfig:
         self.symmetry: str = "random"
         self.include_local_part: bool = True
         self.symmetrize_degenerate_gaps: bool = True
+        self.resolve_frequency_parity: bool = False
         self.subfolder_name: str = "Eliashberg"
 
 
