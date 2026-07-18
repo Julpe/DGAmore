@@ -274,6 +274,9 @@ class ConfigParser:
         conf.symmetrize_degenerate_gaps = self._try_parse(
             section, "symmetrize_degenerate_gaps", conf.symmetrize_degenerate_gaps
         )
+        conf.resolve_frequency_parity = self._try_parse(
+            section, "resolve_frequency_parity", conf.resolve_frequency_parity
+        )
         conf.subfolder_name = self._try_parse(section, "subfolder_name", conf.subfolder_name)
 
         return conf

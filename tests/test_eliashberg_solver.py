@@ -16,6 +16,10 @@ from dgamore.eliashberg_solver import (
     _apply_gamma_pp,
     _apply_gchi0_pp,
     _chi0_to_matmul_layout,
+    _frequency_parity_sectors,
+    gap_parity_diagnostics,
+    _project_gap_to_sector,
+    classify_gap_symmetry,
     create_local_gamma_ud_pp_w0,
     create_local_gamma_ud_pp_w0_per_ineq,
     _gamma_to_matmul_layout,
@@ -429,6 +433,7 @@ def test_degenerate_decoupled_bands_reproduce_single_band_kernel(monkeypatch, ch
     config.eliashberg.n_eig = 2
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "random"
+    config.eliashberg.resolve_frequency_parity = False
     config.logger = MagicMock()
 
     rng = np.random.default_rng(21)
@@ -629,6 +634,7 @@ def test_solve_eliashberg_lanczos_v2_threaded_matches_serial():
     config.eliashberg.n_eig = 2
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "d-wave"
+    config.eliashberg.resolve_frequency_parity = False
     config.logger = SimpleNamespace(
         info=lambda *a, **k: None, log_memory_usage=lambda *a, **k: None, warning=lambda *a, **k: None
     )
@@ -650,11 +656,16 @@ def test_solve_eliashberg_lanczos_v2_threaded_matches_serial():
     ).decompress_q_dimension()
 
     def run(n_threads):
+        from threadpoolctl import threadpool_limits
+
         gamma = FourPoint(gamma_mat.copy(), SpinChannel.SING, nq, 0, 2, True, True, True, FrequencyNotation.PP)
         dist = MpiDistributor(ntasks=n2, comm=create_comm_mock())
         from dgamore.eliashberg_solver import solve_eliashberg_lanczos_v2
 
-        return solve_eliashberg_lanczos_v2(gamma, chi0, dist, [0], n_threads)
+        # pin BLAS to one thread for both runs so the comparison isolates the momentum-batch threading from
+        # nondeterministic multi-threaded BLAS reductions in the serial (n_threads == 1) ARPACK path
+        with threadpool_limits(limits=1):
+            return solve_eliashberg_lanczos_v2(gamma, chi0, dist, [0], n_threads)["none"]
 
     lambdas_serial, gaps_serial = run(1)
     lambdas_threaded, gaps_threaded = run(4)
@@ -683,6 +694,7 @@ def test_solve_eliashberg_lanczos_v2_with_inactive_ranks_runs_on_restricted_dist
     config.eliashberg.n_eig = 3
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "d-wave"
+    config.eliashberg.resolve_frequency_parity = False
     config.eliashberg.symmetrize_degenerate_gaps = False
     config.logger = SimpleNamespace(
         info=lambda *a, **k: None, log_memory_usage=lambda *a, **k: None, warning=lambda *a, **k: None
@@ -721,7 +733,7 @@ def test_solve_eliashberg_lanczos_v2_with_inactive_ranks_runs_on_restricted_dist
         return FourPoint(mat, SpinChannel.SING, nq, 0, 2, True, True, True, FrequencyNotation.PP)
 
     dist_ref = MpiDistributor(ntasks=n2, comm=create_comm_mock())
-    lambdas_ref, gaps_ref = es.solve_eliashberg_lanczos_v2(make_gamma(slice(None)), chi0, dist_ref, [0], 1)
+    lambdas_ref, gaps_ref = es.solve_eliashberg_lanczos_v2(make_gamma(slice(None)), chi0, dist_ref, [0], 1)["none"]
 
     def fn(comm, rank):
         dist_full = MpiDistributor(ntasks=n2, comm=comm)
@@ -731,7 +743,7 @@ def test_solve_eliashberg_lanczos_v2_with_inactive_ranks_runs_on_restricted_dist
             return None
         dist = dist_full.restricted_to(sub, active)
         chi0_arg = chi0 if sub.Get_rank() == 0 else None
-        lambdas, gaps = es.solve_eliashberg_lanczos_v2(make_gamma(dist.my_slice), chi0_arg, dist, active, 1)
+        lambdas, gaps = es.solve_eliashberg_lanczos_v2(make_gamma(dist.my_slice), chi0_arg, dist, active, 1)["none"]
         return lambdas, gaps[0].mat
 
     _, res = run_parallel(4, fn)
@@ -755,6 +767,7 @@ def test_solve_eliashberg_lanczos_runs_eigsh_inside_thread_budget(monkeypatch):
     config.eliashberg.n_eig = 1
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "random"
+    config.eliashberg.resolve_frequency_parity = False
     config.logger = MagicMock()
 
     rng = np.random.default_rng(4)
@@ -916,3 +929,315 @@ def test_local_gamma_ud_pp_w0_per_ineq_reuses_repeated_atoms():
     assert np.allclose(gamma_full.mat[:2, :2, :2, :2], gamma_full.mat[2:, 2:, 2:, 2:], atol=1e-12)
     chi0_a = BubbleGenerator.create_generalized_chi0_pp_w0(g_a, niv_pp, beta).extend_vn_to_diagonal()
     assert np.allclose(gamma_full.mat[:2, :2, :2, :2], create_local_gamma_ud_pp_w0(chi_a, chi0_a, beta).mat, atol=1e-6)
+
+
+# --- frequency-parity gap sectors (physical-gap projection) ---
+def _flip_nu(g: np.ndarray) -> np.ndarray:
+    """T involution on a [kx, ky, kz, o1, o2, v] gap array (nu -> -nu)."""
+    return np.flip(g, axis=-1)
+
+
+def _flip_po(g: np.ndarray) -> np.ndarray:
+    """P.O involution on a [kx, ky, kz, o1, o2, v] gap array (k -> -k and o1 <-> o2)."""
+    return np.roll(np.flip(g.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+
+
+@pytest.mark.parametrize("resolve, expected", [(True, [("even", 1), ("odd", -1)]), (False, [("none", None)])])
+def test_frequency_parity_sectors_maps_boolean(resolve, expected):
+    """_frequency_parity_sectors returns the even and odd sectors when resolving frequency parity, else the raw sector."""
+    assert _frequency_parity_sectors(resolve) == expected
+
+
+@pytest.mark.parametrize("eps_t, eps_po", [(1, 1), (1, -1), (-1, 1), (-1, -1)])
+def test_project_gap_to_sector_is_idempotent_and_selects_parities(eps_t, eps_po):
+    """The sector projector is idempotent and its image has T-parity eps_t and (P.O)-parity eps_po."""
+    shape = (2, 2, 1, 2, 2, 4)
+    rng = np.random.default_rng(7)
+    vec = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).ravel()
+    proj = _project_gap_to_sector(vec, shape, eps_t, eps_po)
+    assert np.allclose(_project_gap_to_sector(proj, shape, eps_t, eps_po), proj, atol=1e-12)
+    g = proj.reshape(shape)
+    assert np.allclose(_flip_nu(g), eps_t * g, atol=1e-12)
+    assert np.allclose(_flip_po(g), eps_po * g, atol=1e-12)
+
+
+def test_project_gap_to_sector_is_hermitian_and_partitions_identity():
+    """The four sector projectors are Hermitian and sum to the identity over a channel (even/odd x its forced P.O)."""
+    shape = (2, 2, 1, 2, 2, 4)
+    n = int(np.prod(shape))
+    basis = np.eye(n, dtype=np.complex128)
+    total = np.zeros((n, n), dtype=np.complex128)
+    for eps_t, eps_po in [(1, 1), (1, -1), (-1, 1), (-1, -1)]:
+        proj = np.column_stack([_project_gap_to_sector(basis[:, i], shape, eps_t, eps_po) for i in range(n)])
+        assert np.allclose(proj, proj.conj().T, atol=1e-12)
+        total += proj
+    assert np.allclose(total, np.eye(n), atol=1e-12)
+
+
+@pytest.mark.parametrize("eps_t, eps_po", [(1, -1), (-1, 1)])
+def test_gap_parity_diagnostics_reports_projected_parities(eps_t, eps_po):
+    """_gap_parity_diagnostics returns the T and P.O Rayleigh quotients of a gap projected into a known sector."""
+    shape = (2, 2, 1, 2, 2, 4)
+    rng = np.random.default_rng(3)
+    vec = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).ravel()
+    diag = gap_parity_diagnostics(_project_gap_to_sector(vec, shape, eps_t, eps_po), shape)
+    assert np.isclose(diag["T"].real, eps_t, atol=1e-10) and np.isclose(diag["T"].imag, 0.0, atol=1e-10)
+    assert np.isclose(diag["PO"].real, eps_po, atol=1e-10) and np.isclose(diag["PO"].imag, 0.0, atol=1e-10)
+
+
+def test_gap_parity_diagnostics_zero_gap_returns_zeros():
+    """_gap_parity_diagnostics returns zero Rayleigh quotients (no division by zero) for an all-zero gap."""
+    shape = (2, 2, 1, 1, 1, 4)
+    diag = gap_parity_diagnostics(np.zeros(int(np.prod(shape)), dtype=np.complex128), shape)
+    assert all(diag[key] == 0 for key in ("T", "P", "O", "PO"))
+
+
+def _wave_gap(form: np.ndarray, parity: str, niv: int = 2) -> np.ndarray:
+    """Builds a [kx, ky, 1, 1, 1, 2*niv] gap carrying the [kx, ky] momentum form with the given frequency parity."""
+    gap = np.zeros(form.shape + (1, 1, 1, 2 * niv), dtype=np.complex128)
+    positive = form[:, :, None, None, None, None]
+    gap[..., niv:] = positive
+    gap[..., :niv] = positive if parity == "even" else -positive
+    return gap
+
+
+_K4 = 2 * np.pi * np.arange(4) / 4
+_S_FORM = np.cos(_K4)[:, None] + np.cos(_K4)[None, :]
+_D_FORM = np.cos(_K4)[:, None] - np.cos(_K4)[None, :]
+_P_FORM = np.broadcast_to(np.sin(_K4)[:, None], (4, 4)).astype(float).copy()
+
+
+@pytest.mark.parametrize(
+    "form, parity, expected",
+    [
+        (_S_FORM, "even", "s+"),
+        (_D_FORM, "even", "d+"),
+        (_D_FORM, "odd", "d-"),
+        (_P_FORM, "odd", "p-"),
+        (_P_FORM, "even", "p+"),
+    ],
+)
+def test_classify_gap_symmetry_labels_wave_and_frequency_parity(form, parity, expected):
+    """classify_gap_symmetry labels the spatial wave (s/d/p) and the frequency parity (+/-) of a gap."""
+    assert classify_gap_symmetry(_wave_gap(form.astype(complex), parity)) == expected
+
+
+def test_classify_gap_symmetry_returns_unknown_for_zero_gap():
+    """classify_gap_symmetry returns 'unknown' when the positive-frequency momentum slice is identically zero."""
+    assert classify_gap_symmetry(np.zeros((4, 4, 1, 1, 1, 4), dtype=complex)) == "unknown"
+
+
+def _single_band_pp_operands(nq: tuple, niv_pp: int, seed: int) -> tuple[FourPoint, FourPoint]:
+    """Builds a random single-band pp pairing vertex and bare pp bubble on the given momentum grid for solver tests."""
+    config.lattice.nk = nq
+    config.lattice.k_grid = bz.KGrid(nq, symmetries=[])
+    config.sys.beta = 10.0
+    config.logger = MagicMock()
+    nq_tot, n2 = int(np.prod(nq)), 2 * niv_pp
+    rng = np.random.default_rng(seed)
+    gshape = (nq_tot, 1, 1, 1, 1, n2, n2)
+    gamma = FourPoint(
+        rng.standard_normal(gshape) + 1j * rng.standard_normal(gshape),
+        SpinChannel.SING,
+        nq,
+        0,
+        2,
+        True,
+        True,
+        True,
+        FrequencyNotation.PP,
+    )
+    chi0 = FourPoint(
+        rng.standard_normal(gshape[:-1]) + 1j * rng.standard_normal(gshape[:-1]),
+        SpinChannel.NONE,
+        nq,
+        0,
+        1,
+        True,
+        True,
+        True,
+        FrequencyNotation.PP,
+    )
+    return gamma, chi0
+
+
+def test_solve_eliashberg_lanczos_both_projects_matvec_and_v0_into_each_sector(monkeypatch):
+    """With resolve_frequency_parity set the singlet solve returns an even and an odd sector, and each sector's eigsh
+    operator and seed are projected: the matvec output and v0 carry that sector's T-parity and P.O-parity exactly."""
+    nq, niv_pp = (4, 4, 1), 2
+    gap_shape = nq + (1, 1) + (2 * niv_pp,)
+    config.eliashberg.n_eig = 2
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetry = "random"
+    config.eliashberg.resolve_frequency_parity = True
+    gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=11)
+
+    seen = []
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter):
+        n = op.shape[0]
+        rng = np.random.default_rng(1)
+        probe = op.matvec(rng.standard_normal(n) + 1j * rng.standard_normal(n))
+        seen.append((v0.copy(), probe))
+        return np.arange(k, 0, -1).astype(float), np.ones((n, k), dtype=np.complex64)
+
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        result = solve_eliashberg_lanczos(gamma, chi0, (0, 0))
+
+    assert set(result) == {"even", "odd"}
+    for parity, (lambdas, gaps) in result.items():
+        assert len(gaps) == config.eliashberg.n_eig and len(lambdas) == config.eliashberg.n_eig
+    for (parity, eps_t, eps_po), (v0, probe) in zip([("even", 1, 1), ("odd", -1, -1)], seen):
+        for vec in (v0, probe):
+            g = vec.reshape(gap_shape)
+            assert np.allclose(_flip_nu(g), eps_t * g, atol=1e-5)
+            assert np.allclose(_flip_po(g), eps_po * g, atol=1e-5)
+
+
+def _densify_pairing_kernel(monkeypatch, gamma_arr: np.ndarray, chi0_arr: np.ndarray, nq: tuple, channel) -> np.ndarray:
+    """Densifies the production pairing-kernel matvec (unprojected) by intercepting eigsh and hitting the operator
+    with every standard-basis column."""
+    config.lattice.nk = nq
+    config.lattice.k_grid = bz.KGrid(nq, symmetries=[])
+    config.sys.beta = 10.0
+    config.eliashberg.n_eig = 1
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetry = "random"
+    config.eliashberg.resolve_frequency_parity = False
+    config.eliashberg.symmetrize_degenerate_gaps = False
+    config.logger = MagicMock()
+    dense = []
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter):
+        n = op.shape[0]
+        dense.append(np.column_stack([op.matvec(np.eye(n, dtype=np.complex128)[:, i]) for i in range(n)]))
+        return np.ones(k), np.ones((n, k), dtype=np.complex128)
+
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        solve_eliashberg_lanczos(
+            FourPoint(gamma_arr.copy(), channel, nq, 0, 2, True, True, True, FrequencyNotation.PP),
+            FourPoint(chi0_arr.copy(), SpinChannel.NONE, nq, 0, 1, True, True, True, FrequencyNotation.PP),
+            (0, 0),
+        )
+    return dense[0]
+
+
+def _symmetrize_tr_inversion(arr: np.ndarray, nq: tuple, two_fermion: bool) -> np.ndarray:
+    """Averages a compressed-q pp array with its Gamma(q, v, v') = Gamma(-q, -v, -v') image (time reversal plus
+    inversion), the symmetry that makes the pairing kernel conserve fermionic-frequency parity."""
+    grid = arr.reshape(nq + arr.shape[1:])
+    flipped = np.roll(np.flip(grid, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+    flipped = np.flip(flipped, axis=(-1, -2)) if two_fermion else np.flip(flipped, axis=-1)
+    return (0.5 * (grid + flipped)).reshape(arr.shape)
+
+
+@pytest.mark.parametrize("channel", [SpinChannel.SING, SpinChannel.TRIP])
+def test_kernel_conserves_frequency_parity_only_for_tr_inversion_symmetric_vertex(monkeypatch, channel):
+    """The densified pairing kernel commutes with the T (nu -> -nu) involution exactly when the pairing vertex and
+    bubble carry the time-reversal-plus-inversion symmetry Gamma(q, v, v') = Gamma(-q, -v, -v') - the precondition
+    for splitting the gap into frequency-even and frequency-odd sectors - and fails to for a generic vertex."""
+    nq, o, niv_pp = (2, 2, 1), 2, 2
+    nq_tot, n2 = int(np.prod(nq)), 2 * niv_pp
+    rng = np.random.default_rng(0)
+    gamma = rng.standard_normal((nq_tot, o, o, o, o, n2, n2)) + 1j * rng.standard_normal((nq_tot, o, o, o, o, n2, n2))
+    chi0 = rng.standard_normal((nq_tot, o, o, o, o, n2)) + 1j * rng.standard_normal((nq_tot, o, o, o, o, n2))
+    gap_shape = nq + (o, o) + (n2,)
+
+    m_generic = _densify_pairing_kernel(monkeypatch, gamma, chi0, nq, channel)
+    m_symm = _densify_pairing_kernel(
+        monkeypatch,
+        _symmetrize_tr_inversion(gamma, nq, two_fermion=True),
+        _symmetrize_tr_inversion(chi0, nq, two_fermion=False),
+        nq,
+        channel,
+    )
+    n = m_generic.shape[0]
+    t_mat = np.column_stack(
+        [np.flip(np.eye(n, dtype=complex)[:, i].reshape(gap_shape), axis=-1).reshape(-1) for i in range(n)]
+    )
+    generic_commutator = np.abs(m_generic @ t_mat - t_mat @ m_generic).max() / np.abs(m_generic).max()
+    symm_commutator = np.abs(m_symm @ t_mat - t_mat @ m_symm).max() / np.abs(m_symm).max()
+    assert symm_commutator < 1e-5
+    assert generic_commutator > 1e-1
+
+
+def test_solve_eliashberg_lanczos_reseeds_when_symmetry_seed_orthogonal_to_sector(monkeypatch):
+    """When the configured momentum symmetry seeds a frequency parity orthogonal to the requested sector (a d-wave
+    even-nu singlet seed projected onto the odd sector collapses), the solver reseeds so the eigsh start is nonzero
+    and carries the sector's parities."""
+    nq, niv_pp = (4, 4, 1), 2
+    gap_shape = nq + (1, 1) + (2 * niv_pp,)
+    config.eliashberg.n_eig = 1
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetry = "d-wave"
+    config.eliashberg.resolve_frequency_parity = True
+    gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=5)
+
+    seeds = []
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter):
+        seeds.append(v0.copy())
+        n = op.shape[0]
+        return np.arange(k, 0, -1).astype(float), np.ones((n, k), dtype=np.complex64)
+
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        result = solve_eliashberg_lanczos(gamma, chi0, (0, 0))
+
+    assert set(result) == {"even", "odd"}
+    v0_odd = seeds[1].reshape(gap_shape)
+    assert np.linalg.norm(v0_odd) > 0
+    assert np.allclose(_flip_nu(v0_odd), -v0_odd, atol=1e-6) and np.allclose(_flip_po(v0_odd), -v0_odd, atol=1e-6)
+
+
+def test_solve_eliashberg_lanczos_seeds_empty_sector_with_nonzero_base(monkeypatch):
+    """On a self-dual grid where every k equals -k (2x2) the P-odd singlet sector is empty, so the projected seed
+    and its random reseed both collapse; the solver still hands eigsh the nonzero base seed rather than a zero
+    vector."""
+    nq, niv_pp = (2, 2, 1), 2
+    config.eliashberg.n_eig = 1
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetry = "random"
+    config.eliashberg.resolve_frequency_parity = True
+    config.eliashberg.symmetrize_degenerate_gaps = False
+    gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=8)
+
+    seeds = []
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter):
+        seeds.append(v0.copy())
+        n = op.shape[0]
+        return np.zeros(k), np.zeros((n, k), dtype=np.complex64)
+
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        solve_eliashberg_lanczos(gamma, chi0, (0, 0))
+
+    assert np.linalg.norm(seeds[1]) > 0
+
+
+def test_solve_eliashberg_lanczos_none_returns_single_unprojected_sector(monkeypatch):
+    """With resolve_frequency_parity disabled the solve returns one 'none' sector whose matvec is the raw
+    (unprojected) pairing kernel."""
+    nq, niv_pp = (2, 2, 1), 2
+    config.eliashberg.n_eig = 2
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetry = "random"
+    config.eliashberg.resolve_frequency_parity = False
+    gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=12)
+
+    calls = []
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter):
+        calls.append(op)
+        n = op.shape[0]
+        return np.arange(k, 0, -1).astype(float), np.ones((n, k), dtype=np.complex64)
+
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        result = solve_eliashberg_lanczos(gamma, chi0, (0, 0))
+
+    assert set(result) == {"none"}
+    assert len(calls) == 1 and len(result["none"][1]) == config.eliashberg.n_eig

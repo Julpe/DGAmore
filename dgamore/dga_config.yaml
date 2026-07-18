@@ -63,6 +63,7 @@ eliashberg:
   symmetry: "random" # Symmetry of the gap function that will be used as a starting point for the ARNOLDI Lanczos. Available: p-wave-x, p-wave-y, d-wave, random
   include_local_part: True # If True, the local part of the pairing vertex is included in the Eliashberg calculation. This is only relevant if one might expect s-wave symmetry.
   symmetrize_degenerate_gaps: True # If True, gap functions within (near-)degenerate eigenvalue clusters are orthogonalized (Loewdin) and doublets rotated to the mirror-adapted p_x/p_y basis.
+  resolve_frequency_parity: False # If True, project each channel's gap onto its physical frequency-even and frequency-odd sectors (paired momentum-orbital parity fixed by Pauli) and return both; if False, return the overall leading eigenpairs unprojected.
   subfolder_name: "Eliashberg" # name for the subfolder where certain outputs are generated
 
 self_energy_interpolation:
