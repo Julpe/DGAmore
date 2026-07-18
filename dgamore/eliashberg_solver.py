@@ -14,6 +14,7 @@ eigenvalue :math:`\lambda` signals the pairing instability and the eigenvector i
 """
 
 import os
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
@@ -31,6 +32,7 @@ from dgamore.greens_function import GreensFunction
 from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.matsubara_frequencies import MFHelper
+from dgamore.memory_estimator import LANCZOS_VERTEX_FACTOR
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE
 
@@ -844,7 +846,7 @@ def _v2_solver_thread_budget(comm: MPI.Comm, active_ranks: list) -> int:
     if comm.size == 1:
         return _clamp_to_openblas_slot_cap(max(1, len(my_mask))) if my_mask else 1
 
-    infos = comm.allgather((str(MPI.Get_processor_name()).strip(), my_mask))
+    infos = comm.allgather((socket.gethostname(), my_mask))
     if my_mask is None or comm.rank not in active_ranks:
         return 1
 
@@ -1034,7 +1036,15 @@ def _apply_gamma_pp(
 
 
 def _solve_pairing_sectors(
-    mv, gap_shape: tuple, sign: int, channel: SpinChannel, nq: tuple, executor, ranks, base_seed: np.ndarray
+    mv,
+    gap_shape: tuple,
+    sign: int,
+    channel: SpinChannel,
+    nq: tuple,
+    executor,
+    ranks,
+    base_seed: np.ndarray,
+    parities: list[str] | None = None,
 ) -> dict[str, tuple[np.ndarray, list[GapFunction]]]:
     r"""
     Runs the ARPACK/Lanczos solve of the pairing kernel ``mv`` once per physical frequency-parity sector selected by
@@ -1053,6 +1063,8 @@ def _solve_pairing_sectors(
     :param base_seed: The flattened initial gap seed, identical on every rank (broadcast beforehand for the
         frequency-distributed solve); projected into each sector, with a deterministic random fallback when the
         projection of the seed collapses (a seed whose parity is orthogonal to the requested sector).
+    :param parities: An optional subset of parity labels to solve; ``None`` solves every configured sector. Used to
+        hand different sectors to different ranks.
     :return: ``{parity_label: (lambdas, [GapFunction, ...])}`` for each solved sector.
     """
     logger = config.logger
@@ -1081,9 +1093,13 @@ def _solve_pairing_sectors(
         # nonzero base seed so the eigensolver gets a valid deterministic start (the projected operator returns ~0)
         return fallback if np.linalg.norm(fallback) > 0 else base_seed
 
+    sectors = _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)
+    if parities is not None:
+        sectors = [(label, eps_t) for label, eps_t in sectors if label in parities]
+
     results: dict[str, tuple[np.ndarray, list[GapFunction]]] = {}
     try:
-        for parity, eps_t in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity):
+        for parity, eps_t in sectors:
             eps_po = None if eps_t is None else sign * eps_t
             label = f"{channel.value}let/{parity}"
             logger.info(f"Starting Lanczos method for the {label} sector.", allowed_ranks=ranks)
@@ -1119,7 +1135,7 @@ def _solve_pairing_sectors(
 
 
 def solve_eliashberg_lanczos(
-    gamma_r_pp: FourPoint, gchi0_q0_pp: FourPoint, ranks: tuple[int, int]
+    gamma_r_pp: FourPoint, gchi0_q0_pp: FourPoint, ranks: tuple[int, int], parities: list[str] | None = None
 ) -> dict[str, tuple[np.ndarray, list[GapFunction]]]:
     r"""
     Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using
@@ -1135,9 +1151,11 @@ def solve_eliashberg_lanczos(
     :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (irreducible BZ, pp notation) for one channel;
         consumed by the solve.
     :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{pp}` at :math:`\omega = 0`.
-    :param ranks: The ``(rank_sing, rank_trip)`` pair used for logging.
+    :param ranks: The ranks used for logging.
+    :param parities: An optional subset of parity labels to solve on this rank (``None`` solves every configured
+        sector); the caller assigns different parities to different ranks so the sectors solve concurrently.
     :return: A dict ``{parity_label: (lambdas, gaps)}`` of the leading eigenvalues and :class:`GapFunction` objects
-        per physical frequency-parity sector (a single ``"none"`` key when no projection is requested).
+        per solved physical frequency-parity sector (a single ``"none"`` key when no projection is requested).
     """
     logger = config.logger
 
@@ -1201,7 +1219,9 @@ def solve_eliashberg_lanczos(
         return gap_new.flatten()
 
     base_seed = get_initial_gap_function(gap_shape, gamma_r_pp.channel).flatten()
-    return _solve_pairing_sectors(mv, gap_shape, sign, gamma_r_pp.channel, gamma_r_pp.nq, executor, ranks, base_seed)
+    return _solve_pairing_sectors(
+        mv, gap_shape, sign, gamma_r_pp.channel, gamma_r_pp.nq, executor, ranks, base_seed, parities
+    )
 
 
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
@@ -1360,6 +1380,94 @@ def dispatch_full_vertex_calculation(
     return f_q_r
 
 
+def _solve_sectors_in_memory(
+    mpi_dist_irrk: MpiDistributor,
+    gamma_sing_pp: FourPoint,
+    gamma_trip_pp: FourPoint,
+    giwk_dga: GreensFunction,
+    niv_pp: int,
+    sing_ranks: list[int],
+    trip_ranks: list[int],
+    bubble_rank: int,
+    parities: list[str],
+) -> dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]]:
+    r"""
+    Distributes the singlet and triplet pairing vertices and the bare pp bubble across the sector ranks and solves
+    every ``(channel, parity)`` sector on its assigned rank so they run concurrently (the in-memory Lanczos path).
+    Each channel's vertex is gathered to every rank that owns one of its sectors (the distinct-node assignment of
+    :func:`get_ranks_for_lanczos` keeps this at one copy per node); the bubble is built once on ``bubble_rank`` (the
+    only rank still holding ``giwk_dga``) and shipped to the other solving ranks. The results are broadcast from each
+    sector's owning rank so every rank returns the full dict.
+
+    :param mpi_dist_irrk: The irreducible-BZ q-distributor.
+    :param gamma_sing_pp: The singlet pairing vertex (irr-BZ q-distributed on entry; consumed).
+    :param gamma_trip_pp: The triplet pairing vertex (irr-BZ q-distributed on entry; consumed).
+    :param giwk_dga: The DGA Green's function (held only on ``bubble_rank``; used to build the bubble).
+    :param niv_pp: The pp fermionic box size.
+    :param sing_ranks: The rank owning each singlet parity sector (index ``i`` -> ``parities[i]``).
+    :param trip_ranks: The rank owning each triplet parity sector.
+    :param bubble_rank: The rank that builds the pp bubble (``sing_ranks[0]``).
+    :param parities: The parity labels to solve.
+    :return: ``{(channel, parity): (lambdas, gaps)}`` for every sector, identical on every rank.
+    """
+    logger = config.logger
+    my_rank = mpi_dist_irrk.my_rank
+    n_eig = config.eliashberg.n_eig
+    distinct_sing = list(dict.fromkeys(sing_ranks))
+    distinct_trip = list(dict.fromkeys(trip_ranks))
+
+    local_sing = gamma_sing_pp.mat
+    for target in distinct_sing:
+        gathered = mpi_dist_irrk.gather(local_sing, root=target)
+        if my_rank == target:
+            gamma_sing_pp.mat = gathered
+    if my_rank not in distinct_sing:
+        gamma_sing_pp.free()
+    local_trip = gamma_trip_pp.mat
+    for target in distinct_trip:
+        gathered = mpi_dist_irrk.gather(local_trip, root=target)
+        if my_rank == target:
+            gamma_trip_pp.mat = gathered
+    if my_rank not in distinct_trip:
+        gamma_trip_pp.free()
+
+    gchi0_q_pp = None
+    if my_rank == bubble_rank:
+        gchi0_q_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(giwk_dga, niv_pp, config.lattice.k_grid)
+        logger.info("Created the bare bubble susceptibility in pp notation.", allowed_ranks=(bubble_rank,))
+    for target in dict.fromkeys(distinct_sing + distinct_trip):
+        if target == bubble_rank:
+            continue
+        if my_rank == bubble_rank:
+            mpi_dist_irrk.send_to_rank(gchi0_q_pp, dest=target, base_tag=0)
+        elif my_rank == target:
+            gchi0_q_pp = mpi_dist_irrk.recv_from_rank(source=bubble_rank, base_tag=0)
+
+    my_sing = [parities[i] for i in range(len(parities)) if sing_ranks[i] == my_rank]
+    my_trip = [parities[i] for i in range(len(parities)) if trip_ranks[i] == my_rank]
+    sectors_sing = sectors_trip = None
+    if my_sing:
+        sectors_sing = solve_eliashberg_lanczos(gamma_sing_pp, gchi0_q_pp, tuple(distinct_sing), my_sing)
+    if my_trip:
+        sectors_trip = solve_eliashberg_lanczos(gamma_trip_pp, gchi0_q_pp, tuple(distinct_trip), my_trip)
+
+    mpi_dist_irrk.delete_file()
+
+    results: dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]] = {}
+    for channel, sectors, ranks_list in (
+        (SpinChannel.SING, sectors_sing, sing_ranks),
+        (SpinChannel.TRIP, sectors_trip, trip_ranks),
+    ):
+        for i, parity in enumerate(parities):
+            owner = ranks_list[i]
+            local = sectors[parity] if (sectors is not None and parity in sectors) else None
+            lambdas = mpi_dist_irrk.bcast(local[0] if local is not None else None, root=owner)
+            gaps = local[1] if local is not None else [GapFunction(np.empty(0)) for _ in range(n_eig)]
+            gaps = [mpi_dist_irrk.bcast_npoint(gap, root=owner) for gap in gaps]
+            results[(channel, parity)] = (lambdas, gaps)
+    return results
+
+
 def solve(
     giwk_dga: GreensFunction, g_dmft: GreensFunction, u_loc: LocalInteraction, v_nonloc: Interaction, comm: MPI.Comm
 ):
@@ -1389,19 +1497,34 @@ def solve(
 
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
 
-    # giwk_dga is consumed only by the pp-bubble build on a single rank (the in-memory singlet solver rank, or rank 0
-    # of the frequency-distributed variant), so every other rank drops its replicated full-grid copy for this phase.
+    parities = [parity for parity, _ in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)]
+    niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
+
+    # giwk_dga is consumed only by the pp-bubble build on a single rank (the in-memory bubble rank, or rank 0 of the
+    # frequency-distributed variant), so every other rank drops its replicated full-grid copy for this phase.
     if config.memory.save_memory_for_lanczos:
-        rank_sing = rank_trip = bubble_rank = 0
+        sing_ranks = trip_ranks = None
+        bubble_rank = 0
     else:
-        rank_sing, rank_trip = get_ranks_for_lanczos(comm)
-        if comm.size == 1:
-            rank_trip = rank_sing
-        bubble_rank = rank_sing
+        import psutil
+
+        # per-node memory drives how many (channel, parity) sectors run concurrently: pack as many per node as its
+        # free memory fits, so the sectors parallelize without overcommitting a node (the estimate mirrors the
+        # memory_estimator lanczos peak - LANCZOS_VERTEX_FACTOR full-BZ pp vertices + the pp bubble + ARPACK basis)
+        itemsize = np.dtype(DTYPE).itemsize
+        n2 = 2 * niv_pp
+        vertex_pp_full = config.lattice.k_grid.nk_tot * config.sys.n_bands**4 * n2**2 * itemsize
+        chi0_pp_full = config.lattice.k_grid.nk_tot * config.sys.n_bands**4 * n2 * itemsize
+        gap_bytes = config.lattice.k_grid.nk_tot * config.sys.n_bands**2 * n2 * itemsize
+        per_sector_bytes = (
+            LANCZOS_VERTEX_FACTOR * vertex_pp_full + chi0_pp_full + (2 * config.eliashberg.n_eig + 20) * gap_bytes
+        )
+        sing_ranks, trip_ranks = get_ranks_for_lanczos(
+            comm, len(parities), psutil.virtual_memory().available, per_sector_bytes, giwk_dga.mat.nbytes
+        )
+        bubble_rank = sing_ranks[0]
     if comm.rank != bubble_rank:
         giwk_dga.free()
-
-    niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
 
     f_dens_pp = dispatch_full_vertex_calculation(SpinChannel.DENS, u_loc, v_nonloc, niv_pp, mpi_dist_irrk)
     f_magn_pp = dispatch_full_vertex_calculation(SpinChannel.MAGN, u_loc, v_nonloc, niv_pp, mpi_dist_irrk)
@@ -1463,44 +1586,15 @@ def solve(
         gamma_trip_pp.mat = mpi_dist_irrk.scatter(gamma_trip_pp.mat)
         logger.info(f"Saved singlet and triplet pairing vertices in pp notation in the irreducible BZ to file.")
 
-    parities = [parity for parity, _ in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)]
-
     def empty_sector_gaps() -> list[GapFunction]:
         return [GapFunction(np.empty(0)) for _ in range(config.eliashberg.n_eig)]
 
     results: dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]] = {}
 
     if not config.memory.save_memory_for_lanczos:
-        gamma_sing_pp.mat = mpi_dist_irrk.gather(gamma_sing_pp.mat, root=rank_sing)
-        gamma_trip_pp.mat = mpi_dist_irrk.gather(gamma_trip_pp.mat, root=rank_trip)
-
-        if mpi_dist_irrk.my_rank == rank_sing:
-            gchi0_q_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(giwk_dga, niv_pp, config.lattice.k_grid)
-            logger.info("Created the bare bubble susceptibility in pp notation.", allowed_ranks=(rank_sing,))
-
-        if mpi_dist_irrk.my_rank == rank_sing and mpi_dist_irrk.mpi_size > 1:
-            mpi_dist_irrk.send_to_rank(gchi0_q_pp, dest=rank_trip, base_tag=0)
-        elif mpi_dist_irrk.my_rank == rank_trip and mpi_dist_irrk.mpi_size > 1:
-            gchi0_q_pp = mpi_dist_irrk.recv_from_rank(source=rank_sing, base_tag=0)
-
-        sectors_sing = sectors_trip = None
-        if mpi_dist_irrk.my_rank == rank_sing:
-            sectors_sing = solve_eliashberg_lanczos(gamma_sing_pp, gchi0_q_pp, (rank_sing, rank_trip))
-        if mpi_dist_irrk.my_rank == rank_trip:
-            sectors_trip = solve_eliashberg_lanczos(gamma_trip_pp, gchi0_q_pp, (rank_sing, rank_trip))
-
-        mpi_dist_irrk.delete_file()
-
-        for channel, sectors, owner in (
-            (SpinChannel.SING, sectors_sing, rank_sing),
-            (SpinChannel.TRIP, sectors_trip, rank_trip),
-        ):
-            for parity in parities:
-                local = sectors[parity] if sectors is not None else None
-                lambdas = mpi_dist_irrk.bcast(local[0] if local is not None else None, root=owner)
-                gaps = local[1] if local is not None else empty_sector_gaps()
-                gaps = [mpi_dist_irrk.bcast_npoint(gap, root=owner) for gap in gaps]
-                results[(channel, parity)] = (lambdas, gaps)
+        results = _solve_sectors_in_memory(
+            mpi_dist_irrk, gamma_sing_pp, gamma_trip_pp, giwk_dga, niv_pp, sing_ranks, trip_ranks, bubble_rank, parities
+        )
     else:
         mpi_dist_v = MpiDistributor.create_distributor(
             ntasks=gamma_sing_pp.current_shape[-2], comm=comm, name="V", output_path=config.output.output_path
@@ -1568,35 +1662,83 @@ def solve(
     return results
 
 
-def get_ranks_for_lanczos(comm: MPI.Comm) -> tuple[int, int]:
-    """
-    Picks two MPI ranks on different cluster nodes (if available) so the singlet and triplet Lanczos solves can run
-    concurrently on separate nodes; falls back to two ranks on the same node otherwise.
+# Fraction of a node's available host memory the sector packing may occupy (mirrors DGAmore.NODE_MEMORY_FRACTION).
+NODE_MEMORY_FRACTION: float = 0.97
+
+
+def get_ranks_for_lanczos(
+    comm: MPI.Comm,
+    n_parities: int = 1,
+    available_bytes: int | None = None,
+    per_sector_bytes: int | None = None,
+    giwk_bytes: int = 0,
+) -> tuple[list[int], list[int]]:
+    r"""
+    Assigns MPI ranks to the singlet and triplet frequency-parity sectors so that as many as fit run concurrently.
+    When a per-sector memory estimate is supplied, each node is packed with as many concurrent sector solves as its
+    free memory holds (one full pairing vertex per solving rank, capped by the node's rank count), so several sectors
+    may share a node when it has the headroom - never exceeding ``available_bytes * NODE_MEMORY_FRACTION`` per node,
+    hence never overcommitting. The bubble node (the first solving rank) additionally reserves ``giwk_bytes``. Sectors
+    beyond a node's capacity reuse an already-assigned rank of the same channel and are solved sequentially there
+    (one vertex copy). Without the estimate (``per_sector_bytes is None``) it falls back to the proven 2-way: singlet
+    on one node, triplet on another (or a second rank of the sole node), each channel's parities solved sequentially.
 
     :param comm: The MPI communicator.
-    :return: The tuple ``(rank_for_singlet, rank_for_triplet)``.
+    :param n_parities: The number of frequency-parity sectors per channel (2 when resolving parity, else 1).
+    :param available_bytes: This rank's free host memory (:func:`psutil.virtual_memory().available`), allgathered and
+        reduced (minimum) per node; ``None`` selects the memory-unaware 2-way fallback.
+    :param per_sector_bytes: The estimated peak host memory of one in-memory sector solve (dominated by the full-BZ
+        pairing vertex); ``None`` selects the fallback.
+    :param giwk_bytes: The DGA Green's function size held on the bubble node while it builds the pp bubble.
+    :return: ``(singlet_ranks, triplet_ranks)``, each a list of ``n_parities`` ranks (the rank that owns parity ``i``).
     """
-    import socket
+    info = comm.allgather((socket.gethostname(), available_bytes))
+    node_to_ranks: dict = {}
+    node_available: dict = {}
+    for r, (host, avail) in enumerate(info):
+        node_to_ranks.setdefault(host, []).append(r)
+        if avail is not None:
+            node_available[host] = avail if host not in node_available else min(node_available[host], avail)
+    nodes = list(node_to_ranks)
 
-    hostname = socket.gethostname()
+    if per_sector_bytes is None or not node_available:
+        # no memory estimate: the proven 2-way (channels concurrent, a channel's parities sequential on its rank)
+        if len(nodes) >= 2:
+            singlet_rank, triplet_rank = node_to_ranks[nodes[0]][0], node_to_ranks[nodes[1]][0]
+        else:
+            ranks_on_node = node_to_ranks[nodes[0]]
+            singlet_rank = ranks_on_node[0]
+            triplet_rank = ranks_on_node[1] if len(ranks_on_node) > 1 else ranks_on_node[0]
+        return [singlet_rank] * n_parities, [triplet_rank] * n_parities
 
-    # Gather all hostnames so every rank knows the full layout
-    all_hostnames = comm.allgather(hostname)
+    # concurrent vertices a node can hold (the first node also stores the giwk for the bubble build)
+    capacity = {}
+    for i, host in enumerate(nodes):
+        budget = node_available[host] * NODE_MEMORY_FRACTION - (giwk_bytes if i == 0 else 0)
+        capacity[host] = max(1, min(len(node_to_ranks[host]), int(budget // per_sector_bytes)))
 
-    # Build a mapping: node_name -> list of ranks on that node
-    node_to_ranks = {}
-    for r, h in enumerate(all_hostnames):
-        node_to_ranks.setdefault(h, []).append(r)
+    # distinct solving ranks (one vertex each), filled round-robin across nodes up to each node's capacity
+    n_sectors = 2 * n_parities
+    slots: list[int] = []
+    used = {host: 0 for host in nodes}
+    while len(slots) < n_sectors:
+        progressed = False
+        for host in nodes:
+            if used[host] < capacity[host]:
+                slots.append(node_to_ranks[host][used[host]])
+                used[host] += 1
+                progressed = True
+                if len(slots) >= n_sectors:
+                    break
+        if not progressed:
+            break
 
-    nodes = list(node_to_ranks.keys())
+    if len(slots) <= 1:
+        rank = slots[0] if slots else node_to_ranks[nodes[0]][0]
+        return [rank] * n_parities, [rank] * n_parities
 
-    if len(nodes) >= 2:
-        rank_for_singlet = node_to_ranks[nodes[0]][0]
-        rank_for_triplet = node_to_ranks[nodes[1]][0]
-    else:
-        # Fallback: both on the same node, pick any two ranks
-        ranks_on_node = node_to_ranks[nodes[0]]
-        rank_for_singlet = ranks_on_node[0]
-        rank_for_triplet = ranks_on_node[1] if len(ranks_on_node) > 1 else ranks_on_node[0]
-
-    return rank_for_singlet, rank_for_triplet
+    singlet_count = min(n_parities, (len(slots) + 1) // 2)
+    singlet_slots, triplet_slots = slots[:singlet_count], slots[singlet_count:]
+    singlet_ranks = [singlet_slots[i % len(singlet_slots)] for i in range(n_parities)]
+    triplet_ranks = [triplet_slots[i % len(triplet_slots)] for i in range(n_parities)]
+    return singlet_ranks, triplet_ranks

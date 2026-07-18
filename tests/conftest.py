@@ -205,6 +205,10 @@ def Get_processor_name():
     return getattr(_tls, "hostname", "node0")
 
 
+def gethostname():
+    return getattr(_tls, "hostname", "node0")
+
+
 class _Request:
     def __init__(self, wait_fn=None):
         self._wait_fn, self._done = wait_fn, False
@@ -418,6 +422,8 @@ FAKE_MPI = _types.SimpleNamespace(
     COMM_WORLD=COMM_WORLD,
     Get_processor_name=Get_processor_name,
 )
+
+FAKE_SOCKET = _types.SimpleNamespace(gethostname=gethostname)
 
 
 def run_parallel(size, fn, hostnames=None):

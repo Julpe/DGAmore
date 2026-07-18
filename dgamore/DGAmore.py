@@ -16,6 +16,7 @@ configuration and the assembled local quantities are broadcast to the other MPI 
 import itertools as it
 import logging
 import os
+import socket
 
 # OpenMPI: exclude the UCX one-sided (RMA) component before MPI init. Some OpenMPI 5.x builds fail its own
 # component-query and print a benign "OSC UCX component priority set inside component query failed" warning otherwise.
@@ -577,7 +578,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
     # Gather (hostname, available bytes) from every rank in a single collective and reduce to one entry per node:
     # the rank count and the (minimum, conservative) available memory on that node.
     node_available = psutil.virtual_memory().available
-    hostname = str(MPI.Get_processor_name()).strip()
+    hostname = socket.gethostname()
     nodes: dict[str, list] = {}
     for host, avail in comm.allgather((hostname, node_available)):
         if host not in nodes:

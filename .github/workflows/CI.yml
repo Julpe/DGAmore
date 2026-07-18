@@ -14,6 +14,7 @@ jobs:
   test:
     name: Test on ${{ matrix.os }} / Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -47,29 +48,26 @@ jobs:
       - name: Install wheel
         run: |
           pip install $(python -c "import glob; print(glob.glob('dist/*.whl')[0])")
-      # 7. Run tests with coverage.
-      #    Retries ONLY if the process was killed with SIGTERM (exit 143).
-      #    Any other exit code is passed through immediately without retrying.
+      # 7. Probe MPI initialization (diagnostic). If the runner's MPI_Init is the source of the
+      #    intermittent startup SIGTERM (exit 143), this cheap step catches and labels it first.
+      - name: Probe MPI initialization
+        shell: bash
+        run: |
+          python -c "from mpi4py import MPI; print('mpi4py lib:', MPI.Get_library_version().splitlines()[0], flush=True)"
+          for i in $(seq 1 10); do
+            python -c "from mpi4py import MPI; MPI.Get_processor_name(); print('probe', $i, 'MPI_INIT_OK', flush=True)" \
+              || { rc=$?; echo "::error::MPI init probe $i failed (exit $rc)"; exit "$rc"; }
+          done
+      # 8. Run tests with coverage.
       - name: Run tests
         shell: bash
         env:
           PYTHONUNBUFFERED: "1"
         run: |
-          max_attempts=3
-          attempt=0
-          while true; do
-            attempt=$((attempt + 1))
-            set +e
-            pytest tests --runslow --cov=dgamore --cov-report=term-missing --cov-report=xml --cov-fail-under=85 -vv
-            code=$?
-            set -e
-            if [ "$code" -eq 143 ] && [ "$attempt" -lt "$max_attempts" ]; then
-              echo "::warning::pytest was killed with SIGTERM (exit 143) on attempt ${attempt}/${max_attempts} — retrying"
-              continue
-            fi
-            exit "$code"
-          done
-      # 8. Upload coverage to Codecov (requires CODECOV_TOKEN for private repos)
+          trap 'echo "::warning::Run tests hit SIGTERM (exit 143); see how far pytest collection/tests got above"; exit 143' TERM INT
+          echo "pytest starting; collection imports the package and triggers MPI_Init"
+          pytest tests --runslow --cov=dgamore --cov-report=term-missing --cov-report=xml --cov-fail-under=85 -vv
+      # 9. Upload coverage to Codecov (requires CODECOV_TOKEN for private repos)
       - name: Upload test results to Codecov
         uses: codecov/codecov-action@v7
         with:

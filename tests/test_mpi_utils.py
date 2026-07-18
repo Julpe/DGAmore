@@ -20,7 +20,7 @@ from dgamore.brillouin_zone import KGrid
 from dgamore.four_point import FourPoint
 from dgamore.n_point_base import SpinChannel
 
-from tests.conftest import run_parallel, FAKE_MPI as MPI
+from tests.conftest import run_parallel, FAKE_MPI as MPI, FAKE_SOCKET
 
 # The shared conftest autouse-fixture no-ops os.remove (so the suite never deletes real files). Capture the genuine
 # os.remove here at import time, so the rank-file lifecycle test can opt back into real deletion without disturbing it.
@@ -32,6 +32,7 @@ def _use_fake_mpi(monkeypatch):
     # Inject the thread-based fake communicator into the module under test (the distributor, the chunking primitives
     # and the data-movement routines all live in mpi_utils now); real mpi4py is left untouched elsewhere.
     monkeypatch.setattr(mu, "MPI", MPI)
+    monkeypatch.setattr(mu, "socket", FAKE_SOCKET)
 
 
 @pytest.fixture(autouse=True)

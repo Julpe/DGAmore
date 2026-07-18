@@ -192,7 +192,7 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeyp
     captured = {}
     real_solver = eliashberg_solver.solve_eliashberg_lanczos
 
-    def capture_solver(gamma_r_pp, gchi0_q0_pp, ranks):
+    def capture_solver(gamma_r_pp, gchi0_q0_pp, ranks, parities=None):
         dense_holder = []
 
         def fake_eigsh(op, k, tol, v0, which, maxiter):
@@ -212,7 +212,7 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeyp
         gamma_full.free()
         with monkeypatch.context() as m:
             m.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
-            out = real_solver(gamma_r_pp, gchi0_q0_pp, ranks)
+            out = real_solver(gamma_r_pp, gchi0_q0_pp, ranks, parities)
         captured[channel]["dense"] = dense_holder[0]
         return out
 
