@@ -81,7 +81,12 @@ but separate files may be used instead. The results of a completed run are writt
 folder, whose name encodes run-specific parameters such as the momentum-grid size and the frequency box.
 
 .. note::
-   During the in-memory Eliashberg solve only one or two ranks compute while the others wait, so DGAmore spreads
+   During the in-memory Eliashberg solve the singlet and triplet, and (with ``resolve_frequency_parity``) their
+   frequency-even and frequency-odd sectors, are each solved on their own rank so all of them run concurrently -
+   up to four at once. How many run concurrently on a given node is decided from that node's free host memory: the
+   solver packs as many sector solves per node as fit (one pairing vertex per solving rank), never exceeding the
+   node's available memory, so a node with enough headroom can run all four while a memory-tight node runs fewer
+   and solves the rest sequentially. Spreading the ranks over several nodes therefore gives the most concurrency. Because at most a handful of ranks compute while the others wait, DGAmore additionally spreads
    the solver ranks' matrix-vector products over as many threads as their CPU affinity mask allows for exactly
    that phase (the results are bit-identical to the single-threaded ones, and ``OMP_NUM_THREADS=1`` stays correct
    for the rest of the run). The frequency-distributed solve (``save_memory_for_lanczos``) is threaded the same

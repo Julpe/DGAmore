@@ -23,6 +23,7 @@ from dgamore.eliashberg_solver import (
     create_local_gamma_ud_pp_w0,
     create_local_gamma_ud_pp_w0_per_ineq,
     _gamma_to_matmul_layout,
+    get_ranks_for_lanczos,
     solve_eliashberg_lanczos,
     symmetrize_degenerate_gaps,
     transform_vertex_loc_frequencies_w0,
@@ -577,6 +578,19 @@ def test_v2_thread_budget_falls_back_without_affinity_api_and_single_rank(monkey
     assert es._v2_solver_thread_budget(_make_budget_comm(4, 0, None), [0, 1, 2, 3]) == 1
     monkeypatch.setattr(es.os, "sched_getaffinity", lambda pid: set(range(6)), raising=False)
     assert es._v2_solver_thread_budget(_make_budget_comm(1, 0, None), [0]) == 6
+
+
+def test_v2_thread_budget_needs_no_initialized_mpi(monkeypatch):
+    """The frequency-distributed budget groups ranks by socket.gethostname, so it never calls MPI.Get_processor_name and works with MPI_Init skipped."""
+    import dgamore.eliashberg_solver as es
+
+    monkeypatch.setattr(es.os, "sched_getaffinity", lambda pid: set(range(8)), raising=False)
+    monkeypatch.setattr(es, "_openblas_thread_slot_cap", MagicMock(return_value=None))
+    monkeypatch.setattr(
+        es.MPI, "Get_processor_name", MagicMock(side_effect=RuntimeError("MPI not initialized")), raising=False
+    )
+    infos = [("n0", frozenset(range(8)))] * 2
+    assert es._v2_solver_thread_budget(_make_budget_comm(2, 0, infos), [0, 1]) == 4
 
 
 def test_openblas_thread_slot_cap_reads_back_compiled_maximum(monkeypatch):
@@ -1241,3 +1255,128 @@ def test_solve_eliashberg_lanczos_none_returns_single_unprojected_sector(monkeyp
 
     assert set(result) == {"none"}
     assert len(calls) == 1 and len(result["none"][1]) == config.eliashberg.n_eig
+
+
+@pytest.mark.parametrize(
+    "info, per_sector, giwk, expected",
+    [
+        # 4 nodes (one rank each), memory fits one vertex per node -> the four sectors spread over the four nodes
+        ([("n0", 100), ("n1", 100), ("n2", 100), ("n3", 100)], 90, 0, ([0, 1], [2, 3])),
+        # one node with four ranks and ample memory -> all four sectors run concurrently on that node
+        ([("n0", 10000)] * 4, 10, 0, ([0, 1], [2, 3])),
+        # one node whose memory only fits two vertices -> the singlet/triplet 2-way (sectors sequential per channel)
+        ([("n0", 250)] * 4, 100, 0, ([0, 0], [1, 1])),
+        # the bubble-node giwk reservation eats the memory down to one vertex -> everything sequential on one rank
+        ([("n0", 1000)] * 4, 100, 800, ([0, 0], [0, 0])),
+    ],
+)
+def test_get_ranks_for_lanczos_packs_sectors_by_node_memory(info, per_sector, giwk, expected):
+    """get_ranks_for_lanczos co-locates as many concurrent sector solves per node as its free memory fits (one
+    pairing vertex per solving rank), reserving the giwk on the bubble node, and falls back to fewer ranks otherwise."""
+    comm = MagicMock()
+    comm.allgather.side_effect = lambda payload: info
+    assert get_ranks_for_lanczos(comm, 2, info[0][1], per_sector, giwk) == expected
+
+
+@pytest.mark.parametrize(
+    "hostnames, n_parities, expected",
+    [
+        (["n0", "n0", "n1", "n1"], 2, ([0, 0], [2, 2])),
+        (["n0", "n0", "n0", "n0"], 2, ([0, 0], [1, 1])),
+        (["n0"], 2, ([0, 0], [0, 0])),
+        (["n0", "n1"], 1, ([0], [1])),
+    ],
+)
+def test_get_ranks_for_lanczos_falls_back_to_two_way_without_memory_info(hostnames, n_parities, expected):
+    """Without a per-sector memory estimate get_ranks_for_lanczos returns the proven 2-way: singlet on one node,
+    triplet on another (or a second rank of the sole node), with each channel's parities sequential on its rank."""
+    comm = MagicMock()
+    comm.allgather.side_effect = lambda payload: [(h, None) for h in hostnames]
+    assert get_ranks_for_lanczos(comm, n_parities) == expected
+
+
+def test_solve_eliashberg_lanczos_parities_subset_solves_only_requested(monkeypatch):
+    """Passing an explicit parities subset restricts the solve (and eigsh calls) to just those sectors."""
+    nq, niv_pp = (4, 4, 1), 2
+    config.eliashberg.n_eig = 2
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetry = "random"
+    config.eliashberg.resolve_frequency_parity = True
+    gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=13)
+
+    calls = []
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter):
+        calls.append(1)
+        n = op.shape[0]
+        return np.arange(k, 0, -1).astype(float), np.ones((n, k), dtype=np.complex64)
+
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        result = solve_eliashberg_lanczos(gamma, chi0, (0, 0), parities=["odd"])
+
+    assert set(result) == {"odd"} and len(calls) == 1
+
+
+def test_solve_sectors_in_memory_runs_each_sector_on_its_assigned_rank(monkeypatch):
+    """The in-memory sector distribution gathers each channel's vertex to its owner ranks, ships the bubble, solves
+    every (channel, parity) sector on its assigned rank (4 ranks on 4 nodes), and returns the full aggregated dict on
+    every rank."""
+    import dgamore.eliashberg_solver as es
+    from dgamore.bubble_gen import BubbleGenerator
+    from dgamore.gap_function import GapFunction
+    from dgamore.greens_function import GreensFunction
+    from dgamore.mpi_utils import MpiDistributor
+    from tests.conftest import FAKE_MPI, _tls, run_parallel
+
+    monkeypatch.setattr("dgamore.mpi_utils.MPI", FAKE_MPI)
+    nq, o, niv_pp, ntasks = (2, 2, 1), 1, 2, 8
+    n2 = 2 * niv_pp
+    config.lattice.nk = nq
+    config.lattice.k_grid = bz.KGrid(nq, symmetries=[])
+    config.sys.beta = 10.0
+    config.eliashberg.n_eig = 2
+    config.logger = MagicMock()
+
+    def fake_solver(gamma, gchi0, ranks, parities=None):
+        rank = getattr(_tls, "rank", 0)
+        n_eig = config.eliashberg.n_eig
+        return {
+            p: (
+                np.array([rank + 1] * n_eig, dtype=float),
+                [GapFunction(np.zeros(nq + (o, o, n2), dtype=np.complex64)) for _ in range(n_eig)],
+            )
+            for p in parities
+        }
+
+    def fake_bubble(giwk, niv, k_grid):
+        return FourPoint(
+            np.zeros((ntasks, 1, 1, 1, 1, n2)), SpinChannel.NONE, nq, 0, 1, True, True, True, FrequencyNotation.PP
+        )
+
+    monkeypatch.setattr(es, "solve_eliashberg_lanczos", fake_solver)
+    monkeypatch.setattr(BubbleGenerator, "create_generalized_chi0_q_pp_w0", fake_bubble)
+
+    def fn(comm, rank):
+        dist = MpiDistributor(ntasks=ntasks, comm=comm)
+        shape = (dist.my_size, o, o, o, o, n2, n2)
+        gsing = FourPoint(
+            np.zeros(shape, dtype=np.complex64), SpinChannel.SING, nq, 0, 2, True, True, True, FrequencyNotation.PP
+        )
+        gtrip = FourPoint(
+            np.zeros(shape, dtype=np.complex64), SpinChannel.TRIP, nq, 0, 2, True, True, True, FrequencyNotation.PP
+        )
+        giwk = GreensFunction(np.zeros(nq + (o, o, 10), dtype=np.complex64), nk=nq)
+        return es._solve_sectors_in_memory(dist, gsing, gtrip, giwk, niv_pp, [0, 2], [1, 3], 0, ["even", "odd"])
+
+    _, results = run_parallel(4, fn)
+    owners = {
+        (SpinChannel.SING, "even"): 1,
+        (SpinChannel.SING, "odd"): 3,
+        (SpinChannel.TRIP, "even"): 2,
+        (SpinChannel.TRIP, "odd"): 4,
+    }
+    for res in results:
+        assert set(res) == set(owners)
+        for key, expected_marker in owners.items():
+            assert res[key][0][0] == expected_marker and len(res[key][1]) == config.eliashberg.n_eig

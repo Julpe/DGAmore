@@ -27,6 +27,7 @@ chunked path.
 import gc
 import os
 import pickle
+import socket
 
 import h5py
 import mpi4py.MPI as MPI
@@ -813,7 +814,7 @@ def _get_node_aware_v_dist(n_nu, comm):
     size = comm.Get_size()
 
     # 1. Group ranks by physical hostname
-    local_hostname = str(MPI.Get_processor_name()).strip()
+    local_hostname = socket.gethostname()
     all_hostnames = comm.allgather(local_hostname)
 
     # Map hostnames to the list of ranks living on them

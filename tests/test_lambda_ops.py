@@ -7,7 +7,6 @@
 import os
 from unittest.mock import MagicMock
 
-import mpi4py
 import numpy as np
 import pytest
 
@@ -18,6 +17,8 @@ from dgamore.local_four_point import LocalFourPoint
 from dgamore.n_point_base import SpinChannel
 import dgamore.config as config
 import dgamore.brillouin_zone as bz
+
+from tests.conftest import FAKE_MPI
 
 
 def load_four_point(lc_type: str, filename: str, channel: SpinChannel) -> FourPoint:
@@ -112,7 +113,7 @@ def test_lambda_correction_in_sde_sp(monkeypatch, lc_type):
     config.lambda_correction.type = lc_type
     config.output.output_path = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/lambda_correction/{lc_type}"
 
-    comm_mock = MagicMock(wraps=mpi4py.MPI.COMM_WORLD)
+    comm_mock = MagicMock(wraps=FAKE_MPI.COMM_WORLD)
     with monkeypatch.context() as mp:
         mp.setattr("mpi4py.MPI.COMM_WORLD", comm_mock)
         config.logger = DgaLogger(comm_mock, "./")
