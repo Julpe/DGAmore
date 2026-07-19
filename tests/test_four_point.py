@@ -244,8 +244,7 @@ def _channel_interactions(rng, o=2, qtot=16, nq=(4, 4, 1)):
 
 
 def test_sub_inplace_with_local_interaction_matches_copy(rng):
-    """sub(u_loc, copy=False) broadcast-subtracts the local interaction into self in place, bit-equal to the
-    copying branch, and returns self."""
+    """sub(u_loc, copy=False) broadcast-subtracts the local interaction in place, bit-equal to the copy branch."""
     a, ref = _kernel_block(rng, SpinChannel.DENS, num_vn=2), None
     u_loc, _ = _channel_interactions(rng)
     ref = deepcopy(a).sub(u_loc)
@@ -255,8 +254,7 @@ def test_sub_inplace_with_local_interaction_matches_copy(rng):
 
 
 def test_add_inplace_with_nonlocal_interaction_matches_copy(rng):
-    """add(v_nonloc, copy=False) broadcast-adds the q-dependent interaction into self in place, bit-equal to the
-    copying branch."""
+    """add(v_nonloc, copy=False) broadcast-adds the q-dependent interaction in place, bit-equal to the copy branch."""
     a = _kernel_block(rng, SpinChannel.DENS, num_vn=2)
     _, v_nonloc = _channel_interactions(rng)
     ref = deepcopy(a).add(v_nonloc)
@@ -275,8 +273,7 @@ def _local_block(rng, num_vn=2, o=2, niw=3, niv=3):
 
 
 def test_add_inplace_with_local_fourpoint_matches_copy(rng):
-    """add(local_other, copy=False) broadcast-accumulates a momentum-independent operand into self in place,
-    bit-equal to the copying branch, leaving the operand untouched."""
+    """add(local_other, copy=False) accumulates a momentum-independent operand in place, bit-equal to the copy."""
     a, b = _kernel_block(rng, SpinChannel.DENS, num_vn=2), _local_block(rng, num_vn=2)
     b_before = b.mat.copy()
     ref = deepcopy(a).add(deepcopy(b))
@@ -294,8 +291,7 @@ def test_sub_inplace_with_local_fourpoint_rejects_vn_extension(rng):
 
 
 def test_add_on_vn_diagonal_matches_extend_and_add(rng):
-    """add_on_vn_diagonal(other, factor) equals extending the 1-vn other to the fermionic diagonal and adding the
-    scaled result, without allocating the extended block; mutates and returns self."""
+    """add_on_vn_diagonal(other, factor) equals extending the 1-vn other to the diagonal and adding, no block."""
     a = _kernel_block(rng, SpinChannel.DENS, num_vn=2)
     b = _kernel_block(rng, SpinChannel.NONE, num_vn=1)
     ref = deepcopy(a).add(deepcopy(b).scale(2.5).extend_vn_to_diagonal())
@@ -759,9 +755,7 @@ def test_invert_num_vn1_per_q_matches_batched_reference(rng):
 
 
 def test_invert_num_vn2_per_q_matches_batched_compound_reference(rng):
-    """The num_vn==2 invert matches a batched np.linalg.inv on the explicit compound layout [q, w, (1, 2, v),
-    (4, 3, v')] for both frequency notations (pp pairs rows (1, 3, v) x cols (4, 2, v') via the acbd permute), and
-    inverting twice returns the original."""
+    """The num_vn==2 invert matches a batched np.linalg.inv on the compound layout for both notations, round-trips."""
     nq = (3, 2, 1)
     qtot, o, niw, niv = 6, 2, 2, 2
     size = o * o * 2 * niv
@@ -813,6 +807,32 @@ def test_invert_and_sum_methods_agree_on_compressed_fp(small_fourpoint_compresse
     assert out2._num_vn_dimensions == 1
     assert out1.current_shape == out2.current_shape
     assert np.allclose(out1.mat, out2.mat, atol=1e-6)
+
+
+@pytest.mark.parametrize("o", [1, 2, 3])
+def test_invert_and_sum_v2_matches_full_inverse_across_band_counts(rng, o):
+    """The per-slice LU invert_and_sum_over_last_vn_v2 reproduces the full-inverse variant for one to three bands."""
+    nq_tot, niw, niv = 3, 2, 3
+    shape = (nq_tot, o, o, o, o, 2 * niw + 1, 2 * niv, 2 * niv)
+    mat = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    eye = 10.0 * np.eye(2 * niv)
+    for a in range(o):  # boost the compound diagonal so the complex64 per-slice inverse stays well-conditioned
+        for b in range(o):
+            mat[:, a, b, b, a] += eye
+    fp = FourPoint(
+        mat,
+        nq=(nq_tot, 1, 1),
+        num_wn_dimensions=1,
+        num_vn_dimensions=2,
+        has_compressed_q_dimension=True,
+        full_niw_range=True,
+    )
+    beta = 8.0
+    out_v1 = deepcopy(fp).invert_and_sum_over_last_vn(beta)
+    out_v2 = deepcopy(fp).invert_and_sum_over_last_vn_v2(beta)
+    assert out_v2.mat.dtype == np.complex64
+    assert out_v1.current_shape == out_v2.current_shape
+    assert np.allclose(out_v1.mat, out_v2.mat, atol=1e-4)
 
 
 def test_invert_and_sum_scales_with_beta(small_fourpoint_compressed):
@@ -875,8 +895,7 @@ def test_invert_and_sum_and_invert_preserve_complex64(small_fourpoint_compressed
 
 
 def _compound_product_reference_q(mat1: np.ndarray, mat2: np.ndarray, notation: FrequencyNotation) -> np.ndarray:
-    """Per-momentum compound-space matrix product of two full-index tensors [q,o,o,o,o,v,v'] in the given frequency
-    notation (ph: rows {1,2,v}, cols {4,3,v'}; pp: rows {1,3,v}, cols {4,2,v'})."""
+    """Per-momentum compound-space matrix product of two full-index tensors in the given frequency notation."""
     nq_tot, o, n2 = mat1.shape[0], mat1.shape[1], mat1.shape[-1]
     dim = o * o * n2
     order = (0, 1, 4, 3, 2, 5) if notation == FrequencyNotation.PH else (0, 2, 4, 3, 1, 5)
@@ -888,8 +907,7 @@ def _compound_product_reference_q(mat1: np.ndarray, mat2: np.ndarray, notation: 
 
 @pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
 def test_matmul_propagates_frequency_notation_and_compound_pairing(notation):
-    """Matmul contracts each momentum slice in the compound space of the operands' notation and the result carries
-    the frequency notation of self, so pp results unravel with the acbd back-permute."""
+    """Matmul contracts in the operands' compound notation and keeps self's notation (pp unravels via acbd)."""
     rng = np.random.default_rng(13)
     nq, o, niv = (2, 2, 1), 2, 3
     nq_tot = int(np.prod(nq))
@@ -908,9 +926,7 @@ def test_matmul_propagates_frequency_notation_and_compound_pairing(notation):
 
 @pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
 def test_matmul_mixed_vn_respects_frequency_notation(notation):
-    """The memory-saving 2vn @ 1vn matmul branch contracts each momentum slice with the notation's orbital pairing
-    (the 1vn operand acts nu-diagonally on the result's second frequency) and keeps the frequency notation of
-    self."""
+    """The 2vn @ 1vn matmul contracts with the notation's pairing (1vn nu-diagonal) and keeps self's notation."""
     rng = np.random.default_rng(16)
     nq, o, niv = (2, 2, 1), 2, 3
     nq_tot = int(np.prod(nq))
@@ -934,8 +950,7 @@ def test_matmul_mixed_vn_respects_frequency_notation(notation):
 
 @pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
 def test_matmul_with_local_interaction_respects_frequency_notation(notation):
-    """FourPoint @ LocalInteraction contracts the frequency-constant bare interaction with the notation's orbital
-    pairing on every momentum slice and keeps the frequency notation of the four-point operand."""
+    """FourPoint @ LocalInteraction contracts the bare interaction with the notation's pairing, keeps 4pt notation."""
     rng = np.random.default_rng(17)
     nq, o, niv = (2, 2, 1), 2, 3
     nq_tot = int(np.prod(nq))
@@ -954,8 +969,7 @@ def test_matmul_with_local_interaction_respects_frequency_notation(notation):
 
 
 def test_pow_pp_squares_in_pp_compound_space_without_explicit_identity():
-    """fp ** 2 on a pp object squares each momentum slice in the pp compound space (rows {1,3,v}, cols {4,2,v'})
-    and keeps the PP notation, with the matching identity derived internally via identity_like."""
+    """fp ** 2 on a pp object squares in pp compound space and keeps PP notation (identity via identity_like)."""
     rng = np.random.default_rng(20)
     nq, o, niv = (2, 2, 1), 2, 3
     nq_tot = int(np.prod(nq))

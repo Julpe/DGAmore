@@ -74,12 +74,11 @@ def create_gamma_r_with_shell_correction(
     :param u_loc: The bare local interaction :math:`U`.
     :return: The shell-corrected irreducible vertex :math:`\Gamma_{r}` as a :class:`LocalFourPoint`.
     """
-    # the +U below must couple ALL fermionic frequencies, so the block-diagonally inverted bubble is explicitly extended
-    # to the two-fermion layout first (keeping it 1-vn would put U on the nu-diagonal only - wrong physics).
-    chi_tilde_shell = (
-        gchi0.invert().extend_vn_to_diagonal() + 1.0 / config.sys.beta**2 * u_loc.as_channel(gchi_r.channel)
+    # the +U couples ALL fermionic frequencies (a rank-orbital^2 update on the block-diagonal inverse bubble), so the
+    # core box of (extend(chi0^-1) + U/beta^2)^-1 is built by the Woodbury identity - no full-box dense inversion.
+    chi_tilde_core_inv = gchi0.shell_inverse_core(
+        u_loc.as_channel(gchi_r.channel), config.sys.beta, config.box.niv_core
     ).invert()
-    chi_tilde_core_inv = chi_tilde_shell.cut_niv(config.box.niv_core).invert()
     # subtract/scale/accumulate in place on the freshly inverted block, so only that one two-fermion block is
     # allocated (the former chain held up to three such blocks at its peak)
     return (

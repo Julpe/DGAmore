@@ -398,6 +398,55 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         self.mat = np.linalg.inv(self.mat)
         return self.to_full_indices()
 
+    def shell_inverse_core(self, u_channel: "LocalInteraction", beta: float, niv_core: int) -> "LocalFourPoint":
+        r"""
+        Returns the core fermionic-frequency box of the shell-corrected inverse
+        :math:`\big(\mathrm{diag}_\nu[(\chi_{0}^{\omega\nu})^{-1}] + \mathcal{U}/\beta^2\big)^{-1}`, where ``self`` is
+        the bare bubble :math:`\chi_0` (one fermionic axis, block-diagonal in :math:`\nu`) and the interaction couples
+        every fermionic frequency. The full :math:`n_{\nu,\mathrm{full}}` compound inversion is avoided via the
+        Woodbury identity: the added term is a rank-:math:`\mathrm{orbital}^2` update
+        :math:`\mathcal{U}\otimes\mathbf{1}\mathbf{1}^T` on the block-diagonal inverse bubble, whose own inverse is
+        :math:`\chi_0` itself. With :math:`S=\sum_\nu \chi_{0}^{\omega\nu}` and
+        :math:`K'=(\mathcal{U}/\beta^2)(\mathbb{1}+S\,\mathcal{U}/\beta^2)^{-1}` (the :math:`\mathcal{U}^{-1}`-free
+        form, so a singular density-density :math:`\mathcal{U}` is admissible), the core block reads
+        :math:`\delta_{\nu\nu'}\chi_{0}^{\omega\nu} - \chi_{0}^{\omega\nu} K' \chi_{0}^{\omega\nu'}`. This replaces the
+        :math:`O((n_{\nu,\mathrm{full}}\,\mathrm{orbital}^2)^3)` dense inversion by an :math:`\mathrm{orbital}^2`
+        inverse plus an :math:`O(n_{\nu,\mathrm{core}}^2)` contraction, and never materializes a full-box compound
+        block. ``self`` is not modified.
+
+        :param u_channel: The channel-projected local interaction :math:`\mathcal{U}` (see :meth:`LocalInteraction.as_channel`).
+        :param beta: Inverse temperature :math:`\beta`.
+        :param niv_core: Number of positive fermionic frequencies of the returned core box.
+        :return: The shell-corrected inverse on the core box as a two-fermion :class:`LocalFourPoint` (half niw range).
+        """
+        o = self.n_bands
+        o2 = o * o
+
+        mat = self.mat
+        if self.full_niw_range:
+            mat = mat[..., mat.shape[-2] // 2 :, :]  # w >= 0 half, read-only (self is not mutated)
+        w_dim, vn_full = mat.shape[-2], mat.shape[-1]
+        niv = vn_full // 2
+
+        # bubble as compound (o1,o2) x (o4,o3) blocks per (w, v); pairing matches invert()/to_compound_indices
+        bubble = mat.transpose(4, 5, 0, 1, 3, 2).reshape(w_dim, vn_full, o2, o2)
+        u_compound = u_channel.mat.transpose(0, 1, 3, 2).reshape(o2, o2) / beta**2
+
+        lo, hi = niv - niv_core, niv + niv_core
+        identity = np.eye(o2, dtype=self.mat.dtype)
+        diag = np.arange(2 * niv_core)
+        core = np.empty((w_dim, 2 * niv_core, 2 * niv_core, o2, o2), dtype=self.mat.dtype)
+        for iw in range(w_dim):
+            s = bubble[iw].sum(axis=0)  # sum over the full fermionic box
+            k_prime = u_compound @ np.linalg.inv(identity + s @ u_compound)
+            g_core = bubble[iw, lo:hi]  # [2 niv_core, o2, o2]
+            block = -np.einsum("vpq,qr,wrs->vwps", g_core, k_prime, g_core, optimize=True)
+            block[diag, diag] += g_core  # + delta_{v v'} chi_0
+            core[iw] = block
+
+        core = core.reshape(w_dim, 2 * niv_core, 2 * niv_core, o, o, o, o).transpose(3, 4, 6, 5, 0, 1, 2)
+        return LocalFourPoint(core, u_channel.channel, 1, 2, False, self.full_niv_range)
+
     def matmul(self, other, left_hand_side: bool = True) -> "LocalFourPoint":
         """
         Helper method that allows for a matrix multiplication between LocalFourPoint and LocalFourPoint and LocalInteraction

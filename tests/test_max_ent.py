@@ -109,9 +109,7 @@ def test_orbital_to_band_basis_band_diagonal_is_symmetry_invariant():
 
 
 def _fake_problem(im_axis, re_axis, im_data, beta):
-    """AnalyticContinuationProblem stand-in: encodes the first im-axis value of the data it is handed into a
-    constant real-frequency spectrum, so the continued 'spectral function' carries the band-diagonal Green's
-    function it was fed."""
+    """AnalyticContinuationProblem stand-in: encodes the first im-axis data value into a constant real-freq spectrum."""
     a_opt = np.full(len(re_axis), float(np.imag(im_data[0])))
     return MagicMock(solve=MagicMock(side_effect=lambda *args, **kwargs: [SimpleNamespace(A_opt=a_opt.copy())]))
 
@@ -122,14 +120,12 @@ def _problem_from_solve(solve):
 
 
 def _fake_real_freq_two_point(spectrum=None, wgrid=None, kind=""):
-    """RealFreqTwoPoint stand-in whose kkt() returns a zero real part, so the continued self-energy reduces to
-    the (restored) Hartree shift."""
+    """RealFreqTwoPoint stand-in whose kkt() returns zero real part, so the self-energy reduces to the Hartree shift."""
     return MagicMock(kkt=MagicMock(return_value=np.zeros(len(wgrid))))
 
 
 def _build_hk(nk, n_bands, seed=0):
-    """Random Hermitian H(k) per k-point, with non-zero off-diagonal coupling so that
-    the band basis genuinely differs from the orbital basis."""
+    """Random Hermitian H(k) per k-point with off-diagonal coupling, so the band basis differs from the orbital"""
     rng = np.random.default_rng(seed)
     hk = np.zeros((*nk, n_bands, n_bands), dtype=complex)
     for idx in np.ndindex(*nk):
@@ -160,9 +156,7 @@ def _setup_maxent_config(tmp_path, nk, n_bands, niv_core=3, w_count=7, seed=0):
 
 
 def _expected_band_spectrum(mat, hk, nk, n_bands, niv_core, k_grid):
-    """Independently reproduces the expected full-BZ band-resolved spectrum: rotate to
-    band basis, take the band-diagonal at the IBZ points, read the first frequency, and
-    unfold via irrk_inv. Returns shape [nk_tot, n_bands]."""
+    """Reproduces the full-BZ band-resolved spectrum by rotating to band basis and unfolding the IBZ via irrk_inv."""
     giwk = GreensFunction(mat.copy(), nk=nk).cut_niv(niv_core).to_half_niv_range()
     rotated = orbital_to_band_basis(hk.copy(), giwk.mat.copy())
     nk_tot = int(np.prod(nk))
@@ -188,9 +182,7 @@ def patch_maxent_mpi(monkeypatch):
 
 @pytest.mark.parametrize("size", [1, 2])
 def test_perform_maxent_giwk_continues_band_diagonal_and_unfolds(tmp_path, patch_maxent_mpi, size):
-    """perform_maxent_giwk continues the band-diagonal Green's function and unfolds it over the full BZ; since
-    H(k) has off-diagonal coupling the result must differ from the orbital-diagonal continuation, which proves
-    the band rotation is applied."""
+    """perform_maxent_giwk continues the band-diagonal G and unfolds it, unlike orbital-diagonal continuation."""
     nk, n_bands, niv_core, w_count = (4, 4, 1), 2, 3, 7
     hk = _setup_maxent_config(tmp_path, nk, n_bands, niv_core, w_count, seed=7)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=11)

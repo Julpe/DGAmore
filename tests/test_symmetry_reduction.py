@@ -243,7 +243,7 @@ def test_get_symmetry_reduction_public_api_with_monkeypatched_discovery(monkeypa
 
 
 def test_expand_reconstructs_full_hamiltonian_from_ibz_values(monkeypatch):
-    """With a fake group containing a translation by (1,0,0), both FBZ points collapse onto the single representative at index 0. ``expand`` therefore replicates the single IBZ value across the full BZ."""
+    """A fake (1,0,0)-translation group collapses both FBZ points onto index 0, so expand replicates the IBZ value."""
     H = np.zeros((2, 1, 1, 1, 1), dtype=complex)
     H[0, 0, 0, 0, 0] = 1.0
     H[1, 0, 0, 0, 0] = 2.0
@@ -330,7 +330,7 @@ def test_expand_tensor_validates_kind_and_tensor_shape(monkeypatch):
 
 
 def test_expand_tensor_supports_shortcuts_and_sigma_power_zero(monkeypatch):
-    """``rank4`` shortcut means 4 orbital axes (kkbb pattern). With norb=1 the output shape is ``(nx, ny, nz, 1, 1, 1, 1)`` regardless of sigma. With ``sigma_power=0`` the per-k sign factor is suppressed entirely."""
+    """The rank4 shortcut gives 4 orbital axes; norb=1 gives size-1 orbitals and sigma_power=0 drops the sign."""
     H = np.zeros((2, 1, 1, 1, 1), dtype=complex)
     fake_group = {
         sr._GroupElement.identity(1, (2, 1, 1)),
@@ -384,7 +384,7 @@ def test_grid_action_bytes_caches_and_reuses_result():
 
 
 def test_discover_symmetries_branching_with_monkeypatched_helpers(monkeypatch):
-    """The discovery loop iterates ``sigma in {+1,-1}`` × valid q's × ``conj in {False,True}``. Patch the helpers so the eigenvalue pre-screen always matches and ``_solve_U_for_op`` succeeds; verify the returned op records have the expected schema and are deduplicated by (idx_q, sigma, conj, U)."""
+    """With the pre-screen and _solve_U_for_op patched to succeed, discovery returns deduplicated op records."""
     H = np.zeros((2, 1, 1, 1, 1), dtype=complex)
 
     with monkeypatch.context() as mp:
@@ -411,7 +411,7 @@ def test_translate_kgrid_identity_translation_keeps_indices():
 
 
 def test_apply_m_to_kgrid_indices_with_axis_swap_is_modulo_correct():
-    """For an x<->y swap to act consistently on the grid, the two axes must be commensurate. With nk=(3,3,1) the swap maps (ix, iy, iz) to (iy, ix, iz)."""
+    """On nk=(3,3,1) an x<->y swap maps (ix,iy,iz) to (iy,ix,iz) modulo the commensurate axes."""
     nk = (3, 3, 1)
     swap_xy = np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.int64)
     out = sr._apply_M_to_kgrid_indices(swap_xy, nk)
@@ -449,7 +449,7 @@ def test_solve_u_for_op_accepts_global_phase_equivalent_matching():
 
 
 def test_fix_phases_nondegenerate_can_return_unitary_for_diagonal_case():
-    """When Hk == Hg and both are diagonal with distinct eigenvalues, the identity U is one valid solution. _fix_phases_nondegenerate should find it (with phi all 1) without needing rng patching: the natural rng draws will eventually produce a k1 where the off-diagonal phases are determined consistently."""
+    """For diagonal Hk == Hg with distinct eigenvalues _fix_phases_nondegenerate finds the identity U."""
     nk = (2, 1, 1)
     hk = np.zeros((*nk, 2, 2), dtype=complex)
     hg = np.zeros((*nk, 2, 2), dtype=complex)
@@ -587,7 +587,7 @@ def test_group_element_equality_depends_on_canonical_action_and_phase():
 
 
 def test_discover_symmetries_dedups_identical_M_grid_actions(monkeypatch):
-    """When two enumerated M's produce identical grid actions, the second one should be skipped by the M-dedup. With identity-everywhere mocks and 1 k-point, the loop iterates: 1 unique-M × 2 sigmas × 1 q × 2 conjs = 4 distinct ops."""
+    """When two M's give identical grid actions the second is skipped, so identity mocks yield 4 distinct ops."""
     H = np.zeros((1, 1, 1, 1, 1), dtype=complex)
 
     with monkeypatch.context() as mp:
@@ -728,7 +728,7 @@ def test_apply_auto_orbital_transform_handles_empty_input():
 
 
 def test_solve_u_for_op_one_orbital_returns_identity_when_spectra_match():
-    """For norb=1, U is a 1x1 unitary (a global phase). Identity always works when spectra match, regardless of grid extent."""
+    """For norb=1, U is a global phase, so identity always solves when spectra match, regardless of grid extent."""
     h_k = np.zeros((3, 2, 4, 1, 1), dtype=complex)
     h_k[..., 0, 0] = np.arange(24).reshape(3, 2, 4)
     h_g = h_k.copy()
@@ -751,7 +751,7 @@ def test_solve_u_for_op_one_orbital_returns_none_when_spectra_differ():
 
 
 def test_solve_u_for_op_one_orbital_does_not_call_eigh(monkeypatch):
-    """The norb=1 path short-circuits before any eigendecomposition or gauge fixing. Patch _fix_phases_nondegenerate/_fix_gauge_degenerate to raise if invoked."""
+    """The norb=1 path short-circuits before any eigendecomposition or gauge fixing (the fixers raise if invoked)."""
     h_k = np.zeros((2, 1, 1, 1, 1), dtype=complex)
     h_k[..., 0, 0] = np.array([1.0, 2.0]).reshape(2, 1, 1)
 
@@ -805,7 +805,7 @@ def _require_hamiltonian(fname: str, expected_shape: tuple) -> np.ndarray:
 
 @pytest.mark.parametrize("fname,shape", _HAMILTONIAN_CASES)
 def test_auto_symmetry_discovery_reconstructs_hamiltonian(fname, shape):
-    """For every supplied Hamiltonian, the IBZ -> FBZ reconstruction via the auto-discovered symmetry data must reproduce H to machine precision (double). This is the most important integration test: if it passes, the entire discover -> close-group -> orbit-collapse -> expand pipeline is consistent."""
+    """The IBZ->FBZ reconstruction via the auto-discovered symmetry data reproduces every H to double precision."""
     H = _require_hamiltonian(fname, shape)
 
     result = sr.get_symmetry_reduction(H, atol=1e-8, verbose=False)
@@ -828,7 +828,7 @@ def test_auto_symmetry_discovery_reconstructs_hamiltonian(fname, shape):
 
 @pytest.mark.parametrize("fname,shape", _HAMILTONIAN_CASES)
 def test_auto_symmetry_discovery_expand_tensor_reproduces_HtimesH_vertex(fname, shape):
-    """Build a rank-4 tensor Gamma = H tensor H (which inherits the same symmetries as H since each factor transforms identically), reduce to IBZ, expand back, and check exact recovery. This exercises the 4-orbital-index expand_tensor path and verifies the sigma_power=2 convention (sigma^2 == 1 always)."""
+    """Gamma = H (x) H reduced to IBZ and expanded back recovers exactly, exercising the rank-4 sigma_power=2 path."""
     H = _require_hamiltonian(fname, shape)
     nx, ny, nz, nb, _ = shape
 
@@ -846,7 +846,7 @@ def test_auto_symmetry_discovery_expand_tensor_reproduces_HtimesH_vertex(fname, 
 
 
 def test_auto_discovery_finds_2d_square_group_for_isotropic_lattice():
-    """The 32x32x1 1-band square lattice has full square point group D4h × TR. Auto should detect the 8-element point group (and combine it with TR-like operations to give a 16-element total)."""
+    """The 32x32x1 isotropic square lattice's auto group is the 8-element point group (16 with TR-like ops)."""
     H = _require_hamiltonian("hk_1band_square_32x32x1.npy", (32, 32, 1, 1, 1))
     result = sr.get_symmetry_reduction(H, atol=1e-8, verbose=False)
     # empirically 8 spatial (+8 TR-combined) group elements; the IBZ is 153/1024 ~= an 8x reduction
@@ -856,7 +856,7 @@ def test_auto_discovery_finds_2d_square_group_for_isotropic_lattice():
 
 
 def test_auto_discovery_finds_smaller_group_for_anisotropic_lattice():
-    """The 48x48x1 anisotropic 1-band lattice has tx != ty, so kx<->ky is NOT a symmetry. Only inversion and individual axis flips (real H) survive. The IBZ should be ~4x reduced, much less than 8x for the isotropic case."""
+    """The anisotropic lattice (tx != ty) drops kx<->ky, so only inversion and axis flips survive."""
     H = _require_hamiltonian("hk_1band_anisotropy_48x48x1.npy", (48, 48, 1, 1, 1))
     result = sr.get_symmetry_reduction(H, atol=1e-8, verbose=False)
 
@@ -868,7 +868,7 @@ def test_auto_discovery_finds_smaller_group_for_anisotropic_lattice():
 
 @pytest.mark.slow
 def test_auto_discovery_matches_explicit_cubic_group_for_12cubed_hamiltonian():
-    """Auto-discovered IBZ partition must match the explicit three_dimensional_cubic partition for a genuinely cubic 3-band Hamiltonian. (12^3 - slower.)"""
+    """The auto IBZ partition matches the explicit three_dimensional_cubic partition for a cubic 3-band H (12^3)."""
     import dgamore.brillouin_zone as bz
 
     fname, shape = "hk_3band_srvo3_cubic_12x12x12.npy", (12, 12, 12, 3, 3)
@@ -903,7 +903,7 @@ def test_auto_discovery_matches_explicit_cubic_group_for_20cubed_hamiltonian():
 
 
 def test_get_symmetry_reduction_on_trivial_1x1x1_grid():
-    """A single k-point: every symmetry operation acts trivially on k-space. IBZ has exactly 1 point, the FBZ point coincides with it."""
+    """A single k-point: every symmetry acts trivially, the IBZ has one point and the FBZ point coincides with it."""
     H = np.zeros((1, 1, 1, 2, 2), dtype=complex)
     H[..., 0, 0] = 1.0
     H[..., 1, 1] = 2.0
@@ -923,7 +923,7 @@ def test_get_symmetry_reduction_on_trivial_1x1x1_grid():
 
 
 def test_get_symmetry_reduction_on_random_non_symmetric_hamiltonian_yields_full_bz_ibz():
-    """A random Hermitian H with no special structure has only the trivial symmetry group {e} (and possibly TR if real). IBZ should equal FBZ for a sufficiently generic complex H."""
+    """A generic complex Hermitian H has only the trivial group, so the IBZ equals the FBZ."""
     rng = np.random.default_rng(7)
     nx, ny, nz, nb = 4, 4, 1, 2
     H = rng.standard_normal((nx, ny, nz, nb, nb)) + 1j * rng.standard_normal((nx, ny, nz, nb, nb))
@@ -951,7 +951,7 @@ def test_get_symmetry_reduction_handles_zero_hamiltonian():
 
 
 def test_get_symmetry_reduction_handles_diagonal_real_hamiltonian():
-    """A purely-diagonal H with cos-like dispersion on a cubic grid -- exercise a case where the orbital action is identity for all symmetries."""
+    """A purely-diagonal cubic H exercises the case where the orbital action is identity for all symmetries."""
     nx = ny = nz = 4
     j1, j2, j3 = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
     k1 = 2 * np.pi * j1 / nx
@@ -992,7 +992,7 @@ def test_get_symmetry_reduction_returns_callables_and_complete_dict_schema():
 
 
 def test_apply_auto_orbital_transform_two_orbital_axes_preserves_trailing_dims():
-    """The function is shape-polymorphic in the trailing axes after the orbital pair: pass an array with extra frequency-like axes and verify they pass through."""
+    """apply_auto_orbital_transform is shape-polymorphic in the trailing axes after the orbital pair."""
     k_local, nb, n_extra = 2, 2, 3
     mat = np.arange(k_local * nb * nb * n_extra, dtype=np.complex128).reshape(k_local, nb, nb, n_extra)
     us = np.stack([np.eye(nb), np.eye(nb)]).astype(np.complex128)
@@ -1006,7 +1006,7 @@ def test_apply_auto_orbital_transform_two_orbital_axes_preserves_trailing_dims()
 
 
 def test_apply_auto_orbital_transform_returns_input_array_object_for_identity_only_groups():
-    """When every k-point has identity (U, sigma=+1, conj=False), the function returns the same array object without allocating a new one."""
+    """For identity-only groups the function returns the same array object without allocating."""
     mat = np.arange(8, dtype=np.complex128).reshape(2, 2, 2)
     us = np.stack([np.eye(2), np.eye(2)]).astype(np.complex128)
     sigmas = np.array([1, 1], dtype=int)
@@ -1029,21 +1029,21 @@ def _make_real_cubic_h(nx=4, ny=4, nz=4, nb=1):
 
 
 def test_get_symmetry_reduction_default_excludes_antiunitary_ops():
-    """The default behavior must drop anti-unitary operations; therefore no FBZ point should carry conj=True. This is the safe semantics for frequency- dependent quantities."""
+    """The default drops anti-unitary ops, so no FBZ point carries conj=True (safe for frequency objects)."""
     H = _make_real_cubic_h(4, 4, 4, 1)
     result = sr.get_symmetry_reduction(H, atol=1e-8)
     assert result["conjs"].any() == False  # noqa: E712 - explicit bool check
 
 
 def test_get_symmetry_reduction_include_antiunitary_admits_conj_ops():
-    """For a real-valued H, H(k) = H(k)* always gives anti-unitary ops; opting in must therefore produce at least one conj=True point."""
+    """For a real H, H(k)=H(k)* gives anti-unitary ops, so opting in produces at least one conj=True point."""
     H = _make_real_cubic_h(4, 4, 4, 1)
     result = sr.get_symmetry_reduction(H, atol=1e-8, include_antiunitary=True)
     assert int(result["conjs"].sum()) > 0
 
 
 def test_get_symmetry_reduction_include_antiunitary_shrinks_or_equals_ibz():
-    """Adding TR ops can only make orbits larger, never smaller; hence the IBZ with anti-unitary ops must be smaller than or equal to the spatial-only IBZ."""
+    """Adding TR ops only grows orbits, so the anti-unitary IBZ is smaller than or equal to the spatial-only IBZ."""
     H = _make_real_cubic_h(4, 4, 4, 1)
     r_default = sr.get_symmetry_reduction(H, atol=1e-8, include_antiunitary=False)
     r_full = sr.get_symmetry_reduction(H, atol=1e-8, include_antiunitary=True)
@@ -1051,7 +1051,7 @@ def test_get_symmetry_reduction_include_antiunitary_shrinks_or_equals_ibz():
 
 
 def test_get_symmetry_reduction_include_antiunitary_reconstructs_H_correctly():
-    """When anti-unitary ops are included, reconstruction of H itself is still correct (anti-unitary ops are valid symmetries of H - only frequency-dependent objects are affected by the missing freq flip)."""
+    """With anti-unitary ops included, H reconstruction is still exact (only frequency objects need the freq flip)."""
     H = _make_real_cubic_h(4, 4, 4, 1)
     result = sr.get_symmetry_reduction(H, atol=1e-8, include_antiunitary=True)
     H_ibz = H.reshape(-1, 1, 1)[result["irrk_ind"]]
@@ -1076,7 +1076,7 @@ def test_get_symmetry_reduction_verbose_does_not_report_drop_when_keeping_antiun
 
 
 def test_get_symmetry_reduction_default_yields_no_conjugation_in_expansion():
-    """Concrete consequence of default ``include_antiunitary=False``: applying ``expand`` to any IBZ payload does NOT conjugate orbital indices anywhere. We verify this by feeding a complex payload built so that conjugation would be detectable (the conjugate differs from the original)."""
+    """With the default, expand never conjugates orbital indices, checked with a payload whose conjugate differs."""
     H = _make_real_cubic_h(4, 4, 4, 1)
     result = sr.get_symmetry_reduction(H, atol=1e-8)
     # Reconstruct H itself - well-defined and exact
@@ -1087,7 +1087,7 @@ def test_get_symmetry_reduction_default_yields_no_conjugation_in_expansion():
 
 
 def test_canonicalize_sign_gauge_norb_gt_6_fallback_flips_negative_rows():
-    """For norb > 6 the routine uses a row-major canonicalization: each row is scaled by the sign of its largest-magnitude entry. With a diagonal H the sign flips cancel in U H U^dag, so the canonicalized U is returned."""
+    """For norb > 6 the row-major sign canonicalization returns U when the flips cancel in U H U^dag (diagonal H)."""
     norb = 8
     Hk = np.diag(np.arange(1.0, norb + 1)).astype(complex)[None, None, None]
     Hg = Hk.copy()
@@ -1103,7 +1103,7 @@ def test_canonicalize_sign_gauge_norb_gt_6_fallback_flips_negative_rows():
 
 
 def test_canonicalize_sign_gauge_norb_gt_6_returns_original_when_canon_breaks_solution():
-    """If the row-major sign flip moves U out of the centralizer of a *non*- degenerate H, the resulting matrix no longer solves U H U^dag = Hg and the original U is returned unchanged. A rotation angle near pi/2 makes exactly one row of the 2x2 block flip (so the flip does not cancel)."""
+    """For norb > 6, if the sign flip breaks U H U^dag = Hg for non-degenerate H the original U is returned."""
     norb = 7
     base = np.diag(np.arange(1.0, norb + 1))
     base[0, 1] = base[1, 0] = 0.3
@@ -1129,7 +1129,7 @@ def test_canonicalize_sign_gauge_norb_gt_6_returns_original_when_canon_breaks_so
 
 
 def test_canonicalize_sign_gauge_accepts_lower_score_sign_diagonal():
-    """For norb <= 6 the routine searches sign-diagonals. Starting from U = -I (two negative entries), D = -I yields +I (zero negative entries) which still solves, so the lower-score solution is accepted."""
+    """For norb <= 6 a lower-score sign-diagonal that still solves is accepted (U=-I with D=-I yields +I)."""
     Hk = np.diag([1.0, 2.0]).astype(complex)[None, None, None]
     Hg = Hk.copy()
     U = -np.eye(2, dtype=complex)
@@ -1139,14 +1139,14 @@ def test_canonicalize_sign_gauge_accepts_lower_score_sign_diagonal():
 
 
 def test_solve_u_for_op_one_orbital_returns_none_when_close_but_outside_atol():
-    """norb==1: spectra agree within 10*atol (the pre-screen passes) but H itself differs by more than atol, so the final validation fails and None is returned. Near-zero values keep allclose's relative term from masking the difference."""
+    """For norb=1, spectra within 10*atol but H differing beyond atol fails validation and returns None."""
     Hg = np.array([[[[[0.0 + 0j]]]]])
     Hk = np.array([[[[[5e-12 + 0j]]]]])
     assert sr._solve_U_for_op(Hg, Hk, atol=1e-12) is None
 
 
 def test_solve_u_for_op_continues_when_perpoint_eigh_spectra_disagree(monkeypatch):
-    """The global eigenvalue pre-screen passes (Hk == Hg), but a patched eigh desynchronizes the per-point spectra between the Hk and Hg evaluations, so every candidate reference point hits the `continue` and None is returned."""
+    """A patched eigh desyncs the per-point Hk/Hg spectra, so every reference point continues and returns None."""
     Hk = np.zeros((2, 1, 1, 2, 2), dtype=complex)
     Hk[..., 0, 0] = np.array([1.0, 1.0]).reshape(2, 1, 1)
     Hk[..., 1, 1] = np.array([2.0, 3.0]).reshape(2, 1, 1)
@@ -1166,7 +1166,7 @@ def test_solve_u_for_op_continues_when_perpoint_eigh_spectra_disagree(monkeypatc
 
 
 def test_solve_u_for_op_routes_through_degenerate_gauge_fix():
-    """A 2-fold degenerate spectrum forces the degenerate-cluster branch: the naive W @ V^dag picks an arbitrary orientation of the degenerate eigenspace that does not match the (fixed) U relating Hk and Hg, so _fix_gauge_degenerate must solve for the block rotation. The returned U must satisfy the relation."""
+    """A 2-fold degenerate spectrum routes through _fix_gauge_degenerate, which solves the block rotation matching U."""
     norb = 3
     nk = (6, 1, 1)
     rng = np.random.default_rng(0)
@@ -1193,7 +1193,7 @@ def test_solve_u_for_op_routes_through_degenerate_gauge_fix():
 
 
 def test_fix_phases_nondegenerate_hits_near_zero_ratio_continue():
-    """When A[r, col] is significant but B[r, col] ~ 0, the candidate phase has near-zero magnitude and is skipped (`continue`). With no column yielding a consistent phase, every trial fails and None is returned."""
+    """When B[r,col] ~ 0 the candidate phase is near-zero and skipped; with no consistent column it returns None."""
     nk = (3, 1, 1)
     Hk = np.zeros((*nk, 2, 2), dtype=complex)
     Hg = np.zeros((*nk, 2, 2), dtype=complex)
@@ -1223,7 +1223,7 @@ def test_fix_gauge_degenerate_returns_none_on_stacked_svd_linalgerror(monkeypatc
 
 
 def test_fix_gauge_degenerate_returns_none_on_block_svd_linalgerror(monkeypatch):
-    """If the per-block SVD raises LinAlgError (after the stacked SVD succeeded and a null vector was found), the routine returns None."""
+    """If the per-block SVD raises LinAlgError after a null vector was found, _fix_gauge_degenerate returns None."""
     nk = (2, 1, 1)
     Hk = np.zeros((*nk, 2, 2), dtype=complex)
     Hg = np.zeros((*nk, 2, 2), dtype=complex)
@@ -1246,7 +1246,7 @@ def test_fix_gauge_degenerate_returns_none_on_block_svd_linalgerror(monkeypatch)
 
 
 def test_discover_symmetries_handles_hash_collision_of_grid_actions(monkeypatch):
-    """Two M's with distinct grid actions but a (forced) identical hash must both be kept: the collision is confirmed via array comparison and the second M is appended rather than dropped."""
+    """Two M's with distinct grid actions but a forced identical hash are both kept (confirmed by array compare)."""
     H = np.zeros((2, 1, 1, 1, 1), dtype=complex)
     with monkeypatch.context() as mp:
         mp.setattr(
@@ -1258,7 +1258,7 @@ def test_discover_symmetries_handles_hash_collision_of_grid_actions(monkeypatch)
         mp.setattr(
             sr,
             "_apply_M_to_kgrid_indices",
-            MagicMock(side_effect=[np.array([0, 1], dtype=np.int64), np.array([1, 0], dtype=np.int64)]),
+            MagicMock(side_effect=lambda M, nk: np.array([0, 1] if int(M[0, 0]) > 0 else [1, 0], dtype=np.int64)),
         )
         mp.setattr(sr, "_apply_M_to_ev_field", MagicMock(return_value=np.zeros((2, 1, 1, 1))))
         mp.setattr(sr, "_solve_U_for_op", MagicMock(return_value=np.eye(1)))
@@ -1269,7 +1269,7 @@ def test_discover_symmetries_handles_hash_collision_of_grid_actions(monkeypatch)
 
 
 def test_discover_symmetries_handles_zero_pivot_in_U_canonicalization(monkeypatch):
-    """When the solver returns an all-near-zero U, the canonical-bytes helper has a near-zero pivot magnitude and skips the phase division (the else branch)."""
+    """An all-near-zero U gives a near-zero pivot, so canonical-bytes skips the phase division (else branch)."""
     H = np.zeros((1, 1, 1, 1, 1), dtype=complex)
     with monkeypatch.context() as mp:
         mp.setattr(sr, "_enumerate_integer_matrices", MagicMock(return_value=[np.eye(3, dtype=np.int64)]))
@@ -1282,7 +1282,7 @@ def test_discover_symmetries_handles_zero_pivot_in_U_canonicalization(monkeypatc
 
 
 def test_discover_symmetries_skips_duplicate_action_key(monkeypatch):
-    """Two distinct M's whose translated grid actions coincide for some q (with identical sigma/conj/U) produce the same action key; the duplicate is skipped rather than recorded twice."""
+    """Two M's whose translated grid actions coincide for some q share an action key, so the duplicate is skipped."""
     H = np.zeros((2, 1, 1, 1, 1), dtype=complex)
     with monkeypatch.context() as mp:
         mp.setattr(
@@ -1294,7 +1294,7 @@ def test_discover_symmetries_skips_duplicate_action_key(monkeypatch):
         mp.setattr(
             sr,
             "_apply_M_to_kgrid_indices",
-            MagicMock(side_effect=[np.array([0, 1], dtype=np.int64), np.array([1, 0], dtype=np.int64)]),
+            MagicMock(side_effect=lambda M, nk: np.array([0, 1] if int(M[0, 0]) > 0 else [1, 0], dtype=np.int64)),
         )
         mp.setattr(sr, "_apply_M_to_ev_field", MagicMock(return_value=np.zeros((2, 1, 1, 1))))
         mp.setattr(sr, "_solve_U_for_op", MagicMock(return_value=np.eye(1)))
@@ -1317,7 +1317,7 @@ def test_grid_action_bytes_evicts_cache_past_size_cap():
 
 
 def test_close_group_returns_early_when_max_size_reached_during_composition():
-    """A translation generator on an 8-point axis generates an 8-element cyclic group; with max_size=4 the closure aborts mid-composition and returns the partially-built group."""
+    """An 8-point translation generates an 8-element group; with max_size=4 the closure returns the partial group."""
     nk = (8, 1, 1)
     ops_raw = [
         {
@@ -1333,7 +1333,7 @@ def test_close_group_returns_early_when_max_size_reached_during_composition():
 
 
 def test_group_element_with_near_zero_U_skips_phase_normalization():
-    """A U whose entries are all ~0 has a near-zero pivot magnitude, so the global phase normalization is skipped (the False side of the pivot guard)."""
+    """An all-near-zero U has a near-zero pivot, so the global phase normalization is skipped (pivot-guard False)."""
     g = sr._GroupElement(
         np.eye(3, dtype=np.int64),
         np.zeros(3, dtype=np.int64),
@@ -1350,7 +1350,7 @@ def _rot2(theta):
 
 
 def test_apply_auto_orbital_transform_four_orbital_nonidentity_einsum():
-    """A non-identity U with 4 orbital axes exercises the rank-4 einsum branch (the identity short-circuit does not apply)."""
+    """A non-identity U with 4 orbital axes exercises the rank-4 einsum branch (identity short-circuit skipped)."""
     u = _rot2(np.pi / 5)
     mat = np.arange(1, 1 + 16, dtype=np.complex128).reshape(1, 2, 2, 2, 2)
     us = np.array([u])
@@ -1365,7 +1365,7 @@ def test_apply_auto_orbital_transform_four_orbital_nonidentity_einsum():
 
 
 def test_apply_auto_orbital_transform_reuses_cached_path_two_dim():
-    """Two distinct non-identity groups in one call: the second reuses the cached 2-index einsum path (the False side of `if path_2 is None`)."""
+    """Two non-identity groups in one call: the second reuses the cached 2-index einsum path."""
     us = np.stack([_rot2(np.pi / 5), _rot2(np.pi / 3)])
     mat = np.arange(2 * 2 * 2, dtype=np.complex128).reshape(2, 2, 2)
     sigmas = np.array([1, 1], dtype=int)

@@ -506,8 +506,7 @@ def test_nk_seg_returns_diff_of_cind():
 
 
 def test_k_axis_normalized_positions_and_length():
-    """The k-axis normalizes positions to [0,1] by cumulative distance: four consecutive k-points with equal
-    step lengths of 1 give cumulative positions [0,1,2,3], normalized by 3 to [0, 1/3, 2/3, 1]."""
+    """The k-axis normalizes cumulative distances to [0,1]: four unit-step points give [0, 1/3, 2/3, 1]."""
     kp = KPath(nk=(4, 4, 4), path="gamma-x")
     kp.kpts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]])
     kp.nkp = [2, 2]
@@ -517,7 +516,7 @@ def test_k_axis_normalized_positions_and_length():
 
 
 def test_build_k_path_single_segment_gamma_to_x():
-    """For nk=(4,4,4) and path 'gamma-x' the segment should produce two indices: [[0,0,0], [1,0,0]] and nkp should be [2]."""
+    """For nk=(4,4,4) the 'gamma-x' segment yields indices [[0,0,0],[1,0,0]] and nkp [2]."""
     kp = KPath(nk=(4, 4, 4), path="gamma-x")
     k_path, nkp = kp.build_k_path()
 
@@ -528,7 +527,7 @@ def test_build_k_path_single_segment_gamma_to_x():
 
 
 def test_get_kpath_val_reads_each_axis_for_its_own_column():
-    """get_kpath_val maps the x/y/z path columns through kx/ky/kz respectively (regression: kx was used for all three)."""
+    """get_kpath_val maps the x/y/z path columns through kx/ky/kz (regression: kx was used for all three)."""
     kp = KPath(nk=(4, 4, 4), path="gamma-x")
     kp.kx = np.array([10.0, 11.0, 12.0])
     kp.ky = np.array([20.0, 21.0, 22.0])
@@ -592,10 +591,7 @@ def test_get_lattice_symmetries_from_string_auto_is_case_insensitive():
 
 
 def _make_small_real_cubic_h(nx=4, ny=4, nz=4, nb=1):
-    """A simple real, Hermitian, cubic-symmetric H on a small grid - convenient for
-    testing auto-detection. With a single band the orbital action is trivial; the
-    discovered symmetry is the spatial cubic group (8 ops for nx=ny=nz with all-axes
-    inversions + permutations)."""
+    """A small real Hermitian cubic-symmetric single-band H; the auto-discovered group is the spatial cubic group."""
     j1, j2, j3 = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
     k1 = 2 * np.pi * j1 / nx
     k2 = 2 * np.pi * j2 / ny
@@ -626,7 +622,7 @@ def test_kgrid_with_no_symmetries_does_not_set_auto_mode():
 
 
 def test_kgrid_auto_mode_starts_with_trivial_ibz_and_no_auto_data():
-    """Before specify_auto_symmetries() is called, the auto-mode KGrid behaves like the symmetry-free case: the IBZ equals the FBZ. The auto-data slots are unset."""
+    """Before specify_auto_symmetries an auto KGrid has IBZ == FBZ and unset auto-data slots."""
     nx, ny, nz = 4, 4, 4
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     assert grid._auto_us is None
@@ -637,7 +633,7 @@ def test_kgrid_auto_mode_starts_with_trivial_ibz_and_no_auto_data():
 
 
 def test_kgrid_is_auto_property_is_false_before_specify_auto_symmetries():
-    """``is_auto`` is the runtime indicator that auto-data has been populated. It must be False between construction and specify_auto_symmetries()."""
+    """is_auto is False between construction and specify_auto_symmetries and True afterward."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
     assert grid.is_auto is False
 
@@ -658,7 +654,7 @@ def test_kgrid_is_auto_property_is_true_after_specify_auto_symmetries():
 
 
 def test_specify_auto_symmetries_populates_all_expected_arrays():
-    """After a successful call, every cached IBZ-related field plus the new auto-data fields must be populated and internally consistent."""
+    """After a successful call every cached IBZ field and auto-data field is populated and consistent."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
@@ -680,7 +676,7 @@ def test_specify_auto_symmetries_populates_all_expected_arrays():
 
 
 def test_specify_auto_symmetries_produces_consistent_fbz2irrk_and_irrk_inv():
-    """irrk_inv must be a true inverse of irrk_ind w.r.t. fbz2irrk: irrk_ind[irrk_inv[k]] == fbz2irrk.flat[k] for every k."""
+    """irrk_inv inverts irrk_ind w.r.t. fbz2irrk: irrk_ind[irrk_inv[k]] == fbz2irrk.flat[k] for every k."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
@@ -725,7 +721,7 @@ def test_specify_auto_symmetries_sigmas_are_plus_or_minus_one():
 
 
 def test_specify_auto_symmetries_default_drops_antiunitary_ops():
-    """The default ``include_antiunitary=False`` filters out time-reversal-like ops so the FBZ expansion is safe for frequency-dependent objects: no per-k transformation should carry conj=True."""
+    """The default include_antiunitary=False drops time-reversal-like ops, so no per-k transform carries conj=True."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
@@ -734,7 +730,7 @@ def test_specify_auto_symmetries_default_drops_antiunitary_ops():
 
 
 def test_specify_auto_symmetries_with_include_antiunitary_admits_conj_ops():
-    """Opting in via ``include_antiunitary=True`` produces a larger group; for a purely-real H, anti-unitary ops always exist (H(k) = H(k)*), so at least some FBZ k-points will carry conj=True."""
+    """include_antiunitary=True gives a larger group; for a real H some FBZ points carry conj=True."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
@@ -754,7 +750,7 @@ def test_specify_auto_symmetries_with_include_antiunitary_yields_smaller_or_equa
 
 
 def test_specify_auto_symmetries_raises_when_kgrid_is_not_in_auto_mode():
-    """Calling specify_auto_symmetries on a plain-symmetry (non-auto) KGrid must fail loudly so users don't accidentally clobber a non-auto setup."""
+    """specify_auto_symmetries on a plain-symmetry (non-auto) KGrid raises rather than clobbering it."""
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
     H = _make_small_real_cubic_h(4, 4, 4, 1)
     with pytest.raises(RuntimeError, match="auto mode"):
@@ -786,7 +782,7 @@ def test_specify_auto_symmetries_raises_on_non_square_orbital_axes():
 
 
 def test_specify_auto_symmetries_accepts_non_contiguous_input():
-    """The implementation casts to complex128 explicitly; non-contiguous or non-complex128 input should be accepted without crashing."""
+    """Non-contiguous or non-complex128 input is accepted (the routine casts to complex128 explicitly)."""
     H = _make_small_real_cubic_h(4, 4, 4, 1).astype(np.complex64)
     grid = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
     # Should not raise
@@ -795,8 +791,7 @@ def test_specify_auto_symmetries_accepts_non_contiguous_input():
 
 
 def test_plain_symmetry_kgrid_two_dimensional_square_unchanged():
-    """The plain-symmetry code path must keep producing the same IBZ it always did: 4x4x1 with the full square
-    symmetry group has a small IBZ (Γ, X, M, and one interior point) whose counts sum to the full grid."""
+    """The plain-symmetry path keeps its IBZ: 4x4x1 square symmetry gives Gamma, X, M and one interior point."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     assert grid.nk_irr <= 16
     assert grid.irrk_count.sum() == 16
@@ -811,7 +806,7 @@ def test_plain_symmetry_kgrid_three_dimensional_cubic_unchanged():
 
 
 def test_specify_auto_symmetries_finds_at_least_explicit_cubic_symmetries_for_cubic_h():
-    """For a real cubic H, the auto-discovered spatial group must be at least as large as the explicit ``three_dimensional_cubic`` group, so the auto IBZ must be no larger than the explicit-group IBZ. (Auto can find accidental extra symmetries on small grids, so we don't insist on strict equality here.)"""
+    """For a real cubic H the auto IBZ is no larger than the explicit three_dimensional_cubic IBZ."""
     H = _make_small_real_cubic_h(4, 4, 4, 1)
     g_auto = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
     g_auto.specify_auto_symmetries(H)

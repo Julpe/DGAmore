@@ -45,9 +45,9 @@ FQ_MATMUL_FACTOR: int = 2
 # FFT SDE holds the full-BZ niw-half kernel + its half-niv copy through the conj/distributed-FFT round trip, ~2 blocks.
 SDE_FFT_KERNEL_FACTOR: int = 2
 
-# numpy.fft.ifftn on the c64 full-grid bubble transiently allocates ~2x the buffer beyond it (returned array + work
-# arrays; numpy 2.x, dtype preserved). Per-iw peak = multiply buffer + this transient.
-CHI0Q_IFFTN_TRANSIENT_FACTOR: int = 2
+# scipy.fft.ifftn(overwrite_x=True) transforms the c64 full-grid bubble in place, so no ifftn transient is allocated
+# beyond the multiply buffer (numpy.fft would allocate ~2x: returned array + work arrays). Per-iw peak = multiply buffer.
+CHI0Q_IFFTN_TRANSIENT_FACTOR: int = 0
 
 # In-memory Eliashberg solver holds the direct vertex + its matmul-layout copy at the layout-build peak (the flipped
 # vertex is never stored - the matvec reuses the direct array via gap-sized index shuffles). Peak 2, residency 1.
@@ -225,7 +225,7 @@ def estimate_peaks(
     peaks: dict[str, BranchPeak] = {}
 
     # Fast (FFT) path: multi-rank splits (w, v) columns (DISTRIBUTED, R-space G node-shared); single-rank builds the
-    # whole irr-BZ bubble + B^4 multiply buffer + ~2x ifftn transient per iw. Lean per-q einsum is DISTRIBUTED.
+    # whole irr-BZ bubble + B^4 multiply buffer (in-place scipy ifftn, no transient) per iw. Lean per-q einsum is DISTRIBUTED.
     gf_window_bubble = 2 * (niv_full + niw_core)
     if n_ranks == 1:
         chi0q_baseline = baseline_bubble

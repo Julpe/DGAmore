@@ -15,6 +15,7 @@ provided that trade speed for footprint. Notation mirrors the thesis (Chapters 3
 import gc
 
 import numpy as np
+import scipy as sp
 
 from dgamore.brillouin_zone import KGrid
 from dgamore.interaction import Interaction, LocalInteraction
@@ -845,10 +846,12 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
     def invert_and_sum_over_last_vn_v2(self, beta: float):
         r"""
         Helper method that explicitly handles the calculation of the sum over the auxiliary susceptibility while
-        being highly memory-efficient. Does not invert the matrix directly but uses a linear solver to avoid the
-        creation of large intermediate arrays. This is especially important for objects with a large number of
-        orbital degrees of freedom, where the matrix in compound index space can become very large. Is up to
-        numerical precision the same as :meth:`invert_and_sum_over_last_vn`.
+        being highly memory-efficient. Rather than inverting the full compound matrix, each momentum and bosonic
+        frequency slice is LU-factorized in place (``scipy.linalg.lu_factor`` with ``overwrite_a``) and only the
+        :math:`o^2` right-hand sides that select the last-fermionic-frequency sum grouped by :math:`(o_4, o_3)` are
+        back-substituted. The single compound slice held live per iteration keeps the peak footprint far below the
+        full inverse, which matters most for a large number of orbital degrees of freedom, where the compound-index
+        matrix becomes very large. Is up to numerical precision the same as :meth:`invert_and_sum_over_last_vn`.
 
         :param beta: Inverse temperature :math:`\beta`.
         :return: ``self`` with the last fermionic axis summed out (``num_vn_dimensions`` reduced to 1).
@@ -864,23 +867,23 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
         idx = np.arange(compound_size)
 
-        # decode flat index -> (o4,o3)
+        # decode flat compound column index (o4,o3,v') -> the (o4,o3) group it contributes its v' sum to
         idx_o4 = idx // (o * vn)
         idx_o3 = (idx // vn) % o
 
         rhs = np.zeros((compound_size, o * o), dtype=self.mat.dtype)
         rhs[idx, idx_o4 * o + idx_o3] = 1.0
-        rhs = np.ascontiguousarray(rhs)
-
-        rhs_batched = np.broadcast_to(rhs, (w_dim, compound_size, o * o))
 
         for i in range(self.current_shape[0]):
-            compound_arr = np.ascontiguousarray(self.mat[i].transpose(4, 0, 1, 5, 3, 2, 6)).reshape(
-                w_dim, compound_size, compound_size
-            )
-            new_arr[i] = (
-                np.linalg.solve(compound_arr, rhs_batched).reshape((w_dim, o, o, vn, o, o)).transpose(1, 2, 5, 4, 0, 3)
-            )
+            block = self.mat[i]
+            for w in range(w_dim):
+                # compound rows (o1,o2,v), cols (o4,o3,v'); factor in place so no batched Fortran copy is made
+                compound = np.asfortranarray(
+                    block[:, :, :, :, w].transpose(0, 1, 4, 3, 2, 5).reshape(compound_size, compound_size)
+                )
+                lu_and_piv = sp.linalg.lu_factor(compound, overwrite_a=True, check_finite=False)
+                solution = sp.linalg.lu_solve(lu_and_piv, rhs, check_finite=False)
+                new_arr[i][:, :, :, :, w, :] = solution.reshape((o, o, vn, o, o)).transpose(0, 1, 4, 3, 2)
 
         new_arr /= beta  # in-place scale: new_arr is freshly allocated and unaliased, so no full-size temporary
         self.mat = new_arr

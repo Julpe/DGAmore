@@ -1336,36 +1336,23 @@ def execute_distributed_fft(obj: FourPoint, comm: MPI.Comm) -> FourPoint:
     :return: The same :class:`FourPoint`, now holding the BZ Fourier transform (back in the ``flat`` layout).
     """
     nq = obj.nq
-    nx, ny, nz = nq
 
-    # --- STEP 1: Z-FFT ---
-    # Move to Z-pencils. The number of rows in obj.mat will now be (my_z_pencils * nz)
-    obj.mat = _redistribute_p2p(obj.mat, nq, comm, "flat", "z_pencil")
+    # The 3D BZ FFT factorizes into independent, commuting 1D FFTs along z, y and x. A singleton axis (n == 1, e.g.
+    # nz == 1 on a 2D/layered lattice) has an identity 1D FFT, so its pencil stage is skipped entirely - one fewer
+    # distributed redistribution per skipped axis; the remaining axes give the identical result.
+    active_stages = [(n, layout) for n, layout in zip(nq[::-1], ("z_pencil", "y_pencil", "x_pencil")) if n > 1]
+    if not active_stages:
+        return obj  # a single momentum on every axis: the BZ FFT is the identity
 
-    # Save the shape of the Z-pencil layout to restore after FFT
-    shape_z = obj.mat.shape
-    # Reshape to (n_pencils, nz, orbitals..., frequencies...)
-    obj.mat = obj.mat.reshape(-1, nz, *shape_z[1:])
-    obj.mat = fft.fftn(obj.mat, axes=(1,), overwrite_x=True)
-    obj.mat = obj.mat.reshape(shape_z)
+    current_layout = "flat"
+    for n, layout in active_stages:
+        # Move to this axis's pencil layout (whole lines rank-local), FFT along it, keep the pencil shape.
+        obj.mat = _redistribute_p2p(obj.mat, nq, comm, current_layout, layout)
+        pencil_shape = obj.mat.shape
+        obj.mat = obj.mat.reshape(-1, n, *pencil_shape[1:])
+        obj.mat = fft.fftn(obj.mat, axes=(1,), overwrite_x=True)
+        obj.mat = obj.mat.reshape(pencil_shape)
+        current_layout = layout
 
-    # --- STEP 2: Y-FFT ---
-    obj.mat = _redistribute_p2p(obj.mat, nq, comm, "z_pencil", "y_pencil")
-
-    shape_y = obj.mat.shape
-    obj.mat = obj.mat.reshape(-1, ny, *shape_y[1:])
-    obj.mat = fft.fftn(obj.mat, axes=(1,), overwrite_x=True)
-    obj.mat = obj.mat.reshape(shape_y)
-
-    # --- STEP 3: X-FFT ---
-    obj.mat = _redistribute_p2p(obj.mat, nq, comm, "y_pencil", "x_pencil")
-
-    shape_x = obj.mat.shape
-    obj.mat = obj.mat.reshape(-1, nx, *shape_x[1:])
-    obj.mat = fft.fftn(obj.mat, axes=(1,), overwrite_x=True)
-    obj.mat = obj.mat.reshape(shape_x)
-
-    # --- STEP 4: BACK TO FLAT ---
-    obj.mat = _redistribute_p2p(obj.mat, nq, comm, "x_pencil", "flat")
-
+    obj.mat = _redistribute_p2p(obj.mat, nq, comm, current_layout, "flat")
     return obj

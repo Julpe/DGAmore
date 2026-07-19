@@ -21,6 +21,7 @@ import re
 
 import mpi4py.MPI as MPI
 import numpy as np
+import scipy as sp
 from scipy import optimize as opt
 
 import dgamore.config as config
@@ -38,9 +39,7 @@ from dgamore.n_point_base import SpinChannel
 from dgamore.self_energy import SelfEnergy
 
 
-def get_hartree_fock(
-    u_loc: LocalInteraction, v_nonloc: Interaction, q_list: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
+def get_hartree_fock(u_loc: LocalInteraction, v_nonloc: Interaction) -> tuple[np.ndarray, np.ndarray]:
     r"""
     Returns the Hartree-Fock term separately for the local and non-local interaction. Since we are always SU(2)-symmetric,
     the sum over the spins of the first term in Eq. (4.55) in Anna Galler's thesis results in a simple factor of 2. This
@@ -52,12 +51,16 @@ def get_hartree_fock(
     :math:`\Sigma_{F}^k = - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}`. The Hartree contraction uses the
     middle-index-swapped ``U_{acbd}`` so it picks up the inter-orbital density :math:`U'` (stored at :math:`U_{abab}`);
     see :func:`dgamore.local_sde.get_local_hartree_fock`.
-    Processes the Fock term for each individual orbital to save memory, as for high momentum grids,
-    the ``occ_qk`` property can become large.
+
+    The Fock momentum sum is a circular convolution over the periodic Brillouin zone, so it is evaluated with the
+    convolution theorem instead of an explicit q-loop:
+    :math:`\Sigma_{F}^k = -\tfrac{1}{N_q}\,\mathcal{F}^{-1}\big[\mathcal{F}[(U+V)^{(-q)}_{adcb}]\,\mathcal{F}[n_{dc}]\big]`
+    (the interaction is momentum-flipped because the shift is :math:`n^{k+q}` after the ``-q`` roll convention). This is
+    :math:`O(N_k \log N_k)` and materializes only R-space :math:`[k, o^4]`/:math:`[k, o^2]` arrays, never a
+    :math:`[q, k]` occupation block, so the whole full-BZ term is computed on every rank without a q-distribution.
 
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}` (see :class:`Interaction`).
-    :param q_list: Array of integer q-point index triplets handled by this rank.
+    :param v_nonloc: The non-local interaction :math:`V^{q}` on the full q-grid (see :class:`Interaction`).
     :return: The tuple ``(hartree, fock)`` of self-energy contributions, broadcastable to ``[k, o1, o2, v]``.
     """
     v_q0 = v_nonloc.find_q((0, 0, 0))
@@ -67,26 +70,16 @@ def get_hartree_fock(
 
     nb = config.sys.n_bands
     nk_tot = np.prod(config.lattice.nk)
-    nq_tot = np.prod(config.lattice.nk)
 
-    uq = (u_loc + v_nonloc.reduce_q(q_list)).permute_orbitals("abcd->adcb")  # (nq,a,d,c,b)
+    # Fourier the momentum-flipped interaction (U+V^{-q})_{adcb} and the occupation n_{dc} to R-space, contract the
+    # summed orbitals pointwise per R, and transform back: the convolution theorem for the periodic-BZ Fock sum.
+    w_r = (u_loc + v_nonloc).permute_orbitals("abcd->adcb").flip_momentum_axis(copy=False).fft(copy=False)
+    w_r_mat = w_r.decompress_q_dimension().mat  # [kx, ky, kz, a, d, c, b]
+    occ_r = sp.fft.fftn(config.sys.occ_k.astype(w_r_mat.dtype, copy=False), axes=(0, 1, 2))  # [kx, ky, kz, d, c]
 
-    fock = np.zeros((nk_tot, nb, nb), dtype=uq.mat.dtype)
-
-    for d in range(nb):
-        for c in range(nb):
-            u_slice = uq[:, :, d, c, :]
-            if not np.any(u_slice):
-                continue
-
-            occ_qk_dc = np.array(
-                [np.roll(config.sys.occ_k[..., d, c], [-i for i in q], axis=(0, 1, 2)) for q in q_list]
-            )
-            occ_qk_dc = occ_qk_dc.reshape(len(q_list), nk_tot)
-            # contract over q directly: the broadcast product materialized a full [q, k, o1, o2] block
-            fock += np.einsum("qab,qk->kab", u_slice, occ_qk_dc, optimize=True)
-
-    fock *= -1.0 / nq_tot
+    fock_r = np.einsum("xyzadcb,xyzdc->xyzab", w_r_mat, occ_r, optimize=True)
+    fock = sp.fft.ifftn(fock_r, axes=(0, 1, 2), overwrite_x=True).reshape(nk_tot, nb, nb)
+    fock *= -1.0 / nk_tot
     return hartree[None, ..., None], fock[..., None]  # [k,o1,o2,v]
 
 
@@ -820,12 +813,43 @@ def calculate_sigma_from_kernel_auto(
     return calculate_sigma_from_kernel_cpu(kernel, giwk, my_full_q_list)
 
 
+def _build_rspace_giwk_pencil(giwk: GreensFunction, mpi_dist: MpiDistributor, node_comm=None) -> np.ndarray:
+    r"""
+    Builds this rank's real-space Green's function pencil :math:`F[G](R)` for the FFT self-energy contraction. The
+    forward FFT :math:`G(k) \to F[G](R)` is computed once (in a per-node shared-memory window when ``node_comm`` is
+    given and the shared-giwk option is enabled, else privately per rank); each rank then keeps only its R-pencil
+    slice (a copy) and the full R-space array/window is released. The pencil is identical for the positive- and
+    negative-:math:`\omega` passes of :func:`calculate_self_energy_q` (it is kernel-independent and depends only on
+    ``giwk``), so it is built once here and handed to both passes.
+
+    :param giwk: The momentum-dependent :class:`GreensFunction` (already cut to the self-energy core box).
+    :param mpi_dist: MPI distributor providing the R-space pencil decomposition (rank/size).
+    :param node_comm: Optional node-local communicator; when given (and the shared-giwk option is enabled), the
+        R-space Green's function is built once per node in a shared-memory window instead of once per rank.
+    :return: The rank-local R-space Green's function pencil ``[R_local, o1, o2, 2*niv]`` (host, complex64).
+    """
+    rank, size = mpi_dist.comm.Get_rank(), mpi_dist.comm.Get_size()
+    nkx, nky, nkz = config.lattice.k_grid.nk
+    nk_tot = config.lattice.k_grid.nk_tot
+    nb = config.sys.n_bands
+
+    if node_comm is not None and config.memory.use_shared_memory_common_obj:
+        g_r_mat, g_r_win = mpi_utils.build_node_shared_array(node_comm, lambda: giwk.fft().mat)
+    else:
+        g_r_mat, g_r_win = giwk.fft().mat, None
+    my_r_indices = mpi_utils.get_pencil_indices(rank, size, (nkx, nky, nkz), "flat")
+    g_r_local = g_r_mat.reshape(nk_tot, nb, nb, -1)[my_r_indices]
+    del g_r_mat
+    _free_shared_window(g_r_win, node_comm)
+    return g_r_local
+
+
 def calculate_sigma_from_kernel_fft_cpu(
     mpi_dist: MpiDistributor,
     kernel: FourPoint,
-    giwk: GreensFunction,
+    g_r_local: np.ndarray,
+    giwk_niv: int,
     niw_index_w_pairs: list[tuple[int, int]],
-    node_comm=None,
 ) -> SelfEnergy:
     r"""
     Computes the self-energy using distributed FFTs (CPU). Replaces the q-loop with a real-space pointwise
@@ -842,33 +866,20 @@ def calculate_sigma_from_kernel_fft_cpu(
     :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
     :param kernel: The self-energy kernel :math:`K` for one niw half (full BZ): the positive half (``w >= 0``) or the
         negative block from :meth:`LocalNPoint.to_negative_niw_range` (``w = 0, -1, ..., -niw``).
-    :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :param g_r_local: This rank's real-space Green's function pencil from :func:`_build_rspace_giwk_pencil` (built
+        once and shared by both niw passes).
+    :param giwk_niv: The central fermionic-frequency index of ``g_r_local`` (``giwk.niv``), used to window and shift
+        the Green's function per bosonic frequency.
     :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract. The positive pass passes
         ``[(i, i) for i in range(niw + 1)]`` (``w = 0..+niw``), the negative pass
         ``[(i, -i) for i in range(1, niw + 1)]`` (``w = -1..-niw``, skipping the ``w = 0`` duplicate).
-    :param node_comm: Optional node-local communicator; when given (and the shared-giwk window is enabled),
-        the R-space Green's function is built once per node in a shared-memory window instead of once per rank.
     :return: The rank-local R-space :class:`SelfEnergy` (compressed q, half niv range, moments not fitted).
     """
     comm = mpi_dist.comm
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-    nkx, nky, nkz = config.lattice.k_grid.nk
-    nk_tot = config.lattice.k_grid.nk_tot
     nb = config.sys.n_bands
     niv_core = config.box.niv_core
     beta = config.sys.beta
-
-    # G(k) -> F[G](R), forward FFT: built once per node in a shared window when available, else privately per rank.
-    # Each rank keeps only its R-pencil slice (a copy), so the R-space object frees before the kernel FFT.
-    if node_comm is not None and config.memory.use_shared_memory_common_obj:
-        g_r_mat, g_r_win = mpi_utils.build_node_shared_array(node_comm, lambda: giwk.fft().mat)
-    else:
-        g_r_mat, g_r_win = giwk.fft().mat, None
-    my_r_indices = mpi_utils.get_pencil_indices(rank, size, (nkx, nky, nkz), "flat")
-    g_r_local = g_r_mat.reshape(nk_tot, nb, nb, -1)[my_r_indices]
-    del g_r_mat
-    _free_shared_window(g_r_win, node_comm)
+    nk_tot = config.lattice.k_grid.nk_tot
 
     # K(q) -> F[K](-R) via the conjugate trick: conj, fft, conj. The kernel is already a single niw half (positive
     # half, or the negative block), so there is no to_full_niw_range here -- the full-niw kernel is never built.
@@ -884,7 +895,7 @@ def calculate_sigma_from_kernel_fft_cpu(
 
     path = None
     for idx, w in niw_index_w_pairs:
-        g_slice = g_r_local[..., giwk.niv - w : giwk.niv + niv_core - w]
+        g_slice = g_r_local[..., giwk_niv - w : giwk_niv + niv_core - w]
         k_slice = kernel.mat[..., idx, :]
         if path is None:  # slice shapes are identical across the loop -> compute the contraction path once
             path = np.einsum_path("Radv,Raijdv->Rijv", g_slice, k_slice, optimize="optimal")[0]
@@ -905,9 +916,9 @@ def calculate_sigma_from_kernel_fft_cpu(
 def calculate_sigma_from_kernel_fft_gpu(
     mpi_dist: MpiDistributor,
     kernel: FourPoint,
-    giwk: GreensFunction,
+    g_r_local: np.ndarray,
+    giwk_niv: int,
     niw_index_w_pairs: list[tuple[int, int]],
-    node_comm=None,
 ) -> SelfEnergy:
     r"""
     Computes the self-energy using distributed FFTs, running on the GPU (CuPy). Same algorithm as
@@ -918,34 +929,22 @@ def calculate_sigma_from_kernel_fft_gpu(
     :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
     :param kernel: The self-energy kernel :math:`K` for one niw half (full BZ): the positive half or the negative
         block from :meth:`LocalNPoint.to_negative_niw_range`.
-    :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :param g_r_local: This rank's (host) real-space Green's function pencil from :func:`_build_rspace_giwk_pencil`
+        (built once and shared by both niw passes); uploaded to the device here.
+    :param giwk_niv: The central fermionic-frequency index of ``g_r_local`` (``giwk.niv``).
     :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract (see
         :func:`calculate_sigma_from_kernel_fft_cpu`).
-    :param node_comm: Optional node-local communicator; when given (and the shared-giwk window is enabled),
-        the R-space Green's function is built once per node in a shared-memory window instead of once per rank.
     :return: The rank-local R-space :class:`SelfEnergy` (compressed q, half niv range, moments not fitted).
     """
     import cupy as cp
 
     comm = mpi_dist.comm
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-    nkx, nky, nkz = config.lattice.k_grid.nk
-    nk_tot = config.lattice.k_grid.nk_tot
     nb = config.sys.n_bands
     niv_core = config.box.niv_core
     beta = config.sys.beta
+    nk_tot = config.lattice.k_grid.nk_tot
 
-    # G(k) -> F[G](R), forward FFT: built once per node in a (host-side) shared window when available, else
-    # privately per rank; only the rank's R-pencil slice is uploaded to the device, then the host copy is released.
-    if node_comm is not None and config.memory.use_shared_memory_common_obj:
-        g_r_mat, g_r_win = mpi_utils.build_node_shared_array(node_comm, lambda: giwk.fft().mat)
-    else:
-        g_r_mat, g_r_win = giwk.fft().mat, None
-    my_r_indices = mpi_utils.get_pencil_indices(rank, size, (nkx, nky, nkz), "flat")
-    g_r_local = cp.asarray(g_r_mat.reshape(nk_tot, nb, nb, -1)[my_r_indices])
-    del g_r_mat
-    _free_shared_window(g_r_win, node_comm)
+    g_r_local = cp.asarray(g_r_local)
 
     # K(q) -> F[K](-R) via the conjugate trick: conj, fft, conj. The kernel is already a single niw half, so there is
     # no to_full_niw_range here -- the full-niw kernel is never built.
@@ -959,7 +958,7 @@ def calculate_sigma_from_kernel_fft_gpu(
     mat = cp.zeros((n_r_local, nb, nb, niv_core), dtype=kernel.mat.dtype)
 
     for idx, w in niw_index_w_pairs:
-        g_slice = g_r_local[..., giwk.niv - w : giwk.niv + niv_core - w]
+        g_slice = g_r_local[..., giwk_niv - w : giwk_niv + niv_core - w]
         k_slice = kernel.mat[..., idx, :]
         mat += cp.einsum("Radv,Raijdv->Rijv", g_slice, k_slice, optimize=True)
 
@@ -1004,10 +1003,10 @@ def select_sigma_fft_device(mpi_distributor: MpiDistributor) -> bool:
 def calculate_sigma_from_kernel_fft(
     mpi_dist: MpiDistributor,
     kernel: FourPoint,
-    giwk: GreensFunction,
+    g_r_local: np.ndarray,
+    giwk_niv: int,
     niw_index_w_pairs: list[tuple[int, int]],
     use_gpu: bool,
-    node_comm=None,
 ) -> SelfEnergy:
     r"""
     Dispatches one bosonic-frequency FFT pass to the GPU (:func:`calculate_sigma_from_kernel_fft_gpu`) or CPU
@@ -1016,49 +1015,50 @@ def calculate_sigma_from_kernel_fft(
 
     :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
     :param kernel: The self-energy kernel :math:`K` for one niw half (full BZ).
-    :param giwk: The momentum-dependent :class:`GreensFunction`.
+    :param g_r_local: This rank's real-space Green's function pencil from :func:`_build_rspace_giwk_pencil` (built
+        once and shared by both niw passes).
+    :param giwk_niv: The central fermionic-frequency index of ``g_r_local`` (``giwk.niv``).
     :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract (see
         :func:`calculate_sigma_from_kernel_fft_cpu`).
     :param use_gpu: Whether to run the GPU implementation (as decided by :func:`select_sigma_fft_device`).
-    :param node_comm: Optional node-local communicator; when given (and the shared-giwk window is enabled),
-        the R-space Green's function is built once per node in a shared-memory window instead of once per rank.
     :return: The rank-local R-space :class:`SelfEnergy`.
     """
     if use_gpu:
-        return calculate_sigma_from_kernel_fft_gpu(mpi_dist, kernel, giwk, niw_index_w_pairs, node_comm)
-    return calculate_sigma_from_kernel_fft_cpu(mpi_dist, kernel, giwk, niw_index_w_pairs, node_comm)
+        return calculate_sigma_from_kernel_fft_gpu(mpi_dist, kernel, g_r_local, giwk_niv, niw_index_w_pairs)
+    return calculate_sigma_from_kernel_fft_cpu(mpi_dist, kernel, g_r_local, giwk_niv, niw_index_w_pairs)
 
 
 def _run_fft_sde_pass(
     kernel_src: FourPoint,
     mpi_dist_irrk: MpiDistributor,
     mpi_dist_fullbz: MpiDistributor,
-    giwk_full: GreensFunction,
+    g_r_local: np.ndarray,
+    giwk_niv: int,
     niw_index_w_pairs: list[tuple[int, int]],
     use_gpu: bool,
     negative_w: bool,
-    node_comm=None,
 ) -> SelfEnergy:
     r"""
     Runs one bosonic-frequency FFT self-energy pass: maps the (small) irreducible-BZ kernel to the full BZ
     (consuming ``kernel_src``), optionally builds its time-reversed negative-:math:`\omega` block, contracts the
-    requested ``niw_index_w_pairs`` via :func:`calculate_sigma_from_kernel_fft`, and frees the full-BZ kernel. Both
-    passes of :func:`calculate_self_energy_q` go through this helper: the caller hands the positive pass a
-    :meth:`~dgamore.n_point_base.IHaveMat.copy` of the irreducible kernel (so it survives for the negative pass) and
-    the negative pass the original (which this consumes), so only a single full-BZ niw half is ever resident.
+    requested ``niw_index_w_pairs`` via :func:`calculate_sigma_from_kernel_fft` against the prebuilt R-space Green's
+    function pencil, and frees the full-BZ kernel. Both passes of :func:`calculate_self_energy_q` go through this
+    helper: the caller hands the positive pass a :meth:`~dgamore.n_point_base.IHaveMat.copy` of the irreducible
+    kernel (so it survives for the negative pass) and the negative pass the original (which this consumes), so only
+    a single full-BZ niw half is ever resident.
 
     :param kernel_src: The irreducible-BZ kernel for this pass; consumed by the full-BZ map (mutated or replaced).
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points.
     :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
-    :param giwk_full: The momentum-dependent :class:`GreensFunction`.
+    :param g_r_local: This rank's real-space Green's function pencil from :func:`_build_rspace_giwk_pencil`, built
+        once by the caller and reused by both passes.
+    :param giwk_niv: The central fermionic-frequency index of ``g_r_local`` (``giwk.niv``).
     :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract (see
         :func:`calculate_sigma_from_kernel_fft_cpu`).
     :param use_gpu: Whether to run the GPU implementation (as decided by :func:`select_sigma_fft_device`).
     :param negative_w: If True, build the negative-:math:`\omega` block via
         :meth:`LocalNPoint.to_negative_niw_range` before contracting (the negative pass) and trim the kernel peak
         back to the OS on free; if False, contract the mapped kernel directly (the positive pass).
-    :param node_comm: Optional node-local communicator; when given (and the shared-giwk window is enabled),
-        the R-space Green's function is built once per node in a shared-memory window instead of once per rank.
     :return: The rank-local R-space :class:`SelfEnergy` of this pass.
     """
     # the distributed p2p exchange always returns a fresh full-BZ object, so the irreducible source is freed
@@ -1070,9 +1070,7 @@ def _run_fft_sde_pass(
         kernel_full.free()  # release the full-BZ positive copy as soon as the negative block is built
         kernel_full = kernel_neg
 
-    sigma = calculate_sigma_from_kernel_fft(
-        mpi_dist_irrk, kernel_full, giwk_full, niw_index_w_pairs, use_gpu, node_comm
-    )
+    sigma = calculate_sigma_from_kernel_fft(mpi_dist_irrk, kernel_full, g_r_local, giwk_niv, niw_index_w_pairs, use_gpu)
     kernel_full.free(trim=negative_w)  # coarse per-iteration trim on the last (negative) pass
     return sigma
 
@@ -1329,7 +1327,6 @@ def calculate_sigma_proposal(
     sigma_dmft: SelfEnergy,
     delta_sigma: SelfEnergy,
     my_irr_q_list: np.ndarray,
-    my_full_q_list: np.ndarray,
     mpi_dist_irrk: MpiDistributor,
     mpi_dist_fullbz: MpiDistributor,
     comm: MPI.Comm,
@@ -1354,7 +1351,6 @@ def calculate_sigma_proposal(
     :param sigma_dmft: The DMFT self-energy (cut to the loop's niv), providing the high-frequency tail.
     :param delta_sigma: The DMFT-minus-local noise-removal term on the core box.
     :param my_irr_q_list: This rank's irreducible q-point list.
-    :param my_full_q_list: This rank's full-BZ q-point list.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points.
     :param mpi_dist_fullbz: MPI distributor over the full BZ.
     :param comm: The MPI communicator.
@@ -1365,8 +1361,9 @@ def calculate_sigma_proposal(
     """
     logger = config.logger
 
-    hartree, fock = get_hartree_fock(u_loc, v_nonloc_full, my_full_q_list)
-    fock = mpi_dist_fullbz.allreduce(fock)
+    # The FFT Fock term uses the full q-grid interaction and occupation (both replicated on every rank), so each
+    # rank computes the identical full-BZ Hartree/Fock directly - no q-distribution and no allreduce.
+    hartree, fock = get_hartree_fock(u_loc, v_nonloc_full)
     logger.info("Calculated Hartree and Fock terms.")
 
     giwk_full, giwk_win, shared_node_comm = _build_giwk_full(
@@ -1494,26 +1491,32 @@ def calculate_sigma_proposal(
     # Decide CPU/GPU (and select the GPU) once
     use_gpu = select_sigma_fft_device(mpi_dist_fullbz)
 
+    # The R-space Green's function pencil is identical for both niw passes (kernel-independent), so it is FFT-built
+    # once here (one full giwk FFT + one node-shared window) and reused by both, instead of once per pass.
+    g_r_local = _build_rspace_giwk_pencil(giwk_full, mpi_dist_irrk, shared_node_comm)
+    giwk_niv = giwk_full.niv
+
     sigma_prop = _run_fft_sde_pass(
         kernel_irr.copy(),
         mpi_dist_irrk,
         mpi_dist_fullbz,
-        giwk_full,
+        g_r_local,
+        giwk_niv,
         [(i, i) for i in range(niw + 1)],
         use_gpu,
         negative_w=False,
-        node_comm=shared_node_comm,
     )
     sigma_neg = _run_fft_sde_pass(
         kernel_irr,
         mpi_dist_irrk,
         mpi_dist_fullbz,
-        giwk_full,
+        g_r_local,
+        giwk_niv,
         [(i, -i) for i in range(1, niw + 1)],
         use_gpu,
         negative_w=True,
-        node_comm=shared_node_comm,
     )
+    del g_r_local  # both passes done; release the rank-local R-space Green's function pencil
 
     sigma_prop.mat += sigma_neg.mat  # accumulate the rank-local R-space partial self-energies (in place)
     sigma_neg.free()
@@ -1611,14 +1614,12 @@ def calculate_self_energy_q(
     mpi_dist_irrk = MpiDistributor.create_distributor(
         ntasks=config.lattice.k_grid.nk_irr, comm=comm, name="Q", output_path=config.output.output_path
     )
-    full_q_list = config.lattice.k_grid.get_q_list()
     irrk_q_list = config.lattice.k_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrk.my_slice]
 
     mpi_dist_fullbz = MpiDistributor.create_distributor(
         ntasks=config.lattice.k_grid.nk_tot, comm=comm, name="FBZ", output_path=config.output.output_path
     )
-    my_full_q_list = full_q_list[mpi_dist_fullbz.my_slice]
 
     sigma_old, starting_iter = get_starting_sigma(sigma_dmft)
     if starting_iter > 0:
@@ -1688,7 +1689,6 @@ def calculate_self_energy_q(
             sigma_dmft,
             delta_sigma,
             my_irr_q_list,
-            my_full_q_list,
             mpi_dist_irrk,
             mpi_dist_fullbz,
             comm,

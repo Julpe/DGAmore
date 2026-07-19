@@ -67,8 +67,7 @@ def test_node_aware_single_node():
 
 
 def test_node_aware_multi_node():
-    """_get_node_aware_v_dist splits frequencies per node and agrees across ranks: 4 ranks over 2 nodes with 6
-    frequencies gives 3 per node, and within a node the excess lands on the first local rank."""
+    """_get_node_aware_v_dist splits frequencies per node consistently: 6 frequencies over 2 nodes gives 3 per node."""
     hostnames = ["n0", "n1", "n0", "n1"]
 
     def fn(comm, rank):
@@ -208,10 +207,7 @@ def test_exchange_and_map_single_rank():
 
 
 def test_exchange_and_map_auto_orbital_transform(monkeypatch):
-    """exchange_and_map_irrbz_fullbz applies the auto orbital transform per rank slice: the identity transform is
-    recorded on every rank with a non-empty slice, the rank-local slice sizes sum to the full BZ and the mapped
-    result is unchanged. Patching on the symmetry_reduction module works whether that module is the real one or
-    the in-process fake (the auto branch in mpi_utils calls it by name)."""
+    """exchange_and_map_irrbz_fullbz applies the auto orbital transform per rank slice; the slices sum to the BZ."""
     calls = []
 
     def _recording_transform(full_mat, us, sigmas, conjs, num_orbital_dimensions):
@@ -378,6 +374,23 @@ def test_redistribute_self_shift_skips_mpi(monkeypatch):
     assert counter["n"] == 0  # the single rank's only shift is the self-shift -> no MPI traffic
 
 
+@pytest.mark.parametrize("nq", [(2, 3, 2), (3, 4, 1), (1, 4, 2), (1, 1, 1)])
+def test_execute_distributed_fft_matches_reference(nq):
+    """execute_distributed_fft matches a direct 3D FFT for 3D, 2D (nz=1), leading- and all-singleton grids."""
+    n_tot = int(np.prod(nq))
+    rng = np.random.default_rng(5)
+    G = (rng.standard_normal((n_tot, 2, 3)) + 1j * rng.standard_normal((n_tot, 2, 3))).astype(np.complex64)
+
+    def fn(comm, rank):
+        obj = SimpleNamespace(nq=nq, mat=G[mu.get_pencil_indices(rank, comm.size, nq, "flat")].copy())
+        return rank, mu.execute_distributed_fft(obj, comm).mat
+
+    _, res = run_parallel(3, fn)
+    assembled = np.concatenate([out for _, out in sorted(res, key=lambda pair: pair[0])], axis=0)
+    ref = np.fft.fftn(G.reshape(*nq, 2, 3), axes=(0, 1, 2)).reshape(n_tot, 2, 3)
+    assert np.allclose(assembled, ref, atol=1e-4)
+
+
 def test_redistribute_roundtrip_multichunk(monkeypatch):
     """_redistribute_p2p round-trips flat->z-pencil->flat across multiple chunks."""
     nq = (2, 2, 2)
@@ -398,8 +411,7 @@ def test_redistribute_roundtrip_multichunk(monkeypatch):
 
 
 def _run_dist_fft(size, G, nq):
-    """Run the distributed FFT across `size` ranks and reconstruct the global
-    flat-layout result."""
+    """Run the distributed FFT across `size` ranks and reconstruct the global flat-layout result."""
 
     def fn(comm, rank):
         flat = mu.get_pencil_indices(rank, comm.size, nq, "flat")
@@ -459,9 +471,7 @@ def test_gather_full_ibz_for_vslice():
 
 
 def test_gather_full_ibz_for_vslice_tags_stay_below_mpi_tag_ub_minimum():
-    """The exchange tags must be rank-independent (MPI matching is (source, tag)-scoped), so they stay far below
-    the MPI-guaranteed MPI_TAG_UB minimum of 32767 at any rank count - the former rank*size base overflowed it
-    above ~180 ranks."""
+    """The exchange tags are rank-independent and stay below MPI_TAG_UB's 32767 minimum (rank*size overflowed)."""
     n_irrq, n_v, n_vp, norb = 4, 3, 2, 2
     q_grid = KGrid((n_irrq, 1, 1), [])
     G = (np.arange(n_irrq * norb * n_v * n_vp).reshape(n_irrq, norb, n_v, n_vp) + 1j).astype(np.complex128)
@@ -579,8 +589,7 @@ def test_rankfile_created_and_context_manager(tmp_path, monkeypatch):
 
 
 def test_open_close_delete_are_safe_without_file():
-    """MpiDistributor file ops are no-ops without an output path: no _fname attribute exists, so open swallows
-    the AttributeError, close swallows the None.close() and delete swallows the os.remove of a missing file."""
+    """MpiDistributor file ops are no-ops without an output path: open/close/delete swallow the missing errors."""
     d = MpiDistributor(ntasks=2, comm=comm1())
     assert d._file is None
     d.open_file()
@@ -777,9 +786,7 @@ def test_gather_chunked(monkeypatch):
 
 
 def test_gather_chunked_multidim_trailing(monkeypatch):
-    """MpiDistributor.gather writes chunks directly into multi-dimensional destination slices: the chunked
-    receive fills the contiguous axis-0 destination slice with no staging buffer, exercised with a
-    multi-dimensional trailing shape and many small chunks."""
+    """MpiDistributor.gather writes chunks straight into multi-dimensional axis-0 slices with no staging buffer."""
     full = (np.arange(5 * 2 * 3).reshape(5, 2, 3) + 1j).astype(np.complex128)
     monkeypatch.setattr(mu, "MAX_MPI_BYTES", 16)  # 1 row per chunk -> exercises the per-chunk Recv path
 
@@ -999,8 +1006,7 @@ def test_allreduce_sums_across_ranks():
 
 
 def test_allreduce_respects_message_limit(monkeypatch):
-    """MpiDistributor.allreduce chunks the reduction so no single MPI message exceeds the 2 GB limit (the reduced
-    arrays are always equally shaped across ranks, so every rank chunks identically)."""
+    """MpiDistributor.allreduce chunks the reduction so no message exceeds 2 GB (equal shapes chunk identically)."""
     base = (np.arange(6 * 2).reshape(6, 2) + 1j).astype(np.complex128)  # 32 bytes per row
     recorded = []
     orig = MPI.Comm.Allreduce
@@ -1290,9 +1296,7 @@ def test_build_node_shared_array_view_is_live_shared_memory():
 
 
 def test_restricted_to_rebases_slices_to_sub_communicator():
-    """restricted_to keeps only the member ranks' sizes and slices (in sub-communicator rank order) and
-    re-derives the calling rank's own slice from the sub-communicator rank, so the returned distributor's
-    collectives span exactly the members."""
+    """restricted_to keeps the member ranks' slices in sub-comm order and re-derives the caller's slice from it."""
     from types import SimpleNamespace
 
     full = SimpleNamespace(Get_rank=lambda: 2, Get_size=lambda: 4, size=4, rank=2)
@@ -1307,8 +1311,7 @@ def test_restricted_to_rebases_slices_to_sub_communicator():
 
 
 def test_fake_comm_split_groups_by_color_ordered_by_key():
-    """The fake Comm's Split mirrors MPI_Comm_split: one sub-communicator per color, shared by its members,
-    with ranks ordered by key (the production usage keys on the original rank)."""
+    """The fake Comm's Split mirrors MPI_Comm_split: one sub-comm per color, members shared, ranks ordered by key."""
 
     def fn(comm, rank):
         sub = comm.Split(0 if rank in (1, 3) else 1, rank)
