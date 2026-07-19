@@ -201,10 +201,20 @@ def _fft_bubble_reference(g, niw, niv, q_grid, beta):
     return BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, beta)
 
 
+def test_fft_bubble_matches_direct_einsum_bubble():
+    """The FFT bubble (scipy c64 ifft) matches the direct einsum bubble on the irr wedge and stays complex64."""
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 2, 2, 2.5
+    g = _make_momentum_g(nk, nb, niv + niw + 2, seed=7)
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    fft_bubble = _fft_bubble_reference(g, niw, niv, q_grid, beta)
+    direct = BubbleGenerator.create_generalized_chi0_q(g, niw, niv, np.array(q_grid.get_irrq_list()), q_grid, beta)
+    assert fft_bubble.mat.dtype == np.complex64
+    assert fft_bubble.mat.shape == direct.mat.shape
+    assert np.allclose(fft_bubble.mat, direct.mat, atol=1e-4)
+
+
 def test_fft_bubble_distributed_matches_single_rank(monkeypatch):
-    """The R-scattered multi-rank FFT bubble (pointwise R product, distributed pencil ifft via the conjugation
-    trick, row exchange onto the irr-BZ distribution) must reproduce the single-rank rank-0 path on a grid with a
-    non-trivial irreducible wedge."""
+    """The R-scattered multi-rank FFT bubble reproduces the single-rank rank-0 path on a non-trivial wedge."""
     import dgamore.mpi_utils as mpi_utils
     from dgamore.mpi_utils import MpiDistributor
     from tests.conftest import FAKE_MPI, run_parallel
@@ -226,8 +236,7 @@ def test_fft_bubble_distributed_matches_single_rank(monkeypatch):
 
 
 def test_fft_bubble_distributed_with_node_shared_greens_function(monkeypatch):
-    """With a node communicator the distributed bubble builds the R-space Green's function once per node in a
-    shared window and still reproduces the single-rank reference (two fake nodes exercise the window path)."""
+    """The distributed bubble builds the R-space Green's function once per node in a shared window and matches."""
     import dgamore.mpi_utils as mpi_utils
     from dgamore.mpi_utils import MpiDistributor
     from tests.conftest import FAKE_MPI, run_parallel
@@ -249,8 +258,7 @@ def test_fft_bubble_distributed_with_node_shared_greens_function(monkeypatch):
 
 
 def test_fft_bubble_distributed_with_fewer_columns_than_ranks(monkeypatch):
-    """With fewer (w, v) columns than ranks the surplus ranks compute nothing but still receive their irr-BZ
-    q-slice through the ring exchange, and the assembled bubble matches the single-rank reference."""
+    """With fewer (w,v) columns than ranks the idle ranks still receive their q-slice and the bubble matches."""
     import dgamore.mpi_utils as mpi_utils
     from dgamore.mpi_utils import MpiDistributor
     from tests.conftest import FAKE_MPI, run_parallel

@@ -34,9 +34,7 @@ def setup(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def mock_logger(monkeypatch):
-    """
-    Automatically mock logger.log for all tests in this file.
-    """
+    """Automatically mock logger.log for all tests in this file."""
     logger_mock = MagicMock()
     monkeypatch.setattr(logging, "getLogger", lambda name=None: logger_mock)
     monkeypatch.setattr(logging, "Logger", MagicMock(return_value=logger_mock))

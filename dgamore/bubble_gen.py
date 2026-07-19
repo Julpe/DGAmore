@@ -11,6 +11,7 @@ direct momentum-shift einsum, distributed over MPI ranks and optionally accelera
 """
 
 import numpy as np
+import scipy as sp
 
 import dgamore.mpi_utils as mpi_utils
 from dgamore.brillouin_zone import KGrid
@@ -84,8 +85,16 @@ class BubbleGenerator:
 
         if use_gpu:
             import cupy as xp
+
+            def ifftn_kxyz(arr):
+                return xp.fft.ifftn(arr, axes=(0, 1, 2))
+
         else:
             import numpy as xp
+
+            def ifftn_kxyz(arr):
+                # scipy.fft keeps complex64 in place; numpy.fft would upcast to complex128 (double work + 2x buffer)
+                return sp.fft.ifftn(arr, axes=(0, 1, 2), overwrite_x=True)
 
         order = "F" if use_gpu else "C"
 
@@ -112,9 +121,9 @@ class BubbleGenerator:
             for iw, wn_i in enumerate(wn):
                 g_vw = g_r_rev[..., start - wn_i : end - wn_i]
                 xp.multiply(g_r[:, :, :, :, None, None, :, :], g_vw[:, :, :, None, :, :, None, :], out=chi_r_v_buffer)
-                gchi0_q_mat[..., iw, :] = xp.fft.ifftn(chi_r_v_buffer, axes=(0, 1, 2)).reshape(
-                    (k_grid.nk_tot, nb, nb, nb, nb, 2 * niv)
-                )[k_grid.irrk_ind]
+                gchi0_q_mat[..., iw, :] = ifftn_kxyz(chi_r_v_buffer).reshape((k_grid.nk_tot, nb, nb, nb, nb, 2 * niv))[
+                    k_grid.irrk_ind
+                ]
 
             gchi0_q_mat *= -beta / k_grid.nk_tot
             if use_gpu:
@@ -211,7 +220,10 @@ class BubbleGenerator:
                         out=buf_v[..., col - c0],
                     )
                 chunk_irr = np.ascontiguousarray(
-                    np.fft.ifftn(buf_v, axes=(0, 1, 2)).reshape(nk_tot, nb, nb, nb, nb, n_mine)[k_grid.irrk_ind]
+                    # scipy.fft keeps complex64 in place; numpy.fft would upcast to complex128 (double work + 2x buffer)
+                    sp.fft.ifftn(buf_v, axes=(0, 1, 2), overwrite_x=True).reshape(nk_tot, nb, nb, nb, nb, n_mine)[
+                        k_grid.irrk_ind
+                    ]
                 )
                 if my_nq:
                     gchi0_cols[:, :, c0:c1] = chunk_irr[my_q_slice].reshape(my_nq, nb**4, n_mine)

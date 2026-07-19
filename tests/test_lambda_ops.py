@@ -48,8 +48,7 @@ def load_local_four_point(lc_type: str, filename: str, channel: SpinChannel) -> 
 
 
 def test_lambda_correction_spch():
-    """spch-type single lambda correction reproduces reference chi and lambdas for dens and magn channels; the dens
-    channel stalls at the divergence bound and warns, so the logger must be mocked for a standalone run."""
+    """spch single lambda correction reproduces reference chi and lambdas; dens stalls at the divergence bound."""
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.logger = MagicMock()
@@ -149,9 +148,7 @@ def test_find_lambda_warns_on_non_convergence():
 
 
 def _synthetic_chi_inv_qw(n_bands: int, nq: int, nw: int, seed: int = 0) -> np.ndarray:
-    """Physically-structured inverse compound susceptibility ``[nq, nw, No2, No2]``: real-symmetric (P3), SPD, with
-    an :math:`\\omega^2` growth so the domain binds at :math:`\\omega=0` and the sum-rule map is monotone (unique
-    root), like the real ladder susceptibility."""
+    """Physically-structured inverse compound susceptibility: real-symmetric SPD with omega^2 growth (unique root)."""
     rng = np.random.default_rng(seed)
     no2 = n_bands**2
     w0 = nw // 2
@@ -165,8 +162,7 @@ def _synthetic_chi_inv_qw(n_bands: int, nq: int, nw: int, seed: int = 0) -> np.n
 
 
 def _synthetic_chi_qw(n_bands: int, nq: int, nw: int, seed: int = 0) -> np.ndarray:
-    """The susceptibility belonging to :func:`_synthetic_chi_inv_qw` (same seed, per-block inverse): the input the
-    resolvent-form calibration consumes directly."""
+    """The per-block inverse of _synthetic_chi_inv_qw (same seed): the chi the resolvent-form calibration consumes."""
     return np.linalg.inv(_synthetic_chi_inv_qw(n_bands, nq, nw, seed))
 
 
@@ -246,8 +242,7 @@ def test_find_lambda_matrix_falls_back_to_lstsq_on_singular_hessian(monkeypatch)
 
 
 def test_multiorbital_perform_single_matches_single_band_for_magn():
-    """For the cleanly-converging magnetic channel, the No=1 matrix correction coincides with the scalar
-    LambdaCorrection (same lambda and corrected chi on the spch reference data)."""
+    """For the cleanly-converging magnetic channel the No=1 matrix correction equals the scalar LambdaCorrection."""
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.sys.n_bands = 1
@@ -265,8 +260,7 @@ def test_multiorbital_perform_single_matches_single_band_for_magn():
 
 @pytest.mark.parametrize("channel", [SpinChannel.DENS, SpinChannel.MAGN])
 def test_multiorbital_perform_single_satisfies_sum_rule(channel):
-    """The corrected susceptibility's full-BZ frequency sum matches the local target for BOTH channels - including
-    density, where the scalar single-band solver stalls at the divergence bound instead of the true root."""
+    """The corrected chi's full-BZ sum matches the local target for both channels, including density (scalar stalls)."""
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.sys.n_bands = 1
@@ -283,8 +277,7 @@ def test_multiorbital_perform_single_satisfies_sum_rule(channel):
 
 
 def _multiorbital_chi_fourpoint(n_bands: int, nq_grid: tuple, nw_half: int, seed: int) -> FourPoint:
-    """Physical two-index-per-leg chi^q FourPoint on the IBZ (no fermionic frequencies): its compound inverse is a
-    real-symmetric SPD block with omega^2 growth, so the sum-rule root is unique."""
+    """Physical two-index-per-leg chi^q on the IBZ: real-symmetric SPD compound inverse with omega^2 growth."""
     config.lattice.k_grid = bz.KGrid(nk=nq_grid, symmetries=bz.two_dimensional_square_symmetries())
     rng = np.random.default_rng(seed)
     n_irr = config.lattice.k_grid.irrk_count.shape[0]
@@ -302,8 +295,7 @@ def _multiorbital_chi_fourpoint(n_bands: int, nq_grid: tuple, nw_half: int, seed
 
 
 def test_multiorbital_perform_single_recovers_matrix_mass_and_sum_rule():
-    """Two-band object path: perform_single recovers a planted matrix mass and its corrected chi satisfies the
-    full-BZ sum rule (exercises map_to_full_bz + compound inversion for No > 1)."""
+    """The two-band object path recovers a planted matrix mass and its corrected chi satisfies the full-BZ sum rule."""
     config.sys.beta = 8.0
     config.sys.n_bands = 2
     chi = _multiorbital_chi_fourpoint(2, (4, 4, 1), 3, seed=7)
@@ -324,8 +316,7 @@ def test_multiorbital_perform_single_recovers_matrix_mass_and_sum_rule():
 
 
 def test_multiorbital_perform_loads_target_writes_lambda_and_corrects(tmp_path):
-    """perform loads the channel's local sum-rule target, corrects the susceptibility and appends ||Lambda|| to the
-    lambda file (single-band spch reference data in an isolated run directory)."""
+    """perform loads the channel's local target, corrects chi and appends ||Lambda|| to the lambda file."""
     import shutil
 
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
@@ -409,9 +400,7 @@ def test_lambda_correction_perform_raises_on_unknown_type():
 
 
 def test_find_lambda_matrix_feasibility_binds_at_omega_zero_only():
-    """A high-|w| ladder-tail slice with a deeply negative Hermitian eigenvalue must not inflate the feasibility
-    bound: the planted mass violates the all-frequency bound but is still recovered because only the static
-    (w=0) slice binds (regression: an all-w bound pushed lambda_start orders of magnitude above the true root)."""
+    """Only the static (w=0) slice binds the feasibility bound: a mass violating the all-w bound is still recovered."""
     beta, nq, nw, n_bands = 5.0, 6, 5, 2
     chi_inv_qw = _synthetic_chi_inv_qw(n_bands, nq, nw)
     no2 = n_bands**2
@@ -429,8 +418,7 @@ def test_find_lambda_matrix_feasibility_binds_at_omega_zero_only():
 
 
 def test_log_pauli_diagnostic_scans_multiple_inequivalent_atoms(monkeypatch):
-    """With two single-band inequivalent atoms the diagnostic reports the single worst deviation across atoms,
-    labeled with the correct inequivalent-atom index and global orbital offset."""
+    """With two single-band atoms the diagnostic reports the worst deviation, labeled with atom and orbital offset."""
     config.sys.beta = 5.0
     config.sys.n_bands = 2
     config.dmft.ineq_ordering = [1, 2]
@@ -481,9 +469,7 @@ def test_multiorbital_perform_quiet_writes_nothing_and_skips_pauli(monkeypatch, 
 
 
 def _synthetic_auto_grid(n_bands: int = 2):
-    """KGrid (2, 2, 1) with hand-built auto-symmetry data: two 2-point stars whose non-representative members carry
-    a nontrivial orbital rotation (one of them antiunitary and one with sigma = -1), exercising every branch of the
-    irreducible-to-full-BZ expansion."""
+    """A 2x2x1 KGrid with hand-built auto data whose star members carry antiunitary and sigma=-1 rotations."""
     grid = bz.KGrid(nk=(2, 2, 1), symmetries=[])
     fbz2irrk = np.array([0, 0, 2, 2])
     grid.fbz2irrk = fbz2irrk.reshape(2, 2, 1)
@@ -500,8 +486,7 @@ def _synthetic_auto_grid(n_bands: int = 2):
 
 
 def _chi_on_grid(grid, n_bands: int, nw_half: int, seed: int) -> FourPoint:
-    """Physical chi^q FourPoint on the grid's irreducible wedge (0 fermionic frequencies): SPD real-symmetric
-    compound inverse with omega^2 growth, invertible at every (q, w)."""
+    """Physical chi^q on the grid's irreducible wedge: SPD real-symmetric compound inverse with omega^2 growth."""
     rng = np.random.default_rng(seed)
     n_irr = grid.irrk_count.shape[0]
     no2, nw = n_bands**2, 2 * nw_half + 1
@@ -518,8 +503,7 @@ def _chi_on_grid(grid, n_bands: int, nw_half: int, seed: int) -> FourPoint:
 
 
 def test_expand_compound_slice_is_exact_gather_without_auto_data():
-    """Without auto-symmetry data the FBZ expansion is the plain irrk_inv gather, bit-identical per bosonic
-    frequency to what map_to_full_bz produces."""
+    """Without auto data the FBZ expansion is the plain irrk_inv gather, matching map_to_full_bz per frequency."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.lattice.k_grid = grid
     chi = _chi_on_grid(grid, 2, 2, seed=5)
@@ -531,9 +515,7 @@ def test_expand_compound_slice_is_exact_gather_without_auto_data():
 
 
 def test_expand_compound_slice_matches_object_map_and_commutes_with_inversion():
-    """In auto mode the raw-array FBZ expansion reproduces map_to_full_bz (gather + per-k orbital rotation incl.
-    the antiunitary member) and commutes with the compound inversion to complex128 accuracy, so expanding the
-    cached irreducible-wedge inverse is exact."""
+    """In auto mode the raw expansion reproduces map_to_full_bz and commutes with inversion, so it is exact."""
     grid = _synthetic_auto_grid()
     chi = _chi_on_grid(grid, 2, 1, seed=6)
     expected = chi.copy().map_to_full_bz(grid).to_compound_indices().mat
@@ -549,9 +531,7 @@ def test_expand_compound_slice_matches_object_map_and_commutes_with_inversion():
 
 @pytest.mark.parametrize("auto", [False, True])
 def test_find_lambda_matrix_ibz_resident_matches_full_bz_reference(auto):
-    """The IBZ-resident calibration (q_grid passed, inverse cached on the wedge, per-w expansion) yields the same
-    mass as the reference full-BZ-stack path: near-bit-exact on a plain-symmetry grid, and at the complex64
-    transform-noise level on an auto grid with genuine orbital rotations."""
+    """The IBZ-resident calibration yields the same mass as the full-BZ-stack path (c64-noise level on auto grids)."""
     beta, n_bands = 5.0, 2
     grid = _synthetic_auto_grid() if auto else bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.lattice.k_grid = grid

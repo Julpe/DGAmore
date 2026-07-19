@@ -1190,6 +1190,9 @@ def solve_eliashberg_lanczos(
     # TRIQS order (cdag c cdag c), see https://triqs.github.io/tprf/latest/theory/eliashberg.html
     gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.permute_orbitals("abcd->badc", False).mat)
     gamma_r_pp.free()
+    # fold the kernel prefactor into the persistent vertex once: both matvec terms inherit it by linearity, so the
+    # per-matvec full-gap multiply is dropped.
+    gamma_mm *= norm
 
     sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
 
@@ -1208,14 +1211,16 @@ def solve_eliashberg_lanczos(
             _apply_gchi0_pp(chi0_mm, gap, n_bands), axes=(0, 1, 2), overwrite_x=True, workers=n_threads
         )
         gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands, executor, n_threads)
-        # crossed term: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]
-        crossed = _apply_gamma_pp(gamma_mm, np.flip(gap_gg, axis=-1), n_bands, executor, n_threads)
+        # crossed term: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]; the flipped
+        # RHS is materialized contiguously so np.matmul stays on the BLAS fast path (a single-band flip is a view).
+        crossed = _apply_gamma_pp(
+            gamma_mm, np.ascontiguousarray(np.flip(gap_gg, axis=-1)), n_bands, executor, n_threads
+        )
         crossed = np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
         if sign != 1:
             crossed *= sign
         gap_new += crossed
         gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True, workers=n_threads)
-        gap_new *= norm
         return gap_new.flatten()
 
     base_seed = get_initial_gap_function(gap_shape, gamma_r_pp.channel).flatten()
@@ -1298,6 +1303,9 @@ def solve_eliashberg_lanczos_v2(
     # differ by the "abcd->badc" swap (o1<->o2, o3<->o4), which aligns the gap's creation legs; no-op for one band.
     gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.permute_orbitals("abcd->badc", False).mat)
     gamma_r_pp.free()
+    # fold the kernel prefactor into the persistent vertex once (see solve_eliashberg_lanczos): both matvec terms
+    # inherit it by linearity, dropping the per-matvec full-gap multiply.
+    gamma_mm *= norm
 
     sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
 
@@ -1321,14 +1329,15 @@ def solve_eliashberg_lanczos_v2(
         # 3. contract with the pairing vertex over (c, d, p) -> the gap for this rank's v slice; the crossed term
         #    reuses the direct vertex: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]
         gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands, executor, n_threads)
-        crossed = _apply_gamma_pp(gamma_mm, np.flip(gap_gg, axis=-1), n_bands, executor, n_threads)
+        crossed = _apply_gamma_pp(
+            gamma_mm, np.ascontiguousarray(np.flip(gap_gg, axis=-1)), n_bands, executor, n_threads
+        )
         crossed = np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
         if sign != 1:
             crossed *= sign
         gap_new += crossed
         # 4. perform fourier transform on the local v slice
         gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True, workers=n_threads)
-        gap_new *= norm
         # 5. assemble gap_new for the full v range through mpi_dist_v and allgather (remember we distributed v)
         gap_new = np.moveaxis(gap_new, -1, 0)  # (v_local, nq_tot, orb, orb)
         gap_new = mpi_dist_v.allgather(gap_new)  # (v_total, nq_tot, orb, orb)

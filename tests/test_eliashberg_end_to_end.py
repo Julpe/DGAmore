@@ -64,8 +64,7 @@ def _assert_gap_sector_parity(results: dict) -> None:
 
 @pytest.mark.parametrize("save_fq, save_memory", [(True, True), (False, True), (True, False), (False, False)])
 def test_eliashberg_equation_without_local_part(setup, save_fq, save_memory):
-    """The Eliashberg solve without the local vertex part reproduces the reference eigenvalues and each gap carries
-    its sector's frequency/momentum-orbital parity in all four save_fq x save_memory flag combinations."""
+    """The Eliashberg solve without the local part matches reference eigenvalues and gap parity in all flag combos."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20
@@ -108,8 +107,7 @@ def test_eliashberg_equation_without_local_part(setup, save_fq, save_memory):
 
 @pytest.mark.parametrize("save_fq, save_memory", [(True, True), (False, True), (True, False), (False, False)])
 def test_eliashberg_equation_with_local_part(setup, save_fq, save_memory):
-    """The Eliashberg solve including the local vertex part reproduces the reference eigenvalues and each gap carries
-    its sector's frequency/momentum-orbital parity in all four save_fq x save_memory flag combinations."""
+    """The Eliashberg solve with the local part matches reference eigenvalues and gap parity in all flag combos."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20
@@ -161,13 +159,7 @@ def _fft_index_map(nq: tuple, f) -> np.ndarray:
 
 
 def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeypatch):
-    """Locks the full multi-orbital pairing kernel on the real two-band vertex against thesis Eq. (4.63): the
-    densified production matvec must equal the transparent index formula norm * sum_{ef} [Gamma^{K-Q;vv'}_{e1f2}
-    + sign Gamma^{(-K)-Q;v(-v')}_{e2f1}] G_{eh}(Q, v') conj(G_{gf}(Q, v')) Delta_{gh}(Q, v')
-    (pinning every layout, permute, FFT and the bubble-gap contraction for orbitally off-diagonal G), and its
-    leading eigenvalue spectrum must equal that of the independently densified thesis kernel
-    K^{vv'}_{1b2a}(K - Q) chi^{Q v'}_{0;acbd} Delta_{cd} with chi_{0;acbd} = G_{ad}(Q) G_{cb}(-Q) and the vertex
-    legs read as Gamma-thesis_{1234} = Gamma-stored_{2341}."""
+    """The densified two-band pairing kernel matches the index formula and the thesis Eq. (4.63) spectrum."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20
@@ -256,8 +248,7 @@ def _phase_align(gap: np.ndarray, reference: np.ndarray) -> np.ndarray:
 
 
 def test_eliashberg_gap_functions_carry_sector_parity_and_match_reference(setup):
-    """Each Eliashberg gap function carries its sector's frequency (T) and momentum-orbital (P.O) parity and, with a
-    fixed seed, reproduces the committed reference gap function up to a global phase."""
+    """Each gap carries its sector's T and P.O parity and, with a fixed seed, matches the reference up to a phase."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20

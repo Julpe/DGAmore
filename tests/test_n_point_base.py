@@ -658,8 +658,7 @@ def test_compresses_other_when_self_is_compressed():
 
 
 def test_filter_small_values_sets_tiny_entries_to_zero():
-    """filter_small_values (default threshold 1e-12) zeroes exactly the entries whose real and imaginary parts
-    are both below the threshold, preserves entries with any component above it, and returns self."""
+    """filter_small_values zeroes entries with both real and imag parts below 1e-12, keeps the rest and returns self."""
     mat = np.array(
         [
             [1e-13 + 1e-13j, 1e-11 + 1e-13j],
@@ -680,8 +679,7 @@ def test_filter_small_values_sets_tiny_entries_to_zero():
 
 
 def test_filter_small_values_respects_custom_threshold():
-    """filter_small_values zeroes entries with both components below a custom threshold and preserves entries
-    with one component above it."""
+    """filter_small_values zeroes entries with both components below a custom threshold and keeps entries above it."""
     mat = np.array([1e-6 + 1e-6j, 2e-6 + 0.0j, 5e-5 + 1e-8j], dtype=np.complex128)
     obj = IHaveMat(mat)
     obj.filter_small_values(threshold=1e-5)
@@ -728,8 +726,7 @@ def test_free_with_trim_calls_malloc_trim(monkeypatch):
 
 
 def test__malloc_trim_is_noop_when_unavailable(monkeypatch):
-    """_malloc_trim is a no-op when malloc_trim is unavailable: neither _malloc_trim() nor free(trim=True)
-    touches the libc."""
+    """_malloc_trim is a no-op when malloc_trim is unavailable: neither it nor free(trim=True) touches the libc."""
     monkeypatch.setattr(IHaveMat, "_malloc_trim_available", False)
 
     # a libc that raises if called, proving it is never invoked
@@ -808,8 +805,7 @@ def test_skip_on_non_posix_or_no_proc(monkeypatch):
 
 
 def test_loads_libc_and_calls_malloc_trim(monkeypatch):
-    """On POSIX with /proc present, _malloc_trim loads the libc via ctypes.CDLL, stores it on the class and
-    invokes its malloc_trim."""
+    """On POSIX with /proc, _malloc_trim loads the libc via ctypes.CDLL, caches it and invokes its malloc_trim."""
     fake_lib = MagicMock()
     fake_ctypes = types.ModuleType("ctypes")
     fake_ctypes.CDLL = lambda name: fake_lib
@@ -847,8 +843,7 @@ def test_ctypes_cdll_failure_sets_unavailable(monkeypatch):
 
 
 def test_malloc_trim_exception_is_suppressed(monkeypatch):
-    """An exception from malloc_trim itself is suppressed, and availability stays True since ctypes loaded the
-    libc successfully."""
+    """An exception from malloc_trim is suppressed, and availability stays True since ctypes loaded the libc."""
     bad_lib = MagicMock(malloc_trim=MagicMock(side_effect=RuntimeError("boom")))
     fake_ctypes = types.ModuleType("ctypes")
     fake_ctypes.CDLL = lambda name: bad_lib
@@ -1227,8 +1222,7 @@ def test_interpolate_q_grid_single_kpoint_axis_upsamples_constant(c128_storage):
 
 
 def _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1, hopping=1.0, include_antiunitary=False):
-    """Build an auto-mode KGrid populated with a small real cubic Hamiltonian.
-    Returns (kgrid, H_full[nx,ny,nz,nb,nb])."""
+    """Builds an auto-mode KGrid with a small real cubic Hamiltonian; returns (kgrid, H_full)."""
     j1, j2, j3 = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
     k1 = 2 * np.pi * j1 / nx
     k2 = 2 * np.pi * j2 / ny
@@ -1244,13 +1238,12 @@ def _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1, hopping=1.0, include_antiunitary=F
 
 @pytest.fixture
 def c128_storage(monkeypatch):
-    """Runs the test with complex128 object storage: patches the module-level DTYPE that the mat setter
-    enforces, so plain production objects keep double precision for exact mapping references."""
+    """Runs the test with complex128 object storage by patching the module DTYPE the mat setter enforces."""
     monkeypatch.setattr(npb, "DTYPE", np.complex128)
 
 
 def test_map_to_full_bz_plain_symmetry_kgrid_pure_replication(c128_storage):
-    """With a plain-symmetry (non-auto) KGrid, ``_map_to_full_bz`` reduces to a bare IBZ→FBZ index expansion via ``irrk_inv``: each FBZ point gets the IBZ value at the index pointed to by ``irrk_inv``, with no orbital transformation."""
+    """With a plain-symmetry KGrid, _map_to_full_bz is a bare IBZ->FBZ irrk_inv expansion with no orbital transform."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     nb = 1
     nq_tot = 16
@@ -1290,7 +1283,7 @@ def test_map_to_full_bz_auto_2idx_reconstructs_H_for_multiorbital_case(c128_stor
 
 
 def test_map_to_full_bz_auto_4idx_reconstructs_HotimesH_exactly(c128_storage):
-    """For Γ = H ⊗ H (which inherits H's symmetry trivially), reconstruction must be exact under the 4-orbital-index code path."""
+    """For Gamma = H (x) H, the 4-orbital-index reconstruction is exact."""
     grid, H = _build_auto_kgrid(nx=3, ny=3, nz=3, nb=2)
     nb = 2
     Gamma_full = np.einsum("...ab,...cd->...abcd", H, H)
@@ -1303,7 +1296,7 @@ def test_map_to_full_bz_auto_4idx_reconstructs_HotimesH_exactly(c128_storage):
 
 
 def test_map_to_full_bz_auto_preserves_trailing_frequency_dimensions(c128_storage):
-    """The mapping is shape-polymorphic in the trailing axes (e.g. frequency axes). A 1-band IBZ payload with 2 frequency axes after the orbital pair must come back to the full BZ unmodified beyond the index expansion; the payload is distinct at every IBZ slot so missing or wrong indices show up."""
+    """The mapping is shape-polymorphic in trailing (frequency) axes and reconstructs the payload unmodified."""
     grid, _ = _build_auto_kgrid(nx=4, ny=4, nz=1, nb=1)
     nb = 1
     n_freq = 5
@@ -1321,7 +1314,7 @@ def test_map_to_full_bz_auto_preserves_trailing_frequency_dimensions(c128_storag
 
 
 def test_map_to_full_bz_auto_default_no_antiunitary_does_no_conjugation(c128_storage):
-    """Default (include_antiunitary=False): no FBZ point should ever be conjugated, so a complex IBZ payload reconstructs as a pure index replication. This is the safe semantics for frequency-dependent objects."""
+    """With include_antiunitary=False no FBZ point is conjugated, so a complex payload is pure index replication."""
     nb = 1
     grid, _ = _build_auto_kgrid(nx=4, ny=4, nz=1, nb=nb, include_antiunitary=False)
     assert int(grid._auto_conjs.sum()) == 0
@@ -1337,7 +1330,7 @@ def test_map_to_full_bz_auto_default_no_antiunitary_does_no_conjugation(c128_sto
 
 
 def test_map_to_full_bz_auto_delegates_to_apply_auto_orbital_transform(c128_storage, monkeypatch):
-    """The auto branch must call ``symmetry_reduction.apply_auto_orbital_transform`` with the correctly-sliced (Us, sigmas, conjs) arrays and the right ndim."""
+    """The auto branch calls apply_auto_orbital_transform with the correctly-sliced (Us, sigmas, conjs) and ndim."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=2)
     nb = 2
     nktot = 4 * 4 * 4
@@ -1371,7 +1364,7 @@ def test_map_to_full_bz_auto_passes_num_orbital_dimensions_4_for_vertex(c128_sto
 
 
 def test_map_to_full_bz_plain_symmetry_kgrid_does_not_call_orbital_transform(c128_storage, monkeypatch):
-    """For a plain-symmetry (non-auto) KGrid, the orbital transform helper must NOT be called: only the IBZ→FBZ replication runs."""
+    """For a plain-symmetry KGrid the orbital transform helper is not called; only the IBZ->FBZ replication runs."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     nb = 1
     ibz_payload = np.arange(grid.nk_irr).astype(np.complex128).reshape(grid.nk_irr, nb, nb)
@@ -1394,7 +1387,7 @@ def test_map_to_full_bz_raises_for_invalid_num_orbital_dimensions(c128_storage):
 
 
 def test_map_to_full_bz_raises_when_not_compressed(c128_storage):
-    """The compressed-q convention is required: an already-expanded matrix is not a valid input to ``_map_to_full_bz``."""
+    """_map_to_full_bz requires compressed q: an already-expanded matrix is not a valid input."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
     obj = IAmNonLocal(mat=H, nq=(4, 4, 4), has_compressed_q_dimension=False)
     with pytest.raises(ValueError, match="compressed momentum dimension"):
@@ -1432,7 +1425,7 @@ def test_map_to_full_bz_plain_symmetry_returns_self_for_method_chaining(c128_sto
 
 
 def test_map_to_full_bz_auto_1x1x1_trivial_grid_is_identity(c128_storage):
-    """Edge case: a 1×1×1 grid has a single k-point, so the FBZ trivially equals the IBZ and the mapping returns the input unchanged in value."""
+    """On a 1x1x1 grid the FBZ equals the IBZ, so the mapping returns the input unchanged in value."""
     nb = 2
     H = np.zeros((1, 1, 1, nb, nb), dtype=complex)
     H[0, 0, 0] = np.array([[1.0, 0.3], [0.3, 2.0]])
@@ -1445,7 +1438,7 @@ def test_map_to_full_bz_auto_1x1x1_trivial_grid_is_identity(c128_storage):
 
 
 def test_map_to_full_bz_auto_preserves_dtype():
-    """The output matrix has the same dtype as the input (the function does not silently cast within the auto branch - the cast to complex64 happens elsewhere in ``IHaveMat.mat = value``)."""
+    """The auto branch does not silently cast: the output dtype equals the input dtype."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
     H_ibz_64 = H.reshape(-1, 1, 1)[grid.irrk_ind].astype(np.complex64).copy()
     obj = IAmNonLocal(mat=H_ibz_64, nq=(4, 4, 4), has_compressed_q_dimension=True)
@@ -1454,7 +1447,7 @@ def test_map_to_full_bz_auto_preserves_dtype():
 
 
 def test_map_to_full_bz_auto_irrk_inv_consistency_at_every_fbz_point(c128_storage):
-    """Every FBZ k must end up with the value at irrk_inv[k] transformed by the stored (U_k, sigma_k, conj_k). Check this explicitly point-by-point."""
+    """Every FBZ k ends up with the value at irrk_inv[k] transformed by the stored (U_k, sigma_k, conj_k)."""
     grid, H = _build_auto_kgrid(nx=3, ny=3, nz=3, nb=2)
     nb = 2
     H_flat = H.reshape(-1, nb, nb)
@@ -1621,8 +1614,7 @@ def _filter_reference(mat: np.ndarray, threshold: float) -> np.ndarray:
 
 
 def test_filter_small_values_chunked_path_matches_single_pass(monkeypatch):
-    """filter_small_values under a tiny chunk budget (step == 1, one element per chunk) matches the single-pass
-    reference on a mask spanning several chunks, and stays chainable."""
+    """filter_small_values with a one-element chunk budget matches the single-pass reference and stays chainable."""
     rng = np.random.default_rng(7)
     mat = (rng.standard_normal((50, 4)) + 1j * rng.standard_normal((50, 4))).astype(np.complex64)
     mat[::3] = 1e-15 + 1e-15j
@@ -1637,8 +1629,7 @@ def test_filter_small_values_chunked_path_matches_single_pass(monkeypatch):
 
 
 def test_filter_small_values_handles_non_contiguous_input(monkeypatch):
-    """filter_small_values handles a non-contiguous (transposed) input: the already-complex64 view is kept by
-    the setter and the tiny chunk budget forces axis-0 chunking on the non-contiguous branch."""
+    """filter_small_values handles a non-contiguous (transposed) input under a tiny chunk budget (axis-0 chunking)."""
     rng = np.random.default_rng(11)
     base = (rng.standard_normal((6, 8)) + 1j * rng.standard_normal((6, 8))).astype(np.complex64)
     base[:, ::2] = 1e-15 + 1e-15j
@@ -1655,8 +1646,7 @@ def test_filter_small_values_handles_non_contiguous_input(monkeypatch):
 
 
 def test_fft_ifft_preserve_complex64_dtype():
-    """fft and ifft preserve the complex64 dtype and round-trip the input: the BZ FFTs must keep complex64
-    (scipy.fft + overwrite_x); a regression to np.fft would upcast and spike memory."""
+    """fft and ifft keep complex64 and round-trip (scipy.fft + overwrite_x; np.fft would upcast and spike memory)."""
     rng = np.random.default_rng(3)
     shape = (4, 4, 2, 1, 1, 6)
     mat = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)

@@ -17,8 +17,7 @@ import dgamore.config as config
 
 
 def pytest_addoption(parser):
-    """Register the --runslow flag so individual tests can be marked @pytest.mark.slow
-    and skipped by default. CI can opt in via `pytest --runslow`."""
+    """Registers --runslow so @pytest.mark.slow tests are skipped unless --runslow is passed."""
     parser.addoption(
         "--runslow",
         action="store_true",

@@ -33,8 +33,7 @@ def _make_single_rank_distributor():
 
 
 def _to_mat(x: np.ndarray, nv: int, no: int) -> np.ndarray:
-    """Maps a two-frequency four-orbital tensor X^{vv'}_{1234} to its compound-matrix representation
-    M[(v,1,2),(v',4,3)], under which the vertex product and inversion become plain matrix operations."""
+    """Maps a two-frequency four-orbital tensor to its compound matrix (product and inversion become matrix ops)."""
     d = nv * no * no
     return x.transpose(4, 0, 1, 5, 3, 2).reshape(d, d)
 
@@ -67,10 +66,7 @@ def setup(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("no", [2, 3, 4, 5])
 def test_create_full_vertex_q_r_matches_exact_bse_inversion(setup, no):
-    """The production F^q chain (calculate_sigma_kernel_r_q + create_full_vertex_q_r) reproduces the exact BSE
-    inversion. Inputs: reversal-symmetric invertible bubble slices -beta (A(x)B + A^T(x)B^T), a local irreducible
-    vertex with the physical (nu, nu') time-reversal symmetry, a reversal-symmetric TR-projected local interaction
-    with vanishing non-local part, and zero shell terms so the dressing reduces to [(sum chi*)^{-1} + U_r]^{-1}."""
+    """The production F^q chain reproduces the exact BSE inversion on reversal-symmetric bubbles with zero shell."""
     rng = np.random.default_rng(0)
     beta = config.sys.beta
     n_q, n_w, niv = 2, 3, 3

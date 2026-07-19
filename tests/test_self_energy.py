@@ -22,13 +22,7 @@ mat_compressed = np.random.rand(16, 2, 2, 2 * niv)
 
 
 def _se(mat, **kwargs):
-    """Construct a SelfEnergy, injecting the module's beta unless the test overrides it.
-
-    SelfEnergy no longer reads ``config.sys.beta``; beta is an explicit constructor
-    argument. This helper keeps the bulk tests DRY while passing beta explicitly. The
-    dedicated decoupling tests below construct ``SelfEnergy`` directly to prove the
-    class never consults the global config.
-    """
+    """Constructs a SelfEnergy with beta passed explicitly (the class no longer reads config.sys.beta), tests DRY."""
     kwargs.setdefault("beta", sys.beta)
     return SelfEnergy(mat, **kwargs)
 

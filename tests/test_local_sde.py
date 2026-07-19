@@ -16,14 +16,7 @@ TEST_DATA = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/local_sde"
 
 
 def test_local_hartree_fock_matches_reference():
-    """
-    Verifies the local Hartree-Fock (static) self-energy for a genuine multi-orbital interaction. The two-orbital
-    La3Ni2O7 ``u_matrix.dat`` carries off-diagonal Kanamori terms (inter-orbital density ``U' = 2.39`` at
-    ``U_{abab}``, Hund ``J = 0.61``); the reference ``sigma_HF.npy`` was generated to match the DMFT
-    high-frequency self-energy moment of that system. This guards the orbital-index convention of the Hartree
-    term (see :func:`dgamore.local_sde.get_local_hartree_fock`): reverting the ``abcd->acbd`` swap makes the
-    Hartree pick ``U_{aabb} = J`` instead of ``U'`` and the test fails.
-    """
+    """The local Hartree-Fock matches the multi-orbital reference; the abcd->acbd swap picks U' not J."""
     u_loc = Hamiltonian().read_umatrix(f"{TEST_DATA}/u_matrix.dat").get_local_u()
     occ = np.load(f"{TEST_DATA}/occ.npy", allow_pickle=False)
     sigma_hf_ref = np.load(f"{TEST_DATA}/sigma_HF.npy", allow_pickle=False)
@@ -35,11 +28,7 @@ def test_local_hartree_fock_matches_reference():
 
 
 def test_local_hartree_fock_uses_inter_orbital_u_prime():
-    """
-    Guards against the convention bug directly: the inter-orbital Hartree must use ``U' = U_{abab}``, not
-    ``J = U_{aabb}``. The pre-fix contraction (without the ``abcd->acbd`` swap) gives a clearly different,
-    too-small static self-energy, so it must NOT match the reference.
-    """
+    """The inter-orbital Hartree must use U'=U_{abab}; the pre-fix contraction (no abcd->acbd swap) must not match."""
     u_loc = Hamiltonian().read_umatrix(f"{TEST_DATA}/u_matrix.dat").get_local_u()
     occ = np.load(f"{TEST_DATA}/occ.npy", allow_pickle=False)
     sigma_hf_ref = np.load(f"{TEST_DATA}/sigma_HF.npy", allow_pickle=False)
@@ -71,8 +60,7 @@ def _local_chain_inputs(o=2, nw=3, niv=3, beta=12.5, seed=51):
 
 
 def test_create_auxiliary_chi_matches_two_block_expression():
-    """The fused local auxiliary susceptibility (in-place scale + diagonal bubble add + in-place invert) must
-    match the former two-block expression (chi0^-1 + (Gamma - U)/beta^2)^-1 and leave gamma untouched."""
+    """The fused local auxiliary susceptibility matches (chi0^-1 + (Gamma-U)/beta^2)^-1 and leaves gamma untouched."""
     import dgamore.config as config
 
     gamma_r, gchi0_inv, u_loc = _local_chain_inputs()
@@ -85,8 +73,7 @@ def test_create_auxiliary_chi_matches_two_block_expression():
 
 
 def test_create_gamma_r_with_shell_correction_matches_two_block_expression():
-    """The fused shell-corrected irreducible vertex (diagonal subtract + in-place scale and interaction add) must
-    match the former subtract/scale/add chain and leave the generalized susceptibility untouched."""
+    """The fused shell-corrected irreducible vertex matches the former subtract/scale/add chain, chi untouched."""
     import dgamore.config as config
 
     gchi_r, _, u_loc = _local_chain_inputs(seed=52)
@@ -99,10 +86,9 @@ def test_create_gamma_r_with_shell_correction_matches_two_block_expression():
     gchi_before = gchi_r.mat.copy()
 
     beta = config.sys.beta
-    chi_tilde_shell = (
-        gchi0.invert().extend_vn_to_diagonal() + 1.0 / beta**2 * u_loc.as_channel(gchi_r.channel)
-    ).invert()
-    chi_tilde_core_inv = chi_tilde_shell.cut_niv(config.box.niv_core).invert()
+    # isolate the outer fused subtract/scale/add: the inner shell inverse uses the same Woodbury path as production
+    # (its equivalence to the dense chain is locked separately by test_shell_inverse_core_matches_dense_chain).
+    chi_tilde_core_inv = gchi0.shell_inverse_core(u_loc.as_channel(gchi_r.channel), beta, config.box.niv_core).invert()
     ref = (gchi_r.invert() - chi_tilde_core_inv).scale(beta**2) + u_loc.as_channel(gchi_r.channel)
 
     out = local_sde.create_gamma_r_with_shell_correction(gchi_r, gchi0, u_loc)
@@ -111,8 +97,7 @@ def test_create_gamma_r_with_shell_correction_matches_two_block_expression():
 
 
 def test_create_full_vertex_from_gamma_matches_batched_expression():
-    """The per-w full-vertex solve F = Gamma_u [1 + chi_0 Gamma_u / beta^2]^{-1} must match the former batched
-    identity/matmul/invert expression within complex64 rounding and leave gamma untouched."""
+    """The per-w full-vertex solve matches the former batched identity/matmul/invert expression, gamma untouched."""
     import dgamore.config as config
     from dgamore.bubble_gen import BubbleGenerator
     from dgamore.greens_function import GreensFunction
