@@ -35,7 +35,7 @@ from dgamore.n_point_base import DTYPE
 DTYPE_BYTES: int = np.dtype(DTYPE).itemsize
 OVERHEAD_FACTOR: float = 1.0
 
-# chiq_aux builds its BSE block in ONE allocation (nonlocal_sde._assemble_bse_matrix), then holds it resident across
+# chiq_aux builds its BSE block in ONE allocation (nonlocal_sde.create_inverse_auxiliary_chi_r_q), then holds it across
 # the per-q invert_and_sum_over_last_vn (per-q inversion transient negligible). Peak ~1x the rank-local block.
 CHIQ_AUX_INVERT_FACTOR: int = 1
 
@@ -102,17 +102,18 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
-def _two_fermion_block(q: int, nb: int, nw: int, nv: int) -> int:
+def _two_fermion_block(q: int, nb: int, nw: int, nv: int, nv_second: int = -1) -> int:
     """
-    Returns the element count of a full two-fermion four-point block ``[q, nb^4, nw, nv, nv]``.
+    Returns the element count of a two-fermion four-point block ``[q, nb^4, nw, nv, nv_second]``.
 
     :param q: Number of (rank-local) momentum points.
     :param nb: Number of bands.
     :param nw: Number of bosonic frequencies.
-    :param nv: Number of fermionic frequencies (single axis length).
+    :param nv: Number of fermionic frequencies of the first axis (single axis length).
+    :param nv_second: Length of the second fermionic axis; defaults to ``nv``, i.e. a symmetric block.
     :return: The number of complex elements.
     """
-    return q * nb**4 * nw * nv * nv
+    return q * nb**4 * nw * nv * (nv if nv_second < 0 else nv_second)
 
 
 def _bubble_block(q: int, nb: int, nw: int, nv: int) -> int:
@@ -253,8 +254,9 @@ def estimate_peaks(
     )
 
     # Fast holds the whole rank-local two-fermion block, lean accumulates the 1-fermion result (both DISTRIBUTED; map
-    # always p2p, no single-rank term). One node-shared local vertex (f_dc_loc at niv_full or core-box gamma) resident.
-    local_vertex_shared = scale * max(_two_fermion_block(1, nb, wp, vf), _two_fermion_block(1, nb, wp, vc))
+    # always p2p, no single-rank term). One node-shared local vertex resident: f_dc_loc carries the summed fermionic
+    # index on the full box but the surviving one only on the core box, so it is niv_full x niv_core, not squared.
+    local_vertex_shared = scale * max(_two_fermion_block(1, nb, wp, vf, vc), _two_fermion_block(1, nb, wp, vc))
     peaks["chiq_aux"] = BranchPeak(
         baseline=baseline_kernel_section + local_vertex_shared,
         giwk_shareable=giwk_sde + local_vertex_shared,

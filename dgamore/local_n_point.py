@@ -120,6 +120,34 @@ class LocalNPoint(IHaveMat):
         return self.original_shape[-1] // 2
 
     @property
+    def niv_first(self) -> int:
+        r"""
+        Returns the number of fermionic frequencies of the first fermionic axis :math:`\nu`.
+
+        Objects with two fermionic axes are usually stored on a symmetric :math:`\nu \times \nu'` box, where this
+        equals :attr:`niv_second`. The two axes may however carry different widths, and every operation addressing
+        them individually has to read each width separately.
+
+        :return: The half-width of the first fermionic axis (0 if there is none, the only one if there is one).
+        """
+        if self.num_vn_dimensions == 0:
+            return 0
+        if self.num_vn_dimensions == 1:
+            return self.niv
+        return self.original_shape[-2] // 2
+
+    @property
+    def niv_second(self) -> int:
+        r"""
+        Returns the number of fermionic frequencies of the second fermionic axis :math:`\nu'`, the counterpart of
+        :attr:`niv_first` (see there for the asymmetric case). Objects with a single fermionic axis report that
+        axis, so this coincides with :attr:`niv`.
+
+        :return: The half-width of the second fermionic axis (0 if there is none, the only one if there is one).
+        """
+        return self.niv
+
+    @property
     def full_niw_range(self) -> bool:
         r"""
         Specifies whether the object is stored in the full bosonic frequency range or
@@ -140,6 +168,18 @@ class LocalNPoint(IHaveMat):
         :return: True if the fermionic axes span the full (signed) range.
         """
         return self._full_niv_range
+
+    def vn_slice(self, niv_axis: int, niv_cut: int) -> slice:
+        """
+        Returns the slice keeping ``niv_cut`` fermionic frequencies of an axis that holds ``niv_axis`` of them.
+
+        :param niv_axis: Number of fermionic frequencies (per sign) stored on the axis.
+        :param niv_cut: Number of fermionic frequencies (per sign) to keep.
+        :return: The slice to apply to that axis; a full slice only if the cutoff exceeds the axis.
+        """
+        if niv_cut > niv_axis:  # strict: on a half fermionic range an equal cutoff still truncates
+            return slice(None)
+        return slice(niv_axis - niv_cut, niv_axis + niv_cut) if self.full_niv_range else slice(0, niv_cut)
 
     def cut_niw(self, niw_cut: int, copy: bool = True):
         """
@@ -193,7 +233,7 @@ class LocalNPoint(IHaveMat):
         if self.num_vn_dimensions == 0:
             raise ValueError("Cannot cut fermionic frequencies if there are none.")
 
-        if niv_cut > self.niv:
+        if niv_cut > self.niv_first and niv_cut > self.niv_second:
             return self
 
         if copy:
@@ -202,13 +242,12 @@ class LocalNPoint(IHaveMat):
         else:
             obj = self
 
-        niv_slice = slice(obj.niv - niv_cut, obj.niv + niv_cut) if obj.full_niv_range else slice(0, niv_cut)
-
+        # both axes are sliced against their own width, so an asymmetric nu x nu' box is cut correctly
         # ``.copy()`` so the trimmed parent array is actually released; a bare slice would keep it alive via the view.
         if obj.num_vn_dimensions == 2:
-            obj.mat = obj.mat[..., niv_slice, niv_slice].copy()
+            obj.mat = obj.mat[..., obj.vn_slice(obj.niv_first, niv_cut), obj.vn_slice(obj.niv_second, niv_cut)].copy()
         elif obj.num_vn_dimensions == 1:
-            obj.mat = obj.mat[..., niv_slice].copy()
+            obj.mat = obj.mat[..., obj.vn_slice(obj.niv_second, niv_cut)].copy()
 
         obj.update_original_shape()
         return obj
@@ -233,7 +272,7 @@ class LocalNPoint(IHaveMat):
             raise ValueError("Cannot cut fermionic frequencies if there are none.")
 
         cut_w = niw_cut <= self.niw
-        cut_v = niv_cut <= self.niv
+        cut_v = niv_cut <= self.niv_first or niv_cut <= self.niv_second
         if not cut_w and not cut_v:
             return self
 
@@ -249,10 +288,9 @@ class LocalNPoint(IHaveMat):
                 slice(obj.niw - niw_cut, obj.niw + niw_cut + 1) if obj.full_niw_range else slice(0, niw_cut + 1)
             )
         if cut_v:
-            niv_slice = slice(obj.niv - niv_cut, obj.niv + niv_cut) if obj.full_niv_range else slice(0, niv_cut)
-            idx[-1] = niv_slice
+            idx[-1] = obj.vn_slice(obj.niv_second, niv_cut)
             if obj.num_vn_dimensions == 2:
-                idx[-2] = niv_slice
+                idx[-2] = obj.vn_slice(obj.niv_first, niv_cut)
 
         # single ``.copy()`` so the trimmed parent array is released (a bare slice would keep it alive via the view).
         obj.mat = obj.mat[tuple(idx)].copy()

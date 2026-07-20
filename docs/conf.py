@@ -1,6 +1,9 @@
 import inspect
 import os
 import sys
+import typing
+
+from sphinx.ext.autodoc.mock import _MockObject
 
 sys.path.insert(0, os.path.abspath(".."))
 
@@ -22,6 +25,11 @@ autosummary_generate = True
 # Native/optional dependencies that need not (and on a docs runner cannot easily) be installed to build the docs.
 # autodoc only needs to *import* the package; mocking these keeps the docs build light and runner-agnostic.
 autodoc_mock_imports = ["mpi4py", "cupy", "psutil"]
+
+# Mocked attributes are not classes, so a union annotation over them (``MPI.Comm | None``) raises a TypeError while
+# autodoc imports the package. Teaching the mock the union operators keeps such annotations importable and rendered.
+_MockObject.__or__ = lambda self, other: typing.Union[self, other]
+_MockObject.__ror__ = lambda self, other: typing.Union[other, self]
 
 # Cross-reference the standard library and the scientific stack.
 intersphinx_mapping = {

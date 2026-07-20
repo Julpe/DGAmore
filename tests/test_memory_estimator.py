@@ -171,12 +171,13 @@ def test_bubble_baseline_is_giwk_plus_sigma_old_at_niv_cut():
 
 
 def test_sde_section_baseline_uses_post_bubble_windows():
-    """The chiq_aux baseline holds giwk at niv_core+niw_core; sde also holds the node-shareable R-space G copy."""
+    """The chiq_aux baseline holds giwk at niv_core+niw_core and the asymmetric local vertex; sde the R-space G copy."""
     nk, nb = TINY["nk_tot"], TINY["n_bands"]
     giwk = nk * nb**2 * 2 * (TINY["niv_core"] + TINY["niw_core"])
     sigma_old = nk * nb**2 * 2 * TINY["niv_core"]
     peaks = estimate_peaks(**TINY)
-    local_vertex = TINY["n_bands"] ** 4 * (TINY["niw_core"] + 1) * (2 * TINY["niv_full"]) ** 2
+    vf, vc = 2 * TINY["niv_full"], 2 * TINY["niv_core"]
+    local_vertex = TINY["n_bands"] ** 4 * (TINY["niw_core"] + 1) * max(vf * vc, vc * vc)
     assert peaks["chiq_aux"].baseline == pytest.approx(SCALE * (giwk + sigma_old + local_vertex))
     assert peaks["sde"].baseline == pytest.approx(SCALE * (2 * giwk + sigma_old))
     assert peaks["chiq_aux"].giwk_shareable == pytest.approx(SCALE * (giwk + local_vertex))

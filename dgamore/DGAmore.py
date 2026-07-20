@@ -59,8 +59,6 @@ def main():
 
     :return: None.
     """
-    configure_matplotlib()
-
     comm = MPI.COMM_WORLD
 
     config_parser = ConfigParser().parse_config(comm)
@@ -322,8 +320,11 @@ def main():
 
         gchi_d_full.save(name="gchi_dens_loc", output_dir=config.output.output_path)
         gchi_m_full.save(name="gchi_magn_loc", output_dir=config.output.output_path)
-        f_d_full.save(name="f_dens_loc", output_dir=config.output.output_path)
-        f_m_full.save(name="f_magn_loc", output_dir=config.output.output_path)
+        # only the double-counting kernel sums the first fermionic index over the full box, so it gets its own file;
+        # the channel files are cut square, as the Eliashberg equation reduces both indices to niv_pp <= niv_core // 2
+        f_m_full.save(name="f_dc_loc", output_dir=config.output.output_path)
+        f_d_full.cut_niv(config.box.niv_core, copy=False).save(name="f_dens_loc", output_dir=config.output.output_path)
+        f_m_full.cut_niv(config.box.niv_core, copy=False).save(name="f_magn_loc", output_dir=config.output.output_path)
         del f_d_full, f_m_full
         logger.info("Saved all relevant quantities as numpy files.")
 
@@ -789,31 +790,6 @@ def _log_lambda_correction_dispatch() -> None:
         config.logger.info(
             f"Lambda correction: dispatching to the multi-orbital matrix correction ({config.sys.n_bands} bands)."
         )
-
-
-def configure_matplotlib():
-    """
-    Configures matplotlib to use the Euler font for mathematical expressions if it is available on the system. This is
-    done because the Euler font is the default math font in my thesis.
-
-    :return: None.
-    """
-    euler_font = [s for s in font_manager.findSystemFonts() if "euler" in s.lower()]
-    if len(euler_font) == 0:
-        return
-    euler_font_path = euler_font[0]
-    font_manager.fontManager.addfont(euler_font_path)
-    prop_euler = font_manager.FontProperties(fname=euler_font_path)
-    plt.rc("axes", unicode_minus=False)
-    plt.rcParams["font.family"] = "sans-serif"
-    plt.rcParams["font.sans-serif"] = prop_euler.get_name()
-    plt.rcParams["font.size"] = 12
-    plt.rcParams["mathtext.fontset"] = "custom"
-    plt.rcParams["axes.titlesize"] = 12
-    plt.rcParams["text.usetex"] = False
-    plt.rcParams["mathtext.rm"] = prop_euler.get_name()
-    plt.rcParams["mathtext.it"] = prop_euler.get_name()
-    plt.rcParams["mathtext.bf"] = prop_euler.get_name()
 
 
 if __name__ == "__main__":

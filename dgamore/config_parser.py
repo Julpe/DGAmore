@@ -45,7 +45,7 @@ class ConfigParser:
         :return: ``self`` (for chaining).
         """
         parser = argparse.ArgumentParser(
-            prog="DGApy", description="Multi-orbital dynamical vertex approximation solver."
+            prog="DGAmore", description="Multi-orbital dynamical vertex approximation solver."
         )
         parser.add_argument("-c", "--config", nargs="?", default=name, type=str, help=" Config file name. ")
         parser.add_argument("-p", "--path", nargs="?", default=path, type=str, help=" Path to the config file. ")
@@ -133,7 +133,7 @@ class ConfigParser:
             return conf
 
         conf.nk = self._try_parse(section, "nk", conf.nk)
-        symmetries = self._try_parse(section, "symmetries", "two_dimensional_square")
+        symmetries = self._try_parse(section, "symmetries", "auto")
         conf.symmetries = bz.get_lattice_symmetries_from_string(symmetries)
 
         conf.k_grid = bz.KGrid(conf.nk, conf.symmetries)

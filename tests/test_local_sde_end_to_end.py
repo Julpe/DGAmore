@@ -235,8 +235,21 @@ def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
     compare_quantity(gamma_d, gamma_m, "gamma_dens_loc", "gamma_magn_loc", 2, config.box.niv_core)
     compare_quantity(chi_d, chi_m, "chi_dens_loc", "chi_magn_loc", 0, config.box.niv_core)
     compare_quantity(vrg_d, vrg_m, "vrg_dens_loc", "vrg_magn_loc", 1, config.box.niv_core)
-    compare_quantity(f_d, f_m, "f_dens_loc", "f_magn_loc", 2, config.box.niv_full)
     compare_quantity(gchi_d, gchi_m, "gchi_dens_loc", "gchi_magn_loc", 2, config.box.niv_core)
+
+    def compare_full_vertex(obj_sde, name: str, channel: SpinChannel):
+        """The full vertex is built on the asymmetric nu x nu' box, so it matches the reference's nu' window."""
+        ref = LocalFourPoint.load(f"{folder}/{name}.npy", channel, num_vn_dimensions=2)
+        window = slice(config.box.niv_full - config.box.niv_core, config.box.niv_full + config.box.niv_core)
+
+        assert obj_sde.niv_first == config.box.niv_full and obj_sde.niv == config.box.niv_core
+        assert obj_sde.channel == ref.channel and obj_sde.full_niw_range == ref.full_niw_range
+        assert obj_sde.num_wn_dimensions == ref.num_wn_dimensions
+        assert obj_sde.current_shape == (2, 2, 2, 2, 21, 2 * config.box.niv_full, 2 * config.box.niv_core)
+        assert np.allclose(obj_sde.mat, ref.mat[..., window], atol=1e-3)
+
+    compare_full_vertex(f_d, "f_dens_loc", SpinChannel.DENS)
+    compare_full_vertex(f_m, "f_magn_loc", SpinChannel.MAGN)
 
     sigma_loc_ref = np.load(f"{folder}/siw_dga_local.npy")
     assert np.allclose(sigma_loc.mat, sigma_loc_ref, atol=1e-5)

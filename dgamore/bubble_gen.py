@@ -147,13 +147,13 @@ class BubbleGenerator:
         r"""
         Distributed-CPU evaluation of :meth:`create_generalized_chi0_q_fft`: the flattened bosonic-fermionic
         frequency columns :math:`(\omega, \nu)` are split across the ranks, each rank runs the R-space multiply and
-        the full-grid ``numpy.fft.ifftn`` (bit-identical to the rank-0 path) only for its columns - reading the
-        R-space Green's function and its momentum-flipped, orbital-transposed partner from per-node shared-memory
+        the full-grid in-place ``scipy.fft.ifftn`` (bit-identical to the rank-0 path) only for its columns - reading
+        the R-space Green's function and its momentum-flipped, orbital-transposed partner from per-node shared-memory
         windows - and the per-column irreducible-BZ results are ring-exchanged onto the irr-BZ q-distribution
         (the same total bytes the former rank-0 scatter moved). The columns are processed in sub-chunks sized so
-        that a node's combined full-grid buffers (including the ~2x ``ifftn`` transient) stay well below the former
-        rank-0 footprint; the exchange is pipelined per sub-chunk on a globally derived schedule, so no rank ever
-        holds more than its final irr-BZ slice plus one sub-chunk in flight.
+        that a node's combined full-grid buffers stay well below the former rank-0 footprint; the exchange is
+        pipelined per sub-chunk on a globally derived schedule, so no rank ever holds more than its final irr-BZ
+        slice plus one sub-chunk in flight.
 
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
         :param giwk: The momentum-dependent :class:`GreensFunction`.

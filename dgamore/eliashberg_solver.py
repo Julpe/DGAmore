@@ -58,6 +58,22 @@ def delete_files(filepath: str, *args) -> None:
                 config.logger.info(f"Error deleting file: {name}.")
 
 
+def _compute_once_per_node(node_comm: MPI.Comm | None, compute_fn):
+    """
+    Evaluates ``compute_fn`` on the node-local root rank only and broadcasts its (small) result to the node's other
+    ranks. Used for quantities whose result is cheap but whose construction holds a multi-GB transient, so that
+    transient exists once per node instead of once per rank. A ``None`` communicator evaluates locally.
+
+    :param node_comm: The node-local communicator (e.g. from ``comm.Split_type(MPI.COMM_TYPE_SHARED)``), or ``None``.
+    :param compute_fn: Zero-argument callable returning the result; invoked only on the node root.
+    :return: The node root's result, on every rank of the node.
+    """
+    if node_comm is None:
+        return compute_fn()
+    result = compute_fn() if node_comm.Get_rank() == 0 else None
+    return node_comm.bcast(result, root=0)
+
+
 # --- Frequency transform helpers (PH -> PP w0) ---
 def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp: int) -> np.ndarray:
     r"""
@@ -482,7 +498,7 @@ def create_local_gamma_ud_pp_w0(
     :param gchi0_pp_w0: The local bare pp bubble :math:`\chi^{pp;\nu\nu'}_{0;1234}` (diagonal in :math:`\nu\nu'`),
         built from the DMFT Green's function via
         :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_pp_w0`.
-    :param beta: Inverse temperature :math:`\beta`, see :attr:`~dgamore.config.SystemConfig.beta`.
+    :param beta: Inverse temperature :math:`\beta`, see ``beta`` of :class:`~dgamore.config.SystemConfig`.
     :return: The vertex :math:`\Gamma^{pp;\nu\nu'}_{\uparrow\downarrow;1234}` as a :class:`LocalFourPoint` in pp
         notation.
     """
@@ -572,8 +588,8 @@ def create_local_ud_diagrams_pp_w0(
     (ph legs evaluated at :math:`\omega_{ph} = \nu + \nu'`) and the bare pp bubble built from the local DMFT
     Green's function :math:`G^{\mathrm{DMFT}}_{12}(\nu)` via
     :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_pp_w0`. These are the local diagrams
-    subtracted/added when :attr:`~dgamore.config.EliashbergConfig.include_local_part` is enabled, to avoid double
-    counting the local pairing contribution (thesis Eqs. 4.49-4.52).
+    subtracted/added when ``include_local_part`` of :class:`~dgamore.config.EliashbergConfig` is enabled, to avoid
+    double counting the local pairing contribution (thesis Eqs. 4.49-4.52).
 
     :param g_dmft: The local DMFT :class:`GreensFunction` :math:`G^{\mathrm{DMFT}}_{12}(\nu)`.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex; the local diagrams are cut to this
@@ -606,6 +622,30 @@ def create_local_ud_diagrams_pp_w0(
     f_ud_loc_pp_w0 = f_ud_loc_pp_w0.take_first_wn()
 
     return f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0
+
+
+def create_local_f_ud_transformed_w0(niv_pp: int) -> LocalFourPoint:
+    r"""
+    Loads the local full vertex of both particle-hole channels from file and returns the up-down combination
+
+    .. math:: F^{\omega\nu\nu'}_{\uparrow\downarrow;1234} = \frac{1}{2}\left(F^{\omega\nu\nu'}_{d;1234}
+        - F^{\omega\nu\nu'}_{m;1234}\right)
+
+    in the modified particle-particle notation at :math:`\omega' = 0` (see
+    :func:`transform_vertex_loc_frequencies_w0`). This is the local full vertex subtracted from each ladder slot of
+    the pairing vertex (thesis Eqs. 4.49-4.52); it carries a different frequency notation than the other local pp
+    diagrams of :func:`create_local_ud_diagrams_pp_w0`. The loaded vertices carry both fermionic indices on the core
+    box (only the double-counting kernel needs the summed index on the full asymptotic box, and it reads its own
+    file for that), yet they remain among the largest objects of this step, so the caller reduces them once per node.
+
+    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
+    :return: The transformed vertex as a :class:`LocalFourPoint` (channel UD, pp notation, no bosonic axis).
+    """
+    f_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_dens_loc.npy"), SpinChannel.DENS)
+    f_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_magn_loc.npy"), SpinChannel.MAGN)
+    f_ud_loc = (f_dens_loc - f_magn_loc).set_channel(SpinChannel.UD).scale(0.5)
+    del f_dens_loc, f_magn_loc
+    return transform_vertex_loc_frequencies_w0(f_ud_loc, niv_pp)
 
 
 # --- Gap initialization ---
@@ -665,6 +705,24 @@ def _frequency_parity_sectors(resolve_frequency_parity: bool) -> list[tuple[str,
     :return: The ``[(label, eps_T), ...]`` sector list.
     """
     return [("even", 1), ("odd", -1)] if resolve_frequency_parity else [("none", None)]
+
+
+def _sector_log_label(channel: SpinChannel, parities: list[str] | None = None) -> str:
+    """
+    Returns the name of the sectors a solver call covers, for log messages. Sector-aware naming keeps concurrently
+    solving ranks distinguishable in the log, where a channel-only name would repeat verbatim once per sector.
+
+    :param channel: The spin channel being solved.
+    :param parities: The subset of parity labels this call handles, or ``None`` for all of them.
+    :return: ``"the singlet channel"`` when the parity projection is off, otherwise the covered sectors, e.g.
+        ``"the singlet/even & odd sectors"`` or ``"the triplet/odd sector"``.
+    """
+    labels = [label for label, _ in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)]
+    if parities is not None:
+        labels = [label for label in labels if label in parities]
+    if labels == ["none"]:
+        return f"the {channel.value}let channel"
+    return f"the {channel.value}let/{' & '.join(labels)} sector{'' if len(labels) == 1 else 's'}"
 
 
 def _project_gap_to_sector(vec: np.ndarray, gap_shape: tuple, eps_t: int, eps_po: int) -> np.ndarray:
@@ -889,8 +947,8 @@ def symmetrize_degenerate_gaps(
     is diagonalized within the cluster, ordering the even (:math:`+1`, :math:`p_x`-like) partner first and the
     odd (:math:`-1`, :math:`p_y`-like) partner second; (iii) the global phase of every vector is fixed such that
     its largest-magnitude element is real and positive. Eigenvalues are not modified; vectors of non-degenerate
-    eigenvalues are only phase-fixed. Enabled via
-    :attr:`~dgamore.config.EliashbergConfig.symmetrize_degenerate_gaps`.
+    eigenvalues are only phase-fixed. Enabled via ``symmetrize_degenerate_gaps`` of
+    :class:`~dgamore.config.EliashbergConfig`.
 
     :param lambdas: Eigenvalues sorted in descending order.
     :param gaps: Eigenvector matrix ``[n, n_eig]`` with one flattened gap function per column.
@@ -1101,8 +1159,8 @@ def _solve_pairing_sectors(
     try:
         for parity, eps_t in sectors:
             eps_po = None if eps_t is None else sign * eps_t
-            label = f"{channel.value}let/{parity}"
-            logger.info(f"Starting Lanczos method for the {label} sector.", allowed_ranks=ranks)
+            label = _sector_log_label(channel, [parity])
+            logger.info(f"Starting Lanczos method for {label}.", allowed_ranks=ranks)
             mat = sp.sparse.linalg.LinearOperator(shape=(shape_flat, shape_flat), matvec=sector_matvec(eps_t, eps_po))
             # BLAS is pinned to one thread for the solve (threadpool_limits resizes the live pool; an environment
             # change would be ignored) so the momentum-batch threads never nest BLAS threads underneath.
@@ -1121,7 +1179,7 @@ def _solve_pairing_sectors(
             if config.eliashberg.symmetrize_degenerate_gaps:
                 gaps = symmetrize_degenerate_gaps(lambdas, gaps, gap_shape)
             logger.info(
-                f"Largest eigenvalue{plural} for the {label} sector: " + ", ".join(f"{lam:.6f}" for lam in lambdas),
+                f"Largest eigenvalue{plural} for {label}: " + ", ".join(f"{lam:.6f}" for lam in lambdas),
                 allowed_ranks=ranks,
             )
             gap_list = [GapFunction(gaps[:, i].reshape(gap_shape), channel, nq) for i in range(n_eig)]
@@ -1174,7 +1232,7 @@ def solve_eliashberg_lanczos(
 
     symmetry_label = config.eliashberg.symmetry.lower() if config.eliashberg.symmetry else "random"
     logger.info(
-        f"Initialized the gap function as {symmetry_label} for the {gamma_r_pp.channel.value}let channel.",
+        f"Initialized the gap function as {symmetry_label} for {_sector_log_label(gamma_r_pp.channel, parities)}.",
         allowed_ranks=ranks,
     )
 
@@ -1286,7 +1344,7 @@ def solve_eliashberg_lanczos_v2(
 
     symmetry_label = config.eliashberg.symmetry.lower() if config.eliashberg.symmetry else "random"
     logger.info(
-        f"Initialized the gap function as {symmetry_label} for the {gamma_r_pp.channel.value}let channel.",
+        f"Initialized the gap function as {symmetry_label} for {_sector_log_label(gamma_r_pp.channel)}.",
         allowed_ranks=root,
     )
 
@@ -1553,7 +1611,12 @@ def solve(
     logger.info("Calculated full ladder-vertex (triplet) in pp notation.")
 
     if config.eliashberg.include_local_part:
-        f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0 = create_local_ud_diagrams_pp_w0(g_dmft, niv_pp)
+        # the local diagrams are reduced from local vertices on the full asymptotic fermionic box; one rank per node
+        # reads and reduces them and broadcasts the pp-box-sized results, so that transient exists once per node
+        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED) if comm.size > 1 else None
+        f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0 = _compute_once_per_node(
+            node_comm, lambda: create_local_ud_diagrams_pp_w0(g_dmft, niv_pp)
+        )
 
         if mpi_dist_irrk.my_rank == 0:
             f_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="f_ud_loc_pp_w0")
@@ -1565,11 +1628,9 @@ def solve(
 
         # special treatment of local full vertex that is subtracted with a different frequency notation and is
         # different from the regular pp
-        f_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_dens_loc.npy"), SpinChannel.DENS)
-        f_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_magn_loc.npy"), SpinChannel.MAGN)
-        f_ud_loc = (f_dens_loc - f_magn_loc).set_channel(SpinChannel.UD).scale(0.5)
-        f_ud_loc_transf_w0 = transform_vertex_loc_frequencies_w0(f_ud_loc, niv_pp)
-        del f_dens_loc, f_magn_loc, f_ud_loc
+        f_ud_loc_transf_w0 = _compute_once_per_node(node_comm, lambda: create_local_f_ud_transformed_w0(niv_pp))
+        if node_comm is not None:
+            node_comm.Free()
 
         # Eqs. (4.49)-(4.52): the assembled vertex holds the negative crossed slot, so the local full vertex enters with
         # a relative minus and the pp-reducible diagrams phi with a plus, both in crossed-slot form ((v, -v'), 1432).

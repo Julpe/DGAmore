@@ -46,7 +46,8 @@ pip install .
 ```
 
 Configure a run by editing your configuration file, then execute the routine with `-p` to point at the directory
-holding it and `-c` to name it (defaults: the repository directory and [dga_config.yaml](dgamore/dga_config.yaml)):
+holding it and `-c` to name it (defaults: the current working directory and
+[dga_config.yaml](dgamore/dga_config.yaml)):
 
 ```bash
 mpiexec -np 8 DGAmore -p /configs/ -c my_config.yaml   # or: DGAmore for a single-core test run

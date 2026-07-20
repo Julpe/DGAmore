@@ -1,5 +1,5 @@
 # Dependencies to build the Sphinx documentation.
-# mpi4py and cupy are intentionally omitted: they are mocked in conf.py
+# mpi4py, cupy and psutil are intentionally omitted: they are mocked in conf.py
 # (autodoc_mock_imports), so the docs build needs neither MPI nor CUDA.
 # Pinned: the pydata theme's navbar/sidebar options and layout change across minor releases, so an unpinned
 # upgrade can silently shift the rendered docs. Bump these deliberately and re-check the navbar/sidebar locally.

@@ -125,7 +125,7 @@ def create_auxiliary_chi_r_q(
 
     .. math:: \chi^{*;q\nu\nu'}_{r;abcd} = ((\chi_{0;abcd}^{q\nu})^{-1} + (\Gamma_{r;abcd}^{\omega\nu\nu'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1},
 
-    with the matrix to invert assembled in a single block by :func:`_assemble_bse_matrix`.
+    with the matrix to invert assembled in a single block by :func:`create_inverse_auxiliary_chi_r_q`.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
@@ -355,6 +355,13 @@ def calculate_sigma_dc_kernel(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, u_lo
     Returns the double-counting kernel for the self-energy calculation, contracting the local full vertex with the
     momentum-dependent bubble per q-point. For details, see Eq. (4.28) in my master's thesis.
 
+    The vertex's first fermionic index is summed over the full asymptotic box while its second one survives into the
+    result on the core box, so ``f_dc_loc`` is expected on the asymmetric
+    :math:`2 n_{\nu,\mathrm{full}} \times 2 n_{\nu,\mathrm{core}}` box that
+    :func:`~dgamore.local_sde.create_full_vertex_from_gamma` returns. This is the only consumer needing the summed
+    index on the full box, which is why it reads its own ``f_dc_loc`` file rather than the square per-channel ones.
+    A vertex carrying a wider second index still gives the same result, only more slowly.
+
     :param f_dc_loc: The local full vertex :math:`F` used for the double-counting correction.
     :param gchi0_q: The momentum-dependent bare bubble :math:`\chi_0^q`.
     :param u_loc: The bare local interaction :math:`U`.
@@ -365,10 +372,17 @@ def calculate_sigma_dc_kernel(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, u_lo
     einsum_str = "abcdwv,dcefwvp->abefwp"
     path, _ = np.einsum_path(einsum_str, kernel.mat[0].copy(), f_dc_loc.mat, optimize="optimal")
 
+    # the surviving index is never wider than the summed one, so each result is narrower than the kernel's own
+    # storage: it goes into the leading part of that storage, which is trimmed afterwards (no second full buffer)
+    niv_out = min(f_dc_loc.niv_second, config.box.niv_core)
+    window = f_dc_loc.vn_slice(f_dc_loc.niv_second, niv_out)
     for q in range(kernel.current_shape[0]):
-        kernel[q] = np.einsum(einsum_str, kernel[q].copy(), f_dc_loc.mat, optimize=path)
+        result = np.einsum(einsum_str, kernel[q].copy(), f_dc_loc.mat, optimize=path)
+        kernel.mat[q, ..., : 2 * niv_out] = result[..., window]
 
-    return kernel.cut_niv(config.box.niv_core)
+    kernel.mat = kernel.mat[..., : 2 * niv_out].copy()
+    kernel.update_original_shape()
+    return kernel
 
 
 def calculate_kernel_r_q(
@@ -1407,7 +1421,7 @@ def calculate_sigma_proposal(
     # the local vertices are identical on every rank, so they are loaded once per node into shared windows
     f_dc_loc, f_dc_win = _load_node_shared_local_vertex(
         shared_node_comm,
-        os.path.join(config.output.output_path, "f_magn_loc.npy"),
+        os.path.join(config.output.output_path, "f_dc_loc.npy"),
         SpinChannel.NONE,
         transform=lambda obj: obj.permute_orbitals("abcd->cbad", copy=False).scale(2.0),
     )

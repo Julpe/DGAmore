@@ -40,7 +40,7 @@ process count adds communication overhead and does not always improve performanc
 
 Two optional command-line arguments are available. The ``-p`` argument specifies the directory containing the
 configuration file, which is useful when several configuration files are kept in different directories; if it is not
-given, the path defaults to the repository directory. The ``-c`` argument specifies the name of the configuration
+given, the path defaults to the current working directory. The ``-c`` argument specifies the name of the configuration
 file to load and defaults to ``dga_config.yaml``. As an example, the following command runs the code with eight MPI
 processes and loads the configuration file ``my_config.yaml`` from ``/configs/``:
 

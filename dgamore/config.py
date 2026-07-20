@@ -90,7 +90,7 @@ class LatticeConfig:
     """
 
     def __init__(self):
-        self.symmetries: list[bz.KnownSymmetries] = bz.two_dimensional_square_symmetries()
+        self.symmetries: list[bz.KnownSymmetries] = [bz.KnownSymmetries.AUTO]
         self.type: str = "from_wannier90"
         self.er_input: str | list = "/path/to/file"
         self.interaction_type: str = "one_band_from_dmft"
@@ -148,7 +148,7 @@ class StabilizationConfig:
         a single shared bosonic mass :math:`\lambda` (measured from the worst channel's static susceptibility
         gap, never user-chosen) is added to the inverse physical susceptibility of every channel, damped toward its
         target and annealed to exactly zero between converged phases - the final result is always pure self-consistency (the schedule and
-        state live in :class:`~dgamore.nonlocal_sde.LambdaAnnealer`, owned by the loop). Multi-orbital-safe,
+        state live in :class:`~dgamore.lambda_ops.LambdaAnnealer`, owned by the loop). Multi-orbital-safe,
         unlike the sum-rule lambda correction.
     """
 

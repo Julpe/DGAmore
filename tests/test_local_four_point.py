@@ -1456,30 +1456,64 @@ def test_invert_one_vn_keeps_single_fermionic_dimension_and_matches_dense_refere
     assert np.allclose(out.invert().mat, obj.mat, atol=1e-4)
 
 
-@pytest.mark.parametrize("o", [1, 2, 3])
-@pytest.mark.parametrize("singular_u", [False, True])
-@pytest.mark.parametrize("full_niw", [True, False])
-@pytest.mark.parametrize("niv_core", [2, 3, 6])
-def test_shell_inverse_core_matches_dense_chain(o, singular_u, full_niw, niv_core):
-    """shell_inverse_core (Woodbury) matches the dense chain across bands, singular U, niw ranges and niv_shell vs"""
-    rng = np.random.default_rng(4)
-    niw, niv_full, beta = 2, 6, 3.0
-    w_entries = 2 * niw + 1 if full_niw else niw + 1
-    shape = (o, o, o, o, w_entries, 2 * niv_full)
+def _shell_inversion_inputs(o, niw, niv_full, full_niw, singular_coupling, seed=4):
+    """Builds a block-invertible one-fermion object and a (optionally rank-deficient) coupling for the shell inverse."""
+    rng = np.random.default_rng(seed)
+    shape = (o, o, o, o, 2 * niw + 1 if full_niw else niw + 1, 2 * niv_full)
     mat = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
     for a in range(o):
         for b in range(o):
-            mat[a, b, b, a] += 6.0  # compound-diagonal boost keeps the bubble blocks invertible
-    gchi0 = LocalFourPoint(mat, channel=SpinChannel.NONE, num_vn_dimensions=1, full_niw_range=full_niw)
+            mat[a, b, b, a] += 6.0  # compound-diagonal boost keeps the per-frequency blocks invertible
+    obj = LocalFourPoint(mat, channel=SpinChannel.NONE, num_vn_dimensions=1, full_niw_range=full_niw)
+    c_mat = (rng.standard_normal((o, o, o, o)) + 1j * rng.standard_normal((o, o, o, o))).astype(np.complex64)
+    if singular_coupling and o > 1:
+        c_mat[:, :, :, o - 1] = 0.0  # rank-deficient compound coupling (density-density-like)
+    return obj, LocalInteraction(c_mat, SpinChannel.NONE).as_channel(SpinChannel.DENS)
 
-    u_mat = (rng.standard_normal((o, o, o, o)) + 1j * rng.standard_normal((o, o, o, o))).astype(np.complex64)
-    if singular_u and o > 1:
-        u_mat[:, :, :, o - 1] = 0.0  # rank-deficient compound U (density-density-like)
-    u = LocalInteraction(u_mat, SpinChannel.NONE).as_channel(SpinChannel.DENS)
 
-    ref = (gchi0.invert().extend_vn_to_diagonal() + (1.0 / beta**2) * u).invert().cut_niv(niv_core)
-    out = gchi0.shell_inverse_core(u, beta, niv_core)
+@pytest.mark.parametrize("o", [1, 2, 3])
+@pytest.mark.parametrize("singular_coupling", [False, True])
+@pytest.mark.parametrize("full_niw", [True, False])
+@pytest.mark.parametrize("niv_core", [2, 3, 6])
+def test_get_core_from_shell_inversion_matches_dense_chain(o, singular_coupling, full_niw, niv_core):
+    """get_core_from_shell_inversion matches the dense chain across bands, singular couplings and niw/niv ranges."""
+    niw, niv_full = 2, 6
+    obj, coupling = _shell_inversion_inputs(o, niw, niv_full, full_niw, singular_coupling)
+
+    ref = (obj.invert().extend_vn_to_diagonal() + coupling).invert().cut_niv(niv_core)
+    out = obj.get_core_from_shell_inversion(coupling, niv_core)
 
     assert out.num_vn_dimensions == 2 and out.channel == SpinChannel.DENS
     assert out.mat.shape == ref.mat.shape
+    assert np.allclose(out.mat, ref.mat, atol=1e-4)
+
+
+@pytest.mark.parametrize("o", [1, 2, 3])
+@pytest.mark.parametrize("niv_core", [-1, 6, 9])
+def test_get_core_from_shell_inversion_returns_the_whole_box_without_a_cut(o, niv_core):
+    """A negative cut, or one not smaller than the object's own box, returns the full fermionic box."""
+    niw, niv_full = 1, 6
+    obj, coupling = _shell_inversion_inputs(o, niw, niv_full, False, False)
+
+    ref = (obj.invert().extend_vn_to_diagonal() + coupling).invert()
+    out = obj.get_core_from_shell_inversion(coupling, niv_core)
+
+    assert out.niv == niv_full and out.mat.shape == ref.mat.shape
+    assert np.allclose(out.mat, ref.mat, atol=1e-4)
+
+
+def test_get_core_from_shell_inversion_accepts_a_coupling_unrelated_to_the_interaction():
+    """The coupling is an arbitrary frequency-independent tensor, not necessarily an interaction over beta squared."""
+    o, niw, niv_full, niv_core = 2, 1, 5, 2
+    obj, _ = _shell_inversion_inputs(o, niw, niv_full, False, False)
+    rng = np.random.default_rng(17)
+    arbitrary = LocalInteraction(
+        (rng.standard_normal((o, o, o, o)) + 1j * rng.standard_normal((o, o, o, o))).astype(np.complex64) * 4.0,
+        SpinChannel.MAGN,
+    )
+
+    ref = (obj.invert().extend_vn_to_diagonal() + arbitrary).invert().cut_niv(niv_core)
+    out = obj.get_core_from_shell_inversion(arbitrary, niv_core)
+
+    assert out.channel == SpinChannel.MAGN
     assert np.allclose(out.mat, ref.mat, atol=1e-4)

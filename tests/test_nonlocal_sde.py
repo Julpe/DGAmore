@@ -258,7 +258,7 @@ def _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc):
     )
 
 
-def test_assemble_bse_matrix_matches_two_block_expression():
+def test_create_inverse_auxiliary_chi_r_q_matches_two_block_expression():
     """The fused single-block BSE assembly is bit-equal to the former add/extend/subtract chain, inputs untouched."""
     rng = np.random.default_rng(21)
     gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
@@ -273,7 +273,7 @@ def test_assemble_bse_matrix_matches_two_block_expression():
     assert np.array_equal(gchi0_q_inv.mat, chi0_before) and gchi0_q_inv.num_vn_dimensions == 1
 
 
-def test_assemble_bse_matrix_accepts_half_niw_gamma():
+def test_create_inverse_auxiliary_chi_r_q_accepts_half_niw_gamma():
     """A gamma already in the half bosonic range assembles identically to its full-range twin."""
     rng = np.random.default_rng(22)
     gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
@@ -956,3 +956,63 @@ def test_annealer_static_gap_reduces_min_across_ranks():
     _, results = run_parallel(2, fn)
     assert np.allclose(results[0], -0.7, atol=1e-5)
     assert np.allclose(results[1], -0.7, atol=1e-5)
+
+
+def _dc_kernel_inputs(o, nq, niw, niv_core, niv_full, beta=8.0, seed=23):
+    """Builds (f_dc_loc on the full nu x nu' box, gchi0_q, u_loc) for the double-counting kernel tests."""
+    config.sys.beta = beta
+    config.box.niw_core, config.box.niv_core = niw, niv_core
+    config.box.niv_shell, config.box.niv_full = niv_full - niv_core, niv_full
+    rng = np.random.default_rng(seed)
+    f_shape = (o, o, o, o, niw + 1, 2 * niv_full, 2 * niv_full)
+    f_dc_loc = LocalFourPoint(
+        (rng.standard_normal(f_shape) + 1j * rng.standard_normal(f_shape)).astype(np.complex64),
+        SpinChannel.MAGN,
+        1,
+        2,
+        False,
+        True,
+    )
+    b_shape = (nq, o, o, o, o, niw + 1, 2 * niv_full)
+    gchi0_q = FourPoint(
+        (rng.standard_normal(b_shape) + 1j * rng.standard_normal(b_shape)).astype(np.complex64),
+        SpinChannel.NONE,
+        nq=(nq, 1, 1),
+        num_wn_dimensions=1,
+        num_vn_dimensions=1,
+        full_niw_range=False,
+        has_compressed_q_dimension=True,
+    )
+    u_loc = LocalInteraction(rng.standard_normal((o,) * 4).astype(np.complex64), SpinChannel.NONE)
+    return f_dc_loc, gchi0_q, u_loc
+
+
+@pytest.mark.parametrize("o", [1, 2])
+def test_sigma_dc_kernel_with_a_nu_prime_cut_vertex_matches_the_full_vertex(o):
+    """Cutting the vertex's surviving index to the core box leaves the double-counting kernel unchanged."""
+    nq, niw, niv_core, niv_full = 3, 2, 2, 5
+    f_full, gchi0_q, u_loc = _dc_kernel_inputs(o, nq, niw, niv_core, niv_full)
+    # built through the constructor so that original_shape, which the niv properties read, matches the array
+    f_cut = LocalFourPoint(
+        f_full.mat[..., niv_full - niv_core : niv_full + niv_core].copy(), SpinChannel.MAGN, 1, 2, False, True
+    )
+    assert f_cut.niv_first == niv_full and f_cut.niv_second == niv_core
+
+    from_full = nonlocal_sde.calculate_sigma_dc_kernel(f_full, gchi0_q.copy(), u_loc)
+    from_cut = nonlocal_sde.calculate_sigma_dc_kernel(f_cut, gchi0_q.copy(), u_loc)
+
+    assert from_cut.niv == niv_core and from_cut.current_shape == from_full.current_shape
+    assert np.allclose(from_cut.mat, from_full.mat, atol=1e-4)
+
+
+def test_sigma_dc_kernel_sums_the_first_fermionic_index_over_the_full_box():
+    """The kernel contracts the vertex's first index over the whole asymptotic box, not only over the core box."""
+    nq, niw, niv_core, niv_full = 2, 1, 2, 5
+    f_dc_loc, gchi0_q, u_loc = _dc_kernel_inputs(1, nq, niw, niv_core, niv_full)
+    f_shell_zeroed = f_dc_loc.copy()
+    f_shell_zeroed.mat[..., : niv_full - niv_core, :] = 0.0
+
+    full = nonlocal_sde.calculate_sigma_dc_kernel(f_dc_loc, gchi0_q.copy(), u_loc)
+    zeroed = nonlocal_sde.calculate_sigma_dc_kernel(f_shell_zeroed, gchi0_q.copy(), u_loc)
+
+    assert not np.allclose(zeroed.mat, full.mat, atol=1e-6)
