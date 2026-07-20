@@ -260,7 +260,7 @@ Superconducting properties are obtained by solving the linearized Eliashberg equ
      symmetry: "random"           # str
      include_local_part: True     # bool
      symmetrize_degenerate_gaps: True # bool
-     resolve_frequency_parity: True # bool
+     resolve_frequency_parity: False # bool
      subfolder_name: "Eliashberg" # str
 
 The equation is solved only when ``perform_eliashberg`` is ``True``. Enabling ``save_pairing_vertex`` or ``save_fq``
@@ -366,9 +366,10 @@ This section collects further output settings.
      do_plotting: True                # bool
      plotting_subfolder_name: "Plots" # str
 
-When ``output_path`` is empty, the results are written to a subfolder created next to the DMFT input files;
-otherwise they go to the folder it names. If ``do_plotting`` is enabled, a few quantities such as the self-energy
-and the Green's function are plotted with matplotlib into the subfolder named by ``plotting_subfolder_name``.
+Every run creates its own subfolder, named after the momentum grid and the frequency box, inside ``output_path``;
+when ``output_path`` is empty it is taken to be the folder holding the DMFT input files. If ``do_plotting`` is
+enabled, a few quantities such as the self-energy and the Green's function are plotted with matplotlib into the
+subfolder named by ``plotting_subfolder_name``.
 
 Analytic continuation
 ---------------------
@@ -382,7 +383,7 @@ through the ``ana_cont`` package.
      do_spectrum_dga: False                                     # bool
      do_spectrum_dmft: False                                    # bool
      w_count: 1001                                              # int
-     plot_spectrum: True                                        # bool
+     plot_spectrum: False                                       # bool
      k_path: [ [0.0, 0.0, 0.0, "Gamma"], [0.0, 0.5, 0.0, "X"] ] # list[tuple]
      energy_window: [ -2, 3 ]                                   # list[float]
 

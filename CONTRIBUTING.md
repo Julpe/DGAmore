@@ -69,13 +69,18 @@ When you would like to contribute code, the following workflow keeps things smoo
    ```bash
    pytest tests                       # fast suite (skips tests marked slow)
    pytest tests --runslow             # full suite, as run in CI
+   ```
+   The coverage run additionally needs `pytest-cov`, which is not part of the runtime dependencies:
+   ```bash
+   pip install pytest-cov
    pytest tests --runslow --cov=dgamore --cov-report=term-missing --cov-fail-under=85   # coverage, as CI runs it
    ```
 5. **Open a pull request** against the `main` branch, with a short description of what you changed and why. If your
    pull request is related to an existing issue, mentioning it helps connect the two.
 
-A continuous integration pipeline runs on every pull request. It checks that the code is Black-formatted, then runs the
-full test suite across Python 3.12 to 3.14 on both Linux and macOS. This is there to catch regressions, not to be a
+A continuous integration pipeline runs on every pull request. Independent workflows check that the code is
+Black-formatted, build the documentation, spell-check the sources, and run the full test suite across Python 3.12 to
+3.14 on both Linux and macOS. This is there to catch regressions, not to be a
 gatekeeper, so please do not worry if something turns red on the first try; it is a normal part of the process, and we
 are glad to help you get it passing. The pipeline also requires the overall test coverage to stay at **at least 85%**,
 and the build fails if it drops below that threshold. Beyond the overall figure, the new or changed code in a pull

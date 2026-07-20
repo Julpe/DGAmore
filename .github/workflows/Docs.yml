@@ -30,7 +30,7 @@ jobs:
           python-version: "3.13"
           cache: 'pip'
 
-      # 3. Install documentation dependencies (mpi4py and cupy are mocked in conf.py)
+      # 3. Install documentation dependencies (mpi4py, cupy and psutil are mocked in conf.py)
       - name: Install documentation dependencies
         run: |
           python -m pip install --upgrade pip

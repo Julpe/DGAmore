@@ -21,7 +21,7 @@ from dgamore.greens_function import GreensFunction
 from dgamore.interaction import LocalInteraction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.matsubara_frequencies import MFHelper
-from dgamore.n_point_base import SpinChannel, FrequencyNotation
+from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE
 from dgamore.self_energy import SelfEnergy
 
 
@@ -76,8 +76,8 @@ def create_gamma_r_with_shell_correction(
     """
     # the +U couples ALL fermionic frequencies (a rank-orbital^2 update on the block-diagonal inverse bubble), so the
     # core box of (extend(chi0^-1) + U/beta^2)^-1 is built by the Woodbury identity - no full-box dense inversion.
-    chi_tilde_core_inv = gchi0.shell_inverse_core(
-        u_loc.as_channel(gchi_r.channel), config.sys.beta, config.box.niv_core
+    chi_tilde_core_inv = gchi0.get_core_from_shell_inversion(
+        1.0 / config.sys.beta**2 * u_loc.as_channel(gchi_r.channel), config.box.niv_core
     ).invert()
     # subtract/scale/accumulate in place on the freshly inverted block, so only that one two-fermion block is
     # allocated (the former chain held up to three such blocks at its peak)
@@ -128,50 +128,157 @@ def create_generalized_chi_with_shell_correction(
     return ((gchi_aux_sum + gchi0_full_sum - gchi0_core_sum).invert() + u_loc.as_channel(gchi_aux_sum.channel)).invert()
 
 
-def create_full_vertex_from_gamma(gamma_r, gchi0, u_loc):
+def create_full_vertex_from_gamma(gamma_r: LocalFourPoint, gchi0: LocalFourPoint, u_loc: LocalInteraction):
     r"""
-    Returns the local full vertex in the ``niv_full`` region from the irreducible vertex,
-    :math:`F = \Gamma [1 + \frac{1}{\beta^2} \chi_0 \Gamma]^{-1}` (with :math:`\Gamma` padded with :math:`U` beyond the core box).
+    Returns the local full vertex from the irreducible vertex,
+    :math:`F = \Gamma [1 + \frac{1}{\beta^2} \chi_0 \Gamma]^{-1}` (with :math:`\Gamma` padded with :math:`U` beyond
+    the core box), on the asymmetric :math:`2 n_{\nu,\mathrm{full}} \times 2 n_{\nu,\mathrm{core}}` box.
 
-    Every bosonic slice is independent, so the solve runs one :math:`\omega` at a time in compound space and writes
-    the result back into the padded vertex: only compound ``[x1, x2]``-sized workspaces accompany the single
-    ``niv_full``-sized block, where the former batched identity/matmul/invert chain held ~4 such blocks (plus the
-    fully materialized compound identity) at its peak. The linear system is solved directly
-    (``F^T = (A^T)^{-1} \Gamma^T``) instead of inverting and multiplying.
+    The vertex is only ever read with its second (free) fermionic index on the core box: the double-counting kernel
+    of the non-local self-energy sums the first index over the full asymptotic range but keeps the second one only on
+    the core box, and the Eliashberg equation cuts both indices to ``niv_pp``, which is at most half the core box. The
+    free index is therefore restricted right away instead of being computed and discarded. Only the double-counting
+    kernel needs the summed index on the full box, so this asymmetric object is written to its own ``f_dc_loc`` file
+    while the per-channel ``f_dens_loc``/``f_magn_loc`` files are cut square to the core box.
 
     :param gamma_r: The irreducible vertex :math:`\Gamma_{r}` (core box).
     :param gchi0: The bare bubble :math:`\chi_0` (with its fermionic axis taken on the diagonal).
     :param u_loc: The bare local interaction :math:`U`, used to pad the shell.
     :return: The full vertex :math:`F_{r}` as a :class:`LocalFourPoint`.
+    :raises ValueError: If the full fermionic box is narrower than the vertex's own core box.
     """
-    gamma_urange = gamma_r.pad_with_u(u_loc.as_channel(gamma_r.channel), config.box.niv_full)
+    niv_full = config.box.niv_full
+    if niv_full < gamma_r.niv:
+        raise ValueError("The full fermionic box cannot be narrower than the core box of the irreducible vertex.")
+    if niv_full == gamma_r.niv:  # without a shell the low-rank split is not smaller, so solve densely
+        return _solve_full_vertex_dense(gamma_r, gchi0, config.sys.beta)
+    return _solve_full_vertex_push_through(gamma_r, gchi0, u_loc.as_channel(gamma_r.channel), config.sys.beta, niv_full)
 
-    n = gamma_urange.n_bands
-    niv2 = gamma_urange.current_shape[-1]
-    size = n * n * niv2
-    w_dim = gamma_urange.current_shape[-3]
-    diag = np.arange(size)
-    # the bubble arrives in the full bosonic range while gamma is half-range: align via a half-range view (the
-    # w >= 0 block), exactly what the former matmul's internal to_half_niw_range did
+
+def _half_niw_bubble_and_w_dim(gamma_r: LocalFourPoint, gchi0: LocalFourPoint) -> tuple[np.ndarray, int]:
+    r"""
+    Returns the bubble's array aligned to the vertex's bosonic range together with the number of bosonic slices.
+
+    The bubble arrives over the full bosonic range while the irreducible vertex is stored half-range, so the
+    :math:`\omega \geq 0` block is taken as a read-only view (``gchi0`` is not modified).
+
+    :param gamma_r: The irreducible vertex, which defines the bosonic range to align to.
+    :param gchi0: The bare bubble with a single fermionic axis.
+    :return: The tuple ``(chi0_mat, w_dim)``.
+    :raises ValueError: If the aligned bubble does not carry one bosonic slice per slice of the vertex.
+    """
     chi0_mat = gchi0.mat
     if gchi0.full_niw_range:
         chi0_mat = chi0_mat[..., chi0_mat.shape[-2] // 2 :, :]
-    chi0_scaled = chi0_mat * (1.0 / config.sys.beta**2)
+    w_dim = gamma_r.current_shape[-3]
+    if chi0_mat.shape[-2] != w_dim:
+        raise ValueError(f"Bubble carries {chi0_mat.shape[-2]} bosonic slices, but the vertex has {w_dim}.")
+    return chi0_mat, w_dim
 
-    path = None
+
+def _solve_full_vertex_push_through(
+    gamma_r: LocalFourPoint, gchi0: LocalFourPoint, u_channel: LocalInteraction, beta: float, niv_full: int
+) -> LocalFourPoint:
+    r"""
+    Returns :math:`F = \Gamma_U [\mathbb{1} + \frac{1}{\beta^2}\chi_0 \Gamma_U]^{-1}` on the
+    :math:`2 n_{\nu,\mathrm{full}} \times 2 n_{\nu,\mathrm{core}}` box without ever building the padded vertex
+    :math:`\Gamma_U`.
+
+    Padding fills :math:`\mathcal{U}` over the whole box and overwrites only the core block, so the padded vertex
+    splits exactly as :math:`\Gamma_U = \mathcal{U}\otimes J + \Delta`, with :math:`J` the all-ones matrix in
+    :math:`(\nu, \nu')` and :math:`\Delta = \Gamma - \mathcal{U}` supported on the core block alone. Both terms are
+    of low rank in the compound index, i.e. :math:`\Gamma_U = LR` with
+    :math:`r = \mathrm{orbital}^2 (1 + 2 n_{\nu,\mathrm{core}})` against the compound dimension
+    :math:`N = 2 n_{\nu,\mathrm{full}}\,\mathrm{orbital}^2`. With :math:`C` the bubble (block-diagonal in
+    :math:`\nu`), the push-through identity :math:`R(\mathbb{1} + CLR)^{-1} = (\mathbb{1}_r + RCL)^{-1}R` gives
+
+    .. math:: F = L\,(\mathbb{1}_r + R\,C\,L)^{-1}\,R ,
+
+    replacing the :math:`O(N^3)` dense solve per :math:`\omega` by an :math:`O(r^3)` one. Only the core columns of
+    :math:`R` are needed, since the free index :math:`\nu'` is kept on the core box; applying :math:`L` is a
+    :math:`\nu`-independent broadcast plus a scatter onto the core rows of :math:`\nu`.
+
+    :param gamma_r: The irreducible vertex :math:`\Gamma_{r}` on the core box.
+    :param gchi0: The bare bubble :math:`\chi_0` on the ``niv_full`` box, fermionic axis taken on the diagonal.
+    :param u_channel: The channel-projected local interaction :math:`\mathcal{U}` the shell is padded with.
+    :param beta: Inverse temperature :math:`\beta`.
+    :param niv_full: Number of positive fermionic frequencies of the summed index :math:`\nu`.
+    :return: The full vertex as a two-fermion :class:`LocalFourPoint`. ``gamma_r`` is not modified.
+    """
+    o = gamma_r.n_bands
+    o2 = o * o
+    nf, nc = 2 * niv_full, 2 * gamma_r.niv
+    core = slice(niv_full - gamma_r.niv, niv_full + gamma_r.niv)
+
+    chi0_mat, w_dim = _half_niw_bubble_and_w_dim(gamma_r, gchi0)
+    u_c = u_channel.mat.transpose(0, 1, 3, 2).reshape(o2, o2)
+
+    r = o2 + o2 * nc
+    diag_r = np.arange(r)
+    out = np.empty((o, o, o, o, w_dim, nf, nc), dtype=DTYPE)
+
     for iw in range(w_dim):
-        gamma_w = gamma_urange.mat[..., iw, :, :]
-        if path is None:  # identical shapes across the loop -> compute the contraction path once
-            path = np.einsum_path("abcdv,dcefvp->abefvp", chi0_scaled[..., 0, :], gamma_w, optimize="optimal")[0]
-        a_w = np.einsum("abcdv,dcefvp->abefvp", chi0_scaled[..., iw, :], gamma_w, optimize=path)
-        # compound pairing (rows {1, 2, v}, cols {4, 3, v'}, as in to_compound_indices) + identity on the diagonal
-        a_w = a_w.transpose(0, 1, 4, 3, 2, 5).reshape(size, size)
-        a_w[diag, diag] += 1.0
-        gamma_w = gamma_w.transpose(0, 1, 4, 3, 2, 5).reshape(size, size)
-        f_w = np.linalg.solve(a_w.T, gamma_w.T).T
-        gamma_urange.mat[..., iw, :, :] = f_w.reshape(n, n, niv2, n, n, niv2).transpose(0, 1, 4, 3, 2, 5)
+        chi0_w = chi0_mat[..., iw, :].transpose(4, 0, 1, 3, 2).reshape(nf, o2, o2) / beta**2
+        chi0_core = chi0_w[core]
+        gamma_w = gamma_r.mat[..., iw, :, :].transpose(0, 1, 4, 3, 2, 5).reshape(o2, nc, o2, nc)
+        delta = gamma_w - u_c[:, None, :, None]
 
-    return gamma_urange
+        m = np.empty((r, r), dtype=DTYPE)
+        m[:o2, :o2] = u_c @ chi0_w.sum(axis=0)  # the shell enters only through this full-box bubble sum
+        m[:o2, o2:] = np.einsum("ja,vak->jkv", u_c, chi0_core, optimize=True).reshape(o2, o2 * nc)
+        d2 = np.einsum("jwav,vak->jwkv", delta, chi0_core, optimize=True)
+        m[o2:, :o2] = d2.sum(axis=-1).reshape(o2 * nc, o2)
+        m[o2:, o2:] = d2.reshape(o2 * nc, o2 * nc)
+        m[diag_r, diag_r] += 1.0
+
+        rhs = np.empty((r, o2 * nc), dtype=DTYPE)
+        rhs[:o2] = np.repeat(u_c, nc, axis=1)
+        rhs[o2:] = delta.reshape(o2 * nc, o2 * nc)
+        y = np.linalg.solve(m, rhs)
+
+        # expand L: the first block is nu-independent, the second one only corrects the core rows of nu
+        block = np.empty((o2, nf, o2, nc), dtype=DTYPE)
+        block[...] = y[:o2].reshape(o2, o2, nc)[:, None]
+        block[:, core] += y[o2:].reshape(o2, nc, o2, nc)
+        out[..., iw, :, :] = block.reshape(o, o, nf, o, o, nc).transpose(0, 1, 4, 3, 2, 5)
+
+    return LocalFourPoint(
+        out, gamma_r.channel, 1, 2, gamma_r.full_niw_range, gamma_r.full_niv_range, gamma_r.frequency_notation
+    )
+
+
+def _solve_full_vertex_dense(gamma_r: LocalFourPoint, gchi0: LocalFourPoint, beta: float) -> LocalFourPoint:
+    r"""
+    Returns :math:`F = \Gamma [\mathbb{1} + \frac{1}{\beta^2}\chi_0 \Gamma]^{-1}` by a dense compound solve per
+    :math:`\omega`, for the shell-free case where the vertex already spans the full fermionic box.
+
+    Used instead of :func:`_solve_full_vertex_push_through` when there is nothing to pad: the low-rank split of the
+    padded vertex is then no smaller than the compound dimension itself, so it would only add rounding.
+
+    :param gamma_r: The irreducible vertex :math:`\Gamma_{r}`, spanning the full fermionic box.
+    :param gchi0: The bare bubble :math:`\chi_0`, fermionic axis taken on the diagonal.
+    :param beta: Inverse temperature :math:`\beta`.
+    :return: The full vertex as a two-fermion :class:`LocalFourPoint`. ``gamma_r`` is not modified.
+    """
+    o = gamma_r.n_bands
+    o2, nv = o * o, 2 * gamma_r.niv
+    n = o2 * nv
+
+    chi0_mat, w_dim = _half_niw_bubble_and_w_dim(gamma_r, gchi0)
+    diag = np.arange(n)
+    out = np.empty((o, o, o, o, w_dim, nv, nv), dtype=DTYPE)
+
+    for iw in range(w_dim):
+        gamma_w = gamma_r.mat[..., iw, :, :].transpose(0, 1, 4, 3, 2, 5).reshape(o2, nv, o2, nv)
+        chi0_w = chi0_mat[..., iw, :].transpose(4, 0, 1, 3, 2).reshape(nv, o2, o2) / beta**2
+        a = np.einsum("vij,jvkl->ivkl", chi0_w, gamma_w, optimize=True).reshape(n, n)
+        a[diag, diag] += 1.0
+        f = np.linalg.solve(a.T, gamma_w.reshape(n, n).T).T
+        out[..., iw, :, :] = f.reshape(o, o, nv, o, o, nv).transpose(0, 1, 4, 3, 2, 5)
+
+    return LocalFourPoint(
+        out, gamma_r.channel, 1, 2, gamma_r.full_niw_range, gamma_r.full_niv_range, gamma_r.frequency_notation
+    )
 
 
 def create_full_vertex(gchi_r: LocalFourPoint, gchi0_inv: LocalFourPoint) -> LocalFourPoint:

@@ -982,3 +982,79 @@ def test_to_negative_niw_range_matches_full_niw_range_negative_block(num_vn):
         neg_slice = np.take(neg.mat, k, axis=w_axis)
         full_slice = np.take(full.mat, niw - k, axis=w_axis)
         assert np.allclose(neg_slice, full_slice)
+
+
+@pytest.mark.parametrize("num_vn", [0, 1, 2])
+def test_niv_first_and_niv_second_agree_on_a_symmetric_box(num_vn):
+    """Both fermionic-axis accessors coincide with niv whenever the box is symmetric or has at most one axis."""
+    nb, niw, niv = 2, 2, 3
+    shape = (nb, nb, 2 * niw + 1) + (2 * niv,) * num_vn
+    obj = LocalNPoint(np.zeros(shape, dtype=np.complex64), 2, 1, num_vn)
+    assert obj.niv_first == obj.niv_second == obj.niv == (niv if num_vn else 0)
+
+
+@pytest.mark.parametrize("full_niv_range", [True, False])
+def test_niv_first_and_niv_second_report_their_own_axis_of_an_asymmetric_box(full_niv_range):
+    """On an asymmetric nu x nu' box each accessor reports its own axis, with niv_second aliasing niv."""
+    nb, niw, niv_first, niv_second = 2, 2, 5, 2
+    shape = (nb, nb, 2 * niw + 1, 2 * niv_first, 2 * niv_second)
+    obj = LocalNPoint(np.zeros(shape, dtype=np.complex64), 2, 1, 2, full_niv_range=full_niv_range)
+    assert obj.niv_first == niv_first and obj.niv_second == niv_second == obj.niv
+
+
+def test_cut_niv_cuts_each_fermionic_axis_against_its_own_width():
+    """cut_niv slices an asymmetric nu x nu' box per axis instead of reusing the last axis width."""
+    nb, niw, niv_first, niv, niv_cut = 2, 1, 5, 3, 2
+    shape = (nb, nb, 2 * niw + 1, 2 * niv_first, 2 * niv)
+    mat = np.random.rand(*shape) + 1j * np.random.rand(*shape)
+    obj = LocalNPoint(mat.copy(), 2, 1, 2)
+
+    out = obj.cut_niv(niv_cut)
+
+    expected = mat[..., niv_first - niv_cut : niv_first + niv_cut, niv - niv_cut : niv + niv_cut]
+    assert out.mat.shape == (nb, nb, 2 * niw + 1, 2 * niv_cut, 2 * niv_cut)
+    assert np.allclose(out.mat, expected, atol=1e-12)
+
+
+def test_cut_niv_still_trims_the_first_axis_when_only_it_is_wider():
+    """A cutoff between nu' and nu leaves nu' untouched and trims nu down to the cutoff."""
+    nb, niw, niv_first, niv, niv_cut = 2, 1, 6, 2, 3
+    shape = (nb, nb, 2 * niw + 1, 2 * niv_first, 2 * niv)
+    mat = np.random.rand(*shape) + 1j * np.random.rand(*shape)
+
+    out = LocalNPoint(mat.copy(), 2, 1, 2).cut_niv(niv_cut)
+
+    assert out.mat.shape == (nb, nb, 2 * niw + 1, 2 * niv_cut, 2 * niv)
+    assert np.allclose(out.mat, mat[..., niv_first - niv_cut : niv_first + niv_cut, :], atol=1e-12)
+
+
+def test_cut_niw_and_niv_cuts_each_fermionic_axis_against_its_own_width():
+    """The fused bosonic/fermionic cut slices an asymmetric nu x nu' box per axis."""
+    nb, niw, niv_first, niv, niw_cut, niv_cut = 2, 3, 5, 3, 1, 2
+    shape = (nb, nb, 2 * niw + 1, 2 * niv_first, 2 * niv)
+    mat = np.random.rand(*shape) + 1j * np.random.rand(*shape)
+
+    out = LocalNPoint(mat.copy(), 2, 1, 2).cut_niw_and_niv(niw_cut, niv_cut)
+
+    expected = mat[
+        ...,
+        niw - niw_cut : niw + niw_cut + 1,
+        niv_first - niv_cut : niv_first + niv_cut,
+        niv - niv_cut : niv + niv_cut,
+    ]
+    assert out.mat.shape == (nb, nb, 2 * niw_cut + 1, 2 * niv_cut, 2 * niv_cut)
+    assert np.allclose(out.mat, expected, atol=1e-12)
+
+
+@pytest.mark.parametrize("num_vn", [1, 2])
+def test_cut_niv_on_a_half_fermionic_range_truncates_at_an_equal_cutoff(num_vn):
+    """On a half fermionic range a cutoff equal to niv still truncates the axis rather than keeping it whole."""
+    nb, niw, niv = 2, 1, 3
+    shape = (nb, nb, 2 * niw + 1) + (2 * niv,) * num_vn
+    mat = np.random.rand(*shape) + 1j * np.random.rand(*shape)
+    obj = LocalNPoint(mat.copy(), 2, 1, num_vn, full_niv_range=False)
+
+    out = obj.cut_niv(obj.niv)
+
+    assert out.current_shape == (nb, nb, 2 * niw + 1) + (niv,) * num_vn
+    assert np.allclose(out.mat, mat[(...,) + (slice(0, niv),) * num_vn], atol=1e-12)

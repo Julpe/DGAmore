@@ -16,10 +16,13 @@ from dgamore.eliashberg_solver import (
     _apply_gamma_pp,
     _apply_gchi0_pp,
     _chi0_to_matmul_layout,
+    _compute_once_per_node,
     _frequency_parity_sectors,
+    _sector_log_label,
     gap_parity_diagnostics,
     _project_gap_to_sector,
     classify_gap_symmetry,
+    create_local_f_ud_transformed_w0,
     create_local_gamma_ud_pp_w0,
     create_local_gamma_ud_pp_w0_per_ineq,
     _gamma_to_matmul_layout,
@@ -1333,3 +1336,85 @@ def test_solve_sectors_in_memory_runs_each_sector_on_its_assigned_rank(monkeypat
         assert set(res) == set(owners)
         for key, expected_marker in owners.items():
             assert res[key][0][0] == expected_marker and len(res[key][1]) == config.eliashberg.n_eig
+
+
+def test_compute_once_per_node_evaluates_the_builder_only_on_the_node_root():
+    """_compute_once_per_node runs the builder once per node and hands that result to the node's other ranks."""
+    from tests.conftest import FAKE_MPI, run_parallel
+
+    def fn(comm, r):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        return _compute_once_per_node(node_comm, lambda: f"built-by-{r}")
+
+    _, results = run_parallel(4, fn, hostnames=["a", "a", "b", "b"])
+    assert results == ["built-by-0", "built-by-0", "built-by-2", "built-by-2"]
+
+
+def test_compute_once_per_node_evaluates_the_builder_without_a_node_communicator():
+    """_compute_once_per_node falls back to a plain local evaluation when no node communicator is given."""
+    assert _compute_once_per_node(None, lambda: "built") == "built"
+
+
+def test_create_local_f_ud_transformed_w0_is_the_w0_transform_of_the_half_difference(monkeypatch):
+    """create_local_f_ud_transformed_w0 returns the pp-w0 transform of 0.5 (F_dens - F_magn) read from file."""
+    rng = np.random.default_rng(3)
+    shape = (5, 1, 1, 1, 1, 8, 8)
+    f_dens = LocalFourPoint(rng.random(shape) + 1j * rng.random(shape), SpinChannel.DENS, 1, 2, False, True)
+    f_magn = LocalFourPoint(rng.random(shape) + 1j * rng.random(shape), SpinChannel.MAGN, 1, 2, False, True)
+    stored = {SpinChannel.DENS: f_dens, SpinChannel.MAGN: f_magn}
+    monkeypatch.setattr(
+        LocalFourPoint, "load", staticmethod(lambda filename, channel=SpinChannel.NONE: stored[channel].copy())
+    )
+    expected = transform_vertex_loc_frequencies_w0((f_dens - f_magn).set_channel(SpinChannel.UD).scale(0.5), 2)
+    assert np.allclose(create_local_f_ud_transformed_w0(2).mat, expected.mat, atol=1e-6)
+
+
+@pytest.mark.parametrize("o", [1, 2])
+def test_local_vertex_pp_transforms_are_blind_to_a_nu_prime_restricted_vertex(o):
+    """Both pp transforms of the local full vertex ignore the nu' columns outside the core box they cut to."""
+    niw, niv_core, niv_full, niv_pp = 6, 8, 12, 3
+    rng = np.random.default_rng(5)
+    shape = (o, o, o, o, niw + 1, 2 * niv_full, 2 * niv_full)
+    full = LocalFourPoint(
+        (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64),
+        SpinChannel.DENS,
+        1,
+        2,
+        False,
+        True,
+    )
+    cut = LocalFourPoint(
+        full.mat[..., niv_full - niv_core : niv_full + niv_core].copy(), SpinChannel.DENS, 1, 2, False, True
+    )
+
+    assert cut.niv_first == niv_full and cut.niv_second == niv_core
+    assert np.array_equal(
+        transform_vertex_loc_frequencies_w0(full.copy(), niv_pp).mat,
+        transform_vertex_loc_frequencies_w0(cut.copy(), niv_pp).mat,
+    )
+    assert np.array_equal(
+        full.copy().cut_niv(niv_pp).change_frequency_notation_ph_to_pp_w0().mat,
+        cut.copy().cut_niv(niv_pp).change_frequency_notation_ph_to_pp_w0().mat,
+    )
+
+
+@pytest.mark.parametrize(
+    "resolve, parities, expected",
+    [
+        (False, None, "the singlet channel"),
+        (True, None, "the singlet/even & odd sectors"),
+        (True, ["odd"], "the singlet/odd sector"),
+        (True, ["even"], "the singlet/even sector"),
+    ],
+)
+def test_sector_log_label_names_the_sectors_a_call_covers(resolve, parities, expected):
+    """The log label names the covered sectors, so concurrently solving ranks never emit identical lines."""
+    config.eliashberg.resolve_frequency_parity = resolve
+    assert _sector_log_label(SpinChannel.SING, parities) == expected
+
+
+def test_sector_log_label_distinguishes_the_channels():
+    """Both channels get their own label, so the four concurrent sector solves are told apart in the log."""
+    config.eliashberg.resolve_frequency_parity = True
+    labels = [_sector_log_label(c, [p]) for c in (SpinChannel.SING, SpinChannel.TRIP) for p in ("even", "odd")]
+    assert len(set(labels)) == 4

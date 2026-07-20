@@ -1,7 +1,7 @@
 # Read the Docs build configuration.
 # https://docs.readthedocs.io/en/stable/config-file/v2.html
 #
-# mpi4py and cupy are mocked in docs/conf.py (autodoc_mock_imports), so the build
+# mpi4py, cupy and psutil are mocked in docs/conf.py (autodoc_mock_imports), so the build
 # needs neither MPI nor CUDA. The package is imported from source via the
 # sys.path entry in conf.py, so no editable install of the package is required.
 version: 2
