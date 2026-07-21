@@ -43,7 +43,7 @@ class MFHelper:
         Returns the integer bosonic Matsubara indices in the closed interval :math:`[-\mathrm{niw}, \mathrm{niw}]`,
         optionally shifted. This is the index-only overload (no temperature dependence).
 
-        :param niw: Half-width of the bosonic frequency box (number of positive bosonic frequencies).
+        :param niw: Number of positive bosonic frequencies.
         :param shift: Integer offset added to the whole index range.
         :param return_only_positive: If True, return only the non-negative indices :math:`[0, \mathrm{niw}]`.
         :return: 1D integer array of bosonic Matsubara indices.
@@ -59,7 +59,7 @@ class MFHelper:
         Returns the real bosonic Matsubara frequencies :math:`\omega_n = 2 n \pi / \beta` for the index range
         :math:`n \in [-\mathrm{niw}, \mathrm{niw}]`, optionally shifted.
 
-        :param niw: Half-width of the bosonic frequency box (number of positive bosonic frequencies).
+        :param niw: Number of positive bosonic frequencies.
         :param beta: Inverse temperature :math:`\beta`.
         :param shift: Integer offset added to the whole index range before scaling.
         :param return_only_positive: If True, return only the non-negative frequencies.
@@ -75,7 +75,7 @@ class MFHelper:
         :math:`[-\mathrm{niv}, \mathrm{niv})`, optionally shifted. This is the index-only overload (no temperature
         dependence).
 
-        :param niv: Half-width of the fermionic frequency box (number of positive fermionic frequencies).
+        :param niv: Number of positive fermionic frequencies.
         :param shift: Integer offset added to the whole index range.
         :param return_only_positive: If True, return only the non-negative indices :math:`[0, \mathrm{niv})`.
         :return: 1D integer array of fermionic Matsubara indices.
@@ -91,7 +91,7 @@ class MFHelper:
         Returns the real fermionic Matsubara frequencies :math:`\nu_n = (2 n + 1) \pi / \beta` for the index range
         :math:`n \in [-\mathrm{niv}, \mathrm{niv})`, optionally shifted.
 
-        :param niv: Half-width of the fermionic frequency box (number of positive fermionic frequencies).
+        :param niv: Number of positive fermionic frequencies.
         :param beta: Inverse temperature :math:`\beta`.
         :param shift: Integer offset added to the whole index range before scaling.
         :param return_only_positive: If True, return only the positive frequencies.

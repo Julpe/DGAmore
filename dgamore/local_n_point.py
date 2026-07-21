@@ -41,8 +41,8 @@ class LocalNPoint(IHaveMat):
         :param num_orbital_dimensions: Number of orbital axes; 2 (two-point) or 4 (three-/four-leg vertex).
         :param num_wn_dimensions: Number of bosonic frequency axes (0 or 1).
         :param num_vn_dimensions: Number of fermionic frequency axes (0, 1 or 2).
-        :param full_niw_range: Whether the bosonic axis spans the full (signed) range or only :math:`\omega \geq 0`.
-        :param full_niv_range: Whether the fermionic axes span the full (signed) range or only :math:`\nu \geq 0`.
+        :param full_niw_range: Whether the object spans the full (signed) bosonic range or only :math:`\omega \geq 0`.
+        :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
         """
         IHaveMat.__init__(self, mat)
 

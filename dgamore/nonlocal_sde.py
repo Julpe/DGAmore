@@ -1062,7 +1062,7 @@ def _run_fft_sde_pass(
     a single full-BZ niw half is ever resident.
 
     :param kernel_src: The irreducible-BZ kernel for this pass; consumed by the full-BZ map (mutated or replaced).
-    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
     :param g_r_local: This rank's real-space Green's function pencil from :func:`_build_rspace_giwk_pencil`, built
         once by the caller and reused by both passes.
@@ -1243,7 +1243,7 @@ def _build_giwk_full(comm: MPI.Comm, sigma: SelfEnergy, mu: float, ek: np.ndarra
     :func:`dgamore.mpi_utils.build_node_shared_array`). Otherwise every rank builds its own copy. The node topology is
     discovered at runtime via ``comm.Split_type(MPI.COMM_TYPE_SHARED)`` (nothing about the cluster is hard-coded).
 
-    :param comm: The (world) MPI communicator.
+    :param comm: The MPI communicator.
     :param sigma: The self-energy :math:`\Sigma` entering the Dyson equation.
     :param mu: Chemical potential :math:`\mu`.
     :param ek: Band dispersion :math:`\varepsilon(k)`.
@@ -1358,14 +1358,14 @@ def calculate_sigma_proposal(
     ``config.sys.occ`` / ``occ_k``, which the caller sets consistently with :math:`\Sigma_{\mathrm{in}}`.
 
     :param sigma_in: The input self-energy (full-BZ or local first-iteration, DMFT tail attached).
-    :param mu: The chemical potential the Green's function is built with.
+    :param mu: Chemical potential :math:`\mu`.
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{q}`, reduced to this rank's irreducible q-points.
     :param v_nonloc_full: The non-local interaction on the full q-grid (for the Hartree/Fock term).
     :param sigma_dmft: The DMFT self-energy (cut to the loop's niv), providing the high-frequency tail.
     :param delta_sigma: The DMFT-minus-local noise-removal term on the core box.
     :param my_irr_q_list: This rank's irreducible q-point list.
-    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param mpi_dist_fullbz: MPI distributor over the full BZ.
     :param comm: The MPI communicator.
     :param current_iter: The current iteration number (the RPA susceptibility is saved only on iteration 1).

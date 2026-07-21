@@ -177,7 +177,7 @@ class GreensFunction(TwoPoint):
             filling/occupation, exposed via the :attr:`n`, :attr:`occ` and :attr:`occ_k` properties.
         :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
             (True) or as three separate axes ``[kx, ky, kz, ...]`` (False).
-        :param nk: Number of momenta per spatial direction ``(nkx, nky, nkz)``.
+        :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
         :param beta: Inverse temperature :math:`\beta`.
         :param mu: Chemical potential :math:`\mu`.
         """
@@ -378,7 +378,7 @@ class GreensFunction(TwoPoint):
 
         :param smom0: Zeroth self-energy moment :math:`\Sigma_\infty`, shape ``[o1, o2]``.
         :param smom1: First self-energy tail coefficient :math:`\Sigma_1`, shape ``[o1, o2]``.
-        :param niv: Number of positive fermionic frequencies in the box.
+        :param niv: Number of positive fermionic frequencies.
         :param beta: Inverse temperature :math:`\beta`.
         :return: The model tail contribution to the potential energy (real scalar, not yet divided by ``nk_tot``).
         """

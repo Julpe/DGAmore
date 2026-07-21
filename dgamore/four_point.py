@@ -47,13 +47,13 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
         :param mat: Underlying array with one momentum axis (compressed or not), four orbital axes, then frequency axes.
         :param channel: Spin channel of the object (see :class:`SpinChannel`).
-        :param nq: Number of momenta per spatial direction.
-        :param num_wn_dimensions: Number of bosonic frequency axes (0–1).
-        :param num_vn_dimensions: Number of fermionic frequency axes (0–2).
+        :param nq: Number of momenta per spatial direction ``(nx, ny, nz)``.
+        :param num_wn_dimensions: Number of bosonic frequency axes (0 or 1).
+        :param num_vn_dimensions: Number of fermionic frequency axes (0, 1 or 2).
         :param full_niw_range: Whether the object spans the full (signed) bosonic range or only :math:`\omega \geq 0`.
         :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
         :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
-            (True) or as ``[qx, qy, qz, ...]`` (False).
+            (True) or as three separate axes ``[qx, qy, qz, ...]`` (False).
         :param frequency_notation: Frequency convention (see :class:`FrequencyNotation`).
         """
         LocalFourPoint.__init__(
@@ -399,8 +399,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
         :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, :class:`LocalInteraction`,
             numpy array, or number.
-        :param copy: If True (default), return a new :class:`FourPoint`; if False, accumulate into ``self`` in place
-            (only supported when ``other`` is a conforming :class:`FourPoint`, see :meth:`_add`).
+        :param copy: If True (default), return a new :class:`FourPoint`; if False, accumulate into ``self`` in place and
+            return ``self`` (only supported when ``other`` is a conforming :class:`FourPoint`, see :meth:`_add`).
         :return: A new :class:`FourPoint` holding the sum (or ``self`` when ``copy=False``).
         """
         return self._add(other, copy=copy)
@@ -908,13 +908,13 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
         :param filename: Path to the ``.npy`` file (loaded with ``allow_pickle=False``).
         :param channel: Spin channel of the object (see :class:`SpinChannel`).
-        :param nq: Number of momenta per spatial direction.
-        :param num_wn_dimensions: Number of bosonic frequency axes (0–1).
-        :param num_vn_dimensions: Number of fermionic frequency axes (0–2).
-        :param full_niw_range: Whether the stored array spans the full (signed) bosonic range or only :math:`\omega \geq 0`.
-        :param full_niv_range: Whether the stored array spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
-        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis (True) or as
-            ``[qx, qy, qz, ...]`` (False).
+        :param nq: Number of momenta per spatial direction ``(nx, ny, nz)``.
+        :param num_wn_dimensions: Number of bosonic frequency axes (0 or 1).
+        :param num_vn_dimensions: Number of fermionic frequency axes (0, 1 or 2).
+        :param full_niw_range: Whether the object spans the full (signed) bosonic range or only :math:`\omega \geq 0`.
+        :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
+        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
+            (True) or as three separate axes ``[qx, qy, qz, ...]`` (False).
         :param frequency_notation: Frequency convention (see :class:`FrequencyNotation`).
         :return: The loaded :class:`FourPoint`.
         """
@@ -948,7 +948,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         :param niw: Number of positive bosonic frequencies.
         :param niv: Number of positive fermionic frequencies.
         :param nq_tot: Total number of momenta (product over directions).
-        :param nq: Number of momenta per spatial direction.
+        :param nq: Number of momenta per spatial direction ``(nx, ny, nz)``.
         :param num_vn_dimensions: Number of fermionic frequency axes (1 or 2).
         :param frequency_notation: Frequency convention (see :class:`FrequencyNotation`).
         :return: The identity :class:`FourPoint` (compressed momentum, half niw range).

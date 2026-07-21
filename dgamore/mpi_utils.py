@@ -878,7 +878,7 @@ def _send_in_chunks(comm, arr, dest, base_tag=0):
     :param comm: The MPI communicator.
     :param arr: The array to send.
     :param dest: Destination rank.
-    :param base_tag: Base MPI tag; successive chunks add the chunk index.
+    :param base_tag: Base MPI tag; successive chunks use ``base_tag + chunk_index``.
     :return: None.
     """
     send_rows(comm, arr, dest, base_tag=base_tag, limit=MAX_MPI_BYTES)
@@ -893,7 +893,7 @@ def _recv_in_chunks(comm, shape, dtype, source, base_tag=0):
     :param shape: Shape of the array to receive.
     :param dtype: Dtype of the array to receive.
     :param source: Source rank.
-    :param base_tag: Base MPI tag; successive chunks add the chunk index.
+    :param base_tag: Base MPI tag; successive chunks use ``base_tag + chunk_index``.
     :return: The received array.
     """
     return recv_rows_alloc(comm, shape, dtype, source, base_tag=base_tag, limit=MAX_MPI_BYTES)
@@ -1183,7 +1183,7 @@ def get_pencil_indices(rank: int, size: int, nq: tuple[int, int, int], layout: s
 
     :param rank: The rank whose indices to compute.
     :param size: Total number of ranks.
-    :param nq: The momentum grid sizes ``(nx, ny, nz)``.
+    :param nq: Number of momenta per spatial direction ``(nx, ny, nz)``.
     :param layout: One of ``"flat"``, ``"z_pencil"``, ``"y_pencil"``, ``"x_pencil"``.
     :return: The global flattened q-indices owned by ``rank``.
     :raises ValueError: If ``layout`` is not one of the supported layouts.
@@ -1260,7 +1260,7 @@ def _redistribute_p2p(mat, nq, comm, source_layout, target_layout):
     exchanging only the rows each rank pair shares (in below-2 GB byte chunks).
 
     :param mat: The local array slice, with the q-index on axis 0.
-    :param nq: The momentum grid sizes ``(nx, ny, nz)``.
+    :param nq: Number of momenta per spatial direction ``(nx, ny, nz)``.
     :param comm: The MPI communicator.
     :param source_layout: The current layout of ``mat`` (see :func:`get_pencil_indices`).
     :param target_layout: The desired layout of the result.

@@ -273,7 +273,9 @@ symmetry, but ``"random"`` is sufficient most of the time. The pairing vertex in
 which can be skipped by setting ``include_local_part`` to ``False``; this is only advisable when s-wave symmetry is
 not expected, as these diagrams become relevant in that case. With ``symmetrize_degenerate_gaps`` enabled (the
 default), gap functions belonging to (near-)degenerate eigenvalues are orthogonalized with a Loewdin scheme and
-degenerate doublets are rotated to their mirror-adapted (:math:`p_x`/:math:`p_y`-like) partners.
+rotated to their mirror-adapted partners: single-axis (:math:`p_x`/:math:`p_y`/:math:`p_z`-like) and two-axis
+(:math:`d_{xy}`/:math:`d_{xz}`/:math:`d_{yz}`-like) modes are ordered by the momentum reflections they are odd
+under.
 
 The ``resolve_frequency_parity`` field controls whether the physical gap-symmetry sectors are returned. The
 unprojected eigensolver leaks onto the globally dominant eigenvector, mixing frequency-even and frequency-odd modes;
