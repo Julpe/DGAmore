@@ -390,7 +390,7 @@ class KGrid:
         """
         Builds the k-axes and the irreducible-BZ maps from the grid size and symmetries.
 
-        :param nk: Number of k-points per spatial direction, as a tuple ``(nx, ny, nz)``.
+        :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
         :param symmetries: A list of :class:`KnownSymmetries` defining the irreducible BZ, or
             ``[KnownSymmetries.AUTO]`` to defer symmetry discovery to :meth:`specify_auto_symmetries`.
         """
@@ -685,7 +685,7 @@ class KPath:
         r"""
         Builds the k-axes and the discretized path (and its k-points) from the path string.
 
-        :param nk: Number of k-points per spatial direction, as a tuple ``(nx, ny, nz)``.
+        :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
         :param path: The desired path through the BZ as a delimiter-separated string of corner-point labels.
         :param kx: Optional explicit kx-axis array; a :math:`[0, 2\pi)` grid is built if None.
         :param ky: Optional explicit ky-axis array; a :math:`[0, 2\pi)` grid is built if None.
@@ -908,7 +908,7 @@ def kpath_segment(k_start, k_end, nk):
 
     :param k_start: Fractional coordinates of the segment start point.
     :param k_end: Fractional coordinates of the segment end point.
-    :param nk: Number of k-points per spatial direction.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :return: A tuple ``(k_segment, nkp)`` of the integer index array along the segment and the number of points.
     """
     nkp = int(np.round(np.linalg.norm(k_start * nk - k_end * nk, ord=np.inf)))

@@ -18,6 +18,7 @@ from dgamore.eliashberg_solver import (
     _chi0_to_matmul_layout,
     _compute_once_per_node,
     _frequency_parity_sectors,
+    _orient_cluster_by_mirrors,
     _sector_log_label,
     gap_parity_diagnostics,
     _project_gap_to_sector,
@@ -857,6 +858,126 @@ def test_symmetrize_degenerate_gaps_skips_dependent_vectors():
     gaps = np.stack([px, px * (1 + 1e-15)], axis=1)
     fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5]), gaps, gap_shape)
     assert np.allclose(fixed, gaps, atol=1e-12)
+
+
+def _make_p_wave_triplet(nk: int = 4, n2: int = 4) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple]:
+    """Builds orthonormal p_x/p_y/p_z-like gap columns sin(k_i) g(v) on a small three-dimensional single-band grid."""
+    gap_shape = (nk, nk, nk, 1, 1, n2)
+    k = 2 * np.pi * np.arange(nk) / nk
+    g_v = np.linspace(1.0, 0.5, n2)
+    px = np.sin(k)[:, None, None, None, None, None] * g_v * np.ones(gap_shape)
+    py = np.sin(k)[None, :, None, None, None, None] * g_v * np.ones(gap_shape)
+    pz = np.sin(k)[None, None, :, None, None, None] * g_v * np.ones(gap_shape)
+    columns = [(c.ravel() / np.linalg.norm(c)).astype(np.complex128) for c in (px, py, pz)]
+    return columns[0], columns[1], columns[2], gap_shape
+
+
+def _mirror_axis_column(column: np.ndarray, gap_shape: tuple, axis: int) -> np.ndarray:
+    """Applies the single-axis mirror k_axis -> -k_axis to a flattened gap column."""
+    idx = (gap_shape[axis] - np.arange(gap_shape[axis])) % gap_shape[axis]
+    take = [slice(None)] * len(gap_shape)
+    take[axis] = idx
+    return column.reshape(gap_shape)[tuple(take)].ravel()
+
+
+def test_symmetrize_degenerate_gaps_recovers_triplet_partners():
+    """An oblique degenerate triplet is rotated to p_x/p_y/p_z partners ordered by the axis each one is odd under."""
+    px, py, pz, gap_shape = _make_p_wave_triplet()
+    rng = np.random.default_rng(7)
+    mix = rng.standard_normal((3, 3)) + 1j * rng.standard_normal((3, 3))
+    gaps = np.stack([px, py, pz], axis=1) @ mix
+    fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5, 0.5]), gaps, gap_shape)
+    assert np.allclose(fixed.conj().T @ fixed, np.eye(3), atol=1e-10)
+    for col, (parent, odd_axis) in enumerate(((px, 0), (py, 1), (pz, 2))):
+        assert abs(np.vdot(fixed[:, col], parent)) > 1 - 1e-10
+        for axis in range(3):
+            sign = -1.0 if axis == odd_axis else 1.0
+            assert np.allclose(_mirror_axis_column(fixed[:, col], gap_shape, axis), sign * fixed[:, col], atol=1e-10)
+
+
+def test_symmetrize_degenerate_gaps_triplet_is_idempotent():
+    """Applying the symmetrization twice to a degenerate triplet gives the same result as applying it once."""
+    px, py, pz, gap_shape = _make_p_wave_triplet()
+    rng = np.random.default_rng(11)
+    gaps = np.stack([px, py, pz], axis=1) @ (rng.standard_normal((3, 3)) + 1j * rng.standard_normal((3, 3)))
+    lambdas = np.array([0.6, 0.6, 0.6])
+    once = symmetrize_degenerate_gaps(lambdas, gaps, gap_shape)
+    twice = symmetrize_degenerate_gaps(lambdas, once, gap_shape)
+    assert np.allclose(once, twice, atol=1e-10)
+
+
+def _make_d_wave_triplet(nk: int = 4, n2: int = 4) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple]:
+    """Builds orthonormal d_xy/d_xz/d_yz-like gap columns sin(k_i) sin(k_j) g(v) on a small three-dimensional grid."""
+    gap_shape = (nk, nk, nk, 1, 1, n2)
+    s = np.sin(2 * np.pi * np.arange(nk) / nk)
+    g_v = np.linspace(1.0, 0.5, n2)
+    dxy = s[:, None, None, None, None, None] * s[None, :, None, None, None, None] * g_v * np.ones(gap_shape)
+    dxz = s[:, None, None, None, None, None] * s[None, None, :, None, None, None] * g_v * np.ones(gap_shape)
+    dyz = s[None, :, None, None, None, None] * s[None, None, :, None, None, None] * g_v * np.ones(gap_shape)
+    columns = [(c.ravel() / np.linalg.norm(c)).astype(np.complex128) for c in (dxy, dxz, dyz)]
+    return columns[0], columns[1], columns[2], gap_shape
+
+
+def test_symmetrize_degenerate_gaps_orders_two_axis_gaps_by_odd_axis_pair():
+    """A degenerate d_xy/d_xz/d_yz triplet is resolved and ordered by the pair of axes each partner is odd under."""
+    dxy, dxz, dyz, gap_shape = _make_d_wave_triplet()
+    rng = np.random.default_rng(7)
+    mix = rng.standard_normal((3, 3)) + 1j * rng.standard_normal((3, 3))
+    gaps = np.stack([dxy, dxz, dyz], axis=1) @ mix
+    fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5, 0.5]), gaps, gap_shape)
+    assert np.allclose(fixed.conj().T @ fixed, np.eye(3), atol=1e-10)
+    for col, (parent, odd_axes) in enumerate(((dxy, {0, 1}), (dxz, {0, 2}), (dyz, {1, 2}))):
+        assert abs(np.vdot(fixed[:, col], parent)) > 1 - 1e-10
+        for axis in range(3):
+            sign = -1.0 if axis in odd_axes else 1.0
+            assert np.allclose(_mirror_axis_column(fixed[:, col], gap_shape, axis), sign * fixed[:, col], atol=1e-10)
+
+
+def test_orient_cluster_by_mirrors_falls_back_for_non_mirror_cluster():
+    """_orient_cluster_by_mirrors returns None when the cluster vectors are not clean +/-1 mirror eigenstates."""
+    gap_shape = (4, 4, 4, 1, 1, 4)
+    rng = np.random.default_rng(3)
+    n = int(np.prod(gap_shape))
+    block, _ = np.linalg.qr(rng.standard_normal((n, 3)) + 1j * rng.standard_normal((n, 3)))
+    assert _orient_cluster_by_mirrors(block, gap_shape) is None
+
+
+def test_orient_cluster_by_mirrors_falls_back_without_resolved_axes():
+    """_orient_cluster_by_mirrors returns None on a single-k-point grid where no momentum axis is reflected."""
+    gap_shape = (1, 1, 1, 1, 1, 4)
+    block, _ = np.linalg.qr(np.random.default_rng(3).standard_normal((4, 3)) + 0j)
+    assert _orient_cluster_by_mirrors(block, gap_shape) is None
+
+
+def test_orient_cluster_by_mirrors_resolves_a_p_triplet_without_diagonal_mirrors():
+    """On a non-square grid the coordinate mirrors alone (no diagonal family) still resolve a p_x/p_y/p_z triplet."""
+    gap_shape = (4, 6, 5, 1, 1, 4)
+    s = [np.sin(2 * np.pi * np.arange(n) / n) for n in gap_shape[:3]]
+    g_v = np.linspace(1.0, 0.5, gap_shape[-1])
+    px = s[0][:, None, None, None, None, None] * g_v * np.ones(gap_shape)
+    py = s[1][None, :, None, None, None, None] * g_v * np.ones(gap_shape)
+    pz = s[2][None, None, :, None, None, None] * g_v * np.ones(gap_shape)
+    cols = [(c.ravel() / np.linalg.norm(c)).astype(np.complex128) for c in (px, py, pz)]
+    rng = np.random.default_rng(2)
+    block, _ = np.linalg.qr(np.stack(cols, axis=1) @ (rng.standard_normal((3, 3)) + 1j * rng.standard_normal((3, 3))))
+    fixed = _orient_cluster_by_mirrors(block, gap_shape)
+    assert fixed is not None
+    for col, odd_axis in enumerate((0, 1, 2)):
+        for axis in range(3):
+            sign = -1.0 if axis == odd_axis else 1.0
+            assert np.allclose(_mirror_axis_column(fixed[:, col], gap_shape, axis), sign * fixed[:, col], atol=1e-10)
+
+
+def test_symmetrize_degenerate_gaps_canonicalizes_diagonal_p_doublet_to_axis_basis():
+    """An obliquely mixed p_{x+y}/p_{x-y} doublet is canonicalized to the coordinate p_x/p_y basis by the M_y mirror."""
+    px, py, gap_shape = _make_p_wave_doublet()
+    pxy = (px + py) / np.linalg.norm(px + py)
+    pxmy = (px - py) / np.linalg.norm(px - py)
+    rng = np.random.default_rng(9)
+    gaps = np.stack([pxy, pxmy], axis=1) @ (rng.standard_normal((2, 2)) + 1j * rng.standard_normal((2, 2)))
+    fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5]), gaps, gap_shape)
+    assert abs(np.vdot(fixed[:, 0], px)) > 1 - 1e-10
+    assert abs(np.vdot(fixed[:, 1], py)) > 1 - 1e-10
 
 
 def _assemble_two_atom_system(niv_pp: int, beta: float) -> tuple:

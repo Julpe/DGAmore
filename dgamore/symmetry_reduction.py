@@ -88,7 +88,7 @@ def _M_preserves_grid(M, nk):
     ``N_i``.
 
     :param M: The candidate 3x3 integer matrix.
-    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :return: True if ``M`` preserves the grid.
     """
     Ns = list(nk)
@@ -105,7 +105,7 @@ def _grid_index_stack(nk):
     Returns the read-only ``(nx, ny, nz, 3)`` stack of k-grid integer coordinates. Cached per grid size so the
     per-M k-index maps do not rebuild the meshgrid (called thousands of times during symmetry discovery).
 
-    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :return: The integer coordinate stack (shared, not to be mutated by callers).
     """
     nx, ny, nz = nk
@@ -121,7 +121,7 @@ def _apply_M_to_kgrid_indices(M, nk):
     scaling for non-cubic grids).
 
     :param M: The 3x3 integer matrix acting on k-indices.
-    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :return: The flat-index permutation array of length ``nx*ny*nz``.
     """
     nx, ny, nz = nk
@@ -145,7 +145,7 @@ def _apply_M_to_points(M, coords, nk):
 
     :param M: The 3x3 integer matrix acting on k-indices.
     :param coords: Integer grid coordinates of shape ``(K, 3)``.
-    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :return: The flat indices of the mapped coordinates, shape ``(K,)``.
     """
     nx, ny, nz = nk
@@ -166,7 +166,7 @@ def _translate_kgrid(idx_map, q, nk):
 
     :param idx_map: An existing flat-index map over the k-grid.
     :param q: The integer translation vector ``(qx, qy, qz)``.
-    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :return: The translated flat-index map.
     """
     nx, ny, nz = nk
@@ -188,7 +188,7 @@ def _apply_M_to_ev_field(M, ev, nk, idx_map=None):
 
     :param M: The 3x3 integer matrix acting on k-indices.
     :param ev: The eigenvalue field of shape ``(nx, ny, nz, n_orb)``.
-    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :param idx_map: Optional precomputed flat-index map from :func:`_apply_M_to_kgrid_indices` for ``M``.
     :return: The transformed eigenvalue field, same shape as ``ev``.
     """
@@ -676,7 +676,7 @@ def _grid_action_bytes(M, q, nk):
 
     :param M: The 3x3 integer matrix.
     :param q: The integer translation vector.
-    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :return: The byte string encoding the resulting flat-index map.
     """
     key = (M.tobytes(), q.tobytes(), tuple(nk))
@@ -720,7 +720,7 @@ class _GroupElement:
         :param U: The orbital-space unitary (canonicalized up to a global phase).
         :param sigma: The antisymmetry sign (``+1`` or ``-1``).
         :param conj: Whether the operation is anti-unitary (complex conjugation).
-        :param nk: The grid sizes ``(nx, ny, nz)``.
+        :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
         """
         self.M = np.asarray(M, dtype=np.int64)
         self.q = np.asarray(q, dtype=np.int64)
@@ -764,7 +764,7 @@ class _GroupElement:
         Builds the identity group element (identity matrix, zero translation, identity unitary, ``sigma=+1``).
 
         :param norb: Number of orbitals.
-        :param nk: The grid sizes ``(nx, ny, nz)``.
+        :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
         :return: The identity :class:`_GroupElement`.
         """
         return _GroupElement(
@@ -778,7 +778,7 @@ def _compose(ga, gb, nk):
 
     :param ga: The outer group element.
     :param gb: The inner group element.
-    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :return: The composed :class:`_GroupElement`.
     """
     Ns = np.array(nk, dtype=np.int64)
@@ -796,7 +796,7 @@ def _inverse(g, nk):
     Computes the inverse of a group element.
 
     :param g: The group element to invert.
-    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :return: The inverse :class:`_GroupElement`.
     """
     Ns = np.array(nk, dtype=np.int64)
@@ -814,7 +814,7 @@ def _close_group(ops_raw, norb, nk, max_size=10000):
 
     :param ops_raw: The list of discovered operation dicts.
     :param norb: Number of orbitals.
-    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :param max_size: Maximum allowed group size before bailing out.
     :return: The closed set of :class:`_GroupElement`.
     """
@@ -845,7 +845,7 @@ def _g_action_on_kgrid(g, nk):
     Returns the flat-index map of a group element's combined ``(M, q)`` action on the k-grid.
 
     :param g: The group element.
-    :param nk: The grid sizes ``(nx, ny, nz)``.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :return: The flat-index permutation array.
     """
     idx = _apply_M_to_kgrid_indices(g.M, nk)

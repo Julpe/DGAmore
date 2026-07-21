@@ -41,11 +41,11 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
         :param mat: Underlying array with four leading orbital axes followed by the frequency axes.
         :param channel: Spin channel of the object (see :class:`SpinChannel`).
-        :param num_wn_dimensions: Number of bosonic frequency axes (0–1).
-        :param num_vn_dimensions: Number of fermionic frequency axes (0–2).
+        :param num_wn_dimensions: Number of bosonic frequency axes (0 or 1).
+        :param num_vn_dimensions: Number of fermionic frequency axes (0, 1 or 2).
         :param full_niw_range: Whether the object spans the full (signed) bosonic range or only :math:`\omega \geq 0`.
         :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
-        :param frequency_notation: Frequency convention (ph/ph_bar/pp; see :class:`FrequencyNotation`).
+        :param frequency_notation: Frequency convention (see :class:`FrequencyNotation`).
         """
         LocalNPoint.__init__(
             self,
@@ -617,8 +617,8 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
         :param other: A :class:`LocalFourPoint`, :class:`LocalInteraction`, numpy array, or number.
         :param copy: If True (default), return a new :class:`LocalFourPoint`; if False, accumulate into ``self`` in
-            place (only supported for conforming :class:`LocalFourPoint` and :class:`LocalInteraction` operands,
-            see :meth:`_add`).
+            place and return ``self`` (only supported for conforming :class:`LocalFourPoint` and
+            :class:`LocalInteraction` operands, see :meth:`_add`).
         :return: The sum (a new :class:`LocalFourPoint`, ``self`` when ``copy=False``, or a raw numpy array for a
             non-local :class:`Interaction`).
         """
@@ -778,8 +778,9 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         Objects will always be returned in the half niw range to save memory.
 
         :param other: A :class:`LocalFourPoint`, :class:`LocalInteraction`, numpy array, or number.
-        :param copy: If True (default), return a new :class:`LocalFourPoint`; if False, subtract into ``self`` in
-            place and return ``self`` (see :meth:`_add` for the supported operands).
+        :param copy: If True (default), return a new :class:`LocalFourPoint`; if False, subtract into ``self`` in place
+            and return ``self`` (only supported for conforming :class:`LocalFourPoint` and :class:`LocalInteraction`
+            operands, see :meth:`_add`).
         :return: The difference, implemented as ``self._add(other, subtract=True)`` (see :meth:`_add`).
         :raises ValueError: Propagated from :meth:`_add` for unsupported operands.
         """
@@ -994,10 +995,10 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
         :param filename: Path to the ``.npy`` file (loaded with ``allow_pickle=False``).
         :param channel: Spin channel of the object (see :class:`SpinChannel`).
-        :param num_wn_dimensions: Number of bosonic frequency axes (0–1).
-        :param num_vn_dimensions: Number of fermionic frequency axes (0–2).
-        :param full_niw_range: Whether the stored array spans the full (signed) bosonic range or only :math:`\omega \geq 0`.
-        :param full_niv_range: Whether the stored array spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
+        :param num_wn_dimensions: Number of bosonic frequency axes (0 or 1).
+        :param num_vn_dimensions: Number of fermionic frequency axes (0, 1 or 2).
+        :param full_niw_range: Whether the object spans the full (signed) bosonic range or only :math:`\omega \geq 0`.
+        :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
         :param frequency_notation: Frequency convention (see :class:`FrequencyNotation`).
         :return: The loaded :class:`LocalFourPoint`.
         """
@@ -1028,8 +1029,8 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         :param n_bands: Number of orbitals/bands per orbital axis.
         :param niw: Number of positive bosonic frequencies.
         :param niv: Number of positive fermionic frequencies.
-        :param num_wn_dimensions: Number of bosonic frequency axes (0–1).
-        :param num_vn_dimensions: Number of fermionic frequency axes (0–2).
+        :param num_wn_dimensions: Number of bosonic frequency axes (0 or 1).
+        :param num_vn_dimensions: Number of fermionic frequency axes (0, 1 or 2).
         :param channel: Spin channel of the object (see :class:`SpinChannel`).
         :param frequency_notation: Frequency convention (see :class:`FrequencyNotation`).
         :param value: Constant fill value.

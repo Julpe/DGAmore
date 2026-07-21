@@ -39,7 +39,7 @@ class TwoPoint(IAmNonLocal, LocalTwoPoint):
 
         :param mat: Underlying array (one momentum axis -- compressed or not -- then two orbital axes and one
             fermionic frequency axis).
-        :param nk: Number of momenta per spatial direction ``(nkx, nky, nkz)``.
+        :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
         :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
         :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
             (True) or as three separate axes ``[kx, ky, kz, ...]`` (False).

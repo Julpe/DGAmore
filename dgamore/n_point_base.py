@@ -429,7 +429,7 @@ class IHaveChannel(ABC):
         Stores the spin channel and frequency notation of the object.
 
         :param channel: Spin channel of the object (see :class:`SpinChannel`).
-        :param frequency_notation: Frequency notation of the object (see :class:`FrequencyNotation`).
+        :param frequency_notation: Frequency convention (see :class:`FrequencyNotation`).
         """
         self._channel = channel
         self._frequency_notation = frequency_notation
@@ -512,7 +512,7 @@ class IAmNonLocal(IHaveMat, ABC):
         Stores the array, the momentum-grid size and the momentum-layout flag.
 
         :param mat: The underlying numpy array with one (compressed) or three (decompressed) leading momentum axes.
-        :param nq: Number of momenta per spatial direction ``(nqx, nqy, nqz)``.
+        :param nq: Number of momenta per spatial direction ``(nx, ny, nz)``.
         :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
             (True) or as three separate axes ``[qx, qy, qz, ...]`` (False).
         """

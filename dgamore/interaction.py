@@ -206,7 +206,7 @@ class Interaction(IAmNonLocal, LocalInteraction):
 
         :param mat: Interaction tensor :math:`V_{1234}^q` with one momentum dimension and four orbital axes.
         :param channel: Spin channel the tensor is expressed in (see :class:`SpinChannel`).
-        :param nq: Number of momenta per spatial direction ``(nqx, nqy, nqz)``.
+        :param nq: Number of momenta per spatial direction ``(nx, ny, nz)``.
         :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
             (True) or as three separate axes ``[qx, qy, qz, ...]`` (False).
         """

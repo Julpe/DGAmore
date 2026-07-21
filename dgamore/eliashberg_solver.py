@@ -498,7 +498,7 @@ def create_local_gamma_ud_pp_w0(
     :param gchi0_pp_w0: The local bare pp bubble :math:`\chi^{pp;\nu\nu'}_{0;1234}` (diagonal in :math:`\nu\nu'`),
         built from the DMFT Green's function via
         :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_pp_w0`.
-    :param beta: Inverse temperature :math:`\beta`, see ``beta`` of :class:`~dgamore.config.SystemConfig`.
+    :param beta: Inverse temperature :math:`\beta`.
     :return: The vertex :math:`\Gamma^{pp;\nu\nu'}_{\uparrow\downarrow;1234}` as a :class:`LocalFourPoint` in pp
         notation.
     """
@@ -892,7 +892,7 @@ def _v2_solver_thread_budget(comm: MPI.Comm, active_ranks: list) -> int:
     launcher binding leaves masks wider than one core (e.g. socket binding) and some of the node's ranks hold
     empty frequency slices. This is a collective call - every rank of ``comm`` must enter it, active or not.
 
-    :param comm: The full MPI communicator.
+    :param comm: The MPI communicator.
     :param active_ranks: The ranks holding non-empty frequency slices (see :func:`solve_eliashberg_lanczos_v2`).
     :return: The thread budget of this rank as an int (1 for inactive ranks and where no affinity API exists).
     """
@@ -928,15 +928,63 @@ def _chi0_to_matmul_layout(chi0_mat: np.ndarray) -> np.ndarray:
     return np.moveaxis(chi0_mat.reshape(nqx, nqy, nqz, nb * nb, nb * nb, v), -1, 3)
 
 
+def _orient_cluster_by_mirrors(block: np.ndarray, gap_shape: tuple, tol: float = 1e-6) -> np.ndarray | None:
+    r"""
+    Rotates an orthonormal degenerate cluster onto the common eigenbasis of the single-axis coordinate mirrors
+    :math:`k_i \to -k_i` and orders the partners lexicographically by the tuple of axes each one is odd under. The
+    mirrors mutually commute, so one generic real combination of their projections into the cluster (weights
+    :math:`1, \sqrt{2}, \sqrt{3}`, giving a distinct eigenvalue per sign pattern) shares their eigenvectors; each
+    partner's mirror eigenvalues are read off as Rayleigh quotients. Single-axis :math:`p`-like partners sort
+    ``x, y, z`` and two-axis :math:`d`-like partners (:math:`d_{xy}`, :math:`d_{xz}`, :math:`d_{yz}`) sort
+    ``xy, xz, yz``.
+
+    :param block: Orthonormal cluster, one flattened gap function per column.
+    :param gap_shape: Full gap shape ``[kx, ky, kz, o1, o2, 2*niv_pp]``.
+    :param tol: Tolerance on the deviation of a mirror Rayleigh quotient from :math:`\pm 1`.
+    :return: The reordered cluster, or ``None`` when no momentum axis is resolved or a partner is not a clean
+        :math:`\pm 1` mirror eigenstate.
+    """
+
+    def reflect_axis(column: np.ndarray, axis: int) -> np.ndarray:
+        idx = (gap_shape[axis] - np.arange(gap_shape[axis])) % gap_shape[axis]
+        take = [slice(None)] * len(gap_shape)
+        take[axis] = idx
+        return column.reshape(gap_shape)[tuple(take)].ravel()
+
+    axes = [axis for axis in (0, 1, 2) if gap_shape[axis] > 1]
+    if not axes:
+        return None
+
+    projected = []
+    for axis in axes:
+        mirrored = np.stack([reflect_axis(block[:, i], axis) for i in range(block.shape[1])], axis=1)
+        m = block.conj().T @ mirrored
+        projected.append(0.5 * (m + m.conj().T))
+
+    weights = np.sqrt(np.arange(1, len(projected) + 1, dtype=float))  # 1, sqrt(2), sqrt(3): generic, deterministic
+    _, vecs = np.linalg.eigh(sum(w * m for w, m in zip(weights, projected)))
+
+    keys = []
+    for col in range(vecs.shape[1]):
+        c = vecs[:, col]
+        signature = np.array([(c.conj() @ m @ c).real for m in projected])
+        if np.any(np.abs(np.abs(signature) - 1.0) > tol):  # not a clean +/-1 mirror eigenstate
+            return None
+        keys.append(tuple(int(a) for a in np.flatnonzero(signature < 0.0)))
+
+    block = block @ vecs
+    return block[:, sorted(range(len(keys)), key=lambda col: keys[col])]
+
+
 def symmetrize_degenerate_gaps(
     lambdas: np.ndarray, gaps: np.ndarray, gap_shape: tuple, tol: float = 1e-4
 ) -> np.ndarray:
     r"""
     Orthonormalizes the eigenvectors returned by the Lanczos solver within clusters of (near-)degenerate
-    eigenvalues and rotates every two-dimensional cluster to the mirror-adapted basis. The pairing kernel is only
-    symmetrizable, not Hermitian in the plain inner product, so ARPACK may return oblique (mutually
-    non-orthogonal) combinations inside a degenerate doublet: the doublet subspace is symmetry-covariant, but the
-    two returned vectors then do not form 90-degree-rotated partners.
+    eigenvalues and rotates every cluster to a mirror-adapted basis. The pairing kernel is only symmetrizable, not
+    Hermitian in the plain inner product, so ARPACK may return oblique (mutually non-orthogonal) combinations
+    inside a degenerate cluster: the cluster subspace is symmetry-covariant, but the returned vectors then do not
+    form the symmetry-adapted partners.
 
     Per cluster the following steps are applied: (i) Loewdin orthonormalization, i.e. :math:`S^{-1/2}` applied to
     the cluster overlap matrix :math:`S`, which yields the orthonormal basis closest to the input vectors; (ii)
@@ -945,14 +993,18 @@ def symmetrize_degenerate_gaps(
     .. math:: M_y: \Delta_{12}(k_x, k_y, k_z, \nu) \to \Delta_{12}(k_x, -k_y, k_z, \nu)
 
     is diagonalized within the cluster, ordering the even (:math:`+1`, :math:`p_x`-like) partner first and the
-    odd (:math:`-1`, :math:`p_y`-like) partner second; (iii) the global phase of every vector is fixed such that
-    its largest-magnitude element is real and positive. Eigenvalues are not modified; vectors of non-degenerate
+    odd (:math:`-1`, :math:`p_y`-like) partner second; every cluster of three or more members is handled by
+    :func:`_orient_cluster_by_mirrors`, which diagonalizes the single-axis coordinate mirrors of the resolved axes
+    simultaneously and orders the partners by the axes each one is odd under (:math:`p`-like as ``x, y, z``,
+    two-axis :math:`d`-like as ``xy, xz, yz``), provided every partner is a clean :math:`\pm 1` eigenstate
+    (otherwise the Loewdin basis is kept); (iii) the global phase of every vector is fixed such that its
+    largest-magnitude element is real and positive. Eigenvalues are not modified; vectors of non-degenerate
     eigenvalues are only phase-fixed. Enabled via ``symmetrize_degenerate_gaps`` of
     :class:`~dgamore.config.EliashbergConfig`.
 
     :param lambdas: Eigenvalues sorted in descending order.
     :param gaps: Eigenvector matrix ``[n, n_eig]`` with one flattened gap function per column.
-    :param gap_shape: Full gap shape ``[kx, ky, kz, o1, o2, 2*niv_pp]``, used to locate the :math:`k_y` axis.
+    :param gap_shape: Full gap shape ``[kx, ky, kz, o1, o2, 2*niv_pp]``, used to locate the momentum axes.
     :param tol: Relative tolerance for clustering neighboring eigenvalues as degenerate.
     :return: The symmetrized eigenvector matrix ``[n, n_eig]``.
     """
@@ -988,6 +1040,10 @@ def symmetrize_degenerate_gaps(
             _, mirror_vecs = np.linalg.eigh(mirror_block)
             # order the even (+1, p_x-like) partner first and the odd (-1, p_y-like) partner second
             block = block @ mirror_vecs[:, ::-1]
+        elif len(cluster) >= 3:
+            oriented = _orient_cluster_by_mirrors(block, gap_shape)
+            if oriented is not None:
+                block = oriented
 
         for col in range(block.shape[1]):
             mags = np.abs(block[:, col])
@@ -1188,7 +1244,7 @@ def _solve_pairing_sectors(
         if executor is not None:
             executor.shutdown()
 
-    logger.info(f"Finished solving the Eliashberg equation for the {channel.value}let channel.", allowed_ranks=ranks)
+    logger.info(f"Finished solving the Eliashberg equation for the {channel.value}let channel.", allowed_ranks=ranks[0])
     return results
 
 
@@ -1219,11 +1275,11 @@ def solve_eliashberg_lanczos(
 
     logger.info(
         f"Starting to solve the Eliashberg equation for the {gamma_r_pp.channel.value}let channel.",
-        allowed_ranks=ranks,
+        allowed_ranks=ranks[0],
     )
 
     gamma_r_pp = gamma_r_pp.map_to_full_bz(config.lattice.k_grid, config.lattice.k_grid.nk).decompress_q_dimension()
-    logger.log_memory_usage(f"Gamma_pp_{gamma_r_pp.channel.value}", gamma_r_pp, 1, allowed_ranks=ranks)
+    logger.log_memory_usage(f"Gamma_pp_{gamma_r_pp.channel.value}", gamma_r_pp, 1, allowed_ranks=ranks[0])
 
     gamma_r_pp = gamma_r_pp.fft(False)
 
@@ -1402,7 +1458,7 @@ def solve_eliashberg_lanczos_v2(
         return np.moveaxis(gap_new, 0, -1).flatten()  # (nq_tot, orb, orb, v_total)
 
     return _solve_pairing_sectors(
-        mv, gap_shape, sign, gamma_r_pp.channel, gamma_r_pp.nq, executor, root, gap0.flatten()
+        mv, gap_shape, sign, gamma_r_pp.channel, gamma_r_pp.nq, executor, (root,), gap0.flatten()
     )
 
 
@@ -1466,7 +1522,7 @@ def _solve_sectors_in_memory(
     only rank still holding ``giwk_dga``) and shipped to the other solving ranks. The results are broadcast from each
     sector's owning rank so every rank returns the full dict.
 
-    :param mpi_dist_irrk: The irreducible-BZ q-distributor.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param gamma_sing_pp: The singlet pairing vertex (irr-BZ q-distributed on entry; consumed).
     :param gamma_trip_pp: The triplet pairing vertex (irr-BZ q-distributed on entry; consumed).
     :param giwk_dga: The DGA Green's function (held only on ``bubble_rank``; used to build the bubble).
