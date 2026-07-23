@@ -385,7 +385,7 @@ through the ``ana_cont`` package.
      do_spectrum_dga: False                                     # bool
      do_spectrum_dmft: False                                    # bool
      w_count: 1001                                              # int
-     plot_spectrum: False                                       # bool
+     plot_spectrum: True                                        # bool
      k_path: [ [0.0, 0.0, 0.0, "Gamma"], [0.0, 0.5, 0.0, "X"] ] # list[tuple]
      energy_window: [ -2, 3 ]                                   # list[float]
 
