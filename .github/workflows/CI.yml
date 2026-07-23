@@ -15,6 +15,13 @@ jobs:
     name: Test on ${{ matrix.os }} / Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    env:
+      # Some GitHub-hosted Azure runners expose a MANA RDMA device (mana_0). UCX then tries to open
+      # ud_verbs on it, the UD queue-pair creation returns "Operation not supported", and MPICH aborts
+      # inside MPI_Init (reported as exit 143). Restricting UCX to shared memory and TCP keeps it away
+      # from verbs devices; the CI runs on a single node, so no RDMA transport is needed. CI-ONLY on
+      # purpose: forcing these transports in the package would disable RDMA on real clusters.
+      UCX_TLS: self,sm,tcp
     strategy:
       fail-fast: false
       matrix:
