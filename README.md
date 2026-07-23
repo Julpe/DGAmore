@@ -5,9 +5,10 @@
 ---
 
 <p align="center">
-  <img src="logos/DGAmore_light.png" alt="DGAmore" width="38%" />
-  &nbsp;&nbsp;&nbsp;
-  <img src="logos/DGAmore_dark.png" alt="DGAmore" width="38%" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="logos/dgamore-lockup-tagline-dark.svg" />
+    <img src="logos/dgamore-lockup-tagline-light.svg" alt="DGAmore" width="55%" />
+  </picture>
 </p>
 
 `DGAmore` is a Python toolbox that computes the multi-orbital, self-consistent ladder Dynamical Vertex Approximation
