@@ -73,8 +73,8 @@ html_theme_options = {
     "navbar_center": [],
     "navigation_with_keys": True,
     "logo": {
-        "image_light": "_static/DGAmore_light.png",
-        "image_dark": "_static/DGAmore_dark.png",
+        "image_light": "_static/dgamore-lockup-tagline-light.svg",
+        "image_dark": "_static/dgamore-lockup-tagline-dark.svg",
         "alt_text": "DGAmore",
     },
 }
