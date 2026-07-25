@@ -949,6 +949,58 @@ def test_orient_cluster_by_mirrors_falls_back_without_resolved_axes():
     assert _orient_cluster_by_mirrors(block, gap_shape) is None
 
 
+def _make_local_orbital_triplet(nk: int = 4, nb: int = 3, n2: int = 4) -> tuple[np.ndarray, tuple]:
+    """Builds an orthonormal momentum-independent triplet of antisymmetric orbital gap functions g(v) e_{o1 o2}."""
+    gap_shape = (nk, nk, nk, nb, nb, n2)
+    g_v = np.linspace(1.0, 0.5, n2)
+    columns = []
+    for o1, o2 in ((0, 1), (0, 2), (1, 2)):
+        c = np.zeros(gap_shape, dtype=np.complex128)
+        c[:, :, :, o1, o2] = g_v
+        c[:, :, :, o2, o1] = -g_v
+        columns.append(c.ravel() / np.linalg.norm(c))
+    return np.stack(columns, axis=1), gap_shape
+
+
+def test_orient_cluster_by_mirrors_falls_back_for_degenerate_local_cluster():
+    """A momentum-independent triplet is even under every mirror, so the mirrors cannot resolve it."""
+    block, gap_shape = _make_local_orbital_triplet()
+    assert _orient_cluster_by_mirrors(block, gap_shape) is None
+
+
+def test_orient_cluster_by_mirrors_falls_back_when_one_axis_cannot_separate_three_partners():
+    """With a single resolved axis two of three partners must share a sign pattern, which stays unresolved."""
+    gap_shape = (6, 1, 1, 1, 1, 4)
+    k = 2 * np.pi * np.arange(gap_shape[0]) / gap_shape[0]
+    g_v = np.linspace(1.0, 0.5, gap_shape[-1])
+    even = np.ones(gap_shape) * g_v
+    odd = np.sin(k)[:, None, None, None, None, None] * g_v * np.ones(gap_shape)
+    even_2 = np.cos(k)[:, None, None, None, None, None] * g_v * np.ones(gap_shape)
+    cols = [(c.ravel() / np.linalg.norm(c)).astype(np.complex128) for c in (even, odd, even_2)]
+    block, _ = np.linalg.qr(np.stack(cols, axis=1))
+    assert _orient_cluster_by_mirrors(block, gap_shape) is None
+
+
+def test_symmetrize_degenerate_gaps_keeps_loewdin_basis_for_local_cluster():
+    """An unresolvable momentum-independent triplet is kept as is instead of rotated arbitrarily within itself."""
+    block, gap_shape = _make_local_orbital_triplet()
+    fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5, 0.5]), block, gap_shape)
+    assert np.allclose(fixed, block, atol=1e-12)
+
+
+def test_symmetrize_degenerate_gaps_keeps_contaminated_local_cluster_unrotated():
+    """The k-dependent noise a real solve leaves on a local triplet must not tip it into an arbitrary rotation."""
+    block, gap_shape = _make_local_orbital_triplet()
+    rng = np.random.default_rng(17)
+    noise = rng.standard_normal(block.shape) + 1j * rng.standard_normal(block.shape)
+    block = block + 1e-7 * noise / np.linalg.norm(noise, axis=0)
+    eigs, u = np.linalg.eigh(block.conj().T @ block)
+    block = block @ (u @ np.diag(eigs**-0.5) @ u.conj().T)  # the Loewdin basis the caller must keep
+    fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5, 0.5]), block, gap_shape)
+    for col in range(3):
+        assert abs(np.vdot(fixed[:, col], block[:, col])) > 1 - 1e-12
+
+
 def test_orient_cluster_by_mirrors_resolves_a_p_triplet_without_diagonal_mirrors():
     """On a non-square grid the coordinate mirrors alone (no diagonal family) still resolve a p_x/p_y/p_z triplet."""
     gap_shape = (4, 6, 5, 1, 1, 4)

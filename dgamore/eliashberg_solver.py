@@ -938,11 +938,18 @@ def _orient_cluster_by_mirrors(block: np.ndarray, gap_shape: tuple, tol: float =
     ``x, y, z`` and two-axis :math:`d`-like partners (:math:`d_{xy}`, :math:`d_{xz}`, :math:`d_{yz}`) sort
     ``xy, xz, yz``.
 
+    Two partners sharing a sign pattern span a subspace the mirrors do not resolve: the combined matrix is
+    degenerate there, so the eigenvectors within it are fixed by floating-point noise alone and the sort cannot
+    separate them either. This is the generic situation for a momentum-independent (purely local) cluster, where
+    every partner is even under every mirror and the combined matrix is a multiple of the identity. Rotating by
+    those eigenvectors would scramble the cluster, so such a cluster is rejected and the caller keeps its input
+    basis.
+
     :param block: Orthonormal cluster, one flattened gap function per column.
     :param gap_shape: Full gap shape ``[kx, ky, kz, o1, o2, 2*niv_pp]``.
     :param tol: Tolerance on the deviation of a mirror Rayleigh quotient from :math:`\pm 1`.
-    :return: The reordered cluster, or ``None`` when no momentum axis is resolved or a partner is not a clean
-        :math:`\pm 1` mirror eigenstate.
+    :return: The reordered cluster, or ``None`` when no momentum axis is resolved, a partner is not a clean
+        :math:`\pm 1` mirror eigenstate, or two partners share the same mirror sign pattern.
     """
 
     def reflect_axis(column: np.ndarray, axis: int) -> np.ndarray:
@@ -972,6 +979,9 @@ def _orient_cluster_by_mirrors(block: np.ndarray, gap_shape: tuple, tol: float =
             return None
         keys.append(tuple(int(a) for a in np.flatnonzero(signature < 0.0)))
 
+    if len(set(keys)) < len(keys):  # a shared sign pattern spans a subspace the mirrors leave unresolved
+        return None
+
     block = block @ vecs
     return block[:, sorted(range(len(keys)), key=lambda col: keys[col])]
 
@@ -996,10 +1006,11 @@ def symmetrize_degenerate_gaps(
     odd (:math:`-1`, :math:`p_y`-like) partner second; every cluster of three or more members is handled by
     :func:`_orient_cluster_by_mirrors`, which diagonalizes the single-axis coordinate mirrors of the resolved axes
     simultaneously and orders the partners by the axes each one is odd under (:math:`p`-like as ``x, y, z``,
-    two-axis :math:`d`-like as ``xy, xz, yz``), provided every partner is a clean :math:`\pm 1` eigenstate
-    (otherwise the Loewdin basis is kept); (iii) the global phase of every vector is fixed such that its
-    largest-magnitude element is real and positive. Eigenvalues are not modified; vectors of non-degenerate
-    eigenvalues are only phase-fixed. Enabled via ``symmetrize_degenerate_gaps`` of
+    two-axis :math:`d`-like as ``xy, xz, yz``), provided every partner is a clean :math:`\pm 1` eigenstate and no
+    two partners share a sign pattern (otherwise the mirrors do not resolve the cluster - a momentum-independent
+    cluster is the generic such case - and the Loewdin basis is kept); (iii) the global phase of every vector is
+    fixed such that its largest-magnitude element is real and positive. Eigenvalues are not modified; vectors of
+    non-degenerate eigenvalues are only phase-fixed. Enabled via ``symmetrize_degenerate_gaps`` of
     :class:`~dgamore.config.EliashbergConfig`.
 
     :param lambdas: Eigenvalues sorted in descending order.
