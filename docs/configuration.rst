@@ -269,13 +269,18 @@ writes the pairing vertex or the full ladder vertex on the irreducible Brillouin
 The equation is solved with a Lanczos algorithm based on the ARPACK routines, retrieving the ``n_eig`` largest
 eigenvalues and the corresponding gap functions to an accuracy of ``epsilon``. The ``symmetry`` field sets the
 starting vector of the iteration: entering ``"d-wave"``, for example, begins from a gap function with d-wave
-symmetry, but ``"random"`` is sufficient most of the time. The pairing vertex includes local reducible diagrams by default,
+symmetry, but ``"random"`` is sufficient most of the time. The random start is drawn from a fixed seed, so a run
+reproduces the same gap functions when repeated. The pairing vertex includes local reducible diagrams by default,
 which can be skipped by setting ``include_local_part`` to ``False``; this is only advisable when s-wave symmetry is
 not expected, as these diagrams become relevant in that case. With ``symmetrize_degenerate_gaps`` enabled (the
 default), gap functions belonging to (near-)degenerate eigenvalues are orthogonalized with a Loewdin scheme and
 rotated to their mirror-adapted partners: single-axis (:math:`p_x`/:math:`p_y`/:math:`p_z`-like) and two-axis
-(:math:`d_{xy}`/:math:`d_{xz}`/:math:`d_{yz}`-like) modes are ordered by the momentum reflections they are odd
-under.
+(:math:`d_{xy}`/:math:`d_{xz}`/:math:`d_{yz}`-like) modes are ordered by the mirrors they are odd under. The mirrors
+are the full point-group ones, :math:`\Delta(k) \to U_i \Delta(M_i k) U_i^\dagger`, whose orbital part :math:`U_i` is
+solved for from :math:`H(k)` rather than tabulated per orbital set, so multi-orbital multiplets (including purely
+local, momentum-independent ones) are resolved as well. A multiplet the coordinate mirrors cannot split - an
+:math:`E_g` doublet, for instance, which would need a three-fold rotation about :math:`[111]` - keeps its Loewdin
+basis instead of being rotated arbitrarily.
 
 The ``resolve_frequency_parity`` field controls whether the physical gap-symmetry sectors are returned. The
 unprojected eigensolver leaks onto the globally dominant eigenvector, mixing frequency-even and frequency-odd modes;
@@ -331,9 +336,13 @@ symmetry :math:`\Gamma^{\nu\nu'}(q) = \Gamma^{(-\nu)(-\nu')}(-q)`. Sector-resolv
 ``gap_<channel>_<parity>_<i>`` (for example ``gap_sing_even_1``), while the unprojected case keeps the
 ``gap_<channel>_<i>`` naming. A ``gap_parity.txt`` file is written alongside them with one line per saved gap: a
 compact wave-symmetry label (``s`` / ``d`` / ``p``, or ``x`` if unclassified, followed by ``+`` / ``-`` for the
-frequency parity) obtained from the dominant orbital-diagonal momentum structure, followed by the measured parity
-Rayleigh quotients :math:`\langle \Delta, X\Delta \rangle / \langle \Delta, \Delta \rangle` for
-:math:`X \in \{T, P, O, P O\}`. Finally, the results are written to a subfolder named according to ``subfolder_name``.
+frequency parity) followed by the measured parity Rayleigh quotients
+:math:`\langle \Delta, X\Delta \rangle / \langle \Delta, \Delta \rangle` for :math:`X \in \{T, P, O, P O\}`. The
+wave letter is read from the momentum structure of every orbital block that carries appreciable weight, not only the
+orbital-diagonal one: when the blocks agree the label stays a single token, and when they differ it lists each wave
+with the blocks realizing it, ordered by weight (for example ``d+[00,11]|s+[22]``), while the frequency-parity sign
+is taken from the global :math:`T` Rayleigh quotient. Finally, the results are written to a subfolder named according
+to ``subfolder_name``.
 
 .. _self-energy-interpolation:
 

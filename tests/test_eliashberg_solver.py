@@ -18,11 +18,16 @@ from dgamore.eliashberg_solver import (
     _chi0_to_matmul_layout,
     _compute_once_per_node,
     _frequency_parity_sectors,
+    _gap_orbital_mirrors,
+    _mirror_acts_on_orbitals,
+    _mirror_operator,
     _orient_cluster_by_mirrors,
     _sector_log_label,
+    _validated_orbital_mirrors,
     gap_parity_diagnostics,
     _project_gap_to_sector,
     classify_gap_symmetry,
+    get_initial_gap_function,
     create_local_f_ud_transformed_w0,
     create_local_gamma_ud_pp_w0,
     create_local_gamma_ud_pp_w0_per_ineq,
@@ -633,7 +638,10 @@ def test_solve_eliashberg_lanczos_v2_threaded_matches_serial():
     config.eliashberg.symmetry = "d-wave"
     config.eliashberg.resolve_frequency_parity = False
     config.logger = SimpleNamespace(
-        info=lambda *a, **k: None, log_memory_usage=lambda *a, **k: None, warning=lambda *a, **k: None
+        info=lambda *a, **k: None,
+        log_memory_usage=lambda *a, **k: None,
+        warning=lambda *a, **k: None,
+        debug=lambda *a, **k: None,
     )
 
     rng = np.random.default_rng(11)
@@ -690,7 +698,10 @@ def test_solve_eliashberg_lanczos_v2_with_inactive_ranks_runs_on_restricted_dist
     config.eliashberg.resolve_frequency_parity = False
     config.eliashberg.symmetrize_degenerate_gaps = False
     config.logger = SimpleNamespace(
-        info=lambda *a, **k: None, log_memory_usage=lambda *a, **k: None, warning=lambda *a, **k: None
+        info=lambda *a, **k: None,
+        log_memory_usage=lambda *a, **k: None,
+        warning=lambda *a, **k: None,
+        debug=lambda *a, **k: None,
     )
 
     rng = np.random.default_rng(17)
@@ -853,11 +864,25 @@ def test_symmetrize_degenerate_gaps_is_idempotent():
 
 
 def test_symmetrize_degenerate_gaps_skips_dependent_vectors():
-    """A cluster of (numerically) linearly dependent vectors is left untouched instead of amplifying noise."""
+    """A cluster of (numerically) linearly dependent vectors is not orthonormalized or rotated, only normalized."""
     px, _, gap_shape = _make_p_wave_doublet()
     gaps = np.stack([px, px * (1 + 1e-15)], axis=1)
     fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5]), gaps, gap_shape)
-    assert np.allclose(fixed, gaps, atol=1e-12)
+    # each column is the input up to normalization and a global phase: no S^{-1/2} amplification, no mirror rotation
+    for col in range(2):
+        overlap = np.vdot(gaps[:, col], fixed[:, col])
+        assert np.isclose(abs(overlap), np.linalg.norm(gaps[:, col]) * np.linalg.norm(fixed[:, col]), rtol=1e-12)
+
+
+def test_symmetrize_degenerate_gaps_phase_fixes_dependent_vectors():
+    """Even the linearly dependent cluster obeys the phase convention: largest-magnitude element real and positive."""
+    px, _, gap_shape = _make_p_wave_doublet()
+    gaps = np.stack([px, px * (1 + 1e-15)], axis=1) * np.exp(1j * 0.7)
+    fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5]), gaps, gap_shape)
+    for col in range(2):
+        assert np.isclose(np.linalg.norm(fixed[:, col]), 1.0, atol=1e-12)
+        leading = fixed[np.argmax(np.abs(fixed[:, col])), col]
+        assert leading.real > 0 and np.isclose(leading.imag, 0.0, atol=1e-12)
 
 
 def _make_p_wave_triplet(nk: int = 4, n2: int = 4) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple]:
@@ -1182,6 +1207,87 @@ def test_classify_gap_symmetry_labels_wave_and_frequency_parity(form, parity, ex
 def test_classify_gap_symmetry_returns_unknown_for_zero_gap():
     """classify_gap_symmetry returns 'unknown' when the positive-frequency momentum slice is identically zero."""
     assert classify_gap_symmetry(np.zeros((4, 4, 1, 1, 1, 4), dtype=complex)) == "unknown"
+
+
+def _orbital_gap(blocks: dict, n_orb: int, nk: int = 6, niv: int = 2) -> np.ndarray:
+    """Builds an even-in-nu [k,k,k,n_orb,n_orb,2*niv] gap from a {(o1, o2): [kx,ky,kz] form} mapping."""
+    gap = np.zeros((nk, nk, nk, n_orb, n_orb, 2 * niv), dtype=complex)
+    for (o1, o2), form in blocks.items():
+        gap[:, :, :, o1, o2, niv:] = form[..., None]
+    gap[..., :niv] = gap[..., niv:]
+    return gap
+
+
+def _cubic_forms(nk: int = 6) -> tuple:
+    """Returns (cos kx, cos ky, cos kz) broadcast over a [nk, nk, nk] grid."""
+    k = 2 * np.pi * np.arange(nk) / nk
+    return np.cos(k)[:, None, None], np.cos(k)[None, :, None], np.cos(k)[None, None, :]
+
+
+def test_classify_gap_symmetry_reads_every_orbital_block():
+    """A gap living entirely in an orbital-off-diagonal block is classified, not written off as undetermined."""
+    cx, cy, _ = _cubic_forms()
+    gap = _orbital_gap({(0, 1): cx - cy, (1, 0): cx - cy}, n_orb=2)
+    assert classify_gap_symmetry(gap) == "d+"
+
+
+def test_classify_gap_symmetry_collapses_per_block_d_wave_partners():
+    """The cubic t2g Eg gap carries a different d-wave in each orbital block; all are d, so the label collapses."""
+    cx, cy, cz = _cubic_forms()
+    gap = _orbital_gap({(0, 0): cx - cy, (1, 1): cz - cx, (2, 2): cy - cz}, n_orb=3)
+    assert classify_gap_symmetry(gap) == "d+"
+
+
+def test_classify_gap_symmetry_tolerates_small_admixture():
+    """A gap that is 95 % extended s-wave is labeled s, where an element-wise comparison would reject it."""
+    cx, cy, cz = _cubic_forms()
+    gap = _orbital_gap({(0, 0): 1.0 + 0.05 * (cx + cy + cz)}, n_orb=1)
+    assert classify_gap_symmetry(gap) == "s+"
+
+
+def test_classify_gap_symmetry_lists_blocks_when_waves_disagree():
+    """Blocks carrying genuinely different waves are reported separately, ordered by weight."""
+    cx, cy, cz = _cubic_forms()
+    gap = _orbital_gap({(0, 0): cx - cy, (1, 1): cx + cy + cz}, n_orb=2)
+    label = classify_gap_symmetry(gap)
+    assert "d+[00]" in label and "s+[11]" in label and "|" in label
+
+
+def test_classify_gap_symmetry_ignores_negligible_blocks():
+    """A block far below the weight floor carries no physical symmetry and must not enter the label."""
+    cx, cy, cz = _cubic_forms()
+    gap = _orbital_gap({(0, 0): cx - cy, (1, 1): 1e-6 * (cx + cy + cz)}, n_orb=2)
+    assert classify_gap_symmetry(gap) == "d+"
+
+
+@pytest.mark.parametrize("symmetry", ["random", "d-wave"])
+def test_get_initial_gap_function_is_deterministic(symmetry):
+    """The start vector is reproducible across calls, so a run (and the basis of a degenerate multiplet) repeats."""
+    config.lattice.nk = (4, 4, 1)
+    config.lattice.k_grid = bz.KGrid((4, 4, 1), symmetries=[])
+    config.eliashberg.symmetry = symmetry
+    shape = (4, 4, 1, 1, 1, 4)
+    first = get_initial_gap_function(shape, SpinChannel.SING)
+    second = get_initial_gap_function(shape, SpinChannel.SING)
+    assert np.array_equal(first, second)
+
+
+@pytest.mark.parametrize(
+    "symmetry, channel, eps_t",
+    [
+        ("d-wave", SpinChannel.SING, 1),
+        ("d-wave", SpinChannel.TRIP, -1),
+        ("p-wave-x", SpinChannel.SING, -1),
+        ("p-wave-x", SpinChannel.TRIP, 1),
+    ],
+)
+def test_get_initial_gap_function_seeds_the_requested_frequency_parity(symmetry, channel, eps_t):
+    """The seeded start vector is an eigenvector of the frequency flip T with the parity its channel requires."""
+    config.lattice.nk = (4, 4, 1)
+    config.lattice.k_grid = bz.KGrid((4, 4, 1), symmetries=[])
+    config.eliashberg.symmetry = symmetry
+    gap = get_initial_gap_function((4, 4, 1, 1, 1, 4), channel)
+    assert np.allclose(np.flip(gap, axis=-1), eps_t * gap, atol=1e-12)
 
 
 def _single_band_pp_operands(nq: tuple, niv_pp: int, seed: int) -> tuple[FourPoint, FourPoint]:
@@ -1591,3 +1697,398 @@ def test_sector_log_label_distinguishes_the_channels():
     config.eliashberg.resolve_frequency_parity = True
     labels = [_sector_log_label(c, [p]) for c in (SpinChannel.SING, SpinChannel.TRIP) for p in ("even", "odd")]
     assert len(set(labels)) == 4
+
+
+# ============================================================================
+# Combined momentum-plus-orbital mirrors
+
+# orbital order d_xy, d_xz, d_yz; a mirror k_i -> -k_i flips the two orbitals that extend along k_i
+_T2G_MIRROR_SIGNS = {0: (-1.0, -1.0, 1.0), 1: (-1.0, 1.0, -1.0), 2: (1.0, -1.0, -1.0)}
+
+
+def _t2g_orbital_mirrors() -> dict:
+    """The orbital part {axis: U} of the coordinate mirrors for three t2g orbitals."""
+    return {axis: np.diag(signs).astype(np.complex128) for axis, signs in _T2G_MIRROR_SIGNS.items()}
+
+
+def _combined_mirror_column(column: np.ndarray, gap_shape: tuple, axis: int, u: np.ndarray = None) -> np.ndarray:
+    """Applies Delta(k) -> U Delta(M_axis k) U^dag to a flattened gap column (momentum only when ``u`` is None)."""
+    idx = (gap_shape[axis] - np.arange(gap_shape[axis])) % gap_shape[axis]
+    take = [slice(None)] * len(gap_shape)
+    take[axis] = idx
+    reflected = column.reshape(gap_shape)[tuple(take)]
+    if u is None:
+        return reflected.ravel()
+    return np.einsum("ap,xyzpqv,bq->xyzabv", u, reflected, np.conj(u)).ravel()
+
+
+def _mirror_signature(column: np.ndarray, gap_shape: tuple, mirrors: dict = None) -> np.ndarray:
+    """The three mirror Rayleigh quotients <Delta|T_axis|Delta> of a normalized gap column."""
+    mirrors = mirrors or {}
+    return np.array(
+        [
+            float(np.vdot(column, _combined_mirror_column(column, gap_shape, axis, mirrors.get(axis))).real)
+            for axis in range(3)
+        ]
+    )
+
+
+def _make_t2g_mixed_triplet(nk: int = 4, n2: int = 4, off_weight: float = 0.8) -> tuple[np.ndarray, tuple]:
+    """
+    Builds an orthonormal t2g triplet of known mirror parity whose partners are exact +/-1 eigenstates of the
+    combined momentum-plus-orbital mirrors but not of the momentum-only ones. Each partner carries an
+    orbital-diagonal piece (s_o s_o = +1, so its sign comes from the momentum parity alone) plus an off-diagonal
+    piece in one orbital pair (s_{o1} s_{o2} = -1 on two of the three axes), chosen so that both pieces end up with
+    the same combined sign. The three partners have mirror signatures (+,-,-), (-,+,-) and (-,-,+).
+    """
+    gap_shape = (nk, nk, nk, 3, 3, n2)
+    s = np.sin(2 * np.pi * np.arange(nk) / nk)
+    g_v = np.linspace(1.0, 0.5, n2)
+    sx, sy, sz = s[:, None, None, None], s[None, :, None, None], s[None, None, :, None]
+    columns = []
+    for diag_f, (o1, o2) in ((sy * sz, (0, 1)), (sx * sz, (0, 2)), (sx * sy, (1, 2))):
+        c = np.zeros(gap_shape, dtype=np.complex128)
+        c[:, :, :, 0, 0] = diag_f * g_v
+        c[:, :, :, o1, o2] = off_weight * g_v
+        c[:, :, :, o2, o1] = off_weight * g_v
+        columns.append(c.ravel() / np.linalg.norm(c))
+    return np.stack(columns, axis=1), gap_shape
+
+
+def _make_eg_like_doublet(nk: int = 4, n2: int = 4) -> tuple[np.ndarray, tuple]:
+    """
+    Builds an orthonormal orbital-diagonal doublet that is even under every coordinate mirror - the E_g situation
+    the coordinate mirrors provably cannot split, since an orbital-diagonal state picks up s_o s_o = +1 everywhere.
+    """
+    gap_shape = (nk, nk, nk, 2, 2, n2)
+    c_k = np.cos(2 * np.pi * np.arange(nk) / nk)
+    g_v = np.linspace(1.0, 0.5, n2)
+    forms = (np.ones((nk, nk, nk, 1)), (c_k[:, None, None] * c_k[None, :, None])[..., None])
+    columns = []
+    for orbital, form in enumerate(forms):
+        c = np.zeros(gap_shape, dtype=np.complex128)
+        c[:, :, :, orbital, orbital] = form * g_v
+        columns.append(c.ravel() / np.linalg.norm(c))
+    return np.stack(columns, axis=1), gap_shape
+
+
+def _cubic_t2g_hamiltonian(nk: int = 8, t: float = 0.25, tp: float = 0.03, ti: float = 0.02) -> np.ndarray:
+    """
+    Cubic t2g Hamiltonian in the orbital order d_xy, d_xz, d_yz (kept in sync with the copy in
+    test_symmetry_reduction.py). The inter-orbital terms carry the only momentum dependence compatible with the t2g
+    mirror signs, which is what lets the mirror solver pin the signs down.
+    """
+    k = 2 * np.pi * np.arange(nk) / nk
+    kx, ky, kz = k[:, None, None], k[None, :, None], k[None, None, :]
+    c, s = np.cos, np.sin
+    h = np.zeros((nk, nk, nk, 3, 3), dtype=complex)
+    h[..., 0, 0] = -2 * t * (c(kx) + c(ky)) - 2 * tp * c(kz)
+    h[..., 1, 1] = -2 * t * (c(kx) + c(kz)) - 2 * tp * c(ky)
+    h[..., 2, 2] = -2 * t * (c(ky) + c(kz)) - 2 * tp * c(kx)
+    h[..., 0, 1] = h[..., 1, 0] = ti * s(ky) * s(kz)
+    h[..., 0, 2] = h[..., 2, 0] = ti * s(kx) * s(kz)
+    h[..., 1, 2] = h[..., 2, 1] = ti * s(kx) * s(ky)
+    return h
+
+
+def _mix(block: np.ndarray, seed: int) -> np.ndarray:
+    """Scrambles a cluster into an oblique, non-orthogonal basis the way ARPACK may hand one back."""
+    rng = np.random.default_rng(seed)
+    n = block.shape[1]
+    return block @ (rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n)))
+
+
+def _loewdin(block: np.ndarray) -> np.ndarray:
+    """The Loewdin basis symmetrize_degenerate_gaps falls back to: column-normalize, then apply S^{-1/2}."""
+    block = block / np.linalg.norm(block, axis=0)
+    eigs, u = np.linalg.eigh(block.conj().T @ block)
+    return block @ (u @ np.diag(eigs**-0.5) @ u.conj().T)
+
+
+def test_mirror_acts_on_orbitals_only_for_non_scalar_matrices():
+    """Conjugation by U is the identity map exactly when U is a multiple of the identity (a global phase cancels)."""
+    assert not _mirror_acts_on_orbitals(None)
+    assert not _mirror_acts_on_orbitals(np.eye(1, dtype=complex))
+    assert not _mirror_acts_on_orbitals(np.eye(3, dtype=complex))
+    assert not _mirror_acts_on_orbitals(-np.eye(3, dtype=complex))
+    assert not _mirror_acts_on_orbitals(np.exp(0.7j) * np.eye(3))
+    assert _mirror_acts_on_orbitals(np.diag([-1.0, -1.0, 1.0]).astype(complex))
+
+
+def test_validated_orbital_mirrors_keeps_only_matching_orbital_dimensions():
+    """Mirrors discovered for a different orbital count must never be applied silently."""
+    gap_shape = (4, 4, 4, 3, 3, 4)
+    mirrors = {0: np.eye(3), 1: np.eye(2), 2: None}
+
+    validated = _validated_orbital_mirrors(gap_shape, mirrors)
+
+    assert sorted(validated) == [0]
+    assert validated[0].dtype == np.complex128
+    assert _validated_orbital_mirrors(gap_shape, None) == {}
+
+
+def test_mirror_operator_applies_the_orbital_signs_on_top_of_the_reflection():
+    """The operator is Delta_{o1 o2}(k) -> s_{o1} s_{o2} Delta_{o1 o2}(M k) for a diagonal-sign orbital mirror."""
+    gap_shape = (4, 4, 4, 3, 3, 2)
+    rng = np.random.default_rng(4)
+    column = (rng.standard_normal(gap_shape) + 1j * rng.standard_normal(gap_shape)).ravel()
+
+    for axis, signs in _T2G_MIRROR_SIGNS.items():
+        got = _mirror_operator(gap_shape, axis, np.diag(signs).astype(np.complex128))(column)
+        reflected = _combined_mirror_column(column, gap_shape, axis).reshape(gap_shape)
+        expected = (np.array(signs)[:, None] * np.array(signs)[None, :])[None, None, None, :, :, None] * reflected
+        assert np.allclose(got, expected.ravel(), atol=1e-12)
+
+
+def test_mirror_operator_is_an_involution_and_norm_preserving():
+    """Applying the combined mirror twice is the identity, so its eigenvalues can only be +/-1."""
+    gap_shape = (4, 4, 4, 3, 3, 2)
+    rng = np.random.default_rng(6)
+    column = (rng.standard_normal(gap_shape) + 1j * rng.standard_normal(gap_shape)).ravel()
+
+    for axis, u in _t2g_orbital_mirrors().items():
+        op = _mirror_operator(gap_shape, axis, u)
+        assert np.allclose(op(op(column)), column, atol=1e-12)
+        assert np.isclose(np.linalg.norm(op(column)), np.linalg.norm(column))
+
+
+def test_mirror_operator_without_an_orbital_matrix_is_a_pure_momentum_reflection():
+    """A missing or scalar orbital matrix leaves the historical momentum-only reflection untouched."""
+    gap_shape = (4, 4, 4, 2, 2, 2)
+    rng = np.random.default_rng(8)
+    column = (rng.standard_normal(gap_shape) + 1j * rng.standard_normal(gap_shape)).ravel()
+
+    for u in (None, np.eye(2, dtype=complex), np.exp(1.1j) * np.eye(2)):
+        got = _mirror_operator(gap_shape, 1, u)(column)
+        assert np.allclose(got, _combined_mirror_column(column, gap_shape, 1), atol=1e-12)
+
+
+def test_momentum_only_mirror_measures_diagonal_minus_off_diagonal_weight():
+    """Without the orbital factor the mirror quotient reads the diagonal-minus-off-diagonal weight, not +/-1."""
+    block, gap_shape = _make_t2g_mixed_triplet()
+
+    for col in range(3):
+        column = block[:, col]
+        weights = np.abs(column.reshape(gap_shape)) ** 2
+        diagonal = float(np.einsum("xyzoov->", weights))
+        difference = abs(diagonal - (1.0 - diagonal))
+        signature = _mirror_signature(column, gap_shape)
+        assert 0.1 < diagonal < 0.9  # substantial weight in both orbital sectors
+        assert np.allclose(sorted(np.abs(signature)), sorted([1.0, difference, difference]), atol=1e-10), signature
+
+
+def test_orient_cluster_by_mirrors_falls_back_without_orbital_mirrors_for_a_multi_orbital_multiplet():
+    """Momentum-only mirrors are not a symmetry of a multi-orbital kernel, so the multiplet is left alone."""
+    block, gap_shape = _make_t2g_mixed_triplet()
+
+    assert _orient_cluster_by_mirrors(np.linalg.qr(_mix(block, 5))[0], gap_shape) is None
+
+
+def test_orient_cluster_by_mirrors_resolves_a_multi_orbital_multiplet_with_orbital_mirrors():
+    """With the orbital factor the partners are clean +/-1 eigenstates, ordered by the axes they are odd under."""
+    block, gap_shape = _make_t2g_mixed_triplet()
+    mirrors = _t2g_orbital_mirrors()
+
+    fixed = _orient_cluster_by_mirrors(np.linalg.qr(_mix(block, 5))[0], gap_shape, orbital_mirrors=mirrors)
+
+    assert fixed is not None
+    assert np.allclose(fixed.conj().T @ fixed, np.eye(3), atol=1e-10)
+    # sorted lexicographically by odd axes: (0,1), (0,2), (1,2) - i.e. the input triplet in reverse
+    for col, (parent, expected) in enumerate(
+        ((block[:, 2], (-1.0, -1.0, 1.0)), (block[:, 1], (-1.0, 1.0, -1.0)), (block[:, 0], (1.0, -1.0, -1.0)))
+    ):
+        signature = _mirror_signature(fixed[:, col], gap_shape, mirrors)
+        assert np.allclose(signature, expected, atol=1e-10), signature
+        for axis in range(3):
+            mirrored = _combined_mirror_column(fixed[:, col], gap_shape, axis, mirrors[axis])
+            assert np.allclose(mirrored, expected[axis] * fixed[:, col], atol=1e-10)
+        assert abs(np.vdot(fixed[:, col], parent)) > 1 - 1e-10
+
+
+def test_orient_cluster_by_mirrors_resolves_a_purely_local_triplet_with_orbital_mirrors():
+    """A momentum-independent triplet is invisible to momentum-only mirrors but split by the orbital factor."""
+    block, gap_shape = _make_local_orbital_triplet()
+    mirrors = _t2g_orbital_mirrors()
+
+    assert _orient_cluster_by_mirrors(block, gap_shape) is None  # momentum-only mirrors act as the identity here
+
+    fixed = _orient_cluster_by_mirrors(block, gap_shape, orbital_mirrors=mirrors)
+
+    assert fixed is not None
+    for col, (parent, expected) in enumerate(
+        ((block[:, 2], (-1.0, -1.0, 1.0)), (block[:, 1], (-1.0, 1.0, -1.0)), (block[:, 0], (1.0, -1.0, -1.0)))
+    ):
+        assert np.allclose(_mirror_signature(fixed[:, col], gap_shape, mirrors), expected, atol=1e-12)
+        assert abs(np.vdot(fixed[:, col], parent)) > 1 - 1e-12
+
+
+def test_symmetrize_degenerate_gaps_returns_clean_mirror_eigenstates_for_a_multi_orbital_triplet():
+    """End to end: an oblique multi-orbital triplet comes back orthonormal and exactly +/-1 under every mirror."""
+    block, gap_shape = _make_t2g_mixed_triplet()
+    mirrors = _t2g_orbital_mirrors()
+
+    fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5, 0.5]), _mix(block, 12), gap_shape, orbital_mirrors=mirrors)
+
+    assert np.allclose(fixed.conj().T @ fixed, np.eye(3), atol=1e-10)
+    for col in range(3):
+        signature = _mirror_signature(fixed[:, col], gap_shape, mirrors)
+        assert np.allclose(np.abs(signature), 1.0, atol=1e-10), signature
+        for axis in range(3):
+            mirrored = _combined_mirror_column(fixed[:, col], gap_shape, axis, mirrors[axis])
+            assert np.allclose(mirrored, signature[axis] * fixed[:, col], atol=1e-10)
+    patterns = {tuple(np.sign(_mirror_signature(fixed[:, c], gap_shape, mirrors))) for c in range(3)}
+    assert len(patterns) == 3  # no two partners share a sign pattern
+
+
+def test_symmetrize_degenerate_gaps_without_orbital_mirrors_keeps_the_loewdin_basis():
+    """The same triplet, symmetrized with momentum-only mirrors, must be left in its Loewdin basis."""
+    block, gap_shape = _make_t2g_mixed_triplet()
+    oblique = _mix(block, 12)
+    loewdin = _loewdin(oblique)
+
+    fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5, 0.5]), oblique, gap_shape)
+
+    for col in range(3):
+        assert abs(np.vdot(fixed[:, col], loewdin[:, col])) > 1 - 1e-10
+
+
+def test_symmetrize_degenerate_gaps_is_idempotent_for_a_multi_orbital_triplet():
+    """Symmetrizing twice with the orbital mirrors reproduces the first result exactly."""
+    block, gap_shape = _make_t2g_mixed_triplet()
+    mirrors = _t2g_orbital_mirrors()
+    lambdas = np.array([0.5, 0.5, 0.5])
+
+    once = symmetrize_degenerate_gaps(lambdas, _mix(block, 3), gap_shape, orbital_mirrors=mirrors)
+    twice = symmetrize_degenerate_gaps(lambdas, once, gap_shape, orbital_mirrors=mirrors)
+
+    assert np.allclose(once, twice, atol=1e-10)
+
+
+def test_symmetrize_degenerate_gaps_resolves_a_multi_orbital_doublet_with_orbital_mirrors():
+    """The two-fold cluster path needs the orbital factor too: M_y splits the pair only once it is included."""
+    block, gap_shape = _make_t2g_mixed_triplet()
+    mirrors = _t2g_orbital_mirrors()
+    pair = block[:, :2]  # partner 0 is odd and partner 1 even under M_y, so M_y alone resolves this pair
+
+    fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5]), _mix(pair, 21), gap_shape, orbital_mirrors=mirrors)
+
+    assert np.allclose(fixed.conj().T @ fixed, np.eye(2), atol=1e-10)
+    for col, (parent, sign) in enumerate(((block[:, 1], 1.0), (block[:, 0], -1.0))):
+        mirrored = _combined_mirror_column(fixed[:, col], gap_shape, 1, mirrors[1])
+        assert np.allclose(mirrored, sign * fixed[:, col], atol=1e-10)
+        assert abs(np.vdot(fixed[:, col], parent)) > 1 - 1e-10
+
+
+def test_symmetrize_degenerate_gaps_leaves_a_multi_orbital_doublet_alone_without_orbital_mirrors():
+    """Without the orbital factor M_y is not a symmetry of the pair, so the Loewdin basis is kept."""
+    block, gap_shape = _make_t2g_mixed_triplet()
+    oblique = _mix(block[:, :2], 21)
+    loewdin = _loewdin(oblique)
+
+    fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5]), oblique, gap_shape)
+
+    for col in range(2):
+        assert abs(np.vdot(fixed[:, col], loewdin[:, col])) > 1 - 1e-10
+
+
+def test_symmetrize_degenerate_gaps_keeps_the_loewdin_basis_for_an_eg_like_doublet():
+    """Coordinate mirrors cannot split an E_g doublet, so the pair keeps its Loewdin basis (not a noise rotation)."""
+    block, gap_shape = _make_eg_like_doublet()
+    mirrors = {axis: np.diag([1.0, -1.0]).astype(np.complex128) for axis in range(3)}
+    for col in range(2):  # both partners are even under every mirror, with or without the orbital factor
+        assert np.allclose(_mirror_signature(block[:, col], gap_shape, mirrors), 1.0, atol=1e-12)
+
+    fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5]), block, gap_shape, orbital_mirrors=mirrors)
+
+    assert np.allclose(np.abs(fixed.conj().T @ block), np.eye(2), atol=1e-10)
+
+
+def test_symmetrize_degenerate_gaps_keeps_a_doublet_that_is_not_a_clean_mirror_eigenspace():
+    """A doublet whose M_y projection is not +/-1 is kept as is instead of rotated into a meaningless basis."""
+    gap_shape = (6, 6, 1, 2, 2, 4)
+    rng = np.random.default_rng(19)
+    n = int(np.prod(gap_shape))
+    block, _ = np.linalg.qr(rng.standard_normal((n, 2)) + 1j * rng.standard_normal((n, 2)))
+    mirrors = {axis: np.diag([1.0, -1.0]).astype(np.complex128) for axis in range(3)}
+
+    fixed = symmetrize_degenerate_gaps(np.array([0.5, 0.5]), block, gap_shape, orbital_mirrors=mirrors)
+
+    assert np.allclose(np.abs(fixed.conj().T @ block), np.eye(2), atol=1e-10)
+
+
+def test_symmetrize_degenerate_gaps_ignores_orbital_mirrors_of_the_wrong_orbital_size():
+    """Mirrors whose orbital dimension does not match the gap are dropped, reducing to momentum-only reflections."""
+    px, py, gap_shape = _make_p_wave_doublet()
+    gaps = np.stack([px, py], axis=1) @ np.array([[1.0, 0.5 - 0.2j], [0.3 + 0.1j, 1.0]])
+    lambdas = np.array([0.7, 0.7])
+
+    with_bad = symmetrize_degenerate_gaps(lambdas, gaps, gap_shape, orbital_mirrors=_t2g_orbital_mirrors())
+
+    assert np.allclose(with_bad, symmetrize_degenerate_gaps(lambdas, gaps, gap_shape), atol=1e-12)
+
+
+def test_gap_orbital_mirrors_returns_nothing_for_a_single_orbital_gap():
+    """A 1x1 orbital unitary is a phase and cancels in U Delta U^dag, so there is nothing to apply."""
+    assert _gap_orbital_mirrors(1) == {}
+
+
+def test_gap_orbital_mirrors_derives_the_t2g_signs_from_the_configured_hamiltonian():
+    """The mirrors are read off the configured H(k) - nothing about the orbital set is hard-coded in the solver."""
+    from dgamore.hamiltonian import Hamiltonian
+
+    nk = 8
+    config.lattice.nk = (nk, nk, nk)
+    config.lattice.k_grid = bz.KGrid(config.lattice.nk, symmetries=[])
+    config.lattice.hamiltonian = Hamiltonian().set_ek(_cubic_t2g_hamiltonian(nk=nk))
+
+    mirrors = _gap_orbital_mirrors(3)
+
+    assert sorted(mirrors) == [0, 1, 2]
+    for axis, signs in _T2G_MIRROR_SIGNS.items():
+        expected = np.diag(signs)
+        assert np.allclose(mirrors[axis], expected, atol=1e-8) or np.allclose(mirrors[axis], -expected, atol=1e-8)
+
+
+def test_gap_orbital_mirrors_returns_nothing_when_the_hamiltonian_is_unavailable():
+    """A failing symmetry probe must degrade to momentum-only mirrors, never abort the solve."""
+    from types import SimpleNamespace
+
+    config.logger = MagicMock()
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=MagicMock(side_effect=RuntimeError("no hopping set")))
+
+    assert _gap_orbital_mirrors(3) == {}
+
+
+def test_solve_pairing_sectors_passes_the_orbital_mirrors_into_the_symmetrization(monkeypatch):
+    """The solver hands the discovered mirrors to symmetrize_degenerate_gaps instead of leaving it momentum-only."""
+    import dgamore.eliashberg_solver as es
+
+    gap_shape = (2, 2, 1, 3, 3, 2)
+    mirrors = _t2g_orbital_mirrors()
+    seen = {}
+
+    def fake_symmetrize(lambdas, gaps, shape, tol=1e-4, orbital_mirrors=None):
+        seen["orbital_mirrors"] = orbital_mirrors
+        return gaps
+
+    n = int(np.prod(gap_shape))
+    monkeypatch.setattr(es, "_gap_orbital_mirrors", lambda n_bands: mirrors)
+    monkeypatch.setattr(es, "symmetrize_degenerate_gaps", fake_symmetrize)
+    monkeypatch.setattr(es.sp.sparse.linalg, "eigsh", lambda *a, **kw: (np.array([0.3]), np.ones((n, 1))))
+    config.eliashberg.n_eig = 1
+    config.eliashberg.symmetrize_degenerate_gaps = True
+    config.eliashberg.resolve_frequency_parity = None
+    config.logger = MagicMock()
+
+    es._solve_pairing_sectors(
+        mv=lambda gap: gap,
+        gap_shape=gap_shape,
+        sign=1,
+        channel=SpinChannel.SING,
+        nq=gap_shape[:3],
+        executor=None,
+        ranks=(0, 0),
+        base_seed=np.ones(n),
+    )
+
+    assert seen["orbital_mirrors"] is mirrors

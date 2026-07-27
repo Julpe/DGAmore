@@ -171,7 +171,8 @@ class EliashbergConfig:
     :ivar str symmetry: Initial gap-function symmetry (``"d-wave"``, ``"p-wave-x"``, ``"p-wave-y"``, or ``"random"``).
     :ivar bool include_local_part: Whether to add the local reducible pp diagrams to the pairing vertex.
     :ivar bool symmetrize_degenerate_gaps: Whether to orthonormalize the gap functions within (near-)degenerate
-        eigenvalue clusters and rotate doublets to the mirror-adapted basis (see
+        eigenvalue clusters and rotate each cluster to the basis adapted to the point-group mirrors, which act on the
+        orbital indices as well as on the momenta (see
         :func:`~dgamore.eliashberg_solver.symmetrize_degenerate_gaps`).
     :ivar bool resolve_frequency_parity: Whether to project each channel's gap onto its physical frequency-even and
         frequency-odd sectors (the paired momentum-orbital parity is fixed by the Pauli constraint) and return both,
