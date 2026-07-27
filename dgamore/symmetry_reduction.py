@@ -1026,6 +1026,62 @@ def get_symmetry_reduction(H, atol=1e-8, verbose=False, include_antiunitary=Fals
     }
 
 
+def _coordinate_mirror_matrix(axis: int) -> np.ndarray:
+    """
+    Builds the integer matrix of the single-axis coordinate mirror ``k_axis -> -k_axis`` (the identity on the other
+    two axes), in the same lattice-basis convention as the discovery enumeration.
+
+    :param axis: The reflected momentum axis (0, 1 or 2).
+    :return: The 3x3 integer mirror matrix.
+    """
+    M = np.eye(3, dtype=np.int64)
+    M[axis, axis] = -1
+    return M
+
+
+def find_coordinate_mirror_orbital_unitaries(H, atol=1e-8) -> dict:
+    r"""
+    Solves for the orbital part of the single-axis coordinate mirrors of ``H``, i.e. for each axis :math:`i` a
+    unitary :math:`U_i` with
+
+    .. math:: H(M_i k) = U_i\, H(k)\, U_i^\dagger, \qquad M_i: k_i \to -k_i .
+
+    This is the same relation and the same U-solver (:func:`_solve_U_for_op`) the full symmetry discovery uses,
+    restricted to the three mirrors and to a zero translation, so it costs a handful of small eigen-solves instead of
+    a scan over the 6960 candidate matrices. A point-group mirror acts on the orbital indices as well as on the
+    momenta; for :math:`t_{2g}` orbitals :math:`U_i` comes out as the diagonal sign matrix of the mirror
+    (:math:`\mathrm{diag}(-1,-1,+1)` for :math:`M_x` in the order :math:`d_{xy}, d_{xz}, d_{yz}`), but nothing here
+    assumes a particular orbital set, so :math:`e_g`-based and other Wannier bases work the same way.
+
+    :math:`U_i` is fixed only up to the commutant of :math:`H`, which is harmless where the gap transforms by
+    conjugation (a global phase or sign cancels in :math:`U \Delta U^\dagger`) but does limit what can be recovered:
+    for an :math:`H` that is exactly orbital-diagonal every diagonal sign matrix solves the relation and the
+    canonical identity comes back, and on an axis with two or fewer k-points the momentum action is trivial, so
+    there is no orbital information to recover there either. In both cases the mirror degenerates to the
+    momentum-only reflection, which is what ``H`` alone justifies.
+
+    :param H: The Hamiltonian field of shape ``(nx, ny, nz, norb, norb)`` in the primitive reciprocal-lattice basis.
+    :param atol: Absolute tolerance for validating the mirror relation.
+    :return: A dict ``{axis: U}`` holding one orbital unitary per axis whose mirror is a symmetry of ``H``.
+    """
+    nx, ny, nz, norb, _ = H.shape
+    nk = (nx, ny, nz)
+    H = np.asarray(H, dtype=complex)
+    H_flat = H.reshape(-1, norb, norb)
+    ev = np.linalg.eigvalsh(H)
+    ev_flat = ev.reshape(-1, norb)
+
+    mirrors = {}
+    for axis in range(3):
+        idx = _apply_M_to_kgrid_indices(_coordinate_mirror_matrix(axis), nk)
+        Hg = H_flat[idx].reshape(nx, ny, nz, norb, norb)
+        ev_g = ev_flat[idx].reshape(nx, ny, nz, norb)  # eigvalsh(Hg) = ev reindexed by the mirror
+        U = _solve_U_for_op(Hg, H, atol, ev_k=ev, ev_g=ev_g)
+        if U is not None:
+            mirrors[axis] = U
+    return mirrors
+
+
 def apply_auto_orbital_transform(
     mat: np.ndarray,
     us: np.ndarray,

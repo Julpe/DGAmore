@@ -1393,3 +1393,129 @@ def test_apply_auto_orbital_transform_reuses_cached_path_four_dim():
         uc = u.conj()
         exp = np.einsum("ap,bq,cr,ds,pqrs->abcd", u, uc, u, uc, mat[i])
         assert np.allclose(out[i], exp)
+
+
+# ============================================================================
+# Coordinate-mirror orbital unitaries
+
+_T2G_MIRROR_SIGNS = {0: (-1.0, -1.0, 1.0), 1: (-1.0, 1.0, -1.0), 2: (1.0, -1.0, -1.0)}
+
+
+def _cubic_t2g_hamiltonian(nk: int = 8, t: float = 0.25, tp: float = 0.03, ti: float = 0.02) -> np.ndarray:
+    """
+    Cubic t2g Hamiltonian in the orbital order d_xy, d_xz, d_yz. Each orbital disperses in its own two directions,
+    and the inter-orbital terms carry the only momentum dependence compatible with the t2g mirror signs (e.g.
+    H_{xy,xz} is even in k_x but odd in k_y and k_z, since s_xy s_xz is +1 under M_x and -1 under M_y and M_z).
+    """
+    k = 2 * np.pi * np.arange(nk) / nk
+    kx, ky, kz = k[:, None, None], k[None, :, None], k[None, None, :]
+    c, s = np.cos, np.sin
+    H = np.zeros((nk, nk, nk, 3, 3), dtype=complex)
+    H[..., 0, 0] = -2 * t * (c(kx) + c(ky)) - 2 * tp * c(kz)
+    H[..., 1, 1] = -2 * t * (c(kx) + c(kz)) - 2 * tp * c(ky)
+    H[..., 2, 2] = -2 * t * (c(ky) + c(kz)) - 2 * tp * c(kx)
+    H[..., 0, 1] = H[..., 1, 0] = ti * s(ky) * s(kz)
+    H[..., 0, 2] = H[..., 2, 0] = ti * s(kx) * s(kz)
+    H[..., 1, 2] = H[..., 2, 1] = ti * s(kx) * s(ky)
+    return H
+
+
+def _mirrored_hamiltonian(H: np.ndarray, axis: int) -> np.ndarray:
+    """Returns H(M_axis k), i.e. H reindexed by the single-axis coordinate mirror k_axis -> -k_axis."""
+    take = [slice(None)] * H.ndim
+    take[axis] = (H.shape[axis] - np.arange(H.shape[axis])) % H.shape[axis]
+    return H[tuple(take)]
+
+
+def _matches_up_to_global_sign(u: np.ndarray, expected: np.ndarray) -> bool:
+    """U is only fixed up to the commutant of H; a global sign cancels in the conjugation U A U^dag."""
+    return np.allclose(u, expected, atol=1e-8) or np.allclose(u, -expected, atol=1e-8)
+
+
+def test_coordinate_mirror_matrix_flips_only_the_requested_axis():
+    """_coordinate_mirror_matrix builds diag(...) with -1 on the requested axis and +1 elsewhere."""
+    for axis in range(3):
+        M = sr._coordinate_mirror_matrix(axis)
+        assert M.dtype == np.int64
+        assert np.array_equal(M, np.diag([-1 if i == axis else 1 for i in range(3)]))
+
+
+def test_find_coordinate_mirror_orbital_unitaries_recovers_t2g_sign_matrices():
+    """The t2g mirror sign matrices are solved for from H alone, with no hard-coded orbital table."""
+    mirrors = sr.find_coordinate_mirror_orbital_unitaries(_cubic_t2g_hamiltonian())
+
+    assert sorted(mirrors) == [0, 1, 2]
+    for axis, signs in _T2G_MIRROR_SIGNS.items():
+        assert _matches_up_to_global_sign(mirrors[axis], np.diag(signs)), f"axis {axis}: {mirrors[axis]}"
+
+
+def test_find_coordinate_mirror_orbital_unitaries_solutions_satisfy_the_mirror_relation():
+    """Every returned U reproduces H(M_i k) = U_i H(k) U_i^dag to machine precision, and is unitary."""
+    H = _cubic_t2g_hamiltonian()
+    for axis, u in sr.find_coordinate_mirror_orbital_unitaries(H).items():
+        assert np.allclose(u @ u.conj().T, np.eye(u.shape[0]), atol=1e-10)
+        rhs = np.einsum("ij,...jk,lk->...il", u, H, u.conj())
+        assert np.allclose(_mirrored_hamiltonian(H, axis), rhs, atol=1e-10)
+
+
+def test_find_coordinate_mirror_orbital_unitaries_drops_an_axis_without_a_mirror():
+    """An orbital-diagonal term odd in k_x cannot be undone by any U (s_o s_o = +1), so M_x is not reported."""
+    nk = 8
+    H = _cubic_t2g_hamiltonian(nk=nk)
+    H[..., 0, 0] += 0.1 * np.sin(2 * np.pi * np.arange(nk) / nk)[:, None, None]
+
+    mirrors = sr.find_coordinate_mirror_orbital_unitaries(H)
+
+    assert 0 not in mirrors
+    assert sorted(mirrors) == [1, 2]
+
+
+def test_find_coordinate_mirror_orbital_unitaries_returns_identity_for_orbital_diagonal_hamiltonian():
+    """With no inter-orbital hopping every diagonal sign matrix solves the relation, so the canonical identity wins."""
+    mirrors = sr.find_coordinate_mirror_orbital_unitaries(_cubic_t2g_hamiltonian(ti=0.0))
+
+    assert sorted(mirrors) == [0, 1, 2]
+    for u in mirrors.values():
+        assert np.allclose(u, np.eye(3), atol=1e-10)
+
+
+def test_find_coordinate_mirror_orbital_unitaries_single_orbital_returns_identity():
+    """A one-orbital H has a 1x1 unitary; the phase cancels in the conjugation, so the identity is returned."""
+    nk = 6
+    k = 2 * np.pi * np.arange(nk) / nk
+    H = (-2 * (np.cos(k)[:, None, None] + np.cos(k)[None, :, None] + np.cos(k)[None, None, :]))[..., None, None]
+
+    mirrors = sr.find_coordinate_mirror_orbital_unitaries(H.astype(complex))
+
+    assert sorted(mirrors) == [0, 1, 2]
+    for u in mirrors.values():
+        assert u.shape == (1, 1) and np.allclose(u, np.eye(1))
+
+
+def test_find_coordinate_mirror_orbital_unitaries_handles_a_squashed_axis():
+    """On a single-k-point axis the momentum action is trivial, so its mirror carries no orbital information."""
+    H = _cubic_t2g_hamiltonian(nk=6)[:, :, :1]
+
+    mirrors = sr.find_coordinate_mirror_orbital_unitaries(np.ascontiguousarray(H))
+
+    assert 2 in mirrors and np.allclose(mirrors[2], np.eye(3), atol=1e-10)
+
+
+def test_find_coordinate_mirror_orbital_unitaries_recovers_t2g_signs_for_srvo3():
+    """On the real SrVO3 t2g Hamiltonian the solve reproduces the d_xy/d_xz/d_yz mirror sign table exactly."""
+    H = _require_hamiltonian("hk_3band_srvo3_cubic_12x12x12.npy", (12, 12, 12, 3, 3))
+
+    mirrors = sr.find_coordinate_mirror_orbital_unitaries(H)
+
+    assert sorted(mirrors) == [0, 1, 2]
+    for axis, signs in _T2G_MIRROR_SIGNS.items():
+        assert _matches_up_to_global_sign(mirrors[axis], np.diag(signs)), f"axis {axis}: {mirrors[axis]}"
+        rhs = np.einsum("ij,...jk,lk->...il", mirrors[axis], H, mirrors[axis].conj())
+        assert np.allclose(_mirrored_hamiltonian(H, axis), rhs, atol=1e-10)
+
+
+def test_find_coordinate_mirror_orbital_unitaries_reports_nothing_without_coordinate_mirrors():
+    """The La3Ni2O7 model's axes are not coordinate-mirror axes on this grid, so no mirror is reported at all."""
+    H = _require_hamiltonian("hk_4band_la3ni2o7_32x32x32.npy", (32, 32, 32, 4, 4))
+
+    assert sr.find_coordinate_mirror_orbital_unitaries(H) == {}

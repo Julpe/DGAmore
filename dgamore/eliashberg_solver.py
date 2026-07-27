@@ -35,6 +35,7 @@ from dgamore.matsubara_frequencies import MFHelper
 from dgamore.memory_estimator import LANCZOS_VERTEX_FACTOR
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE
+from dgamore.symmetry_reduction import find_coordinate_mirror_orbital_unitaries
 
 
 def delete_files(filepath: str, *args) -> None:
@@ -655,40 +656,43 @@ def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
     (d-wave / p-wave-x / p-wave-y) and the corresponding frequency parity for the singlet/triplet channel; falls back
     to a random guess if no symmetry is configured or recognized.
 
+    The random guess is drawn from a generator with a fixed seed rather than from the global ``np.random``
+    state: an unseeded start vector makes a run irreproducible, and inside a degenerate multiplet - where the
+    eigensolver is free to return any basis of the eigenspace - it changes which partners come back from one run to
+    the next. It also keeps the seed identical on every rank without a broadcast.
+
+    For a configured symmetry the negative-frequency half is set from the positive one reflected under the
+    fermionic-frequency flip T (``np.flip`` over the last axis, pairing ``niv + j`` with ``niv - 1 - j``) and signed
+    by the channel's required parity, so the seed is a T eigenvector even for a frequency-dependent form factor.
+
     :param shape: Target array shape ``[kx, ky, kz, o1, o2, v]`` of the gap function.
     :param channel: Pairing channel, either :attr:`SpinChannel.SING` or :attr:`SpinChannel.TRIP`.
-    :return: The initial gap-function array.
+    :return: The initial gap-function array (dtype ``DTYPE`` either way).
     :raises ValueError: If ``channel`` is neither SING nor TRIP.
     """
     if channel not in {SpinChannel.SING, SpinChannel.TRIP}:
         raise ValueError("Channel must be either SING or TRIP.")
 
-    gap0 = np.zeros(shape, dtype=DTYPE)
-    niv = shape[-1] // 2
-    k_grid = config.lattice.k_grid.grid
-
+    symmetry = config.eliashberg.symmetry
     symm = {
         "d-wave": lambda k: -np.cos(k[0])[:, None, None] + np.cos(k[1])[None, :, None],
         "p-wave-x": lambda k: np.sin(k[0])[:, None, None],
         "p-wave-y": lambda k: np.sin(k[1])[None, :, None],
     }
-
-    if config.eliashberg.symmetry in symm:
-        gap0[..., niv:] = np.repeat(symm[config.eliashberg.symmetry](k_grid)[:, :, :, None, None, None], niv, axis=-1)
-    else:
-        gap0 = np.random.random_sample(shape)
-
     v_sym = {
         "d-wave": "even" if channel == SpinChannel.SING else "odd",
         "p-wave-x": "odd" if channel == SpinChannel.SING else "even",
         "p-wave-y": "odd" if channel == SpinChannel.SING else "even",
-    }.get(config.eliashberg.symmetry, "")
+    }
 
-    if v_sym in {"even", "odd"}:
-        gap0[..., :niv] = gap0[..., niv:] if v_sym == "even" else -gap0[..., niv:]
-    else:
-        gap0 = np.random.random_sample(shape)
+    if symmetry not in symm:
+        return np.random.default_rng(42).random(shape).astype(DTYPE)
 
+    niv = shape[-1] // 2
+    gap0 = np.zeros(shape, dtype=DTYPE)
+    gap0[..., niv:] = np.repeat(symm[symmetry](config.lattice.k_grid.grid)[:, :, :, None, None, None], niv, axis=-1)
+    # reflect the positive-frequency half under T (np.flip) and sign it with the channel's parity
+    gap0[..., :niv] = (1 if v_sym[symmetry] == "even" else -1) * np.flip(gap0[..., niv:], axis=-1)
     return gap0
 
 
@@ -775,55 +779,109 @@ def gap_parity_diagnostics(gap: np.ndarray, gap_shape: tuple) -> dict[str, compl
     return {name: complex(np.vdot(g, op) / denom) for name, op in ops.items()}
 
 
-def classify_gap_symmetry(gap: np.ndarray) -> str:
+def _classify_momentum_block(block: np.ndarray, purity: float) -> str:
     r"""
-    Classifies the dominant momentum wave symmetry and Matsubara-frequency parity of a gap and returns a compact
-    label of the form ``<wave><parity>``. The wave letter is ``s``, ``d`` or ``p`` (``x`` if none of these match),
-    and the parity sign is ``+`` (even in :math:`\nu`), ``-`` (odd) or empty (neither). The frequency parity is the
-    sign of the global T Rayleigh quotient :math:`\langle \Delta, T\Delta \rangle / \langle \Delta, \Delta \rangle`
-    (with :math:`T` the fermionic-frequency flip), so it is consistent with the parity diagnostics and robust for
-    multi-orbital gaps. The wave symmetry is read from the orbital-diagonal ``o1 = o2 = 0``, ``kz = 0`` block at the
-    first positive Matsubara frequency under the lattice inversions (:math:`k_x \to -k_x`, :math:`k_y \to -k_y`, the
-    full :math:`k \to -k`, realized with the ``np.roll(np.flip(...), 1)`` convention for the Gamma-at-index-0 grid)
-    and the :math:`k_x \leftrightarrow k_y` exchange: ``s`` is even under both axis inversions and symmetric under
-    exchange, ``d`` is even under both axis inversions and antisymmetric under exchange, and ``p`` is odd under the
-    full inversion.
+    Classifies the wave symmetry of one orbital block's momentum profile, returning ``s``, ``d``, ``p`` or ``x``.
+
+    The block is decomposed into symmetry sectors rather than compared element-wise: for an involution :math:`X`,
+    the fraction of the block's weight that is even under it is
+    :math:`\lVert \tfrac{1}{2}(b + Xb)\rVert^{2}/\lVert b\rVert^{2}`, and the odd fraction is its complement. A
+    sector counts as realized when its fraction reaches ``purity``. This tolerates the few percent of admixture
+    that a converged gap generally carries, where an element-wise ``allclose`` would reject it outright.
+
+    The involutions are the three coordinate inversions :math:`k_i \to -k_i` (in the ``np.roll(np.flip(...), 1)``
+    convention of the Gamma-at-index-0 grid) and the axis exchanges :math:`k_i \leftrightarrow k_j`, the latter only
+    for pairs of axes of equal length. All three exchanges are tested, not just :math:`k_x \leftrightarrow k_y`: on
+    a cubic lattice a :math:`d`-wave living in the :math:`xz` plane is antisymmetric under
+    :math:`k_x \leftrightarrow k_z` and carries no definite symmetry under :math:`k_x \leftrightarrow k_y` at all.
+
+    Only the momentum profile enters here; the orbital indices are fixed by the caller. This is a diagnostic label,
+    so unlike the mirrors of :func:`_mirror_operator` no orbital transformation accompanies the reflections.
+
+    :param block: The momentum profile ``[kx, ky, kz]`` of one orbital block.
+    :param purity: Minimum weight fraction for a symmetry sector to count as realized.
+    :return: ``s`` (even under every inversion, symmetric under every applicable exchange), ``d`` (even under every
+        inversion, antisymmetric under some exchange), ``p`` (odd under the full inversion) or ``x``.
+    """
+
+    def even_fraction(arr: np.ndarray, mirrored: np.ndarray) -> float:
+        norm = float(np.vdot(arr, arr).real)
+        return float(np.vdot(arr + mirrored, arr + mirrored).real) / (4.0 * norm) if norm > 0 else 0.0
+
+    def invert(arr: np.ndarray, axes: tuple) -> np.ndarray:
+        return np.roll(np.flip(arr, axis=axes), shift=(1,) * len(axes), axis=axes)
+
+    if float(np.vdot(block, block).real) <= 0:
+        return "x"
+
+    even_axis = [even_fraction(block, invert(block, (axis,))) for axis in range(3)]
+    if all(frac >= purity for frac in even_axis):
+        exchanges = [
+            (i, j) for i, j in ((0, 1), (0, 2), (1, 2)) if block.shape[i] == block.shape[j] and block.shape[i] > 1
+        ]
+        swapped = [np.swapaxes(block, i, j) for i, j in exchanges]
+        if any(even_fraction(block, -swap) >= purity for swap in swapped):  # antisymmetric under some exchange
+            return "d"
+        if all(even_fraction(block, swap) >= purity for swap in swapped):
+            return "s"
+        return "x"
+    if even_fraction(block, -invert(block, (0, 1, 2))) >= purity:  # odd under the full inversion
+        return "p"
+    return "x"
+
+
+def classify_gap_symmetry(gap: np.ndarray, purity: float = 0.9, weight_floor: float = 0.01) -> str:
+    r"""
+    Classifies the momentum wave symmetry and Matsubara-frequency parity of a gap and returns a compact label of the
+    form ``<wave><parity>``. The wave letter is ``s``, ``d`` or ``p`` (``x`` if none of these match), and the parity
+    sign is ``+`` (even in :math:`\nu`), ``-`` (odd) or empty (neither). The frequency parity is the sign of the
+    global T Rayleigh quotient :math:`\langle \Delta, T\Delta \rangle / \langle \Delta, \Delta \rangle` (with
+    :math:`T` the fermionic-frequency flip), so it is consistent with the parity diagnostics.
+
+    Every orbital block :math:`(o_1, o_2)` carrying at least ``weight_floor`` of the heaviest block's weight is
+    classified separately from its momentum profile at the first positive Matsubara frequency (see
+    :func:`_classify_momentum_block`), because a multi-orbital gap need not carry the same wave in every block: the
+    :math:`E_g` singlet of a cubic :math:`t_{2g}` system, for instance, is a :math:`d`-wave in each block but a
+    *different* one each time, :math:`\cos k_x - \cos k_y` on :math:`d_{xy}` and its cyclic images on the other two.
+    Blocks below the floor are skipped - the wave symmetry of a numerically negligible block is noise.
+
+    Blocks that agree collapse to a single label, so the common case stays one token wide. When they disagree the
+    label lists each distinct wave with the blocks realizing it, e.g. ``d+[00,11]|s+[22]``, ordered by weight; the
+    number of entries is bounded by the number of distinct waves, never by the number of orbital blocks.
 
     :param gap: The gap array in the ``[kx, ky, kz, o1, o2, v]`` layout.
-    :return: The ``<wave><parity>`` label, ``"unknown"`` for an all-zero gap, or ``x<parity>`` when the wave cannot
-        be determined from the orbital-diagonal block.
+    :param purity: Minimum weight fraction for a symmetry sector to count as realized within a block.
+    :param weight_floor: Minimum weight of a block relative to the heaviest one for it to be classified at all.
+    :return: The ``<wave><parity>`` label, or ``"unknown"`` for an all-zero gap.
     """
-    atol = 1e-3
     denom = np.vdot(gap, gap)
     if denom == 0:
         return "unknown"
     t = (np.vdot(gap, np.flip(gap, axis=-1)) / denom).real
     freq_label = "+" if t > 0.5 else ("-" if t < -0.5 else "")
 
-    d_plus = gap[
-        ..., 0, 0, 0, gap.shape[-1] // 2
-    ].real  # [kx, ky]: orbital-diagonal (0, 0) block at kz = 0, nu = +pi/beta
-    scale = np.max(np.abs(d_plus))
-    if scale == 0:
+    n_o1, n_o2 = gap.shape[3], gap.shape[4]
+    weights = np.linalg.norm(gap.reshape(-1, n_o1, n_o2, gap.shape[-1]), axis=(0, -1))
+    if weights.max() <= 0:
         return f"x{freq_label}"
-    d_plus = d_plus / scale
-    inv_x = np.roll(np.flip(d_plus, axis=0), shift=1, axis=0)
-    inv_y = np.roll(np.flip(d_plus, axis=1), shift=1, axis=1)
-    inv_full = np.roll(np.flip(d_plus, axis=(0, 1)), shift=(1, 1), axis=(0, 1))
-    even_x = np.allclose(d_plus, inv_x, atol=atol, rtol=0)
-    even_y = np.allclose(d_plus, inv_y, atol=atol, rtol=0)
-    odd_full = np.allclose(d_plus, -inv_full, atol=atol, rtol=0)
-    square = d_plus.shape[0] == d_plus.shape[1]
-    xy_sym = square and np.allclose(d_plus, d_plus.T, atol=atol, rtol=0)
-    xy_anti = square and np.allclose(d_plus, -d_plus.T, atol=atol, rtol=0)
 
-    if even_x and even_y and xy_sym:
-        return f"s{freq_label}"
-    if even_x and even_y and xy_anti:
-        return f"d{freq_label}"
-    if odd_full:
-        return f"p{freq_label}"
-    return f"x{freq_label}"
+    labeled: dict[str, list[tuple[float, str]]] = {}
+    for o1 in range(n_o1):
+        for o2 in range(n_o2):
+            if weights[o1, o2] < weight_floor * weights.max():
+                continue
+            wave = _classify_momentum_block(gap[:, :, :, o1, o2, gap.shape[-1] // 2], purity)
+            labeled.setdefault(wave, []).append((float(weights[o1, o2]), f"{o1}{o2}"))
+
+    if not labeled:
+        return f"x{freq_label}"
+    if len(labeled) == 1:
+        return f"{next(iter(labeled))}{freq_label}"
+    order = sorted(labeled.items(), key=lambda kv: -sum(w for w, _ in kv[1]))
+    return "|".join(
+        f"{wave}{freq_label}[{','.join(block for _, block in sorted(blocks, key=lambda wb: -wb[0]))}]"
+        for wave, blocks in order
+    )
 
 
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
@@ -928,7 +986,103 @@ def _chi0_to_matmul_layout(chi0_mat: np.ndarray) -> np.ndarray:
     return np.moveaxis(chi0_mat.reshape(nqx, nqy, nqz, nb * nb, nb * nb, v), -1, 3)
 
 
-def _orient_cluster_by_mirrors(block: np.ndarray, gap_shape: tuple, tol: float = 1e-6) -> np.ndarray | None:
+_MIRROR_TOL = 1e-6  # tolerance on the deviation of a mirror eigenvalue from +/-1
+
+
+def _gap_orbital_mirrors(n_bands: int) -> dict:
+    r"""
+    Collects the orbital part :math:`U_i` of the single-axis coordinate mirrors :math:`k_i \to -k_i` for the gap
+    symmetrization (see :func:`_mirror_operator`) by solving for them from :math:`H(k)` with the same U-solver the
+    automatic symmetry discovery uses (:func:`~dgamore.symmetry_reduction.find_coordinate_mirror_orbital_unitaries`,
+    a handful of small eigen-solves on the cached :math:`H(k)`). Nothing is hard-coded per orbital set - the mirrors
+    are read off the Hamiltonian, so :math:`t_{2g}`, :math:`e_g` and any other Wannier basis are covered alike, and
+    no symmetry mode is assumed (the solve does not need ``symmetries: auto``).
+
+    A single-orbital gap needs no orbital factor (a :math:`1 \times 1` unitary is a phase, and it cancels in
+    :math:`U \Delta U^\dagger`), and a failure to determine the mirrors is not fatal: the symmetrization then
+    reduces to momentum-only mirrors and falls back to the Loewdin basis wherever those do not resolve a multiplet.
+
+    :param n_bands: Number of orbitals of the gap.
+    :return: A dict ``{axis: U}`` (empty when there is nothing to apply or the mirrors cannot be determined).
+    """
+    if n_bands < 2:
+        return {}
+
+    try:
+        ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
+        return find_coordinate_mirror_orbital_unitaries(np.asarray(ek, dtype=np.complex128))
+    except Exception as exc:  # never let a symmetry probe abort a solve; momentum-only mirrors still work
+        config.logger.debug(f"Could not determine the orbital mirror matrices for the gap symmetrization: {exc}")
+        return {}
+
+
+def _mirror_acts_on_orbitals(u: np.ndarray | None) -> bool:
+    r"""
+    Whether an orbital mirror matrix acts non-trivially on the gap. The gap transforms by conjugation,
+    :math:`\Delta \to U \Delta U^\dagger`, which is the identity map exactly when :math:`U` is a multiple of the
+    identity - a global phase cancels between the two factors.
+
+    :param u: The orbital mirror matrix, or ``None``.
+    :return: True if conjugation by ``u`` is not the identity map.
+    """
+    if u is None or u.shape[0] < 2:
+        return False
+    return not np.allclose(u, (np.trace(u) / u.shape[0]) * np.eye(u.shape[0]), atol=1e-8)
+
+
+def _validated_orbital_mirrors(gap_shape: tuple, orbital_mirrors: dict | None) -> dict:
+    r"""
+    Normalizes the caller-supplied orbital mirror matrices, dropping entries that do not match the gap's orbital
+    dimension (a mirror discovered on a different orbital set must never be applied silently).
+
+    :param gap_shape: Full gap shape ``[kx, ky, kz, o1, o2, 2*niv_pp]``.
+    :param orbital_mirrors: A dict ``{axis: U}`` of orbital mirror matrices, or ``None``.
+    :return: The validated dict ``{axis: U}`` as complex arrays (empty when nothing usable is supplied).
+    """
+    n_orb = gap_shape[3]
+    return {
+        int(axis): np.asarray(u, dtype=np.complex128)
+        for axis, u in (orbital_mirrors or {}).items()
+        if u is not None and np.shape(u) == (n_orb, n_orb)
+    }
+
+
+def _mirror_operator(gap_shape: tuple, axis: int, u: np.ndarray | None):
+    r"""
+    Builds the single-axis mirror operator acting on a flattened gap column. A point-group mirror
+    :math:`k_i \to -k_i` acts on the orbital indices as well as on the momenta, so with the orbital matrix
+    :math:`U` of that mirror (:math:`H(M_i k) = U H(k) U^\dagger`, see
+    :func:`~dgamore.symmetry_reduction.find_coordinate_mirror_orbital_unitaries`) the gap transforms as
+
+    .. math:: \Delta_{o_1 o_2}(k) \to \left[U\, \Delta(M_i k)\, U^\dagger\right]_{o_1 o_2} .
+
+    For :math:`t_{2g}` orbitals :math:`U` is the diagonal sign matrix of the mirror and this reduces to the familiar
+    :math:`s_{o_1} s_{o_2} \Delta_{o_1 o_2}(M_i k)`. Dropping the orbital factor (as a momentum-only reflection does)
+    leaves an operator that is not a symmetry of the multi-orbital pairing kernel: a partner carrying weight in both
+    orbital sectors then measures the orbital-diagonal minus the orbital-off-diagonal weight instead of
+    :math:`\pm 1`, and the cleanliness check in :func:`_orient_cluster_by_mirrors` rejects it.
+
+    :param gap_shape: Full gap shape ``[kx, ky, kz, o1, o2, 2*niv_pp]``.
+    :param axis: The reflected momentum axis (0, 1 or 2).
+    :param u: The orbital matrix of that mirror, or ``None``/a multiple of the identity for a momentum-only mirror.
+    :return: A callable mapping a flattened gap column to its mirrored image.
+    """
+    idx = (gap_shape[axis] - np.arange(gap_shape[axis])) % gap_shape[axis]
+    take = [slice(None)] * len(gap_shape)
+    take[axis] = idx
+    take = tuple(take)
+
+    if not _mirror_acts_on_orbitals(u):
+        return lambda column: column.reshape(gap_shape)[take].ravel()
+
+    return lambda column: np.einsum(
+        "ap,...pqv,bq->...abv", u, column.reshape(gap_shape)[take], u.conj(), optimize=True
+    ).ravel()
+
+
+def _orient_cluster_by_mirrors(
+    block: np.ndarray, gap_shape: tuple, tol: float = _MIRROR_TOL, orbital_mirrors: dict | None = None
+) -> np.ndarray | None:
     r"""
     Rotates an orthonormal degenerate cluster onto the common eigenbasis of the single-axis coordinate mirrors
     :math:`k_i \to -k_i` and orders the partners lexicographically by the tuple of axes each one is odd under. The
@@ -938,33 +1092,36 @@ def _orient_cluster_by_mirrors(block: np.ndarray, gap_shape: tuple, tol: float =
     ``x, y, z`` and two-axis :math:`d`-like partners (:math:`d_{xy}`, :math:`d_{xz}`, :math:`d_{yz}`) sort
     ``xy, xz, yz``.
 
+    Each mirror acts on the orbital indices as well as on the momenta (see :func:`_mirror_operator`); an axis whose
+    orbital matrix is non-trivial therefore resolves partners even when its momentum action does not, which is what
+    makes purely local (momentum-independent) multiplets - a local :math:`T_{1g}` triplet, say - resolvable at all.
+
     Two partners sharing a sign pattern span a subspace the mirrors do not resolve: the combined matrix is
     degenerate there, so the eigenvectors within it are fixed by floating-point noise alone and the sort cannot
-    separate them either. This is the generic situation for a momentum-independent (purely local) cluster, where
-    every partner is even under every mirror and the combined matrix is a multiple of the identity. Rotating by
-    those eigenvectors would scramble the cluster, so such a cluster is rejected and the caller keeps its input
-    basis.
+    separate them either. Coordinate mirrors alone cannot split an :math:`E_g` doublet, for instance, because an
+    orbital-diagonal state picks up :math:`s_o s_o = +1` on every axis; separating those partners would take a
+    three-fold rotation about :math:`[111]`. Rotating by noise-fixed eigenvectors would scramble the cluster, so
+    such a cluster is rejected and the caller keeps its input basis.
 
     :param block: Orthonormal cluster, one flattened gap function per column.
     :param gap_shape: Full gap shape ``[kx, ky, kz, o1, o2, 2*niv_pp]``.
     :param tol: Tolerance on the deviation of a mirror Rayleigh quotient from :math:`\pm 1`.
-    :return: The reordered cluster, or ``None`` when no momentum axis is resolved, a partner is not a clean
-        :math:`\pm 1` mirror eigenstate, or two partners share the same mirror sign pattern.
+    :param orbital_mirrors: A dict ``{axis: U}`` with the orbital part of each coordinate mirror; entries whose shape
+        does not match the gap's orbital dimension are ignored, and a missing axis falls back to a momentum-only
+        reflection (exact for a single-orbital gap, but not a kernel symmetry for a multi-orbital one).
+    :return: The reordered cluster, or ``None`` when no axis is resolved, a partner is not a clean :math:`\pm 1`
+        mirror eigenstate, or two partners share the same mirror sign pattern.
     """
-
-    def reflect_axis(column: np.ndarray, axis: int) -> np.ndarray:
-        idx = (gap_shape[axis] - np.arange(gap_shape[axis])) % gap_shape[axis]
-        take = [slice(None)] * len(gap_shape)
-        take[axis] = idx
-        return column.reshape(gap_shape)[tuple(take)].ravel()
-
-    axes = [axis for axis in (0, 1, 2) if gap_shape[axis] > 1]
+    mirrors = _validated_orbital_mirrors(gap_shape, orbital_mirrors)
+    # an axis resolves partners through its momentum reflection, its orbital matrix, or both
+    axes = [axis for axis in (0, 1, 2) if gap_shape[axis] > 1 or _mirror_acts_on_orbitals(mirrors.get(axis))]
     if not axes:
         return None
 
     projected = []
     for axis in axes:
-        mirrored = np.stack([reflect_axis(block[:, i], axis) for i in range(block.shape[1])], axis=1)
+        reflect = _mirror_operator(gap_shape, axis, mirrors.get(axis))
+        mirrored = np.stack([reflect(block[:, i]) for i in range(block.shape[1])], axis=1)
         m = block.conj().T @ mirrored
         projected.append(0.5 * (m + m.conj().T))
 
@@ -987,7 +1144,7 @@ def _orient_cluster_by_mirrors(block: np.ndarray, gap_shape: tuple, tol: float =
 
 
 def symmetrize_degenerate_gaps(
-    lambdas: np.ndarray, gaps: np.ndarray, gap_shape: tuple, tol: float = 1e-4
+    lambdas: np.ndarray, gaps: np.ndarray, gap_shape: tuple, tol: float = 1e-4, orbital_mirrors: dict | None = None
 ) -> np.ndarray:
     r"""
     Orthonormalizes the eigenvectors returned by the Lanczos solver within clusters of (near-)degenerate
@@ -997,33 +1154,44 @@ def symmetrize_degenerate_gaps(
     form the symmetry-adapted partners.
 
     Per cluster the following steps are applied: (i) Loewdin orthonormalization, i.e. :math:`S^{-1/2}` applied to
-    the cluster overlap matrix :math:`S`, which yields the orthonormal basis closest to the input vectors; (ii)
+    the cluster overlap matrix :math:`S`, which yields the orthonormal basis closest to the input vectors. A cluster
+    of (nearly) linearly dependent vectors is exempt from it and from the orientation of step (ii), since
+    :math:`S^{-1/2}` would amplify exactly the noise that makes such vectors distinct; it is still normalized and
+    phase-fixed, so step (iii) holds for every returned vector without exception; (ii)
     for doublets, the mirror operation
 
-    .. math:: M_y: \Delta_{12}(k_x, k_y, k_z, \nu) \to \Delta_{12}(k_x, -k_y, k_z, \nu)
+    .. math:: M_y: \Delta_{o_1 o_2}(k_x, k_y, k_z, \nu) \to
+        \left[U_y\, \Delta(k_x, -k_y, k_z, \nu)\, U_y^\dagger\right]_{o_1 o_2}
 
     is diagonalized within the cluster, ordering the even (:math:`+1`, :math:`p_x`-like) partner first and the
-    odd (:math:`-1`, :math:`p_y`-like) partner second; every cluster of three or more members is handled by
+    odd (:math:`-1`, :math:`p_y`-like) partner second, but only when the two partners come out as clean, oppositely
+    signed :math:`\pm 1` eigenstates (an :math:`E_g` doublet, even under every coordinate mirror, is not resolved
+    this way and keeps the Loewdin basis); every cluster of three or more members is handled by
     :func:`_orient_cluster_by_mirrors`, which diagonalizes the single-axis coordinate mirrors of the resolved axes
     simultaneously and orders the partners by the axes each one is odd under (:math:`p`-like as ``x, y, z``,
     two-axis :math:`d`-like as ``xy, xz, yz``), provided every partner is a clean :math:`\pm 1` eigenstate and no
-    two partners share a sign pattern (otherwise the mirrors do not resolve the cluster - a momentum-independent
-    cluster is the generic such case - and the Loewdin basis is kept); (iii) the global phase of every vector is
-    fixed such that its largest-magnitude element is real and positive. Eigenvalues are not modified; vectors of
-    non-degenerate eigenvalues are only phase-fixed. Enabled via ``symmetrize_degenerate_gaps`` of
-    :class:`~dgamore.config.EliashbergConfig`.
+    two partners share a sign pattern (otherwise the mirrors do not resolve the cluster and the Loewdin basis is
+    kept); (iii) the global phase of every vector is fixed such that its largest-magnitude element is real and
+    positive. Eigenvalues are not modified; vectors of non-degenerate eigenvalues are only phase-fixed. Enabled via
+    ``symmetrize_degenerate_gaps`` of :class:`~dgamore.config.EliashbergConfig`.
+
+    The mirrors act on the orbital indices as well as on the momenta (:math:`U_y` above, see
+    :func:`_mirror_operator`). Without that orbital factor the operator is not a symmetry of a multi-orbital pairing
+    kernel, and any multiplet with weight in both the orbital-diagonal and the orbital-off-diagonal sector fails the
+    :math:`\pm 1` check and falls back to the Loewdin basis; with it, purely local (momentum-independent) multiplets
+    become resolvable too, which a momentum-only mirror cannot do because it acts on them as the identity.
 
     :param lambdas: Eigenvalues sorted in descending order.
     :param gaps: Eigenvector matrix ``[n, n_eig]`` with one flattened gap function per column.
     :param gap_shape: Full gap shape ``[kx, ky, kz, o1, o2, 2*niv_pp]``, used to locate the momentum axes.
     :param tol: Relative tolerance for clustering neighboring eigenvalues as degenerate.
+    :param orbital_mirrors: A dict ``{axis: U}`` with the orbital part of each coordinate mirror, as produced by
+        :func:`_gap_orbital_mirrors`. Omitting it reduces the mirrors to momentum-only reflections, which is exact
+        for a single-orbital gap only.
     :return: The symmetrized eigenvector matrix ``[n, n_eig]``.
     """
-    n_ky = gap_shape[1]
-    idx_neg = (n_ky - np.arange(n_ky)) % n_ky
-
-    def mirror_y(column: np.ndarray) -> np.ndarray:
-        return column.reshape(gap_shape)[:, idx_neg].ravel()
+    mirrors = _validated_orbital_mirrors(gap_shape, orbital_mirrors)
+    mirror_y = _mirror_operator(gap_shape, 1, mirrors.get(1))
 
     clusters = [[0]]
     for i in range(1, gaps.shape[1]):
@@ -1037,27 +1205,35 @@ def symmetrize_degenerate_gaps(
         block = gaps[:, cluster].astype(np.complex128)
         block /= np.linalg.norm(block, axis=0)
 
+        independent = True
         if len(cluster) > 1:
             overlap = block.conj().T @ block
             eigs, u = np.linalg.eigh(overlap)
-            if eigs.min() < 1e-12:  # (nearly) linearly dependent vectors cannot be orthonormalized meaningfully
-                continue
-            block = block @ (u @ np.diag(eigs**-0.5) @ u.conj().T)
+            # dependent vectors keep only the stable normalization and phase fix; S^{-1/2} and the mirror step
+            # would amplify the noise that makes them distinct (see the step (i) note in the docstring)
+            independent = bool(eigs.min() >= 1e-12)
+            if independent:
+                block = block @ (u @ np.diag(eigs**-0.5) @ u.conj().T)
 
-        if len(cluster) == 2:
+        if independent and len(cluster) == 2:
             mirrored = np.stack([mirror_y(block[:, i]) for i in range(2)], axis=1)
             mirror_block = block.conj().T @ mirrored
             mirror_block = 0.5 * (mirror_block + mirror_block.conj().T)
-            _, mirror_vecs = np.linalg.eigh(mirror_block)
-            # order the even (+1, p_x-like) partner first and the odd (-1, p_y-like) partner second
-            block = block @ mirror_vecs[:, ::-1]
-        elif len(cluster) >= 3:
-            oriented = _orient_cluster_by_mirrors(block, gap_shape)
+            mirror_eigs, mirror_vecs = np.linalg.eigh(mirror_block)
+            # rotate only when M_y resolves the doublet into clean, oppositely signed +/-1 eigenstates; otherwise
+            # keep the Loewdin basis (an E_g doublet is even under every mirror, so noise would fix the rotation)
+            if np.all(np.abs(np.abs(mirror_eigs) - 1.0) <= _MIRROR_TOL) and mirror_eigs[0] * mirror_eigs[1] < 0.0:
+                # order the even (+1, p_x-like) partner first and the odd (-1, p_y-like) partner second
+                block = block @ mirror_vecs[:, ::-1]
+        elif independent and len(cluster) >= 3:
+            oriented = _orient_cluster_by_mirrors(block, gap_shape, orbital_mirrors=mirrors)
             if oriented is not None:
                 block = oriented
 
         for col in range(block.shape[1]):
             mags = np.abs(block[:, col])
+            if mags.max() == 0:  # an all-zero vector has no phase to fix (and dividing by it would yield nan)
+                continue
             # tie-break on the first index among the maximal-modulus elements, stable against fp noise
             phase = block[np.flatnonzero(mags >= mags.max() * (1.0 - 1e-8))[0], col]
             block[:, col] *= phase.conjugate() / abs(phase)
@@ -1222,6 +1398,9 @@ def _solve_pairing_sectors(
     if parities is not None:
         sectors = [(label, eps_t) for label, eps_t in sectors if label in parities]
 
+    # the mirrors are a property of the orbital basis and the lattice, not of the sector: determine them once
+    orbital_mirrors = _gap_orbital_mirrors(gap_shape[3]) if config.eliashberg.symmetrize_degenerate_gaps else {}
+
     results: dict[str, tuple[np.ndarray, list[GapFunction]]] = {}
     try:
         for parity, eps_t in sectors:
@@ -1244,12 +1423,13 @@ def _solve_pairing_sectors(
             lambdas = lambdas[order]
             gaps = gaps[:, order]
             if config.eliashberg.symmetrize_degenerate_gaps:
-                gaps = symmetrize_degenerate_gaps(lambdas, gaps, gap_shape)
+                gaps = symmetrize_degenerate_gaps(lambdas, gaps, gap_shape, orbital_mirrors=orbital_mirrors)
             logger.info(
                 f"Largest eigenvalue{plural} for {label}: " + ", ".join(f"{lam:.6f}" for lam in lambdas),
                 allowed_ranks=ranks,
             )
-            gap_list = [GapFunction(gaps[:, i].reshape(gap_shape), channel, nq) for i in range(n_eig)]
+            # ARPACK may return fewer eigenpairs than requested, so size the list off what actually came back
+            gap_list = [GapFunction(gaps[:, i].reshape(gap_shape), channel, nq) for i in range(gaps.shape[1])]
             results[parity] = (lambdas, gap_list)
     finally:
         if executor is not None:
