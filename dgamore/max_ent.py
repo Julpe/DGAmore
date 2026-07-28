@@ -4,11 +4,10 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
-Analytic continuation of imaginary-frequency quantities to the real axis via the maximum-entropy method. This
-module wraps the (vendored) :mod:`dgamore.ana_cont` solver to continue the momentum-dependent DGA Green's function
-and the local DMFT Green's function to real frequencies, yielding the spectral function
-:math:`A(\mathbf{k}, \omega)`. The momentum-resolved continuation is distributed over MPI ranks across the
-irreducible BZ.
+Analytic continuation of imaginary-frequency quantities to the real axis via the maximum-entropy method. This module
+wraps the (vendored) :mod:`dgamore.ana_cont` solver to continue the momentum-dependent DGA Green's function and the
+local DMFT Green's function to real frequencies, yielding the spectral function :math:`A(\mathbf{k}, \omega)`. The
+momentum-resolved continuation is distributed over MPI ranks across the irreducible BZ.
 """
 
 import contextlib
@@ -31,17 +30,19 @@ from dgamore.self_energy import SelfEnergy
 
 def orbital_to_band_basis(hk: np.ndarray, data: np.ndarray) -> np.ndarray:
     r"""
-    Rotates a momentum-dependent quantity from the orbital basis into the band (eigen) basis of the Hamiltonian,
-    per k-point: :math:`O^{\mathrm{band}}(k) = U(k)^\dagger O(k) U(k)`, where the columns of :math:`U(k)` are the
-    (energy-ascending) eigenvectors of :math:`H(k)`. The Hamiltonian is diagonalized only once per k-point; if a
-    trailing fermionic-frequency axis is present, the same :math:`U(k)` is reused for every frequency.
+    Rotates a momentum-dependent quantity from the orbital basis into the band (eigen) basis of the Hamiltonian, per
+    k-point: :math:`O^{\mathrm{band}}(\mathbf{k}) = U(\mathbf{k})^\dagger O(\mathbf{k}) U(\mathbf{k})`, where the
+    columns of :math:`U(\mathbf{k})` are the (energy-ascending) eigenvectors of :math:`H(\mathbf{k})`. The Hamiltonian
+    is diagonalized only once per k-point; if a trailing fermionic-frequency axis is present, the same
+    :math:`U(\mathbf{k})` is reused for every frequency.
 
-    Note that the band basis is defined by :math:`H(k)` alone, so for an interacting quantity whose self-energy is
-    not simultaneously diagonal with :math:`H(k)` the rotated object is not exactly diagonal -- the off-diagonal
-    band components are kept here and only discarded later when the band-diagonal is taken. Within a degenerate
-    eigenspace of :math:`H(k)` the individual band assignment is basis-dependent (the subspace trace is not).
+    Note that the band basis is defined by :math:`H(\mathbf{k})` alone, so for an interacting quantity whose self-energy
+    is not simultaneously diagonal with :math:`H(\mathbf{k})` the rotated object is not exactly diagonal -- the
+    off-diagonal band components are kept here and only discarded later when the band-diagonal is taken. Within a
+    degenerate eigenspace of :math:`H(\mathbf{k})` the individual band assignment is basis-dependent (the subspace trace
+    is not).
 
-    :param hk: The Hamiltonian :math:`H(k)` of shape ``[kx, ky, kz, n_orb, n_orb]``.
+    :param hk: The Hamiltonian :math:`H(\mathbf{k})` of shape ``[kx, ky, kz, n_orb, n_orb]``.
     :param data: The quantity to rotate, of shape ``[kx, ky, kz, n_orb, n_orb]`` or, with a trailing fermionic
         frequency axis, ``[kx, ky, kz, n_orb, n_orb, n_v]`` (rotated in place and returned).
     :return: The quantity in the band basis (same shape as ``data``).
@@ -69,9 +70,11 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
     k-points are distributed across MPI ranks; failed continuations are set to zero.
 
     :param giwk: The momentum-dependent :class:`GreensFunction` to continue.
-    :param name: Label used in log messages (e.g. ``"DGA"``).
+    :param name: Label of the continued quantity (e.g. ``"DGA"``), used in the log messages and, lowercased, in the
+        output file name ``spectral_function_<name>.npy``.
     :param comm: The MPI communicator.
-    :return: The spectral function :math:`A(\mathbf{k}, \omega)` of shape ``[k, n_bands, w]`` (full BZ on rank 0).
+    :return: The spectral function :math:`A(\mathbf{k}, \omega)` of shape ``[kx, ky, kz, n_bands, w]`` (full BZ on
+        rank 0), i.e. with a decompressed momentum dimension, like :func:`perform_maxent_dmft`.
     """
     logger = config.logger
 
@@ -142,9 +145,13 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
     logger.info("Analytic continuation of Green's function finished.")
 
     if mpi_dist.comm.rank == 0:
-        spectral_function = spectral_function[config.lattice.k_grid.irrk_inv]  # map the spectral function to the FBZ
+        # map to the FBZ through a flattened index map, then decompress explicitly: numpy's ``return_inverse`` shape
+        # changed across 2.x, so indexing with ``irrk_inv`` alone would leave a version-dependent momentum layout
+        spectral_function = spectral_function[np.reshape(config.lattice.k_grid.irrk_inv, -1)]
+        spectral_function = spectral_function.reshape(*config.lattice.k_grid.nk, *spectral_function.shape[1:])
 
-        np.save(os.path.join(config.output.output_path, "spectral_function.npy"), spectral_function)
+        # the file carries the label, so continuing several quantities in one run does not overwrite the earlier ones
+        np.save(os.path.join(config.output.output_path, f"spectral_function_{name.lower()}.npy"), spectral_function)
         logger.info(f"Saved {name} spectral function for the full BZ to file.")
 
     mpi_dist.delete_file()
@@ -158,7 +165,7 @@ def perform_maxent_dmft(sigma_dmft: SelfEnergy, hk: np.ndarray) -> np.ndarray:
     Green's function and its spectral function.
 
     :param sigma_dmft: The local DMFT :class:`SelfEnergy`.
-    :param hk: The Hamiltonian :math:`H(k)` of shape ``[kx, ky, kz, n_orb, n_orb]``.
+    :param hk: The Hamiltonian :math:`H(\mathbf{k})` of shape ``[kx, ky, kz, n_orb, n_orb]``.
     :return: The spectral function :math:`A(\mathbf{k}, \omega)` of shape ``[kx, ky, kz, n_bands, w]``.
     """
     logger = config.logger

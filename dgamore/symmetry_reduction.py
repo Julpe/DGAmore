@@ -203,8 +203,9 @@ def _apply_M_to_ev_field(M, ev, nk, idx_map=None):
 
 def _fft_find_matching_q(A, B, atol):
     r"""
-    Finds all integer translations ``q`` such that ``A[k] = B[k + q]`` for all ``k``, via a 3D FFT cross-correlation
-    of the (real) eigenvalue fields, i.e. minimizing :math:`D(q) = \sum_{k,e} (A - B(\cdot+q))^2`.
+    Finds all integer translations ``q`` such that ``A[k] = B[k + q]`` for all ``k``, via a 3D FFT cross-correlation of
+    the (real) eigenvalue fields, i.e. minimizing :math:`D(\mathbf{q}) = \sum_{\mathbf{k},e} (A -
+    B(\cdot+\mathbf{q}))^2`.
 
     :param A: First real field of shape ``(Nx, Ny, Nz, n_orb_evals)``.
     :param B: Second real field of the same shape.
@@ -887,10 +888,10 @@ def get_symmetry_reduction(H, atol=1e-8, verbose=False, include_antiunitary=Fals
     :param atol: Absolute tolerance for symmetry validation.
     :param verbose: If True, print diagnostics about discovery and group closure.
     :param include_antiunitary: If False (default), anti-unitary symmetries (``conj=True``, e.g. time-reversal-like
-        :math:`H(k) = H(k)^*`) are discarded after discovery. They are valid symmetries of H, but for
-        frequency-dependent objects they additionally require a Matsubara-frequency flip
-        :math:`\imath\omega \to -\imath\omega` that the FBZ-mapping path does not perform; keep the default unless
-        reducing a strictly static quantity (such as H itself or a band structure).
+        :math:`H(\mathbf{k}) = H(\mathbf{k})^*`) are discarded after discovery. They are valid symmetries of H, but for
+        frequency-dependent objects they additionally require a Matsubara-frequency flip :math:`\imath\omega \to
+        -\imath\omega` that the FBZ-mapping path does not perform; keep the default unless reducing a strictly static
+        quantity (such as H itself or a band structure).
     :return: A dict with keys ``'group'`` (the discovered :class:`_GroupElement` list), ``'irrk_ind'`` (flat IBZ
         representative indices), ``'fbz2irrk'`` (per-k representative field), ``'expand'`` (callable mapping IBZ
         Hamiltonian values to the full BZ), ``'expand_tensor'`` (callable for arbitrary-rank tensors with per-axis
@@ -1044,7 +1045,7 @@ def find_coordinate_mirror_orbital_unitaries(H, atol=1e-8) -> dict:
     Solves for the orbital part of the single-axis coordinate mirrors of ``H``, i.e. for each axis :math:`i` a
     unitary :math:`U_i` with
 
-    .. math:: H(M_i k) = U_i\, H(k)\, U_i^\dagger, \qquad M_i: k_i \to -k_i .
+    .. math:: H(M_i \mathbf{k}) = U_i\, H(\mathbf{k})\, U_i^\dagger, \qquad M_i: k_i \to -k_i .
 
     This is the same relation and the same U-solver (:func:`_solve_U_for_op`) the full symmetry discovery uses,
     restricted to the three mirrors and to a zero translation, so it costs a handful of small eigen-solves instead of
@@ -1100,12 +1101,13 @@ def apply_auto_orbital_transform(
 
     .. math::
 
-        M_{12}(k)   &= \sigma_k\, U_{1a} [M_{ab}(k_{\mathrm{rep}})]^{[*\mathrm{conj}_k]} U^\dagger_{b2} \\
-        M_{1234}(k) &= \sigma_k^2\, U_{1a} [M_{abcd}(k_{\mathrm{rep}})]^{[*\mathrm{conj}_k]} U^\dagger_{b2}
-                       U_{3c} U^\dagger_{d4}
+        M_{12}(\mathbf{k})   &= \sigma_{\mathbf{k}}\, U_{1a} [M_{ab}(\mathbf{k}_{\mathrm{rep}})]^{[*\mathrm{conj}_k]}
+                                U^\dagger_{b2} \\
+        M_{1234}(\mathbf{k}) &= \sigma_{\mathbf{k}}^2\, U_{1a} [M_{abcd}(\mathbf{k}_{\mathrm{rep}})]^{[*\mathrm{conj}_k]}
+                                U^\dagger_{b2} U_{3c} U^\dagger_{d4}
 
-    Since :math:`\sigma_k = \pm 1`, :math:`\sigma_k^2 = 1`; the 4-index case effectively has no sign factor, which is
-    the correct physics for vertex quantities under particle-hole-like antisymmetries.
+    Since :math:`\sigma_{\mathbf{k}} = \pm 1`, :math:`\sigma_{\mathbf{k}}^2 = 1`; the 4-index case effectively has no
+    sign factor, which is the correct physics for vertex quantities under particle-hole-like antisymmetries.
 
     :param mat: Input tensor of shape ``(k_local, nb, [nb, nb,] nb, ...)``. The leading axis may be the full FBZ or a
         contiguous slice of it; ``us``, ``sigmas`` and ``conjs`` must be sliced consistently.

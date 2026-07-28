@@ -230,33 +230,28 @@ def main():
             obj_full[sl, sl, sl, sl] = obj_ineq.mat
             return obj_full
 
-        def write_to_full_2pt_quantity(
-            obj_full, obj_ineq: SelfEnergy | GreensFunction, sl: slice, has_momentum: bool = True
-        ):
+        def write_to_full_2pt_quantity(obj_full, obj_ineq: SelfEnergy | GreensFunction, sl: slice):
             """
             Writes a single inequivalent atom's two-point quantity into the orbital-diagonal block of the assembled
             full multi-band quantity (allocating the full object on the first call), resetting the self-energy moments.
+            The local two-point quantities descend from :class:`TwoPoint`, so they carry a single-momentum dimension
+            and the block layout is ``[1, 1, 1, o1, o2, v]``.
 
             :param obj_full: The full multi-band object, or None to allocate it from ``obj_ineq``.
             :param obj_ineq: The per-atom :class:`SelfEnergy` or :class:`GreensFunction` to insert.
             :param sl: The orbital slice (block) of this atom in the full object.
-            :param has_momentum: Whether the object carries leading momentum axes ``[1, 1, 1, ...]``.
             :return: The full object with this atom's block filled in.
             """
             if obj_full is None:
                 obj_full = obj_ineq.copy()
                 obj_full.mat = np.zeros(
-                    ((1, 1, 1) + (config.sys.n_bands,) * 2 if has_momentum else (config.sys.n_bands,) * 2)
-                    + (obj_ineq.current_shape[-1],),
-                    dtype=obj_ineq.mat.dtype,
+                    (1, 1, 1) + (config.sys.n_bands,) * 2 + (obj_ineq.current_shape[-1],), dtype=obj_ineq.mat.dtype
                 )
                 obj_full.update_original_shape()
-            if has_momentum:
-                obj_full[0, 0, 0, sl, sl, :] = obj_ineq.mat
-                obj_full._smom0 = np.zeros((config.sys.n_bands,) * 2)
-                obj_full._smom1 = np.zeros((config.sys.n_bands,) * 2)
-            else:
-                obj_full[sl, sl] = obj_ineq.mat
+                if isinstance(obj_full, SelfEnergy):
+                    obj_full._smom0 = np.zeros((config.sys.n_bands,) * 2)
+                    obj_full._smom1 = np.zeros((config.sys.n_bands,) * 2)
+            obj_full[0, 0, 0, sl, sl, :] = obj_ineq.mat
             return obj_full
 
         def write_smom(obj_full: SelfEnergy, obj_ineq: SelfEnergy, sl: slice):
@@ -294,7 +289,7 @@ def main():
             gchi_d_full = write_to_full_4pt_quantity(gchi_d_full, gchi_d_per_ineq[ineq - 1], s)
             gchi_m_full = write_to_full_4pt_quantity(gchi_m_full, gchi_m_per_ineq[ineq - 1], s)
             sigma_dmft_full = write_to_full_2pt_quantity(sigma_dmft_full, sigma_dmft_per_ineq[ineq - 1], s)
-            g_dmft_full = write_to_full_2pt_quantity(g_dmft_full, g_dmft_per_ineq[ineq - 1], s, has_momentum=False)
+            g_dmft_full = write_to_full_2pt_quantity(g_dmft_full, g_dmft_per_ineq[ineq - 1], s)
             sigma_loc_full = write_to_full_2pt_quantity(sigma_loc_full, sigma_loc_per_ineq[ineq - 1], s)
 
             sigma_loc_full = write_smom(sigma_loc_full, sigma_loc_per_ineq[ineq - 1], s)

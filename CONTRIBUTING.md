@@ -99,6 +99,24 @@ All prose and identifiers use **American English** (`normalize`, `color`, `behav
 in docstrings and comments, and in the documentation. The spell-checking job in CI runs with the `en-us` locale, so
 British spellings are reported as typos.
 
+Formulas in docstrings, comments and documentation follow one notation for momenta and frequencies:
+
+- An **upright** `\mathrm{q}` and `\mathrm{k}` are the compound momentum-frequency indices
+  `\mathrm{q} = (\mathbf{q}, \omega)` and `\mathrm{k} = (\mathbf{k}, \nu)`. Lattice quantities carry them as a
+  superscript, and the frequency they already contain is not repeated: write `\chi^{\mathrm{q}\nu}_{0;1234}` (one free
+  fermionic index left over), `G^{\mathrm{k}}_{12}` and `\Sigma^{\mathrm{k}}_{12}`. A sum over such an index,
+  `\sum_{\mathrm{q}}`, runs over momentum and frequency together.
+- A **bold** `\mathbf{q}` and `\mathbf{k}` are momentum vectors alone. Use them for quantities without any frequency
+  dependence (`\varepsilon_{12}(\mathbf{k})`, `H(\mathbf{k})`, `V^{\mathbf{q}}_{1234}`), for sums that run over
+  momentum only (`\sum_{\mathbf{k}}`), and for the momentum counts `n_{\mathbf{q}}` and `n_{\mathbf{k}}`.
+- Counts are a lowercase `n` with the counted object as the subscript: `n_{\mathbf{q}}`, `n_{\mathbf{k}}`,
+  `n_{\mathrm{o}}` (orbitals), `n_{\mathbf{q}}^{\mathrm{irr}}` (momenta in the irreducible zone).
+- Subscripts and superscripts that are words rather than indices are upright: `E_{\mathrm{kin}}`,
+  `\chi^{\mathrm{phys};\mathrm{q}}_{r}`, `\mathbf{k}_{\mathrm{rep}}`.
+
+The orbital-index convention (free indices `1234`, summed indices `a, b, c, ...` in order of first appearance) is
+described in the docstrings that use it.
+
 ## A final word
 
 If you are ever unsure about any of this, about how to set things up, how to label an issue, or whether an idea is

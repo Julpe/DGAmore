@@ -88,3 +88,23 @@ class TwoPoint(IAmNonLocal, LocalTwoPoint):
         :return: ``self`` defined on the full BZ.
         """
         return self._map_to_full_bz(k_grid, 2, nq)
+
+    @staticmethod
+    def load(
+        filename: str,
+        nk: tuple[int, int, int] = (1, 1, 1),
+        full_niv_range: bool = True,
+        has_compressed_q_dimension: bool = False,
+    ) -> "TwoPoint":
+        r"""
+        Loads a :class:`TwoPoint` from a ``.npy`` file. The default momentum layout is the decompressed one the
+        two-point objects are written in.
+
+        :param filename: Path to the ``.npy`` file (loaded with ``allow_pickle=False``).
+        :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+        :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
+        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[k, ...]``
+            (True) or as three separate axes ``[kx, ky, kz, ...]`` (False).
+        :return: The loaded :class:`TwoPoint`.
+        """
+        return TwoPoint(np.load(filename, allow_pickle=False), nk, full_niv_range, has_compressed_q_dimension)

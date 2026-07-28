@@ -5,9 +5,9 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Interaction tensors. :class:`LocalInteraction` wraps the momentum-independent (Hubbard/Kanamori) interaction
-:math:`U_{1234}`; :class:`Interaction` adds a momentum dimension for the non-local interaction :math:`V_{1234}^q`.
-Both provide the channel projections (density/magnetic/singlet/triplet) and the algebra used in the ladder
-equations.
+:math:`U_{1234}`; :class:`Interaction` adds a momentum dimension for the non-local interaction
+:math:`V^{\mathbf{q}}_{1234}`. Both provide the channel projections (density/magnetic/singlet/triplet) and the algebra
+used in the ladder equations.
 """
 
 import numpy as np
@@ -191,7 +191,7 @@ class LocalInteraction(IHaveMat, IHaveChannel):
 
 class Interaction(IAmNonLocal, LocalInteraction):
     r"""
-    Class for the non-local (momentum-dependent) interaction :math:`V_{1234}^q`.
+    Class for the non-local (momentum-dependent) interaction :math:`V^{\mathbf{q}}_{1234}`.
     """
 
     def __init__(
@@ -204,7 +204,7 @@ class Interaction(IAmNonLocal, LocalInteraction):
         r"""
         Initializes the non-local interaction tensor in the given spin channel and momentum layout.
 
-        :param mat: Interaction tensor :math:`V_{1234}^q` with one momentum dimension and four orbital axes.
+        :param mat: Interaction tensor :math:`V^{\mathbf{q}}_{1234}` with one momentum dimension and four orbital axes.
         :param channel: Spin channel the tensor is expressed in (see :class:`SpinChannel`).
         :param nq: Number of momenta per spatial direction ``(nx, ny, nz)``.
         :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[q, ...]``
@@ -314,7 +314,7 @@ class Interaction(IAmNonLocal, LocalInteraction):
     def pow(self, power) -> "Interaction":
         r"""
         Raises the interaction to an integer power via repeated momentum-diagonal orbital contraction
-        :math:`V^{(n);q}_{1234} = \sum_{ab} V^{q}_{12ab} V^{(n-1);q}_{ba34}`.
+        :math:`V^{(n);\mathbf{q}}_{1234} = \sum_{ab} V^{\mathbf{q}}_{12ab} V^{(n-1);\mathbf{q}}_{ba34}`.
 
         :param power: Positive integer exponent (must be greater than zero).
         :return: A new :class:`Interaction` in the same momentum-compression state as ``self``.

@@ -4,15 +4,16 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
-Lambda operations on the physical susceptibility - the two ways DGAmore shifts :math:`\chi^q_r` by a bosonic mass
-:math:`\lambda`:
+Lambda operations on the physical susceptibility - the two ways DGAmore shifts :math:`\chi^{\mathrm{q}}_{r}` by a
+bosonic mass :math:`\lambda`:
 
 - :class:`LambdaCorrection` - the Moriya sum-rule :math:`\lambda`-correction: a single constant per channel chosen
-  so the momentum sum of :math:`\chi^q_r` matches the local sum rule. Single-band only (a multi-orbital correction
-  would be non-unique).
+  so the momentum sum of :math:`\chi^{\mathrm{q}}_{r}` matches the local sum rule. Single-band only (a multi-orbital
+  correction would be non-unique).
 - :class:`MultiOrbitalLambdaCorrection` - the matrix-valued generalization of the sum-rule correction: a full
-  real-symmetric :math:`N_o^2\times N_o^2` mass matrix :math:`\Lambda_r` per channel, calibrated so the momentum sum
-  of :math:`\chi^q_r` matches the local sum rule component by component (a well-posed matrix root). Multi-orbital.
+  real-symmetric :math:`n_{\mathrm{o}}^2\times n_{\mathrm{o}}^2` mass matrix :math:`\Lambda_r` per channel, calibrated
+  so the momentum sum of :math:`\chi^{\mathrm{q}}_{r}` matches the local sum rule component by component (a well-posed
+  matrix root). Multi-orbital.
 - :class:`LambdaAnnealer` - the lambda-annealing convergence scaffold: a bosonic mass measured from the
   susceptibility spectrum, held per convergence phase and annealed to zero, so the final result is pure
   self-consistency. Multi-orbital-safe.
@@ -46,8 +47,8 @@ class LambdaCorrection:
     def get_lambda_start(chi_r: np.ndarray) -> float:
         r"""
         Returns the lower bound for :math:`\lambda`, i.e. the value at which the corrected susceptibility at
-        :math:`\omega = 0` would first diverge (:math:`-\min_q 1/\chi_r^{q,\omega=0}`). The search starts just
-        above it.
+        :math:`\omega = 0` would first diverge (:math:`-\min_{\mathbf{q}} 1/\chi^{(\mathbf{q},\omega=0)}_{r}`). The
+        search starts just above it.
 
         :param chi_r: Physical susceptibility in the irreducible BZ with a trailing bosonic frequency axis,
             shape ``[q, w]``.
@@ -140,7 +141,7 @@ class LambdaCorrection:
         sum-rule target is read from the saved local susceptibilities, and the determined :math:`\lambda` is
         appended to a text file.
 
-        :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{q}_{r}` to correct.
+        :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` to correct.
         :param quiet: If ``True``, the determined :math:`\lambda` is not appended to the lambda text file. Note the
             'sp' type reads the *saved* density susceptibility from file, so quiet evaluations use the last
             really-saved one.
@@ -214,14 +215,13 @@ class LambdaCorrection:
 
 class MultiOrbitalLambdaCorrection:
     r"""
-    Matrix-valued Moriya :math:`\lambda`-correction for multi-orbital ladder D\ :math:`\Gamma`\ A.
-    The single-band :class:`LambdaCorrection` shifts the scalar inverse
-    susceptibility by one number; here the mass is a full :math:`N_o^2\times N_o^2` matrix
-    :math:`\Lambda_r` added to the compound inverse susceptibility
-    :math:`(\chi^{q\omega}_{r})^{-1} \to (\chi^{q\omega}_{r})^{-1} + \Lambda_r`, calibrated so the momentum- and
-    frequency-summed corrected susceptibility matches the local (AIM) sum rule component by component -
-    :math:`N_o^2(N_o^2+1)/2` real conditions for the same number of real parameters (a well-posed matrix root
-    problem, not a rugged optimization). With ``spch`` both channels are corrected with independent
+    Matrix-valued Moriya :math:`\lambda`-correction for multi-orbital ladder D\ :math:`\Gamma`\ A. The single-band
+    :class:`LambdaCorrection` shifts the scalar inverse susceptibility by one number; here the mass is a full
+    :math:`n_{\mathrm{o}}^2\times n_{\mathrm{o}}^2` matrix :math:`\Lambda_r` added to the compound inverse
+    susceptibility :math:`(\chi^{\mathrm{q}}_{r})^{-1} \to (\chi^{\mathrm{q}}_{r})^{-1} + \Lambda_r`, calibrated so the
+    momentum- and frequency-summed corrected susceptibility matches the local (AIM) sum rule component by component -
+    :math:`n_{\mathrm{o}}^2(n_{\mathrm{o}}^2+1)/2` real conditions for the same number of real parameters (a well-posed
+    matrix root problem, not a rugged optimization). With ``spch`` both channels are corrected with independent
     :math:`\Lambda_d, \Lambda_m`.
 
     The calibration is done in complex128 (the near-singular static inversions that dominate the sum rule are
@@ -258,16 +258,16 @@ class MultiOrbitalLambdaCorrection:
     def get_lambda_start_matrix(chi_inv_static: np.ndarray) -> float:
         r"""
         Returns the scalar feasibility bound for :math:`\Lambda`: the smallest shift
-        :math:`-\min_{q}\lambda_{\min}(\mathrm{Herm}((\chi^{q,\omega=0}_r)^{-1}))` at which
-        :math:`\mathrm{Herm}((\chi^{q,\omega=0}_r)^{-1}) + \lambda\mathbb{1}` first becomes positive definite. The
-        matrix generalization of :meth:`LambdaCorrection.get_lambda_start`.
+        :math:`-\min_{\mathbf{q}}\lambda_{\min}(\mathrm{Herm}((\chi^{(\mathbf{q},\omega=0)}_{r})^{-1}))` at which
+        :math:`\mathrm{Herm}((\chi^{(\mathbf{q},\omega=0)}_{r})^{-1}) + \lambda\mathbb{1}` first becomes positive
+        definite. The matrix generalization of :meth:`LambdaCorrection.get_lambda_start`.
 
         Only the STATIC (:math:`\omega=0`) blocks are passed: the domain constraint binds at :math:`\omega=0`
         (:math:`\mathrm{Herm}(\chi^{-1})` grows like :math:`\omega^2`), while the high-frequency ladder tails, where
         :math:`\chi` is small and its inverse blows up, are not genuine poles of the collective mode and must not set
         the bound.
 
-        :param chi_inv_static: Inverse compound susceptibility at :math:`\omega=0`, shape ``[Nq, No^2, No^2]``.
+        :param chi_inv_static: Inverse compound susceptibility at :math:`\omega=0`, shape ``[nq, no^2, no^2]``.
         :return: The lower-bound shift (Newton starts just above it).
         """
         herm = 0.5 * (chi_inv_static + np.conj(np.swapaxes(chi_inv_static, -1, -2)))
@@ -276,12 +276,12 @@ class MultiOrbitalLambdaCorrection:
     @staticmethod
     def _static_gap(chi_inv_static: np.ndarray, lambda_mat: np.ndarray) -> float:
         r"""
-        Returns :math:`\min_{q}\lambda_{\min}(\mathrm{Herm}((\chi^{q,\omega=0}_r)^{-1} + \Lambda))` over the static
-        blocks - strictly positive iff :math:`\Lambda` lies in the domain where the corrected susceptibility is well
-        defined at the binding (:math:`\omega=0`) frequency.
+        Returns :math:`\min_{\mathbf{q}}\lambda_{\min}(\mathrm{Herm}((\chi^{(\mathbf{q},\omega=0)}_{r})^{-1} +
+        \Lambda))` over the static blocks - strictly positive iff :math:`\Lambda` lies in the domain where the corrected
+        susceptibility is well defined at the binding (:math:`\omega=0`) frequency.
 
-        :param chi_inv_static: Inverse compound susceptibility at :math:`\omega=0`, shape ``[Nq, No^2, No^2]``.
-        :param lambda_mat: The mass matrix :math:`\Lambda`, shape ``[No^2, No^2]``.
+        :param chi_inv_static: Inverse compound susceptibility at :math:`\omega=0`, shape ``[nq, no^2, no^2]``.
+        :param lambda_mat: The mass matrix :math:`\Lambda`, shape ``[no^2, no^2]``.
         :return: The smallest eigenvalue of the shifted Hermitian static inverse over all momenta.
         """
         shifted = chi_inv_static + lambda_mat
@@ -299,9 +299,9 @@ class MultiOrbitalLambdaCorrection:
         Both the gather and the (anti)unitary rotation commute with the compound inversion, so the slice may equally
         be the susceptibility or its cached inverse.
 
-        :param slice_irr: Compound slice over the irreducible BZ, shape ``[Nq_irr, No^2, No^2]``.
+        :param slice_irr: Compound slice over the irreducible BZ, shape ``[nq_irr, no^2, no^2]``.
         :param q_grid: The momentum grid carrying ``irrk_inv`` and the optional auto-mode orbital rotations.
-        :return: The compound slice over the full BZ, shape ``[Nq, No^2, No^2]``, same dtype as the input.
+        :return: The compound slice over the full BZ, shape ``[nq, no^2, no^2]``, same dtype as the input.
         """
         full = np.take(slice_irr, q_grid.irrk_inv.ravel(), axis=0)
         if q_grid.is_auto:
@@ -324,9 +324,10 @@ class MultiOrbitalLambdaCorrection:
     @staticmethod
     def _symmetric_basis(no2: int) -> np.ndarray:
         r"""
-        Returns an orthonormal (Frobenius) basis of the real-symmetric :math:`N_o^2\times N_o^2` matrices, flattened
-        to columns, shape ``[No^2 * No^2, No^2(No^2+1)/2]``. Newton runs in the span of this basis, so the solve is
-        restricted to the symmetric (and thereby well-posed) subspace.
+        Returns an orthonormal (Frobenius) basis of the real-symmetric
+        :math:`n_{\mathrm{o}}^2\times n_{\mathrm{o}}^2` matrices, flattened to columns, shape
+        ``[no^2 * no^2, no^2(no^2+1)/2]``. Newton runs in the span of this basis, so the solve is restricted to the
+        symmetric (and thereby well-posed) subspace.
         """
         mats = []
         for i in range(no2):
@@ -343,21 +344,21 @@ class MultiOrbitalLambdaCorrection:
     @staticmethod
     def _residual(chi_qw: np.ndarray, lambda_mat: np.ndarray, s_r: np.ndarray, beta: float, nk_tot: int, q_grid=None):
         r"""
-        Returns the real-symmetric sum-rule residual :math:`G(\Lambda) = (\beta N_q)^{-1}\sum_{q\omega}
-        (\chi^{q\omega}_r{}^{-1} + \Lambda)^{-1} - S_r` (Hermitian part, real), with the corrected susceptibility
-        evaluated in resolvent form :math:`(\mathbb{1} + \chi^{q\omega}_r\Lambda)^{-1}\chi^{q\omega}_r` so
+        Returns the real-symmetric sum-rule residual :math:`G(\Lambda) = (\beta n_{\mathbf{q}})^{-1}\sum_{\mathrm{q}}
+        (\chi^{\mathrm{q}}_{r}{}^{-1} + \Lambda)^{-1} - S_r` (Hermitian part, real), with the corrected susceptibility
+        evaluated in resolvent form :math:`(\mathbb{1} + \chi^{\mathrm{q}}_{r}\Lambda)^{-1}\chi^{\mathrm{q}}_{r}` so
         :math:`\chi^{-1}` is never formed. Bosonic frequencies are looped so the transients never exceed a single
         frequency slice; when ``q_grid`` is given the cached susceptibility lives on the irreducible wedge and each
         slice is expanded to the full BZ on the fly.
 
-        :param chi_qw: Compound susceptibility, shape ``[Nq, Nw, No^2, No^2]`` over the full BZ, or over the
+        :param chi_qw: Compound susceptibility, shape ``[nq, nw, no^2, no^2]`` over the full BZ, or over the
             irreducible wedge when ``q_grid`` is given.
-        :param lambda_mat: Current mass matrix :math:`\Lambda`, shape ``[No^2, No^2]``.
-        :param s_r: Local (AIM) sum-rule target :math:`S_r`, shape ``[No^2, No^2]``.
+        :param lambda_mat: Current mass matrix :math:`\Lambda`, shape ``[no^2, no^2]``.
+        :param s_r: Local (AIM) sum-rule target :math:`S_r`, shape ``[no^2, no^2]``.
         :param beta: Inverse temperature :math:`\beta`.
-        :param nk_tot: Number of full-BZ momenta :math:`N_q`.
+        :param nk_tot: Number of full-BZ momenta :math:`n_{\mathbf{q}}`.
         :param q_grid: The momentum grid for the per-slice full-BZ expansion (``None`` for a full-BZ input).
-        :return: The residual matrix ``G`` (real, symmetric), shape ``[No^2, No^2]``.
+        :return: The residual matrix ``G`` (real, symmetric), shape ``[no^2, no^2]``.
         """
         no2 = lambda_mat.shape[0]
         identity = np.eye(no2)
@@ -376,27 +377,28 @@ class MultiOrbitalLambdaCorrection:
     ):
         r"""
         Returns the sum-rule residual and its closed-form Newton Jacobian. With the compound
-        :math:`N_o^2\times N_o^2` object :math:`\chi^{\Lambda,q\omega} = (\chi^{q\omega}{}^{-1} + \Lambda)^{-1}`,
-        evaluated in resolvent form :math:`(\mathbb{1} + \chi^{q\omega}\Lambda)^{-1}\chi^{q\omega}` (so
-        :math:`\chi^{-1}` is never formed), and
-        :math:`\delta\chi^{\Lambda,q\omega} = -\chi^{\Lambda,q\omega}\,\delta\Lambda\,\chi^{\Lambda,q\omega}`,
+        :math:`n_{\mathrm{o}}^2\times n_{\mathrm{o}}^2` object :math:`\chi^{\Lambda,\mathrm{q}} =
+        (\chi^{\mathrm{q}}{}^{-1} + \Lambda)^{-1}`, evaluated in resolvent form :math:`(\mathbb{1} +
+        \chi^{\mathrm{q}}\Lambda)^{-1}\chi^{\mathrm{q}}` (so :math:`\chi^{-1}` is never formed), and
+        :math:`\delta\chi^{\Lambda,\mathrm{q}} = -\chi^{\Lambda,\mathrm{q}}\,\delta\Lambda\,\chi^{\Lambda,\mathrm{q}}`,
 
         .. math::
             (J)_{1234} = \frac{\partial G_{12}}{\partial \Lambda_{34}}
-                       = -\frac{1}{\beta N_q}\sum_{q\omega} \chi^{\Lambda,q\omega}_{13}\, \chi^{\Lambda,q\omega}_{42}.
+                       = -\frac{1}{\beta n_{\mathbf{q}}}\sum_{\mathrm{q}} \chi^{\Lambda,\mathrm{q}}_{13}\,
+                       \chi^{\Lambda,\mathrm{q}}_{42}.
 
         The bosonic-frequency loop bounds the transients to a single frequency slice; when ``q_grid`` is given the
         cached susceptibility lives on the irreducible wedge and each slice is expanded to the full BZ on the fly.
 
-        :param chi_qw: Compound susceptibility, shape ``[Nq, Nw, No^2, No^2]`` over the full BZ, or over the
+        :param chi_qw: Compound susceptibility, shape ``[nq, nw, no^2, no^2]`` over the full BZ, or over the
             irreducible wedge when ``q_grid`` is given.
-        :param lambda_mat: Current mass matrix :math:`\Lambda`, shape ``[No^2, No^2]``.
-        :param s_r: Local (AIM) sum-rule target :math:`S_r`, shape ``[No^2, No^2]``.
+        :param lambda_mat: Current mass matrix :math:`\Lambda`, shape ``[no^2, no^2]``.
+        :param s_r: Local (AIM) sum-rule target :math:`S_r`, shape ``[no^2, no^2]``.
         :param beta: Inverse temperature :math:`\beta`.
-        :param nk_tot: Number of full-BZ momenta :math:`N_q`.
+        :param nk_tot: Number of full-BZ momenta :math:`n_{\mathbf{q}}`.
         :param q_grid: The momentum grid for the per-slice full-BZ expansion (``None`` for a full-BZ input).
-        :return: A tuple ``(G, J)`` of the real-symmetric residual (``[No^2, No^2]``) and the real Jacobian tensor
-            (``[No^2, No^2, No^2, No^2]``).
+        :return: A tuple ``(G, J)`` of the real-symmetric residual (``[no^2, no^2]``) and the real Jacobian tensor
+            (``[no^2, no^2, no^2, no^2]``).
         """
         no2 = lambda_mat.shape[0]
         identity = np.eye(no2)
@@ -435,19 +437,19 @@ class MultiOrbitalLambdaCorrection:
         evaluations use the resolvent form :math:`(\mathbb{1} + \chi\Lambda)^{-1}\chi`, so the only inversion of the
         susceptibility itself is the single static slice the feasibility/gap machinery needs. When ``q_grid`` is
         given, ``chi_qw`` holds only the irreducible wedge and every sum-rule evaluation expands the slices to the
-        full BZ on the fly (:meth:`_expand_compound_slice_to_full_bz`) - same result, ``Nq/Nq_irr`` times less
+        full BZ on the fly (:meth:`_expand_compound_slice_to_full_bz`) - same result, ``nq/nq_irr`` times less
         resident memory.
 
-        :param chi_qw: Compound susceptibility, shape ``[Nq, Nw, No^2, No^2]`` (complex128) over the full BZ, or
+        :param chi_qw: Compound susceptibility, shape ``[nq, nw, no^2, no^2]`` (complex128) over the full BZ, or
             over the irreducible wedge when ``q_grid`` is given.
-        :param s_r: Local (AIM) sum-rule target :math:`S_r`, shape ``[No^2, No^2]``.
+        :param s_r: Local (AIM) sum-rule target :math:`S_r`, shape ``[no^2, no^2]``.
         :param beta: Inverse temperature :math:`\beta`.
-        :param nk_tot: Number of full-BZ momenta :math:`N_q`.
+        :param nk_tot: Number of full-BZ momenta :math:`n_{\mathbf{q}}`.
         :param delta: Offset of the initial guess above the feasibility bound (default :data:`_DELTA`).
         :param eps: Convergence tolerance on the Frobenius norm of the residual (default :data:`_EPS`).
         :param maxiter: Maximum number of Newton iterations (default :data:`_MAXITER`).
         :param q_grid: The momentum grid for the per-slice full-BZ expansion (``None`` for a full-BZ input).
-        :return: The converged mass matrix :math:`\Lambda_r`, shape ``[No^2, No^2]``, real symmetric.
+        :return: The converged mass matrix :math:`\Lambda_r`, shape ``[no^2, no^2]``, real symmetric.
         """
         delta = MultiOrbitalLambdaCorrection._DELTA if delta is None else delta
         eps = MultiOrbitalLambdaCorrection._EPS if eps is None else eps
@@ -504,8 +506,8 @@ class MultiOrbitalLambdaCorrection:
         Applies the matrix correction :math:`\chi_r \to (\chi_r^{-1} + \Lambda_r)^{-1}` to a stack of compound
         susceptibility blocks. The mass is broadcast over all leading (momentum/frequency) axes.
 
-        :param chi_compound: Compound susceptibility blocks, shape ``[..., No^2, No^2]`` (complex).
-        :param lambda_mat: The mass matrix :math:`\Lambda_r`, shape ``[No^2, No^2]``.
+        :param chi_compound: Compound susceptibility blocks, shape ``[..., no^2, no^2]`` (complex).
+        :param lambda_mat: The mass matrix :math:`\Lambda_r`, shape ``[no^2, no^2]``.
         :return: The corrected compound susceptibility, same shape as ``chi_compound``.
         """
         # resolvent form (1 + chi Lambda)^-1 chi: chi^-1 is never formed, so zero crossings of chi are harmless
@@ -521,10 +523,10 @@ class MultiOrbitalLambdaCorrection:
         cache; the converged (point-group-invariant) mass is then applied to the irreducible-BZ representatives,
         consistent with the downstream full-BZ mapping.
 
-        :param chi_r: Physical susceptibility :math:`\chi^{q}_{r}` in the irreducible BZ (no fermionic frequencies,
-            compressed momentum dimension). Consumed in place.
+        :param chi_r: Physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` in the irreducible BZ (no fermionic
+            frequencies, compressed momentum dimension). Consumed in place.
         :param s_r: Local (AIM) sum-rule target :math:`S_r = \beta^{-1}\sum_\omega \chi_{r,\mathrm{loc}}(i\omega)`,
-            a compound :math:`N_o^2\times N_o^2` matrix.
+            a compound :math:`n_{\mathrm{o}}^2\times n_{\mathrm{o}}^2` matrix.
         :return: A tuple of (i) the corrected susceptibility in the irreducible BZ and half bosonic frequency range,
             and (ii) the determined mass matrix :math:`\Lambda_r`.
         """
@@ -553,7 +555,7 @@ class MultiOrbitalLambdaCorrection:
         Frobenius norm is appended to a text file (unless ``quiet``). Unlike the single-band
         :meth:`LambdaCorrection.perform` this works for any number of orbitals.
 
-        :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{q}_{r}` to correct.
+        :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` to correct.
         :param quiet: If ``True``, the determined mass is not appended to the lambda text file (no file writes
             outside the run's regular per-iteration output).
         :return: The :math:`\lambda`-corrected physical susceptibility.
@@ -589,10 +591,11 @@ class MultiOrbitalLambdaCorrection:
     def _density_diagonal_sum(chi_r: FourPoint) -> np.ndarray:
         r"""
         Returns the density-diagonal, momentum- and frequency-summed corrected susceptibility per orbital,
-        :math:`C_{r;1} = (\beta N_q)^{-1} \sum_{q\omega} \chi^{q\omega}_{r;1111}` (the compound-diagonal entries
-        :math:`(11)(11)`), evaluated over the FULL BZ. Operates on a copy, so ``chi_r`` is not mutated.
+        :math:`C_{r;1} = (\beta n_{\mathbf{q}})^{-1} \sum_{\mathrm{q}} \chi^{\mathrm{q}}_{r;1111}` (the
+        compound-diagonal entries :math:`(11)(11)`), evaluated over the FULL BZ. Operates on a copy, so ``chi_r`` is not
+        mutated.
 
-        :param chi_r: The corrected physical susceptibility :math:`\chi^{q}_{r}` in the irreducible BZ.
+        :param chi_r: The corrected physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` in the irreducible BZ.
         :return: The real array :math:`C_{r;a}`, shape ``[n_bands]``.
         """
         n_bands = chi_r.n_bands
@@ -615,7 +618,7 @@ class MultiOrbitalLambdaCorrection:
         susceptibility has already been saved. Skipped when the occupation metadata or the saved density
         susceptibility is unavailable.
 
-        :param chi_magn: The freshly corrected magnetic susceptibility :math:`\chi^{q}_{m}` (irreducible BZ).
+        :param chi_magn: The freshly corrected magnetic susceptibility :math:`\chi^{\mathrm{q}}_{m}` (irreducible BZ).
         :return: None.
         """
         dens_path = os.path.join(config.output.output_path, "chi_phys_q_dens.npy")
@@ -709,7 +712,7 @@ class LambdaAnnealer:
         Measures the channel's static boson gap (unless ``measure`` is False) and, if the shared mass is nonzero,
         adds it to the compound diagonal of the inverse susceptibility at all bosonic frequencies.
 
-        :param chi_phys_q_r: The physical susceptibility :math:`\chi^{q\omega}_{r;1234}` (no fermionic frequency
+        :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r;1234}` (no fermionic frequency
             dimensions).
         :param mpi_dist_irrq: The irreducible-BZ distributor (the measured gap is reduced over ranks).
         :param measure: If ``True``, (re-)measure and store the static gap; ``False`` applies the mass only.
@@ -737,7 +740,7 @@ class LambdaAnnealer:
     def _static_gap(chi_phys_q_r: FourPoint, mpi_dist_irrq: MpiDistributor) -> float:
         r"""
         Returns the smallest eigenvalue of the Hermitian part of the static inverse compound susceptibility
-        :math:`(\chi^{q(\omega=0)}_{r;1234})^{-1}` over all momenta, reduced with ``MPI.MIN`` across ranks.
+        :math:`(\chi^{(\mathbf{q},\omega=0)}_{r;1234})^{-1}` over all momenta, reduced with ``MPI.MIN`` across ranks.
         """
         w0 = chi_phys_q_r.niw if chi_phys_q_r.full_niw_range else 0
         n = chi_phys_q_r.n_bands**2

@@ -254,7 +254,7 @@ class W2dynInterface(DMFTInterface):
     def get_giw(self, ineq: int = 1, dmft_iter: str = "dmft-last") -> GreensFunction:
         """
         Returns the spin-averaged one-particle Green's function from DMFT, extended to a diagonal orbital matrix of
-        shape ``[nbands, nbands, 2*niv_dmft]``.
+        shape ``[1, 1, 1, nbands, nbands, 2*niv_dmft]``.
 
         :param ineq: The index of the inequivalent atom (for multi-site DMFT).
         :param dmft_iter: The DMFT iteration to read from.
@@ -262,7 +262,7 @@ class W2dynInterface(DMFTInterface):
         """
         giw = self.file_1p[self._ineq_group(ineq, dmft_iter) + "/giw/value"][()]  # [band, spin, niv]
         giw = np.mean(giw, axis=1)  # mean over spin
-        return GreensFunction(self._extend_orbital(giw), nk=config.lattice.nk, beta=config.sys.beta)
+        return GreensFunction(self._extend_orbital(giw)[None, None, None, ...], beta=config.sys.beta)
 
     def get_siw(self, ineq: int = 1, dmft_iter: str = "dmft-last") -> SelfEnergy:
         """

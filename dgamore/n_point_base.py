@@ -21,7 +21,7 @@ import scipy as sp
 
 from dgamore.brillouin_zone import KGrid
 
-# Global storage precision for all N-point quantities. Switch this single constant to np.complex128 for double
+# Global storage precision for all n-point quantities. Switch this single constant to np.complex128 for double
 # precision (doubling memory). All IHaveMat-derived objects store .mat in this dtype; also exposed as IHaveMat.DTYPE.
 DTYPE = np.complex64
 
@@ -564,8 +564,8 @@ class IAmNonLocal(IHaveMat, ABC):
         r"""
         Shifts all momenta by the given values and returns a copy of the object with a decompressed momentum dimension.
 
-        :param q: The momentum shift :math:`\vec{q}` as integer grid offsets ``(qx, qy, qz)``.
-        :return: A copy shifted by :math:`\vec{q}`, in the same momentum-compression state as ``self``.
+        :param q: The momentum shift :math:`\mathbf{q}` as integer grid offsets ``(qx, qy, qz)``.
+        :return: A copy shifted by :math:`\mathbf{q}`, in the same momentum-compression state as ``self``.
         """
         copy = self._clone_without_mat()
         copy.mat = self.mat  # shared reference; np.roll below allocates a fresh array, leaving self.mat untouched
@@ -633,7 +633,7 @@ class IAmNonLocal(IHaveMat, ABC):
     def reduce_q(self, q_list: np.ndarray):
         r"""
         Reduces the object to the given list of momenta and returns a copy with a compressed momentum dimension. Acts
-        like a filter. Makes it possible to use e.g. only the :math:`\vec{q}=0` component of a non-local object or
+        like a filter. Makes it possible to use e.g. only the :math:`\mathbf{q}=0` component of a non-local object or
         filter the irreducible Brillouin zone from an object in the full Brillouin zone.
 
         :param q_list: Array of momentum grid indices to keep, shape ``[3, n_q]`` (one column per momentum).
@@ -664,7 +664,7 @@ class IAmNonLocal(IHaveMat, ABC):
 
     def find_q(self, q: tuple[int, int, int] = (0, 0, 0)):
         r"""
-        Finds the matrix element for a single momentum :math:`\vec{q}` and returns a compressed copy.
+        Finds the matrix element for a single momentum :math:`\mathbf{q}` and returns a compressed copy.
 
         :param q: The momentum grid index ``(qx, qy, qz)`` to select.
         :return: A compressed copy containing only the requested momentum (``nq = (1, 1, 1)``).
@@ -721,7 +721,7 @@ class IAmNonLocal(IHaveMat, ABC):
 
         For each axis the method chooses automatically:
           * if the target is a sub-lattice of the source (``n_new`` divides ``n_old``), the exact
-            :math:`\Sigma(\vec{q})` at the retained points is obtained by striding -- no band-limiting;
+            :math:`\Sigma(\mathbf{q})` at the retained points is obtained by striding -- no band-limiting;
           * otherwise (upsampling or incommensurate downsampling) a band-limited Fourier
             interpolation (FFT -> pad/truncate spectrum -> iFFT, with symmetric Nyquist handling) is used.
 
@@ -780,13 +780,14 @@ class IAmNonLocal(IHaveMat, ABC):
         value to all its symmetry-equivalent FBZ images via ``k_grid.irrk_inv``. Then applies the
         per-k orbital transformation stored on ``k_grid`` by ``specify_auto_symmetries(hk)``.
 
-        The orbital transformation follows the ket/bra convention of the operator ordering
-        :math:`G_{1234} := \langle T[c_1 c^\dagger_2 c_3 c^\dagger_4]\rangle` -- annihilation indices
-        (positions 1, 3) transform with :math:`U`, creation indices (positions 2, 4) with :math:`U^\dagger` --
-        combined with a per-k antisymmetry sign :math:`\sigma_k` and an optional complex conjugation ``conj_k``:
+        The orbital transformation follows the ket/bra convention of the operator ordering :math:`G_{1234} := \langle
+        T[c_1 c^\dagger_2 c_3 c^\dagger_4]\rangle` -- annihilation indices (positions 1, 3) transform with :math:`U`,
+        creation indices (positions 2, 4) with :math:`U^\dagger` -- combined with a per-k antisymmetry sign
+        :math:`\sigma_{\mathbf{k}}` and an optional complex conjugation ``conj_k``:
 
-            2-index : :math:`M_{12}(k)   = \sigma_k     \, U_{1a} [M_{ab}(k_{rep})]^{[*conj_k]} U^\dagger_{b2}`
-            4-index : :math:`M_{1234}(k) = \sigma_k^2 \, U_{1a} [M_{abcd}(k_{rep})]^{[*conj_k]} U^\dagger_{b2} U_{3c} U^\dagger_{d4}`
+            2-index : :math:`M_{12}(\mathbf{k}) = \sigma_{\mathbf{k}}\, U_{1a} [M_{ab}(\mathbf{k}_{\mathrm{rep}})]^{[*conj_k]} U^\dagger_{b2}`
+
+            4-index : :math:`M_{1234}(\mathbf{k}) = \sigma_{\mathbf{k}}^2\, U_{1a} [M_{abcd}(\mathbf{k}_{\mathrm{rep}})]^{[*conj_k]} U^\dagger_{b2} U_{3c} U^\dagger_{d4}`
 
         If ``k_grid`` is not yet in auto mode (``specify_auto_symmetries`` has not been called),
         only the momentum expansion is performed and orbital indices are left unchanged.
@@ -867,7 +868,7 @@ class IAmNonLocal(IHaveMat, ABC):
 
     def flip_momentum_axis(self, copy: bool = True):
         r"""
-        Flips the momentum axis :math:`F^{q}\to F^{-q}` of the object and returns a copy if specified.
+        Flips the momentum axis :math:`F^{\mathbf{q}}\to F^{-\mathbf{q}}` of the object and returns a copy if specified.
 
         :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
         :return: The momentum-flipped object, in the same momentum-compression state as the input.
@@ -887,8 +888,8 @@ class IAmNonLocal(IHaveMat, ABC):
 
     def _align_q_dimensions_for_operations(self, other: "IAmNonLocal"):
         """
-        Helper method which adapts the frequency dimensions of two non-local objects to fit each other for
-        addition or multiplication.
+        Brings the momentum layouts of two non-local objects onto the same (compressed) footing before an addition
+        or multiplication.
 
         :param other: The other non-local object to align with ``self``.
         :return: ``other``, compressed if necessary to match ``self``'s momentum layout.

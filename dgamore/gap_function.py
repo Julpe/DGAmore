@@ -41,3 +41,26 @@ class GapFunction(TwoPoint, IHaveChannel):
         """
         TwoPoint.__init__(self, mat, nk, full_niv_range, has_compressed_q_dimension)
         IHaveChannel.__init__(self, channel, FrequencyNotation.PP)
+
+    @staticmethod
+    def load(
+        filename: str,
+        channel: SpinChannel = SpinChannel.NONE,
+        nk: tuple[int, int, int] = (1, 1, 1),
+        full_niv_range: bool = True,
+        has_compressed_q_dimension: bool = False,
+    ) -> "GapFunction":
+        r"""
+        Loads a :class:`GapFunction` from a ``.npy`` file.
+
+        :param filename: Path to the ``.npy`` file (loaded with ``allow_pickle=False``).
+        :param channel: Pairing channel, i.e. singlet or triplet (see :class:`SpinChannel`).
+        :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+        :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
+        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[k, ...]``
+            (True) or as three separate axes ``[kx, ky, kz, ...]`` (False).
+        :return: The loaded :class:`GapFunction`.
+        """
+        return GapFunction(
+            np.load(filename, allow_pickle=False), channel, nk, full_niv_range, has_compressed_q_dimension
+        )

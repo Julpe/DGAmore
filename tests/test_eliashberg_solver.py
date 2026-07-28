@@ -95,7 +95,7 @@ def _make_pp_chi_and_bubble(
     rng = np.random.default_rng(seed)
     g_mat = rng.standard_normal((o, o, 2 * (niv_pp + 2))) + 1j * rng.standard_normal((o, o, 2 * (niv_pp + 2)))
     g_mat = 0.5 * (g_mat + g_mat.transpose(1, 0, 2)) + 2.0 * np.eye(o)[:, :, None]
-    g = GreensFunction(g_mat)
+    g = GreensFunction(g_mat[None, None, None, ...])
     chi0 = BubbleGenerator.create_generalized_chi0_pp_w0(g, niv_pp, beta).extend_vn_to_diagonal()
     shape = (o, o, o, o, 1, 2 * niv_pp, 2 * niv_pp)
     chi_mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
@@ -233,7 +233,7 @@ def test_local_gamma_ud_pp_w0_satisfies_pp_bse(o):
 
     chi = chi_obj.mat[:, :, :, :, 0].astype(np.complex128)
     chi0 = chi0_obj.mat[:, :, :, :, 0].astype(np.complex128)
-    gv = g.mat[:, :, 2:-2].astype(np.complex128)
+    gv = g.mat[0, 0, 0][:, :, 2:-2].astype(np.complex128)
     gm = gv[:, :, ::-1]
     chi0_j = np.einsum("abcdvp->adcbvp", chi0)[..., ::-1]
     assert np.allclose(chi0_j, -beta * np.einsum("abv,cdv,vp->abcdvp", gv, gm, np.eye(n2)[:, ::-1]), atol=1e-4)
@@ -1065,9 +1065,9 @@ def _assemble_two_atom_system(niv_pp: int, beta: float) -> tuple:
     chi_full = np.zeros((3, 3, 3, 3, 1, n2, n2), dtype=complex)
     chi_full[:1, :1, :1, :1] = chi_a.mat
     chi_full[1:, 1:, 1:, 1:] = chi_b.mat
-    g_full = np.zeros((3, 3, nvg), dtype=complex)
-    g_full[:1, :1] = g_a.mat
-    g_full[1:, 1:] = g_b.mat
+    g_full = np.zeros((1, 1, 1, 3, 3, nvg), dtype=complex)
+    g_full[..., :1, :1, :] = g_a.mat
+    g_full[..., 1:, 1:, :] = g_b.mat
     chi_full_obj = LocalFourPoint(chi_full, SpinChannel.UD, 1, 2, True, True, FrequencyNotation.PP)
     return chi_full_obj, GreensFunction(g_full), (chi_a, g_a), (chi_b, g_b)
 

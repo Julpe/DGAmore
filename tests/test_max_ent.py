@@ -222,6 +222,38 @@ def test_perform_maxent_giwk_unfolds_symmetry_equivalent_kpoints(tmp_path, patch
         assert np.allclose(spectrum[k], spectrum[flat_rep[k]], atol=1e-6)
 
 
+def test_perform_maxent_giwk_returns_a_decompressed_momentum_dimension(tmp_path, patch_maxent_mpi):
+    """perform_maxent_giwk hands back three separate momentum axes, the layout perform_maxent_dmft also uses."""
+    nk, n_bands, w_count = (4, 4, 1), 2, 5
+    _setup_maxent_config(tmp_path, nk, n_bands, w_count=w_count, seed=8)
+    mat = _build_giwk_mat(nk, n_bands, niv=4, seed=29)
+
+    def fn(comm, rank):
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
+
+    _, results = run_parallel(1, fn)
+    assert results[0].shape == (*nk, n_bands, w_count)
+
+
+def test_perform_maxent_giwk_writes_one_file_per_continued_quantity(tmp_path, patch_maxent_mpi, monkeypatch):
+    """perform_maxent_giwk names the output after the continued quantity, so a second continuation cannot clobber it."""
+    nk, n_bands = (4, 4, 1), 2
+    _setup_maxent_config(tmp_path, nk, n_bands, seed=9)
+    mat = _build_giwk_mat(nk, n_bands, niv=4, seed=31)
+    saver = MagicMock()
+    monkeypatch.setattr(np, "save", saver)
+
+    for label in ("DGA", "DMFT"):
+
+        def fn(comm, rank, label=label):
+            return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), label, comm)
+
+        run_parallel(1, fn)
+
+    written = [str(call.args[0]).rsplit("/", maxsplit=1)[-1] for call in saver.call_args_list]
+    assert written == ["spectral_function_dga.npy", "spectral_function_dmft.npy"]
+
+
 def test_perform_maxent_giwk_failed_continuation_logs_kpoint_and_yields_zeros(tmp_path, monkeypatch):
     """perform_maxent_giwk logs a per-k-point error (not a stack trace) and yields zeros when continuation raises."""
     nk, n_bands, w_count = (4, 4, 1), 2, 6

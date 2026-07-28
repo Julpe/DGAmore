@@ -25,16 +25,16 @@ class InteractionConfig:
     Stores the interaction parameters. Currently only ``udd``, ``vdd``, ``jdd`` are used (local and Kanamori-type
     interactions); the remaining parameters are reserved for future use.
 
-    :ivar float udd: Intra-orbital Hubbard interaction :math:`U_{dd}` on the d orbitals.
+    :ivar float udd: Intra-orbital Hubbard interaction :math:`U_{\mathrm{dd}}` on the d orbitals.
     :ivar float udp: Inter-orbital d-p Hubbard interaction.
-    :ivar float upp: Intra-orbital Hubbard interaction :math:`U_{pp}` on the p orbitals.
+    :ivar float upp: Intra-orbital Hubbard interaction :math:`U_{\mathrm{pp}}` on the p orbitals.
     :ivar float uppod: Off-diagonal p-p Hubbard interaction.
-    :ivar float jdd: Hund's exchange :math:`J_{dd}` on the d orbitals.
+    :ivar float jdd: Hund's exchange :math:`J_{\mathrm{dd}}` on the d orbitals.
     :ivar float jdp: Inter-orbital d-p exchange.
-    :ivar float jpp: Hund's exchange :math:`J_{pp}` on the p orbitals.
+    :ivar float jpp: Hund's exchange :math:`J_{\mathrm{pp}}` on the p orbitals.
     :ivar float jppod: Off-diagonal p-p exchange.
-    :ivar float vdd: Inter-orbital interaction :math:`V_{dd}` on the d orbitals.
-    :ivar float vpp: Inter-orbital interaction :math:`V_{pp}` on the p orbitals.
+    :ivar float vdd: Inter-orbital interaction :math:`V_{\mathrm{dd}}` on the d orbitals.
+    :ivar float vpp: Inter-orbital interaction :math:`V_{\mathrm{pp}}` on the p orbitals.
     """
 
     def __init__(self):
