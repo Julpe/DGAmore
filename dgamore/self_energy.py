@@ -5,10 +5,10 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Single-particle self-energy. :class:`SelfEnergy` wraps the (possibly momentum-dependent) self-energy
-:math:`\Sigma_{12}(k, \nu)` and provides its high-frequency moments (:math:`\Sigma_\infty` and the
-:math:`1/\imath\nu` coefficient), tools to estimate the core frequency box, to append the analytic asymptotic
-tail beyond the core, to polynomial-fit the tail, and to interpolate the self-energy between temperatures. The
-moments are obtained by fitting the highest available Matsubara frequencies.
+:math:`\Sigma^{\mathrm{k}}_{12}` and provides its high-frequency moments (:math:`\Sigma_\infty` and the
+:math:`1/\imath\nu` coefficient), tools to estimate the core frequency box, to append the analytic asymptotic tail
+beyond the core, to polynomial-fit the tail, and to interpolate the self-energy between temperatures. The moments are
+obtained by fitting the highest available Matsubara frequencies.
 """
 
 import itertools as it
@@ -22,7 +22,7 @@ from dgamore.two_point import TwoPoint
 
 class SelfEnergy(TwoPoint):
     r"""
-    The (possibly momentum-dependent) single-particle self-energy :math:`\Sigma_{12}(k, \nu)`. On top of the
+    The (possibly momentum-dependent) single-particle self-energy :math:`\Sigma^{\mathrm{k}}_{12}`. On top of the
     two-point orbital bookkeeping inherited from :class:`LocalTwoPoint` it provides the high-frequency moments
     (:math:`\Sigma_\infty` and the :math:`1/\imath\nu` coefficient), an estimate of the core frequency box, the
     construction/append of the analytic asymptotic tail beyond the core, a polynomial tail fit, and the
@@ -384,3 +384,27 @@ class SelfEnergy(TwoPoint):
             self.nq
         )[..., None, None, None]
         return SelfEnergy(asympt, self.nq, beta=self._beta)
+
+    @staticmethod
+    def load(
+        filename: str,
+        nk: tuple[int, int, int] = (1, 1, 1),
+        full_niv_range: bool = True,
+        has_compressed_q_dimension: bool = False,
+        beta: float = None,
+    ) -> "SelfEnergy":
+        r"""
+        Loads a :class:`SelfEnergy` from a ``.npy`` file. The default momentum layout is the decompressed one the
+        two-point objects are written in; a purely local self-energy is stored as ``[o1, o2, v]`` and needs no grid.
+
+        :param filename: Path to the ``.npy`` file (loaded with ``allow_pickle=False``).
+        :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+        :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
+        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[k, ...]``
+            (True) or as three separate axes ``[kx, ky, kz, ...]`` (False).
+        :param beta: Inverse temperature :math:`\beta` used for the Matsubara frequencies in the moment fit.
+        :return: The loaded :class:`SelfEnergy`.
+        """
+        return SelfEnergy(
+            np.load(filename, allow_pickle=False), nk, full_niv_range, has_compressed_q_dimension, beta=beta
+        )

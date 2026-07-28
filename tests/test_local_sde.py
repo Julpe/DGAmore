@@ -60,6 +60,41 @@ def _local_chain_inputs(o=2, nw=3, niv=3, beta=12.5, seed=51):
     return gchi_r, gchi0_inv, u_loc
 
 
+@pytest.mark.parametrize("builder", ["vrg", "gamma"])
+def test_local_self_energies_carry_a_single_momentum_dimension(builder):
+    """The locally computed self-energies descend from TwoPoint, so they carry ``[1, 1, 1]`` momentum axes."""
+    import dgamore.config as config
+    from dgamore.greens_function import GreensFunction
+    from dgamore.interaction import LocalInteraction
+    from dgamore.local_four_point import LocalFourPoint
+
+    o, niw, niv = 2, 3, 4
+    config.sys.beta = 10.0
+    config.box.niw_core, config.box.niv_core = niw, niv
+    config.sys.occ_dmft = np.eye(o) * 0.5
+    rng = np.random.default_rng(17)
+
+    def four_point(num_vn):
+        shape = (o, o, o, o, niw + 1) + (2 * niv,) * num_vn
+        return LocalFourPoint(
+            rng.standard_normal(shape) + 1j * rng.standard_normal(shape), SpinChannel.DENS, 1, num_vn, False, True
+        )
+
+    g_mat = rng.standard_normal((o, o, 4 * (niw + niv))) + 1j * rng.standard_normal((o, o, 4 * (niw + niv)))
+    g_dmft = GreensFunction(g_mat[None, None, None, ...], beta=config.sys.beta)
+    u_loc = LocalInteraction(rng.standard_normal((o,) * 4), SpinChannel.NONE)
+
+    if builder == "vrg":
+        sigma = local_sde.get_loc_self_energy_vrg(
+            four_point(1), four_point(1), four_point(0), four_point(0), g_dmft, u_loc
+        )
+    else:
+        sigma = local_sde.get_loc_self_energy_gamma_abinitio_dga(four_point(1), u_loc, g_dmft)
+
+    assert sigma.current_shape[:3] == (1, 1, 1)
+    assert sigma.current_shape[3:5] == (o, o)
+
+
 def test_create_auxiliary_chi_matches_two_block_expression():
     """The fused local auxiliary susceptibility matches (chi0^-1 + (Gamma-U)/beta^2)^-1 and leaves gamma untouched."""
     import dgamore.config as config
@@ -83,7 +118,7 @@ def test_create_gamma_r_with_shell_correction_matches_two_block_expression():
 
     rng = np.random.default_rng(53)
     g_mat = rng.standard_normal((2, 2, 24)) + 1j * rng.standard_normal((2, 2, 24))
-    gchi0 = BubbleGenerator.create_generalized_chi0(GreensFunction(g_mat), 2, 6, config.sys.beta)
+    gchi0 = BubbleGenerator.create_generalized_chi0(GreensFunction(g_mat[None, None, None, ...]), 2, 6, config.sys.beta)
     gchi_before = gchi_r.mat.copy()
 
     beta = config.sys.beta
@@ -116,7 +151,9 @@ def test_create_full_vertex_from_gamma_matches_batched_expression():
         rng.standard_normal(gamma_shape) + 1j * rng.standard_normal(gamma_shape), SpinChannel.DENS, 1, 2, False, True
     )
     g_mat = rng.standard_normal((o, o, 2 * (niv_full + nw))) + 1j * rng.standard_normal((o, o, 2 * (niv_full + nw)))
-    gchi0 = BubbleGenerator.create_generalized_chi0(GreensFunction(g_mat), nw - 1, niv_full, beta).take_vn_diagonal()
+    gchi0 = BubbleGenerator.create_generalized_chi0(
+        GreensFunction(g_mat[None, None, None, ...]), nw - 1, niv_full, beta
+    ).take_vn_diagonal()
     u_loc = LocalInteraction(rng.standard_normal((o,) * 4), SpinChannel.NONE)
     gamma_before = gamma_r.mat.copy()
 

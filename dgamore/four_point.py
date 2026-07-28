@@ -4,12 +4,12 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
-Momentum-dependent four-point objects. :class:`FourPoint` extends :class:`LocalFourPoint` with one momentum axis
-(see :class:`IAmNonLocal`) to represent quantities such as the ladder susceptibility
-:math:`\chi_{1234}^{q\omega\nu\nu'}` and vertex :math:`F^{q}` over the (irreducible) BZ. The arithmetic and
-compound-index machinery mirrors :class:`LocalFourPoint` but accounts for the extra momentum dimension; these
-operations are the performance and memory bottleneck of the non-local ladder DGA step, so several variants are
-provided that trade speed for footprint. Notation mirrors the thesis (Chapters 3 & 4).
+Momentum-dependent four-point objects. :class:`FourPoint` extends :class:`LocalFourPoint` with one momentum axis (see
+:class:`IAmNonLocal`) to represent quantities such as the ladder susceptibility :math:`\chi^{\mathrm{q}\nu\nu'}_{1234}`
+and vertex :math:`F^{\mathrm{q}}` over the (irreducible) BZ. The arithmetic and compound-index machinery mirrors
+:class:`LocalFourPoint` but accounts for the extra momentum dimension; these operations are the performance and memory
+bottleneck of the non-local ladder DGA step, so several variants are provided that trade speed for footprint. Notation
+mirrors the thesis (Chapters 3 & 4).
 """
 
 import gc
@@ -25,9 +25,9 @@ from dgamore.n_point_base import IAmNonLocal, SpinChannel, FrequencyNotation, DT
 
 class FourPoint(IAmNonLocal, LocalFourPoint):
     """
-    This class is used to represent a non-local four-point object in a given channel with one momentum dimension,
-    four orbital dimensions and variable bosonic and fermionic frequency dimensions. Calculations using these objects
-    are the bottleneck of the DGA algorithm and need to be optimized for performance and memory usage.
+    A non-local four-point object in a given channel, carrying one momentum dimension, four orbital dimensions and
+    a variable number of bosonic and fermionic frequency dimensions. Calculations on these objects are the
+    bottleneck of the DGA algorithm, so they have to stay fast and memory-lean.
     """
 
     def __init__(
@@ -407,11 +407,10 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
     def _add(self, other, subtract: bool = False, copy: bool = True) -> "FourPoint":
         """
-        Helper method that allows for addition of FourPoint objects and other FourPoint, LocalFourPoint, Interaction or
-        LocalInteraction objects. Additions with numpy arrays, floats, ints or complex numbers are also supported.
-        Depending on the number of frequency and momentum dimensions, the vertices have to be added slightly different.
-        If the objects have different niw ranges, they will be converted to the half niw range before the addition.
-        Objects will always be returned in the half niw range to save memory.
+        Adds a FourPoint, LocalFourPoint, Interaction or LocalInteraction object (or a numpy array, float, int or
+        complex number) to this one. How the vertices are added depends on their frequency and momentum dimensions.
+        Operands with different niw ranges are first brought to the half niw range, and the result stays in the half
+        niw range to save memory.
 
         :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, :class:`LocalInteraction`,
             numpy array, or number. Local operands are broadcast over the momentum axis.
@@ -566,11 +565,10 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
     def sub(self, other, copy: bool = True) -> "FourPoint":
         """
-        Helper method that allows for subtraction of FourPoint objects and other FourPoint, LocalFourPoint, Interaction or
-        LocalInteraction objects. Subtractions with numpy arrays, floats, ints or complex numbers are also supported.
-        Depending on the number of frequency and momentum dimensions, the vertices have to be subtracted slightly different.
-        If the objects have different niw ranges, they will be converted to the half niw range before the subtraction.
-        Objects will always be returned in the half niw range to save memory.
+        Subtracts a FourPoint, LocalFourPoint, Interaction or LocalInteraction object (or a numpy array, float, int
+        or complex number) from this one. How the vertices are subtracted depends on their frequency and momentum
+        dimensions. Operands with different niw ranges are first brought to the half niw range, and the result stays
+        in the half niw range to save memory.
 
         :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, :class:`LocalInteraction`,
             numpy array, or number.
@@ -584,11 +582,12 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
     def mul(self, other) -> "FourPoint":
         r"""
-        Allows for the multiplication with a number, a numpy array or another FourPoint object. This is different from
-        the :meth:`matmul` method, which is used for matrix multiplication.
-        In the case the other object is a FourPoint object, we require that both objects have only one fermionic
-        frequency dimension, such that :math:`\sum_{ab} A_{12ab}^{q\nu} * B_{ba34}^{q\nu'} = C_{1234}^{q\nu\nu'}`. This is needed to
-        construct the full vertex, see Eq. (3.139) in my thesis. Returns the object in the half niw range.
+        Multiplies the object by a scalar/array (element-wise) or by another :class:`FourPoint`. Note this is **not**
+        a matrix product (see :meth:`matmul`): for two four-point operands, each with a single fermionic frequency,
+        it forms :math:`\sum_{ab} A^{\mathrm{q}\nu}_{12ab} \, B^{\mathrm{q}\nu'}_{ba34} =
+        C^{\mathrm{q}\nu\nu'}_{1234}`, contracting the inner orbitals while keeping both fermionic frequencies as
+        separate axes. This product builds the full vertex, see Eq. (3.139) in my thesis. Returns the object in the
+        half niw range.
 
         :param other: A number, numpy array, or :class:`FourPoint`.
         :return: A new :class:`FourPoint` (in the half niw range for the four-point case).
@@ -622,12 +621,11 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
     def matmul(self, other, left_hand_side: bool = True) -> "FourPoint":
         """
-        Helper method that allows for a matrix multiplication between FourPoint and FourPoint, LocalFourPoint,
-        Interaction and LocalInteraction objects. Depending on the number of frequency and momentum dimensions,
-        the objects have to be multiplied differently. The use of einsum is very crucial for memory efficiency here,
-        as a regular matrix multiplication in compound index space would create large intermediate arrays if one of both
-        partaking objects has less than two fermionic frequency dimensions. Result objects will always be returned in
-        half of their niw range to save memory.
+        Matrix-multiplies this object with a FourPoint, LocalFourPoint, Interaction or LocalInteraction operand. How
+        the product is wired depends on the frequency and momentum dimensions of the two operands. einsum is
+        essential for memory here: a plain matrix multiplication in compound index space would build large
+        intermediates whenever one of the operands has fewer than two fermionic frequency dimensions. The result
+        comes back in half its niw range to save memory.
 
         :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, or :class:`LocalInteraction`.
             Local operands are broadcast over the momentum axis.
@@ -845,8 +843,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
     def invert_and_sum_over_last_vn_v2(self, beta: float):
         r"""
-        Helper method that explicitly handles the calculation of the sum over the auxiliary susceptibility while
-        being highly memory-efficient. Rather than inverting the full compound matrix, each momentum and bosonic
+        Computes the sum over the auxiliary susceptibility with a very small memory footprint. Rather than inverting
+        the full compound matrix, each momentum and bosonic
         frequency slice is LU-factorized in place (``scipy.linalg.lu_factor`` with ``overwrite_a``) and only the
         :math:`o^2` right-hand sides that select the last-fermionic-frequency sum grouped by :math:`(o_4, o_3)` are
         back-substituted. The single compound slice held live per iteration keeps the peak footprint far below the

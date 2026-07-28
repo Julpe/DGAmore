@@ -627,7 +627,7 @@ class MpiDistributor:
 
     def send_to_rank(self, obj, dest: int, base_tag: int = 0):
         """
-        Sends an N-point-like object to a single rank. The large ``.mat`` array is sent as raw chunks (to avoid
+        Sends an n-point-like object to a single rank. The large ``.mat`` array is sent as raw chunks (to avoid
         holding a full pickle blob in memory), while the rest of the object is pickled into a small metadata blob.
 
         :param obj: The object to send; must expose a ``.mat`` numpy array attribute.
@@ -693,7 +693,7 @@ class MpiDistributor:
 
     def bcast_npoint(self, obj, root: int = 0):
         """
-        Broadcasts an N-point-like object (one exposing a ``.mat`` numpy array) from ``root`` to all ranks. The large
+        Broadcasts an n-point-like object (one exposing a ``.mat`` numpy array) from ``root`` to all ranks. The large
         ``.mat`` is broadcast as raw sub-2 GB chunks (so there is no multi-gigabyte pickle blob and no >2 GB message),
         while the rest of the object travels as a small pickled metadata blob - the broadcast analog of
         :meth:`send_to_rank`/:meth:`recv_from_rank`. Prefer this over :meth:`bcast` for large objects such as a

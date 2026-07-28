@@ -4,7 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 """
-Base class for all local (momentum-independent) N-point quantities. :class:`LocalNPoint` adds the orbital and
+Base class for all local (momentum-independent) n-point quantities. :class:`LocalNPoint` adds the orbital and
 frequency-axis bookkeeping (number of orbital/bosonic/fermionic axes, full vs. half frequency ranges) and the
 shared frequency transformations (cut, diagonal extension, full/half range conversion, orbital symmetrization)
 on top of :class:`IHaveMat`.

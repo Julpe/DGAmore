@@ -105,10 +105,10 @@ class MFHelper:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         r"""
         Returns the index arrays that map a particle-hole quantity onto the :math:`\omega = 0` particle-particle
-        notation, i.e. the :math:`(\omega', \nu_1', \nu_2')` indices such that
-        :math:`F_{pp}[\omega, \nu_1, \nu_2] = F_{ph}[\omega', \nu_1', \nu_2']` with the frequency shift
-        :math:`(\omega = 0, \nu_1, \nu_2) \to (\nu_1 + \nu_2, \nu_1, \nu_2)`. The returned arrays are already
-        offset so they can be used to index directly into the full (positive-and-negative) ph frequency axes.
+        notation, i.e. the :math:`(\omega', \nu_1', \nu_2')` indices such that :math:`F_{\mathrm{pp}}[\omega, \nu_1,
+        \nu_2] = F_{\mathrm{ph}}[\omega', \nu_1', \nu_2']` with the frequency shift :math:`(\omega = 0, \nu_1, \nu_2)
+        \to (\nu_1 + \nu_2, \nu_1, \nu_2)`. The returned arrays are already offset so they can be used to index directly
+        into the full (positive-and-negative) ph frequency axes.
 
         :param niw: Half-width of the bosonic frequency box of the source ph quantity.
         :param niv: Half-width of the fermionic frequency box of the source ph quantity.

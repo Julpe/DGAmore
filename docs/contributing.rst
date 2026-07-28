@@ -114,6 +114,27 @@ All prose and identifiers use **American English** (``normalize``, ``color``, ``
 the code, in docstrings and comments, and in the documentation. The spell-checking job in CI runs with the ``en-us``
 locale, so British spellings are reported as typos.
 
+Formulas in docstrings, comments and documentation follow one notation for momenta and frequencies:
+
+- An **upright** :math:`\mathrm{q}` and :math:`\mathrm{k}` are the compound momentum-frequency indices
+  :math:`\mathrm{q} = (\mathbf{q}, \omega)` and :math:`\mathrm{k} = (\mathbf{k}, \nu)`. Lattice quantities carry them
+  as a superscript, and the frequency they already contain is not repeated: write
+  :math:`\chi^{\mathrm{q}\nu}_{0;1234}` (one free fermionic index left over), :math:`G^{\mathrm{k}}_{12}` and
+  :math:`\Sigma^{\mathrm{k}}_{12}`. A sum over such an index, :math:`\sum_{\mathrm{q}}`, runs over momentum and
+  frequency together.
+- A **bold** :math:`\mathbf{q}` and :math:`\mathbf{k}` are momentum vectors alone. Use them for quantities without any
+  frequency dependence (:math:`\varepsilon_{12}(\mathbf{k})`, :math:`H(\mathbf{k})`,
+  :math:`V^{\mathbf{q}}_{1234}`), for sums that run over momentum only (:math:`\sum_{\mathbf{k}}`), and for the
+  momentum counts :math:`n_{\mathbf{q}}` and :math:`n_{\mathbf{k}}`.
+- Counts are a lowercase :math:`n` with the counted object as the subscript: :math:`n_{\mathbf{q}}`,
+  :math:`n_{\mathbf{k}}`, :math:`n_{\mathrm{o}}` (orbitals), :math:`n_{\mathbf{q}}^{\mathrm{irr}}` (momenta in the
+  irreducible zone).
+- Subscripts and superscripts that are words rather than indices are upright: :math:`E_{\mathrm{kin}}`,
+  :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}`, :math:`\mathbf{k}_{\mathrm{rep}}`.
+
+The orbital-index convention (free indices :math:`1234`, summed indices :math:`a, b, c, \ldots` in order of first
+appearance) is described in the docstrings that use it.
+
 A final word
 ------------
 

@@ -45,8 +45,11 @@ class BubbleGenerator:
         wn = MFHelper.wn(niw)
         niv_range = np.arange(-niv, niv)
 
-        g_left_mat = g_dmft.mat[:, None, None, :, None, g_dmft.niv - niv : g_dmft.niv + niv]
-        g_right_mat = g_dmft.transpose_orbitals().mat[None, :, :, None, g_dmft.niv + niv_range[None, :] - wn[:, None]]
+        # the local Green's function carries a single-momentum dimension; index it away for the orbital algebra
+        g_mat = g_dmft.mat[0, 0, 0]
+        g_mat_transposed = g_dmft.transpose_orbitals().mat[0, 0, 0]
+        g_left_mat = g_mat[:, None, None, :, None, g_dmft.niv - niv : g_dmft.niv + niv]
+        g_right_mat = g_mat_transposed[None, :, :, None, g_dmft.niv + niv_range[None, :] - wn[:, None]]
         return LocalFourPoint(-beta * g_left_mat * g_right_mat, SpinChannel.NONE, 1, 1).filter_small_values()
 
     @staticmethod
@@ -61,11 +64,11 @@ class BubbleGenerator:
         node_comm=None,
     ) -> FourPoint:
         r"""
-        Returns the momentum-dependent generalized bare susceptibility
-        :math:`\chi_{0;1234}^{q\omega\nu} = -\beta \sum_k G^{k\nu}_{14}\, G^{(k-q)(\nu-\omega)}_{32}`, evaluated via an FFT over the BZ with
-        preallocated buffers. On a multi-rank CPU run the bosonic-frequency loop is distributed across all ranks
-        (see :meth:`_create_generalized_chi0_q_fft_distributed`); on a single rank or on the GPU the whole bubble is
-        computed on rank 0 over the irreducible BZ and scattered across ranks.
+        Returns the momentum-dependent generalized bare susceptibility :math:`\chi^{\mathrm{q}\nu}_{0;1234} = -\beta
+        \sum_{\mathbf{k}} G^{\mathrm{k}}_{14}\, G^{\mathrm{k}-\mathrm{q}}_{32}`, evaluated via an FFT over the BZ with
+        preallocated buffers. On a multi-rank CPU run the bosonic-frequency loop is distributed across all ranks (see
+        :meth:`_create_generalized_chi0_q_fft_distributed`); on a single rank or on the GPU the whole bubble is computed
+        on rank 0 over the irreducible BZ and scattered across ranks.
 
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
         :param giwk: The momentum-dependent :class:`GreensFunction`.
@@ -323,8 +326,8 @@ class BubbleGenerator:
         use_gpu: bool = False,
     ) -> FourPoint:
         r"""
-        Returns the momentum-dependent generalized bare susceptibility
-        :math:`\chi_{0;1234}^{q\omega\nu} = -\beta \sum_k G^{k\nu}_{14}\, G^{(k-q)(\nu-\omega)}_{32}`, evaluated by a direct momentum-shift
+        Returns the momentum-dependent generalized bare susceptibility :math:`\chi^{\mathrm{q}\nu}_{0;1234} = -\beta
+        \sum_{\mathbf{k}} G^{\mathrm{k}}_{14}\, G^{\mathrm{k}-\mathrm{q}}_{32}`, evaluated by a direct momentum-shift
         and a fused einsum over the explicit list of q-points (preallocated buffers).
 
         :param giwk: The momentum-dependent :class:`GreensFunction`.
@@ -441,8 +444,8 @@ class BubbleGenerator:
         # transpose_orbitals() returns a fresh private copy, so flip it in place (copy=False) instead of deepcopying
         # that throwaway again.
         gchi0_pp_w0 = (
-            g.mat[:, None, None, :, :]
-            * g.transpose_orbitals().flip_frequency_axis(-1, copy=False).mat[None, :, :, None, :]
+            g.mat[0, 0, 0][:, None, None, :, :]
+            * g.transpose_orbitals().flip_frequency_axis(-1, copy=False).mat[0, 0, 0][None, :, :, None, :]
         )
         return LocalFourPoint(
             -beta * gchi0_pp_w0[..., None, :], SpinChannel.NONE, 1, 1, frequency_notation=FrequencyNotation.PP
@@ -452,7 +455,8 @@ class BubbleGenerator:
     def create_generalized_chi0_q_pp_w0(giwk: GreensFunction, niv_pp: int, q_grid: KGrid) -> FourPoint:
         r"""
         Returns the momentum-dependent particle-particle bare bubble at :math:`\omega = 0`,
-        :math:`\chi_{0;1234}^{k(\omega=0)\nu} = G_{14}^{k\nu}\, G_{23}^{(-k)(-\nu)}` with :math:`G_{23}^{(-k)(-\nu)} = G_{32}^{*k\nu}`.
+        :math:`\chi^{\mathrm{k}}_{0;1234} = G^{\mathrm{k}}_{14}\, G^{-\mathrm{k}}_{23}` with :math:`G^{-\mathrm{k}}_{23}
+        = (G^{\mathrm{k}}_{32})^{*}`.
         Note that no factor of :math:`-\beta` is included here.
 
         :param giwk: The momentum-dependent :class:`GreensFunction`.

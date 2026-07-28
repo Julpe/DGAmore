@@ -159,10 +159,10 @@ def test_extracts_dmft_quantities_correctly_with_symmetrization(setup, niw_core,
         .cut_niw_and_niv(config.box.niw_core, config.box.niv_core)
     ).symmetrize_orbitals([1, 2])
 
+    g_dmft, s_dmft = g_dmft[0, 0, 0], s_dmft[0, 0, 0]
     assert np.allclose(g_dmft[0, 0], g_dmft[1, 1])
     assert np.allclose(g_dmft[0, 1], g_dmft[1, 0])
 
-    s_dmft = s_dmft[0, 0, 0]
     assert np.allclose(s_dmft[0, 0], s_dmft[1, 1])
     assert np.allclose(s_dmft[0, 1], s_dmft[1, 0])
 

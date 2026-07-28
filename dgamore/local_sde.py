@@ -39,7 +39,7 @@ def create_generalized_chi(g2: LocalFourPoint, g_dmft: GreensFunction) -> LocalF
     chi = config.sys.beta * g2.to_half_niw_range()
 
     if g2.channel == SpinChannel.DENS and g2.frequency_notation == FrequencyNotation.PH:
-        g_loc_slice_mat = g_dmft.mat[..., g_dmft.niv - config.box.niv_core : g_dmft.niv + config.box.niv_core]
+        g_loc_slice_mat = g_dmft.mat[0, 0, 0][..., g_dmft.niv - config.box.niv_core : g_dmft.niv + config.box.niv_core]
         ggv_mat = g_loc_slice_mat[:, :, None, None, :, None] * g_loc_slice_mat[None, None, :, :, None, :]
         chi[:, :, :, :, 0, ...] -= 2.0 * config.sys.beta * ggv_mat
 
@@ -365,9 +365,9 @@ def create_vertex_functions(
 
 def get_local_hartree_fock(u_loc: LocalInteraction, occ: np.ndarray) -> np.ndarray:
     r"""
-    Returns the local Hartree-Fock (static, frequency-independent) self-energy
-    :math:`\Sigma^{HF}_{12}` from the bare interaction and the local occupation, i.e. the density-channel
-    interaction contracted with the occupation, see Eq. (3.55) in my master's thesis.
+    Returns the local Hartree-Fock (static, frequency-independent) self-energy :math:`\Sigma^{\mathrm{HF}}_{12}` from
+    the bare interaction and the local occupation, i.e. the density-channel interaction contracted with the occupation,
+    see Eq. (3.55) in my master's thesis.
 
     The interaction tensor is stored with the inter-orbital density :math:`U'` at :math:`U_{1212}` (the convention
     of :meth:`Hamiltonian.kanamori_interaction_dp` and the w2dynamics ``umatrix`` files), whereas the density-channel

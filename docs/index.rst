@@ -71,6 +71,7 @@ running a calculation, and contributing, while the :doc:`api` documents every mo
    installation
    usage
    configuration
+   output
    contributing
    about
    api

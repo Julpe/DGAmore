@@ -22,8 +22,8 @@ from dgamore.n_point_base import IHaveChannel, SpinChannel, FrequencyNotation, D
 
 class LocalFourPoint(LocalNPoint, IHaveChannel):
     """
-    This class is used to represent a local four-point object in a given channel with four orbital dimensions and a
-    variable number of bosonic and fermionic frequency dimensions.
+    A local four-point object in a given channel, carrying four orbital dimensions and a variable number of bosonic
+    and fermionic frequency dimensions.
     """
 
     def __init__(
@@ -458,12 +458,11 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
     def matmul(self, other, left_hand_side: bool = True) -> "LocalFourPoint":
         """
-        Helper method that allows for a matrix multiplication between LocalFourPoint and LocalFourPoint and LocalInteraction
-        objects. Depending on the number of frequency and momentum dimensions,
-        the objects have to be multiplied differently. The use of einsum is very crucial for memory efficiency here,
-        as a regular matrix multiplication in compound index space would create large intermediate arrays if one of both
-        partaking objects has less than two fermionic frequency dimensions. Result objects will always be returned in
-        half of their niw range to save memory.
+        Matrix-multiplies this object with another LocalFourPoint or a LocalInteraction operand. How the product is
+        wired depends on the frequency dimensions of the two operands. einsum is essential for memory here: a plain
+        matrix multiplication in compound index space would build large intermediates whenever one of the operands
+        has fewer than two fermionic frequency dimensions. The result comes back in half its niw range to save
+        memory.
 
         :param other: The right/left operand, a :class:`LocalFourPoint` or :class:`LocalInteraction`.
         :param left_hand_side: If True, compute ``self @ other``; if False, compute ``other @ self``.
@@ -626,11 +625,9 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
     def _add(self, other, subtract: bool = False, copy: bool = True):
         """
-        Helper method that allows for addition of LocalFourPoint objects and other LocalFourPoint or LocalInteraction
-        objects. Additions with numpy arrays, floats, ints or complex numbers are also supported.
-        Depending on the number of frequency and momentum dimensions, the vertices have to be added slightly different.
-        If the objects have different niw ranges, they will be converted to the half niw range before the addition.
-        Objects will always be returned in the half niw range to save memory.
+        Adds a LocalFourPoint or LocalInteraction object (or a numpy array, float, int or complex number) to this
+        one. How the vertices are added depends on their frequency dimensions. Operands with different niw ranges
+        are first brought to the half niw range, and the result stays in the half niw range to save memory.
 
         :param other: A :class:`LocalFourPoint`, :class:`LocalInteraction`, numpy array, or number.
         :param subtract: If True, subtract ``other`` instead of adding it (used by :meth:`sub` to avoid a negated copy).
@@ -771,11 +768,9 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
     def sub(self, other, copy: bool = True):
         """
-        Helper method that allows for subtraction of LocalFourPoint objects and other LocalFourPoint or LocalInteraction
-        objects. Subtractions with numpy arrays, floats, ints or complex numbers are also supported.
-        Depending on the number of frequency and momentum dimensions, the vertices have to be subtracted slightly different.
-        If the objects have different niw ranges, they will be converted to the half niw range before the subtraction.
-        Objects will always be returned in the half niw range to save memory.
+        Subtracts a LocalFourPoint or LocalInteraction object (or a numpy array, float, int or complex number) from
+        this one. How the vertices are subtracted depends on their frequency dimensions. Operands with different niw
+        ranges are first brought to the half niw range, and the result stays in the half niw range to save memory.
 
         :param other: A :class:`LocalFourPoint`, :class:`LocalInteraction`, numpy array, or number.
         :param copy: If True (default), return a new :class:`LocalFourPoint`; if False, subtract into ``self`` in place

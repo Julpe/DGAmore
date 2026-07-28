@@ -4,13 +4,13 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
-Linearized Eliashberg equation solver. Starting from the ladder-DGA full vertex (saved per channel by the
-non-local SDE step), this module assembles the particle-particle pairing vertex in the singlet/triplet channels at
-:math:`\omega = 0`, optionally adds the local reducible diagrams, and solves the linearized gap equation
-:math:`\lambda \Delta = \pm\frac{1}{2\beta N_q}\, \Gamma^{pp}\, \chi_0^{pp}\, \Delta` with a matrix-free
+Linearized Eliashberg equation solver. Starting from the ladder-DGA full vertex (saved per channel by the non-local SDE
+step), this module assembles the particle-particle pairing vertex in the singlet/triplet channels at :math:`\omega = 0`,
+optionally adds the local reducible diagrams, and solves the linearized gap equation :math:`\lambda \Delta =
+\pm\frac{1}{2\beta n_{\mathbf{q}}}\, \Gamma^{\mathrm{pp}}\, \chi_0^{\mathrm{pp}}\, \Delta` with a matrix-free
 ARPACK/Lanczos eigensolver (two variants: an in-memory one and a memory-lean frequency-distributed one). The leading
 eigenvalue :math:`\lambda` signals the pairing instability and the eigenvector is the gap function
-:math:`\Delta(k, \nu)`. Equation numbers refer to the author's master's thesis (Chapter 4).
+:math:`\Delta^{\mathrm{k}}_{12}`. Equation numbers refer to the author's master's thesis (Chapter 4).
 """
 
 import os
@@ -82,15 +82,15 @@ def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp:
     Kitatani's frequency convention: the fermionic frequency is flipped, the bosonic index is remapped via
     :math:`\omega = \nu - \nu'` and the orbitals are permuted to :math:`1432`. In full index notation the output is
 
-    .. math:: \bar{F}^{pp;\nu\nu'}_{1234} = -F^{ph;\,\omega=\nu-\nu';\ \nu_1=\nu,\ \nu_2=-\nu'}_{1432}
-        = -F^{ph;(\nu-\nu')\nu(-\nu')}_{1432},
+    .. math:: \bar{F}^{\mathrm{pp};\nu\nu'}_{1234} = -F^{\mathrm{ph};\,\omega=\nu-\nu';\ \nu_1=\nu,\ \nu_2=-\nu'}_{1432}
+        = -F^{\mathrm{ph};(\nu-\nu')\nu(-\nu')}_{1432},
 
     i.e. (minus) the crossed-slot form of the pairing vertex of Eq. (4.49) in my thesis: with the ph frequency
-    convention of Eq. (3.28a) the four legs of :math:`\bar{F}^{pp;\nu\nu'}_{1234}` carry the frequencies
+    convention of Eq. (3.28a) the four legs of :math:`\bar{F}^{\mathrm{pp};\nu\nu'}_{1234}` carry the frequencies
     :math:`(\nu, \nu', -\nu, -\nu')` on the orbitals :math:`(1, 4, 3, 2)`. The overall minus is the sign of the
-    power-iteration matrix :math:`M = -\Gamma\chi` of Eq. (4.42). Used by
-    :func:`transform_vertex_loc_frequencies_w0` and :func:`transform_vertex_q_frequencies_w0`; the direct-slot
-    counterpart (:math:`\omega_{ph} = \nu + \nu'`, no flip, orbitals :math:`1234`) is
+    power-iteration matrix :math:`M = -\Gamma\chi` of Eq. (4.42). Used by :func:`transform_vertex_loc_frequencies_w0`
+    and :func:`transform_vertex_q_frequencies_w0`; the direct-slot counterpart (:math:`\omega_{\mathrm{ph}} = \nu +
+    \nu'`, no flip, orbitals :math:`1234`) is
     :meth:`~dgamore.local_four_point.LocalFourPoint.change_frequency_notation_ph_to_pp_w0`.
 
     :param vertex: The vertex to transform (:class:`LocalFourPoint` or :class:`FourPoint`) in ph notation.
@@ -143,7 +143,7 @@ def transform_vertex_q_frequencies_w0(f_q_r: FourPoint, niv_pp: int) -> FourPoin
     Transforms a momentum-dependent vertex from particle-hole to the modified particle-particle notation at
     :math:`\omega' = 0` (see :func:`_transform_vertex_frequencies_w0`).
 
-    :param f_q_r: The momentum-dependent vertex :math:`F^{q}` in ph notation.
+    :param f_q_r: The momentum-dependent vertex :math:`F^{\mathrm{q}}` in ph notation.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :return: The transformed vertex as a :class:`FourPoint` (pp notation, no bosonic axis, compressed q).
     """
@@ -161,11 +161,11 @@ def create_full_vertex_q_r(
     notation unless ``save_fq`` requests keeping the ph form. Deletes the consumed intermediate files afterwards.
 
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :return: The full ladder vertex :math:`F^{q}_{r}` as a :class:`FourPoint`.
+    :return: The full ladder vertex :math:`F^{\mathrm{q}}_{r}` as a :class:`FourPoint`.
     """
     logger = config.logger
     logger.info(f"Starting to calculate the full {gamma_r.channel.value} vertex.")
@@ -246,11 +246,11 @@ def create_full_vertex_q_r_pp_w0(
     notation in the irreducible BZ, and returns it transformed to pp notation at :math:`\omega' = 0`.
 
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :return: The full ladder vertex :math:`F^{q}_{r}` in pp notation as a :class:`FourPoint`.
+    :return: The full ladder vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
     """
     logger = config.logger
 
@@ -291,15 +291,15 @@ def create_full_vertex_q_r_v2(
     :func:`create_full_vertex_q_r`), transforming it to pp notation unless ``save_fq`` keeps the ph form.
 
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` over all rank-local q-points.
-    :param vrg_q_r_left: The momentum-dependent three-leg vertex :math:`\gamma^q_{r}`.
-    :param vrg_q_r_right: The momentum-dependent "right-side" three-leg vertex :math:`\gamma^q_{r}`.
-    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{phys;q}_{r}`.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` over all rank-local q-points.
+    :param vrg_q_r_left: The momentum-dependent three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}`.
+    :param vrg_q_r_right: The momentum-dependent "right-side" three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}`.
+    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}`.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param q_index: Index of the q-point (into the rank-local list) to compute.
-    :return: The full ladder vertex :math:`F^{q}_{r}` for that q-point as a :class:`FourPoint`.
+    :return: The full ladder vertex :math:`F^{\mathrm{q}}_{r}` for that q-point as a :class:`FourPoint`.
     """
     gchi0_q_inv_idx = gchi0_q_inv.filter_q_index(q_index)
     vrg_q_r_left_idx = vrg_q_r_left.filter_q_index(q_index)
@@ -338,11 +338,11 @@ def create_full_vertex_q_r_pp_w0_v2(
     in pp notation at :math:`\omega' = 0`.
 
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :return: The full ladder vertex :math:`F^{q}_{r}` in pp notation as a :class:`FourPoint`.
+    :return: The full ladder vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
     """
     logger = config.logger
 
@@ -446,62 +446,63 @@ def create_local_gamma_ud_pp_w0(
     Returns the local pp-irreducible up-down vertex at :math:`\omega = 0` from the crossing-decoupled pp
     Bethe-Salpeter equation,
 
-    .. math:: \Gamma^{pp;\nu\nu'}_{\uparrow\downarrow;1234} = \beta^2 \left[\chi^{pp}_0 J - \chi^{pp}_0\,
-        (\chi^{pp}_{\uparrow\downarrow})^{-1}\, \chi^{pp}_0\right]^{-1;\,\nu\nu'}_{1234}.
+    .. math:: \Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234} = \beta^2 \left[\chi^{\mathrm{pp}}_0 J - \chi^{\mathrm{pp}}_0\,
+        (\chi^{\mathrm{pp}}_{\uparrow\downarrow})^{-1}\, \chi^{\mathrm{pp}}_0\right]^{-1;\,\nu\nu'}_{1234}.
 
-    All products and inverses live in compound pp index space, i.e. as matrices
-    :math:`M_{(13\nu),(42\nu')} = X^{pp;\nu\nu'}_{1234}` with the product and unit element
+    All products and inverses live in compound pp index space, i.e. as matrices :math:`M_{(13\nu),(42\nu')} =
+    X^{\mathrm{pp};\nu\nu'}_{1234}` with the product and unit element
 
-    .. math:: (X Y)^{pp;\nu\nu'}_{1234} = \sum_{ab\nu_1} X^{pp;\nu\nu_1}_{1a3b}\, Y^{pp;\nu_1\nu'}_{b2a4}, \qquad
-        \mathbb{1}^{pp;\nu\nu'}_{1234} = \delta_{14}\,\delta_{23}\,\delta_{\nu\nu'}.
+    .. math:: (X Y)^{\mathrm{pp};\nu\nu'}_{1234} = \sum_{ab\nu_1} X^{\mathrm{pp};\nu\nu_1}_{1a3b}\, Y^{\mathrm{pp};\nu_1\nu'}_{b2a4}, \qquad
+        \mathbb{1}^{\mathrm{pp};\nu\nu'}_{1234} = \delta_{14}\,\delta_{23}\,\delta_{\nu\nu'}.
 
-    The ingredients in full index notation are the diagonal bare pp bubble, built from the local DMFT Green's
-    function :math:`G^{\mathrm{DMFT}}_{12}(\nu)`, and its image under the crossing operator :math:`J`
-    (:math:`\nu' \to -\nu'` combined with the orbital permutation :math:`1234 \to 1432`, i.e.
-    :math:`(XJ)^{pp;\nu\nu'}_{1234} = X^{pp;\nu(-\nu')}_{1432}`),
+    The ingredients in full index notation are the diagonal bare pp bubble, built from the local DMFT Green's function
+    :math:`G^{\mathrm{DMFT}}_{12}(\nu)`, and its image under the crossing operator :math:`J` (:math:`\nu' \to -\nu'`
+    combined with the orbital permutation :math:`1234 \to 1432`, i.e. :math:`(XJ)^{\mathrm{pp};\nu\nu'}_{1234} =
+    X^{\mathrm{pp};\nu(-\nu')}_{1432}`),
 
-    .. math:: \chi^{pp;\nu\nu'}_{0;1234} = -\beta\, G^{\mathrm{DMFT}}_{14}(\nu)\, G^{\mathrm{DMFT}}_{32}(-\nu)\,
-        \delta_{\nu\nu'}, \qquad (\chi^{pp}_0 J)^{\nu\nu'}_{1234} = -\beta\, G^{\mathrm{DMFT}}_{12}(\nu)\,
+    .. math:: \chi^{\mathrm{pp};\nu\nu'}_{0;1234} = -\beta\, G^{\mathrm{DMFT}}_{14}(\nu)\, G^{\mathrm{DMFT}}_{32}(-\nu)\,
+        \delta_{\nu\nu'}, \qquad (\chi^{\mathrm{pp}}_0 J)^{\nu\nu'}_{1234} = -\beta\, G^{\mathrm{DMFT}}_{12}(\nu)\,
         G^{\mathrm{DMFT}}_{34}(-\nu)\, \delta_{\nu,-\nu'}.
 
-    The returned :math:`\Gamma^{pp}_{\uparrow\downarrow}` is equivalent to solving the crossing-decoupled pp BSE
+    The returned :math:`\Gamma^{\mathrm{pp}}_{\uparrow\downarrow}` is equivalent to solving the crossing-decoupled pp
+    BSE
 
-    .. math:: F^{pp;\nu\nu'}_{\uparrow\downarrow;1234} = \Gamma^{pp;\nu\nu'}_{\uparrow\downarrow;1234}
-        - \frac{1}{\beta} \sum_{\nu_1} \sum_{abcd} \Gamma^{pp;\nu\nu_1}_{\uparrow\downarrow;1a3b}\,
+    .. math:: F^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234} = \Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}
+        - \frac{1}{\beta} \sum_{\nu_1} \sum_{abcd} \Gamma^{\mathrm{pp};\nu\nu_1}_{\uparrow\downarrow;1a3b}\,
         G^{\mathrm{DMFT}}_{bc}(\nu_1)\, G^{\mathrm{DMFT}}_{ad}(-\nu_1)\,
-        F^{pp;(-\nu_1)\nu'}_{\uparrow\downarrow;d2c4}
+        F^{\mathrm{pp};(-\nu_1)\nu'}_{\uparrow\downarrow;d2c4}
 
-    for the full vertex :math:`F^{pp}_{\uparrow\downarrow}` defined by amputating the DMFT legs of the
+    for the full vertex :math:`F^{\mathrm{pp}}_{\uparrow\downarrow}` defined by amputating the DMFT legs of the
     susceptibility,
 
-    .. math:: \chi^{pp;\nu\nu'}_{\uparrow\downarrow;1234} = -\sum_{abcd} F^{pp;\nu\nu'}_{\uparrow\downarrow;abcd}\,
+    .. math:: \chi^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234} = -\sum_{abcd} F^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;abcd}\,
         G^{\mathrm{DMFT}}_{1a}(\nu)\, G^{\mathrm{DMFT}}_{b2}(-\nu')\, G^{\mathrm{DMFT}}_{3c}(-\nu)\,
         G^{\mathrm{DMFT}}_{d4}(\nu').
 
-    Note that :math:`\chi^{pp}_{\uparrow\downarrow}` must be the CONNECTED susceptibility: the disconnected
-    straight term :math:`\delta_{\omega_{ph} 0}\, \beta\, G^{\mathrm{DMFT}}_{12}(\nu)\, G^{\mathrm{DMFT}}_{34}(\nu')`
-    would land exactly on the pp anti-diagonal :math:`\nu' = -\nu` and corrupt the :math:`\chi^{pp}_0 J` rung. The
-    loader guarantees this: :func:`~dgamore.local_sde.create_generalized_chi` subtracts that term in the density
-    channel, and the :math:`\frac{1}{2}(\chi^{ph}_{d} - \chi^{ph}_{m})` combination cancels both it and the
-    vertical bubble exactly.
+    Note that :math:`\chi^{\mathrm{pp}}_{\uparrow\downarrow}` must be the CONNECTED susceptibility: the disconnected
+    straight term :math:`\delta_{\omega_{\mathrm{ph}} 0}\, \beta\, G^{\mathrm{DMFT}}_{12}(\nu)\,
+    G^{\mathrm{DMFT}}_{34}(\nu')` would land exactly on the pp anti-diagonal :math:`\nu' = -\nu` and corrupt the
+    :math:`\chi^{\mathrm{pp}}_0 J` rung. The loader guarantees this: :func:`~dgamore.local_sde.create_generalized_chi`
+    subtracts that term in the density channel, and the :math:`\frac{1}{2}(\chi^{\mathrm{ph}}_{d} -
+    \chi^{\mathrm{ph}}_{m})` combination cancels both it and the vertical bubble exactly.
 
     :math:`J` commutes with every pp object by crossing symmetry, so this is the full-space form of inverting the
     decoupled singlet/triplet BSEs (thesis Eqs. 3.51/3.52) on their :math:`J`-even/odd blocks. For a single band
-    :math:`J` reduces to the plain frequency flip and the expression is equivalent to Eq. (B.26) of Rohringer's
-    thesis. Assumes :math:`G^{\mathrm{DMFT}}_{12}(\nu) = G^{\mathrm{DMFT}}_{21}(\nu)` (real orbital basis, no
-    spin-orbit coupling); with SOC the rung :math:`\chi^{pp}_0 J` must be replaced by
-    :math:`-\beta\, G^{\mathrm{DMFT}}_{12}(\nu)\, G^{\mathrm{DMFT}}_{43}(-\nu)\, \delta_{\nu,-\nu'}` (second
-    Green's function transposed).
+    :math:`J` reduces to the plain frequency flip and the expression is equivalent to Eq. (B.26) of Rohringer's thesis.
+    Assumes :math:`G^{\mathrm{DMFT}}_{12}(\nu) = G^{\mathrm{DMFT}}_{21}(\nu)` (real orbital basis, no spin-orbit
+    coupling); with SOC the rung :math:`\chi^{\mathrm{pp}}_0 J` must be replaced by :math:`-\beta\,
+    G^{\mathrm{DMFT}}_{12}(\nu)\, G^{\mathrm{DMFT}}_{43}(-\nu)\, \delta_{\nu,-\nu'}` (second Green's function
+    transposed).
 
     :param gchi_ud_pp_w0: The local connected up-down susceptibility
-        :math:`\chi^{pp;\nu\nu'}_{\uparrow\downarrow;1234}` in pp notation at :math:`\omega = 0`, see
+        :math:`\chi^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}` in pp notation at :math:`\omega = 0`, see
         :meth:`~dgamore.local_four_point.LocalFourPoint.change_frequency_notation_ph_to_pp_w0`.
-    :param gchi0_pp_w0: The local bare pp bubble :math:`\chi^{pp;\nu\nu'}_{0;1234}` (diagonal in :math:`\nu\nu'`),
-        built from the DMFT Green's function via
+    :param gchi0_pp_w0: The local bare pp bubble :math:`\chi^{\mathrm{pp};\nu\nu'}_{0;1234}` (diagonal in
+        :math:`\nu\nu'`), built from the DMFT Green's function via
         :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_pp_w0`.
     :param beta: Inverse temperature :math:`\beta`.
-    :return: The vertex :math:`\Gamma^{pp;\nu\nu'}_{\uparrow\downarrow;1234}` as a :class:`LocalFourPoint` in pp
-        notation.
+    :return: The vertex :math:`\Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}` as a :class:`LocalFourPoint` in
+        pp notation.
     """
     # chi0 * J in tensor form: the bubble with the second fermionic frequency flipped and the orbitals permuted
     gchi0_j = gchi0_pp_w0.flip_frequency_axis(-1).permute_orbitals("abcd->adcb", copy=False).to_half_niw_range()
@@ -517,21 +518,21 @@ def create_local_gamma_ud_pp_w0_per_ineq(
     gchi_ud_pp_w0: LocalFourPoint, g_dmft: GreensFunction, beta: float
 ) -> LocalFourPoint:
     r"""
-    Builds the local pp-irreducible up-down vertex :math:`\Gamma^{pp;\nu\nu'}_{\uparrow\downarrow;1234}` per
+    Builds the local pp-irreducible up-down vertex :math:`\Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}` per
     inequivalent atom and assembles the per-atom blocks into the full multi-band object (mirroring the local
     Schwinger-Dyson assembly). Local correlations do not connect orbitals of different atoms, so the assembled
-    multi-band susceptibility is nonzero only when all four orbital indices belong to the same atom; the compound
-    pp matrix of the FULL object is therefore singular for more than one atom and must never be inverted directly.
-    Instead, :func:`create_local_gamma_ud_pp_w0` is evaluated on each atom's orbital block (with the bare pp
-    bubble built from that atom's block of :math:`G^{\mathrm{DMFT}}_{12}(\nu)`), computing every inequivalent atom
-    only once and writing the result into all of its positions in the compound band layout.
+    multi-band susceptibility is nonzero only when all four orbital indices belong to the same atom; the compound pp
+    matrix of the FULL object is therefore singular for more than one atom and must never be inverted directly. Instead,
+    :func:`create_local_gamma_ud_pp_w0` is evaluated on each atom's orbital block (with the bare pp bubble built from
+    that atom's block of :math:`G^{\mathrm{DMFT}}_{12}(\nu)`), computing every inequivalent atom only once and writing
+    the result into all of its positions in the compound band layout.
 
     :param gchi_ud_pp_w0: The full multi-band connected up-down susceptibility
-        :math:`\chi^{pp;\nu\nu'}_{\uparrow\downarrow;1234}` in pp notation at :math:`\omega = 0`
+        :math:`\chi^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}` in pp notation at :math:`\omega = 0`
         (block-structured per inequivalent atom).
     :param g_dmft: The full multi-band local DMFT :class:`GreensFunction` :math:`G^{\mathrm{DMFT}}_{12}(\nu)`.
     :param beta: Inverse temperature :math:`\beta`.
-    :return: The assembled vertex :math:`\Gamma^{pp;\nu\nu'}_{\uparrow\downarrow;1234}` as a
+    :return: The assembled vertex :math:`\Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}` as a
         :class:`LocalFourPoint` in pp notation (nonzero only on the same-atom orbital blocks).
     """
     n_bands = gchi_ud_pp_w0.n_bands
@@ -562,7 +563,7 @@ def create_local_gamma_ud_pp_w0_per_ineq(
                 FrequencyNotation.PP,
             )
             g_mat_block = g_dmft.mat[..., sl, sl, :]
-            g_block = GreensFunction(g_mat_block.reshape(g_mat_block.shape[-3:]).copy())
+            g_block = GreensFunction(g_mat_block.reshape((1, 1, 1) + g_mat_block.shape[-3:]).copy())
             gchi0_block = BubbleGenerator.create_generalized_chi0_pp_w0(
                 g_block, gchi_block.niv, beta
             ).extend_vn_to_diagonal()
@@ -576,21 +577,22 @@ def create_local_ud_diagrams_pp_w0(
     g_dmft: GreensFunction, niv_pp: int
 ) -> tuple[LocalFourPoint, LocalFourPoint, LocalFourPoint]:
     r"""
-    Builds the local particle-particle reducible diagrams at :math:`\omega = 0` in the up-down channel: the full
-    vertex :math:`F^{pp;\nu\nu'}_{\uparrow\downarrow;1234}`, the pp-irreducible vertex
-    :math:`\Gamma^{pp;\nu\nu'}_{\uparrow\downarrow;1234}` (built per inequivalent atom and assembled into the full
-    multi-band object, see :func:`create_local_gamma_ud_pp_w0_per_ineq`), and the reducible part
+    Builds the local particle-particle reducible diagrams at :math:`\omega = 0` in the up-down channel: the full vertex
+    :math:`F^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}`, the pp-irreducible vertex
+    :math:`\Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}` (built per inequivalent atom and assembled into the
+    full multi-band object, see :func:`create_local_gamma_ud_pp_w0_per_ineq`), and the reducible part
 
-    .. math:: \Phi^{pp;\nu\nu'}_{\uparrow\downarrow;1234} = F^{pp;\nu\nu'}_{\uparrow\downarrow;1234}
-        - \Gamma^{pp;\nu\nu'}_{\uparrow\downarrow;1234},
+    .. math:: \Phi^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234} = F^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}
+        - \Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234},
 
-    with :math:`\chi^{pp}_{\uparrow\downarrow} = \frac{1}{2}(\chi^{ph}_{d} - \chi^{ph}_{m})` mapped to pp notation
-    at :math:`\omega_{pp} = 0` via :meth:`~dgamore.local_four_point.LocalFourPoint.change_frequency_notation_ph_to_pp_w0`
-    (ph legs evaluated at :math:`\omega_{ph} = \nu + \nu'`) and the bare pp bubble built from the local DMFT
-    Green's function :math:`G^{\mathrm{DMFT}}_{12}(\nu)` via
-    :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_pp_w0`. These are the local diagrams
-    subtracted/added when ``include_local_part`` of :class:`~dgamore.config.EliashbergConfig` is enabled, to avoid
-    double counting the local pairing contribution (thesis Eqs. 4.49-4.52).
+    with :math:`\chi^{\mathrm{pp}}_{\uparrow\downarrow} = \frac{1}{2}(\chi^{\mathrm{ph}}_{d} - \chi^{\mathrm{ph}}_{m})`
+    mapped to pp notation at :math:`\omega_{\mathrm{pp}} = 0` via
+    :meth:`~dgamore.local_four_point.LocalFourPoint.change_frequency_notation_ph_to_pp_w0` (ph legs evaluated at
+    :math:`\omega_{\mathrm{ph}} = \nu + \nu'`) and the bare pp bubble built from the local DMFT Green's function
+    :math:`G^{\mathrm{DMFT}}_{12}(\nu)` via :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_pp_w0`.
+    These are the local diagrams subtracted/added when ``include_local_part`` of
+    :class:`~dgamore.config.EliashbergConfig` is enabled, to avoid double counting the local pairing contribution
+    (thesis Eqs. 4.49-4.52).
 
     :param g_dmft: The local DMFT :class:`GreensFunction` :math:`G^{\mathrm{DMFT}}_{12}(\nu)`.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex; the local diagrams are cut to this
@@ -733,15 +735,15 @@ def _project_gap_to_sector(vec: np.ndarray, gap_shape: tuple, eps_t: int, eps_po
     r"""
     Projects a flattened gap onto a physical symmetry sector by applying the two commuting Hermitian projectors
     :math:`\tfrac{1}{2}(1 + \varepsilon_T T)` and :math:`\tfrac{1}{2}(1 + \varepsilon_{PO}\, P O)` in turn, where the
-    three involutions act on the orbital gap :math:`\Delta_{12}^{\nu}(k)` as
-    :math:`(T\Delta)_{12}^{\nu}(k) = \Delta_{12}^{-\nu}(k)` (fermionic-frequency flip),
-    :math:`(P\Delta)_{12}^{\nu}(k) = \Delta_{12}^{\nu}(-k)` (momentum flip) and
-    :math:`(O\Delta)_{12}^{\nu}(k) = \Delta_{21}^{\nu}(k)` (orbital transpose), realized by the same array operations
-    the pairing-kernel matvec uses. The Pauli antisymmetry :math:`\hat{S}\,P\,O\,T\,\Delta = -\Delta` with the spin
-    exchange :math:`\hat{S}` a scalar in the singlet/triplet basis fixes :math:`P\,O\,T\,\Delta = \mathrm{sign}\,\Delta`
-    (``sign`` the channel sign), so once the frequency parity :math:`\varepsilon_T` is chosen the combined
-    momentum-orbital parity is forced to :math:`\varepsilon_{PO} = \mathrm{sign}\cdot\varepsilon_T`; only the product
-    :math:`P\,O` is fixed, never :math:`P` and :math:`O` separately.
+    three involutions act on the orbital gap :math:`\Delta^{\nu}_{12}(\mathbf{k})` as
+    :math:`(T\Delta)^{\nu}_{12}(\mathbf{k}) = \Delta^{-\nu}_{12}(\mathbf{k})` (fermionic-frequency flip),
+    :math:`(P\Delta)^{\nu}_{12}(\mathbf{k}) = \Delta^{\nu}_{12}(-\mathbf{k})` (momentum flip) and
+    :math:`(O\Delta)^{\nu}_{12}(\mathbf{k}) = \Delta^{\nu}_{21}(\mathbf{k})` (orbital transpose), realized by the same
+    array operations the pairing-kernel matvec uses. The Pauli antisymmetry :math:`\hat{S}\,P\,O\,T\,\Delta = -\Delta`
+    with the spin exchange :math:`\hat{S}` a scalar in the singlet/triplet basis fixes :math:`P\,O\,T\,\Delta =
+    \mathrm{sign}\,\Delta` (``sign`` the channel sign), so once the frequency parity :math:`\varepsilon_T` is chosen the
+    combined momentum-orbital parity is forced to :math:`\varepsilon_{PO} = \mathrm{sign}\cdot\varepsilon_T`; only the
+    product :math:`P\,O` is fixed, never :math:`P` and :math:`O` separately.
 
     :param vec: The flattened gap vector.
     :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
@@ -978,7 +980,7 @@ def _chi0_to_matmul_layout(chi0_mat: np.ndarray) -> np.ndarray:
     Returns the bare pp bubble in batched-matmul layout ``[x, y, z, v, o2, o2]`` (a view, no copy) for use with
     :func:`_apply_gchi0_pp`. ``chi0_mat`` is in the einsum layout ``[x, y, z, a, b, c, d, v]``.
 
-    :param chi0_mat: The bubble array :math:`\chi_0^{pp}`, shape ``[x, y, z, o, o, o, o, v]``.
+    :param chi0_mat: The bubble array :math:`\chi_0^{\mathrm{pp}}`, shape ``[x, y, z, o, o, o, o, v]``.
     :return: A view reshaped/transposed to ``[x, y, z, v, o2, o2]`` (rows ``(a, b)``, columns ``(c, d)``).
     """
     nqx, nqy, nqz, nb = chi0_mat.shape[:4]
@@ -992,11 +994,11 @@ _MIRROR_TOL = 1e-6  # tolerance on the deviation of a mirror eigenvalue from +/-
 def _gap_orbital_mirrors(n_bands: int) -> dict:
     r"""
     Collects the orbital part :math:`U_i` of the single-axis coordinate mirrors :math:`k_i \to -k_i` for the gap
-    symmetrization (see :func:`_mirror_operator`) by solving for them from :math:`H(k)` with the same U-solver the
-    automatic symmetry discovery uses (:func:`~dgamore.symmetry_reduction.find_coordinate_mirror_orbital_unitaries`,
-    a handful of small eigen-solves on the cached :math:`H(k)`). Nothing is hard-coded per orbital set - the mirrors
-    are read off the Hamiltonian, so :math:`t_{2g}`, :math:`e_g` and any other Wannier basis are covered alike, and
-    no symmetry mode is assumed (the solve does not need ``symmetries: auto``).
+    symmetrization (see :func:`_mirror_operator`) by solving for them from :math:`H(\mathbf{k})` with the same U-solver
+    the automatic symmetry discovery uses (:func:`~dgamore.symmetry_reduction.find_coordinate_mirror_orbital_unitaries`,
+    a handful of small eigen-solves on the cached :math:`H(\mathbf{k})`). Nothing is hard-coded per orbital set - the
+    mirrors are read off the Hamiltonian, so :math:`t_{2g}`, :math:`e_g` and any other Wannier basis are covered alike,
+    and no symmetry mode is assumed (the solve does not need ``symmetries: auto``).
 
     A single-orbital gap needs no orbital factor (a :math:`1 \times 1` unitary is a phase, and it cancels in
     :math:`U \Delta U^\dagger`), and a failure to determine the mirrors is not fatal: the symmetrization then
@@ -1049,18 +1051,18 @@ def _validated_orbital_mirrors(gap_shape: tuple, orbital_mirrors: dict | None) -
 
 def _mirror_operator(gap_shape: tuple, axis: int, u: np.ndarray | None):
     r"""
-    Builds the single-axis mirror operator acting on a flattened gap column. A point-group mirror
-    :math:`k_i \to -k_i` acts on the orbital indices as well as on the momenta, so with the orbital matrix
-    :math:`U` of that mirror (:math:`H(M_i k) = U H(k) U^\dagger`, see
+    Builds the single-axis mirror operator acting on a flattened gap column. A point-group mirror :math:`k_i \to -k_i`
+    acts on the orbital indices as well as on the momenta, so with the orbital matrix :math:`U` of that mirror
+    (:math:`H(M_i \mathbf{k}) = U H(\mathbf{k}) U^\dagger`, see
     :func:`~dgamore.symmetry_reduction.find_coordinate_mirror_orbital_unitaries`) the gap transforms as
 
-    .. math:: \Delta_{o_1 o_2}(k) \to \left[U\, \Delta(M_i k)\, U^\dagger\right]_{o_1 o_2} .
+    .. math:: \Delta_{o_1 o_2}(\mathbf{k}) \to \left[U\, \Delta(M_i \mathbf{k})\, U^\dagger\right]_{o_1 o_2} .
 
     For :math:`t_{2g}` orbitals :math:`U` is the diagonal sign matrix of the mirror and this reduces to the familiar
-    :math:`s_{o_1} s_{o_2} \Delta_{o_1 o_2}(M_i k)`. Dropping the orbital factor (as a momentum-only reflection does)
-    leaves an operator that is not a symmetry of the multi-orbital pairing kernel: a partner carrying weight in both
-    orbital sectors then measures the orbital-diagonal minus the orbital-off-diagonal weight instead of
-    :math:`\pm 1`, and the cleanliness check in :func:`_orient_cluster_by_mirrors` rejects it.
+    :math:`s_{o_1} s_{o_2} \Delta_{o_1 o_2}(M_i \mathbf{k})`. Dropping the orbital factor (as a momentum-only reflection
+    does) leaves an operator that is not a symmetry of the multi-orbital pairing kernel: a partner carrying weight in
+    both orbital sectors then measures the orbital-diagonal minus the orbital-off-diagonal weight instead of :math:`\pm
+    1`, and the cleanliness check in :func:`_orient_cluster_by_mirrors` rejects it.
 
     :param gap_shape: Full gap shape ``[kx, ky, kz, o1, o2, 2*niv_pp]``.
     :param axis: The reflected momentum axis (0, 1 or 2).
@@ -1453,9 +1455,9 @@ def solve_eliashberg_lanczos(
     :func:`_project_gap_to_sector`), so the eigensolver returns the leading eigenpairs of :math:`\Pi M \Pi` restricted
     to that sector; otherwise the raw kernel :math:`M` is run unchanged.
 
-    :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (irreducible BZ, pp notation) for one channel;
-        consumed by the solve.
-    :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{pp}` at :math:`\omega = 0`.
+    :param gamma_r_pp: The pairing vertex :math:`\Gamma^{\mathrm{pp}}_{r}` (irreducible BZ, pp notation) for one
+        channel; consumed by the solve.
+    :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{\mathrm{pp}}` at :math:`\omega = 0`.
     :param ranks: The ranks used for logging.
     :param parities: An optional subset of parity labels to solve on this rank (``None`` solves every configured
         sector); the caller assigns different parities to different ranks so the sectors solve concurrently.
@@ -1503,11 +1505,11 @@ def solve_eliashberg_lanczos(
 
     def mv(gap: np.ndarray):
         r"""
-        Applies the pairing kernel to a flattened gap vector (the matrix-vector product for the eigensolver):
-        multiplies by :math:`\chi_0^{pp}`, FFTs to real space, contracts with the pairing vertex (direct plus the
-        crossed term, the latter reusing the direct vertex via gap-sized index shuffles), and transforms back. The
-        orbital contractions are batched ``np.matmul`` products and the BZ transforms run in place through
-        ``scipy.fft`` (both threaded up to the solver thread budget).
+        Applies the pairing kernel to a flattened gap vector (the matrix-vector product for the eigensolver): multiplies
+        by :math:`\chi_0^{\mathrm{pp}}`, FFTs to real space, contracts with the pairing vertex (direct plus the crossed
+        term, the latter reusing the direct vertex via gap-sized index shuffles), and transforms back. The orbital
+        contractions are batched ``np.matmul`` products and the BZ transforms run in place through ``scipy.fft`` (both
+        threaded up to the solver thread budget).
 
         :param gap: The flattened gap vector.
         :return: The flattened result of applying the pairing kernel to ``gap``.
@@ -1543,20 +1545,20 @@ def solve_eliashberg_lanczos_v2(
     n_threads: int = 1,
 ) -> dict[str, tuple[np.ndarray, list[GapFunction]]]:
     r"""
-    Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using
-    an ARPACK/Lanczos eigensolver. This variant distributes the gap function along the fermionic frequency axis across
-    ranks (and performs the :math:`\chi_0^{pp}` multiplication only on the root rank), so it is more memory-efficient
-    but slower than :func:`solve_eliashberg_lanczos`. The passed pairing vertex is **consumed** (Fourier transformed
-    in place, then freed once its matmul-layout copy is built).
+    Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using an
+    ARPACK/Lanczos eigensolver. This variant distributes the gap function along the fermionic frequency axis across
+    ranks (and performs the :math:`\chi_0^{\mathrm{pp}}` multiplication only on the root rank), so it is more
+    memory-efficient but slower than :func:`solve_eliashberg_lanczos`. The passed pairing vertex is **consumed**
+    (Fourier transformed in place, then freed once its matmul-layout copy is built).
 
     The physical frequency-parity sectors of ``config.eliashberg.resolve_frequency_parity`` are handled exactly as in
     :func:`solve_eliashberg_lanczos`: the sector projector :math:`\Pi` (see :func:`_project_gap_to_sector`) wraps the
     matvec and the starting vector on the full (undistributed) gap vector the eigensolver sees, so the frequency
     distribution is transparent to the projection.
 
-    :param gamma_r_pp: The pairing vertex :math:`\Gamma^{pp}_{r}` (frequency-distributed) for one channel; consumed
-        by the solve.
-    :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{pp}` at :math:`\omega = 0` (held on the root rank).
+    :param gamma_r_pp: The pairing vertex :math:`\Gamma^{\mathrm{pp}}_{r}` (frequency-distributed) for one channel;
+        consumed by the solve.
+    :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{\mathrm{pp}}` at :math:`\omega = 0` (held on the root rank).
     :param mpi_dist_v: MPI distributor over the fermionic frequency axis (see :class:`MpiDistributor`). Its
         communicator must span exactly the participating ranks - when some ranks hold empty frequency slices the
         caller passes the restricted distributor (see :meth:`~dgamore.mpi_utils.MpiDistributor.restricted_to`),
@@ -1617,8 +1619,8 @@ def solve_eliashberg_lanczos_v2(
     def mv(gap: np.ndarray):
         r"""
         Applies the pairing kernel to a flattened gap vector in the frequency-distributed scheme: the root rank
-        multiplies by :math:`\chi_0^{pp}` and broadcasts, all ranks FFT and contract with their frequency slice of the
-        pairing vertex, then the result is reassembled across the frequency axis via all-gather. The orbital
+        multiplies by :math:`\chi_0^{\mathrm{pp}}` and broadcasts, all ranks FFT and contract with their frequency slice
+        of the pairing vertex, then the result is reassembled across the frequency axis via all-gather. The orbital
         contractions and the BZ transforms are threaded up to this rank's budget (serial for a budget of 1).
 
         :param gap: The flattened gap vector (full on root, sliced elsewhere).
@@ -1657,32 +1659,32 @@ def dispatch_full_vertex_calculation(
     channel: SpinChannel, u_loc: LocalInteraction, v_nonloc: Interaction, niv_pp: int, mpi_dist: MpiDistributor
 ) -> FourPoint:
     r"""
-    Loads the local irreducible vertex for ``channel`` and builds the full ladder pp vertex, dispatching between
-    the memory-lean and the regular construction routine based on the memory configuration. Please note that
-    Eq. (4.43) in my master's thesis is wrong. The correct formula is
-    :math:`F^{q\nu\nu'}_{r;1234}=F^{(1);q\nu\nu'}_{r;1234}+F^{(2);q\nu\nu'}_{r;1234}`, with
-    :math:`F^{(1);q\nu\nu'}_{r;1234} = \beta^2\Big[(\chi_{0;1234}^{q\nu\nu'})^{-1}-
-    \sum_{\nu_1\nu_2}\sum_{abcd}(\chi_{0;12ab}^{q\nu\nu_1})^{-1}\chi_{r;bacd}^{*;q\nu_1\nu_2}(\chi_{0;dc34}^{q\nu_2\nu'})^{-1}\Big]` and
-    :math:`F^{(2);q\nu\nu'}_{r;1234} = \sum_{abcdgh}\gamma^{q\nu}_{r;12ab}\Big(\mathbb{1}_{bacd} -
-    \sum_{ef}\mathcal{U}^{q}_{r;baef}\chi^{q}_{r;fecd}\Big)\mathcal{U}^{q}_{r;dcgh}\tilde\gamma^{q\nu'}_{r;hg34}`,
-    where
-    :math:`\tilde\gamma_{r;1234}^{q\nu}=\beta \sum_{ab}\sum_{\nu'} \chi^{*;q\nu'\nu}_{r;12ab} (\chi^{q\nu}_{0;ba34})^{-1}
-    =\beta \sum_{ab}\sum_{\nu'} \chi^{*;q\nu\nu'}_{r;ab21} (\chi^{q\nu}_{0;ab34})^{-1}`, i.e. the sum over the first
-    frequency argument equals the sum over the last one only up to the orbital reversal dictated by
-    time-reversal symmetry, see :meth:`~dgamore.nonlocal_sde.create_vrg_r_q_right`. No explicit factors of
-    :math:`\beta` appear in :math:`F^{(2)}` because they are absorbed into the stored objects:
-    :math:`\chi^{q}_{r}` is the (:math:`U`-dressed, shell- (and sometimes :math:`\lambda`-corrected)) physical
-    susceptibility normalized as :math:`\frac{1}{\beta^2}\sum_{\nu\nu'}\chi^{q\nu\nu'}_{r}`, and the three-leg
-    vertices carry the net normalization :math:`\gamma^{q\nu}_{r} = (\chi^{q\nu}_{0})^{-1}\sum_{\nu'}
-    \chi^{*;q\nu\nu'}_{r}` (the explicit :math:`\beta` in their construction cancels the :math:`1/\beta` of the
-    fused frequency sum), such that :math:`\gamma^{q\nu}_{r} \to \mathbb{1}` for :math:`\nu \to \infty`.
+    Loads the local irreducible vertex for ``channel`` and builds the full ladder pp vertex, dispatching between the
+    memory-lean and the regular construction routine based on the memory configuration. Please note that Eq. (4.43) in
+    my master's thesis is wrong. The correct formula is
+    :math:`F^{\mathrm{q}\nu\nu'}_{r;1234}=F^{(1);\mathrm{q}\nu\nu'}_{r;1234}+F^{(2);\mathrm{q}\nu\nu'}_{r;1234}`, with
+    :math:`F^{(1);\mathrm{q}\nu\nu'}_{r;1234} = \beta^2\Big[(\chi^{\mathrm{q}\nu\nu'}_{0;1234})^{-1}-
+    \sum_{\nu_1\nu_2}\sum_{abcd}(\chi^{\mathrm{q}\nu\nu_1}_{0;12ab})^{-1}\chi^{*;\mathrm{q}\nu_1\nu_2}_{r;bacd}(\chi^{\mathrm{q}\nu_2\nu'}_{0;dc34})^{-1}\Big]`
+    and :math:`F^{(2);\mathrm{q}\nu\nu'}_{r;1234} = \sum_{abcdgh}\gamma^{\mathrm{q}\nu}_{r;12ab}\Big(\mathbb{1}_{bacd} -
+    \sum_{ef}\mathcal{U}^{\mathbf{q}}_{r;baef}\chi^{\mathrm{q}}_{r;fecd}\Big)\mathcal{U}^{\mathbf{q}}_{r;dcgh}\tilde\gamma^{\mathrm{q}\nu'}_{r;hg34}`,
+    where :math:`\tilde\gamma^{\mathrm{q}\nu}_{r;1234}=\beta \sum_{ab}\sum_{\nu'} \chi^{*;\mathrm{q}\nu'\nu}_{r;12ab}
+    (\chi^{\mathrm{q}\nu}_{0;ba34})^{-1}
+    =\beta \sum_{ab}\sum_{\nu'} \chi^{*;\mathrm{q}\nu\nu'}_{r;ab21} (\chi^{\mathrm{q}\nu}_{0;ab34})^{-1}`, i.e. the sum
+    over the first frequency argument equals the sum over the last one only up to the orbital reversal dictated by
+    time-reversal symmetry, see :meth:`~dgamore.nonlocal_sde.create_vrg_r_q_right`. No explicit factors of :math:`\beta`
+    appear in :math:`F^{(2)}` because they are absorbed into the stored objects: :math:`\chi^{\mathrm{q}}_{r}` is the
+    (:math:`U`-dressed, shell- (and sometimes :math:`\lambda`-corrected)) physical susceptibility normalized as
+    :math:`\frac{1}{\beta^2}\sum_{\nu\nu'}\chi^{\mathrm{q}\nu\nu'}_{r}`, and the three-leg vertices carry the net
+    normalization :math:`\gamma^{\mathrm{q}\nu}_{r} = (\chi^{\mathrm{q}\nu}_{0})^{-1}\sum_{\nu'}
+    \chi^{*;\mathrm{q}\nu\nu'}_{r}` (the explicit :math:`\beta` in their construction cancels the :math:`1/\beta` of the
+    fused frequency sum), such that :math:`\gamma^{\mathrm{q}\nu}_{r} \to \mathbb{1}` for :math:`\nu \to \infty`.
 
     :param channel: The spin channel (density or magnetic).
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist: MPI distributor over the irreducible BZ q-points.
-    :return: The full ladder pp vertex :math:`F^{q}_{r}` as a :class:`FourPoint`.
+    :return: The full ladder pp vertex :math:`F^{\mathrm{q}}_{r}` as a :class:`FourPoint`.
     """
     gamma_r = LocalFourPoint.load(os.path.join(config.output.output_path, f"gamma_{channel.value}_loc.npy"), channel)
     if config.memory.save_memory_for_fq:
@@ -1794,7 +1796,7 @@ def solve(
     :param giwk_dga: The converged momentum-dependent DGA :class:`GreensFunction`.
     :param g_dmft: The local (DMFT) :class:`GreensFunction` (used for the local diagrams).
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param comm: The MPI communicator.
     :return: A dict keyed by ``(channel, parity_label)`` mapping to ``(lambdas, gaps)`` of the leading eigenvalues
         and :class:`GapFunction` objects for each solved physical frequency-parity sector. When

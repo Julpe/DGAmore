@@ -98,8 +98,8 @@ then, the loop stops and the program exits. The non-local self-energy is written
 iteration. Convergence itself is judged by ``epsilon`` through the relative *step* residual of the Schwinger-Dyson
 iteration - the norm of the change of the mixed self-energy between consecutive iterations, divided by the norm of
 the previous one - taken over the full momentum grid, all orbital combinations and the positive fermionic
-frequencies of the core box (reported in the log every iteration); in addition, the chemical potential is required
-to change by less than a small temperature-dependent threshold between iterations.
+frequencies of the core box (reported in the log every iteration). The chemical potential must also settle,
+changing by less than a small temperature-dependent threshold between iterations.
 
 The ``mixing`` parameter is a floating-point number between zero and one that sets the weight of the new
 self-energy in the update. The accompanying ``mixing_strategy`` selects between ``linear``, ``pulay`` and
@@ -137,10 +137,11 @@ the *uncorrected* self-consistent solution to the full ``epsilon``, so the corre
 the final result. It is independent of the one-shot ``perform_lambda_correction`` of the
 :ref:`lambda correction section <lambda-correction>`, which takes precedence when both are enabled.
 
-The multi-band scheme mimics the scalar correction without being derived from it: instead of one
-scalar per channel it calibrates a full :math:`N_o^2 \times N_o^2` real-symmetric mass matrix :math:`\Lambda_r` per
-channel (both density and magnetic), added to the compound inverse susceptibility so that the momentum- and
-frequency-summed corrected susceptibility matches the local (impurity) sum rule component by component. The number
+The multi-band scheme mimics the scalar correction without being derived from it: instead of one scalar per channel
+it calibrates a full :math:`n_{\mathrm{o}}^2 \times n_{\mathrm{o}}^2` real-symmetric mass matrix
+:math:`\Lambda_{\mathrm{r}}` per channel (both density and magnetic), added to the compound inverse susceptibility
+so that the momentum- and frequency-summed corrected susceptibility matches the local (impurity) sum rule component
+by component. The number
 of conditions matches the number of parameters exactly, so the calibration is a well-posed matrix root problem
 solved by a damped Newton iteration (in the physically relevant regime the map is strictly monotone, hence the root
 is unique); it runs in double precision and is line-searched to keep the static susceptibility gap positive. The
@@ -276,9 +277,9 @@ not expected, as these diagrams become relevant in that case. With ``symmetrize_
 default), gap functions belonging to (near-)degenerate eigenvalues are orthogonalized with a Loewdin scheme and
 rotated to their mirror-adapted partners: single-axis (:math:`p_x`/:math:`p_y`/:math:`p_z`-like) and two-axis
 (:math:`d_{xy}`/:math:`d_{xz}`/:math:`d_{yz}`-like) modes are ordered by the mirrors they are odd under. The mirrors
-are the full point-group ones, :math:`\Delta(k) \to U_i \Delta(M_i k) U_i^\dagger`, whose orbital part :math:`U_i` is
-solved for from :math:`H(k)` rather than tabulated per orbital set, so multi-orbital multiplets (including purely
-local, momentum-independent ones) are resolved as well. A multiplet the coordinate mirrors cannot split - an
+are the full point-group ones, :math:`\Delta(\mathbf{k}) \to U_i \Delta(M_i \mathbf{k}) U_i^\dagger`, whose orbital
+part :math:`U_i` is solved for from :math:`H(\mathbf{k})` rather than tabulated per orbital set, so multi-orbital
+multiplets (including purely local, momentum-independent ones) are resolved as well. A multiplet the coordinate mirrors cannot split - an
 :math:`E_g` doublet, for instance, which would need a three-fold rotation about :math:`[111]` - keeps its Loewdin
 basis instead of being rotated arbitrarily.
 
@@ -286,12 +287,12 @@ The ``resolve_frequency_parity`` field controls whether the physical gap-symmetr
 unprojected eigensolver leaks onto the globally dominant eigenvector, mixing frequency-even and frequency-odd modes;
 projecting the trial vector onto a fixed symmetry sector at every iteration separates them.
 
-The orbital gap :math:`\Delta_{12}(k, \nu)` (with the spin part folded into the channel) acts on three commuting
-involutions built from the same array operations as the pairing kernel: the frequency flip
-:math:`(T\Delta)_{12}(k, \nu) = \Delta_{12}(k, -\nu)`, the momentum flip
-:math:`(P\Delta)_{12}(k, \nu) = \Delta_{12}(-k, \nu)` and the orbital transpose
-:math:`(O\Delta)_{12}(k, \nu) = \Delta_{21}(k, \nu)`. The Pauli principle requires the Cooper-pair amplitude to be
-antisymmetric under the combined exchange of spin, momentum, orbital and frequency,
+The orbital gap :math:`\Delta_{12}(\mathbf{k}, \nu)` (with the spin part folded into the channel) acts on three
+commuting involutions built from the same array operations as the pairing kernel: the frequency flip
+:math:`(T\Delta)_{12}(\mathbf{k}, \nu) = \Delta_{12}(\mathbf{k}, -\nu)`, the momentum flip
+:math:`(P\Delta)_{12}(\mathbf{k}, \nu) = \Delta_{12}(-\mathbf{k}, \nu)` and the orbital transpose
+:math:`(O\Delta)_{12}(\mathbf{k}, \nu) = \Delta_{21}(\mathbf{k}, \nu)`. The Pauli principle requires the Cooper-pair
+amplitude to be antisymmetric under the combined exchange of spin, momentum, orbital and frequency,
 
 .. math::
 
@@ -332,8 +333,8 @@ applied to both the matrix-vector product and the starting vector at every itera
 singlet and triplet channels, while ``False`` (the default) returns the overall leading eigenpairs without any
 projection.
 Clean frequency-parity separation additionally requires the pairing vertex to satisfy the time-reversal-plus-inversion
-symmetry :math:`\Gamma^{\nu\nu'}(q) = \Gamma^{(-\nu)(-\nu')}(-q)`. Sector-resolved gap functions are written as
-``gap_<channel>_<parity>_<i>`` (for example ``gap_sing_even_1``), while the unprojected case keeps the
+symmetry :math:`\Gamma^{\nu\nu'}(\mathbf{q}) = \Gamma^{(-\nu)(-\nu')}(-\mathbf{q})`. Sector-resolved gap functions
+are written as ``gap_<channel>_<parity>_<i>`` (for example ``gap_sing_even_1``), while the unprojected case keeps the
 ``gap_<channel>_<i>`` naming. A ``gap_parity.txt`` file is written alongside them with one line per saved gap: a
 compact wave-symmetry label (``s`` / ``d`` / ``p``, or ``x`` if unclassified, followed by ``+`` / ``-`` for the
 frequency parity) followed by the measured parity Rayleigh quotients

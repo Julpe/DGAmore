@@ -5,13 +5,13 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Non-local ladder DGA step - the parallel-heavy core of the code. Starting from the local irreducible vertex
-:math:`\Gamma_{r}` and the bare interaction, the functions here build, per momentum :math:`q` and spin channel,
-the bubble :math:`\chi_0^q`, the auxiliary susceptibility :math:`\chi^{*;q}_{r}`, the three-leg vertex
-:math:`\gamma^q_{r}`, the physical susceptibility :math:`\chi^q_{r}` (with shell and optional
-:math:`\lambda`-correction) and the self-energy kernel, then contract the kernel with the Green's function to get
-the momentum-dependent self-energy :math:`\Sigma(k, \nu)`. Several CPU/GPU/FFT variants of the heavy contractions
-are provided, distributed over MPI ranks. The whole thing is wrapped in a self-consistency loop with chemical-
-potential adjustment and self-energy mixing (linear / Pulay / Anderson). Equation numbers refer to the author's
+:math:`\Gamma_{r}` and the bare interaction, the functions here build, per momentum :math:`\mathbf{q}` and spin channel,
+the bubble :math:`\chi^{\mathrm{q}\nu}_{0}`, the auxiliary susceptibility :math:`\chi^{*;\mathrm{q}}_{r}`, the three-leg
+vertex :math:`\gamma^{\mathrm{q}\nu}_{r}`, the physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` (with shell and
+optional :math:`\lambda`-correction) and the self-energy kernel, then contract the kernel with the Green's function to
+get the momentum-dependent self-energy :math:`\Sigma^{\mathrm{k}}_{12}`. Several CPU/GPU/FFT variants of the heavy
+contractions are provided, distributed over MPI ranks. The whole thing is wrapped in a self-consistency loop with
+chemical-potential adjustment and self-energy mixing (linear / Pulay / Anderson). Equation numbers refer to the author's
 master's thesis (Chapters 3 & 4).
 """
 
@@ -45,22 +45,24 @@ def get_hartree_fock(u_loc: LocalInteraction, v_nonloc: Interaction) -> tuple[np
     the sum over the spins of the first term in Eq. (4.55) in Anna Galler's thesis results in a simple factor of 2. This
     can be seen in my master's thesis, Eq. (3.55). The Hartree-Fock term is given by
 
-    .. math:: \Sigma_{HF}^k = 2(U_{acbd} + V^{q=0}_{acbd}) n_{dc} - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}
+    .. math:: \Sigma^{\mathbf{k}}_{\mathrm{HF}} = 2(U_{acbd} + V^{\mathbf{q}=0}_{acbd}) n_{dc} - 1/n_{\mathbf{q}} \sum_{\mathbf{q}} (U_{adcb} + V^{\mathbf{q}}_{adcb}) n^{\mathbf{k}-\mathbf{q}}_{dc}
 
-    where the Hartree term reads :math:`\Sigma_{H} = 2(U_{acbd} + V^{q=0}_{acbd}) n_{dc}` and the Fock term reads
-    :math:`\Sigma_{F}^k = - 1/N_q \sum_q (U_{adcb} + V^{q}_{adcb}) n^{k-q}_{dc}`. The Hartree contraction uses the
-    middle-index-swapped ``U_{acbd}`` so it picks up the inter-orbital density :math:`U'` (stored at :math:`U_{abab}`);
-    see :func:`dgamore.local_sde.get_local_hartree_fock`.
+    where the Hartree term reads :math:`\Sigma_{\mathrm{H}} = 2(U_{acbd} + V^{\mathbf{q}=0}_{acbd}) n_{dc}` and the Fock
+    term reads :math:`\Sigma^{\mathbf{k}}_{\mathrm{F}} = - 1/n_{\mathbf{q}} \sum_{\mathbf{q}} (U_{adcb} +
+    V^{\mathbf{q}}_{adcb}) n^{\mathbf{k}-\mathbf{q}}_{dc}`. The Hartree contraction uses the middle-index-swapped
+    ``U_{acbd}`` so it picks up the inter-orbital density :math:`U'` (stored at :math:`U_{abab}`); see
+    :func:`dgamore.local_sde.get_local_hartree_fock`.
 
     The Fock momentum sum is a circular convolution over the periodic Brillouin zone, so it is evaluated with the
-    convolution theorem instead of an explicit q-loop:
-    :math:`\Sigma_{F}^k = -\tfrac{1}{N_q}\,\mathcal{F}^{-1}\big[\mathcal{F}[(U+V)^{(-q)}_{adcb}]\,\mathcal{F}[n_{dc}]\big]`
-    (the interaction is momentum-flipped because the shift is :math:`n^{k+q}` after the ``-q`` roll convention). This is
-    :math:`O(N_k \log N_k)` and materializes only R-space :math:`[k, o^4]`/:math:`[k, o^2]` arrays, never a
-    :math:`[q, k]` occupation block, so the whole full-BZ term is computed on every rank without a q-distribution.
+    convolution theorem instead of an explicit q-loop: :math:`\Sigma^{\mathbf{k}}_{\mathrm{F}} =
+    -\tfrac{1}{n_{\mathbf{q}}}\,\mathcal{F}^{-1}
+    \big[\mathcal{F}[(U+V)^{(-\mathbf{q})}_{adcb}]\,\mathcal{F}[n_{dc}]\big]` (the interaction is momentum-flipped
+    because the shift is :math:`n^{\mathbf{k}+\mathbf{q}}` after the ``-q`` roll convention). This is
+    :math:`O(n_{\mathbf{k}} \log n_{\mathbf{k}})` and materializes only R-space ``[k, o^4]``/``[k, o^2]`` arrays, never
+    a ``[q, k]`` occupation block, so the whole full-BZ term is computed on every rank without a q-distribution.
 
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}` on the full q-grid (see :class:`Interaction`).
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` on the full q-grid (see :class:`Interaction`).
     :return: The tuple ``(hartree, fock)`` of self-energy contributions, broadcastable to ``[k, o1, o2, v]``.
     """
     v_q0 = v_nonloc.find_q((0, 0, 0))
@@ -88,7 +90,7 @@ def create_inverse_auxiliary_chi_r_q(gamma_r: LocalFourPoint, gchi0_q_inv: FourP
     Assembles the Bethe-Salpeter matrix whose inversion yields the auxiliary susceptibility (Eq. (3.60) in my
     master's thesis),
 
-    .. math:: M^{q\nu\nu'}_{1234} = (\chi_{0;1234}^{q\nu})^{-1}\delta_{\nu\nu'} + (\Gamma_{r;1234}^{\omega\nu\nu'}-\mathcal{U}_{r;1234}^{q})/\beta^2,
+    .. math:: M^{\mathrm{q}\nu\nu'}_{1234} = (\chi^{\mathrm{q}\nu}_{0;1234})^{-1}\delta_{\nu\nu'} + (\Gamma^{\omega\nu\nu'}_{r;1234}-\mathcal{U}^{\mathbf{q}}_{r;1234})/\beta^2,
 
     in a **single** two-fermion block: the result is broadcast-filled with the scaled local vertex over the momentum
     axis, the inverse bubble is added on the fermionic frequency diagonal in place (see
@@ -98,9 +100,12 @@ def create_inverse_auxiliary_chi_r_q(gamma_r: LocalFourPoint, gchi0_q_inv: FourP
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` (full or half bosonic range; read via a
         half-range view).
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (half bosonic range, one fermionic dimension).
-    :param u_r: The channel-projected total interaction :math:`\mathcal{U}_{r}^{q} = U_{r} + V_{r}^{q}`.
-    :return: The assembled matrix :math:`M^{q}` as a :class:`FourPoint` (half niw range, two fermionic dimensions).
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (half bosonic range, one
+        fermionic dimension).
+    :param u_r: The channel-projected total interaction :math:`\mathcal{U}^{\mathbf{q}}_{r} = U_{r} +
+        V^{\mathbf{q}}_{r}`.
+    :return: The assembled matrix :math:`M^{\mathrm{q}}` as a :class:`FourPoint` (half niw range, two fermionic
+        dimensions).
     """
     beta = config.sys.beta
     gamma_mat = gamma_r.mat
@@ -123,15 +128,15 @@ def create_auxiliary_chi_r_q(
     r"""
     Returns the auxiliary susceptibility, see Eq. (3.60) in my master's thesis,
 
-    .. math:: \chi^{*;q\nu\nu'}_{r;abcd} = ((\chi_{0;abcd}^{q\nu})^{-1} + (\Gamma_{r;abcd}^{\omega\nu\nu'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1},
+    .. math:: \chi^{*;\mathrm{q}\nu\nu'}_{r;abcd} = ((\chi^{\mathrm{q}\nu}_{0;abcd})^{-1} + (\Gamma^{\omega\nu\nu'}_{r;abcd}-U_{r;abcd}-V^{\mathbf{q}}_{r;abcd})/\beta^2)^{-1},
 
     with the matrix to invert assembled in a single block by :func:`create_inverse_auxiliary_chi_r_q`.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
-    :return: The momentum-dependent auxiliary susceptibility :math:`\chi^{*;q}_{r}` as a :class:`FourPoint`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :return: The momentum-dependent auxiliary susceptibility :math:`\chi^{*;\mathrm{q}}_{r}` as a :class:`FourPoint`.
     """
     u_r = v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel)
     return create_inverse_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_r).invert(False)
@@ -145,13 +150,14 @@ def create_auxiliary_chi_r_q_sum_v1(
     and sums over the last fermionic frequency in one fused step (see
     :meth:`FourPoint.invert_and_sum_over_last_vn`),
 
-    .. math:: \sum_{\nu'}\chi^{*;q\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi_{0;abcd}^{q\nu})^{-1} + (\Gamma_{r;abcd}^{\omega\nu\nu'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}.
+    .. math:: \sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi^{\mathrm{q}\nu}_{0;abcd})^{-1} + (\Gamma^{\omega\nu\nu'}_{r;abcd}-U_{r;abcd}-V^{\mathbf{q}}_{r;abcd})/\beta^2)^{-1}.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
-    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q}_{r}` as a :class:`FourPoint`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` as a
+        :class:`FourPoint`.
     """
     u_r = v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel)
     return create_inverse_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_r).invert_and_sum_over_last_vn(config.sys.beta)
@@ -169,14 +175,15 @@ def create_auxiliary_chi_r_q_sum_v2(
     the rank-local q-points (capping peak memory to one q at a time) and uses the standard fused invert-and-sum per
     q (see :meth:`FourPoint.invert_and_sum_over_last_vn`),
 
-    .. math:: \sum_{\nu'}\chi^{*;q\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi_{0;abcd}^{q\nu})^{-1} + (\Gamma_{r;abcd}^{\omega\nu\nu'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}.
+    .. math:: \sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi^{\mathrm{q}\nu}_{0;abcd})^{-1} + (\Gamma^{\omega\nu\nu'}_{r;abcd}-U_{r;abcd}-V^{\mathbf{q}}_{r;abcd})/\beta^2)^{-1}.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q}_{r}` as a :class:`FourPoint`.
+    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` as a
+        :class:`FourPoint`.
     """
     irrk_q_list = config.lattice.k_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrq.my_slice]
@@ -204,14 +211,15 @@ def create_auxiliary_chi_r_q_sum_v3(
     memory-lean variant: it loops over the rank-local q-points and uses the highly memory-efficient
     linear-solver-based fused invert-and-sum per q (see :meth:`FourPoint.invert_and_sum_over_last_vn_v2`),
 
-    .. math:: \sum_{\nu'}\chi^{*;q\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi_{0;abcd}^{q\nu})^{-1} + (\Gamma_{r;abcd}^{\omega\nu\nu'}-U_{r;abcd}-V_{r;abcd}^q)/\beta^2)^{-1}.
+    .. math:: \sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi^{\mathrm{q}\nu}_{0;abcd})^{-1} + (\Gamma^{\omega\nu\nu'}_{r;abcd}-U_{r;abcd}-V^{\mathbf{q}}_{r;abcd})/\beta^2)^{-1}.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q}_{r}` as a :class:`FourPoint`.
+    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` as a
+        :class:`FourPoint`.
     """
     irrk_q_list = config.lattice.k_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrq.my_slice]
@@ -230,32 +238,36 @@ def create_auxiliary_chi_r_q_sum_v3(
 def create_vrg_r_q(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint) -> FourPoint:
     r"""
     Returns the momentum-dependent three-leg vertex, see Eq. (3.63) in my master's thesis,
-    :math:`\gamma_{r;1234}^{q\nu} = \beta \sum_{ab} \sum_{\nu'} (\chi^{q\nu}_{0;12ab})^{-1} \chi^{*;q\nu\nu'}_{r;ba34}`.
+    :math:`\gamma^{\mathrm{q}\nu}_{r;1234} = \beta \sum_{ab} \sum_{\nu'} (\chi^{\mathrm{q}\nu}_{0;12ab})^{-1}
+    \chi^{*;\mathrm{q}\nu\nu'}_{r;ba34}`.
 
-    :param gchi_aux_q_r_sum: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q\nu\nu'}_{r}`.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
-    :return: The three-leg vertex :math:`\gamma^q_{r}` (``vrg``) as a :class:`FourPoint`.
+    :param gchi_aux_q_r_sum: The frequency-summed auxiliary susceptibility
+        :math:`\sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r}`.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
+    :return: The three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}` (``vrg``) as a :class:`FourPoint`.
     """
     return (gchi0_q_inv @ gchi_aux_q_r_sum).scale(config.sys.beta)
 
 
 def create_vrg_r_q_right(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint) -> FourPoint:
     r"""
-    Returns the momentum-dependent right-sided three-leg vertex, i.e. the counterpart of :meth:`create_vrg_r_q`
-    (Eq. (3.63) in my master's thesis) with the summed frequency argument of :math:`\chi^{*}` and the position of
-    :math:`(\chi_0)^{-1}` swapped. It thus reads
-    :math:`\tilde{\gamma}_{r;1234}^{q\nu} = \beta \sum_{ab} \sum_{\nu'} \chi^{*;q\nu'\nu}_{r;12ab} (\chi^{q\nu}_{0;ba34})^{-1}`.
-    Notice that the sum runs over the *first* frequency argument, whereas only the sum over the last frequency is
-    available (see :meth:`FourPoint.invert_and_sum_over_last_vn`). The two are related by the time-reversal symmetry
-    :math:`\chi^{*;q\nu\nu'}_{r;1234} = \chi^{*;q\nu'\nu}_{r;4321}` (enforced on the DMFT two-particle Green's
-    function via :meth:`LocalFourPoint.symmetrize_v_vp` and inherited by all vertices built from it), which carries
-    an orbital reversal along with the frequency swap:
-    :math:`\sum_{\nu'} \chi^{*;q\nu'\nu}_{r;12ab} = \sum_{\nu'} \chi^{*;q\nu\nu'}_{r;ba21}`. Hence the last-frequency
-    sum enters with the orbital permutation ``"abcd->dcba"`` applied.
+    Returns the momentum-dependent right-sided three-leg vertex, i.e. the counterpart of :meth:`create_vrg_r_q` (Eq.
+    (3.63) in my master's thesis) with the summed frequency argument of :math:`\chi^{*}` and the position of
+    :math:`(\chi_0)^{-1}` swapped. It thus reads :math:`\tilde{\gamma}^{\mathrm{q}\nu}_{r;1234} = \beta \sum_{ab}
+    \sum_{\nu'} \chi^{*;\mathrm{q}\nu'\nu}_{r;12ab} (\chi^{\mathrm{q}\nu}_{0;ba34})^{-1}`. Notice that the sum runs over
+    the *first* frequency argument, whereas only the sum over the last frequency is available (see
+    :meth:`FourPoint.invert_and_sum_over_last_vn`). The two are related by the time-reversal symmetry
+    :math:`\chi^{*;\mathrm{q}\nu\nu'}_{r;1234} = \chi^{*;\mathrm{q}\nu'\nu}_{r;4321}` (enforced on the DMFT two-particle
+    Green's function via :meth:`LocalFourPoint.symmetrize_v_vp` and inherited by all vertices built from it), which
+    carries an orbital reversal along with the frequency swap: :math:`\sum_{\nu'} \chi^{*;\mathrm{q}\nu'\nu}_{r;12ab} =
+    \sum_{\nu'} \chi^{*;\mathrm{q}\nu\nu'}_{r;ba21}`. Hence the last-frequency sum enters with the orbital permutation
+    ``"abcd->dcba"`` applied.
 
-    :param gchi_aux_q_r_sum: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;q\nu\nu'}_{r}`.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
-    :return: The right-sided three-leg vertex :math:`\tilde{\gamma}^q_{r}` (``vrg_right``) as a :class:`FourPoint`.
+    :param gchi_aux_q_r_sum: The frequency-summed auxiliary susceptibility
+        :math:`\sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r}`.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
+    :return: The right-sided three-leg vertex :math:`\tilde{\gamma}^{\mathrm{q}\nu}_{r}` (``vrg_right``) as a
+        :class:`FourPoint`.
     """
     return (gchi_aux_q_r_sum.permute_orbitals("abcd->dcba") @ gchi0_q_inv).scale(config.sys.beta)
 
@@ -272,12 +284,12 @@ def create_generalized_chi_q_with_shell_correction(
     Motoharu Kitatani et al. 2022 J. Phys. Mater. 5 034005; DOI 10.1088/2515-7639/ac7e6d. Eq. A.15. See also Sec. 3.7.2
     in my master's thesis for details.
 
-    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{phys;q}_{r}`.
+    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}`.
     :param gchi0_q_full_sum: The frequency-summed bare bubble over the full box.
     :param gchi0_q_core_sum: The frequency-summed bare bubble over the core box.
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
-    :return: The shell-corrected physical susceptibility :math:`\chi^{q}_{r}` as a :class:`FourPoint`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :return: The shell-corrected physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` as a :class:`FourPoint`.
     """
     return (
         (chi_phys_q_r + gchi0_q_full_sum - gchi0_q_core_sum).invert()
@@ -287,16 +299,16 @@ def create_generalized_chi_q_with_shell_correction(
 
 def restrict_chi_phys_to_positive_eigenvalues(chi_phys_q_r: FourPoint, floor: float = 1e-4) -> tuple[FourPoint, int]:
     r"""
-    Regularizes the physical susceptibility: for every momentum and bosonic frequency
-    the eigenvalues of the Hermitian part of the inverse compound matrix :math:`(\chi^{q\omega}_{r;1234})^{-1}`
-    are floored at :math:`+\text{floor}` (the skew-Hermitian part is kept), and the result is inverted back. A
-    negative eigenvalue of the inverse marks a crossed pole of the Bethe-Salpeter equation (an unphysical branch
-    of the ladder, e.g. the high-temperature charge-channel instability); flooring it pins the corresponding
-    susceptibility eigenvalue at :math:`1/\text{floor}` while all healthy eigenpairs - including legitimately
-    negative off-diagonal matrix elements - pass through unchanged. For a single band the compound block is a
-    scalar and this reduces to the plain clamp of negative inverse values.
+    Regularizes the physical susceptibility: for every momentum and bosonic frequency the eigenvalues of the Hermitian
+    part of the inverse compound matrix :math:`(\chi^{\mathrm{q}}_{r;1234})^{-1}` are floored at :math:`+\text{floor}`
+    (the skew-Hermitian part is kept), and the result is inverted back. A negative eigenvalue of the inverse marks a
+    crossed pole of the Bethe-Salpeter equation (an unphysical branch of the ladder, e.g. the high-temperature
+    charge-channel instability); flooring it pins the corresponding susceptibility eigenvalue at :math:`1/\text{floor}`
+    while all healthy eigenpairs - including legitimately negative off-diagonal matrix elements - pass through
+    unchanged. For a single band the compound block is a scalar and this reduces to the plain clamp of negative inverse
+    values.
 
-    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{q\omega}_{r;1234}` (no fermionic frequency
+    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r;1234}` (no fermionic frequency
         dimensions).
     :param floor: Lower bound imposed on the eigenvalues of the inverse susceptibility.
     :return: The tuple ``(chi_restricted, n_floored)`` of the restricted susceptibility as a :class:`FourPoint`
@@ -336,12 +348,11 @@ def _effective_epsilon(annealer: "LambdaAnnealer | None" = None) -> float:
 def min_static_compound_eigenvalue(chi_phys_q_r: FourPoint) -> float:
     r"""
     Returns the smallest eigenvalue of the Hermitian part of the static compound blocks
-    :math:`\chi^{q(\omega=0)}_{r;1234}` over all rank-local momenta. A physical static susceptibility is positive
-    semi-definite per momentum, so a significantly negative value flags that the ladder sits on an unphysical
-    (past-pole) branch. Expects the object with a compressed momentum dimension and no fermionic frequency
-    dimensions.
+    :math:`\chi^{(\mathbf{q},\omega=0)}_{r;1234}` over all rank-local momenta. A physical static susceptibility is
+    positive semi-definite per momentum, so a significantly negative value flags that the ladder sits on an unphysical
+    (past-pole) branch. Expects the object with a compressed momentum dimension and no fermionic frequency dimensions.
 
-    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{q\omega}_{r;1234}`.
+    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r;1234}`.
     :return: The minimum eigenvalue as a float.
     """
     w0 = chi_phys_q_r.niw if chi_phys_q_r.full_niw_range else 0
@@ -363,7 +374,7 @@ def calculate_sigma_dc_kernel(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, u_lo
     A vertex carrying a wider second index still gives the same result, only more slowly.
 
     :param f_dc_loc: The local full vertex :math:`F` used for the double-counting correction.
-    :param gchi0_q: The momentum-dependent bare bubble :math:`\chi_0^q`.
+    :param gchi0_q: The momentum-dependent bare bubble :math:`\chi^{\mathrm{q}\nu}_{0}`.
     :param u_loc: The bare local interaction :math:`U`.
     :return: The double-counting kernel as a :class:`FourPoint`, cut to the core fermionic box.
     """
@@ -392,11 +403,11 @@ def calculate_kernel_r_q(
     Returns the kernel for the self-energy calculation minus 2/3 times the identity if the channel is the magnetic
     channel (due to the extra factor of :math:`U_{ah21}` in Eq. (4.29) in my master's thesis),
 
-    .. math:: K = \gamma_{r;abcd}^{q\nu} - \gamma_{r;abef}^{q\nu} U^{q}_{r;fehg} \chi_{r;ghcd}^{q}.
+    .. math:: K = \gamma^{\mathrm{q}\nu}_{r;abcd} - \gamma^{\mathrm{q}\nu}_{r;abef} U^{\mathbf{q}}_{r;fehg} \chi^{\mathrm{q}}_{r;ghcd}.
 
-    :param vrg_q_r: The momentum-dependent three-leg vertex :math:`\gamma^q_{r}`.
-    :param chi_phys_q_r: The (shell-corrected) physical susceptibility :math:`\chi^{phys;q}_{r}`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param vrg_q_r: The momentum-dependent three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}`.
+    :param chi_phys_q_r: The (shell-corrected) physical susceptibility :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param u_loc: The bare local interaction :math:`U`.
     :return: The self-energy kernel :math:`U_r K` as a :class:`FourPoint`.
     """
@@ -414,12 +425,12 @@ def calculate_kernel_r_q(
 
 def perform_ornstein_zernike_fit(chi_phys_q_r: FourPoint) -> None:
     r"""
-    Fits the static (:math:`\omega = 0`) physical susceptibility to an Ornstein-Zernike form
-    :math:`\chi(q) = A / (\xi^{-2} + (q - q_0)^2)` around the antiferromagnetic wave vector
-    :math:`q_0 = (\pi, \pi, 0)`, per orbital combination, and writes the amplitude :math:`A` and correlation length
-    :math:`\xi` to ``oz_coeff.txt``. Non-converging fits are flagged with ``[-1, -1]``.
+    Fits the static (:math:`\omega = 0`) physical susceptibility to an Ornstein-Zernike form :math:`\chi(\mathbf{q}) = A
+    / (\xi^{-2} + (\mathbf{q} - \mathbf{q}_0)^2)` around the antiferromagnetic wave vector :math:`\mathbf{q}_0 = (\pi,
+    \pi, 0)`, per orbital combination, and writes the amplitude :math:`A` and the correlation length :math:`\xi` to
+    ``oz_coeff.txt``. Non-converging fits are flagged with ``[-1, -1]``.
 
-    :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{q}_{r}` (irreducible BZ).
+    :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` (irreducible BZ).
     :return: None.
     """
 
@@ -492,9 +503,9 @@ def calculate_and_save_chi_q_r_rpa(
     functions, :math:`\chi_{d/m;\mathrm{RPA}} = \chi_0 (1 + U_{d/m}\chi_0)^{-1} = (\chi_0^{-1} + U_{d/m})^{-1}`. The
     result is gathered to rank 0 and written to file.
 
-    :param gchi0_q_core_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :param gchi0_q_core_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :return: None.
     """
@@ -518,7 +529,8 @@ def _select_and_apply_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
     single-band input uses the scalar Moriya correction, multi-band input the multi-orbital matrix correction (the
     dispatch is logged once at setup). If neither flag is enabled the susceptibility is returned unchanged.
 
-    :param chi_phys_q_r: The rank-0 gathered physical susceptibility :math:`\chi^{q}_{r}` in the irreducible BZ.
+    :param chi_phys_q_r: The rank-0 gathered physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` in the irreducible
+        BZ.
     :return: The (possibly corrected) physical susceptibility.
     """
     if config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction:
@@ -545,11 +557,11 @@ def calculate_sigma_kernel_r_q(
     count). Saves the physical susceptibility (and, if Eliashberg is enabled, the intermediate vertices) to file.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi_0^q)^{-1}` (core box).
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
     :param gchi0_q_full_sum: The frequency-summed bare bubble over the full box.
     :param gchi0_q_core_sum: The frequency-summed bare bubble over the core box.
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param annealer: The active :class:`LambdaAnnealer` (its boson mass is applied to the physical susceptibility),
         or ``None`` when annealing is off.
@@ -649,9 +661,10 @@ def calculate_sigma_kernel_r_q(
 
 def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full_q_list: np.ndarray) -> SelfEnergy:
     r"""
-    Returns :math:`\Sigma_{12}^{k\nu} = -\frac{1}{2\beta N_q} \sum_{q\omega} \sum_{abcd} U^q_{r;a1bc} K_{r;cb2d}^{q\omega\nu} G_{ad}^{\nu-\omega}`.
-    For very large momentum grids, this function is the slowest part compared to the rest of the code due to the
-    repeated loops. Potential speed-ups could be achieved by batching the q-points or using numba.
+    Returns :math:`\Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{abcd}
+    U^{\mathbf{q}}_{r;a1bc} K^{\mathrm{q}\nu}_{r;cb2d} G^{\mathrm{k}-\mathrm{q}}_{ad}`. For very large momentum grids,
+    this function is the slowest part of the code because of its repeated loops. Batching the
+    q-points or using numba could speed it up further.
 
     Currently unused: the pipeline always runs the two-pass FFT contraction (see
     :func:`calculate_sigma_from_kernel_fft_cpu`), since this q-loop variant restores the full bosonic range on the
@@ -689,11 +702,11 @@ def calculate_sigma_from_kernel_cpu(
     my_full_q_list: np.ndarray,
 ) -> SelfEnergy:
     r"""
-    Returns :math:`\Sigma_{12}^{k\nu} = -\frac{1}{2\beta N_q} \sum_{q\omega} \sum_{abcd} U^q_{r;a1bc} K_{r;cb2d}^{q\omega\nu} G_{ad}^{\nu-\omega}`.
-    For very large momentum grids, this function is the slowest part compared to the rest of the code due to the
-    repeated loops. There is no real way to speed it up further without leveraging GPUs or other hardware accelerators.
-    This is the CPU implementation (Fortran-ordered buffers, preallocated accumulator). Currently unused, see
-    :func:`calculate_sigma_from_kernel`.
+    Returns :math:`\Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{abcd}
+    U^{\mathbf{q}}_{r;a1bc} K^{\mathrm{q}\nu}_{r;cb2d} G^{\mathrm{k}-\mathrm{q}}_{ad}`. For very large momentum grids,
+    this function is the slowest part of the code because of its repeated loops. Short of moving the
+    work to a GPU or another accelerator, there is no real way to speed it up further. This is the CPU implementation
+    (Fortran-ordered buffers, preallocated accumulator). Currently unused, see :func:`calculate_sigma_from_kernel`.
 
     :param kernel: The self-energy kernel :math:`K` (full BZ, scattered across ranks).
     :param giwk: The momentum-dependent :class:`GreensFunction`.
@@ -742,10 +755,10 @@ def calculate_sigma_from_kernel_gpu(
     my_full_q_list: np.ndarray,
 ) -> SelfEnergy:
     r"""
-    Returns :math:`\Sigma_{12}^{k\nu} = -\frac{1}{2\beta N_q} \sum_{q\omega} \sum_{abcd} U^q_{r;a1bc} K_{r;cb2d}^{q\omega\nu} G_{ad}^{\nu-\omega}`.
-    For very large momentum grids, this function is the slowest part compared to the rest of the code due to the
-    repeated loops. This is the GPU implementation using CuPy. Currently unused, see
-    :func:`calculate_sigma_from_kernel`.
+    Returns :math:`\Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{abcd}
+    U^{\mathbf{q}}_{r;a1bc} K^{\mathrm{q}\nu}_{r;cb2d} G^{\mathrm{k}-\mathrm{q}}_{ad}`. For very large momentum grids,
+    this function is the slowest part of the code because of its repeated loops. This is the GPU
+    implementation using CuPy. Currently unused, see :func:`calculate_sigma_from_kernel`.
 
     :param kernel: The self-energy kernel :math:`K` (full BZ, scattered across ranks).
     :param giwk: The momentum-dependent :class:`GreensFunction`.
@@ -830,10 +843,10 @@ def calculate_sigma_from_kernel_auto(
 def _build_rspace_giwk_pencil(giwk: GreensFunction, mpi_dist: MpiDistributor, node_comm=None) -> np.ndarray:
     r"""
     Builds this rank's real-space Green's function pencil :math:`F[G](R)` for the FFT self-energy contraction. The
-    forward FFT :math:`G(k) \to F[G](R)` is computed once (in a per-node shared-memory window when ``node_comm`` is
-    given and the shared-giwk option is enabled, else privately per rank); each rank then keeps only its R-pencil
-    slice (a copy) and the full R-space array/window is released. The pencil is identical for the positive- and
-    negative-:math:`\omega` passes of :func:`calculate_self_energy_q` (it is kernel-independent and depends only on
+    forward FFT :math:`G(\mathbf{k}) \to F[G](R)` is computed once (in a per-node shared-memory window when
+    ``node_comm`` is given and the shared-giwk option is enabled, else privately per rank); each rank then keeps only
+    its R-pencil slice (a copy) and the full R-space array/window is released. The pencil is identical for the positive-
+    and negative-:math:`\omega` passes of :func:`calculate_self_energy_q` (it is kernel-independent and depends only on
     ``giwk``), so it is built once here and handed to both passes.
 
     :param giwk: The momentum-dependent :class:`GreensFunction` (already cut to the self-energy core box).
@@ -1236,17 +1249,17 @@ def _load_node_shared_local_vertex(node_comm, path: str, channel: SpinChannel, t
 
 def _build_giwk_full(comm: MPI.Comm, sigma: SelfEnergy, mu: float, ek: np.ndarray, beta: float) -> tuple:
     r"""
-    Builds the full-grid Green's function :math:`G(k, \nu)`, optionally deduplicated across the MPI ranks that share
-    a physical node. With ``config.memory.use_shared_memory_common_obj`` set (the default), the Dyson inversion runs only on
-    each node's root rank and the result is placed in one MPI shared-memory window per node, so ``giwk_full`` occupies
-    a single physical buffer per node instead of one private copy per rank (see
+    Builds the full-grid Green's function :math:`G^{\mathrm{k}}_{12}`, optionally deduplicated across the MPI ranks that
+    share a physical node. With ``config.memory.use_shared_memory_common_obj`` set (the default), the Dyson inversion
+    runs only on each node's root rank and the result is placed in one MPI shared-memory window per node, so
+    ``giwk_full`` occupies a single physical buffer per node instead of one private copy per rank (see
     :func:`dgamore.mpi_utils.build_node_shared_array`). Otherwise every rank builds its own copy. The node topology is
     discovered at runtime via ``comm.Split_type(MPI.COMM_TYPE_SHARED)`` (nothing about the cluster is hard-coded).
 
     :param comm: The MPI communicator.
     :param sigma: The self-energy :math:`\Sigma` entering the Dyson equation.
     :param mu: Chemical potential :math:`\mu`.
-    :param ek: Band dispersion :math:`\varepsilon(k)`.
+    :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
     :param beta: Inverse temperature :math:`\beta`.
     :return: The tuple ``(giwk_full, win, node_comm)``; ``win`` and ``node_comm`` are ``None`` on the non-shared path
         and must otherwise be released with :func:`_release_shared_giwk` once ``giwk_full`` has been cut to its private
@@ -1360,7 +1373,7 @@ def calculate_sigma_proposal(
     :param sigma_in: The input self-energy (full-BZ or local first-iteration, DMFT tail attached).
     :param mu: Chemical potential :math:`\mu`.
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`, reduced to this rank's irreducible q-points.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`, reduced to this rank's irreducible q-points.
     :param v_nonloc_full: The non-local interaction on the full q-grid (for the Hartree/Fock term).
     :param sigma_dmft: The DMFT self-energy (cut to the loop's niv), providing the high-frequency tail.
     :param delta_sigma: The DMFT-minus-local noise-removal term on the core box.
@@ -1614,7 +1627,7 @@ def calculate_self_energy_q(
 
     :param comm: The MPI communicator.
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{q}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param sigma_dmft: The DMFT self-energy (used as the starting point and for the shell/tail correction).
     :param sigma_local: The locally recomputed self-energy (used for smoothing out the DGA :class:`SelfEnergy`).
     :return: The converged (or last-iteration) momentum-dependent DGA :class:`SelfEnergy`.

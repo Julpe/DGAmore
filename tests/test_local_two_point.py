@@ -17,9 +17,13 @@ from dgamore.greens_function import GreensFunction, _fermi_dirac_density
 from dgamore.gap_function import GapFunction
 from dgamore.local_n_point import LocalNPoint
 from dgamore.local_two_point import LocalTwoPoint
-from dgamore.n_point_base import IAmNonLocal
+from dgamore.n_point_base import IAmNonLocal, SpinChannel
 from dgamore.self_energy import SelfEnergy
 from dgamore.two_point import TwoPoint
+
+# captured at import time, before the autouse mock_numpy_save fixture patches np.save; the load tests need a real
+# file to read back
+_real_np_save = np.save
 
 
 def test_local_two_point_is_not_nonlocal():
@@ -201,3 +205,75 @@ def test_fermi_dirac_density_batched_matches_per_element():
     rho_batched = _fermi_dirac_density(h, beta)
     for k in range(h.shape[0]):
         assert np.allclose(rho_batched[k], _fermi_dirac_density(h[k], beta))
+
+
+@pytest.mark.parametrize("full_niv_range", [True, False])
+def test_local_two_point_load_round_trips_a_saved_object(tmp_path, full_niv_range):
+    """LocalTwoPoint.load reads a saved array back with the requested fermionic range and the two-point axis counts."""
+    path = str(tmp_path / "local.npy")
+    mat = np.arange(2 * 2 * 8, dtype=np.complex64).reshape(2, 2, 8)
+    _real_np_save(path, mat)
+
+    loaded = LocalTwoPoint.load(path, full_niv_range=full_niv_range)
+
+    assert isinstance(loaded, LocalTwoPoint)
+    assert np.array_equal(loaded.mat, mat)
+    assert (loaded.num_wn_dimensions, loaded.num_vn_dimensions) == (0, 1)
+    assert loaded.full_niv_range is full_niv_range
+
+
+def test_two_point_load_defaults_to_the_decompressed_momentum_layout(tmp_path):
+    """TwoPoint.load defaults to three separate momentum axes, the layout the two-point objects are saved in."""
+    path = str(tmp_path / "nonlocal.npy")
+    nk = (2, 2, 1)
+    mat = np.arange(int(np.prod(nk)) * 2 * 2 * 6, dtype=np.complex64).reshape(*nk, 2, 2, 6)
+    _real_np_save(path, mat)
+
+    loaded = TwoPoint.load(path, nk=nk)
+
+    assert isinstance(loaded, TwoPoint)
+    assert np.array_equal(loaded.mat, mat)
+    assert loaded.nq == nk
+    assert not loaded.has_compressed_q_dimension
+
+
+def test_two_point_load_honors_a_compressed_momentum_axis(tmp_path):
+    """TwoPoint.load accepts a compressed momentum axis when told, mirroring FourPoint.load."""
+    path = str(tmp_path / "compressed.npy")
+    nk = (2, 2, 1)
+    mat = np.arange(int(np.prod(nk)) * 2 * 2 * 6, dtype=np.complex64).reshape(int(np.prod(nk)), 2, 2, 6)
+    _real_np_save(path, mat)
+
+    loaded = TwoPoint.load(path, nk=nk, has_compressed_q_dimension=True)
+
+    assert loaded.has_compressed_q_dimension
+    assert np.array_equal(loaded.decompress_q_dimension().mat, mat.reshape(*nk, 2, 2, 6))
+
+
+def test_two_point_subclasses_load_as_themselves(tmp_path):
+    """GreensFunction, SelfEnergy and GapFunction each load into their own class, not into the TwoPoint base."""
+    nk = (2, 2, 1)
+    mat = np.ones((*nk, 2, 2, 8), dtype=np.complex64)
+    path = str(tmp_path / "two_point.npy")
+    _real_np_save(path, mat)
+
+    giwk = GreensFunction.load(path, nk=nk, beta=10.0)
+    sigma = SelfEnergy.load(path, nk=nk, beta=10.0)
+    gap = GapFunction.load(path, SpinChannel.SING, nk=nk)
+
+    assert (type(giwk), type(sigma), type(gap)) == (GreensFunction, SelfEnergy, GapFunction)
+    assert all(np.array_equal(obj.mat, mat) for obj in (giwk, sigma, gap))
+    assert gap.channel == SpinChannel.SING
+
+
+def test_self_energy_loads_a_single_momentum_local_array(tmp_path):
+    """SelfEnergy.load reads the [1, 1, 1, o1, o2, v] layout the local DMFT and DGA self-energies are saved in."""
+    path = str(tmp_path / "sigma_dmft.npy")
+    mat = np.ones((1, 1, 1, 2, 2, 40), dtype=np.complex64)
+    _real_np_save(path, mat)
+
+    loaded = SelfEnergy.load(path, beta=10.0)
+
+    assert loaded.nq == (1, 1, 1)
+    assert loaded.n_bands == 2
+    assert np.array_equal(loaded.mat, mat)

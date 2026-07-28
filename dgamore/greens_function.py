@@ -4,12 +4,12 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
-Single-particle Green's function. :class:`GreensFunction` builds the momentum-dependent interacting Green's
-function :math:`G_{12}(k, \nu) = [(\imath\nu + \mu)\delta_{12} - \varepsilon_{12}(k) - \Sigma_{12}(k, \nu)]^{-1}`
-from a :class:`SelfEnergy`, the band dispersion :math:`\varepsilon(k)` and the chemical potential :math:`\mu`,
-and derives the filling, occupation, kinetic and (Galitskii-Migdal) potential energies. The module-level helpers
-adjust :math:`\mu` to a target filling via a Newton root search. Moment-corrected asymptotic sums are used so the
-finite Matsubara box does not bias the energies/filling.
+Single-particle Green's function. :class:`GreensFunction` builds the momentum-dependent interacting Green's function
+:math:`G^{\mathrm{k}}_{12} = [(\imath\nu + \mu)\delta_{12} - \varepsilon_{12}(\mathbf{k}) -
+\Sigma^{\mathrm{k}}_{12}]^{-1}` from a :class:`SelfEnergy`, the band dispersion :math:`\varepsilon(\mathbf{k})` and the
+chemical potential :math:`\mu`, and derives the filling, occupation, kinetic and (Galitskii-Migdal) potential energies.
+The module-level helpers adjust :math:`\mu` to a target filling via a Newton root search. Moment-corrected asymptotic
+sums are used so the finite Matsubara box does not bias the energies/filling.
 """
 
 import numpy as np
@@ -50,15 +50,14 @@ def _fermi_dirac_density(h: np.ndarray, beta: float) -> np.ndarray:
 
 def get_total_fill(mu: float, ek: np.ndarray, sigma_mat: np.ndarray, beta: float, smom0: np.ndarray) -> float:
     r"""
-    Returns the total filling calculated from the self-energy, :math:`\mu`, kinetic Hamiltonian and more.
-    Helper method for the root finding of :math:`\mu` via a Newton method. A local model Green's function built
-    from the self-energy moment is subtracted to accelerate the Matsubara sum convergence. This is the cheap,
-    purely local (k-summed) scalar variant used inside the :math:`\mu` root search;
+    Returns the total filling for a given :math:`\mu`, self-energy and kinetic Hamiltonian. A local model Green's
+    function built from the self-energy moment is subtracted to accelerate the Matsubara sum convergence. This is
+    the cheap, purely local (k-summed) scalar variant used inside the :math:`\mu` root search (a Newton method);
     :meth:`GreensFunction.get_fill_nonlocal` is the k-resolved counterpart that additionally returns the
     occupation matrices. Both share the Fermi-Dirac density matrix via :func:`_fermi_dirac_density`.
 
     :param mu: Chemical potential :math:`\mu`.
-    :param ek: Band dispersion :math:`\varepsilon(k)`, shape ``[kx, ky, kz, o1, o2]``.
+    :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`, shape ``[kx, ky, kz, o1, o2]``.
     :param sigma_mat: Self-energy array, shape ``[k, o1, o2, v]``.
     :param beta: Inverse temperature :math:`\beta`.
     :param smom0: Zeroth moment :math:`\Sigma_\infty` of the self-energy, shape ``[o1, o2]``.
@@ -93,7 +92,7 @@ def root_fun(
 
     :param mu: Chemical potential :math:`\mu`.
     :param target_filling: Desired total filling.
-    :param ek: Band dispersion :math:`\varepsilon(k)`.
+    :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
     :param sigma_mat: Self-energy array, shape ``[k, o1, o2, v]``.
     :param beta: Inverse temperature :math:`\beta`.
     :param smom0: Zeroth moment :math:`\Sigma_\infty` of the self-energy.
@@ -118,7 +117,7 @@ def update_mu(
 
     :param mu0: Initial guess for the chemical potential.
     :param target_filling: Desired total filling.
-    :param ek: Band dispersion :math:`\varepsilon(k)`.
+    :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
     :param sigma_mat: Self-energy array, shape ``[k, o1, o2, v]``.
     :param beta: Inverse temperature :math:`\beta`.
     :param smom0: Zeroth moment :math:`\Sigma_\infty` of the self-energy.
@@ -144,11 +143,11 @@ def update_mu(
 
 class GreensFunction(TwoPoint):
     r"""
-    The single-particle Green's function :math:`G_{12}(k, \nu) = [(\imath\nu + \mu)\delta_{12} -
-    \varepsilon_{12}(k) - \Sigma_{12}(k, \nu)]^{-1}`. Built from a :class:`SelfEnergy`, the band dispersion
-    :math:`\varepsilon(k)` and the chemical potential :math:`\mu`; on top of the two-point orbital bookkeeping
-    inherited from :class:`LocalTwoPoint` it adds the Dyson construction (local and momentum-resolved) and the
-    derived quantities - filling, occupation matrices, kinetic and (Galitskii-Migdal) potential energy - all using
+    The single-particle Green's function :math:`G^{\mathrm{k}}_{12} = [(\imath\nu + \mu)\delta_{12} -
+    \varepsilon_{12}(\mathbf{k}) - \Sigma^{\mathrm{k}}_{12}]^{-1}`. Built from a :class:`SelfEnergy`, the band
+    dispersion :math:`\varepsilon(\mathbf{k})` and the chemical potential :math:`\mu`; on top of the two-point orbital
+    bookkeeping inherited from :class:`LocalTwoPoint` it adds the Dyson construction (local and momentum-resolved) and
+    the derived quantities - filling, occupation matrices, kinetic and (Galitskii-Migdal) potential energy - all using
     moment-corrected asymptotic Matsubara sums so the finite frequency box does not bias the result.
     """
 
@@ -171,7 +170,7 @@ class GreensFunction(TwoPoint):
         :param mat: Underlying Green's function array (two orbital axes and one fermionic frequency axis, optionally
             preceded by momentum axes). Overwritten by the local Green's function when ``calc_filling`` is True.
         :param sigma: The :class:`SelfEnergy` used to construct the Green's function (optional).
-        :param ek: Band dispersion :math:`\varepsilon(k)` (optional).
+        :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})` (optional).
         :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
         :param calc_filling: If True (and ``sigma``/``ek`` are given), compute the local Green's function and the
             filling/occupation, exposed via the :attr:`n`, :attr:`occ` and :attr:`occ_k` properties.
@@ -199,7 +198,7 @@ class GreensFunction(TwoPoint):
         r"""
         The band dispersion stored on this object.
 
-        :return: The band dispersion :math:`\varepsilon(k)` as a numpy array.
+        :return: The band dispersion :math:`\varepsilon(\mathbf{k})` as a numpy array.
         """
         return self._ek
 
@@ -233,12 +232,12 @@ class GreensFunction(TwoPoint):
     @staticmethod
     def get_g_full(siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float):
         r"""
-        Builds the full momentum-dependent Green's function
-        :math:`G(k, \nu) = [(\imath\nu + \mu) - \varepsilon(k) - \Sigma(k, \nu)]^{-1}`.
+        Builds the full momentum-dependent Green's function :math:`G^{\mathrm{k}} = [(\imath\nu + \mu) -
+        \varepsilon(\mathbf{k}) - \Sigma^{\mathrm{k}}]^{-1}`.
 
         :param siw: The :class:`SelfEnergy` :math:`\Sigma`.
         :param mu: Chemical potential :math:`\mu`.
-        :param ek: Band dispersion :math:`\varepsilon(k)`.
+        :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
         :param beta: Inverse temperature :math:`\beta`.
         :return: The momentum-dependent :class:`GreensFunction` (filling not recomputed).
         """
@@ -263,7 +262,7 @@ class GreensFunction(TwoPoint):
         Builds a local (k-summed) Green's function from a self-energy and band dispersion.
 
         :param siw: The :class:`SelfEnergy` :math:`\Sigma`.
-        :param ek: Band dispersion :math:`\varepsilon(k)`.
+        :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
         :param beta: Inverse temperature :math:`\beta`.
         :param mu: Chemical potential :math:`\mu`.
         :param calc_filling: If True, compute the filling/occupation (exposed via the ``n``/``occ``/``occ_k``
@@ -297,7 +296,8 @@ class GreensFunction(TwoPoint):
         :return: Array of shape ``[o1, o2, w, v]``.
         """
         niv_cut_range = np.arange(-niv_cut, niv_cut)
-        return self.mat[..., self.niv + niv_cut_range[None, :] - wn[:, None]]
+        # the local Green's function carries a single-momentum dimension; index it away for the orbital algebra
+        return self.mat[0, 0, 0][..., self.niv + niv_cut_range[None, :] - wn[:, None]]
 
     def get_fill_nonlocal(self) -> tuple[float, np.ndarray, np.ndarray]:
         r"""
@@ -325,8 +325,8 @@ class GreensFunction(TwoPoint):
 
     def get_ekin(self) -> float:
         r"""
-        Returns the kinetic energy from the band dispersion and the k-resolved occupation,
-        :math:`E_{kin} = \sum_{\sigma \vec{k} ab} \varepsilon_{ab}(\vec{k})\, n_{ba}(\vec{k})`.
+        Returns the kinetic energy from the band dispersion and the k-resolved occupation, :math:`E_{\mathrm{kin}} =
+        \sum_{\sigma \mathbf{k} ab} \varepsilon_{ab}(\mathbf{k})\, n_{ba}(\mathbf{k})`.
 
         :return: The kinetic energy per site.
         """
@@ -344,10 +344,10 @@ class GreensFunction(TwoPoint):
                       \mathrm{Tr}[(\Sigma_{\mathrm{mod}} - \Sigma_\infty) G_{\mathrm{mod}}],
 
         i.e. the exact Hartree term, the in-box correlation part, and the analytic :math:`1/\nu^2` tail. Here
-        :math:`\Sigma_{\mathrm{mod}} - \Sigma_\infty = -\Sigma_1/(\imath\nu)` and
-        :math:`G_{\mathrm{mod}} = [\imath\nu + \mu - \varepsilon_k - \Sigma_\infty]^{-1}`. The model subtraction
-        cancels the :math:`1/\nu^2` tail of the correlation sum (remainder :math:`\sim 1/\nu^4`), while the large
-        sum supplies the part beyond the stored box.
+        :math:`\Sigma_{\mathrm{mod}} - \Sigma_\infty = -\Sigma_1/(\imath\nu)` and :math:`G_{\mathrm{mod}} = [\imath\nu +
+        \mu - \varepsilon_{\mathbf{k}} - \Sigma_\infty]^{-1}`. The model subtraction cancels the :math:`1/\nu^2` tail of
+        the correlation sum (remainder :math:`\sim 1/\nu^4`), while the large sum supplies the part beyond the stored
+        box.
 
         :param niv_asympt: Number of positive fermionic frequencies used for the asymptotic ("big") tail sum.
         :return: The potential energy per site.
@@ -372,9 +372,9 @@ class GreensFunction(TwoPoint):
 
     def _model_epot(self, smom0, smom1, niv, beta):
         r"""
-        Evaluates the analytic :math:`1/\nu^2` model potential-energy tail
-        :math:`\frac{1}{\beta}\sum_{k,\nu} \mathrm{Tr}[(-\Sigma_1/\imath\nu) G_{\mathrm{mod}}]` over a frequency box
-        of half width ``niv`` (used as the difference of a large and a small box in :meth:`get_epot`).
+        Evaluates the analytic :math:`1/\nu^2` model potential-energy tail :math:`\frac{1}{\beta}\sum_{\mathrm{k}}
+        \mathrm{Tr}[(-\Sigma_1/\imath\nu) G_{\mathrm{mod}}]` over a frequency box of half width ``niv`` (used as the
+        difference of a large and a small box in :meth:`get_epot`).
 
         :param smom0: Zeroth self-energy moment :math:`\Sigma_\infty`, shape ``[o1, o2]``.
         :param smom1: First self-energy tail coefficient :math:`\Sigma_1`, shape ``[o1, o2]``.
@@ -401,8 +401,8 @@ class GreensFunction(TwoPoint):
 
     def _get_gfull_mat(self) -> np.ndarray:
         r"""
-        Builds the full momentum-dependent Green's function array
-        :math:`[(\imath\nu + \mu) - \varepsilon(k) - \Sigma(k, \nu)]^{-1}`.
+        Builds the full momentum-dependent Green's function array :math:`[(\imath\nu + \mu) - \varepsilon(\mathbf{k}) -
+        \Sigma^{\mathrm{k}}]^{-1}`.
 
         :return: The Green's function array, shape ``[kx, ky, kz, o1, o2, v]``.
         """
@@ -448,3 +448,34 @@ class GreensFunction(TwoPoint):
         iv_bands = iv[None, None, :] * eye_bands[..., None]
         mu_bands = self._mu * eye_bands[:, :, None]
         return iv_bands, mu_bands
+
+    @staticmethod
+    def load(
+        filename: str,
+        nk: tuple[int, int, int] = (1, 1, 1),
+        full_niv_range: bool = True,
+        has_compressed_q_dimension: bool = False,
+        beta: float = None,
+        mu: float = None,
+    ) -> "GreensFunction":
+        r"""
+        Loads a :class:`GreensFunction` from a ``.npy`` file. The stored array is kept as it is, since no self-energy
+        and no dispersion are passed; the default momentum layout is the decompressed one it is written in.
+
+        :param filename: Path to the ``.npy`` file (loaded with ``allow_pickle=False``).
+        :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+        :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
+        :param has_compressed_q_dimension: Whether the momentum is stored as a single compressed axis ``[k, ...]``
+            (True) or as three separate axes ``[kx, ky, kz, ...]`` (False).
+        :param beta: Inverse temperature :math:`\beta`.
+        :param mu: Chemical potential :math:`\mu`.
+        :return: The loaded :class:`GreensFunction`.
+        """
+        return GreensFunction(
+            np.load(filename, allow_pickle=False),
+            full_niv_range=full_niv_range,
+            has_compressed_q_dimension=has_compressed_q_dimension,
+            nk=nk,
+            beta=beta,
+            mu=mu,
+        )

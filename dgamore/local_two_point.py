@@ -101,3 +101,14 @@ class LocalTwoPoint(LocalNPoint):
         :return: True if the object is invariant under permutations of those orbitals.
         """
         return self._is_orbitally_symmetrized(orbitals, self._get_orbital_axes())
+
+    @staticmethod
+    def load(filename: str, full_niv_range: bool = True) -> "LocalTwoPoint":
+        r"""
+        Loads a :class:`LocalTwoPoint` from a ``.npy`` file.
+
+        :param filename: Path to the ``.npy`` file (loaded with ``allow_pickle=False``).
+        :param full_niv_range: Whether the object spans the full (signed) fermionic range or only :math:`\nu \geq 0`.
+        :return: The loaded :class:`LocalTwoPoint`.
+        """
+        return LocalTwoPoint(np.load(filename, allow_pickle=False), full_niv_range)

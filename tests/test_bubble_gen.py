@@ -21,10 +21,10 @@ from dgamore.n_point_base import FrequencyNotation
 
 
 def _make_local_g(nb: int, niv: int, seed: int = 0) -> GreensFunction:
-    """Builds a local (momentum-independent) Green's function ``[o1, o2, 2*niv]`` with reproducible random data."""
+    """Builds a local Green's function ``[1, 1, 1, o1, o2, 2*niv]`` with reproducible random data."""
     rng = np.random.default_rng(seed)
     mat = rng.standard_normal((nb, nb, 2 * niv)) + 1j * rng.standard_normal((nb, nb, 2 * niv))
-    return GreensFunction(mat)
+    return GreensFunction(mat[None, None, None, ...])
 
 
 def _make_momentum_g(nk: tuple, nb: int, niv: int, seed: int = 0) -> GreensFunction:
@@ -40,7 +40,7 @@ def test_create_generalized_chi0_matches_reference():
     """create_generalized_chi0 matches an explicit hand-rolled reference of the documented formula."""
     nb, niv, niw, beta = 2, 1, 1, 2.0
     g = _make_local_g(nb, niv + niw + 1, seed=1)
-    gm = g.mat
+    gm = g.mat[0, 0, 0]
     nivd = g.niv
 
     res = BubbleGenerator.create_generalized_chi0(g, niw, niv, beta)
@@ -109,7 +109,7 @@ def test_create_generalized_chi0_pp_w0_matches_reference():
     """create_generalized_chi0_pp_w0 matches an explicit reference and carries PP notation."""
     nb, niv_pp, beta = 2, 2, 2.0
     g = _make_local_g(nb, niv_pp + 1, seed=4)
-    gm = g.cut_niv(niv_pp).mat
+    gm = g.cut_niv(niv_pp).mat[0, 0, 0]
     n = 2 * niv_pp
 
     res = BubbleGenerator.create_generalized_chi0_pp_w0(g, niv_pp, beta)
@@ -183,7 +183,7 @@ def test_momentum_pp_bubble_is_local_pp_bubble_in_acbd_layout():
     gloc = np.empty((nb, nb, 2 * nvg), dtype=np.complex64)
     gloc[:, :, nvg:] = half
     gloc[:, :, :nvg] = np.conj(np.swapaxes(half, 0, 1))[:, :, ::-1]
-    g_loc = GreensFunction(gloc)
+    g_loc = GreensFunction(gloc[None, None, None, ...])
     g_mom = GreensFunction(
         np.broadcast_to(gloc, (*nk, nb, nb, 2 * nvg)).copy(), has_compressed_q_dimension=False, nk=nk
     )

@@ -951,7 +951,7 @@ def test_bcast_chunked_multi_chunk(monkeypatch):
 
 
 def test_bcast_npoint_roundtrips_object_and_mat():
-    """bcast_npoint broadcasts an N-point-like object's metadata and chunk-broadcasts its .mat to every rank."""
+    """bcast_npoint broadcasts an n-point-like object's metadata and chunk-broadcasts its .mat to every rank."""
     arr = (np.arange(5 * 4).reshape(5, 4) + 0.5 + 1j).astype(np.complex128)
 
     def fn(comm, rank):
