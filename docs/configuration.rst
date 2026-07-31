@@ -196,7 +196,7 @@ This section controls the one-shot lambda correction.
      perform_lambda_correction: False # bool
      type: "spch"                     # str
 
-When ``perform_lambda_correction`` is ``True``, the code performs a one-shot DGA with lambda correction:
+When ``perform_lambda_correction`` is ``True``, the code performs a one-shot DΓA with lambda correction:
 ``max_iter`` is overridden to 1 and ``mixing`` to 1.0, and the correction is applied once, dispatched by the band
 count exactly like ``stabilization.use_lambda_correction`` (over which it takes precedence when both are enabled);
 recall that for multi-band data this is the heuristic stabilization scheme of the
@@ -226,7 +226,8 @@ are expected in the folder given by ``input_path``, with ``fname_1p`` and ``fnam
 two-particle results. The two-particle Green's function is always symmetrized under the exchange of its two
 fermionic frequencies :math:`(\nu, \nu')` on load: this is the time-reversal-plus-inversion symmetry that makes the
 right three-leg vertex the first-frequency-summed transpose of the left one, so both are obtained from a single
-auxiliary susceptibility sum.
+auxiliary susceptibility sum. The same symmetry lets the double-counting kernel of the Schwinger-Dyson equation
+read its summed (second) frequency argument off the stored first axis of the local vertex.
 
 The ``symmetrize_orbitals`` field allows the local DMFT quantities, namely the self-energy and the one- and
 two-particle Green's functions, to be symmetrized over orbitals, which is well defined because these quantities are
@@ -236,7 +237,7 @@ four-orbital case in which orbitals one and three as well as orbitals two and fo
 enters ``[[1, 3], [2, 4]]``.
 
 The last two settings were introduced for multi-layered materials such as :math:`\mathrm{La}_3\mathrm{Ni}_2\mathrm{O}_7`.
-There the DGA calculation uses a four-orbital model, while at the DMFT level the symmetry of the system lets one
+There the DΓA calculation uses a four-orbital model, while at the DMFT level the symmetry of the system lets one
 treat pairs of orbitals as equivalent atoms, producing two-orbital DMFT quantities that must be mapped back onto the
 full four-band orbital-diagonal space. The ``n_ineq`` field gives the number of inequivalent atoms treated in DMFT
 (one for :math:`\mathrm{La}_3\mathrm{Ni}_2\mathrm{O}_7`), and ``ineq_ordering`` specifies how these are distributed
@@ -399,7 +400,7 @@ through the ``ana_cont`` package.
      k_path: [ [0.0, 0.0, 0.0, "Gamma"], [0.0, 0.5, 0.0, "X"] ] # list[tuple]
      energy_window: [ -2, 3 ]                                   # list[float]
 
-The flags ``do_spectrum_dga`` and ``do_spectrum_dmft`` toggle the continuation of the DGA and DMFT
+The flags ``do_spectrum_dga`` and ``do_spectrum_dmft`` toggle the continuation of the DΓA and DMFT
 Green's functions, respectively. The procedure yields the spectral function over a symmetric interval of ``w_count``
 real-frequency points. When ``plot_spectrum`` is enabled, the spectral function is plotted along the path given in
 ``k_path``, a list of tuples whose first three elements are the coordinates of a high-symmetry point in the

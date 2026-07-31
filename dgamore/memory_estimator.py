@@ -42,7 +42,7 @@ CHIQ_AUX_INVERT_FACTOR: int = 1
 # fq: single-block BSE assembly + eagerly rebound matmuls (f = gchi0_q_inv @ f, then f @ gchi0_q_inv), ~2 blocks live.
 FQ_MATMUL_FACTOR: int = 2
 
-# FFT SDE holds the full-BZ niw-half kernel + its half-niv copy through the conj/distributed-FFT round trip, ~2 blocks.
+# FFT SDE holds the full-BZ niw-half kernel + its half-niv copy through the distributed-FFT round trip, ~2 blocks.
 SDE_FFT_KERNEL_FACTOR: int = 2
 
 # scipy.fft.ifftn(overwrite_x=True) transforms the c64 full-grid bubble in place, so no ifftn transient is allocated

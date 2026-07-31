@@ -45,19 +45,20 @@ def get_hartree_fock(u_loc: LocalInteraction, v_nonloc: Interaction) -> tuple[np
     the sum over the spins of the first term in Eq. (4.55) in Anna Galler's thesis results in a simple factor of 2. This
     can be seen in my master's thesis, Eq. (3.55). The Hartree-Fock term is given by
 
-    .. math:: \Sigma^{\mathbf{k}}_{\mathrm{HF}} = 2(U_{acbd} + V^{\mathbf{q}=0}_{acbd}) n_{dc} - 1/n_{\mathbf{q}} \sum_{\mathbf{q}} (U_{adcb} + V^{\mathbf{q}}_{adcb}) n^{\mathbf{k}-\mathbf{q}}_{dc}
+    .. math:: \Sigma^{\mathbf{k}}_{\mathrm{HF}} = 2(U_{acbd} + V^{\mathbf{q}=0}_{acbd}) n_{dc}
+        - 1/n_{\mathbf{q}} \sum_{\mathbf{q}} (U_{abcd} + V^{\mathbf{q}}_{abcd}) n^{\mathbf{k}-\mathbf{q}}_{dc}
 
     where the Hartree term reads :math:`\Sigma_{\mathrm{H}} = 2(U_{acbd} + V^{\mathbf{q}=0}_{acbd}) n_{dc}` and the Fock
-    term reads :math:`\Sigma^{\mathbf{k}}_{\mathrm{F}} = - 1/n_{\mathbf{q}} \sum_{\mathbf{q}} (U_{adcb} +
-    V^{\mathbf{q}}_{adcb}) n^{\mathbf{k}-\mathbf{q}}_{dc}`. The Hartree contraction uses the middle-index-swapped
+    term reads :math:`\Sigma^{\mathbf{k}}_{\mathrm{F}} = - 1/n_{\mathbf{q}} \sum_{\mathbf{q}} (U_{abcd} +
+    V^{\mathbf{q}}_{abcd}) n^{\mathbf{k}-\mathbf{q}}_{dc}`. The Hartree contraction uses the middle-index-swapped
     ``U_{acbd}`` so it picks up the inter-orbital density :math:`U'` (stored at :math:`U_{abab}`); see
     :func:`dgamore.local_sde.get_local_hartree_fock`.
 
     The Fock momentum sum is a circular convolution over the periodic Brillouin zone, so it is evaluated with the
     convolution theorem instead of an explicit q-loop: :math:`\Sigma^{\mathbf{k}}_{\mathrm{F}} =
     -\tfrac{1}{n_{\mathbf{q}}}\,\mathcal{F}^{-1}
-    \big[\mathcal{F}[(U+V)^{(-\mathbf{q})}_{adcb}]\,\mathcal{F}[n_{dc}]\big]` (the interaction is momentum-flipped
-    because the shift is :math:`n^{\mathbf{k}+\mathbf{q}}` after the ``-q`` roll convention). This is
+    \big[\mathcal{F}[(U+V)^{\mathbf{q}}_{abcd}]\,\mathcal{F}[n_{dc}]\big]` (a plain convolution, since the shift
+    is :math:`n^{\mathbf{k}-\mathbf{q}}`). This is
     :math:`O(n_{\mathbf{k}} \log n_{\mathbf{k}})` and materializes only R-space ``[k, o^4]``/``[k, o^2]`` arrays, never
     a ``[q, k]`` occupation block, so the whole full-BZ term is computed on every rank without a q-distribution.
 
@@ -67,15 +68,15 @@ def get_hartree_fock(u_loc: LocalInteraction, v_nonloc: Interaction) -> tuple[np
     """
     v_q0 = v_nonloc.find_q((0, 0, 0))
     # The inter-orbital density U' is stored at U_{abab}, so the Hartree term contracts "qacbd" (swapping the middle
-    # orbital indices) to pick it up; the Fock term below uses U_{adcb}. See local_sde.get_local_hartree_fock.
+    # indices) to pick it up; the Fock term below contracts U_{abcd} n_{dc}. See local_sde.get_local_hartree_fock.
     hartree = 2 * (u_loc + v_q0).times("qacbd,dc->ab", config.sys.occ)
 
     nb = config.sys.n_bands
     nk_tot = np.prod(config.lattice.nk)
 
-    # Fourier the momentum-flipped interaction (U+V^{-q})_{adcb} and the occupation n_{dc} to R-space, contract the
-    # summed orbitals pointwise per R, and transform back: the convolution theorem for the periodic-BZ Fock sum.
-    w_r = (u_loc + v_nonloc).permute_orbitals("abcd->adcb").flip_momentum_axis(copy=False).fft(copy=False)
+    # Fourier the interaction (U+V^q)_{abcd} (stored "adcb"-permuted so the einsum labels line up) and n_{dc} to
+    # R-space, contract the summed orbitals pointwise per R, transform back: convolution theorem for the n^{k-q} sum.
+    w_r = (u_loc + v_nonloc).permute_orbitals("abcd->adcb").fft(copy=False)
     w_r_mat = w_r.decompress_q_dimension().mat  # [kx, ky, kz, a, d, c, b]
     occ_r = sp.fft.fftn(config.sys.occ_k.astype(w_r_mat.dtype, copy=False), axes=(0, 1, 2))  # [kx, ky, kz, d, c]
 
@@ -363,64 +364,86 @@ def min_static_compound_eigenvalue(chi_phys_q_r: FourPoint) -> float:
 
 def calculate_sigma_dc_kernel(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, u_loc: LocalInteraction) -> FourPoint:
     r"""
-    Returns the double-counting kernel for the self-energy calculation, contracting the local full vertex with the
-    momentum-dependent bubble per q-point. For details, see Eq. (4.28) in my master's thesis.
+    Returns the double-counting kernel for the self-energy calculation - the local *magnetic* contribution that
+    the two ladder terms of the Schwinger-Dyson equation count twice,
 
-    The vertex's first fermionic index is summed over the full asymptotic box while its second one survives into the
-    result on the core box, so ``f_dc_loc`` is expected on the asymmetric
-    :math:`2 n_{\nu,\mathrm{full}} \times 2 n_{\nu,\mathrm{core}}` box that
-    :func:`~dgamore.local_sde.create_full_vertex_from_gamma` returns. This is the only consumer needing the summed
-    index on the full box, which is why it reads its own ``f_dc_loc`` file rather than the square per-channel ones.
-    A vertex carrying a wider second index still gives the same result, only more slowly.
+    .. math:: -\Sigma^{\mathrm{dc}}_{12} = +\frac{1}{\beta}\sum_{\mathrm{q}\nu'} U_{acb2}\,
+        F^{\omega\nu\nu'}_{\mathrm{magn};1dfe}\,\chi^{\mathrm{q}\nu'}_{0;efcb}\,G^{\mathrm{k}-\mathrm{q}}_{da},
 
-    :param f_dc_loc: The local full vertex :math:`F` used for the double-counting correction.
-    :param gchi0_q: The momentum-dependent bare bubble :math:`\chi^{\mathrm{q}\nu}_{0}`.
+    assembled in the contraction layout of :func:`calculate_kernel_r_q` (the factor :math:`-2` relative to the
+    global :math:`-\tfrac12` prefactor of the sigma contraction realizes the sign above). Keeping the full ladder
+    vertices in both bracket terms and adding this correction leaves exactly one local copy, so the local limit of
+    the total reproduces the local Schwinger-Dyson equation; equivalent placements (subtracting the local density
+    part of the direct term, or the full local part of the transversal term) differ only by closures of
+    :math:`F^{\omega}_{\uparrow\uparrow}`, which vanish for a crossing-symmetric impurity vertex. The frequency sum
+    acts on the *second* fermionic argument of the local magnetic vertex; since ``f_dc_loc`` stores the asymmetric
+    :math:`2 n_{\nu,\mathrm{full}} \times 2 n_{\nu,\mathrm{core}}` box with the **first** index on the full box
+    (see :func:`~dgamore.local_sde.create_full_vertex_from_gamma`), the compound symmetry of the symmetrized local
+    vertex, :math:`F^{\omega\nu\nu'}_{1234} = F^{\omega\nu'\nu}_{4321}`, is used to read the stored first index as
+    the summed :math:`\nu'`.
+
+    :param f_dc_loc: The local full vertex :math:`F_{\mathrm{magn}}` used for the double-counting correction.
+    :param gchi0_q: The momentum-dependent bare bubble :math:`\chi^{\mathrm{q}\nu}_{0}` (full fermionic box).
     :param u_loc: The bare local interaction :math:`U`.
-    :return: The double-counting kernel as a :class:`FourPoint`, cut to the core fermionic box.
+    :return: The double-counting kernel (contraction layout) as a :class:`FourPoint`, cut to the core fermionic box.
     """
-    kernel = 1.0 / config.sys.beta**2 * u_loc.permute_orbitals("abcd->adcb") @ gchi0_q
-
-    einsum_str = "abcdwv,dcefwvp->abefwp"
-    path, _ = np.einsum_path(einsum_str, kernel.mat[0].copy(), f_dc_loc.mat, optimize="optimal")
-
-    # the surviving index is never wider than the summed one, so each result is narrower than the kernel's own
-    # storage: it goes into the leading part of that storage, which is trimmed afterwards (no second full buffer)
     niv_out = min(f_dc_loc.niv_second, config.box.niv_core)
     window = f_dc_loc.vn_slice(f_dc_loc.niv_second, niv_out)
-    for q in range(kernel.current_shape[0]):
-        result = np.einsum(einsum_str, kernel[q].copy(), f_dc_loc.mat, optimize=path)
-        kernel.mat[q, ..., : 2 * niv_out] = result[..., window]
+    nq = gchi0_q.current_shape[0]
+    nb = gchi0_q.n_bands
+    n_w = gchi0_q.mat.shape[-2]
 
-    kernel.mat = kernel.mat[..., : 2 * niv_out].copy()
-    kernel.update_original_shape()
-    return kernel
+    # the stored full-box first index supplies the summed v' via F_{1dfe}(v,v') = F_{efd1}(v',v): the stored slots
+    # (e,f,d,1) then pair directly with chi0's row pair (e,f) - the standard-product reversal F_{..fe} chi0_{ef..}
+    einsum_str = "efgiwvp,efdcwv->igdcwp"
+    path, _ = np.einsum_path(einsum_str, f_dc_loc.mat, gchi0_q.mat[0], optimize="optimal")
+    t_mat = np.empty((nq, nb, nb, nb, nb, n_w, 2 * niv_out), dtype=gchi0_q.mat.dtype)
+    for q in range(nq):
+        t_mat[q] = np.einsum(einsum_str, f_dc_loc.mat, gchi0_q.mat[q], optimize=path)[..., window]
+
+    t = FourPoint(
+        t_mat, SpinChannel.NONE, gchi0_q.nq, 1, 1, gchi0_q.full_niw_range, True, has_compressed_q_dimension=True
+    )
+    # transversal attachment U_{acb2} = -U_magn;a2bc: [T @ U_magn]_{1da2}, then into the contraction layout
+    kernel = (t @ u_loc.as_channel(SpinChannel.MAGN)).permute_orbitals("abcd->badc", copy=False)
+    return kernel.scale(2.0 / config.sys.beta**2, copy=False)
 
 
 def calculate_kernel_r_q(
     vrg_q_r: FourPoint, chi_phys_q_r: FourPoint, v_nonloc: Interaction, u_loc: LocalInteraction
 ) -> FourPoint:
     r"""
-    Returns the kernel for the self-energy calculation minus 2/3 times the identity if the channel is the magnetic
-    channel (due to the extra factor of :math:`U_{ah21}` in Eq. (4.29) in my master's thesis),
+    Returns the kernel for the self-energy calculation minus the identity (which carries the constant
+    :math:`-\mathcal{U}^{\mathbf{q}}_{r}` term of the three-leg Schwinger-Dyson bracket),
 
-    .. math:: K = \gamma^{\mathrm{q}\nu}_{r;abcd} - \gamma^{\mathrm{q}\nu}_{r;abef} U^{\mathbf{q}}_{r;fehg} \chi^{\mathrm{q}}_{r;ghcd}.
+    .. math:: K_{1234} = \gamma^{\mathrm{q}\nu}_{r;1234} - \sum_{abcd} \gamma^{\mathrm{q}\nu}_{r;12ab}\,
+        \mathcal{U}^{\mathbf{q}}_{r;badc}\, \chi^{\mathrm{q}}_{r;dc34} - \mathbb{1}_{1234},
+
+    right-multiplied by the channel interaction and stored in the layout of the sigma contraction. In the
+    multi-orbital Schwinger-Dyson equation the interaction attaches to the :math:`\chi^{*}`-side index pair of the
+    three-leg vertex, while its amputated pair carries the external orbital index and the Green's-function leg
+    (P. Worm's PhD thesis, Eq. (3.70)). The result :math:`M_{1ab2} = [K\,\mathcal{U}^{\mathbf{q}}_{r}]_{1ab2}`
+    enters the self-energy as :math:`\Sigma_{12} \propto \sum_{ab} M_{1ab2} G_{ab}` and is therefore stored with
+    the orbital permutation ``"abcd->badc"``, so that the existing contraction
+    :math:`\Sigma_{12} \propto \sum_{ab} K'_{a12b} G_{ab}` of :func:`calculate_sigma_from_kernel_fft_cpu` applies
+    unchanged.
 
     :param vrg_q_r: The momentum-dependent three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}`.
     :param chi_phys_q_r: The (shell-corrected) physical susceptibility :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param u_loc: The bare local interaction :math:`U`.
-    :return: The self-energy kernel :math:`U_r K` as a :class:`FourPoint`.
+    :return: The self-energy kernel :math:`[(K-\mathbb{1})\,\mathcal{U}_r]` (contraction layout) as a
+        :class:`FourPoint`.
     """
     u_r = v_nonloc.as_channel(vrg_q_r.channel) + u_loc.as_channel(vrg_q_r.channel)
     kernel = vrg_q_r - vrg_q_r @ u_r @ chi_phys_q_r
 
-    if vrg_q_r.channel == SpinChannel.MAGN:
-        # subtract 2/3 directly on the compound-identity positions (o1 == o4, o2 == o3, every frequency) instead of
-        # materializing a full kernel-sized identity block via FourPoint.identity_like
-        orb = np.arange(kernel.n_bands)
-        kernel.mat[:, orb[:, None], orb[None, :], orb[None, :], orb[:, None], ...] -= 2.0 / 3.0
+    # subtract the identity directly on the compound-identity positions (o1 == o4, o2 == o3, every frequency) instead
+    # of materializing an identity block; the channel weights (1x dens, 3x magn) turn this into -U_d - 3U_m
+    orb = np.arange(kernel.n_bands)
+    kernel.mat[:, orb[:, None], orb[None, :], orb[None, :], orb[:, None], ...] -= 1.0
 
-    return u_r @ kernel
+    return (kernel @ u_r).permute_orbitals("abcd->badc", copy=False)
 
 
 def perform_ornstein_zernike_fit(chi_phys_q_r: FourPoint) -> None:
@@ -661,8 +684,8 @@ def calculate_sigma_kernel_r_q(
 
 def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full_q_list: np.ndarray) -> SelfEnergy:
     r"""
-    Returns :math:`\Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{abcd}
-    U^{\mathbf{q}}_{r;a1bc} K^{\mathrm{q}\nu}_{r;cb2d} G^{\mathrm{k}-\mathrm{q}}_{ad}`. For very large momentum grids,
+    Returns :math:`\Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{ab}
+    K^{\mathrm{q}\nu}_{a12b} G^{\mathrm{k}-\mathrm{q}}_{ab}`. For very large momentum grids,
     this function is the slowest part of the code because of its repeated loops. Batching the
     q-points or using numba could speed it up further.
 
@@ -686,7 +709,7 @@ def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full
     path = np.einsum_path("aijdv,xyzadv->xyzijv", kernel[0, ..., 0, config.box.niv_core :], mat, optimize=True)[0]
 
     for idx_q, q in enumerate(my_full_q_list):
-        shifted_mat = np.roll(giwk.mat, [-i for i in q], axis=(0, 1, 2))
+        shifted_mat = np.roll(giwk.mat, tuple(q), axis=(0, 1, 2))  # roll by +q -> G^{k-q}
         for idx_w, wn_i in enumerate(wn):
             g_qk = shifted_mat[..., giwk.niv - wn_i : giwk.niv + config.box.niv_core - wn_i]
             k_slice = kernel[idx_q, ..., idx_w, config.box.niv_core :]
@@ -702,8 +725,8 @@ def calculate_sigma_from_kernel_cpu(
     my_full_q_list: np.ndarray,
 ) -> SelfEnergy:
     r"""
-    Returns :math:`\Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{abcd}
-    U^{\mathbf{q}}_{r;a1bc} K^{\mathrm{q}\nu}_{r;cb2d} G^{\mathrm{k}-\mathrm{q}}_{ad}`. For very large momentum grids,
+    Returns :math:`\Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{ab}
+    K^{\mathrm{q}\nu}_{a12b} G^{\mathrm{k}-\mathrm{q}}_{ab}`. For very large momentum grids,
     this function is the slowest part of the code because of its repeated loops. Short of moving the
     work to a GPU or another accelerator, there is no real way to speed it up further. This is the CPU implementation
     (Fortran-ordered buffers, preallocated accumulator). Currently unused, see :func:`calculate_sigma_from_kernel`.
@@ -724,9 +747,9 @@ def calculate_sigma_from_kernel_cpu(
     kernel = np.asfortranarray(kernel.to_full_niw_range().mat[..., niv_core:])
 
     kxs, kys, kzs = np.arange(nkx), np.arange(nky), np.arange(nkz)
-    kx_indices = [((kxs + q[0]) % nkx) for q in my_full_q_list]
-    ky_indices = [((kys + q[1]) % nky) for q in my_full_q_list]
-    kz_indices = [((kzs + q[2]) % nkz) for q in my_full_q_list]
+    kx_indices = [((kxs - q[0]) % nkx) for q in my_full_q_list]
+    ky_indices = [((kys - q[1]) % nky) for q in my_full_q_list]
+    kz_indices = [((kzs - q[2]) % nkz) for q in my_full_q_list]
 
     acc = np.empty((nkx, nky, nkz, nb, nb, niv_core), dtype=mat.dtype)
 
@@ -755,8 +778,8 @@ def calculate_sigma_from_kernel_gpu(
     my_full_q_list: np.ndarray,
 ) -> SelfEnergy:
     r"""
-    Returns :math:`\Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{abcd}
-    U^{\mathbf{q}}_{r;a1bc} K^{\mathrm{q}\nu}_{r;cb2d} G^{\mathrm{k}-\mathrm{q}}_{ad}`. For very large momentum grids,
+    Returns :math:`\Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{ab}
+    K^{\mathrm{q}\nu}_{a12b} G^{\mathrm{k}-\mathrm{q}}_{ab}`. For very large momentum grids,
     this function is the slowest part of the code because of its repeated loops. This is the GPU
     implementation using CuPy. Currently unused, see :func:`calculate_sigma_from_kernel`.
 
@@ -778,9 +801,9 @@ def calculate_sigma_from_kernel_gpu(
     kernel = cp.asarray(kernel.to_full_niw_range().mat, order="F")[..., niv_core:]
 
     kxs, kys, kzs = cp.arange(nkx), cp.arange(nky), cp.arange(nkz)
-    kx_indices = [((kxs + q[0]) % nkx) for q in my_full_q_list]
-    ky_indices = [((kys + q[1]) % nky) for q in my_full_q_list]
-    kz_indices = [((kzs + q[2]) % nkz) for q in my_full_q_list]
+    kx_indices = [((kxs - q[0]) % nkx) for q in my_full_q_list]
+    ky_indices = [((kys - q[1]) % nky) for q in my_full_q_list]
+    kz_indices = [((kzs - q[2]) % nkz) for q in my_full_q_list]
 
     for iq in range(len(my_full_q_list)):
         g_q_view = giwk_mat[
@@ -880,8 +903,9 @@ def calculate_sigma_from_kernel_fft_cpu(
 ) -> SelfEnergy:
     r"""
     Computes the self-energy using distributed FFTs (CPU). Replaces the q-loop with a real-space pointwise
-    multiplication: both the Green's function and the kernel are FFT'd to real space (the kernel to :math:`-R` via the
-    conjugate trick), contracted pointwise per rank-local R-slice, and accumulated. Returns :math:`\Sigma` in R-space,
+    multiplication: both the Green's function and the kernel are FFT'd to real space, contracted pointwise per
+    rank-local R-slice (the convolution theorem for :math:`\sum_{\mathrm{q}} K^{\mathrm{q}\nu}_{a12b}
+    G^{\mathrm{k}-\mathrm{q}}_{ab}`), and accumulated. Returns :math:`\Sigma` in R-space,
     positive-:math:`\nu` half only; the caller must ifft over :math:`(k_x, k_y, k_z)` and then call
     :meth:`SelfEnergy.to_full_niv_range` before use.
 
@@ -908,12 +932,10 @@ def calculate_sigma_from_kernel_fft_cpu(
     beta = config.sys.beta
     nk_tot = config.lattice.k_grid.nk_tot
 
-    # K(q) -> F[K](-R) via the conjugate trick: conj, fft, conj. The kernel is already a single niw half (positive
-    # half, or the negative block), so there is no to_full_niw_range here -- the full-niw kernel is never built.
+    # K(q) -> F[K](R): the R-space product with F[G](R) realizes the convolution sum_q K(q) G(k-q). The kernel is
+    # already a single niw half (positive half, or the negative block), so the full-niw kernel is never built.
     kernel = kernel.to_half_niv_range()
-    kernel.mat = np.conj(kernel.mat)
     kernel = mpi_utils.execute_distributed_fft(kernel, comm)
-    kernel.mat = np.conj(kernel.mat)
 
     # Local R-space contraction; each rank owns a slice of R-points
     n_r_local = kernel.mat.shape[0]
@@ -973,12 +995,11 @@ def calculate_sigma_from_kernel_fft_gpu(
 
     g_r_local = cp.asarray(g_r_local)
 
-    # K(q) -> F[K](-R) via the conjugate trick: conj, fft, conj. The kernel is already a single niw half, so there is
-    # no to_full_niw_range here -- the full-niw kernel is never built.
+    # K(q) -> F[K](R): the R-space product with F[G](R) realizes the convolution sum_q K(q) G(k-q). The kernel is
+    # already a single niw half, so the full-niw kernel is never built.
     kernel = kernel.to_half_niv_range()
-    kernel.mat = np.conj(kernel.mat)
     kernel = mpi_utils.execute_distributed_fft(kernel, comm)
-    kernel.mat = cp.conj(cp.asarray(kernel.mat))
+    kernel.mat = cp.asarray(kernel.mat)
 
     # Local R-space contraction; each rank owns a slice of R-points
     n_r_local = kernel.mat.shape[0]
@@ -1435,10 +1456,9 @@ def calculate_sigma_proposal(
     f_dc_loc, f_dc_win = _load_node_shared_local_vertex(
         shared_node_comm,
         os.path.join(config.output.output_path, "f_dc_loc.npy"),
-        SpinChannel.NONE,
-        transform=lambda obj: obj.permute_orbitals("abcd->cbad", copy=False).scale(2.0),
+        SpinChannel.MAGN,
     )
-    kernel = calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc).scale(-1.0)
+    kernel = calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc)
     f_dc_loc.mat = None
     if f_dc_win is None:
         f_dc_loc.free()

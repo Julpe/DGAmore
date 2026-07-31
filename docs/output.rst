@@ -63,8 +63,10 @@ Use :meth:`~dgamore.local_n_point.LocalNPoint.to_full_niw_range` to restore the 
 frequencies therefore has ``2 * niv`` entries, running from :math:`\nu = -\mathrm{niv}` to
 :math:`\nu = \mathrm{niv} - 1`, so index ``i`` corresponds to :math:`\nu_i = (2 (i - \mathrm{niv}) + 1) \pi / \beta`.
 The two fermionic axes of a quantity need not have the same length: the local full vertex used for the
-double-counting correction is stored on an asymmetric box, since only its first index has to be summed over the full
-asymptotic region.
+double-counting correction is stored on an asymmetric box, since one of its indices has to be summed over the full
+asymptotic region. The summed frequency is the second argument of the vertex, which the double-counting kernel
+reads off the stored (full-box) first axis via the compound symmetry
+:math:`F^{\omega\nu\nu'}_{1234} = F^{\omega\nu'\nu}_{4321}` of the symmetrized local vertex.
 
 **Data type.** The n-point objects store their array as ``complex64`` to save memory, and the files inherit that
 data type. The few purely real outputs (the chemical-potential history and the spectral functions) are stored as
@@ -254,7 +256,7 @@ a single momentum point and keep three leading axes of length one.
      - Local DMFT self-energy
      - ``[1, 1, 1, no, no, 2 niv_dmft]``
    * - ``siw_dga_local.npy``
-     - Local self-energy of the local DGA step
+     - Local self-energy of the local DΓA step
      - ``[1, 1, 1, no, no, 2 niv_core]``
 
 Momentum-dependent quantities
@@ -376,7 +378,7 @@ The analytic continuation and a few diagnostics do not follow the n-point layout
      - Quantity
      - Array layout
    * - ``spectral_function_dga.npy``
-     - DGA spectral function :math:`A(\mathbf{k}, \omega)` in the full Brillouin zone, ``float32``
+     - DΓA spectral function :math:`A(\mathbf{k}, \omega)` in the full Brillouin zone, ``float32``
        (written when ``do_spectrum_dga`` is enabled)
      - ``[nkx, nky, nkz, no, w_count]``
    * - ``spectral_function_dmft.npy``
