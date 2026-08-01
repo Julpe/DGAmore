@@ -1,5 +1,5 @@
 numpy~=2.2
-matplotlib~=3.10
+matplotlib~=3.11
 mpi4py~=4.0
 h5py~=3.16
 pandas~=2.2
