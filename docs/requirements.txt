@@ -12,6 +12,6 @@ scipy~=1.18
 h5py~=3.16
 pandas~=2.2
 matplotlib~=3.10
-multimethod~=2.0
+multimethod~=2.1
 ruamel.yaml~=0.19
 threadpoolctl~=3.6
