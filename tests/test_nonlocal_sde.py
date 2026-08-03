@@ -94,7 +94,7 @@ def test_nonlocal_hartree_fock_matches_local_reference():
 
 
 def test_nonlocal_fock_fft_matches_explicit_momentum_sum():
-    """The FFT Fock term matches the explicit q-loop correlation for multi-band non-zero V and k-dependent occ."""
+    """The FFT Fock term matches the explicit q-loop n^{k-q} sum for multi-band non-zero V and k-dependent occ."""
     nb, nk = 2, (3, 4, 2)
     nk_tot = int(np.prod(nk))
     config.lattice.nk = nk
@@ -115,7 +115,7 @@ def test_nonlocal_fock_fft_matches_explicit_momentum_sum():
     fock_ref = np.zeros((nk_tot, nb, nb), dtype=np.complex64)
     for d in range(nb):
         for c in range(nb):
-            occ_qk = np.array([np.roll(occ_k[..., d, c], [-i for i in q], axis=(0, 1, 2)) for q in q_list]).reshape(
+            occ_qk = np.array([np.roll(occ_k[..., d, c], tuple(q), axis=(0, 1, 2)) for q in q_list]).reshape(
                 nk_tot, nk_tot
             )
             fock_ref += np.einsum("qab,qk->kab", uq[:, :, d, c, :], occ_qk, optimize=True)
@@ -302,8 +302,13 @@ def test_create_auxiliary_chi_r_q_matches_explicit_reference():
     assert np.allclose(out.mat, ref.mat, atol=1e-10)
 
 
-def test_calculate_kernel_r_q_matches_identity_like_reference():
-    """The magnetic self-energy kernel equals the explicit identity_like expression; density has no identity term."""
+def test_calculate_kernel_r_q_matches_rewired_reference():
+    """The kernel equals [gamma(1 - U chi) - 1] right-multiplied by U_r, in the sigma-contraction layout.
+
+    The reference realizes Sigma_{12} ~ sum_{ab} [K U_r]_{1ab2} G_{ab} == sum_{ab} K'_{a12b} G_{ab}, i.e. the
+    interaction attaches to the chi*-side pair of the three-leg vertex (Worm's placement) and the stored layout
+    is the "abcd->badc" permutation of [K U_r].
+    """
     rng = np.random.default_rng(25)
     o, nqi, nw, niv, beta = 2, 3, 3, 2, 12.5
     config.sys.beta = beta
@@ -333,12 +338,13 @@ def test_calculate_kernel_r_q_matches_identity_like_reference():
         u_loc = nonlocal_sde.LocalInteraction(rng.standard_normal((o,) * 4), SpinChannel.NONE)
         v_nonloc = Interaction(rng.standard_normal((nqi,) + (o,) * 4), SpinChannel.NONE, (nqi, 1, 1), True)
         u_r = v_nonloc.as_channel(channel) + u_loc.as_channel(channel)
-        ref = vrg.copy() - vrg.copy() @ u_r @ chi.copy()
-        if channel == SpinChannel.MAGN:
-            ref = ref - FourPoint.identity_like(ref).scale(2.0 / 3.0)
-        ref = u_r @ ref
+        inner = vrg.copy() - vrg.copy() @ u_r @ chi.copy()
+        inner = inner - FourPoint.identity_like(inner)
+        ref = inner @ u_r
+        # "abcd->badc" on the orbital axes of [q, o1, o2, o3, o4, w, v]
+        ref_mat = ref.mat.transpose(0, 2, 1, 4, 3, 5, 6)
         out = nonlocal_sde.calculate_kernel_r_q(vrg, chi, v_nonloc, u_loc)
-        assert np.allclose(out.mat, ref.mat, atol=1e-10)
+        assert np.allclose(out.mat, ref_mat, atol=1e-10)
 
 
 def test_vrg_right_is_first_frequency_summed_three_leg_vertex():
@@ -983,30 +989,37 @@ def _dc_kernel_inputs(o, nq, niw, niv_core, niv_full, beta=8.0, seed=23):
         full_niw_range=False,
         has_compressed_q_dimension=True,
     )
-    u_loc = LocalInteraction(rng.standard_normal((o,) * 4).astype(np.complex64), SpinChannel.NONE)
+    u_mat = rng.standard_normal((o,) * 4).astype(np.complex64)
+    u_mat = 0.5 * (u_mat + u_mat.transpose(2, 3, 0, 1))  # pair-swap symmetry of physical tensors
+    u_loc = LocalInteraction(u_mat, SpinChannel.NONE)
     return f_dc_loc, gchi0_q, u_loc
 
 
 @pytest.mark.parametrize("o", [1, 2])
-def test_sigma_dc_kernel_with_a_nu_prime_cut_vertex_matches_the_full_vertex(o):
-    """Cutting the vertex's surviving index to the core box leaves the double-counting kernel unchanged."""
+def test_sigma_dc_kernel_matches_explicit_reference(o):
+    """The dc kernel equals -2/b^2 [sum_{nu'} F_magn chi0] @ U^{cbad} in the sigma-contraction layout.
+
+    Only the local interaction enters (the V^q-attached local-vertex piece is not contained in DMFT and is kept).
+    The reference reads the summed nu' off the stored first fermionic index via the compound symmetry
+    F_{1dfe}(nu, nu') = F_{efd1}(nu', nu) of the symmetrized local vertex.
+    """
     nq, niw, niv_core, niv_full = 3, 2, 2, 5
-    f_full, gchi0_q, u_loc = _dc_kernel_inputs(o, nq, niw, niv_core, niv_full)
-    # built through the constructor so that original_shape, which the niv properties read, matches the array
-    f_cut = LocalFourPoint(
-        f_full.mat[..., niv_full - niv_core : niv_full + niv_core].copy(), SpinChannel.MAGN, 1, 2, False, True
-    )
-    assert f_cut.niv_first == niv_full and f_cut.niv_second == niv_core
+    f_dc_loc, gchi0_q, u_loc = _dc_kernel_inputs(o, nq, niw, niv_core, niv_full)
+    beta = config.sys.beta
 
-    from_full = nonlocal_sde.calculate_sigma_dc_kernel(f_full, gchi0_q.copy(), u_loc)
-    from_cut = nonlocal_sde.calculate_sigma_dc_kernel(f_cut, gchi0_q.copy(), u_loc)
+    out = nonlocal_sde.calculate_sigma_dc_kernel(f_dc_loc, gchi0_q.copy(), u_loc)
 
-    assert from_cut.niv == niv_core and from_cut.current_shape == from_full.current_shape
-    assert np.allclose(from_cut.mat, from_full.mat, atol=1e-4)
+    window = slice(niv_full - niv_core, niv_full + niv_core)
+    t = np.einsum("efgiwvp,qefdcwv->qigdcwp", f_dc_loc.mat, gchi0_q.mat, optimize=True)[..., window]
+    u_perm = u_loc.mat.transpose(2, 1, 0, 3)  # "abcd->cbad": the transversal attachment U_{acb2}
+    m = np.einsum("qigdcwp,cdaj->qigajwp", t, u_perm, optimize=True)
+    ref = -2.0 / beta**2 * m.transpose(0, 2, 1, 4, 3, 5, 6)  # "abcd->badc" into the contraction layout
+    assert out.niv == niv_core
+    assert np.allclose(out.mat, ref, atol=1e-4)
 
 
-def test_sigma_dc_kernel_sums_the_first_fermionic_index_over_the_full_box():
-    """The kernel contracts the vertex's first index over the whole asymptotic box, not only over the core box."""
+def test_sigma_dc_kernel_sums_the_stored_first_fermionic_index_over_the_full_box():
+    """The kernel contracts the vertex's stored first index (the summed nu') over the whole asymptotic box."""
     nq, niw, niv_core, niv_full = 2, 1, 2, 5
     f_dc_loc, gchi0_q, u_loc = _dc_kernel_inputs(1, nq, niw, niv_core, niv_full)
     f_shell_zeroed = f_dc_loc.copy()

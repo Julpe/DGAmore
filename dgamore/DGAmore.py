@@ -315,8 +315,8 @@ def main():
 
         gchi_d_full.save(name="gchi_dens_loc", output_dir=config.output.output_path)
         gchi_m_full.save(name="gchi_magn_loc", output_dir=config.output.output_path)
-        # only the double-counting kernel sums the first fermionic index over the full box, so it gets its own file;
-        # the channel files are cut square, as the Eliashberg equation reduces both indices to niv_pp <= niv_core // 2
+        # only the double-counting kernel needs one fermionic index on the full box (the summed nu' is read off the
+        # stored first axis via the compound symmetry); channel files stay square (Eliashberg: niv_pp <= niv_core // 2)
         f_m_full.save(name="f_dc_loc", output_dir=config.output.output_path)
         f_d_full.cut_niv(config.box.niv_core, copy=False).save(name="f_dens_loc", output_dir=config.output.output_path)
         f_m_full.cut_niv(config.box.niv_core, copy=False).save(name="f_magn_loc", output_dir=config.output.output_path)
