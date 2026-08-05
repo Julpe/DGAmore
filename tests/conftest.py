@@ -88,7 +88,6 @@ def reset_config_singletons():
     config.self_consistency = config.SelfConsistencyConfig()
     config.stabilization = config.StabilizationConfig()
     config.eliashberg = config.EliashbergConfig()
-    config.memory = config.MemoryConfig()
     config.ana_cont = config.AnaContConfig()
 
 
@@ -283,7 +282,8 @@ class Comm:
         # MPI_Comm_split: one sub-communicator per color, member order by (key, member) as in the standard.
         pairs = list(self._collective((color, key)))
         group = tuple(m for (c, k), m in sorted(zip(pairs, self._members), key=lambda t: (t[0][1], t[1])) if c == color)
-        cache_key = ("split", color)
+        # the group must be part of the key: successive Splits may reuse a color for different member sets
+        cache_key = ("split", color, group)
         with self._lock:
             if cache_key not in self._split_cache:
                 self._split_cache[cache_key] = Comm(members=group)

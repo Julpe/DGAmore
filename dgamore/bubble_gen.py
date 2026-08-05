@@ -328,7 +328,9 @@ class BubbleGenerator:
         r"""
         Returns the momentum-dependent generalized bare susceptibility :math:`\chi^{\mathrm{q}\nu}_{0;1234} = -\beta
         \sum_{\mathbf{k}} G^{\mathrm{k}}_{14}\, G^{\mathrm{k}-\mathrm{q}}_{32}`, evaluated by a direct momentum-shift
-        and a fused einsum over the explicit list of q-points (preallocated buffers).
+        and a fused einsum over the explicit list of q-points (preallocated buffers). The production bubble always
+        runs the FFT evaluation; this direct form is its independent cross-check and the evaluator for explicit
+        q-subsets.
 
         :param giwk: The momentum-dependent :class:`GreensFunction`.
         :param niw: Number of positive bosonic frequencies.
@@ -381,53 +383,6 @@ class BubbleGenerator:
         return FourPoint(
             gchi0_q, SpinChannel.NONE, q_grid.nk, 1, 1, full_niw_range=False, has_compressed_q_dimension=True
         ).filter_small_values()
-
-    @staticmethod
-    def create_generalized_chi0_q_auto(
-        mpi_distributor: MpiDistributor,
-        giwk: GreensFunction,
-        niw: int,
-        niv: int,
-        q_list: np.ndarray,
-        q_grid: KGrid,
-        beta: float,
-        logger: DgaLogger,
-    ):
-        r"""
-        Dispatches :meth:`create_generalized_chi0_q` to the GPU when CuPy and a usable CUDA device are available
-        (assigning one GPU per MPI rank round-robin), otherwise falls back to the CPU.
-
-        :param mpi_distributor: MPI distributor over the q-points (see :class:`MpiDistributor`).
-        :param giwk: The momentum-dependent :class:`GreensFunction`.
-        :param niw: Number of positive bosonic frequencies.
-        :param niv: Number of positive fermionic frequencies.
-        :param q_list: Array of integer q-point index triplets to compute.
-        :param q_grid: The :class:`KGrid` providing the momentum normalization.
-        :param beta: Inverse temperature :math:`\beta`.
-        :param logger: Logger used to report whether GPU acceleration is used.
-        :return: The bubble as a :class:`FourPoint` over the given q-points.
-        """
-        cp = None
-        try:
-            import cupy as cp
-        except ImportError:
-            pass  # CuPy not installed -> CPU
-
-        n_gpus = 0
-        if cp is not None:
-            try:
-                n_gpus = cp.cuda.runtime.getDeviceCount()
-            except cp.cuda.runtime.CUDARuntimeError:
-                n_gpus = 0  # no usable CUDA driver/device -> CPU
-
-        if n_gpus > 0 and cp.cuda.is_available():
-            logger.info(f"CuPy detected {n_gpus} GPU(s). Using GPU acceleration for gchi0_q calculation.")
-
-            gpu_id = mpi_distributor.my_rank % n_gpus
-            cp.cuda.Device(gpu_id).use()
-            return BubbleGenerator.create_generalized_chi0_q(giwk, niw, niv, q_list, q_grid, beta, use_gpu=True)
-
-        return BubbleGenerator.create_generalized_chi0_q(giwk, niw, niv, q_list, q_grid, beta, use_gpu=False)
 
     @staticmethod
     def create_generalized_chi0_pp_w0(g_dmft: GreensFunction, niv_pp: int, beta: float) -> LocalFourPoint:

@@ -4,23 +4,22 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 """
-Pure, side-effect-free estimator of the peak host-memory of the memory-sensitive DGAmore operations. Each
-``save_memory_*`` switch in :class:`dgamore.config.MemoryConfig` selects between a fast (flag off) and a lean
-(flag on) code path; this module estimates the peak bytes of the dominant arrays of both paths so the driver can set
-the flags automatically. Apart from the global storage precision :data:`dgamore.n_point_base.DTYPE` (the single
+Pure, side-effect-free estimator of the peak host-memory of the memory-sensitive DGAmore operations. Every step runs a single
+code path (the Eliashberg solver alone falls back from its in-memory to its block-distributed grid variant when a
+sector does not fit on one rank); this module estimates the peak bytes of the dominant arrays so the driver can
+verify upfront that a run fits its nodes. Apart from the global storage precision :data:`dgamore.n_point_base.DTYPE` (the single
 source of truth for the per-element size), it pulls in no run-state from the package -- no MPI, no ``psutil``, no
 config singleton: every input is passed as an argument, which keeps the formulas unit-testable in isolation.
 
 All heavy quantities are backed by a single :data:`~dgamore.n_point_base.DTYPE` array, and q-points are distributed
 across MPI ranks, so per-rank arrays scale with the per-rank q-count rather than the total. Only the dominant large
 arrays of each branch are modeled; a single global ``OVERHEAD_FACTOR`` scales every estimate to absorb un-modeled
-transients (known un-modeled costs: the mixing history of ``apply_mixing_strategy`` and the pp pairing-vertex assembly
-in ``eliashberg_solver.solve``, both dominated by the modeled branch peaks). It defaults to ``1.0`` (no extra margin,
-since those costs are dominated by the modeled peaks); the residual headroom for OS/allocator overhead lives in the
+transients (known un-modeled cost: the mixing history of ``apply_mixing_strategy``, dominated by the modeled branch
+peaks). It defaults to ``1.0`` (no extra margin); the residual headroom for OS/allocator overhead lives in the
 driver's node-memory fraction (``NODE_MEMORY_FRACTION`` in :mod:`dgamore.DGAmore`), so the two margins do not compound.
 
 Each branch carries its **own** persistent per-rank ``baseline`` (the full-grid two-point objects resident at that
-branch's peak) and the portion of it (``giwk_shareable``) that ``config.memory.use_shared_memory_common_obj`` deduplicates
+branch's peak) and the portion of it (``giwk_shareable``) that the node-shared giwk window deduplicates
 to a single copy per node; the node-total assembly lives in the driver
 (:func:`dgamore.DGAmore.autodetect_memory_settings`).
 """
@@ -35,15 +34,16 @@ from dgamore.n_point_base import DTYPE
 DTYPE_BYTES: int = np.dtype(DTYPE).itemsize
 OVERHEAD_FACTOR: float = 1.0
 
-# chiq_aux builds its BSE block in ONE allocation (nonlocal_sde.create_inverse_auxiliary_chi_r_q), then holds it across
-# the per-q invert_and_sum_over_last_vn (per-q inversion transient negligible). Peak ~1x the rank-local block.
-CHIQ_AUX_INVERT_FACTOR: int = 1
+# chiq_aux chunk transient: the assembled BSE window, its compound transpose copy inside the per-slice LU solve and
+# the back-substituted columns are alive together at the chunk peak.
+CHIQ_AUX_CHUNK_FACTOR: int = 3
 
 # fq: single-block BSE assembly + eagerly rebound matmuls (f = gchi0_q_inv @ f, then f @ gchi0_q_inv), ~2 blocks live.
 FQ_MATMUL_FACTOR: int = 2
 
-# FFT SDE holds the full-BZ niw-half kernel + its half-niv copy through the distributed-FFT round trip, ~2 blocks.
-SDE_FFT_KERNEL_FACTOR: int = 2
+# FFT SDE per-chunk transient: the exchanged full-BZ bosonic window plus the peer-to-peer exchange's in-flight
+# send and receive staging copies of it.
+SDE_CHUNK_FACTOR: int = 3
 
 # scipy.fft.ifftn(overwrite_x=True) transforms the c64 full-grid bubble in place, so no ifftn transient is allocated
 # beyond the multiply buffer (numpy.fft would allocate ~2x: returned array + work arrays). Per-iw peak = multiply buffer.
@@ -61,6 +61,83 @@ ARPACK_EXTRA_VECTORS: int = 3
 LOCAL_SHELL_INVERT_FACTOR: int = 3
 
 
+# Floor and cap of the per-chunk byte budget of the chunked builds (auxiliary susceptibility and pairing vertex):
+# the floor keeps per-chunk Python and dispatch overhead negligible, the cap bounds the transient on fat nodes.
+SLICE_CHUNK_BYTES: int = 2**28
+MAX_SLICE_CHUNK_BYTES: int = 2**32
+
+
+def dynamic_chunk_budget(total_bytes: float, node_ranks: int) -> int:
+    r"""
+    Returns the per-rank chunk byte budget of the chunked builds: an eighth of the rank's fair share of the node's
+    total host memory, floored at :data:`SLICE_CHUNK_BYTES` and capped at :data:`MAX_SLICE_CHUNK_BYTES`. The
+    transient of a chunked build stays below a few budgets, so the eighth leaves the bulk of the fair share to the
+    step's persistent inputs and outputs while large nodes run correspondingly larger, faster chunks. Deriving the
+    budget from the total rather than the currently free memory keeps the chunking - and with it the floating-point
+    reduction order - reproducible across reruns on the same node layout.
+
+    :param total_bytes: Total host memory of this node.
+    :param node_ranks: Number of MPI ranks sharing the node.
+    :return: The chunk budget in bytes.
+    """
+    return max(SLICE_CHUNK_BYTES, min(MAX_SLICE_CHUNK_BYTES, int(total_bytes // (node_ranks * 8))))
+
+
+def solver_grid_shape(n_ranks: int, n_freq: int) -> tuple[int, int]:
+    r"""
+    Chooses the ``(rows, cols)`` block grid of the distributed Eliashberg solver: frequency rows :math:`\nu` first
+    (up to one row per frequency), then whole-divisor column blocks of the :math:`\nu'` axis, so the column
+    partition is always mirror-symmetric (the crossed matvec term reads each block's mirror). A 1x1 grid degenerates
+    into the in-memory matvec.
+
+    :param n_ranks: Number of available MPI ranks.
+    :param n_freq: Number of fermionic frequencies ``2 niv_pp`` of the pp box.
+    :return: ``(rows, cols)`` with ``rows * cols <= n_ranks`` and ``cols`` dividing ``n_freq``.
+    """
+    rows = min(n_ranks, n_freq)
+    budget = min(n_ranks // rows, n_freq)
+    cols = max(d for d in range(1, budget + 1) if n_freq % d == 0)
+    return rows, cols
+
+
+def lanczos_solver_bytes(
+    n_bands: int, nk_tot: int, nk_irr: int, niv_pp: int, n_eig: int, n_ranks: int, overhead: float = OVERHEAD_FACTOR
+) -> tuple[float, float]:
+    r"""
+    Per-rank host-memory residency of the two Eliashberg solver variants, in bytes: the in-memory solve (one full-BZ
+    sector residency - the matmul-layout vertex and its build copy, the pp bubble and the ARPACK Lanczos basis) and
+    the block-distributed grid solve (this rank's vertex block plus the bubble transient, basis and gather buffer).
+    The single shared formula that both :func:`estimate_peaks` and the solver dispatch consume, so the two can never
+    drift apart.
+
+    :param n_bands: Number of bands :math:`B`.
+    :param nk_tot: Total number of momentum points (full BZ).
+    :param nk_irr: Number of momentum points in the irreducible BZ.
+    :param niv_pp: Number of positive fermionic frequencies of the pp (Eliashberg) box.
+    :param n_eig: Number of requested eigenpairs (sets the ARPACK basis size).
+    :param n_ranks: Number of MPI ranks (sets the solver grid of the distributed variant).
+    :param overhead: Safety factor multiplied onto the raw byte counts.
+    :return: ``(per_sector_bytes, grid_per_rank_bytes)``.
+    """
+    scale = DTYPE_BYTES * overhead
+    vpp = 2 * niv_pp
+    vertex_pp_full = _two_fermion_block(nk_tot, n_bands, 1, vpp)
+    chi0_pp_full = _bubble_block(nk_tot, n_bands, 1, vpp)
+    ncv = max(2 * n_eig + 1, 20)
+    arpack_ws = (ncv + ARPACK_EXTRA_VECTORS) * _giwk_rspace(nk_tot, n_bands, vpp)
+    per_sector = LANCZOS_VERTEX_FACTOR * vertex_pp_full + chi0_pp_full + arpack_ws
+    if n_ranks == 1:
+        per_sector += _two_fermion_block(nk_irr, n_bands, 1, vpp)  # the waiting channel's vertex
+    rows, cols = solver_grid_shape(n_ranks, vpp)
+    grid_share = (
+        LANCZOS_VERTEX_FACTOR * vertex_pp_full / (rows * cols)
+        + chi0_pp_full
+        + arpack_ws
+        + 2 * _giwk_rspace(nk_tot, n_bands, vpp)
+    )
+    return scale * per_sector, scale * grid_share
+
+
 @dataclass(frozen=True)
 class BranchPeak:
     """
@@ -71,7 +148,7 @@ class BranchPeak:
     For the node-total budget the memory on a node with ``r`` ranks at this branch's peak is
     ``r * (baseline + distributed) + single``: a *distributed* transient is held by every rank simultaneously (so it
     scales with ``r``), while a *single-rank* transient is built on one rank while the others idle (so it is counted
-    once). When ``config.memory.use_shared_memory_common_obj`` is on, the driver counts ``giwk_shareable`` once per node
+    once). The driver counts ``giwk_shareable`` once per node
     instead of once per rank (subtracting ``(r - 1) * giwk_shareable`` from the node total).
 
     :ivar baseline: Per-rank persistent bytes (full-grid two-point objects) live at this branch's peak.
@@ -154,7 +231,6 @@ def estimate_peaks(
     niv_pp: int,
     n_ranks: int,
     with_eliashberg: bool,
-    save_fq: bool = False,
     save_pairing_vertex: bool = False,
     n_eig: int = 1,
     overhead: float = OVERHEAD_FACTOR,
@@ -164,11 +240,9 @@ def estimate_peaks(
     branch, split by whether each transient is distributed across the ranks of a node or built on a single rank,
     together with the per-rank persistent baseline live at that branch's peak.
 
-    The returned dict maps a branch key to a :class:`BranchPeak`; the branch keys mirror the ``save_memory_for_*``
-    switches plus the flag-less ``"sde"`` step (always the two-pass FFT contraction, so its off and on slots are
-    identical and the driver only verifies the fit) and the flag-less ``"local"`` step (the rank-0-serial local
-    Schwinger-Dyson pass, also verify-only): ``"chi0q"``, ``"chiq_aux"``, ``"sde"``, ``"local"`` are always present;
-    ``"fq"`` and ``"lanczos"`` are added only when ``with_eliashberg`` is True. For a node with ``r`` ranks the memory at a branch's peak is
+    The returned dict maps a branch key to a :class:`BranchPeak`. Every branch is single-path with identical off
+    and on slots, except ``"lanczos"``, which carries the in-memory solve in its off slots and the block-distributed
+    grid fallback in its on slots. ``"fq"`` and ``"lanczos"`` are present only when ``with_eliashberg`` is True. For a node with ``r`` ranks the memory at a branch's peak is
     ``r * (baseline + distributed) + single``, minus ``(r - 1) * giwk_shareable`` when the node-shared giwk window is
     active (the driver assembles this; see :func:`dgamore.DGAmore.autodetect_memory_settings`).
 
@@ -192,9 +266,6 @@ def estimate_peaks(
     :param niv_pp: Number of positive fermionic frequencies of the pp (Eliashberg) box.
     :param n_ranks: Number of MPI ranks the q-points are distributed over.
     :param with_eliashberg: Whether the Eliashberg step runs (adds the ``"fq"`` and ``"lanczos"`` branches).
-    :param save_fq: Whether the full ladder vertex is kept in the full ph box (``config.eliashberg.save_fq``); when
-        True the per-rank ``fq`` accumulator spans the full ``[wn, vc, vc]`` block instead of the small pp box AND the
-        whole irreducible-BZ vertex is gathered on one rank for saving (a single-rank peak in both paths).
     :param save_pairing_vertex: Whether both pp pairing vertices are gathered on one rank for saving
         (``config.eliashberg.save_pairing_vertex``); a single-rank peak of the ``lanczos`` branch.
     :param n_eig: Number of requested eigenpairs (``config.eliashberg.n_eig``); sets the ARPACK Lanczos basis size
@@ -225,8 +296,8 @@ def estimate_peaks(
 
     peaks: dict[str, BranchPeak] = {}
 
-    # Fast (FFT) path: multi-rank splits (w, v) columns (DISTRIBUTED, R-space G node-shared); single-rank builds the
-    # whole irr-BZ bubble + B^4 multiply buffer (in-place scipy ifftn, no transient) per iw. Lean per-q einsum is DISTRIBUTED.
+    # Single-path FFT bubble (verify-only): multi-rank splits (w, v) columns across ranks (R-space G node-shared);
+    # single-rank builds the whole irr-BZ bubble plus the full-grid multiply buffer per iw (in-place scipy ifftn).
     gf_window_bubble = 2 * (niv_full + niw_core)
     if n_ranks == 1:
         chi0q_baseline = baseline_bubble
@@ -249,27 +320,29 @@ def estimate_peaks(
         giwk_shareable=chi0q_shareable,
         off_distributed=chi0q_off_distributed,
         off_single=chi0q_off_single,
-        on_distributed=scale * (_bubble_block(qi, nb, wp, vf) + 2 * _giwk_rspace(nk_tot, nb, gf_window_bubble)),
-        on_single=0.0,
+        on_distributed=chi0q_off_distributed,
+        on_single=chi0q_off_single,
     )
 
-    # Fast holds the whole rank-local two-fermion block, lean accumulates the 1-fermion result (both DISTRIBUTED; map
-    # always p2p, no single-rank term). One node-shared local vertex resident: f_dc_loc carries the summed fermionic
-    # index on the full box but the surviving one only on the core box, so it is niv_full x niv_core, not squared.
+    # Single-path chunked sum (verify-only): the accumulated 1-fermion result plus the byte-bounded chunk transient
+    # (assembled window, its compound transpose copy and the solved columns). One node-shared local vertex resident:
+    # f_dc_loc is niv_full x niv_core (summed index on the full box), the surviving one core-box square.
     local_vertex_shared = scale * max(_two_fermion_block(1, nb, wp, vf, vc), _two_fermion_block(1, nb, wp, vc))
+    chiq_aux_chunk = min(SLICE_CHUNK_BYTES, DTYPE_BYTES * _two_fermion_block(qi, nb, wp, vc))
+    chiq_aux_distributed = scale * _bubble_block(qi, nb, wp, vc) + overhead * CHIQ_AUX_CHUNK_FACTOR * chiq_aux_chunk
     peaks["chiq_aux"] = BranchPeak(
         baseline=baseline_kernel_section + local_vertex_shared,
         giwk_shareable=giwk_sde + local_vertex_shared,
-        off_distributed=scale * CHIQ_AUX_INVERT_FACTOR * _two_fermion_block(qi, nb, wp, vc),
+        off_distributed=chiq_aux_distributed,
         off_single=0.0,
-        on_distributed=scale
-        * (CHIQ_AUX_INVERT_FACTOR * _two_fermion_block(1, nb, wp, vc) + _bubble_block(qi, nb, wp, vc)),
+        on_distributed=chiq_aux_distributed,
         on_single=0.0,
     )
 
-    # Single flag-less two-pass FFT contraction: full-BZ niw-half kernel + its half-niv copy (~SDE_FFT_KERNEL_FACTOR
-    # blocks) + one private giwk.fft() copy/rank; rank 0 finalizes. The old q-loop path is unused (peaked HIGHER).
-    sde_distributed = scale * (SDE_FFT_KERNEL_FACTOR * _bubble_block(qt, nb, wp, vc) + _bubble_block(qi, nb, wp, vc))
+    # Single flag-less two-pass FFT contraction, walked in bounded w-chunks: the retained irr-BZ kernel plus the
+    # chunk-capped exchange transients (floor modeled - the dynamic budget stays below an eighth of the fair share).
+    sde_chunk = min(SLICE_CHUNK_BYTES, DTYPE_BYTES * _bubble_block(qt, nb, wp, vc))
+    sde_distributed = scale * _bubble_block(qi, nb, wp, vc) + overhead * SDE_CHUNK_FACTOR * sde_chunk
     sde_single = scale * 2 * _giwk_rspace(nk_tot, nb, vc)
     peaks["sde"] = BranchPeak(
         baseline=baseline_sde,
@@ -281,45 +354,34 @@ def estimate_peaks(
     )
 
     if with_eliashberg:
-        # ~FQ_MATMUL_FACTOR two-fermion blocks at the matmul peak (per rank fast, per q lean) + 1-fermion inputs + the
-        # lean accumulator. save_fq gathers the whole irr-BZ vertex on one rank.
-        vc_fq = vc
-        fq_accumulator = _two_fermion_block(qi, nb, wp, vc) if save_fq else _two_fermion_block(qi, nb, 1, vpp)
-        fq_gather_single = scale * _two_fermion_block(nk_irr, nb, wp, vc) if save_fq else 0.0
+        # Slice-direct pairing-vertex build: pp accumulator + three loaded one-fermion inputs + the chunk-bounded
+        # transient (matmul pair plus the sliced local vertex = FQ_MATMUL_FACTOR + 1 chunks; the floor is modeled -
+        # the dynamic budget stays below an eighth of the fair share by construction, see dynamic_chunk_budget).
+        fq_chunk = min(SLICE_CHUNK_BYTES, DTYPE_BYTES * _two_fermion_block(qi, nb, wp, vc))
+        fq_distributed = (
+            scale * (_two_fermion_block(qi, nb, 1, vpp) + 3 * _bubble_block(qi, nb, wp, vc))
+            + overhead * (FQ_MATMUL_FACTOR + 1) * fq_chunk
+        )
         peaks["fq"] = BranchPeak(
             baseline=0.0,
             giwk_shareable=0.0,
-            off_distributed=scale
-            * (FQ_MATMUL_FACTOR * _two_fermion_block(qi, nb, wp, vc_fq) + _bubble_block(qi, nb, wp, vc_fq)),
-            off_single=fq_gather_single + giwk_dga_single,
-            on_distributed=scale
-            * (
-                FQ_MATMUL_FACTOR * _two_fermion_block(1, nb, wp, vc_fq)
-                + fq_accumulator
-                + 3 * _bubble_block(qi, nb, wp, vc_fq)
-            ),
-            on_single=fq_gather_single + giwk_dga_single,
+            off_distributed=fq_distributed,
+            off_single=giwk_dga_single,
+            on_distributed=fq_distributed,
+            on_single=giwk_dga_single,
         )
 
-        # Fast: whole-BZ pairing vertex on ONE rank (LANCZOS_VERTEX_FACTOR copies + full-BZ pp bubble + ARPACK ws;
-        # sing/trip concurrent, driver doubles). Lean: full BZ per rank on its v'-slice, each with its own ARPACK ws.
-        vertex_pp_full = _two_fermion_block(nk_tot, nb, 1, vpp)
-        chi0_pp_full = _bubble_block(nk_tot, nb, 1, vpp)
-        ncv = max(2 * n_eig + 1, 20)
-        arpack_ws = (ncv + ARPACK_EXTRA_VECTORS) * _giwk_rspace(nk_tot, nb, vpp)
-        pairing_gather = 2 * _two_fermion_block(nk_irr, nb, 1, vpp) if save_pairing_vertex else 0
-        v_share = _ceil_div(vpp, n_ranks)  # per-rank share of the v'-distributed vertex (vpp tasks, not q-points)
-        vertex_pp_slice = nk_tot * nb**4 * vpp * v_share
-        solver_single_fast = LANCZOS_VERTEX_FACTOR * vertex_pp_full + chi0_pp_full + arpack_ws
-        if n_ranks == 1:
-            solver_single_fast += _two_fermion_block(nk_irr, nb, 1, vpp)  # the waiting channel's gathered vertex
+        # In-memory Lanczos solver in the off slots, block-distributed grid fallback in the on slots; both from the
+        # one shared formula the solver dispatch reads as well (see lanczos_solver_bytes).
+        solver_single, solver_grid = lanczos_solver_bytes(nb, nk_tot, nk_irr, niv_pp, n_eig, n_ranks, overhead)
+        pairing_gather = scale * (2 * _two_fermion_block(nk_irr, nb, 1, vpp)) if save_pairing_vertex else 0.0
         peaks["lanczos"] = BranchPeak(
             baseline=0.0,
             giwk_shareable=0.0,
             off_distributed=0.0,
-            off_single=scale * max(solver_single_fast, pairing_gather) + giwk_dga_single,
-            on_distributed=scale * (LANCZOS_VERTEX_FACTOR * vertex_pp_slice + arpack_ws),
-            on_single=scale * max(chi0_pp_full, pairing_gather) + giwk_dga_single,
+            off_single=max(solver_single, pairing_gather) + giwk_dga_single,
+            on_distributed=solver_grid,
+            on_single=pairing_gather + giwk_dga_single,
         )
 
     # Rank-0-serial local SDE (flag-less, verify-only): both channels' outputs (gamma + chi at the core box, full

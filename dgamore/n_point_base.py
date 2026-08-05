@@ -13,6 +13,7 @@ vertices, interaction, gap function) compose these mixins.
 
 import gc
 from abc import ABC
+from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
 
@@ -24,6 +25,28 @@ from dgamore.brillouin_zone import KGrid
 # Global storage precision for all n-point quantities. Switch this single constant to np.complex128 for double
 # precision (doubling memory). All IHaveMat-derived objects store .mat in this dtype; also exposed as IHaveMat.DTYPE.
 DTYPE = np.complex64
+
+# When True, free() (and hence every destructor) skips its gc sweep; deferred_collection() flips it and collects once.
+_defer_gc: bool = False
+
+
+@contextmanager
+def deferred_collection():
+    r"""
+    Context manager batching the garbage-collector sweeps of :meth:`IHaveMat.free` into a single one at exit. Inside
+    the context, releasing an n-point object only drops its array reference; the full ``gc.collect()`` (an
+    all-generations heap walk, milliseconds each) runs once when the context closes. Use it around loops that create
+    and release many small n-point objects, where a per-object sweep costs more than the loop's arithmetic.
+
+    :return: A context manager (no value is bound).
+    """
+    global _defer_gc
+    _defer_gc = True
+    try:
+        yield
+    finally:
+        _defer_gc = False
+        gc.collect()
 
 
 class SpinChannel(Enum):
@@ -296,7 +319,8 @@ class IHaveMat(ABC):
         if self._mat is not None:
             self._mat = None
 
-        gc.collect()
+        if not _defer_gc:
+            gc.collect()
 
         if trim:
             self._malloc_trim()
@@ -697,6 +721,26 @@ class IAmNonLocal(IHaveMat, ABC):
         copy.update_original_shape()
         copy._nq = (1, 1, 1)
         return copy
+
+    def take_q_index_slice(self, start: int, stop: int):
+        r"""
+        Returns a **new** object restricted to the index window ``[start, stop)`` of the compressed momentum axis.
+        The momentum-range counterpart of :meth:`filter_q_index`, letting a caller walk the rank-local momenta in
+        bounded groups instead of one at a time or all at once.
+
+        :param start: First momentum index of the window.
+        :param stop: One past the last momentum index of the window.
+        :return: A compressed copy containing those momenta (``nq = (stop - start, 1, 1)``).
+        """
+        if not self.has_compressed_q_dimension:
+            self.compress_q_dimension()
+
+        result = self._clone_without_mat()
+        # ``.copy()`` so the returned object does not keep the full parent array alive via a view
+        result.mat = self.mat[start:stop].copy()
+        result.update_original_shape()
+        result._nq = (stop - start, 1, 1)
+        return result
 
     def q_mean(self):
         r"""

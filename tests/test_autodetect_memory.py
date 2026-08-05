@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2025-2026 Julian Peil <julian.peil@tuwien.ac.at>
 # SPDX-License-Identifier: MIT
-"""Tests for DGAmore.autodetect_memory_settings (node-total budget + floor-semantics wiring)."""
+"""Tests for DGAmore.autodetect_memory_settings (node-total budget wiring; the switches are autodetect-internal)."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -26,10 +26,6 @@ def fake_system(monkeypatch):
     config.box.niv_full = FIXTURE_PARAMS["niv_full"]
     config.box.niv_dmft = 50  # so niv_cut = min(niw_core + niv_full + 10, niv_dmft) = min(32, 50) = 32
     config.eliashberg.perform_eliashberg = False
-    config.memory.save_memory_for_chi0q = False
-    config.memory.save_memory_for_chiq_aux = False
-    config.memory.save_memory_for_fq = False
-    config.memory.save_memory_for_lanczos = False
     config.lattice.k_grid = SimpleNamespace(nk_tot=FIXTURE_PARAMS["nk_tot"], nk_irr=FIXTURE_PARAMS["nk_irr"])
     config.logger = MagicMock()
 
@@ -60,8 +56,7 @@ def _node_total(branch, which, r, with_eliashberg=False):
     distributed = bp.off_distributed if which == "off" else bp.on_distributed
     single = bp.off_single if which == "off" else bp.on_single
     total = r * (bp.baseline + distributed) + single
-    if config.memory.use_shared_memory_common_obj:
-        total -= (r - 1) * bp.giwk_shareable
+    total -= (r - 1) * bp.giwk_shareable
     return total
 
 
@@ -76,48 +71,24 @@ def _mock_branch(
     return BranchPeak(baseline, giwk_shareable, off_distributed, off_single, on_distributed, on_single)
 
 
-def test_large_memory_keeps_all_flags_off(fake_system):
-    """A large free-memory budget on a tiny problem leaves all lean flags off."""
-    fake_system(64 * 1024**3)  # 64 GiB free, tiny problem -> nothing forced on
+def test_large_memory_passes_verification(fake_system):
+    """A large free-memory budget on a tiny problem passes every branch verification without raising."""
+    fake_system(64 * 1024**3)
     dgamore_main.autodetect_memory_settings(_mock_comm())
-    assert config.memory.save_memory_for_chiq_aux is False
-    assert config.memory.save_memory_for_chi0q is False
 
 
-def test_tiny_memory_forces_lean_flags_on(fake_system):
-    """A budget below chiq_aux's fast node total forces its lean flag on without overflowing the node."""
-    off = _node_total("chiq_aux", "off", r=1)
-    max_on = max(_all_node_totals("on", r=1, with_eliashberg=False))
-    budget = max(0.5 * (max_on + off), 1.01 * _node_total("local", "off", r=1))
-    fake_system(int(budget / dgamore_main.NODE_MEMORY_FRACTION))
-    dgamore_main.autodetect_memory_settings(_mock_comm())
-    assert config.memory.save_memory_for_chiq_aux is True
-
-
-def test_user_true_is_preserved_as_floor(fake_system):
-    """A user-set lean flag survives autodetection even when memory is plentiful."""
-    fake_system(64 * 1024**3)  # plenty of memory; auto would leave it off
-    config.memory.save_memory_for_chiq_aux = True
-    dgamore_main.autodetect_memory_settings(_mock_comm())
-    assert config.memory.save_memory_for_chiq_aux is True
-
-
-def test_chi0q_single_rank_peak_fits_under_node_total(fake_system):
-    """chi0q's single-rank transient stays off while the heavier chiq_aux branch is forced on under the node total."""
-    chi0q_off = _node_total("chi0q", "off", r=1)
-    chiq_aux_off = _node_total("chiq_aux", "off", r=1)
-    floor = max(chi0q_off, _node_total("sde", "off", r=1), _node_total("local", "off", r=1))
-    assert floor < chiq_aux_off  # sanity: chiq_aux is the heaviest of the three here
-    budget = 0.5 * (floor + chiq_aux_off)
-    fake_system(int(budget / dgamore_main.NODE_MEMORY_FRACTION))
-    dgamore_main.autodetect_memory_settings(_mock_comm())
-    assert config.memory.save_memory_for_chi0q is False
-    assert config.memory.save_memory_for_chiq_aux is True
+def test_chiq_aux_overflow_raises_while_lighter_branches_fit(fake_system):
+    """A budget between the lighter branches and the chiq_aux node total raises on the heaviest branch."""
+    chiq_aux = _node_total("chiq_aux", "off", r=1)
+    floor = max(_node_total(k, "off", r=1) for k in ("chi0q", "sde", "local"))
+    assert floor < chiq_aux  # sanity: chiq_aux is the heaviest branch here
+    fake_system(int(0.5 * (floor + chiq_aux) / dgamore_main.NODE_MEMORY_FRACTION))
+    with pytest.raises(MemoryError):
+        dgamore_main.autodetect_memory_settings(_mock_comm())
 
 
 def test_more_ranks_per_node_raise_the_distributed_node_total(fake_system):
-    """A distributed branch's node total scales with ranks-per-node, forcing chiq_aux on only at 2 co-located ranks."""
-    config.memory.save_memory_for_chiq_aux = False
+    """A distributed branch's node total scales with ranks-per-node, overflowing only at 2 co-located ranks."""
     one = _node_total("chiq_aux", "off", r=1)
     two = _node_total("chiq_aux", "off", r=2)
     assert two > one  # distributed block counted r times (minus the one-copy giwk credit)
@@ -126,12 +97,10 @@ def test_more_ranks_per_node_raise_the_distributed_node_total(fake_system):
 
     fake_system(avail)
     dgamore_main.autodetect_memory_settings(_mock_comm(size=1))
-    assert config.memory.save_memory_for_chiq_aux is False
 
-    config.memory.save_memory_for_chiq_aux = False
     fake_system(avail)
-    dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=lambda obj: [obj, obj]))
-    assert config.memory.save_memory_for_chiq_aux is True
+    with pytest.raises(MemoryError):
+        dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=lambda obj: [obj, obj]))
 
 
 def test_overflow_raises(fake_system):
@@ -141,30 +110,16 @@ def test_overflow_raises(fake_system):
         dgamore_main.autodetect_memory_settings(_mock_comm())
 
 
-def test_eliashberg_flags_considered_when_enabled(fake_system):
-    """With Eliashberg enabled and ample memory, its lean flags stay off."""
+def test_eliashberg_branches_verified_when_enabled(fake_system):
+    """With Eliashberg enabled and ample memory, the verify-only branch checks pass without raising."""
     config.eliashberg.perform_eliashberg = True
     fake_system(64 * 1024**3)
     dgamore_main.autodetect_memory_settings(_mock_comm())
-    assert config.memory.save_memory_for_fq is False
-    assert config.memory.save_memory_for_lanczos is False
-
-
-def test_eliashberg_flag_forced_on_under_pressure(fake_system):
-    """Under memory pressure with Eliashberg enabled, the fq lean flag is forced on."""
-    config.eliashberg.perform_eliashberg = True
-    off = _node_total("fq", "off", r=1, with_eliashberg=True)
-    max_on = max(_all_node_totals("on", r=1, with_eliashberg=True))
-    budget = 0.5 * (max_on + off)
-    fake_system(int(budget / dgamore_main.NODE_MEMORY_FRACTION))
-    dgamore_main.autodetect_memory_settings(_mock_comm())
-    assert config.memory.save_memory_for_fq is True
 
 
 def test_autodetect_forwards_eliashberg_flags(fake_system, monkeypatch):
-    """The driver forwards save_fq, save_pairing_vertex and n_eig into estimate_peaks."""
+    """The driver forwards save_pairing_vertex and n_eig into estimate_peaks."""
     config.eliashberg.perform_eliashberg = True
-    monkeypatch.setattr(config.eliashberg, "save_fq", True, raising=False)
     monkeypatch.setattr(config.eliashberg, "save_pairing_vertex", True, raising=False)
     monkeypatch.setattr(config.eliashberg, "n_eig", 3, raising=False)
     fake_system(64 * 1024**3)
@@ -178,18 +133,12 @@ def test_autodetect_forwards_eliashberg_flags(fake_system, monkeypatch):
 
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", spy)
     dgamore_main.autodetect_memory_settings(_mock_comm())
-    assert captured["save_fq"] is True
     assert captured["save_pairing_vertex"] is True
     assert captured["n_eig"] == 3
 
 
-def test_memory_config_shares_giwk_by_default():
-    """The node-shared giwk optimization is enabled by default (disable-able for the NUMA case)."""
-    assert config.MemoryConfig().use_shared_memory_common_obj is True
-
-
 def test_shared_giwk_credits_the_bubble_branch_node_total(fake_system, monkeypatch):
-    """use_shared_memory_common_obj credits the deduplicated giwk to the chi0q node total so the fast bubble fits."""
+    """The always-on node-shared giwk window credits the deduplicated giwk to the chi0q node total."""
     fake_system(1)
     r = 4
     giwk_half = 1024.0**2
@@ -207,20 +156,13 @@ def test_shared_giwk_credits_the_bubble_branch_node_total(fake_system, monkeypat
     budget = uncredited - 0.5 * (r - 1) * giwk_half
     ranks = lambda obj: [obj] * r
 
-    config.memory.use_shared_memory_common_obj = True
-    config.memory.save_memory_for_chi0q = False
     monkeypatch.setattr(
         dgamore_main.psutil,
         "virtual_memory",
         lambda: SimpleNamespace(available=int(budget / dgamore_main.NODE_MEMORY_FRACTION)),
     )
+    # the verify-only bubble raises without the credit at this budget, so completing is the assertion
     dgamore_main.autodetect_memory_settings(_mock_comm(size=r, allgather=ranks))
-    assert config.memory.save_memory_for_chi0q is False
-
-    config.memory.use_shared_memory_common_obj = False
-    config.memory.save_memory_for_chi0q = False
-    dgamore_main.autodetect_memory_settings(_mock_comm(size=r, allgather=ranks))
-    assert config.memory.save_memory_for_chi0q is True
 
 
 def test_shared_giwk_credits_a_non_bubble_sde_branch(fake_system, monkeypatch):
@@ -242,20 +184,13 @@ def test_shared_giwk_credits_a_non_bubble_sde_branch(fake_system, monkeypatch):
     budget = uncredited - 0.5 * (r - 1) * giwk_half
     ranks = lambda obj: [obj] * r
 
-    config.memory.use_shared_memory_common_obj = True
-    config.memory.save_memory_for_chiq_aux = False
     monkeypatch.setattr(
         dgamore_main.psutil,
         "virtual_memory",
         lambda: SimpleNamespace(available=int(budget / dgamore_main.NODE_MEMORY_FRACTION)),
     )
+    # the verify-only branch raises without the credit at this budget, so completing is the assertion
     dgamore_main.autodetect_memory_settings(_mock_comm(size=r, allgather=ranks))
-    assert config.memory.save_memory_for_chiq_aux is False
-
-    config.memory.use_shared_memory_common_obj = False
-    config.memory.save_memory_for_chiq_aux = False
-    dgamore_main.autodetect_memory_settings(_mock_comm(size=r, allgather=ranks))
-    assert config.memory.save_memory_for_chiq_aux is True
 
 
 def test_eliashberg_branch_baseline_gets_no_giwk_credit(fake_system, monkeypatch):
@@ -269,44 +204,24 @@ def test_eliashberg_branch_baseline_gets_no_giwk_credit(fake_system, monkeypatch
     }
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: peaks)
 
-    budget = 4.5 * baseline  # credited chi0q fast 3.5 b / fq lean 4 b < budget < fq fast 8 b
-    config.memory.use_shared_memory_common_obj = True
-    config.memory.save_memory_for_chi0q = False
-    config.memory.save_memory_for_fq = False
+    budget = 4.5 * baseline  # credited chi0q fast 3.5 b fits; the uncredited fq verify (8 b) must fail
     monkeypatch.setattr(
         dgamore_main.psutil,
         "virtual_memory",
         lambda: SimpleNamespace(available=int(budget / dgamore_main.NODE_MEMORY_FRACTION)),
     )
-    dgamore_main.autodetect_memory_settings(_mock_comm(size=r, allgather=lambda obj: [obj] * r))
-    assert config.memory.save_memory_for_chi0q is False
-    assert config.memory.save_memory_for_fq is True
+    with pytest.raises(MemoryError):
+        dgamore_main.autodetect_memory_settings(_mock_comm(size=r, allgather=lambda obj: [obj] * r))
 
 
-def test_heavier_lean_path_does_not_raise_when_fast_fits(fake_system, monkeypatch):
-    """A branch whose lean path peaks higher than its fast one must not raise while the fast path fits."""
+def test_non_solver_on_slots_are_ignored_by_verification(fake_system, monkeypatch):
+    """Only the Eliashberg solver consults its on slots; an oversized on slot elsewhere must not raise."""
     fake_system(1)
     small, big = 1024.0**2, 100 * 1024.0**2
     peaks = {"chiq_aux": _mock_branch(baseline=small, off_distributed=small, on_distributed=big)}
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: peaks)
     monkeypatch.setattr(dgamore_main.psutil, "virtual_memory", lambda: SimpleNamespace(available=int(10 * small)))
-
-    config.memory.save_memory_for_chiq_aux = False
     dgamore_main.autodetect_memory_settings(_mock_comm())
-    assert config.memory.save_memory_for_chiq_aux is False  # fast path fits -> no raise despite the oversized lean path
-
-
-def test_user_forced_lean_path_that_overflows_raises(fake_system, monkeypatch):
-    """A user-forced lean flag whose path overflows the node raises even though the fast path would fit."""
-    fake_system(1)
-    small, big = 1024.0**2, 100 * 1024.0**2
-    peaks = {"chiq_aux": _mock_branch(baseline=small, off_distributed=small, on_distributed=big)}
-    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: peaks)
-    monkeypatch.setattr(dgamore_main.psutil, "virtual_memory", lambda: SimpleNamespace(available=int(10 * small)))
-
-    config.memory.save_memory_for_chiq_aux = True
-    with pytest.raises(MemoryError, match="fast path would fit"):
-        dgamore_main.autodetect_memory_settings(_mock_comm())
 
 
 def test_flagless_sde_step_is_verified_and_raises_on_overflow(fake_system, monkeypatch):
@@ -325,26 +240,28 @@ def test_flagless_sde_step_is_verified_and_raises_on_overflow(fake_system, monke
 
 
 def test_lanczos_single_rank_peak_doubled_on_single_node_multi_rank(fake_system, monkeypatch):
-    """On a single-node multi-rank job the concurrent singlet+triplet solves double the lanczos single-rank peak."""
+    """The doubled in-memory peak on a single node raises only when the grid fallback does not fit either."""
     fake_system(1)
     single = 10 * 1024.0**2
-    peaks = {"lanczos": _mock_branch(baseline=1.0, off_single=single, on_distributed=1.0)}
-    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: peaks)
-    budget = 1.5 * single  # fits one solver per node, not two
+    budget = 1.5 * single  # fits one in-memory solver per node, not two concurrent ones
     monkeypatch.setattr(
         dgamore_main.psutil,
         "virtual_memory",
         lambda: SimpleNamespace(available=int(budget / dgamore_main.NODE_MEMORY_FRACTION)),
     )
 
-    config.memory.save_memory_for_lanczos = False
-    dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=lambda obj: [obj, obj]))
-    assert config.memory.save_memory_for_lanczos is True
+    both_too_big = {"lanczos": _mock_branch(off_single=single, on_distributed=single)}
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: both_too_big)
+    with pytest.raises(MemoryError):
+        dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=lambda obj: [obj, obj]))
 
-    config.memory.save_memory_for_lanczos = False
+    grid_rescues = {"lanczos": _mock_branch(off_single=single, on_distributed=0.1 * single)}
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: grid_rescues)
+    dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=lambda obj: [obj, obj]))
+
     two_nodes = lambda obj: [("node0", obj[1]), ("node1", obj[1])]
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: both_too_big)
     dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=two_nodes))
-    assert config.memory.save_memory_for_lanczos is False
 
 
 def test_dgamore_excludes_osc_ucx_before_mpi_init():

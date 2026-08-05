@@ -89,7 +89,6 @@ class ConfigParser:
         config.lattice = self._build_lattice_config(config_file)
         config.self_energy_interpolation = self._build_self_energy_interpolation_config(config_file)
         config.sys = self._build_system_config(config_file)
-        config.memory = self._build_memory_config(config_file)
         config.ana_cont = self._build_ana_cont_config(config_file)
 
     def _build_box_config(self, config_file) -> BoxConfig:
@@ -270,7 +269,6 @@ class ConfigParser:
         conf.n_eig = self._try_parse(section, "n_eig", conf.n_eig)
         conf.epsilon = self._try_parse(section, "epsilon", conf.epsilon)
         conf.symmetry = self._try_parse(section, "symmetry", conf.symmetry)
-        conf.include_local_part = self._try_parse(section, "include_local_part", conf.include_local_part)
         conf.symmetrize_degenerate_gaps = self._try_parse(
             section, "symmetrize_degenerate_gaps", conf.symmetrize_degenerate_gaps
         )
@@ -319,32 +317,6 @@ class ConfigParser:
         conf.do_interpolation = self._try_parse(section, "do_interpolation", conf.do_interpolation)
         conf.beta_target = self._try_parse(section, "target_beta", conf.beta_target)
         conf.niv_target = self._try_parse(section, "target_niv", conf.niv_target)
-
-        return conf
-
-    def _build_memory_config(self, config_file):
-        """
-        Builds the memory config from the ``memory`` section (defaults if absent).
-
-        :param config_file: The parsed YAML mapping.
-        :return: The populated :class:`MemoryConfig`.
-        """
-        conf = MemoryConfig()
-        try:
-            section = config_file["memory"]
-        except KeyError:
-            config.logger.info(f"'memory' section not found. Using default values.")
-            return conf
-
-        conf.save_memory_for_chi0q = self._try_parse(section, "save_memory_for_chi0q", conf.save_memory_for_chi0q)
-        conf.save_memory_for_chiq_aux = self._try_parse(
-            section, "save_memory_for_chiq_aux", conf.save_memory_for_chiq_aux
-        )
-        conf.save_memory_for_fq = self._try_parse(section, "save_memory_for_fq", conf.save_memory_for_fq)
-        conf.save_memory_for_lanczos = self._try_parse(section, "save_memory_for_lanczos", conf.save_memory_for_lanczos)
-        conf.use_shared_memory_common_obj = self._try_parse(
-            section, "use_shared_memory_common_obj", conf.use_shared_memory_common_obj
-        )
 
         return conf
 

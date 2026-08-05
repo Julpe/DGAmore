@@ -123,19 +123,17 @@ def gpu_cpu_context(use_gpu: bool, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "niw_core, niv_core, niv_shell, use_gpu, save_memory",
-    [(20, 20, 10, True, True), (20, 20, 10, False, True), (20, 20, 10, True, False), (20, 20, 10, False, False)],
+    "niw_core, niv_core, niv_shell, use_gpu",
+    [(20, 20, 10, True), (20, 20, 10, False)],
 )
-def test_calculates_nonlocal_sde_correctly(setup, monkeypatch, niw_core, niv_core, niv_shell, use_gpu, save_memory):
-    """The non-local SDE reproduces the reference self-energy on the CPU and (mocked) GPU paths in both memory modes."""
+def test_calculates_nonlocal_sde_correctly(setup, monkeypatch, niw_core, niv_core, niv_shell, use_gpu):
+    """The non-local SDE reproduces the reference self-energy on the CPU and the (mocked) GPU path."""
     folder, comm_mock = setup
 
     config.box.niw_core = niw_core
     config.box.niv_core = niv_core
     config.box.niv_shell = niv_shell
     config.dmft.symmetrize_orbitals = []
-    config.memory.save_memory_for_chi0q = save_memory
-    config.memory.save_memory_for_chiq_aux = save_memory
 
     g_dmft, s_dmft, g2_dens, g2_magn = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
 
@@ -157,8 +155,7 @@ def test_calculates_nonlocal_sde_correctly(setup, monkeypatch, niw_core, niv_cor
     assert np.allclose(sigma_dga_mat, sigma_dga_ref, atol=3e-5 if not mock_gpu else 1e-3)
 
 
-@pytest.mark.parametrize("save_memory", [True, False])
-def test_calculates_srvo3_correctly(setup_srvo3_cubic, save_memory):
+def test_calculates_srvo3_correctly(setup_srvo3_cubic):
     """The SrVO3 cubic run reproduces the cubic point-group symmetry of the self-energy under the three axis swaps."""
     folder_cubic, comm_mock = setup_srvo3_cubic
 
@@ -168,9 +165,6 @@ def test_calculates_srvo3_correctly(setup_srvo3_cubic, save_memory):
     assert s_dmft.is_orbitally_symmetrized([1, 2, 3])
     assert g2_dens.is_orbitally_symmetrized([1, 2, 3])
     assert g2_magn.is_orbitally_symmetrized([1, 2, 3])
-
-    config.memory.save_memory_for_chi0q = save_memory
-    config.memory.save_memory_for_chiq_aux = save_memory
 
     config.output.output_path = folder_cubic
 

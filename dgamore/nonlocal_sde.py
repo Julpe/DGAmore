@@ -34,6 +34,8 @@ from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.lambda_ops import LambdaAnnealer, LambdaCorrection, MultiOrbitalLambdaCorrection
 from dgamore.matsubara_frequencies import MFHelper
+from dgamore import memory_estimator
+from dgamore.memory_estimator import SLICE_CHUNK_BYTES
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel
 from dgamore.self_energy import SelfEnergy
@@ -143,96 +145,55 @@ def create_auxiliary_chi_r_q(
     return create_inverse_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_r).invert(False)
 
 
-def create_auxiliary_chi_r_q_sum_v1(
-    gamma_r: LocalFourPoint, gchi0_q_inv: FourPoint, u_loc: LocalInteraction, v_nonloc: Interaction
-) -> FourPoint:
-    r"""
-    Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis. This variant inverts
-    and sums over the last fermionic frequency in one fused step (see
-    :meth:`FourPoint.invert_and_sum_over_last_vn`),
-
-    .. math:: \sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi^{\mathrm{q}\nu}_{0;abcd})^{-1} + (\Gamma^{\omega\nu\nu'}_{r;abcd}-U_{r;abcd}-V^{\mathbf{q}}_{r;abcd})/\beta^2)^{-1}.
-
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
-    :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` as a
-        :class:`FourPoint`.
-    """
-    u_r = v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel)
-    return create_inverse_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_r).invert_and_sum_over_last_vn(config.sys.beta)
-
-
-def create_auxiliary_chi_r_q_sum_v2(
+def create_auxiliary_chi_r_q_sum(
     gamma_r: LocalFourPoint,
     gchi0_q_inv: FourPoint,
     u_loc: LocalInteraction,
     v_nonloc: Interaction,
-    mpi_dist_irrq: MpiDistributor,
+    chunk_bytes: int | None = None,
 ) -> FourPoint:
     r"""
-    Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis. This variant loops over
-    the rank-local q-points (capping peak memory to one q at a time) and uses the standard fused invert-and-sum per
-    q (see :meth:`FourPoint.invert_and_sum_over_last_vn`),
+    Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis,
 
-    .. math:: \sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi^{\mathrm{q}\nu}_{0;abcd})^{-1} + (\Gamma^{\omega\nu\nu'}_{r;abcd}-U_{r;abcd}-V^{\mathbf{q}}_{r;abcd})/\beta^2)^{-1}.
+    .. math:: \sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi^{\mathrm{q}\nu}_{0;abcd})^{-1} + (\Gamma^{\omega\nu\nu'}_{r;abcd}-U_{r;abcd}-V^{\mathbf{q}}_{r;abcd})/\beta^2)^{-1},
 
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
+    walking the rank-local momenta and their bosonic axis in byte-bounded chunks: each chunk assembles its window of
+    the Bethe-Salpeter matrix (see :func:`create_inverse_auxiliary_chi_r_q`) and back-substitutes only the
+    :math:`\nu'`-summed columns through the per-slice LU of
+    :meth:`~dgamore.four_point.FourPoint.invert_and_sum_over_last_vn_v2`, so the transient never exceeds a few
+    chunk budgets regardless of the box size while small problems degenerate into a single batched evaluation.
+
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` (full or half bosonic range).
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :param chunk_bytes: Chunk byte budget of the build; defaults to the :data:`SLICE_CHUNK_BYTES` floor (callers pass
+        the dynamic budget of :func:`~dgamore.memory_estimator.dynamic_chunk_budget`).
     :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` as a
-        :class:`FourPoint`.
+        :class:`FourPoint` (half niw range, one fermionic dimension).
     """
-    irrk_q_list = config.lattice.k_grid.get_irrq_list()
-    my_irr_q_list = irrk_q_list[mpi_dist_irrq.my_slice]
-    chi_r_q_sum_mat = np.zeros_like(gchi0_q_inv.mat)
-
     u_r = v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel)
-    for idx in range(len(my_irr_q_list)):
-        chi_r_q_sum_mat[idx] = (
-            create_inverse_auxiliary_chi_r_q(gamma_r, gchi0_q_inv.filter_q_index(idx), u_r.filter_q_index(idx))
-            .invert_and_sum_over_last_vn(config.sys.beta)
-            .mat
-        )
-    return FourPoint(chi_r_q_sum_mat, gamma_r.channel, config.lattice.nk, 1, 1, False, has_compressed_q_dimension=True)
+    gamma_half = gamma_r.copy().to_half_niw_range() if gamma_r.full_niw_range else gamma_r
 
+    budget = SLICE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
+    n_q, n_w = gchi0_q_inv.current_shape[0], gchi0_q_inv.current_shape[-2]
+    one_wn_bytes = gamma_half.current_shape[-1] ** 2 * gamma_half.n_bands**4 * np.dtype(gamma_half.mat.dtype).itemsize
+    w_chunk = max(1, int(budget // one_wn_bytes))
+    q_group = max(1, int(budget // max(one_wn_bytes * n_w, 1)))
 
-def create_auxiliary_chi_r_q_sum_v3(
-    gamma_r: LocalFourPoint,
-    gchi0_q_inv: FourPoint,
-    u_loc: LocalInteraction,
-    v_nonloc: Interaction,
-    mpi_dist_irrq: MpiDistributor,
-) -> FourPoint:
-    r"""
-    Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis. This is the most
-    memory-lean variant: it loops over the rank-local q-points and uses the highly memory-efficient
-    linear-solver-based fused invert-and-sum per q (see :meth:`FourPoint.invert_and_sum_over_last_vn_v2`),
-
-    .. math:: \sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi^{\mathrm{q}\nu}_{0;abcd})^{-1} + (\Gamma^{\omega\nu\nu'}_{r;abcd}-U_{r;abcd}-V^{\mathbf{q}}_{r;abcd})/\beta^2)^{-1}.
-
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
-    :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` as a
-        :class:`FourPoint`.
-    """
-    irrk_q_list = config.lattice.k_grid.get_irrq_list()
-    my_irr_q_list = irrk_q_list[mpi_dist_irrq.my_slice]
-    chi_r_q_sum_mat = np.zeros_like(gchi0_q_inv.mat)
-
-    u_r = v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel)
-    for idx in range(len(my_irr_q_list)):
-        chi_r_q_sum_mat[idx] = (
-            create_inverse_auxiliary_chi_r_q(gamma_r, gchi0_q_inv.filter_q_index(idx), u_r.filter_q_index(idx))
-            .invert_and_sum_over_last_vn_v2(config.sys.beta)
-            .mat
-        )
+    chi_r_q_sum_mat = np.empty_like(gchi0_q_inv.mat)
+    for q_start in range(0, n_q, q_group):
+        q_stop = min(n_q, q_start + q_group)
+        gchi0_q = gchi0_q_inv.take_q_index_slice(q_start, q_stop)
+        u_q = u_r.take_q_index_slice(q_start, q_stop)
+        for w_start in range(0, n_w, w_chunk):
+            w_stop = min(n_w, w_start + w_chunk)
+            chunk = create_inverse_auxiliary_chi_r_q(
+                gamma_half.take_wn_slice(w_start, w_stop), gchi0_q.take_wn_slice(w_start, w_stop), u_q
+            )
+            chi_r_q_sum_mat[q_start:q_stop, ..., w_start:w_stop, :] = chunk.invert_and_sum_over_last_vn_v2(
+                config.sys.beta
+            ).mat
     return FourPoint(chi_r_q_sum_mat, gamma_r.channel, config.lattice.nk, 1, 1, False, has_compressed_q_dimension=True)
 
 
@@ -572,6 +533,7 @@ def calculate_sigma_kernel_r_q(
     v_nonloc: Interaction,
     mpi_dist_irrq: MpiDistributor,
     annealer: "LambdaAnnealer | None" = None,
+    chunk_bytes: int | None = None,
 ) -> FourPoint:
     r"""
     Returns the kernel for the self-energy calculation in a specific spin channel. Calculates the auxiliary
@@ -588,14 +550,12 @@ def calculate_sigma_kernel_r_q(
     :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param annealer: The active :class:`LambdaAnnealer` (its boson mass is applied to the physical susceptibility),
         or ``None`` when annealing is off.
+    :param chunk_bytes: Chunk byte budget of the auxiliary-susceptibility build (``None`` uses the floor).
     :return: The self-energy kernel for this channel as a :class:`FourPoint`.
     """
     logger = config.logger
 
-    if config.memory.save_memory_for_chiq_aux:
-        gchi_aux_q_r_sum = create_auxiliary_chi_r_q_sum_v3(gamma_r, gchi0_q_inv, u_loc, v_nonloc, mpi_dist_irrq)
-    else:
-        gchi_aux_q_r_sum = create_auxiliary_chi_r_q_sum_v1(gamma_r, gchi0_q_inv, u_loc, v_nonloc)
+    gchi_aux_q_r_sum = create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc, v_nonloc, chunk_bytes)
 
     mpi_dist_irrq.barrier()
 
@@ -883,7 +843,7 @@ def _build_rspace_giwk_pencil(giwk: GreensFunction, mpi_dist: MpiDistributor, no
     nk_tot = config.lattice.k_grid.nk_tot
     nb = config.sys.n_bands
 
-    if node_comm is not None and config.memory.use_shared_memory_common_obj:
+    if node_comm is not None:
         g_r_mat, g_r_win = mpi_utils.build_node_shared_array(node_comm, lambda: giwk.fft().mat)
     else:
         g_r_mat, g_r_win = giwk.fft().mat, None
@@ -909,21 +869,22 @@ def calculate_sigma_from_kernel_fft_cpu(
     positive-:math:`\nu` half only; the caller must ifft over :math:`(k_x, k_y, k_z)` and then call
     :meth:`SelfEnergy.to_full_niv_range` before use.
 
-    This contracts a **single** bosonic-frequency half (positive-w *or* negative-w) so the full-BZ kernel is never
-    materialized over the full niw range (see :meth:`LocalNPoint.to_negative_niw_range`): the kernel is consumed in
-    whatever niw orientation it is handed (no internal ``to_full_niw_range``), and ``niw_index_w_pairs`` selects which
-    kernel w-slices to contract and how to shift the Green's function.
+    This contracts a **single** bosonic-frequency window (a chunk of the positive-w half *or* of the negative-w
+    block) so the full-BZ kernel is never materialized over the full niw range (see
+    :meth:`LocalNPoint.to_negative_niw_range`): the kernel is consumed in whatever niw orientation it is handed (no
+    internal ``to_full_niw_range``), and ``niw_index_w_pairs`` selects which kernel w-slices to contract and how to
+    shift the Green's function.
 
     :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
-    :param kernel: The self-energy kernel :math:`K` for one niw half (full BZ): the positive half (``w >= 0``) or the
-        negative block from :meth:`LocalNPoint.to_negative_niw_range` (``w = 0, -1, ..., -niw``).
+    :param kernel: The self-energy kernel :math:`K` for one bosonic window (full BZ): a chunk of the positive half
+        (``w >= 0``) or of the negative block from :meth:`LocalNPoint.to_negative_niw_range`.
     :param g_r_local: This rank's real-space Green's function pencil from :func:`_build_rspace_giwk_pencil` (built
         once and shared by both niw passes).
     :param giwk_niv: The central fermionic-frequency index of ``g_r_local`` (``giwk.niv``), used to window and shift
         the Green's function per bosonic frequency.
-    :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract. The positive pass passes
-        ``[(i, i) for i in range(niw + 1)]`` (``w = 0..+niw``), the negative pass
-        ``[(i, -i) for i in range(1, niw + 1)]`` (``w = -1..-niw``, skipping the ``w = 0`` duplicate).
+    :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract; ``kernel_w_index`` is relative to the
+        handed kernel's bosonic axis. The positive pass contracts ``w = 0..+niw``, the negative pass ``w = -1..-niw``
+        (skipping the ``w = 0`` duplicate).
     :return: The rank-local R-space :class:`SelfEnergy` (compressed q, half niv range, moments not fitted).
     """
     comm = mpi_dist.comm
@@ -933,7 +894,7 @@ def calculate_sigma_from_kernel_fft_cpu(
     nk_tot = config.lattice.k_grid.nk_tot
 
     # K(q) -> F[K](R): the R-space product with F[G](R) realizes the convolution sum_q K(q) G(k-q). The kernel is
-    # already a single niw half (positive half, or the negative block), so the full-niw kernel is never built.
+    # already a single bosonic window (of the positive half or the negative block), never the full niw range.
     kernel = kernel.to_half_niv_range()
     kernel = mpi_utils.execute_distributed_fft(kernel, comm)
 
@@ -976,8 +937,8 @@ def calculate_sigma_from_kernel_fft_gpu(
     :math:`(k_x, k_y, k_z)` and then call :meth:`SelfEnergy.to_full_niv_range` before use.
 
     :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
-    :param kernel: The self-energy kernel :math:`K` for one niw half (full BZ): the positive half or the negative
-        block from :meth:`LocalNPoint.to_negative_niw_range`.
+    :param kernel: The self-energy kernel :math:`K` for one bosonic window (full BZ): a chunk of the positive half
+        or of the negative block from :meth:`LocalNPoint.to_negative_niw_range`.
     :param g_r_local: This rank's (host) real-space Green's function pencil from :func:`_build_rspace_giwk_pencil`
         (built once and shared by both niw passes); uploaded to the device here.
     :param giwk_niv: The central fermionic-frequency index of ``g_r_local`` (``giwk.niv``).
@@ -996,7 +957,7 @@ def calculate_sigma_from_kernel_fft_gpu(
     g_r_local = cp.asarray(g_r_local)
 
     # K(q) -> F[K](R): the R-space product with F[G](R) realizes the convolution sum_q K(q) G(k-q). The kernel is
-    # already a single niw half, so the full-niw kernel is never built.
+    # already a single bosonic window (of the positive half or the negative block), never the full niw range.
     kernel = kernel.to_half_niv_range()
     kernel = mpi_utils.execute_distributed_fft(kernel, comm)
     kernel.mat = cp.asarray(kernel.mat)
@@ -1062,7 +1023,7 @@ def calculate_sigma_from_kernel_fft(
     :func:`select_sigma_fft_device`, so no per-pass GPU-detection logging).
 
     :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
-    :param kernel: The self-energy kernel :math:`K` for one niw half (full BZ).
+    :param kernel: The self-energy kernel :math:`K` for one bosonic window (full BZ).
     :param g_r_local: This rank's real-space Green's function pencil from :func:`_build_rspace_giwk_pencil` (built
         once and shared by both niw passes).
     :param giwk_niv: The central fermionic-frequency index of ``g_r_local`` (``giwk.niv``).
@@ -1077,7 +1038,7 @@ def calculate_sigma_from_kernel_fft(
 
 
 def _run_fft_sde_pass(
-    kernel_src: FourPoint,
+    kernel_irr: FourPoint,
     mpi_dist_irrk: MpiDistributor,
     mpi_dist_fullbz: MpiDistributor,
     g_r_local: np.ndarray,
@@ -1085,17 +1046,18 @@ def _run_fft_sde_pass(
     niw_index_w_pairs: list[tuple[int, int]],
     use_gpu: bool,
     negative_w: bool,
+    chunk_bytes: int | None = None,
 ) -> SelfEnergy:
     r"""
-    Runs one bosonic-frequency FFT self-energy pass: maps the (small) irreducible-BZ kernel to the full BZ
-    (consuming ``kernel_src``), optionally builds its time-reversed negative-:math:`\omega` block, contracts the
-    requested ``niw_index_w_pairs`` via :func:`calculate_sigma_from_kernel_fft` against the prebuilt R-space Green's
-    function pencil, and frees the full-BZ kernel. Both passes of :func:`calculate_self_energy_q` go through this
-    helper: the caller hands the positive pass a :meth:`~dgamore.n_point_base.IHaveMat.copy` of the irreducible
-    kernel (so it survives for the negative pass) and the negative pass the original (which this consumes), so only
-    a single full-BZ niw half is ever resident.
+    Runs one bosonic-frequency FFT self-energy pass in bounded bosonic-frequency chunks: each chunk of the (small)
+    irreducible-BZ kernel is mapped to the full BZ peer-to-peer, optionally turned into its time-reversed
+    negative-:math:`\omega` block, contracted via :func:`calculate_sigma_from_kernel_fft` against the prebuilt
+    R-space Green's function pencil, and freed before the next chunk - so neither a full-BZ niw-half kernel nor the
+    exchange's send/receive staging for one is ever resident. ``kernel_irr`` is only read; the caller frees it after
+    both passes. The chunk schedule is derived from rank-independent sizes, so every rank walks the same bosonic
+    windows (the peer-to-peer exchange is collective).
 
-    :param kernel_src: The irreducible-BZ kernel for this pass; consumed by the full-BZ map (mutated or replaced).
+    :param kernel_irr: The rank-local irreducible-BZ kernel slice (half niw range); read-only, shared by both passes.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
     :param g_r_local: This rank's real-space Green's function pencil from :func:`_build_rspace_giwk_pencil`, built
@@ -1104,22 +1066,40 @@ def _run_fft_sde_pass(
     :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract (see
         :func:`calculate_sigma_from_kernel_fft_cpu`).
     :param use_gpu: Whether to run the GPU implementation (as decided by :func:`select_sigma_fft_device`).
-    :param negative_w: If True, build the negative-:math:`\omega` block via
+    :param negative_w: If True, build each chunk's negative-:math:`\omega` block via
         :meth:`LocalNPoint.to_negative_niw_range` before contracting (the negative pass) and trim the kernel peak
-        back to the OS on free; if False, contract the mapped kernel directly (the positive pass).
+        back to the OS on the last chunk's free; if False, contract the mapped chunks directly (the positive pass).
+    :param chunk_bytes: Chunk byte budget of one exchanged full-BZ bosonic window (``None`` uses the floor).
     :return: The rank-local R-space :class:`SelfEnergy` of this pass.
     """
-    # the distributed p2p exchange always returns a fresh full-BZ object, so the irreducible source is freed
-    kernel_full = mpi_utils.exchange_and_map_irrbz_fullbz(kernel_src, mpi_dist_irrk, mpi_dist_fullbz)
-    kernel_src.free()
+    budget = SLICE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
+    # The chunk step comes from the LARGEST per-rank full-BZ q-count, so it is identical on every rank.
+    n_w = kernel_irr.current_shape[-2]
+    nq_rank = -(-mpi_dist_fullbz.ntasks // mpi_dist_fullbz.mpi_size)
+    one_wn_bytes = nq_rank * (int(np.prod(kernel_irr.current_shape[1:])) // n_w) * kernel_irr.mat.itemsize
+    w_step = max(1, int(budget // max(one_wn_bytes, 1)))
 
-    if negative_w:
-        kernel_neg = kernel_full.to_negative_niw_range()
-        kernel_full.free()  # release the full-BZ positive copy as soon as the negative block is built
-        kernel_full = kernel_neg
+    w_first = niw_index_w_pairs[0][0] if niw_index_w_pairs else 0
+    sigma = None
+    for w_start in range(w_first, n_w, w_step):
+        w_stop = min(n_w, w_start + w_step)
+        chunk = mpi_utils.exchange_and_map_irrbz_fullbz(
+            kernel_irr.take_wn_slice(w_start, w_stop), mpi_dist_irrk, mpi_dist_fullbz
+        )
+        if negative_w:
+            chunk_neg = chunk.to_negative_niw_range()
+            chunk.free()  # release the full-BZ positive chunk as soon as its negative block is built
+            chunk = chunk_neg
 
-    sigma = calculate_sigma_from_kernel_fft(mpi_dist_irrk, kernel_full, g_r_local, giwk_niv, niw_index_w_pairs, use_gpu)
-    kernel_full.free(trim=negative_w)  # coarse per-iteration trim on the last (negative) pass
+        pairs = [(i - w_start, w) for i, w in niw_index_w_pairs if w_start <= i < w_stop]
+        part = calculate_sigma_from_kernel_fft(mpi_dist_irrk, chunk, g_r_local, giwk_niv, pairs, use_gpu)
+        chunk.free(trim=negative_w and w_stop == n_w)  # coarse trim once, on the last (negative) pass's last chunk
+
+        if sigma is None:
+            sigma = part
+        else:
+            sigma.mat += part.mat  # accumulate the rank-local R-space partial self-energies (in place)
+            part.free()
     return sigma
 
 
@@ -1260,7 +1240,7 @@ def _load_node_shared_local_vertex(node_comm, path: str, channel: SpinChannel, t
             obj = transform(obj)
         return obj.mat
 
-    if node_comm is None or not config.memory.use_shared_memory_common_obj:
+    if node_comm is None:
         # ascontiguousarray since a pure orbital-permute transform returns a strided view of the loaded array
         return LocalFourPoint(np.ascontiguousarray(_load()), channel, 1, 2, False, True), None
 
@@ -1271,7 +1251,7 @@ def _load_node_shared_local_vertex(node_comm, path: str, channel: SpinChannel, t
 def _build_giwk_full(comm: MPI.Comm, sigma: SelfEnergy, mu: float, ek: np.ndarray, beta: float) -> tuple:
     r"""
     Builds the full-grid Green's function :math:`G^{\mathrm{k}}_{12}`, optionally deduplicated across the MPI ranks that
-    share a physical node. With ``config.memory.use_shared_memory_common_obj`` set (the default), the Dyson inversion
+    share a physical node. The Dyson inversion
     runs only on each node's root rank and the result is placed in one MPI shared-memory window per node, so
     ``giwk_full`` occupies a single physical buffer per node instead of one private copy per rank (see
     :func:`dgamore.mpi_utils.build_node_shared_array`). Otherwise every rank builds its own copy. The node topology is
@@ -1282,13 +1262,10 @@ def _build_giwk_full(comm: MPI.Comm, sigma: SelfEnergy, mu: float, ek: np.ndarra
     :param mu: Chemical potential :math:`\mu`.
     :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
     :param beta: Inverse temperature :math:`\beta`.
-    :return: The tuple ``(giwk_full, win, node_comm)``; ``win`` and ``node_comm`` are ``None`` on the non-shared path
+    :return: The tuple ``(giwk_full, win, node_comm)``; ``win`` is ``None`` on a single-rank node
         and must otherwise be released with :func:`_release_shared_giwk` once ``giwk_full`` has been cut to its private
         core box (the shared buffer is read-only and must not be freed while any rank still reads it).
     """
-    if not config.memory.use_shared_memory_common_obj:
-        return GreensFunction.get_g_full(sigma, mu, ek, beta), None, None
-
     node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
     giwk_mat, win = mpi_utils.build_node_shared_array(
         node_comm, lambda: GreensFunction.get_g_full(sigma, mu, ek, beta).mat
@@ -1327,7 +1304,7 @@ def _cut_and_reshare_giwk(giwk_full: GreensFunction, win, node_comm, niv: int) -
 
     :param giwk_full: The full-niv Green's function (possibly backed by a shared window).
     :param win: The shared-memory window backing ``giwk_full`` (unused here; freed by the caller afterwards).
-    :param node_comm: The node-local communicator (or ``None`` on the non-shared path).
+    :param node_comm: The node-local communicator (or ``None`` when never created).
     :param niv: Half width of the target fermionic core box.
     :return: The tuple ``(giwk_cut, cut_win)``; ``cut_win`` is ``None`` on the non-shared or single-rank-node path.
     """
@@ -1420,28 +1397,16 @@ def calculate_sigma_proposal(
 
     logger.log_memory_usage("giwk", giwk_full, comm.size)
 
-    if config.memory.save_memory_for_chi0q:
-        gchi0_q = BubbleGenerator.create_generalized_chi0_q_auto(
-            mpi_dist_irrk,
-            giwk_full,
-            config.box.niw_core,
-            config.box.niv_full,
-            my_irr_q_list,
-            config.lattice.k_grid,
-            config.sys.beta,
-            config.logger,
-        )
-    else:
-        gchi0_q = BubbleGenerator.create_generalized_chi0_q_fft_auto(
-            mpi_dist_irrk,
-            giwk_full,
-            config.box.niw_core,
-            config.box.niv_full,
-            config.lattice.k_grid,
-            config.sys.beta,
-            config.logger,
-            node_comm=shared_node_comm,
-        )
+    gchi0_q = BubbleGenerator.create_generalized_chi0_q_fft_auto(
+        mpi_dist_irrk,
+        giwk_full,
+        config.box.niw_core,
+        config.box.niv_full,
+        config.lattice.k_grid,
+        config.sys.beta,
+        config.logger,
+        node_comm=shared_node_comm,
+    )
 
     logger.log_memory_usage("Gchi0_q_full", gchi0_q, comm.size)
     # Cut giwk to the core box for the self-energy step. When node-shared, the node root cuts into a new, smaller
@@ -1481,6 +1446,11 @@ def calculate_sigma_proposal(
     if config.eliashberg.perform_eliashberg:
         gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
 
+    import psutil
+
+    node_ranks = shared_node_comm.size if shared_node_comm is not None else 1
+    chunk_bytes = memory_estimator.dynamic_chunk_budget(psutil.virtual_memory().total, node_ranks)
+
     gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
         shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
     )
@@ -1494,6 +1464,7 @@ def calculate_sigma_proposal(
             v_nonloc,
             mpi_dist_irrk,
             annealer,
+            chunk_bytes,
         ),
         copy=False,
     )
@@ -1517,6 +1488,7 @@ def calculate_sigma_proposal(
             v_nonloc,
             mpi_dist_irrk,
             annealer,
+            chunk_bytes,
         ).scale(3.0),
         copy=False,
     )
@@ -1532,9 +1504,9 @@ def calculate_sigma_proposal(
     logger.info("Starting calculation of DGA self-energy.")
 
     # FFT contraction (the only production path - the q-loop variant peaks HIGHER, see calculate_sigma_from_kernel):
-    # split the bosonic sum into positive- and negative-w passes, so only one half-niw full-BZ kernel exists at a time.
+    # both bosonic half-sums are walked in budget-bounded w-chunks, so no full-BZ niw-half kernel is ever resident.
     niw = config.box.niw_core
-    kernel_irr = kernel  # the (small) irreducible-BZ positive-w kernel, mapped to the full BZ once per pass
+    kernel_irr = kernel  # the (small) irreducible-BZ positive-w kernel, mapped to the full BZ chunk by chunk
     # Decide CPU/GPU (and select the GPU) once
     use_gpu = select_sigma_fft_device(mpi_dist_fullbz)
 
@@ -1544,7 +1516,7 @@ def calculate_sigma_proposal(
     giwk_niv = giwk_full.niv
 
     sigma_prop = _run_fft_sde_pass(
-        kernel_irr.copy(),
+        kernel_irr,
         mpi_dist_irrk,
         mpi_dist_fullbz,
         g_r_local,
@@ -1552,6 +1524,7 @@ def calculate_sigma_proposal(
         [(i, i) for i in range(niw + 1)],
         use_gpu,
         negative_w=False,
+        chunk_bytes=chunk_bytes,
     )
     sigma_neg = _run_fft_sde_pass(
         kernel_irr,
@@ -1562,7 +1535,9 @@ def calculate_sigma_proposal(
         [(i, -i) for i in range(1, niw + 1)],
         use_gpu,
         negative_w=True,
+        chunk_bytes=chunk_bytes,
     )
+    kernel_irr.free()
     del g_r_local  # both passes done; release the rank-local R-space Green's function pencil
 
     sigma_prop.mat += sigma_neg.mat  # accumulate the rank-local R-space partial self-energies (in place)

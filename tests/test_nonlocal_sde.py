@@ -24,6 +24,7 @@ from dgamore.interaction import Interaction, LocalInteraction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.local_sde import get_local_hartree_fock
 from dgamore.n_point_base import SpinChannel
+from tests.conftest import FAKE_MPI, run_parallel
 from dgamore.nonlocal_sde import (
     _build_giwk_full,
     _cut_and_reshare_giwk,
@@ -167,22 +168,8 @@ def _tiny_sigma_and_ek(nb=1, niv=4):
     return sigma, ek
 
 
-def test_build_giwk_full_disabled_matches_direct_dyson_and_skips_split():
-    """With node-sharing off, _build_giwk_full is the plain Dyson build and never touches the communicator."""
-    config.memory.use_shared_memory_common_obj = False
-    sigma, ek = _tiny_sigma_and_ek()
-    comm = create_comm_mock()
-
-    giwk, win, node_comm = _build_giwk_full(comm, sigma, 0.3, ek, 10.0)
-
-    assert win is None and node_comm is None
-    assert comm.Split_type.called is False
-    assert np.allclose(giwk.mat, GreensFunction.get_g_full(sigma, 0.3, ek, 10.0).mat, atol=1e-6)
-
-
 def test_build_giwk_full_shared_single_rank_matches_direct_dyson():
     """With node-sharing on but a single-rank node, the giwk is bit-parity with the direct Dyson build (no window)."""
-    config.memory.use_shared_memory_common_obj = True
     sigma, ek = _tiny_sigma_and_ek()
     comm = create_comm_mock()
 
@@ -281,16 +268,6 @@ def test_create_inverse_auxiliary_chi_r_q_accepts_half_niw_gamma():
     full = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
     half = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma.copy().to_half_niw_range(), gchi0_q_inv, u_r)
     assert np.array_equal(full.mat, half.mat)
-
-
-def test_create_auxiliary_chi_r_q_sum_v1_matches_explicit_reference():
-    """The v1 auxiliary susceptibility reproduces the explicit two-block expression then the fused invert-and-sum."""
-    rng = np.random.default_rng(23)
-    gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
-    ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc).invert_and_sum_over_last_vn(config.sys.beta)
-    out = nonlocal_sde.create_auxiliary_chi_r_q_sum_v1(gamma, gchi0_q_inv, u_loc, v_nonloc)
-    assert np.allclose(out.mat, ref.mat, atol=1e-10)
-    assert out.channel == SpinChannel.DENS
 
 
 def test_create_auxiliary_chi_r_q_matches_explicit_reference():
@@ -507,7 +484,6 @@ def test_build_rspace_giwk_pencil_node_sharing_matches_private_build():
     config.box.niv_core = niv
     config.sys.n_bands = o
     config.sys.beta = 12.5
-    config.memory.use_shared_memory_common_obj = True
     config.logger = MagicMock()
 
     rng = np.random.default_rng(9)
@@ -545,7 +521,6 @@ def test_load_node_shared_local_vertex_private_path_applies_transform(monkeypatc
 def test_load_node_shared_local_vertex_loads_once_per_node(monkeypatch):
     """With a node communicator the file is read once per node (the root) and every rank maps the same values."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
-    config.memory.use_shared_memory_common_obj = True
     rng = np.random.default_rng(82)
     mat = (rng.standard_normal((2, 2, 2, 2, 3, 4, 4)) + 1j * rng.standard_normal((2, 2, 2, 2, 3, 4, 4))).astype(
         np.complex64
@@ -1029,3 +1004,69 @@ def test_sigma_dc_kernel_sums_the_stored_first_fermionic_index_over_the_full_box
     zeroed = nonlocal_sde.calculate_sigma_dc_kernel(f_shell_zeroed, gchi0_q.copy(), u_loc)
 
     assert not np.allclose(zeroed.mat, full.mat, atol=1e-6)
+
+
+def test_create_auxiliary_chi_r_q_sum_matches_full_inversion_reference():
+    """The chunked auxiliary-susceptibility sum equals the full compound inversion summed over the last frequency."""
+    rng = np.random.default_rng(31)
+    gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
+    ref = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc, v_nonloc).sum_over_vn(config.sys.beta)
+    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, v_nonloc)
+    assert np.allclose(out.mat, ref.mat, atol=1e-5)
+    assert out.channel == gamma.channel and not out.full_niw_range and out.num_vn_dimensions == 1
+
+
+def test_create_auxiliary_chi_r_q_sum_is_chunk_size_invariant(monkeypatch):
+    """A one-element chunk budget reproduces the whole-box result of the chunked auxiliary-susceptibility sum."""
+    rng = np.random.default_rng(32)
+    gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
+    whole = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, v_nonloc)
+    monkeypatch.setattr(nonlocal_sde, "SLICE_CHUNK_BYTES", 1)
+    chunked = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, v_nonloc)
+    assert np.allclose(chunked.mat, whole.mat, atol=1e-6)
+
+
+@pytest.mark.parametrize("negative_w", [False, True])
+def test_fft_sde_pass_is_invariant_under_the_w_chunk_size(negative_w, monkeypatch):
+    """A one-byte chunk budget reproduces the all-w-at-once result of the chunked FFT self-energy pass."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, o, niw, niv, beta = (4, 4, 1), 2, 3, 4, 12.5
+    rng = np.random.default_rng(21)
+    niv_g = niv + niw
+    g_shape = (*nk, o, o, 2 * niv_g)
+    g_mat = (rng.standard_normal(g_shape) + 1j * rng.standard_normal(g_shape)).astype(np.complex64)
+    n_irr = bz.KGrid(nk, bz.two_dimensional_square_symmetries()).nk_irr
+    k_shape = (n_irr, o, o, o, o, niw + 1, 2 * niv)
+    kernel_mat = (rng.standard_normal(k_shape) + 1j * rng.standard_normal(k_shape)).astype(np.complex64)
+
+    def fn(comm, rank):
+        config.lattice.nk = nk
+        config.lattice.k_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+        config.box.niw_core, config.box.niv_core = niw, niv
+        config.sys.n_bands, config.sys.beta = o, beta
+        config.logger = MagicMock()
+        d_irr = mpi_utils.MpiDistributor(ntasks=n_irr, comm=comm)
+        d_full = mpi_utils.MpiDistributor(ntasks=int(np.prod(nk)), comm=comm)
+        giwk = GreensFunction(g_mat.copy(), calc_filling=False, nk=nk, beta=beta)
+        g_r_local = nonlocal_sde._build_rspace_giwk_pencil(giwk, d_irr)
+        pairs = [(i, -i) for i in range(1, niw + 1)] if negative_w else [(i, i) for i in range(niw + 1)]
+        results = []
+        for chunk_bytes in (2**62, 1):
+            kernel = FourPoint(
+                kernel_mat[d_irr.my_slice].copy(),
+                SpinChannel.NONE,
+                nk,
+                1,
+                1,
+                full_niw_range=False,
+                has_compressed_q_dimension=True,
+            )
+            sigma = nonlocal_sde._run_fft_sde_pass(
+                kernel, d_irr, d_full, g_r_local, niv_g, pairs, False, negative_w, chunk_bytes
+            )
+            results.append(sigma.mat.copy())
+        return results
+
+    _, res = run_parallel(3, fn)
+    for whole, chunked in res:
+        assert np.allclose(chunked, whole, atol=1e-5)

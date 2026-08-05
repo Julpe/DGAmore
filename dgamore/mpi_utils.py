@@ -757,24 +757,6 @@ class MpiDistributor:
             comm = MPI.COMM_WORLD
         return MpiDistributor(ntasks=ntasks, comm=comm, name=name, output_path=output_path)
 
-    def restricted_to(self, sub_comm, member_ranks: list) -> "MpiDistributor":
-        """
-        Returns a new distributor over ``sub_comm`` carrying only ``member_ranks``' task slices of this
-        distributor, in the given order, which must match the sub-communicator's rank order (e.g. from a
-        ``comm.Split`` keyed on the original rank). Collectives of the returned distributor then span exactly the
-        member ranks, so ranks with an empty task slice need not enter them. No per-rank spill file is opened.
-
-        :param sub_comm: The sub-communicator containing exactly the ``member_ranks``.
-        :param member_ranks: The original-communicator ranks to keep, ordered like the sub-communicator's ranks.
-        :return: The restricted :class:`MpiDistributor`.
-        """
-        restricted = MpiDistributor(ntasks=self.ntasks, comm=sub_comm)
-        restricted._sizes = np.array([self._sizes[r] for r in member_ranks], dtype=int)
-        restricted._slices = [self._slices[r] for r in member_ranks]
-        restricted._my_size = restricted._sizes[restricted.my_rank]
-        restricted._my_slice = restricted._slices[restricted.my_rank]
-        return restricted
-
     def _distribute_tasks(self):
         """
         Computes the per-rank chunk sizes and slices, distributing the tasks as evenly as possible (excess tasks go to
@@ -796,79 +778,7 @@ class MpiDistributor:
 
 
 # ====================================================================================================================
-# Higher-level data-movement routines (irreducible-BZ <-> full-BZ remap, node-aware frequency split, distributed FFT).
-def _get_node_aware_v_dist(n_nu, comm):
-    """
-    Calculates frequency distribution based on physical node topology.
-    Frequencies are split equally among nodes, then assigned to ranks within those nodes.
-
-    Uses inverse rank-lookup to be robust against inconsistent hostname strings
-    returned by the OS in local or cluster environments.
-
-    :param n_nu: Total number of fermionic frequencies to distribute.
-    :param comm: The MPI communicator.
-    :return: The tuple ``(all_sizes, all_slices)`` of per-rank frequency counts and ``slice`` objects.
-    :raises RuntimeError: If a rank cannot locate itself in the host map.
-    """
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-
-    # 1. Group ranks by physical hostname
-    local_hostname = socket.gethostname()
-    all_hostnames = comm.allgather(local_hostname)
-
-    # Map hostnames to the list of ranks living on them
-    nodes_map = {}
-    for r, h in enumerate(all_hostnames):
-        h_clean = str(h).strip()
-        if h_clean not in nodes_map:
-            nodes_map[h_clean] = []
-        nodes_map[h_clean].append(r)
-
-    # Sorted list of unique nodes ensures every rank sees the same order
-    sorted_node_names = sorted(nodes_map.keys())
-    n_nodes = len(sorted_node_names)
-
-    # 2. CANONICAL HOSTNAME RESOLUTION: instead of string matching, find which node list contains THIS rank.
-    # This guarantees we find the correct key in nodes_map.
-    canonical_hostname = None
-    for name, ranks in nodes_map.items():
-        if rank in ranks:
-            canonical_hostname = name
-            break
-
-    if canonical_hostname is None:
-        raise RuntimeError(f"Rank {rank} could not find itself in the host map.")
-
-    # 3. Distribute frequencies to nodes
-    v_per_node = n_nu // n_nodes
-    extra_v_nodes = n_nu % n_nodes
-
-    my_node_idx = sorted_node_names.index(canonical_hostname)
-    v_on_this_node = v_per_node + (1 if my_node_idx < extra_v_nodes else 0)
-
-    # 4. Split this node's frequencies among its local ranks
-    ranks_on_my_node = nodes_map[canonical_hostname]
-    rank_in_node = ranks_on_my_node.index(rank)
-
-    v_per_rank = v_on_this_node // len(ranks_on_my_node)
-    extra_v_ranks = v_on_this_node % len(ranks_on_my_node)
-
-    my_size = v_per_rank + (1 if rank_in_node < extra_v_ranks else 0)
-
-    # 5. Globalize the distribution for the Distributor
-    # Allgather ensures every rank knows the frequency slices of every other rank.
-    all_sizes = np.zeros(size, dtype=int)
-    all_sizes[rank] = my_size
-    comm.Allgather(MPI.IN_PLACE, all_sizes)
-
-    # Calculate slices based on the gathered sizes
-    all_offsets = np.insert(np.cumsum(all_sizes), 0, 0)
-    all_slices = [slice(all_offsets[i], all_offsets[i + 1]) for i in range(size)]
-
-    return all_sizes, all_slices
-
-
+# Higher-level data-movement routines (irreducible-BZ <-> full-BZ remap, distributed FFT).
 def _send_in_chunks(comm, arr, dest, base_tag=0):
     """
     Sends a numpy array to a destination rank in below-2 GB chunks along axis 0 (no handshake). Thin wrapper around
@@ -1088,91 +998,6 @@ def exchange_and_map_irrbz_fullbz(
         True,
         obj.frequency_notation,
     )
-
-
-def gather_full_ibz_for_vslice(
-    gamma_r: FourPoint, mpi_dist_irrq: MpiDistributor, mpi_dist_v: MpiDistributor, q_grid: KGrid
-) -> FourPoint:
-    """
-    Re-lays out a q-distributed pairing vertex into a fermionic-frequency-distributed one for the Eliashberg solver:
-    each rank ends up with the full BZ but only its node-aware slice of the (second) fermionic frequency. The
-    momentum is unfolded to the full BZ locally. Ranks with an empty frequency slice receive ``None``.
-
-    :param gamma_r: The :class:`FourPoint` pairing vertex distributed over the irreducible BZ.
-    :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (source layout).
-    :param mpi_dist_v: MPI distributor over the fermionic frequency axis (updated in place to the node-aware split).
-    :param q_grid: The :class:`KGrid` used to unfold to the full BZ.
-    :return: The full-BZ :class:`FourPoint` for this rank's frequency slice, or ``None`` if the slice is empty.
-    """
-    # 1. Distribution Update (Node-Aware)
-    sizes, slices = _get_node_aware_v_dist(mpi_dist_v.ntasks, mpi_dist_v.comm)
-    mpi_dist_v._sizes, mpi_dist_v._slices = sizes, slices
-    mpi_dist_v._my_size = sizes[mpi_dist_v.my_rank]
-
-    comm = mpi_dist_irrq.comm
-    size = mpi_dist_irrq.mpi_size
-    dtype = gamma_r.mat.dtype
-
-    orb_dims = gamma_r.mat.shape[1:-2]
-    n_vp = gamma_r.mat.shape[-1]
-    items_per_q_v = int(np.prod(orb_dims)) * mpi_dist_v.my_size * n_vp
-
-    # 2. Pre-allocate Buffer
-    if mpi_dist_v.my_size > 0:
-        full_ibz_mat = np.zeros((mpi_dist_irrq.ntasks,) + orb_dims + (mpi_dist_v.my_size, n_vp), dtype=dtype)
-    else:
-        full_ibz_mat = None
-
-    # 3. Non-Blocking Exchange (The "Fast" Way)
-    reqs = []
-    send_buffers = []  # Protect from Garbage Collection
-
-    # A. Pre-post Receives (Matches the exchange_and_map logic)
-    if mpi_dist_v.my_size > 0:
-        for r_src in range(size):
-            q_src_count = mpi_dist_irrq.sizes[r_src]
-            if q_src_count == 0:
-                continue
-
-            # Same per-chunk row count as the shared chunking helpers (drives the manual non-blocking loop below).
-            max_q_recv = chunk_step(dtype.itemsize, items_per_q_v, limit=MAX_MPI_BYTES)
-            q_offset = mpi_dist_irrq.slices[r_src].start
-
-            for chunk_idx, i in enumerate(range(0, q_src_count, max_q_recv)):
-                j = min(q_src_count, i + max_q_recv)
-                # MPI matching is (source, tag)-scoped, so the tag only needs to distinguish the chunks of ONE pair
-                # transfer; a rank-dependent base (former r_src*size+rank) overflows MPI_TAG_UB above ~180 ranks.
-                tag = 700 + chunk_idx
-                reqs.append(comm.Irecv(full_ibz_mat[q_offset + i : q_offset + j], source=r_src, tag=tag))
-
-    # B. Post Sends
-    for r_dst in range(size):
-        v_dst_size = mpi_dist_v.sizes[r_dst]
-        if v_dst_size == 0 or mpi_dist_irrq.my_size == 0:
-            continue
-
-        v_dst_slice = mpi_dist_v.slices[r_dst]
-        items_per_q_send = int(np.prod(orb_dims)) * v_dst_size * n_vp
-        max_q_send = chunk_step(dtype.itemsize, items_per_q_send, limit=MAX_MPI_BYTES)
-
-        for chunk_idx, i in enumerate(range(0, mpi_dist_irrq.my_size, max_q_send)):
-            j = min(mpi_dist_irrq.my_size, i + max_q_send)
-            tag = 700 + chunk_idx  # rank-independent, see the matching receive above
-
-            # Payload must be contiguous for Send
-            payload = np.ascontiguousarray(gamma_r.mat[i:j, ..., v_dst_slice, :])
-            send_buffers.append(payload)
-            reqs.append(comm.Isend(payload, dest=r_dst, tag=tag))
-
-    # 4. Wait for All to complete
-    MPI.Request.Waitall(reqs)
-
-    # 5. Local Expansion
-    if mpi_dist_v.my_size > 0:
-        gamma_r.mat = full_ibz_mat
-        return gamma_r.map_to_full_bz(q_grid)
-    else:
-        return None
 
 
 def get_pencil_indices(rank: int, size: int, nq: tuple[int, int, int], layout: str) -> np.ndarray:

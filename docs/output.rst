@@ -334,7 +334,7 @@ at :math:`\omega = 0`, which is why they have no bosonic axis (or a single-entry
        :math:`\omega = 0`
      - ``[no, no, no, no, 1, 2 niv_pp, 2 niv_pp]``
    * - ``f_ud_loc_pp_w0.npy``, ``phi_ud_loc_pp_w0.npy``
-     - Local up-down full vertex and pp-reducible diagrams, written with ``include_local_part``
+     - Local up-down full vertex and pp-reducible diagrams, always written by the Eliashberg step
      - ``[no, no, no, no, 2 niv_pp, 2 niv_pp]``
 
 Per-rank intermediates

@@ -62,9 +62,9 @@ def _assert_gap_sector_parity(results: dict) -> None:
             assert np.isclose(diagnostics["PO"].real, channel_sign[channel] * parity_sign[parity], atol=1e-3)
 
 
-@pytest.mark.parametrize("save_fq, save_memory", [(True, True), (False, True), (True, False), (False, False)])
-def test_eliashberg_equation_without_local_part(setup, save_fq, save_memory):
-    """The Eliashberg solve without the local part matches reference eigenvalues and gap parity in all flag combos."""
+@pytest.mark.parametrize("save_fq", [True, False])
+def test_eliashberg_equation_with_local_part(setup, save_fq):
+    """The Eliashberg solve matches reference eigenvalues and gap parity with and without save_fq."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20
@@ -76,54 +76,8 @@ def test_eliashberg_equation_without_local_part(setup, save_fq, save_memory):
     config.eliashberg.perform_eliashberg = True
     config.output.output_path = folder
     config.output.eliashberg_path = config.output.output_path
-    config.eliashberg.include_local_part = False
     config.eliashberg.resolve_frequency_parity = True
     config.eliashberg.save_fq = save_fq
-    config.memory.save_memory_for_fq = save_memory
-    config.memory.save_memory_for_lanczos = save_memory
-
-    u_loc = config.lattice.hamiltonian.get_local_u()
-    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
-
-    g_dga = GreensFunction(np.load(f"{folder}/giwk_dga.npy"), nk=config.lattice.nk)
-
-    results = eliashberg_solver.solve(g_dga, g_dmft, u_loc, v_nonloc, comm_mock)
-    assert set(results) == {
-        (SpinChannel.SING, "even"),
-        (SpinChannel.SING, "odd"),
-        (SpinChannel.TRIP, "even"),
-        (SpinChannel.TRIP, "odd"),
-    }
-    for (_channel, _parity), (lambdas, gaps) in results.items():
-        assert len(gaps) == config.eliashberg.n_eig and len(lambdas) == config.eliashberg.n_eig
-    # the dominant singlet modes are frequency-even (d-wave family), so sing/even reproduces the unprojected top
-    assert np.allclose(results[(SpinChannel.SING, "even")][0], [16.00752, 15.80254, 14.98193, 14.68490], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.SING, "odd")][0], [4.37008, 4.37007, 3.33718, 3.33718], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.TRIP, "even")][0], [2.84907, 2.84906, 2.40087, 2.40087], atol=1e-2)
-    # the dominant triplet modes are frequency-odd (p-wave family), so trip/odd reproduces the unprojected top
-    assert np.allclose(results[(SpinChannel.TRIP, "odd")][0], [8.06568, 7.79828, 7.33032, 7.26272], atol=1e-2)
-    _assert_gap_sector_parity(results)
-
-
-@pytest.mark.parametrize("save_fq, save_memory", [(True, True), (False, True), (True, False), (False, False)])
-def test_eliashberg_equation_with_local_part(setup, save_fq, save_memory):
-    """The Eliashberg solve with the local part matches reference eigenvalues and gap parity in all flag combos."""
-    folder, comm_mock = setup
-
-    config.box.niw_core = 20
-    config.box.niv_core = 20
-    config.box.niv_shell = 10
-
-    g_dmft, s_dmft, g2_dens, g2_magn = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
-
-    config.eliashberg.perform_eliashberg = True
-    config.output.output_path = folder
-    config.output.eliashberg_path = config.output.output_path
-    config.eliashberg.include_local_part = True
-    config.eliashberg.resolve_frequency_parity = True
-    config.eliashberg.save_fq = save_fq
-    config.memory.save_memory_for_fq = save_memory
-    config.memory.save_memory_for_lanczos = save_memory
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
@@ -171,11 +125,8 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeyp
     config.eliashberg.perform_eliashberg = True
     config.output.output_path = folder
     config.output.eliashberg_path = folder
-    config.eliashberg.include_local_part = True
     config.eliashberg.save_fq = False
     config.eliashberg.resolve_frequency_parity = False
-    config.memory.save_memory_for_fq = False
-    config.memory.save_memory_for_lanczos = False
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
@@ -260,11 +211,8 @@ def test_eliashberg_gap_functions_carry_sector_parity_and_match_reference(setup)
     config.eliashberg.perform_eliashberg = True
     config.output.output_path = folder
     config.output.eliashberg_path = folder
-    config.eliashberg.include_local_part = True
     config.eliashberg.n_eig = 4
     config.eliashberg.resolve_frequency_parity = True
-    config.memory.save_memory_for_fq = False
-    config.memory.save_memory_for_lanczos = False
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
@@ -282,3 +230,31 @@ def test_eliashberg_gap_functions_carry_sector_parity_and_match_reference(setup)
             assert np.isclose(diagnostics["PO"].real, channel_sign[channel] * parity_sign[parity], atol=1e-3)
             reference = np.load(f"{folder}/gap_{channel.value}_{parity}_{i + 1}.npy")
             assert np.allclose(_phase_align(gap.mat, reference), reference, atol=1e-4)
+
+
+def test_eliashberg_grid_solver_matches_reference(setup, monkeypatch):
+    """The forced block-distributed solver reproduces the reference eigenvalues of the in-memory solve."""
+    folder, comm_mock = setup
+
+    config.box.niw_core = 20
+    config.box.niv_core = 20
+    config.box.niv_shell = 10
+
+    g_dmft, _, _, _ = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
+
+    config.eliashberg.perform_eliashberg = True
+    config.output.output_path = folder
+    config.output.eliashberg_path = config.output.output_path
+    config.eliashberg.resolve_frequency_parity = True
+    monkeypatch.setattr(eliashberg_solver, "FORCE_GRID_SOLVER", True)
+
+    u_loc = config.lattice.hamiltonian.get_local_u()
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
+    g_dga = GreensFunction(np.load(f"{folder}/giwk_dga.npy"), nk=config.lattice.nk)
+
+    results = eliashberg_solver.solve(g_dga, g_dmft, u_loc, v_nonloc, comm_mock)
+
+    assert np.allclose(results[(SpinChannel.SING, "even")][0], [15.80255, 15.55585, 14.68491, 14.28071], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.SING, "odd")][0], [4.37008, 4.37007, 3.33718, 3.33718], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.TRIP, "even")][0], [2.84907, 2.84906, 2.40087, 2.40087], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.TRIP, "odd")][0], [7.33033, 7.26272, 6.64910, 6.20756], atol=1e-2)
