@@ -45,9 +45,44 @@ from dgamore.self_energy import SelfEnergy
 
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
-# Fraction of a node's ``psutil.virtual_memory().available`` a run may occupy at any branch's peak. The remainder is the
-# sole overhead margin (OS/allocator/transients); the estimator's OVERHEAD_FACTOR is 1.0, so the two do not compound.
+# Fraction of a node's memory budget a run may occupy at any branch's peak. The remainder is the sole overhead
+# margin (OS/allocator/transients); the estimator's OVERHEAD_FACTOR is 1.0, so the two do not compound.
 NODE_MEMORY_FRACTION: float = 0.97
+
+
+def _cgroup_memory_limit() -> int | None:
+    """
+    Returns this process's effective cgroup memory limit in bytes, or ``None`` when no limit is set (or none is
+    readable). Batch schedulers such as slurm enforce a job's memory request through a cgroup, which can be far
+    below the node's physical memory, so the node budget must honor it. The cgroup path is taken from
+    ``/proc/self/cgroup``; on cgroup v2 every ancestor's ``memory.max`` is read up to the root (the limit may sit on
+    the job level rather than the process's own leaf) and the smallest set value wins, on v1 the controller's
+    ``memory.limit_in_bytes`` is read directly. Values at or above ``2**62`` mean "unlimited" and are ignored.
+
+    :return: The smallest configured limit in bytes, or ``None`` if unlimited or undeterminable.
+    """
+    limits = []
+    try:
+        entries = dict(
+            (line.split(":", 2)[1], line.split(":", 2)[2].strip()) for line in open("/proc/self/cgroup", "r")
+        )
+        if "" in entries:  # cgroup v2: one unified hierarchy, limits possibly on an ancestor
+            path = os.path.normpath("/sys/fs/cgroup" + entries[""])
+            while path.startswith("/sys/fs/cgroup"):
+                try:
+                    value = open(os.path.join(path, "memory.max"), "r").read().strip()
+                    if value != "max":
+                        limits.append(int(value))
+                except OSError:
+                    pass
+                path = os.path.dirname(path)
+        elif "memory" in entries:  # cgroup v1: the memory controller's own hierarchy
+            value = open("/sys/fs/cgroup/memory" + entries["memory"] + "/memory.limit_in_bytes", "r").read()
+            limits.append(int(value))
+    except (OSError, ValueError, IndexError):
+        return None
+    limits = [limit for limit in limits if limit < 2**62]
+    return min(limits) if limits else None
 
 
 def main():
@@ -84,7 +119,6 @@ def main():
         config.eliashberg,
         config.lambda_correction,
         config.self_energy_interpolation,
-        config.memory,
         config.ana_cont,
     ) = comm.bcast(
         (
@@ -98,7 +132,6 @@ def main():
             config.eliashberg,
             config.lambda_correction,
             config.self_energy_interpolation,
-            config.memory,
             config.ana_cont,
         ),
         root=0,
@@ -546,24 +579,24 @@ def main():
 
 def autodetect_memory_settings(comm: MPI.Comm) -> None:
     """
-    Sets the four ``config.memory.save_memory_*`` switches automatically from the host memory available on every node
-    the job runs on and an analytic estimate of the peak memory each affected operation consumes; the flag-less
-    Schwinger-Dyson contraction (always the two-pass FFT path) is verified to fit as well. Must be called only after
-    the irreducible BZ is known (i.e. after auto-symmetry discovery), as the estimate depends on ``k_grid.nk_irr``.
+    Verifies from the host memory available on every node the job runs on, together with an analytic estimate of
+    each heavy step's peak, that the run fits: the FFT bubble, the chunked auxiliary-susceptibility sum, the
+    Schwinger-Dyson contraction, the local Schwinger-Dyson pass, the pairing-vertex construction and the Eliashberg
+    solver (which alone has two variants, in-memory versus its block-distributed grid fallback).
+    Must be called only after the irreducible BZ is known (i.e. after auto-symmetry discovery), as the estimate depends on ``k_grid.nk_irr``.
 
     The budget is a **node total**: on a node with ``r`` ranks the memory held by all of them at a branch's peak is
     ``r * (baseline + distributed) + single`` (every rank holds the branch's persistent baseline; a *distributed*
     transient is held by every rank at once, a *single-rank* transient by one rank while the others idle), minus
-    ``(r - 1) * giwk_shareable`` when ``config.memory.use_shared_memory_common_obj`` deduplicates the branch's ``giwk_full``
-    to one copy per node, and this must not exceed ``psutil.virtual_memory().available * NODE_MEMORY_FRACTION`` for that node. Each
+    ``(r - 1) * giwk_shareable`` for the branch's node-shared ``giwk_full`` window, and this must not exceed
+    ``NODE_MEMORY_FRACTION`` times the node budget - ``psutil.virtual_memory().available``, capped by the cgroup
+    memory limit when the scheduler sets one (see :func:`_cgroup_memory_limit`). Each
     node's rank count and available memory are collected with a single ``allgather`` of
     ``(hostname, available_bytes)``; a branch's path is judged to "fit" only if it fits on **every** node (the flags
     are process-wide, so the tightest node governs, and a single-rank transient may land on any node). The
-    ``lanczos`` fast-path single-rank peak is doubled on a single-node multi-rank job because the singlet and triplet
-    solves then run concurrently on the same node. For each branch the fast path is checked and the flag is switched
-    on if it would not fit -- but an explicit ``True`` from the config is always kept (floor semantics:
-    ``final = user_flag or autodetect_on``). A :class:`MemoryError` is raised only if the path that would actually
-    run does not fit.
+    Eliashberg solver's single-rank peak is doubled on a single-node multi-rank job because the singlet and triplet
+    solves then run concurrently on the same node. A :class:`MemoryError` is raised only if the
+    path that would actually run does not fit.
 
     :param comm: The MPI communicator (used to group ranks by node).
     :return: None.
@@ -574,6 +607,9 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
     # Gather (hostname, available bytes) from every rank in a single collective and reduce to one entry per node:
     # the rank count and the (minimum, conservative) available memory on that node.
     node_available = psutil.virtual_memory().available
+    cgroup_limit = _cgroup_memory_limit()
+    if cgroup_limit is not None:
+        node_available = min(node_available, cgroup_limit)
     hostname = socket.gethostname()
     nodes: dict[str, list] = {}
     for host, avail in comm.allgather((hostname, node_available)):
@@ -596,7 +632,6 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
         niv_pp=niv_pp,
         n_ranks=comm.size,
         with_eliashberg=config.eliashberg.perform_eliashberg,
-        save_fq=config.eliashberg.save_fq,
         save_pairing_vertex=config.eliashberg.save_pairing_vertex,
         n_eig=config.eliashberg.n_eig,
     )
@@ -607,11 +642,9 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
 
     def node_total(bp: memory_estimator.BranchPeak, distributed: float, single: float, n_ranks: int) -> float:
         """Memory held on a node with ``n_ranks`` ranks at a branch's peak (see :func:`autodetect_memory_settings`).
-        When ``config.memory.use_shared_memory_common_obj`` is on, the branch's shareable ``giwk_full`` is counted once per
-        node instead of once per rank."""
+        The branch's shareable ``giwk_full`` is counted once per node instead of once per rank."""
         total = n_ranks * (bp.baseline + distributed) + single
-        if config.memory.use_shared_memory_common_obj:
-            total -= (n_ranks - 1) * bp.giwk_shareable
+        total -= (n_ranks - 1) * bp.giwk_shareable
         return total
 
     def fits_everywhere(bp: memory_estimator.BranchPeak, distributed: float, single: float) -> bool:
@@ -620,23 +653,10 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
             node_total(bp, distributed, single, r) <= avail * NODE_MEMORY_FRACTION for r, avail in nodes.values()
         )
 
-    flag_to_key = {
-        "save_memory_for_chi0q": "chi0q",
-        "save_memory_for_chiq_aux": "chiq_aux",
-        "save_memory_for_fq": "fq",
-        "save_memory_for_lanczos": "lanczos",
-    }
-    key_to_label = {
-        "chi0q": "Bare bubble",
-        "chiq_aux": "Auxiliary susceptibility",
-        "fq": "Full vertex",
-        "lanczos": "Eliashberg solver",
-    }
-
     logger.info(f"Auto memory detection (node-total budget): {len(nodes)} node(s).")
 
-    # The Schwinger-Dyson contraction has no save_memory switch (the q-loop variant is unused - it peaked HIGHER
-    # than the two-pass FFT path); its single path is still checked so an oversized box fails fast, not mid-run.
+    # The Schwinger-Dyson contraction always runs the two-pass FFT path (the q-loop variant is unused - it peaked
+    # HIGHER); its single path is still checked so an oversized box fails fast, not mid-run.
     if "sde" in peaks:
         bp_sde = peaks["sde"]
         if not fits_everywhere(bp_sde, bp_sde.off_distributed, bp_sde.off_single):
@@ -646,11 +666,6 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
                 f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory. Use more nodes, fewer ranks per node, a "
                 f"smaller frequency box or k-grid."
             )
-        worst_sde = max(node_total(bp_sde, bp_sde.off_distributed, bp_sde.off_single, r) for r, _ in nodes.values())
-        logger.info(
-            f"Schwinger-Dyson equation: per-rank baseline {bp_sde.baseline / 1024**3:.3f} GB, "
-            f"node total {worst_sde / 1024**3:.3f} GB (single FFT path, no memory-saving switch)."
-        )
     # The local Schwinger-Dyson step runs serially on rank 0 before the loop and has no memory switch either;
     # its single-rank peak is checked so an oversized multi-band box fails fast, not minutes into the run.
     if "local" in peaks:
@@ -663,38 +678,28 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
                 f"The local Schwinger-Dyson step needs {worst / 1024**3:.3f} GB on rank 0's node, which exceeds "
                 f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory. Use a smaller frequency box or fewer bands."
             )
-        logger.info(
-            f"Local Schwinger-Dyson step: rank-0 single peak {bp_local.off_single / 1024**3:.3f} GB "
-            f"(serial, no memory-saving switch)."
-        )
-    for attr, key in flag_to_key.items():
+    # Single-path branches: the bubble always runs the FFT evaluation, the pairing vertex the chunked slice build,
+    # and the solver falls back from in-memory (single-rank peak doubled when sectors run concurrently) to the grid.
+    verify_only = (
+        ("chi0q", "Bare bubble"),
+        ("chiq_aux", "Auxiliary susceptibility"),
+        ("fq", "Pairing-vertex construction"),
+        ("lanczos", "Eliashberg solver"),
+    )
+    for key, label in verify_only:
         if key not in peaks:
             continue
         bp = peaks[key]
-        label = key_to_label[key]
-        off_single = bp.off_single * (2 if key == "lanczos" and single_node_multi_rank else 1)
-        fits_off = fits_everywhere(bp, bp.off_distributed, off_single)
-        fits_on = fits_everywhere(bp, bp.on_distributed, bp.on_single)
-        autodetect_on = not fits_off
-        final = bool(getattr(config.memory, attr)) or autodetect_on
-        if final and not fits_on:
-            worst = max(node_total(bp, bp.on_distributed, bp.on_single, r) for r, _ in nodes.values())
+        single = bp.off_single * (2 if key == "lanczos" and single_node_multi_rank else 1)
+        fits_in_memory = fits_everywhere(bp, bp.off_distributed, single)
+        fits_grid = key == "lanczos" and fits_everywhere(bp, bp.on_distributed, bp.on_single)
+        if not fits_in_memory and not fits_grid:
+            worst = max(node_total(bp, bp.off_distributed, single, r) for r, _ in nodes.values())
             raise MemoryError(
-                f"The memory-saving path for '{label}' needs {worst / 1024**3:.3f} GB on a node, which exceeds "
-                f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory"
-                + (
-                    " (and its fast path does not fit either)"
-                    if autodetect_on
-                    else " (its fast path would fit; unset the save_memory flag)"
-                )
-                + ". Use more nodes, fewer ranks per node, a smaller frequency box or k-grid."
+                f"The {label} needs {worst / 1024**3:.3f} GB on a node, which exceeds "
+                f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory. Use more nodes, fewer ranks per node, "
+                f"a smaller frequency box or k-grid."
             )
-        setattr(config.memory, attr, final)
-        worst_off = max(node_total(bp, bp.off_distributed, off_single, r) for r, _ in nodes.values())
-        logger.info(
-            f"{label}: per-rank baseline {bp.baseline / 1024**3:.3f} GB, fast-path node total "
-            f"{worst_off / 1024**3:.3f} GB -> memory saving {'enabled' if final else 'disabled'}."
-        )
 
 
 def _resolve_option_exclusivity() -> None:

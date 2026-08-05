@@ -396,6 +396,36 @@ class LocalNPoint(IHaveMat):
         self._full_niw_range = False
         return self
 
+    def take_wn_slice(self, start: int, stop: int):
+        r"""
+        Returns a **new** object restricted to the bosonic index window ``[start, stop)`` of a half (positive)
+        bosonic range object, i.e. to :math:`\omega = \mathrm{start}, \ldots, \mathrm{stop}-1`. Lets a caller walk the
+        bosonic axis in bounded chunks instead of holding the whole box.
+
+        **Only allowed for an object already in the half (positive) bosonic frequency range** (``full_niw_range`` must
+        be ``False``), since index 0 of a full-range object is not :math:`\omega = 0`; ``self`` is left unchanged.
+
+        :param start: First bosonic index of the window.
+        :param stop: One past the last bosonic index of the window.
+        :return: A new object holding that bosonic window (orbital, fermionic and momentum layout unchanged).
+        :raises ValueError: If the object has no bosonic frequency dimension, or is not in the half niw range.
+        """
+        if self.num_wn_dimensions == 0:
+            raise ValueError("Cannot slice the bosonic frequency axis without a bosonic frequency dimension.")
+        if self.full_niw_range:
+            raise ValueError(
+                "Slicing the bosonic frequency axis requires the object to be "
+                "in the half (positive) bosonic frequency range."
+            )
+
+        axis = -(self.num_wn_dimensions + self.num_vn_dimensions)
+        slicer = [slice(None)] * self.mat.ndim
+        slicer[axis] = slice(start, stop)
+        result = self._clone_without_mat()
+        result.mat = self.mat[tuple(slicer)].copy()
+        result.update_original_shape()
+        return result
+
     def to_negative_niw_range(self):
         r"""
         Returns a **new** object holding the negative bosonic frequency block :math:`\omega = 0, -1, \ldots, -niw`

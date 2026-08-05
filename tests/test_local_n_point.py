@@ -1058,3 +1058,25 @@ def test_cut_niv_on_a_half_fermionic_range_truncates_at_an_equal_cutoff(num_vn):
 
     assert out.current_shape == (nb, nb, 2 * niw + 1) + (niv,) * num_vn
     assert np.allclose(out.mat, mat[(...,) + (slice(0, niv),) * num_vn], atol=1e-12)
+
+
+@pytest.mark.parametrize("num_vn", [1, 2])
+def test_take_wn_slice_restricts_a_half_range_object_to_a_bosonic_window(num_vn):
+    """take_wn_slice returns an independent copy holding only the requested bosonic index window."""
+    nb, n_w, niv = 2, 5, 3
+    shape = (nb, nb, n_w) + (2 * niv,) * num_vn
+    mat = (np.random.rand(*shape) + 1j * np.random.rand(*shape)).astype(np.complex64)
+    obj = LocalNPoint(mat.copy(), 2, 1, num_vn, full_niw_range=False)
+
+    out = obj.take_wn_slice(1, 3)
+
+    assert out.current_shape == (nb, nb, 2) + (2 * niv,) * num_vn
+    assert np.array_equal(out.mat, mat[(..., slice(1, 3)) + (slice(None),) * num_vn])
+    assert np.array_equal(obj.mat, mat)
+
+
+def test_take_wn_slice_rejects_a_full_bosonic_range_object():
+    """take_wn_slice refuses a full-range object, whose bosonic index 0 is not omega = 0."""
+    obj = LocalNPoint(np.zeros((2, 2, 5, 6)), 2, 1, 1, full_niw_range=True)
+    with pytest.raises(ValueError):
+        obj.take_wn_slice(1, 3)

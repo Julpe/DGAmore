@@ -8,7 +8,8 @@ Linearized Eliashberg equation solver. Starting from the ladder-DGA full vertex 
 step), this module assembles the particle-particle pairing vertex in the singlet/triplet channels at :math:`\omega = 0`,
 optionally adds the local reducible diagrams, and solves the linearized gap equation :math:`\lambda \Delta =
 \pm\frac{1}{2\beta n_{\mathbf{q}}}\, \Gamma^{\mathrm{pp}}\, \chi_0^{\mathrm{pp}}\, \Delta` with a matrix-free
-ARPACK/Lanczos eigensolver (two variants: an in-memory one and a memory-lean frequency-distributed one). The leading
+ARPACK/Lanczos eigensolver (in memory when one sector's full-BZ pairing vertex fits on a rank, and on a
+block-distributed frequency grid otherwise). The leading
 eigenvalue :math:`\lambda` signals the pairing instability and the eigenvector is the gap function
 :math:`\Delta^{\mathrm{k}}_{12}`. Equation numbers refer to the author's master's thesis (Chapter 4).
 """
@@ -32,9 +33,10 @@ from dgamore.greens_function import GreensFunction
 from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.matsubara_frequencies import MFHelper
-from dgamore.memory_estimator import LANCZOS_VERTEX_FACTOR
+from dgamore import memory_estimator
+from dgamore.memory_estimator import SLICE_CHUNK_BYTES, lanczos_solver_bytes, solver_grid_shape
 from dgamore.mpi_utils import MpiDistributor
-from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE
+from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE, deferred_collection
 from dgamore.symmetry_reduction import find_coordinate_mirror_orbital_unitaries
 
 
@@ -76,6 +78,22 @@ def _compute_once_per_node(node_comm: MPI.Comm | None, compute_fn):
 
 
 # --- Frequency transform helpers (PH -> PP w0) ---
+def _pp_w0_band(niv_pp: int, niw_stored: int) -> tuple[np.ndarray, np.ndarray]:
+    r"""
+    Index map of the :math:`\omega' = 0` particle-particle band, shared by every consumer of the ph-to-pp map so that
+    the map exists in exactly one place. For a pp entry :math:`(\nu, \nu')` the ph object is read at the bosonic
+    frequency :math:`\omega = \nu - \nu'`, so each :math:`\omega` contributes one anti-diagonal of the
+    :math:`(\nu, \nu')` plane and only :math:`|\omega| \leq 2 n_{\nu}^{\mathrm{pp}} - 1` is ever read.
+
+    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
+    :param niw_stored: Number of positive bosonic frequencies available in the ph object.
+    :return: ``(wn, omega)``: the bosonic indices of the readable window, and the matrix
+        :math:`\omega = \nu - \nu'` whose entries select one anti-diagonal per bosonic frequency.
+    """
+    vn = MFHelper.vn(niv_pp)
+    return MFHelper.wn(min(niw_stored, 2 * niv_pp - 1)), vn[:, None] - vn[None, :]
+
+
 def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp: int) -> np.ndarray:
     r"""
     Transforms a vertex from particle-hole to particle-particle notation at :math:`\omega' = 0`, following Motoharu
@@ -88,8 +106,7 @@ def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp:
     i.e. (minus) the crossed-slot form of the pairing vertex of Eq. (4.49) in my thesis: with the ph frequency
     convention of Eq. (3.28a) the four legs of :math:`\bar{F}^{\mathrm{pp};\nu\nu'}_{1234}` carry the frequencies
     :math:`(\nu, \nu', -\nu, -\nu')` on the orbitals :math:`(1, 4, 3, 2)`. The overall minus is the sign of the
-    power-iteration matrix :math:`M = -\Gamma\chi` of Eq. (4.42). Used by :func:`transform_vertex_loc_frequencies_w0`
-    and :func:`transform_vertex_q_frequencies_w0`; the direct-slot counterpart (:math:`\omega_{\mathrm{ph}} = \nu +
+    power-iteration matrix :math:`M = -\Gamma\chi` of Eq. (4.42). Used by :func:`transform_vertex_loc_frequencies_w0`; the direct-slot counterpart (:math:`\omega_{\mathrm{ph}} = \nu +
     \nu'`, no flip, orbitals :math:`1234`) is
     :meth:`~dgamore.local_four_point.LocalFourPoint.change_frequency_notation_ph_to_pp_w0`.
 
@@ -97,15 +114,13 @@ def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp:
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :return: The transformed vertex as a raw numpy array with two fermionic axes ``[..., 2*niv_pp, 2*niv_pp]``.
     """
-    vn = MFHelper.vn(niv_pp)
-    omega = vn[:, None] - vn[None, :]
-
     vertex = vertex.cut_niv(niv_pp)
     # only the |w| <= 2*niv_pp - 1 anti-diagonals (omega = v - v') are read below, so the bosonic axis is trimmed to
     # that window before to_full_niw_range doubles it (cut_niw's no-op guard misjudges half-range objects here)
     w_axis = -3
     niw_stored = vertex.current_shape[w_axis] // 2 if vertex.full_niw_range else vertex.current_shape[w_axis] - 1
-    niw_window = min(niw_stored, 2 * niv_pp - 1)
+    wn, omega = _pp_w0_band(niv_pp, niw_stored)
+    niw_window = (len(wn) - 1) // 2
     if niw_window < niw_stored:
         slicer = [slice(None)] * vertex.mat.ndim
         slicer[w_axis] = (
@@ -115,7 +130,6 @@ def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp:
         )
         vertex.mat = vertex.mat[tuple(slicer)].copy()
         vertex.update_original_shape()
-    wn = MFHelper.wn(niw_window)
 
     vertex = vertex.to_full_niw_range().permute_orbitals("abcd->adcb", copy=False).flip_frequency_axis(-1, False)
     f_q_r_pp_mat = np.zeros((*vertex.current_shape[:-3], 2 * niv_pp, 2 * niv_pp), dtype=vertex.mat.dtype)
@@ -138,270 +152,173 @@ def transform_vertex_loc_frequencies_w0(f_r_loc: LocalFourPoint, niv_pp: int) ->
     return LocalFourPoint(mat, SpinChannel.UD, 0, 2, True, True, FrequencyNotation.PP)
 
 
-def transform_vertex_q_frequencies_w0(f_q_r: FourPoint, niv_pp: int) -> FourPoint:
-    r"""
-    Transforms a momentum-dependent vertex from particle-hole to the modified particle-particle notation at
-    :math:`\omega' = 0` (see :func:`_transform_vertex_frequencies_w0`).
-
-    :param f_q_r: The momentum-dependent vertex :math:`F^{\mathrm{q}}` in ph notation.
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :return: The transformed vertex as a :class:`FourPoint` (pp notation, no bosonic axis, compressed q).
-    """
-    mat = _transform_vertex_frequencies_w0(f_q_r, niv_pp)
-    return FourPoint(mat, f_q_r.channel, config.lattice.k_grid.nk, 0, 2, True, True, True, FrequencyNotation.PP)
+def _wn_chunk_size(one_wn_bytes: int, chunk_bytes: int) -> int:
+    """Number of bosonic frequencies assembled at once, bounded by the chunk byte budget (never below one)."""
+    return max(1, int(chunk_bytes // max(one_wn_bytes, 1)))
 
 
-# --- Full q-dependent vertex creation and transformation ---
-def create_full_vertex_q_r(
-    u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist: MpiDistributor
-) -> FourPoint:
-    r"""
-    Calculates the momentum-dependent full ladder vertex in the given channel (density or magnetic) from the saved
-    intermediates (inverse bubble, three-leg vertex, summed auxiliary susceptibility), and transforms it to pp
-    notation unless ``save_fq`` requests keeping the ph form. Deletes the consumed intermediate files afterwards.
-
-    :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :param mpi_dist: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :return: The full ladder vertex :math:`F^{\mathrm{q}}_{r}` as a :class:`FourPoint`.
-    """
-    logger = config.logger
-    logger.info(f"Starting to calculate the full {gamma_r.channel.value} vertex.")
-
-    gchi0_q_inv = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"gchi0_q_inv_rank_{mpi_dist.my_rank}.npy"), num_vn_dimensions=1
-    )
-
-    logger.info(f"Loaded gchi0_q_inv from file.")
-    f_q_r = nonlocal_sde.create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_loc, v_nonloc)
-    logger.info(f"Non-Local auxiliary susceptibility ({gamma_r.channel.value}) calculated.")
-
-    # eager rebinding releases chi* right after the first matmul, and the bubble term enters on the fermionic
-    # diagonal in place - the former single-expression form held four two-fermion blocks at its subtraction peak
-    f_q_r = gchi0_q_inv @ f_q_r
-    f_q_r = f_q_r @ gchi0_q_inv
-    f_q_r = f_q_r.scale(-config.sys.beta**2).add_on_vn_diagonal(gchi0_q_inv, factor=config.sys.beta**2)
-    gchi0_q_inv.free()
-
-    if not config.eliashberg.save_fq:
-        f_q_r = transform_vertex_q_frequencies_w0(f_q_r, niv_pp)
-
-    mpi_dist.barrier()
-
-    logger.info(f"Calculated first part of full {gamma_r.channel.value} vertex.")
-
-    vrg_q_r_left = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"vrg_q_{gamma_r.channel.value}_rank_{mpi_dist.my_rank}.npy"),
-        channel=gamma_r.channel,
-        num_vn_dimensions=1,
-    )
-
-    chi_phys_q_r = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"chi_phys_q_{gamma_r.channel.value}_rank_{mpi_dist.my_rank}.npy"),
-        channel=gamma_r.channel,
-        num_vn_dimensions=0,
-    )
-    logger.info(f"Loaded vrg_q_{gamma_r.channel.value} and chi_phys_q_{gamma_r.channel.value} from files.")
-
-    u = u_loc.as_channel(gamma_r.channel) + v_nonloc.as_channel(gamma_r.channel)
-    f_q_r_2 = vrg_q_r_left @ u - vrg_q_r_left @ (u @ chi_phys_q_r @ u)
-    vrg_q_r_left.free()
-    chi_phys_q_r.free()
-
-    vrg_q_r_right = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"vrg_q_{gamma_r.channel.value}_right_rank_{mpi_dist.my_rank}.npy"),
-        channel=gamma_r.channel,
-        num_vn_dimensions=1,
-    )
-
-    f_q_r_2 = f_q_r_2 * vrg_q_r_right
-    vrg_q_r_right.free()
-
-    if not config.eliashberg.save_fq:
-        f_q_r_2 = transform_vertex_q_frequencies_w0(f_q_r_2, niv_pp)
-    f_q_r = f_q_r.add(f_q_r_2, copy=False)  # accumulate in place: no third full-size vertex block
-    f_q_r_2.free()
-
-    mpi_dist.barrier()
-
-    logger.info(f"Calculated second part of full {f_q_r.channel.value} vertex.")
-
-    delete_files(
-        config.output.eliashberg_path,
-        f"vrg_q_{gamma_r.channel.value}_rank_{mpi_dist.my_rank}.npy",
-        f"vrg_q_{gamma_r.channel.value}_right_rank_{mpi_dist.my_rank}.npy",
-        f"chi_phys_q_{gamma_r.channel.value}_rank_{mpi_dist.my_rank}.npy",
-    )
-
-    return f_q_r
-
-
-def create_full_vertex_q_r_pp_w0(
-    u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist_irrk: MpiDistributor
-):
-    r"""
-    Builds the full ladder vertex (see :func:`create_full_vertex_q_r`), optionally gathers and saves it in ph
-    notation in the irreducible BZ, and returns it transformed to pp notation at :math:`\omega' = 0`.
-
-    :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :return: The full ladder vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
-    """
-    logger = config.logger
-
-    f_q_r = create_full_vertex_q_r(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk)
-
-    logger.info(f"Full ladder-vertex ({f_q_r.channel.value}) calculated.")
-    logger.log_memory_usage(
-        f"Full ladder-vertex ({f_q_r.channel.value})",
-        f_q_r,
-        mpi_dist_irrk.comm.size * (1 if config.eliashberg.save_fq else 4 * (config.box.niw_core + 1)),
-    )
-
-    if config.eliashberg.save_fq:
-        f_q_r.mat = mpi_dist_irrk.gather(f_q_r.mat)
-        if mpi_dist_irrk.comm.rank == 0:
-            f_q_r.save(output_dir=config.output.output_path, name=f"f_irrq_{f_q_r.channel.value}")
-        f_q_r.mat = mpi_dist_irrk.scatter(f_q_r.mat)
-        config.logger.info(f"Saved full ladder-vertex ({f_q_r.channel.value}) in the irreducible BZ to file.")
-
-    if config.eliashberg.save_fq:
-        return transform_vertex_q_frequencies_w0(f_q_r, niv_pp)
-    return f_q_r
-
-
-def create_full_vertex_q_r_v2(
-    u_loc: LocalInteraction,
-    v_nonloc: Interaction,
+def _build_ladder_vertex_chunk(
     gamma_r: LocalFourPoint,
     gchi0_q_inv: FourPoint,
     vrg_q_r_left: FourPoint,
     vrg_q_r_right: FourPoint,
     chi_phys_q_r: FourPoint,
-    niv_pp: int,
-    q_index: int,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    u_r: Interaction,
+    w_start: int,
+    w_stop: int,
 ) -> FourPoint:
     r"""
-    Calculates the full ladder vertex for a single q-point (memory-lean per-q variant of
-    :func:`create_full_vertex_q_r`), transforming it to pp notation unless ``save_fq`` keeps the ph form.
+    Builds the full ladder vertex :math:`F^{\mathrm{q}}_{r}` for one momentum and the bosonic window
+    ``[w_start, w_stop)``, i.e. the amputated auxiliary susceptibility plus the separable interaction part, on the
+    restricted inputs.
 
-    :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` over all rank-local q-points.
-    :param vrg_q_r_left: The momentum-dependent three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}`.
-    :param vrg_q_r_right: The momentum-dependent "right-side" three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}`.
-    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}`.
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :param q_index: Index of the q-point (into the rank-local list) to compute.
-    :return: The full ladder vertex :math:`F^{\mathrm{q}}_{r}` for that q-point as a :class:`FourPoint`.
+    :param gchi0_q_inv: The single-q inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}`.
+    :param vrg_q_r_left: The single-q three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}`.
+    :param vrg_q_r_right: The single-q "right-side" three-leg vertex :math:`\tilde\gamma^{\mathrm{q}\nu}_{r}`.
+    :param chi_phys_q_r: The single-q physical susceptibility :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}`.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` restricted to this momentum.
+    :param u_r: The channel-projected total interaction :math:`\mathcal{U}^{\mathbf{q}}_{r}`.
+    :param w_start: First bosonic index of the window.
+    :param w_stop: One past the last bosonic index of the window.
+    :return: The ladder vertex over that window as a :class:`FourPoint` (half niw range, two fermionic dimensions).
     """
-    gchi0_q_inv_idx = gchi0_q_inv.filter_q_index(q_index)
-    vrg_q_r_left_idx = vrg_q_r_left.filter_q_index(q_index)
-    vrg_q_r_right_idx = vrg_q_r_right.filter_q_index(q_index)
-    chi_phys_q_r_idx = chi_phys_q_r.filter_q_index(q_index)
-    v_nonloc_idx = v_nonloc.filter_q_index(q_index)
+    gchi0_w = gchi0_q_inv.take_wn_slice(w_start, w_stop)
+    gamma_w = gamma_r.take_wn_slice(w_start, w_stop)
 
-    u = u_loc.as_channel(gamma_r.channel) + v_nonloc_idx.as_channel(gamma_r.channel)
+    # eager rebinding releases chi* right after the first matmul; the bubble term enters on the diagonal in place
+    f_chunk = nonlocal_sde.create_auxiliary_chi_r_q(gamma_w, gchi0_w, u_loc, v_nonloc)
+    f_chunk = gchi0_w @ f_chunk
+    f_chunk = f_chunk @ gchi0_w
+    f_chunk = f_chunk.scale(-config.sys.beta**2).add_on_vn_diagonal(gchi0_w, factor=config.sys.beta**2)
 
-    f_q_r_idx = nonlocal_sde.create_auxiliary_chi_r_q(gamma_r, gchi0_q_inv_idx, u_loc, v_nonloc_idx)
-    # same eager-rebinding / diagonal-add construction as in create_full_vertex_q_r, per q-point
-    f_q_r_idx = gchi0_q_inv_idx @ f_q_r_idx
-    f_q_r_idx = f_q_r_idx @ gchi0_q_inv_idx
-    f_q_r_idx = f_q_r_idx.scale(-config.sys.beta**2).add_on_vn_diagonal(gchi0_q_inv_idx, factor=config.sys.beta**2)
-    f_q_r_idx = f_q_r_idx.add(
-        (vrg_q_r_left_idx @ u - vrg_q_r_left_idx @ (u @ chi_phys_q_r_idx @ u)) * vrg_q_r_right_idx, copy=False
-    )
-
-    gchi0_q_inv_idx.free()
-    vrg_q_r_left_idx.free()
-    vrg_q_r_right_idx.free()
-    chi_phys_q_r_idx.free()
-
-    if not config.eliashberg.save_fq:
-        f_q_r_idx = transform_vertex_q_frequencies_w0(f_q_r_idx, niv_pp)
-
-    return f_q_r_idx
+    vrg_left_w = vrg_q_r_left.take_wn_slice(w_start, w_stop)
+    vrg_right_w = vrg_q_r_right.take_wn_slice(w_start, w_stop)
+    chi_phys_w = chi_phys_q_r.take_wn_slice(w_start, w_stop)
+    return f_chunk.add((vrg_left_w @ u_r - vrg_left_w @ (u_r @ chi_phys_w @ u_r)) * vrg_right_w, copy=False)
 
 
-def create_full_vertex_q_r_pp_w0_v2(
-    u_loc: LocalInteraction, v_nonloc: Interaction, gamma_r: LocalFourPoint, niv_pp: int, mpi_dist_irrk: MpiDistributor
-):
+def _write_pp_band(out: np.ndarray, f_chunk: FourPoint, niv_pp: int, omega: np.ndarray, w_start: int) -> None:
     r"""
-    Builds the full ladder vertex as a memory-lean variant of :func:`create_full_vertex_q_r_pp_w0`, looping over the
-    rank-local q-points (see :func:`create_full_vertex_q_r_v2`), optionally saving it in ph notation, and returning it
-    in pp notation at :math:`\omega' = 0`.
+    Writes the :math:`\omega' = 0` pp band of one ladder-vertex window into the pp accumulator of its momenta.
+
+    Each bosonic frequency contributes the anti-diagonal :math:`\omega = \nu - \nu'` (see :func:`_pp_w0_band`), and
+    the negative bosonic half is obtained from the positive one through the complex-conjugation symmetry that
+    :meth:`~dgamore.local_n_point.LocalNPoint.to_negative_niw_range` implements. The orbital permutation, the
+    fermionic flip and the overall minus are the ones of :func:`_transform_vertex_frequencies_w0`.
+
+    :param out: The pp accumulator of this momentum group, shape ``[nq_group, no, no, no, no, 2 niv_pp, 2 niv_pp]``.
+    :param f_chunk: The ladder vertex over a bosonic window, in ph notation and half niw range.
+    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
+    :param omega: The :math:`\nu - \nu'` matrix returned by :func:`_pp_w0_band`.
+    :param w_start: Bosonic index the window starts at.
+    :return: None.
+    """
+    # cut to the pp box first so the negative-half copy is pp-sized, not core-sized (the cut is centered, so the
+    # fermionic flips inside to_negative_niw_range commute with it); positive then mutates the cut copy in place
+    cut = f_chunk.cut_niv(niv_pp)
+    negative = cut.to_negative_niw_range().permute_orbitals("abcd->adcb", copy=False).flip_frequency_axis(-1, False)
+    positive = cut.permute_orbitals("abcd->adcb", copy=False).flip_frequency_axis(-1, False)
+
+    for index in range(positive.current_shape[-3]):
+        w = w_start + index
+        out[..., omega == w] = -positive.mat[..., index, omega == w]
+        if w > 0:  # w = 0 is shared by both halves and belongs to the positive one
+            out[..., omega == -w] = -negative.mat[..., index, omega == -w]
+
+
+def _build_pairing_vertex_pp(
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    gamma_r: LocalFourPoint,
+    niv_pp: int,
+    mpi_dist_irrk: MpiDistributor,
+    chunk_writer=None,
+    chunk_bytes: int | None = None,
+) -> FourPoint:
+    r"""
+    Shared loop of the slice-direct pairing-vertex construction: walks the rank-local momenta and, per momentum, the
+    bosonic axis in byte-bounded chunks, building each ladder-vertex chunk once and reading its :math:`\omega' = 0`
+    pp band (see :func:`_pp_w0_band`). When ``chunk_writer`` is given, every ph-notation chunk is handed to it before
+    being released, so a caller can stream the full vertex to disk in the same pass.
 
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :return: The full ladder vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
+    :param chunk_writer: Optional callable ``(q_start, w_start, chunk_mat)`` receiving each ph-notation chunk (the
+        momenta of the group as the leading axis).
+    :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
+    :return: The pairing vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
     """
     logger = config.logger
+    channel = gamma_r.channel
+    path, rank = config.output.eliashberg_path, mpi_dist_irrk.my_rank
 
-    gchi0_q_inv = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"gchi0_q_inv_rank_{mpi_dist_irrk.my_rank}.npy"),
-        num_vn_dimensions=1,
-    )
-    logger.info(f"Loaded gchi0_q_inv from file.")
-
+    gchi0_q_inv = FourPoint.load(os.path.join(path, f"gchi0_q_inv_rank_{rank}.npy"), num_vn_dimensions=1)
     vrg_q_r_left = FourPoint.load(
-        os.path.join(config.output.eliashberg_path, f"vrg_q_{gamma_r.channel.value}_rank_{mpi_dist_irrk.my_rank}.npy"),
-        channel=gamma_r.channel,
-        num_vn_dimensions=1,
+        os.path.join(path, f"vrg_q_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=1
     )
-
     vrg_q_r_right = FourPoint.load(
-        os.path.join(
-            config.output.eliashberg_path, f"vrg_q_{gamma_r.channel.value}_right_rank_{mpi_dist_irrk.my_rank}.npy"
-        ),
-        channel=gamma_r.channel,
-        num_vn_dimensions=1,
+        os.path.join(path, f"vrg_q_{channel.value}_right_rank_{rank}.npy"), channel=channel, num_vn_dimensions=1
     )
-
     chi_phys_q_r = FourPoint.load(
-        os.path.join(
-            config.output.eliashberg_path, f"chi_phys_q_{gamma_r.channel.value}_rank_{mpi_dist_irrk.my_rank}.npy"
-        ),
-        channel=gamma_r.channel,
-        num_vn_dimensions=0,
+        os.path.join(path, f"chi_phys_q_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=0
     )
+    logger.info(f"Loaded the intermediates for the {channel.value} pairing vertex.")
 
-    logger.info(f"Loaded vrg_q_{gamma_r.channel.value} and chi_phys_q_{gamma_r.channel.value} from files.")
+    my_irr_q_list = config.lattice.k_grid.get_irrq_list()[mpi_dist_irrk.my_slice]
+    niw_stored = gchi0_q_inv.current_shape[-2] - 1
+    _, omega = _pp_w0_band(niv_pp, niw_stored)
+    # the pp band only reads |w| <= 2 niv_pp - 1, but a streamed full vertex must cover the whole stored box
+    niw_build = niw_stored if chunk_writer is not None else int(np.max(omega))
 
-    irrk_q_list = config.lattice.k_grid.get_irrq_list()
-    my_irr_q_list = irrk_q_list[mpi_dist_irrk.my_slice]
+    n_bands = config.sys.n_bands
+    f_pp_mat = np.zeros((len(my_irr_q_list),) + (n_bands,) * 4 + (2 * niv_pp,) * 2, dtype=gamma_r.mat.dtype)
 
-    if config.eliashberg.save_fq:
-        f_q_r_mat = np.empty(
-            (
-                (len(my_irr_q_list),)
-                + (config.sys.n_bands,) * 4
-                + (gamma_r.current_shape[-3],)
-                + (2 * config.box.niv_core,) * 2
-            ),
-            dtype=gamma_r.mat.dtype,
-        )
-    else:
-        f_q_r_mat = np.empty(
-            ((len(my_irr_q_list),) + (config.sys.n_bands,) * 4 + (2 * niv_pp,) * 2), dtype=gamma_r.mat.dtype
-        )
+    # one byte budget bounds the transient: as many whole-box momenta as fit (small problems degenerate to the
+    # single batched build), and where even one momentum's box exceeds it, that momentum's bosonic axis is chunked
+    budget = SLICE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
+    one_wn_bytes = n_bands**4 * (2 * config.box.niv_core) ** 2 * np.dtype(DTYPE).itemsize
+    w_chunk = _wn_chunk_size(one_wn_bytes, budget)
+    q_group = max(1, int(budget // max(one_wn_bytes * (niw_build + 1), 1)))
 
-    logger.info(f"Starting to calculate the full {gamma_r.channel.value} vertex.")
+    with deferred_collection():
+        for q_start in range(0, len(my_irr_q_list), q_group):
+            q_stop = min(q_start + q_group, len(my_irr_q_list))
+            gchi0_grp = gchi0_q_inv.take_q_index_slice(q_start, q_stop)
+            vrg_left_grp = vrg_q_r_left.take_q_index_slice(q_start, q_stop)
+            vrg_right_grp = vrg_q_r_right.take_q_index_slice(q_start, q_stop)
+            chi_phys_grp = chi_phys_q_r.take_q_index_slice(q_start, q_stop)
+            v_nonloc_grp = v_nonloc.take_q_index_slice(q_start, q_stop)
+            u_r = u_loc.as_channel(channel) + v_nonloc_grp.as_channel(channel)
 
-    for idx, q in enumerate(my_irr_q_list):
-        f_q_r_mat[idx] = create_full_vertex_q_r_v2(
-            u_loc, v_nonloc, gamma_r, gchi0_q_inv, vrg_q_r_left, vrg_q_r_right, chi_phys_q_r, niv_pp, idx
-        ).mat
+            for w_start in range(0, niw_build + 1, w_chunk):
+                f_chunk = _build_ladder_vertex_chunk(
+                    gamma_r,
+                    gchi0_grp,
+                    vrg_left_grp,
+                    vrg_right_grp,
+                    chi_phys_grp,
+                    u_loc,
+                    v_nonloc_grp,
+                    u_r,
+                    w_start,
+                    min(w_start + w_chunk, niw_build + 1),
+                )
+                if chunk_writer is not None:
+                    chunk_writer(q_start, w_start, f_chunk.mat)
+                _write_pp_band(f_pp_mat[q_start:q_stop], f_chunk, niv_pp, omega, w_start)
+                f_chunk.free()
 
-    logger.info(f"Full ladder-vertex ({gamma_r.channel.value}) calculated.")
+            gchi0_grp.free()
+            vrg_left_grp.free()
+            vrg_right_grp.free()
+            chi_phys_grp.free()
 
     gchi0_q_inv.free()
     vrg_q_r_left.free()
@@ -409,33 +326,88 @@ def create_full_vertex_q_r_pp_w0_v2(
     chi_phys_q_r.free()
 
     delete_files(
-        config.output.eliashberg_path,
-        f"vrg_q_{gamma_r.channel.value}_rank_{mpi_dist_irrk.my_rank}.npy",
-        f"vrg_q_{gamma_r.channel.value}_right_rank_{mpi_dist_irrk.my_rank}.npy",
-        f"chi_phys_q_{gamma_r.channel.value}_rank_{mpi_dist_irrk.my_rank}.npy",
+        path,
+        f"vrg_q_{channel.value}_rank_{rank}.npy",
+        f"vrg_q_{channel.value}_right_rank_{rank}.npy",
+        f"chi_phys_q_{channel.value}_rank_{rank}.npy",
     )
 
-    if not config.eliashberg.save_fq:
-        f_q_r = FourPoint(
-            f_q_r_mat, gamma_r.channel, config.lattice.k_grid.nk, 0, 2, False, True, True, FrequencyNotation.PP
-        )
-        logger.log_memory_usage(
-            f"Full ladder-vertex ({f_q_r.channel.value})",
-            f_q_r,
-            mpi_dist_irrk.comm.size * 4 * (config.box.niw_core + 1),
-        )
-        return f_q_r
+    return FourPoint(f_pp_mat, channel, config.lattice.k_grid.nk, 0, 2, False, True, True, FrequencyNotation.PP)
 
-    f_q_r = FourPoint(
-        f_q_r_mat, gamma_r.channel, config.lattice.k_grid.nk, 1, 2, False, True, True, FrequencyNotation.PP
+
+def create_pairing_vertex_slice_q_r(
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    gamma_r: LocalFourPoint,
+    niv_pp: int,
+    mpi_dist_irrk: MpiDistributor,
+    chunk_bytes: int | None = None,
+) -> FourPoint:
+    r"""
+    Builds the pp pairing vertex at :math:`\omega' = 0` directly, without ever materializing the full
+    three-frequency ladder vertex :math:`F^{\mathrm{q}\nu\nu'}_{r}` (see :func:`_build_pairing_vertex_pp`). The
+    result is identical to the full-inversion construction up to floating-point accuracy, at a transient of one
+    byte-bounded bosonic chunk instead of the whole rank-local box.
+
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
+    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
+    :return: The pairing vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
+    """
+    return _build_pairing_vertex_pp(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk, chunk_bytes=chunk_bytes)
+
+
+def create_pairing_vertex_streaming_fq(
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    gamma_r: LocalFourPoint,
+    niv_pp: int,
+    mpi_dist_irrk: MpiDistributor,
+    chunk_bytes: int | None = None,
+) -> FourPoint:
+    r"""
+    Builds the pp pairing vertex like :func:`create_pairing_vertex_slice_q_r` while streaming the full ladder vertex
+    in ph notation to ``f_irrq_<channel>.npy`` chunk by chunk, replacing the rank-0 gather of the whole
+    irreducible-BZ vertex. Rank 0 creates the memory-mapped file with the layout of the gathered save (half bosonic
+    range, global irreducible q-ordering); every rank then writes only its own disjoint ``(q, omega)`` slabs.
+
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
+    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
+    :return: The pairing vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
+    """
+    channel = gamma_r.channel
+    n_bands = config.sys.n_bands
+    nk_irr = config.lattice.k_grid.nk_irr
+    file_path = os.path.join(config.output.output_path, f"f_irrq_{channel.value}.npy")
+    # plain ints: numpy scalars in the shape end up as np.int64(...) in the npy header, which cannot be re-read
+    shape = tuple(
+        int(n) for n in (nk_irr,) + (n_bands,) * 4 + (config.box.niw_core + 1,) + (2 * config.box.niv_core,) * 2
     )
-    logger.log_memory_usage(f"Full ladder-vertex ({f_q_r.channel.value})", f_q_r, mpi_dist_irrk.comm.size)
-    f_q_r.mat = mpi_dist_irrk.gather(f_q_r.mat)
+
     if mpi_dist_irrk.comm.rank == 0:
-        f_q_r.save(output_dir=config.output.output_path, name=f"f_irrq_{f_q_r.channel.value}")
-        logger.info(f"Saved full ladder-vertex ({f_q_r.channel.value}) in the irreducible BZ to file.")
-    f_q_r.mat = mpi_dist_irrk.scatter(f_q_r.mat)
-    return transform_vertex_q_frequencies_w0(f_q_r, niv_pp)
+        np.lib.format.open_memmap(file_path, mode="w+", dtype=DTYPE, shape=shape)
+    mpi_dist_irrk.barrier()
+    file_mat = np.lib.format.open_memmap(file_path, mode="r+")
+
+    q_offset = mpi_dist_irrk.my_slice.indices(nk_irr)[0]
+
+    def chunk_writer(q_start: int, w_start: int, chunk_mat: np.ndarray) -> None:
+        w_stop = w_start + chunk_mat.shape[-3]
+        file_mat[q_offset + q_start : q_offset + q_start + chunk_mat.shape[0], ..., w_start:w_stop, :, :] = chunk_mat
+
+    f_pp = _build_pairing_vertex_pp(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk, chunk_writer, chunk_bytes)
+    file_mat.flush()
+    del file_mat
+    mpi_dist_irrk.barrier()
+    config.logger.info(f"Streamed full ladder-vertex ({channel.value}) in the irreducible BZ to file.")
+    return f_pp
 
 
 # --- Local particle-particle reducible diagrams (w=0) ---
@@ -590,7 +562,7 @@ def create_local_ud_diagrams_pp_w0(
     :meth:`~dgamore.local_four_point.LocalFourPoint.change_frequency_notation_ph_to_pp_w0` (ph legs evaluated at
     :math:`\omega_{\mathrm{ph}} = \nu + \nu'`) and the bare pp bubble built from the local DMFT Green's function
     :math:`G^{\mathrm{DMFT}}_{12}(\nu)` via :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_pp_w0`.
-    These are the local diagrams subtracted/added when ``include_local_part`` of
+    These are the local diagrams always subtracted/added to the pairing vertex; see
     :class:`~dgamore.config.EliashbergConfig` is enabled, to avoid double counting the local pairing contribution
     (thesis Eqs. 4.49-4.52).
 
@@ -886,6 +858,177 @@ def classify_gap_symmetry(gap: np.ndarray, purity: float = 0.9, weight_floor: fl
     )
 
 
+# Testing/benchmark override: forces the block-distributed grid solver even when the in-memory one would fit.
+FORCE_GRID_SOLVER: bool = False
+
+
+def _gather_grid_vertex_block(
+    gamma_r_pp: FourPoint, comm: MPI.Comm, row_slice: slice, col_slice: slice, keep: bool
+) -> np.ndarray | None:
+    r"""
+    Redistributes the q-distributed pairing vertex into this rank's frequency block: every rank broadcasts its
+    rank-local irreducible-BZ share once (chunked, one share in flight at a time), and each grid rank keeps only the
+    ``[row_slice, col_slice]`` frequency window of every share. Afterwards a grid rank holds all irreducible momenta
+    of its own ``(nu, nu')`` block and nothing else.
+
+    :param gamma_r_pp: This rank's irreducible-BZ share of the pairing vertex (compressed momentum axis).
+    :param comm: The MPI communicator.
+    :param row_slice: The :math:`\nu` (row) window of this rank's block.
+    :param col_slice: The :math:`\nu'` (column) window of this rank's block.
+    :param keep: Whether this rank is part of the solver grid (idle ranks only feed the broadcasts).
+    :return: The assembled block ``[nk_irr, o, o, o, o, nu_block, nu'_block]``, or ``None`` on idle ranks.
+    """
+    counts = comm.allgather(gamma_r_pp.current_shape[0])
+    offsets = np.concatenate(([0], np.cumsum(counts))).astype(int)
+
+    block = None
+    if keep:
+        shape = gamma_r_pp.current_shape[1:5] + (
+            row_slice.stop - row_slice.start,
+            col_slice.stop - col_slice.start,
+        )
+        block = np.empty((int(offsets[-1]),) + shape, dtype=gamma_r_pp.mat.dtype)
+
+    for src in range(comm.size):
+        src_mat = mpi_utils.bcast_rows(comm, gamma_r_pp.mat, root=src)
+        if keep:
+            block[offsets[src] : offsets[src + 1]] = src_mat[..., row_slice, col_slice]
+        if src != comm.rank:
+            del src_mat
+    return block
+
+
+def solve_eliashberg_lanczos_grid(
+    gamma_r_pp: FourPoint, gchi0_q0_pp: FourPoint | None, comm: MPI.Comm, bubble_rank: int
+) -> dict[str, tuple[np.ndarray, list[GapFunction]]] | None:
+    r"""
+    Solves the linearized Eliashberg equation with the pairing vertex distributed over a 2-D ``(nu, nu')`` block grid,
+    for problems whose full-BZ vertex does not fit on a single rank. Semantics are identical to
+    :func:`solve_eliashberg_lanczos`: the same matvec, projectors, seeding and post-processing, only the storage and
+    the contraction are distributed.
+
+    Every grid rank holds one full-BZ, Fourier-transformed, matmul-layout block of the vertex and runs the
+    eigensolver in lockstep on the full gap vector (the collectives inside the matvec keep every rank's iterates
+    identical). Per matvec each rank dresses its own and its mirror
+    :math:`\nu'`-column block locally (the crossed term reads the mirror block through the :math:`\nu'` flip), so
+    the only communication is one block-sized ``Allreduce`` over each row group (completing the :math:`\nu'` sum)
+    and one gap-sized ``Allgatherv`` over each column group (reassembling the :math:`\nu` rows). Sectors and
+    channels run sequentially on the whole grid; ranks beyond ``rows * cols`` idle and return ``None``.
+
+    :param gamma_r_pp: This rank's irreducible-BZ share of the pairing vertex; consumed by the solve.
+    :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{\mathrm{pp}}` (only read on ``bubble_rank``).
+    :param comm: The MPI communicator.
+    :param bubble_rank: The rank holding the pp bubble.
+    :return: ``{parity_label: (lambdas, gaps)}`` on grid ranks, ``None`` on idle ranks.
+    """
+    logger = config.logger
+    channel = gamma_r_pp.channel
+    n_freq = gamma_r_pp.current_shape[-1]
+    n_bands = gamma_r_pp.n_bands
+    k_grid = config.lattice.k_grid
+
+    rows, cols = solver_grid_shape(comm.size, n_freq)
+    in_grid = comm.rank < rows * cols
+    logger.info(
+        f"Starting to solve the Eliashberg equation for the {channel.value}let channel "
+        f"on a {rows}x{cols} solver grid.",
+        allowed_ranks=(0,),
+    )
+
+    i, j = divmod(comm.rank, cols) if in_grid else (0, 0)
+    row_bounds = np.linspace(0, n_freq, rows + 1).astype(int)
+    row_slice = slice(int(row_bounds[i]), int(row_bounds[i + 1]))
+    width = n_freq // cols
+    mirror_j = cols - 1 - j
+    col_slice = slice(j * width, (j + 1) * width)
+    mirror_slice = slice(mirror_j * width, (mirror_j + 1) * width)
+
+    # collective splits must involve every rank, including idle ones (distinct colors keep them out of the groups)
+    reduce_comm = comm.Split(i if in_grid else rows, comm.rank)  # same nu rows, nu' columns vary
+    gather_comm = comm.Split(j if in_grid else cols, comm.rank)  # same nu' columns, nu rows vary
+
+    # w2dynamics G2 leg order (c cdag c cdag) -> TRIQS order (cdag c cdag c); orbital-only, so it commutes with the
+    # frequency slicing and is applied to the small rank-local share before the exchange
+    gamma_r_pp = gamma_r_pp.permute_orbitals("abcd->badc", False)
+    block_mat = _gather_grid_vertex_block(gamma_r_pp, comm, row_slice, col_slice, in_grid)
+    gamma_r_pp.free()
+
+    chi0_mat = mpi_utils.bcast_rows(
+        comm, gchi0_q0_pp.mat if comm.rank == bubble_rank else np.empty(0), root=bubble_rank
+    )
+    if not in_grid:
+        return None
+
+    block = FourPoint(block_mat, channel, k_grid.nk, 0, 2, False, True, True, FrequencyNotation.PP)
+    block = block.map_to_full_bz(k_grid, k_grid.nk).decompress_q_dimension().fft(False)
+    logger.log_memory_usage(f"Gamma_pp_{channel.value} grid block", block, rows * cols, allowed_ranks=(0,))
+    gamma_mm = _gamma_to_matmul_layout(block.mat)
+    block.free()
+    # fold the kernel prefactor into the persistent vertex once, exactly as the in-memory solve does
+    gamma_mm *= 0.5 / k_grid.nk_tot / config.sys.beta
+
+    chi0_full = FourPoint(chi0_mat, SpinChannel.NONE, k_grid.nk, 0, 1, False, True, True, FrequencyNotation.PP)
+    chi0_full = chi0_full.decompress_q_dimension()
+    chi0_own = _chi0_to_matmul_layout(np.ascontiguousarray(chi0_full.mat[..., col_slice]))
+    chi0_mir = (
+        chi0_own if mirror_j == j else _chi0_to_matmul_layout(np.ascontiguousarray(chi0_full.mat[..., mirror_slice]))
+    )
+    chi0_full.free()
+
+    gap_shape = k_grid.nk + 2 * (n_bands,) + (n_freq,)
+    sign = 1 if channel == SpinChannel.SING else -1
+    row_counts = (row_bounds[1:] - row_bounds[:-1]) * int(np.prod(gap_shape[:5]))
+    row_displs = np.concatenate(([0], np.cumsum(row_counts[:-1])))
+
+    def mv(gap: np.ndarray):
+        r"""
+        Applies the pairing kernel to a full flattened gap vector on the solver grid: this rank dresses its own and
+        its mirror :math:`\nu'`-column block of the gap, contracts them with its vertex block (direct and crossed
+        term), completes the :math:`\nu'` sum by an ``Allreduce`` over the row group, and reassembles the full
+        :math:`\nu` axis by an ``Allgatherv`` over the column group, so every rank returns the identical full result.
+
+        :param gap: The flattened gap vector (full length, identical on every grid rank).
+        :return: The flattened result of applying the pairing kernel to ``gap``.
+        """
+        gap6 = gap.reshape(gap_shape)
+        gap_gg = sp.fft.fftn(
+            _apply_gchi0_pp(chi0_own, np.ascontiguousarray(gap6[..., col_slice]), n_bands),
+            axes=(0, 1, 2),
+            overwrite_x=True,
+        )
+        gg_mirror = (
+            gap_gg
+            if mirror_j == j
+            else sp.fft.fftn(
+                _apply_gchi0_pp(chi0_mir, np.ascontiguousarray(gap6[..., mirror_slice]), n_bands),
+                axes=(0, 1, 2),
+                overwrite_x=True,
+            )
+        )
+        part = _apply_gamma_pp(gamma_mm, gap_gg, n_bands)
+        # crossed term: flip_p of the FULL dressed gap restricted to this rank's columns equals the mirror block
+        # flipped, so the mirror dressing above replaces any exchange (see solve_eliashberg_lanczos for the identity)
+        crossed = _apply_gamma_pp(gamma_mm, np.ascontiguousarray(np.flip(gg_mirror, axis=-1)), n_bands)
+        crossed = np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+        if sign != 1:
+            crossed *= sign
+        part += crossed
+        if cols > 1:
+            part = np.ascontiguousarray(part)
+            reduce_comm.Allreduce(MPI.IN_PLACE, part)
+        part = sp.fft.ifftn(part, axes=(0, 1, 2), overwrite_x=True)
+        if rows == 1:
+            return part.flatten()
+        send = np.ascontiguousarray(np.moveaxis(part, -1, 0))
+        recv = np.empty((n_freq,) + send.shape[1:], dtype=send.dtype)
+        gather_comm.Allgatherv(send, [recv, (row_counts, row_displs)])
+        return np.moveaxis(recv, 0, -1).flatten()
+
+    # get_initial_gap_function draws from a fixed-seed generator, so every lockstep rank computes the same seed
+    seed = get_initial_gap_function(gap_shape, channel)
+    return _solve_pairing_sectors(mv, gap_shape, sign, channel, k_grid.nk, None, (0,), seed.flatten())
+
+
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
 @lru_cache(maxsize=1)
 def _openblas_thread_slot_cap() -> int | None:
@@ -938,41 +1081,6 @@ def _solver_thread_budget() -> int:
     except AttributeError:
         return 1
     return _clamp_to_openblas_slot_cap(budget)
-
-
-def _v2_solver_thread_budget(comm: MPI.Comm, active_ranks: list) -> int:
-    r"""
-    Returns the momentum-batch/FFT thread budget of THIS rank for the frequency-distributed Lanczos solve. Unlike
-    the in-memory solve (where all other ranks of the node wait and the one solver rank may claim its whole
-    affinity mask, see :func:`_solver_thread_budget`), every rank with a non-empty frequency slice computes
-    simultaneously here, so this rank's mask is divided by the number of active ranks on its node whose affinity
-    masks overlap with it - threading them all at full mask would oversubscribe the shared cores. The result is
-    clamped to the OpenBLAS thread capacity (see :func:`_clamp_to_openblas_slot_cap`). Under a strict
-    one-core-per-rank binding the budget is 1 and the threading is a no-op; idle cores are only picked up when the
-    launcher binding leaves masks wider than one core (e.g. socket binding) and some of the node's ranks hold
-    empty frequency slices. This is a collective call - every rank of ``comm`` must enter it, active or not.
-
-    :param comm: The MPI communicator.
-    :param active_ranks: The ranks holding non-empty frequency slices (see :func:`solve_eliashberg_lanczos_v2`).
-    :return: The thread budget of this rank as an int (1 for inactive ranks and where no affinity API exists).
-    """
-    try:
-        my_mask = frozenset(os.sched_getaffinity(0))
-    except AttributeError:
-        my_mask = None
-
-    if comm.size == 1:
-        return _clamp_to_openblas_slot_cap(max(1, len(my_mask))) if my_mask else 1
-
-    infos = comm.allgather((socket.gethostname(), my_mask))
-    if my_mask is None or comm.rank not in active_ranks:
-        return 1
-
-    my_host = infos[comm.rank][0]
-    sharing = sum(
-        1 for r in active_ranks if infos[r][0] == my_host and infos[r][1] is not None and infos[r][1] & my_mask
-    )
-    return _clamp_to_openblas_slot_cap(max(1, len(my_mask) // max(1, sharing)))
 
 
 def _chi0_to_matmul_layout(chi0_mat: np.ndarray) -> np.ndarray:
@@ -1363,8 +1471,8 @@ def _solve_pairing_sectors(
     :param nq: The momentum-grid shape carried onto each :class:`GapFunction`.
     :param executor: The momentum-batch thread pool (or ``None``); shut down on return.
     :param ranks: The ranks tuple used for logging.
-    :param base_seed: The flattened initial gap seed, identical on every rank (broadcast beforehand for the
-        frequency-distributed solve); projected into each sector, with a deterministic random fallback when the
+    :param base_seed: The flattened initial gap seed, identical on every rank (drawn from a fixed-seed
+        generator); projected into each sector, with a deterministic random fallback when the
         projection of the seed collapses (a seed whose parity is orthogonal to the requested sector).
     :param parities: An optional subset of parity labels to solve; ``None`` solves every configured sector. Used to
         hand different sectors to different ranks.
@@ -1537,130 +1645,17 @@ def solve_eliashberg_lanczos(
 
 
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
-def solve_eliashberg_lanczos_v2(
-    gamma_r_pp: FourPoint,
-    gchi0_q0_pp: FourPoint,
-    mpi_dist_v: MpiDistributor,
-    active_ranks: list,
-    n_threads: int = 1,
-) -> dict[str, tuple[np.ndarray, list[GapFunction]]]:
-    r"""
-    Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using an
-    ARPACK/Lanczos eigensolver. This variant distributes the gap function along the fermionic frequency axis across
-    ranks (and performs the :math:`\chi_0^{\mathrm{pp}}` multiplication only on the root rank), so it is more
-    memory-efficient but slower than :func:`solve_eliashberg_lanczos`. The passed pairing vertex is **consumed**
-    (Fourier transformed in place, then freed once its matmul-layout copy is built).
-
-    The physical frequency-parity sectors of ``config.eliashberg.resolve_frequency_parity`` are handled exactly as in
-    :func:`solve_eliashberg_lanczos`: the sector projector :math:`\Pi` (see :func:`_project_gap_to_sector`) wraps the
-    matvec and the starting vector on the full (undistributed) gap vector the eigensolver sees, so the frequency
-    distribution is transparent to the projection.
-
-    :param gamma_r_pp: The pairing vertex :math:`\Gamma^{\mathrm{pp}}_{r}` (frequency-distributed) for one channel;
-        consumed by the solve.
-    :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{\mathrm{pp}}` at :math:`\omega = 0` (held on the root rank).
-    :param mpi_dist_v: MPI distributor over the fermionic frequency axis (see :class:`MpiDistributor`). Its
-        communicator must span exactly the participating ranks - when some ranks hold empty frequency slices the
-        caller passes the restricted distributor (see :meth:`~dgamore.mpi_utils.MpiDistributor.restricted_to`),
-        whose rank 0 is the first active rank; ranks outside it must not enter this function.
-    :param active_ranks: The original-communicator ranks participating in this solve (used for logging); the
-        first is the root that owns the bubble.
-    :param n_threads: This rank's momentum-batch/FFT thread budget (see :func:`_v2_solver_thread_budget`); the
-        default 1 runs the serial path, results are bit-equal either way.
-    :return: A dict ``{parity_label: (lambdas, gaps)}`` of the leading eigenvalues and :class:`GapFunction` objects
-        per physical frequency-parity sector (a single ``"none"`` key when no projection is requested). The sector
-        projectors act on the full (undistributed) gap vector the eigensolver sees, so the frequency distribution is
-        transparent to them.
-    """
-    logger = config.logger
-    root = active_ranks[0]
-    # distributor operations are rooted at rank 0 of ITS communicator: the first active rank, whether the
-    # distributor spans all ranks (all active) or the Split sub-communicator (keyed on the original rank)
-    dist_root = 0
-
-    logger.info(
-        f"Starting to solve the Eliashberg equation for the {gamma_r_pp.channel.value}let channel.",
-        allowed_ranks=root,
-    )
-    logger.log_memory_usage(f"Gamma_pp_{gamma_r_pp.channel.value}", gamma_r_pp, len(active_ranks), allowed_ranks=root)
-
-    gamma_r_pp = gamma_r_pp.fft(False).decompress_q_dimension()
-
-    gap_shape = gamma_r_pp.nq + 2 * (gamma_r_pp.n_bands,) + (gamma_r_pp.current_shape[-1],)
-
-    gap0 = get_initial_gap_function(gap_shape, gamma_r_pp.channel)
-    gap0 = mpi_dist_v.bcast_chunked(gap0, root=dist_root)
-
-    symmetry_label = config.eliashberg.symmetry.lower() if config.eliashberg.symmetry else "random"
-    logger.info(
-        f"Initialized the gap function as {symmetry_label} for {_sector_log_label(gamma_r_pp.channel)}.",
-        allowed_ranks=root,
-    )
-
-    n_bands = gamma_r_pp.n_bands
-    norm = 0.5 / config.lattice.k_grid.nk_tot / config.sys.beta
-    # every active rank computes simultaneously here, so the budget divides this rank's affinity mask among the
-    # node's active ranks (see _v2_solver_thread_budget); 1 under one-core-per-rank binding = serial path
-    executor = ThreadPoolExecutor(max_workers=n_threads) if n_threads > 1 else None
-
-    # Batched-matmul layout (see solve_eliashberg_lanczos): chi0 on the root rank (a view), the frequency-sliced
-    # pairing vertex materialized once per rank; the flipped vertex is never stored (matvec reuses the direct array).
-    chi0_mm = _chi0_to_matmul_layout(gchi0_q0_pp.mat) if mpi_dist_v.comm.rank == dist_root else None
-    # w2dynamics G2 leg order (c cdag c cdag) vs the TRIQS order (cdag c cdag c) that _apply_gamma_pp expects: they
-    # differ by the "abcd->badc" swap (o1<->o2, o3<->o4), which aligns the gap's creation legs; no-op for one band.
-    gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.permute_orbitals("abcd->badc", False).mat)
-    gamma_r_pp.free()
-    # fold the kernel prefactor into the persistent vertex once (see solve_eliashberg_lanczos): both matvec terms
-    # inherit it by linearity, dropping the per-matvec full-gap multiply.
-    gamma_mm *= norm
-
-    sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
-
-    def mv(gap: np.ndarray):
-        r"""
-        Applies the pairing kernel to a flattened gap vector in the frequency-distributed scheme: the root rank
-        multiplies by :math:`\chi_0^{\mathrm{pp}}` and broadcasts, all ranks FFT and contract with their frequency slice
-        of the pairing vertex, then the result is reassembled across the frequency axis via all-gather. The orbital
-        contractions and the BZ transforms are threaded up to this rank's budget (serial for a budget of 1).
-
-        :param gap: The flattened gap vector (full on root, sliced elsewhere).
-        :return: The flattened result of applying the pairing kernel to ``gap``.
-        """
-        # 1. multiply chi0 * gap for the full BZ (only done by one rank, since memory would be an issue)
-        gap_gg = (
-            _apply_gchi0_pp(chi0_mm, gap, n_bands, executor, n_threads) if mpi_dist_v.comm.rank == dist_root else None
-        )
-        gap_gg = mpi_dist_v.bcast_chunked(gap_gg, root=dist_root)
-        # 2. perform Fourier transform for the full chi0 * gap quantity
-        gap_gg = sp.fft.fftn(gap_gg, axes=(0, 1, 2), overwrite_x=True, workers=n_threads)
-        # 3. contract with the pairing vertex over (c, d, p) -> the gap for this rank's v slice; the crossed term
-        #    reuses the direct vertex: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]
-        gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands, executor, n_threads)
-        crossed = _apply_gamma_pp(
-            gamma_mm, np.ascontiguousarray(np.flip(gap_gg, axis=-1)), n_bands, executor, n_threads
-        )
-        crossed = np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-        if sign != 1:
-            crossed *= sign
-        gap_new += crossed
-        # 4. perform fourier transform on the local v slice
-        gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True, workers=n_threads)
-        # 5. assemble gap_new for the full v range through mpi_dist_v and allgather (remember we distributed v)
-        gap_new = np.moveaxis(gap_new, -1, 0)  # (v_local, nq_tot, orb, orb)
-        gap_new = mpi_dist_v.allgather(gap_new)  # (v_total, nq_tot, orb, orb)
-        return np.moveaxis(gap_new, 0, -1).flatten()  # (nq_tot, orb, orb, v_total)
-
-    return _solve_pairing_sectors(
-        mv, gap_shape, sign, gamma_r_pp.channel, gamma_r_pp.nq, executor, (root,), gap0.flatten()
-    )
-
-
 def dispatch_full_vertex_calculation(
-    channel: SpinChannel, u_loc: LocalInteraction, v_nonloc: Interaction, niv_pp: int, mpi_dist: MpiDistributor
+    channel: SpinChannel,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    niv_pp: int,
+    mpi_dist: MpiDistributor,
+    chunk_bytes: int | None = None,
 ) -> FourPoint:
     r"""
-    Loads the local irreducible vertex for ``channel`` and builds the full ladder pp vertex, dispatching between the
-    memory-lean and the regular construction routine based on the memory configuration. Please note that Eq. (4.43) in
+    Loads the local irreducible vertex for ``channel`` and builds the full ladder pp vertex through the slice-direct
+    construction, streaming the ph-notation vertex to disk when ``save_fq`` is set. Please note that Eq. (4.43) in
     my master's thesis is wrong. The correct formula is
     :math:`F^{\mathrm{q}\nu\nu'}_{r;1234}=F^{(1);\mathrm{q}\nu\nu'}_{r;1234}+F^{(2);\mathrm{q}\nu\nu'}_{r;1234}`, with
     :math:`F^{(1);\mathrm{q}\nu\nu'}_{r;1234} = \beta^2\Big[(\chi^{\mathrm{q}\nu\nu'}_{0;1234})^{-1}-
@@ -1684,13 +1679,14 @@ def dispatch_full_vertex_calculation(
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist: MPI distributor over the irreducible BZ q-points.
+    :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
     :return: The full ladder pp vertex :math:`F^{\mathrm{q}}_{r}` as a :class:`FourPoint`.
     """
     gamma_r = LocalFourPoint.load(os.path.join(config.output.output_path, f"gamma_{channel.value}_loc.npy"), channel)
-    if config.memory.save_memory_for_fq:
-        f_q_r = create_full_vertex_q_r_pp_w0_v2(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist)
+    if config.eliashberg.save_fq:
+        f_q_r = create_pairing_vertex_streaming_fq(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist, chunk_bytes)
     else:
-        f_q_r = create_full_vertex_q_r_pp_w0(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist)
+        f_q_r = create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist, chunk_bytes)
     gamma_r.free()
     mpi_dist.barrier()
     return f_q_r
@@ -1790,8 +1786,9 @@ def solve(
     r"""
     Drives the Eliashberg step: assembles the singlet and triplet pairing vertices from the saved
     ladder-DGA full vertices (optionally adding the local reducible diagrams), then solves the linearized gap equation
-    for each channel and returns the leading eigenvalues and gap functions. Dispatches between the in-memory and the
-    memory-lean Lanczos solvers depending on the memory configuration.
+    for each channel and returns the leading eigenvalues and gap functions. Solves in memory with concurrent
+    (channel x parity) sectors when one sector's residency fits on a rank, and on the block-distributed solver grid
+    otherwise (decided automatically from the available node memory).
 
     :param giwk_dga: The converged momentum-dependent DGA :class:`GreensFunction`.
     :param g_dmft: The local (DMFT) :class:`GreensFunction` (used for the local diagrams).
@@ -1804,6 +1801,7 @@ def solve(
         otherwise a single unprojected ``"none"`` sector is returned.
     """
     logger = config.logger
+    import psutil
 
     mpi_dist_irrk = MpiDistributor.create_distributor(
         ntasks=config.lattice.k_grid.nk_irr, comm=comm, name="Q", output_path=config.output.output_path
@@ -1816,34 +1814,64 @@ def solve(
     parities = [parity for parity, _ in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)]
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
 
-    # giwk_dga is consumed only by the pp-bubble build on a single rank (the in-memory bubble rank, or rank 0 of the
-    # frequency-distributed variant), so every other rank drops its replicated full-grid copy for this phase.
-    if config.memory.save_memory_for_lanczos:
+    # per-node memory drives the solver choice and how many (channel, parity) sectors run concurrently; the
+    # residencies come from the one memory_estimator formula, so dispatch and estimate can never drift apart
+    per_sector_bytes, _ = lanczos_solver_bytes(
+        config.sys.n_bands,
+        config.lattice.k_grid.nk_tot,
+        config.lattice.k_grid.nk_irr,
+        niv_pp,
+        config.eliashberg.n_eig,
+        comm.size,
+    )
+    # one full-BZ sector residency per rank picks the in-memory solve, otherwise the grid takes over; rank 0
+    # decides and broadcasts, so ranks on differently loaded nodes can never pick different solvers
+    use_grid = FORCE_GRID_SOLVER or (
+        comm.size > 1
+        and per_sector_bytes + giwk_dga.mat.nbytes > psutil.virtual_memory().available * NODE_MEMORY_FRACTION
+    )
+    use_grid = comm.bcast(use_grid, root=0)
+    if use_grid:
         sing_ranks = trip_ranks = None
         bubble_rank = 0
-    else:
-        import psutil
-
-        # per-node memory drives how many (channel, parity) sectors run concurrently: pack as many per node as its
-        # free memory fits, so the sectors parallelize without overcommitting a node (the estimate mirrors the
-        # memory_estimator lanczos peak - LANCZOS_VERTEX_FACTOR full-BZ pp vertices + the pp bubble + ARPACK basis)
-        itemsize = np.dtype(DTYPE).itemsize
-        n2 = 2 * niv_pp
-        vertex_pp_full = config.lattice.k_grid.nk_tot * config.sys.n_bands**4 * n2**2 * itemsize
-        chi0_pp_full = config.lattice.k_grid.nk_tot * config.sys.n_bands**4 * n2 * itemsize
-        gap_bytes = config.lattice.k_grid.nk_tot * config.sys.n_bands**2 * n2 * itemsize
-        per_sector_bytes = (
-            LANCZOS_VERTEX_FACTOR * vertex_pp_full + chi0_pp_full + (2 * config.eliashberg.n_eig + 20) * gap_bytes
+        _, grid_bytes = lanczos_solver_bytes(
+            config.sys.n_bands,
+            config.lattice.k_grid.nk_tot,
+            config.lattice.k_grid.nk_irr,
+            niv_pp,
+            config.eliashberg.n_eig,
+            comm.size,
         )
+        rows, cols = solver_grid_shape(comm.size, 2 * niv_pp)
+        logger.info(
+            f"Eliashberg solver: one sector needs {per_sector_bytes / 1024**3:.3f} GB, exceeding the single-rank "
+            f"budget -> block-distributed {rows}x{cols} grid, sectors sequential, {grid_bytes / 1024**3:.3f} GB "
+            f"per rank."
+        )
+    else:
         sing_ranks, trip_ranks = get_ranks_for_lanczos(
             comm, len(parities), psutil.virtual_memory().available, per_sector_bytes, giwk_dga.mat.nbytes
         )
         bubble_rank = sing_ranks[0]
+        n_concurrent = len(set(sing_ranks) | set(trip_ranks))
+        n_sectors = 2 * len(parities)
+        logger.info(
+            f"Eliashberg solver: {n_sectors} (channel x parity) sector(s) on {n_concurrent} rank(s) "
+            f"({'fully concurrent' if n_concurrent == n_sectors else 'partly sequential'}; singlet on rank(s) "
+            f"{sorted(set(sing_ranks))}, triplet on rank(s) {sorted(set(trip_ranks))}), each holding at most "
+            f"{per_sector_bytes / 1024**3:.3f} GB."
+        )
+    # giwk_dga is consumed only by the pp-bubble build on bubble_rank, so every other rank drops its copy
     if comm.rank != bubble_rank:
         giwk_dga.free()
 
-    f_dens_pp = dispatch_full_vertex_calculation(SpinChannel.DENS, u_loc, v_nonloc, niv_pp, mpi_dist_irrk)
-    f_magn_pp = dispatch_full_vertex_calculation(SpinChannel.MAGN, u_loc, v_nonloc, niv_pp, mpi_dist_irrk)
+    node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED) if comm.size > 1 else None
+    chunk_bytes = memory_estimator.dynamic_chunk_budget(
+        psutil.virtual_memory().total, node_comm.size if node_comm is not None else 1
+    )
+
+    f_dens_pp = dispatch_full_vertex_calculation(SpinChannel.DENS, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes)
+    f_magn_pp = dispatch_full_vertex_calculation(SpinChannel.MAGN, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes)
 
     delete_files(config.output.eliashberg_path, f"gchi0_q_inv_rank_{comm.rank}.npy")
 
@@ -1859,37 +1887,33 @@ def solve(
     f_magn_pp.free()
     logger.info("Calculated full ladder-vertex (triplet) in pp notation.")
 
-    if config.eliashberg.include_local_part:
-        # the local diagrams are reduced from local vertices on the full asymptotic fermionic box; one rank per node
-        # reads and reduces them and broadcasts the pp-box-sized results, so that transient exists once per node
-        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED) if comm.size > 1 else None
-        f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0 = _compute_once_per_node(
-            node_comm, lambda: create_local_ud_diagrams_pp_w0(g_dmft, niv_pp)
-        )
+    # the local diagrams are reduced from local vertices on the full asymptotic fermionic box; one rank per node
+    # reads and reduces them and broadcasts the pp-box-sized results, so that transient exists once per node
+    f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0 = _compute_once_per_node(
+        node_comm, lambda: create_local_ud_diagrams_pp_w0(g_dmft, niv_pp)
+    )
 
-        if mpi_dist_irrk.my_rank == 0:
-            f_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="f_ud_loc_pp_w0")
-            phi_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="phi_ud_loc_pp_w0")
-            gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
-            logger.info("Saved local ud diagrams in pp notation to file.")
+    if mpi_dist_irrk.my_rank == 0:
+        f_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="f_ud_loc_pp_w0")
+        phi_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="phi_ud_loc_pp_w0")
+        gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
+        logger.info("Saved local ud diagrams in pp notation to file.")
 
-        del f_ud_loc_pp_w0, gamma_ud_loc_pp_w0
+    del f_ud_loc_pp_w0, gamma_ud_loc_pp_w0
 
-        # special treatment of local full vertex that is subtracted with a different frequency notation and is
-        # different from the regular pp
-        f_ud_loc_transf_w0 = _compute_once_per_node(node_comm, lambda: create_local_f_ud_transformed_w0(niv_pp))
-        if node_comm is not None:
-            node_comm.Free()
+    # special treatment of local full vertex that is subtracted with a different frequency notation and is
+    # different from the regular pp
+    f_ud_loc_transf_w0 = _compute_once_per_node(node_comm, lambda: create_local_f_ud_transformed_w0(niv_pp))
+    if node_comm is not None:
+        node_comm.Free()
 
-        # Eqs. (4.49)-(4.52): the assembled vertex holds the negative crossed slot, so the local full vertex enters with
-        # a relative minus and the pp-reducible diagrams phi with a plus, both in crossed-slot form ((v, -v'), 1432).
-        phi_ud_loc_pp_w0 = phi_ud_loc_pp_w0.flip_frequency_axis(-1, copy=False).permute_orbitals(
-            "abcd->adcb", copy=False
-        )
-        delta_loc = phi_ud_loc_pp_w0.sub(f_ud_loc_transf_w0)
-        gamma_sing_pp.add(delta_loc, copy=False)
-        gamma_trip_pp.add(delta_loc, copy=False)
-        del phi_ud_loc_pp_w0, f_ud_loc_transf_w0, delta_loc
+    # Eqs. (4.49)-(4.52): the assembled vertex holds the negative crossed slot, so the local full vertex enters with
+    # a relative minus and the pp-reducible diagrams phi with a plus, both in crossed-slot form ((v, -v'), 1432).
+    phi_ud_loc_pp_w0 = phi_ud_loc_pp_w0.flip_frequency_axis(-1, copy=False).permute_orbitals("abcd->adcb", copy=False)
+    delta_loc = phi_ud_loc_pp_w0.sub(f_ud_loc_transf_w0)
+    gamma_sing_pp.add(delta_loc, copy=False)
+    gamma_trip_pp.add(delta_loc, copy=False)
+    del phi_ud_loc_pp_w0, f_ud_loc_transf_w0, delta_loc
 
     if config.eliashberg.save_pairing_vertex:
         gamma_sing_pp.mat = mpi_dist_irrk.gather(gamma_sing_pp.mat)
@@ -1905,78 +1929,29 @@ def solve(
         gamma_trip_pp.mat = mpi_dist_irrk.scatter(gamma_trip_pp.mat)
         logger.info(f"Saved singlet and triplet pairing vertices in pp notation in the irreducible BZ to file.")
 
-    def empty_sector_gaps() -> list[GapFunction]:
-        return [GapFunction(np.empty(0)) for _ in range(config.eliashberg.n_eig)]
-
-    results: dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]] = {}
-
-    if not config.memory.save_memory_for_lanczos:
+    if use_grid:
+        gchi0_q_pp = None
+        if comm.rank == bubble_rank:
+            gchi0_q_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(giwk_dga, niv_pp, config.lattice.k_grid)
+            logger.info("Created the bare bubble susceptibility in pp notation.", allowed_ranks=(bubble_rank,))
+        results = {}
+        for gamma_pp in (gamma_sing_pp, gamma_trip_pp):
+            channel = gamma_pp.channel
+            sectors = solve_eliashberg_lanczos_grid(gamma_pp, gchi0_q_pp, comm, bubble_rank)
+            for parity in parities:
+                local = sectors[parity] if sectors is not None else None
+                lambdas = comm.bcast(local[0] if local is not None else None, root=0)
+                gaps = (
+                    local[1]
+                    if local is not None
+                    else [GapFunction(np.empty(0)) for _ in range(config.eliashberg.n_eig)]
+                )
+                gaps = [mpi_dist_irrk.bcast_npoint(gap, root=0) for gap in gaps]
+                results[(channel, parity)] = (lambdas, gaps)
+    else:
         results = _solve_sectors_in_memory(
             mpi_dist_irrk, gamma_sing_pp, gamma_trip_pp, giwk_dga, niv_pp, sing_ranks, trip_ranks, bubble_rank, parities
         )
-    else:
-        mpi_dist_v = MpiDistributor.create_distributor(
-            ntasks=gamma_sing_pp.current_shape[-2], comm=comm, name="V", output_path=config.output.output_path
-        )
-
-        logger.info("Distributing Gamma_sing_pp along v equally to ranks/nodes.")
-        gamma_sing_pp = mpi_utils.gather_full_ibz_for_vslice(
-            gamma_sing_pp, mpi_dist_irrk, mpi_dist_v, config.lattice.k_grid
-        )
-        logger.info("Gamma_sing_pp distributed. Starting with singlet Lanczos solver.")
-
-        active_ranks = [
-            r
-            for r in range(comm.size)
-            if mpi_dist_v.slices[r] is not None and (mpi_dist_v.slices[r].stop - mpi_dist_v.slices[r].start) > 0
-        ]
-
-        root = active_ranks[0]
-        # collective on the full comm (inactive ranks included): splits each active rank's affinity mask among the
-        # active ranks of its node, so the matvec threading never oversubscribes shared cores
-        v2_n_threads = _v2_solver_thread_budget(comm, active_ranks)
-        # the matvec collectives must span exactly the ranks that enter the solve: with empty frequency slices
-        # present, the active ranks run on a Split sub-communicator carrying only their slices
-        if len(active_ranks) < comm.size:
-            active_comm = comm.Split(0 if comm.rank in active_ranks else 1, comm.rank)
-            solver_dist_v = mpi_dist_v.restricted_to(active_comm, active_ranks) if comm.rank in active_ranks else None
-        else:
-            solver_dist_v = mpi_dist_v
-        if comm.rank == root:
-            # calculating gchi0 in the full BZ only once
-            # in the lanczos step only active_rank[0] will perform chi0 * delta due to memory reasons
-            gchi0_q_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(
-                giwk_dga, niv_pp, config.lattice.k_grid
-            ).decompress_q_dimension()
-        else:
-            gchi0_q_pp = None
-
-        sectors_sing = sectors_trip = None
-        if comm.rank in active_ranks:
-            sectors_sing = solve_eliashberg_lanczos_v2(
-                gamma_sing_pp, gchi0_q_pp, solver_dist_v, active_ranks, v2_n_threads
-            )
-            gamma_sing_pp.free()
-
-        logger.info("Distributing Gamma_trip_pp along v equally to ranks/nodes.")
-        gamma_trip_pp = mpi_utils.gather_full_ibz_for_vslice(
-            gamma_trip_pp, mpi_dist_irrk, mpi_dist_v, config.lattice.k_grid
-        )
-        logger.info("Gamma_trip_pp distributed. Starting with triplet Lanczos solver.")
-
-        if comm.rank in active_ranks:
-            sectors_trip = solve_eliashberg_lanczos_v2(
-                gamma_trip_pp, gchi0_q_pp, solver_dist_v, active_ranks, v2_n_threads
-            )
-            gamma_trip_pp.free()
-
-        for channel, sectors in ((SpinChannel.SING, sectors_sing), (SpinChannel.TRIP, sectors_trip)):
-            for parity in parities:
-                local = sectors[parity] if sectors is not None else None
-                lambdas = comm.bcast(local[0] if local is not None else None, root=root)
-                gaps = local[1] if local is not None else empty_sector_gaps()
-                gaps = [mpi_dist_irrk.bcast_npoint(gap, root=root) for gap in gaps]
-                results[(channel, parity)] = (lambdas, gaps)
 
     return results
 

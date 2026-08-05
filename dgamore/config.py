@@ -7,7 +7,7 @@
 Global configuration singleton. This module holds the process-wide mutable state of a DGAmore run as module-level
 instances of the ``*Config`` classes (``box``, ``lattice``, ``sys``, ``dmft``, ``eliashberg``,
 ``lambda_correction``, ``self_consistency``, ``stabilization``, ``self_energy_interpolation``, ``output``,
-``memory``, ``ana_cont``, and the ``logger``). :class:`ConfigParser` populates these from a YAML file on rank 0, after which they are
+``ana_cont``, and the ``logger``). :class:`ConfigParser` populates these from a YAML file on rank 0, after which they are
 broadcast to all MPI ranks; most modules read their parameters directly off this module rather than receiving them
 as arguments, so mutating a field changes behavior everywhere. Each ``*Config`` class documents its fields; the
 example YAML config is ``dgamore/dga_config.yaml``.
@@ -169,7 +169,6 @@ class EliashbergConfig:
     :ivar int n_eig: Number of leading eigenvalues/gap functions to compute per channel.
     :ivar float epsilon: Convergence tolerance for the Lanczos eigensolver.
     :ivar str symmetry: Initial gap-function symmetry (``"d-wave"``, ``"p-wave-x"``, ``"p-wave-y"``, or ``"random"``).
-    :ivar bool include_local_part: Whether to add the local reducible pp diagrams to the pairing vertex.
     :ivar bool symmetrize_degenerate_gaps: Whether to orthonormalize the gap functions within (near-)degenerate
         eigenvalue clusters and rotate each cluster to the basis adapted to the point-group mirrors, which act on the
         orbital indices as well as on the momenta (see
@@ -188,9 +187,8 @@ class EliashbergConfig:
         self.n_eig: int = 4
         self.epsilon: float = 1e-6
         self.symmetry: str = "random"
-        self.include_local_part: bool = True
         self.symmetrize_degenerate_gaps: bool = True
-        self.resolve_frequency_parity: bool = False
+        self.resolve_frequency_parity: bool = True
         self.subfolder_name: str = "Eliashberg"
 
 
@@ -298,29 +296,6 @@ class OutputConfig:
         self.eliashberg_path: str = "./Eliashberg/"
 
 
-class MemoryConfig:
-    """
-    Stores the speed-vs-memory trade-off switches. Each flag, when True, selects a slower but more memory-lean code
-    path for the corresponding quantity.
-
-    :ivar bool save_memory_for_chi0q: Use the per-q einsum bubble instead of the FFT bubble.
-    :ivar bool save_memory_for_chiq_aux: Use the per-q auxiliary-susceptibility path and per-rank BZ mapping.
-    :ivar bool save_memory_for_fq: Use the per-q full-vertex construction in the Eliashberg step.
-    :ivar bool save_memory_for_lanczos: Use the frequency-distributed Lanczos solver.
-    :ivar bool use_shared_memory_common_obj: Store replicated full-grid objects that are common to all ranks - the
-        lattice Green's function ``giwk_full`` and its real-space copy in the Schwinger-Dyson step - in one MPI
-        shared-memory window per node (computed only by the node root) instead of one private copy per rank. Enabled
-        by default; disable it if cross-socket (NUMA) reads of the shared buffers outweigh the memory saving.
-    """
-
-    def __init__(self):
-        self.save_memory_for_chi0q: bool = False
-        self.save_memory_for_chiq_aux: bool = False
-        self.save_memory_for_fq: bool = False
-        self.save_memory_for_lanczos: bool = False
-        self.use_shared_memory_common_obj: bool = True
-
-
 class AnaContConfig:
     """
     Stores the analytic-continuation (maximum-entropy) configuration.
@@ -358,5 +333,4 @@ self_energy_interpolation: SelfEnergyInterpolationConfig = SelfEnergyInterpolati
 self_consistency: SelfConsistencyConfig = SelfConsistencyConfig()
 stabilization: StabilizationConfig = StabilizationConfig()
 eliashberg: EliashbergConfig = EliashbergConfig()
-memory: MemoryConfig = MemoryConfig()
 ana_cont: AnaContConfig = AnaContConfig()

@@ -260,21 +260,23 @@ Superconducting properties are obtained by solving the linearized Eliashberg equ
      n_eig: 4                     # int
      epsilon: 1e-6                # float
      symmetry: "random"           # str
-     include_local_part: True     # bool
      symmetrize_degenerate_gaps: True # bool
-     resolve_frequency_parity: False # bool
+     resolve_frequency_parity: True # bool
      subfolder_name: "Eliashberg" # str
 
 The equation is solved only when ``perform_eliashberg`` is ``True``. Enabling ``save_pairing_vertex`` or ``save_fq``
-writes the pairing vertex or the full ladder vertex on the irreducible Brillouin zone to the output folder.
+writes the pairing vertex or the full ladder vertex on the irreducible Brillouin zone to the output folder. With
+``save_fq`` every rank streams its blocks of the full vertex into a single memory-mapped ``.npy`` file while the
+pairing vertex is assembled, so no rank ever gathers or holds the whole object; the file layout is unchanged. It is
+still an inherently large file (``nk_irr * no^4 * (niw_core + 1) * (2 niv_core)^2`` complex64 entries), so writing it
+remains I/O-bound at scale.
 
 The equation is solved with a Lanczos algorithm based on the ARPACK routines, retrieving the ``n_eig`` largest
 eigenvalues and the corresponding gap functions to an accuracy of ``epsilon``. The ``symmetry`` field sets the
 starting vector of the iteration: entering ``"d-wave"``, for example, begins from a gap function with d-wave
 symmetry, but ``"random"`` is sufficient most of the time. The random start is drawn from a fixed seed, so a run
-reproduces the same gap functions when repeated. The pairing vertex includes local reducible diagrams by default,
-which can be skipped by setting ``include_local_part`` to ``False``; this is only advisable when s-wave symmetry is
-not expected, as these diagrams become relevant in that case. With ``symmetrize_degenerate_gaps`` enabled (the
+reproduces the same gap functions when repeated. The pairing vertex always includes the local reducible pp
+diagrams. With ``symmetrize_degenerate_gaps`` enabled (the
 default), gap functions belonging to (near-)degenerate eigenvalues are orthogonalized with a Loewdin scheme and
 rotated to their mirror-adapted partners: single-axis (:math:`p_x`/:math:`p_y`/:math:`p_z`-like) and two-axis
 (:math:`d_{xy}`/:math:`d_{xz}`/:math:`d_{yz}`-like) modes are ordered by the mirrors they are odd under. The mirrors
@@ -408,56 +410,3 @@ primitive reciprocal lattice and whose fourth element is its label (the example 
 default path). The ``energy_window`` parameter sets the bounds of the frequency axis in the resulting spectral
 plots.
 
-Memory efficiency
------------------
-
-For very large parameter sets memory becomes the main bottleneck, owing to the vectorized nature of the implemented
-equations. This section therefore exposes more memory-efficient algorithms for four of the heaviest steps.
-
-.. code-block:: yaml
-
-   memory:
-     save_memory_for_chi0q: False    # bool
-     save_memory_for_chiq_aux: False # bool
-     save_memory_for_fq: False       # bool
-     save_memory_for_lanczos: False  # bool
-     use_shared_memory_common_obj: True    # bool
-
-The first four switches control, in turn, the construction of the bare bubble susceptibility, of the auxiliary
-susceptibility entering the Schwinger-Dyson equation, of the full ladder vertices for the Eliashberg equation, and
-of the Lanczos algorithm. Enabling any of them increases the runtime substantially because of the additional
-Python-level looping and MPI communication. Under the hood, the bubble uses fast Fourier transforms when its switch
-is left at ``False``; this gives by far the largest speed-up while barely affecting the memory footprint, so it can
-be kept at the default in almost all cases. The Schwinger-Dyson equation itself has no switch: it always runs its
-Fourier-transformed form, which processes the two bosonic frequency halves in separate passes and thereby needs no
-more memory than the alternative momentum-loop formulation would. The largest memory savings come from the
-auxiliary-susceptibility and full-ladder-vertex switches, which shrink those objects considerably, whereas the
-Lanczos switch matters only for extremely large parameter sets and can usually stay disabled.
-
-In practice these switches rarely need to be set by hand. Before the heavy part of a run begins, DGAmore inspects
-the memory available on every node together with an analytic estimate of the peak memory each of the heavy steps
-(including the switch-less Schwinger-Dyson contraction) consumes, accounting for how the momentum points are
-distributed across the MPI ranks that share a node. Whenever
-the default, faster variant of a step would not fit, the corresponding switch is turned on automatically. The
-estimate is evaluated as a node total: it sums, over all ranks placed on a node, the data that each rank keeps
-resident throughout the calculation plus the transient peak of the step in question, and requires the result to stay
-below ninety-seven percent of that node's available memory. Because the switches act process-wide, the most constrained
-node decides whether a given switch is enabled.
-
-A switch that is explicitly set to ``True`` in the configuration is always honored: the automatic detection can
-only enable additional switches, never turn off one that was requested. Conversely, if the variant of a step that is
-about to run does not fit on some node - because neither of its variants fits, or because a switch forced by the
-configuration selects a variant that does not - the run stops immediately with a ``MemoryError`` that recommends
-using more nodes, fewer ranks per node, or a smaller frequency box or momentum grid, rather than failing
-unpredictably partway through.
-
-The final switch, ``use_shared_memory_common_obj``, is of a different kind and is enabled by default. The full-grid lattice
-Green's function is identical on every rank, yet each rank would normally rebuild and store its own copy, so a node
-running many ranks holds that (large) array many times over. When this switch is on, the ranks that share a physical
-node instead keep a single copy in one MPI shared-memory window: the Dyson inversion is performed only by that node's
-first rank and the others map the same buffer read-only. The real-space copy of the Green's function used by the
-Schwinger-Dyson contraction is deduplicated through the same mechanism (built once per node, with each rank keeping
-only its slice of real-space points). The node topology is discovered automatically at runtime, so nothing about the
-cluster needs to be configured. Independently of this switch, the Eliashberg step no longer holds replicated
-full-grid objects: ``sigma_dga`` is freed on every rank before the step (it is already saved to disk) and
-``giwk_dga`` survives only on the rank that builds the pairing bubble.

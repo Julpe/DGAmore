@@ -61,9 +61,8 @@ eliashberg:
   n_eig: 4 # Number of eigenvalues and eigenvectors to be calculated. Default: 4
   epsilon: 1e-6 # Convergence criterion for the eigenvalues and eigenvectors
   symmetry: "random" # Symmetry of the gap function that will be used as a starting point for the ARNOLDI Lanczos. Available: p-wave-x, p-wave-y, d-wave, random
-  include_local_part: True # If True, the local part of the pairing vertex is included in the Eliashberg calculation. This is only relevant if one might expect s-wave symmetry.
   symmetrize_degenerate_gaps: True # If True, gap functions within (near-)degenerate eigenvalue clusters are orthogonalized (Loewdin) and rotated to the mirror-adapted basis, using the full point-group mirrors (momentum reflection plus the orbital transformation solved for from H(k)); multiplets the coordinate mirrors cannot split keep the Loewdin basis.
-  resolve_frequency_parity: False # If True, project each channel's gap onto its physical frequency-even and frequency-odd sectors (paired momentum-orbital parity fixed by Pauli) and return both; if False, return the overall leading eigenpairs unprojected.
+  resolve_frequency_parity: True # If True, project each channel's gap onto its physical frequency-even and frequency-odd sectors (paired momentum-orbital parity fixed by Pauli) and return both; if False, return the overall leading eigenpairs unprojected.
   subfolder_name: "Eliashberg" # name for the subfolder where certain outputs are generated
 
 self_energy_interpolation:
@@ -88,19 +87,4 @@ ana_cont:
   # fractional coordinates in the primitive (not conventional!) k-space basis, and the label for the plot.
   energy_window: [ -2, 3 ] # Energy window for the plot of the spectral function in eV.
 
-memory:
-  # These flags are auto-detected at startup from each node's available RAM.
-  # A value left False may still be switched ON automatically if the fast path would not fit in memory;
-  # an explicit True is always honored (auto-detection only ever enables a flag, never disables it).
-  save_memory_for_chi0q: False # If True, the code will construct chi0(q) in a way that is more memory efficient,
-  # but much slower. If False, the code will use FFT, which requires larger intermediate arrays, but is much faster.
-  save_memory_for_chiq_aux: False # If True, the code will construct the auxiliary susceptibility chi(q) (equal in size
-  # compared to F(q)) in a way that is more memory efficient, but much slower.
-  save_memory_for_fq: False # If True, the code will construct F(qvv') for the d/m channels in a way that is
-  # less memory intensive, but it will increase runtime.
-  save_memory_for_lanczos: False # If True, the code will perform the Lanczos algorithm with the pairing vertex for
-  # the Eliashberg calculation in a more memory efficient way. This will reduce memory usage but increase runtime
-  # due to required MPI communication in each Lanczos step.
-  use_shared_memory_common_obj: True # If True (default), replicated full-grid objects that are common to all ranks (the
-  # lattice Green's function and its real-space copy in the Schwinger-Dyson step) are stored once per node in MPI
   # shared-memory windows (computed only by the node's first rank)

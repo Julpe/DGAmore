@@ -1664,3 +1664,32 @@ def test_q_mean_preserves_complex64_dtype():
     mat = np.ones((4, 4, 2, 3), dtype=np.complex64)
     obj = IAmNonLocal(mat, (4, 4, 2))
     assert obj.q_mean().mat.dtype == np.complex64
+
+
+def test_deferred_collection_batches_gc_into_one_sweep(monkeypatch):
+    """Inside deferred_collection() free() skips the per-object gc sweep; leaving the context collects once."""
+    calls = []
+    monkeypatch.setattr(npb.gc, "collect", lambda: calls.append(1))
+
+    with npb.deferred_collection():
+        for _ in range(5):
+            IHaveMat(np.zeros((2, 2))).free()
+        assert calls == []
+    assert len(calls) == 1
+
+    survivor = IHaveMat(np.zeros((2, 2)))
+    survivor.free()
+    assert len(calls) == 2
+
+
+def test_take_q_index_slice_restricts_to_an_index_window_of_the_compressed_axis():
+    """take_q_index_slice returns an independent compressed copy holding the momentum index window [start, stop)."""
+    mat = (np.arange(4 * 2 * 2 * 6).reshape(4, 2, 2, 6)).astype(np.complex64)
+    obj = IAmNonLocal(mat.copy(), (4, 1, 1), has_compressed_q_dimension=True)
+
+    out = obj.take_q_index_slice(1, 3)
+
+    assert out.current_shape == (2, 2, 2, 6)
+    assert out.nq == (2, 1, 1)
+    assert np.array_equal(out.mat, mat[1:3])
+    assert np.array_equal(obj.mat, mat)

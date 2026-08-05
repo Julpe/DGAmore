@@ -52,48 +52,6 @@ def comm1():
     return MPI.Comm(1)
 
 
-def test_node_aware_single_node():
-    """_get_node_aware_v_dist puts the frequency excess on the first ranks for a single node."""
-
-    # 7 frequencies, 3 ranks, all on one node -> excess on the first ranks.
-    def fn(comm, rank):
-        sizes, slices = mu._get_node_aware_v_dist(7, comm)
-        return list(sizes), [(s.start, s.stop) for s in slices]
-
-    _, res = run_parallel(3, fn, hostnames=["host", "host", "host"])
-    for sizes, slices in res:
-        assert sizes == [3, 2, 2]
-        assert slices == [(0, 3), (3, 5), (5, 7)]
-
-
-def test_node_aware_multi_node():
-    """_get_node_aware_v_dist splits frequencies per node consistently: 6 frequencies over 2 nodes gives 3 per node."""
-    hostnames = ["n0", "n1", "n0", "n1"]
-
-    def fn(comm, rank):
-        sizes, slices = mu._get_node_aware_v_dist(6, comm)
-        return list(sizes)
-
-    _, res = run_parallel(4, fn, hostnames=hostnames)
-    sizes = res[0]
-    assert sum(sizes) == 6
-    assert all(s == sizes for s in res)
-
-
-def test_node_aware_uneven_nodes():
-    """_get_node_aware_v_dist preserves the total over unevenly sized nodes."""
-    # 3 nodes, 5 frequencies -> 2,2,1 across nodes; total preserved.
-    hostnames = ["a", "b", "c", "a"]
-
-    def fn(comm, rank):
-        sizes, _ = mu._get_node_aware_v_dist(5, comm)
-        return list(sizes)
-
-    _, res = run_parallel(4, fn, hostnames=hostnames)
-    assert sum(res[0]) == 5
-    assert all(s == res[0] for s in res)
-
-
 def test_send_recv_in_chunks_roundtrip():
     """_send_in_chunks / _recv_in_chunks round-trip a 2D complex array."""
     arr = (np.arange(5 * 3).reshape(5, 3) + 1j).astype(np.complex128)
@@ -439,91 +397,6 @@ def test_execute_distributed_fft_matches_numpy():
     for size in (1, 2, 3):
         rebuilt = _run_dist_fft(size, G.copy(), nq)
         assert np.allclose(rebuilt, expected), f"mismatch for size={size}"
-
-
-def test_gather_full_ibz_for_vslice():
-    """gather_full_ibz_for_vslice gives each rank the full IBZ for its frequency slice."""
-    n_irrq = 4
-    n_v = 3
-    n_vp = 2
-    norb = 2
-    # identity irr->full map so map_to_full_bz is a no-op
-    q_grid = KGrid((n_irrq, 1, 1), [])
-
-    G = (np.arange(n_irrq * norb * n_v * n_vp).reshape(n_irrq, norb, n_v, n_vp) + 1j).astype(np.complex128)
-
-    def fn(comm, rank):
-        config.lattice.k_grid = q_grid
-        d_irrq = MpiDistributor(ntasks=n_irrq, comm=comm)
-        d_v = MpiDistributor(ntasks=n_v, comm=comm)
-        gamma = FourPoint(G[d_irrq.my_slice].copy(), nq=(2, 2, 1), has_compressed_q_dimension=True)
-        out = mu.gather_full_ibz_for_vslice(gamma, d_irrq, d_v, q_grid)
-        vslice = d_v.slices[rank]
-        if out is None:
-            return None
-        return out.mat, (vslice.start, vslice.stop)
-
-    _, res = run_parallel(2, fn, hostnames=["h", "h"])
-    for r in res:
-        assert r is not None
-        mat, (vs, ve) = r
-        assert np.allclose(mat, G[:, :, vs:ve, :])
-
-
-def test_gather_full_ibz_for_vslice_tags_stay_below_mpi_tag_ub_minimum():
-    """The exchange tags are rank-independent and stay below MPI_TAG_UB's 32767 minimum (rank*size overflowed)."""
-    n_irrq, n_v, n_vp, norb = 4, 3, 2, 2
-    q_grid = KGrid((n_irrq, 1, 1), [])
-    G = (np.arange(n_irrq * norb * n_v * n_vp).reshape(n_irrq, norb, n_v, n_vp) + 1j).astype(np.complex128)
-    seen_tags = []
-
-    def fn(comm, rank):
-        config.lattice.k_grid = q_grid
-        orig_isend, orig_irecv = comm.Isend, comm.Irecv
-
-        def isend(buf, dest, tag=0):
-            seen_tags.append(tag)
-            return orig_isend(buf, dest, tag)
-
-        def irecv(buf, source, tag=0):
-            seen_tags.append(tag)
-            return orig_irecv(buf, source, tag)
-
-        comm.Isend, comm.Irecv = isend, irecv
-        d_irrq = MpiDistributor(ntasks=n_irrq, comm=comm)
-        d_v = MpiDistributor(ntasks=n_v, comm=comm)
-        gamma = FourPoint(G[d_irrq.my_slice].copy(), nq=(2, 2, 1), has_compressed_q_dimension=True)
-        mu.gather_full_ibz_for_vslice(gamma, d_irrq, d_v, q_grid)
-        comm.Isend, comm.Irecv = orig_isend, orig_irecv
-        return None
-
-    run_parallel(2, fn, hostnames=["h", "h"])
-    assert seen_tags and max(seen_tags) < 32767
-    assert max(seen_tags) < 1000  # rank-independent scheme: base 700 + chunk index
-
-
-def test_gather_full_ibz_for_vslice_empty_rank_returns_none():
-    """gather_full_ibz_for_vslice returns None for exactly the rank(s) with no frequencies."""
-    n_irrq = 3
-    n_v = 1  # fewer frequencies than ranks -> rank 1 gets none
-    n_vp = 2
-    norb = 2
-    q_grid = KGrid((n_irrq, 1, 1), [])
-    G = (np.arange(n_irrq * norb * n_v * n_vp).reshape(n_irrq, norb, n_v, n_vp) + 1j).astype(np.complex128)
-
-    def fn(comm, rank):
-        config.lattice.k_grid = q_grid
-        d_irrq = MpiDistributor(ntasks=n_irrq, comm=comm)
-        d_v = MpiDistributor(ntasks=n_v, comm=comm)
-        gamma = FourPoint(G[d_irrq.my_slice].copy(), nq=(3, 1, 1), has_compressed_q_dimension=True)
-        out = mu.gather_full_ibz_for_vslice(gamma, d_irrq, d_v, q_grid)
-        return rank, (out is None), d_v.my_size
-
-    _, res = run_parallel(2, fn, hostnames=["h", "h"])
-    none_flags = [is_none for _, is_none, _ in res]
-    assert none_flags.count(True) == 1
-    for _, is_none, my_v in res:
-        assert is_none == (my_v == 0)
 
 
 def test_distribute_tasks_with_excess():
@@ -1293,21 +1166,6 @@ def test_build_node_shared_array_view_is_live_shared_memory():
     _, res = run_parallel(2, fn, hostnames=["h", "h"])
     for seen in res:
         assert np.array_equal(seen, np.arange(4).astype(np.complex64))
-
-
-def test_restricted_to_rebases_slices_to_sub_communicator():
-    """restricted_to keeps the member ranks' slices in sub-comm order and re-derives the caller's slice from it."""
-    from types import SimpleNamespace
-
-    full = SimpleNamespace(Get_rank=lambda: 2, Get_size=lambda: 4, size=4, rank=2)
-    dist = MpiDistributor(ntasks=6, comm=full)
-    dist._sizes = np.array([3, 0, 2, 1])
-    dist._slices = [slice(0, 3), slice(3, 3), slice(3, 5), slice(5, 6)]
-    sub = SimpleNamespace(Get_rank=lambda: 1, Get_size=lambda: 3, size=3, rank=1)
-    restricted = dist.restricted_to(sub, [0, 2, 3])
-    assert np.array_equal(restricted.sizes, [3, 2, 1])
-    assert list(restricted.slices) == [slice(0, 3), slice(3, 5), slice(5, 6)]
-    assert restricted.my_slice == slice(3, 5) and restricted.my_size == 2
 
 
 def test_fake_comm_split_groups_by_color_ordered_by_key():

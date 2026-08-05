@@ -54,7 +54,7 @@ optional Moriya correction in :mod:`~dgamore.lambda_ops`. Pairing properties are
 :mod:`~dgamore.max_ent`. The remaining modules support the computation: :mod:`~dgamore.matsubara_frequencies`
 handles frequency-index arithmetic, :mod:`~dgamore.mpi_utils` manages the parallel work distribution (message
 chunking, the work distributor and the data-movement routines), :mod:`~dgamore.memory_estimator` predicts the peak
-host memory of the heavy steps so the driver can enable the memory-saving code paths automatically,
+host memory of the heavy steps so the driver can verify upfront that a run fits its nodes,
 :mod:`~dgamore.dga_logger` provides the structured logging, and :mod:`~dgamore.plotting` produces the diagnostic
 figures. A standalone companion console script, :mod:`~dgamore.symmetrize`, prepares the symmetrized
 two-particle DMFT input that a run consumes.

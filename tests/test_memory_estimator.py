@@ -5,16 +5,20 @@
 import numpy as np
 import pytest
 
+import dgamore.memory_estimator as memory_estimator
 from dgamore.memory_estimator import (
     ARPACK_EXTRA_VECTORS,
     CHI0Q_IFFTN_TRANSIENT_FACTOR,
-    CHIQ_AUX_INVERT_FACTOR,
+    CHIQ_AUX_CHUNK_FACTOR,
     DTYPE_BYTES,
     FQ_MATMUL_FACTOR,
     LANCZOS_VERTEX_FACTOR,
     OVERHEAD_FACTOR,
-    SDE_FFT_KERNEL_FACTOR,
+    SDE_CHUNK_FACTOR,
+    MAX_SLICE_CHUNK_BYTES,
+    SLICE_CHUNK_BYTES,
     BranchPeak,
+    dynamic_chunk_budget,
     estimate_peaks,
 )
 from dgamore.n_point_base import DTYPE
@@ -98,13 +102,6 @@ def test_chiq_aux_off_has_distributed_block_and_no_single_rank_gather():
     assert bp.off_single == 0.0
 
 
-def test_lanczos_fast_path_is_single_rank_only():
-    """The lanczos fast path is single-rank-only while its lean path is distributed."""
-    bp = _peaks(with_eliashberg=True)["lanczos"]
-    assert bp.off_distributed == 0.0 and bp.off_single > 0.0
-    assert bp.on_distributed > 0.0 and bp.on_single > 0.0  # lean single: the root rank's full-BZ pp bubble
-
-
 def test_chi0q_distributed_peak_shrinks_with_more_ranks():
     """The column-distributed chi0q fast-path transient shrinks as the rank count grows."""
     assert _peaks(n_ranks=16)["chi0q"].off_distributed < _peaks(n_ranks=2)["chi0q"].off_distributed
@@ -155,9 +152,8 @@ def test_overhead_scales_everything_linearly():
     assert peaks2["chiq_aux"].off_distributed == pytest.approx(2.0 * peaks1["chiq_aux"].off_distributed)
 
 
-def test_fq_distributed_block_heavier_than_chiq_aux_block():
-    """The fq distributed block is heavier than chiq_aux (2 vs 1 two-fermion blocks per q)."""
-    assert FQ_MATMUL_FACTOR > CHIQ_AUX_INVERT_FACTOR
+def test_fq_distributed_block_carries_the_pp_accumulator_beyond_chiq_aux():
+    """The fq distributed transient exceeds chiq_aux's by the pp accumulator and the extra loaded inputs."""
     peaks = _peaks(with_eliashberg=True)
     assert peaks["fq"].on_distributed > peaks["chiq_aux"].on_distributed
 
@@ -213,12 +209,15 @@ def test_bubble_baseline_depends_on_niv_cut_not_niv_full():
     assert _peaks(niv_cut=80)["chi0q"].baseline != pytest.approx(_peaks(niv_cut=800)["chi0q"].baseline)
 
 
-def test_chiq_aux_off_block_is_two_rank_local_two_fermion_blocks():
-    """The chiq_aux off-distributed block equals two rank-local two-fermion blocks."""
+def test_chiq_aux_block_is_the_accumulated_sum_plus_the_chunk_budget():
+    """The chiq_aux transient is the rank-local one-fermion sum plus the chunk-bounded build transient."""
     nb, wp, vc = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"]
     qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
-    block = qi * nb**4 * wp * vc * vc
-    assert estimate_peaks(**TINY)["chiq_aux"].off_distributed == pytest.approx(SCALE * CHIQ_AUX_INVERT_FACTOR * block)
+    chunk = min(SLICE_CHUNK_BYTES, DTYPE_BYTES * qi * nb**4 * wp * vc * vc)
+    expected = SCALE * qi * nb**4 * wp * vc + CHIQ_AUX_CHUNK_FACTOR * chunk
+    bp = estimate_peaks(**TINY)["chiq_aux"]
+    assert bp.off_distributed == pytest.approx(expected)
+    assert bp.on_distributed == bp.off_distributed
 
 
 def test_chi0q_fast_single_counts_buffer_ifftn_transient_and_g_copies():
@@ -240,17 +239,26 @@ def test_chi0q_fast_distributed_is_bounded_by_the_result_slice():
     assert estimate_peaks(**TINY)["chi0q"].off_distributed == pytest.approx(expected)
 
 
-def test_sde_holds_two_kernels_plus_irr_kernel():
-    """The flag-less sde FFT counts the pass kernels and the retained irr kernel; the R-space G is in the baseline."""
+def test_sde_transient_is_the_irr_kernel_plus_the_bounded_exchange_chunks():
+    """The sde transient holds the retained irr kernel plus the chunk-capped exchanged full-BZ w-slices."""
     nb, wp, vc = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"]
     qt = -(-TINY["nk_tot"] // TINY["n_ranks"])
     qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
-    expected = SCALE * (SDE_FFT_KERNEL_FACTOR * qt * nb**4 * wp * vc + qi * nb**4 * wp * vc)
+    chunk = min(SLICE_CHUNK_BYTES, DTYPE_BYTES * qt * nb**4 * wp * vc)
+    expected = SCALE * qi * nb**4 * wp * vc + OVERHEAD_FACTOR * SDE_CHUNK_FACTOR * chunk
     assert estimate_peaks(**TINY)["sde"].off_distributed == pytest.approx(expected)
 
 
+def test_sde_chunk_term_is_capped_by_the_byte_budget(monkeypatch):
+    """Once the per-rank full-BZ kernel exceeds the byte budget, the sde transient stops growing with the grid."""
+    monkeypatch.setattr(memory_estimator, "SLICE_CHUNK_BYTES", 64)
+    small = estimate_peaks(**TINY)["sde"].off_distributed
+    big = estimate_peaks(**{**TINY, "nk_tot": 4 * TINY["nk_tot"]})["sde"].off_distributed
+    assert big == pytest.approx(small)
+
+
 def test_sde_off_and_on_slots_are_identical():
-    """The sde step has no save_memory switch, so both path slots carry the same two-pass FFT estimate."""
+    """The sde step is single-path, so both path slots carry the same two-pass FFT estimate."""
     bp = _peaks()["sde"]
     assert bp.on_distributed == pytest.approx(bp.off_distributed)
     assert bp.on_single == pytest.approx(bp.off_single)
@@ -261,27 +269,6 @@ def test_fq_lean_includes_rank_local_accumulator_and_loads():
     few_ranks = _peaks(with_eliashberg=True, n_ranks=2)["fq"].on_distributed
     many_ranks = _peaks(with_eliashberg=True, n_ranks=8)["fq"].on_distributed
     assert few_ranks > many_ranks
-
-
-def test_fq_lean_accumulator_larger_when_save_fq():
-    """save_fq keeps the full ph box, making the fq lean accumulator larger than the small pp box."""
-    small = _peaks(with_eliashberg=True, save_fq=False)["fq"].on_distributed
-    big = _peaks(with_eliashberg=True, save_fq=True)["fq"].on_distributed
-    assert big > small
-
-
-def test_fq_save_fq_gathers_whole_irr_vertex_on_one_rank():
-    """save_fq gathers the whole irreducible-BZ two-fermion vertex on one rank in both fq paths."""
-    p = {**TINY, "with_eliashberg": True}
-    nb, wp, vc = p["n_bands"], p["niw_core"] + 1, 2 * p["niv_core"]
-    giwk_dga = SCALE * p["nk_tot"] * nb**2 * 2 * p["niv_cut"]
-    expected = SCALE * p["nk_irr"] * nb**4 * wp * vc * vc + giwk_dga
-    peaks = estimate_peaks(**{**p, "save_fq": True})
-    assert peaks["fq"].off_single == pytest.approx(expected)
-    assert peaks["fq"].on_single == pytest.approx(expected)
-    no_save = estimate_peaks(**{**p, "save_fq": False})
-    assert no_save["fq"].off_single == pytest.approx(giwk_dga)
-    assert no_save["fq"].on_single == pytest.approx(giwk_dga)
 
 
 def test_lanczos_fast_counts_layout_build_vertices_bubble_and_arpack_basis():
@@ -296,13 +283,6 @@ def test_lanczos_fast_counts_layout_build_vertices_bubble_and_arpack_basis():
     assert estimate_peaks(**p)["lanczos"].off_single == pytest.approx(expected)
 
 
-def test_lanczos_lean_scales_with_full_bz():
-    """The lanczos lean transient scales with the full BZ size (nk_tot), not the irreducible one."""
-    small = _peaks(with_eliashberg=True, nk_tot=256)["lanczos"].on_distributed
-    big = _peaks(with_eliashberg=True, nk_tot=512)["lanczos"].on_distributed
-    assert big > small
-
-
 def test_lanczos_lean_independent_of_irreducible_bz_size():
     """The lanczos lean transient is independent of the irreducible-BZ size."""
     a = _peaks(with_eliashberg=True, nk_irr=10)["lanczos"].on_distributed
@@ -310,11 +290,15 @@ def test_lanczos_lean_independent_of_irreducible_bz_size():
     assert a == pytest.approx(b)
 
 
-def test_lanczos_lean_vertex_share_saturates_beyond_v_task_count():
-    """The lean vertex share is bounded by the v-axis task count (2*niv_pp tasks), not the rank count."""
-    at_tasks = _peaks(with_eliashberg=True, n_ranks=2 * BASE["niv_pp"])["lanczos"].on_distributed
-    beyond = _peaks(with_eliashberg=True, n_ranks=8 * BASE["niv_pp"])["lanczos"].on_distributed
-    assert beyond == pytest.approx(at_tasks)
+def test_lanczos_grid_share_saturates_at_the_squared_task_count():
+    """The grid vertex share shrinks past the row cap via columns and saturates at (2*niv_pp)^2 ranks."""
+    n_freq = 2 * BASE["niv_pp"]
+    at_rows = _peaks(with_eliashberg=True, n_ranks=n_freq)["lanczos"].on_distributed
+    with_cols = _peaks(with_eliashberg=True, n_ranks=2 * n_freq)["lanczos"].on_distributed
+    at_cap = _peaks(with_eliashberg=True, n_ranks=n_freq * n_freq)["lanczos"].on_distributed
+    beyond = _peaks(with_eliashberg=True, n_ranks=2 * n_freq * n_freq)["lanczos"].on_distributed
+    assert with_cols < at_rows
+    assert beyond == pytest.approx(at_cap)
 
 
 def test_lanczos_arpack_workspace_grows_with_n_eig():
@@ -322,20 +306,15 @@ def test_lanczos_arpack_workspace_grows_with_n_eig():
     default = _peaks(with_eliashberg=True, n_eig=1)["lanczos"]
     many = _peaks(with_eliashberg=True, n_eig=30)["lanczos"]
     assert many.off_single > default.off_single
-    assert many.on_distributed > default.on_distributed
 
 
-def test_save_pairing_vertex_sets_the_lean_single_rank_gather():
-    """save_pairing_vertex gathers both irr-BZ pp vertices on one rank, dominating the lean single-rank peak."""
+def test_save_pairing_vertex_enters_the_single_rank_gather_peak():
+    """save_pairing_vertex gathers both irr-BZ pp vertices on one rank, raising the solver peak when it dominates."""
     p = {**TINY, "with_eliashberg": True}
-    nb, vpp = p["n_bands"], 2 * p["niv_pp"]
-    gather = SCALE * 2 * p["nk_irr"] * nb**4 * vpp * vpp
-    chi0 = SCALE * p["nk_tot"] * nb**4 * vpp
-    giwk_dga = SCALE * p["nk_tot"] * p["n_bands"] ** 2 * 2 * p["niv_cut"]
     with_save = estimate_peaks(**{**p, "save_pairing_vertex": True})["lanczos"]
     without = estimate_peaks(**{**p, "save_pairing_vertex": False})["lanczos"]
-    assert with_save.on_single == pytest.approx(max(chi0, gather) + giwk_dga)
-    assert without.on_single == pytest.approx(chi0 + giwk_dga)
+    assert with_save.off_single >= without.off_single
+    assert with_save.on_single > without.on_single  # the gather is a single-rank peak of the grid variant too
 
 
 def test_local_step_is_flagless_single_rank_and_band_heavy():
@@ -351,3 +330,13 @@ def test_local_step_is_flagless_single_rank_and_band_heavy():
     l_core, l_full = wp * vc * vc, wp * vf * vf
     expected = SCALE * (2 * (2 * l_core + l_full) + 2 * l_core + LOCAL_SHELL_INVERT_FACTOR * l_full)
     assert bp.off_single == pytest.approx(expected)
+
+
+def test_dynamic_chunk_budget_scales_floors_and_caps():
+    """The dynamic chunk budget grows with free memory per node rank, floored and capped at the class constants."""
+    floor, cap = SLICE_CHUNK_BYTES, MAX_SLICE_CHUNK_BYTES
+    assert dynamic_chunk_budget(total_bytes=1, node_ranks=48) == floor
+    mid = dynamic_chunk_budget(total_bytes=300 * 2**30, node_ranks=48)
+    assert floor < mid < cap
+    assert dynamic_chunk_budget(total_bytes=4000 * 2**30, node_ranks=2) == cap
+    assert dynamic_chunk_budget(total_bytes=600 * 2**30, node_ranks=48) == 2 * mid
