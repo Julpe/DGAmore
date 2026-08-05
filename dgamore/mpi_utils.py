@@ -24,6 +24,7 @@ argument (read at call time by the callers), so monkeypatching ``mpi_utils.MAX_M
 chunked path.
 """
 
+import functools
 import gc
 import os
 import pickle
@@ -80,6 +81,27 @@ def build_node_shared_array(node_comm, compute_fn, dtype=DTYPE):
         shared[...] = local
     node_comm.Barrier()
     return shared, win
+
+
+def count_nodes(comm, node_comm) -> int:
+    r"""
+    Returns the number of distinct nodes ``comm`` spans, i.e. how many copies of a per-node shared array (see
+    :func:`build_node_shared_array`) exist across the job - the multiplicity such a quantity must be logged with
+    (see :meth:`dgamore.dga_logger.DgaLogger.log_memory_usage`).
+
+    Counted by summing one contribution per node-local root rank, so it is **collective over** ``comm`` and every
+    rank must call it. A communicator that sits on a single node short-circuits without communication; that
+    condition holds on every rank at once (``node_comm`` is a subset of ``comm``), so no rank is left in the
+    reduction alone.
+
+    :param comm: The MPI communicator.
+    :param node_comm: The node-local (shared-memory) communicator, e.g. from
+        ``comm.Split_type(MPI.COMM_TYPE_SHARED)``; ``None`` means no node topology was determined and counts as one.
+    :return: The number of nodes.
+    """
+    if node_comm is None or node_comm.size >= comm.size:
+        return 1
+    return comm.allreduce(1 if node_comm.rank == 0 else 0)
 
 
 # ====================================================================================================================
@@ -1000,17 +1022,21 @@ def exchange_and_map_irrbz_fullbz(
     )
 
 
+@functools.lru_cache(maxsize=None)
 def get_pencil_indices(rank: int, size: int, nq: tuple[int, int, int], layout: str) -> np.ndarray:
     """
     Calculates which global flattened q-indices (0 to ``n_tot - 1``) a rank owns under a given decomposition layout.
     The ``"flat"`` layout matches :meth:`MpiDistributor._distribute_tasks` (excess on the last ranks); the pencil
     layouts assign whole lines along one axis so a subsequent 1D FFT along that axis is rank-local.
 
+    The result is cached (it is a pure function of the arguments, and :func:`_redistribute_p2p` looks it up twice per
+    rank pair on every redistribution), so callers must treat the returned array as read-only.
+
     :param rank: The rank whose indices to compute.
     :param size: Total number of ranks.
     :param nq: Number of momenta per spatial direction ``(nx, ny, nz)``.
     :param layout: One of ``"flat"``, ``"z_pencil"``, ``"y_pencil"``, ``"x_pencil"``.
-    :return: The global flattened q-indices owned by ``rank``.
+    :return: The global flattened q-indices owned by ``rank``; a cached array, do not modify it.
     :raises ValueError: If ``layout`` is not one of the supported layouts.
     """
     nx, ny, nz = nq

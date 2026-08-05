@@ -122,17 +122,33 @@ class DgaLogger:
         """
         self._log("::WARNING:: " + message, level=logging.WARNING, allowed_ranks=allowed_ranks)
 
-    def log_memory_usage(self, obj_name: str, obj, n_exists: int = 1, allowed_ranks: tuple = (0,)):
+    def log_memory_usage(
+        self, obj_name: str, obj, n_copies: int = 1, allowed_ranks: tuple = (0,), per: str = "rank", scale: float = 1.0
+    ):
         """
-        Logs the memory usage of an object in gigabytes. This is useful for tracking memory consumption in distributed
-        applications, especially when using MPI.
+        Logs the host memory a quantity occupies across the whole job in gigabytes, i.e. the footprint of one copy
+        times the number of copies that are physically allocated, plus that breakdown whenever there is more than one.
+
+        ``n_copies`` must count the copies that really exist: ``comm.size`` for a quantity every rank builds for
+        itself or holds a distinct slice of, but only the **number of nodes** for one kept in a per-node
+        shared-memory window (see :func:`dgamore.mpi_utils.build_node_shared_array`, counted by
+        :func:`dgamore.mpi_utils.count_nodes`), since the ranks of a node map one and the same buffer. ``per`` labels
+        what a copy belongs to in the log line.
 
         :param obj_name: Human-readable name used in the log line.
-        :param obj: An object exposing ``memory_usage_in_gb`` (e.g. any :class:`IHaveMat`); ignored if None.
-        :param n_exists: Multiplicity factor, i.e. how many such objects exist (the reported size is scaled by it).
+        :param obj: An object exposing ``memory_usage_in_gb`` (e.g. any :class:`IHaveMat`), or a list/tuple of such
+            objects whose footprints are summed into one copy; ``None`` (also as an entry) is ignored.
+        :param n_copies: Number of physically allocated copies of ``obj`` across the job.
         :param allowed_ranks: The MPI rank(s) permitted to emit this message.
+        :param per: What a single copy belongs to, i.e. ``"rank"`` or ``"node"``; wording of the breakdown only.
+        :param scale: Factor one copy's footprint is multiplied by, for a quantity reported through a stand-in
+            object that holds a fraction of it (e.g. the frequency-summed auxiliary susceptibility standing in for
+            the full two-fermion one, which the chunked build never materializes).
         :return: None.
         """
-        if obj is None:
+        objects = [o for o in (obj if isinstance(obj, (list, tuple)) else [obj]) if o is not None]
+        if not objects:
             return
-        self.info(f"{obj_name} use(s) (GB): {obj.memory_usage_in_gb * n_exists:.6f}.", allowed_ranks=allowed_ranks)
+        per_copy = scale * sum(o.memory_usage_in_gb for o in objects)
+        breakdown = "" if n_copies == 1 else f" ({n_copies} {per}s x {per_copy:.6f})"
+        self.info(f"{obj_name} use(s) (GB): {per_copy * n_copies:.6f}{breakdown}.", allowed_ranks=allowed_ranks)
