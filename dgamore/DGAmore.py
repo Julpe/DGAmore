@@ -148,8 +148,9 @@ def main():
     sigma_dmft_per_ineq = comm.bcast(sigma_dmft_per_ineq, root=0)
 
     if comm.rank == 0:
-        logger.log_memory_usage("g_dmft & sigma_dmft", g_dmft_per_ineq[0] * len(g_dmft_per_ineq), 2 * comm.size)
-        logger.log_memory_usage("g2_dens & g2_magn", g2_dens_per_ineq[0] * len(g2_dens_per_ineq), 2)
+        # the one-particle input is broadcast to every rank, the two-particle one is only ever held by rank 0
+        logger.log_memory_usage("g_dmft & sigma_dmft", g_dmft_per_ineq + sigma_dmft_per_ineq, comm.size)
+        logger.log_memory_usage("g2_dens & g2_magn", g2_dens_per_ineq + g2_magn_per_ineq)
 
     logger.info("Preprocessing done.")
 
