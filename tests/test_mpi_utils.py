@@ -266,6 +266,14 @@ def test_get_pencil_indices_partition(layout, size):
     assert np.array_equal(np.sort(allidx), np.arange(n_tot))
 
 
+def test_get_pencil_indices_is_cached():
+    """Repeated get_pencil_indices calls with the same arguments are served from the cache with equal content."""
+    first = mu.get_pencil_indices(1, 3, (4, 4, 2), "y_pencil")
+    again = mu.get_pencil_indices(1, 3, (4, 4, 2), "y_pencil")
+    assert np.array_equal(first, again)
+    assert mu.get_pencil_indices.cache_info().hits > 0
+
+
 def test_get_pencil_indices_flat_matches_distributor():
     """get_pencil_indices flat layout matches the MpiDistributor slicing convention."""
     nq = (2, 2, 2)
@@ -1166,6 +1174,44 @@ def test_build_node_shared_array_view_is_live_shared_memory():
     _, res = run_parallel(2, fn, hostnames=["h", "h"])
     for seen in res:
         assert np.array_equal(seen, np.arange(4).astype(np.complex64))
+
+
+def test_count_nodes_single_node_short_circuits_without_communication():
+    """All ranks on one node count a single node without entering the reduction."""
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+        return mu.count_nodes(comm, node_comm)
+
+    _, res = run_parallel(4, fn, hostnames=["h", "h", "h", "h"])
+    assert res == [1, 1, 1, 1]
+
+
+def test_count_nodes_counts_one_per_node_root():
+    """Ranks spread over two nodes count two nodes on every rank."""
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+        return mu.count_nodes(comm, node_comm)
+
+    _, res = run_parallel(4, fn, hostnames=["n0", "n0", "n1", "n1"])
+    assert res == [2, 2, 2, 2]
+
+
+def test_count_nodes_counts_unevenly_populated_nodes():
+    """An uneven rank-to-node mapping is counted by node roots, not by the node-local rank counts."""
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+        return mu.count_nodes(comm, node_comm)
+
+    _, res = run_parallel(4, fn, hostnames=["n0", "n1", "n1", "n2"])
+    assert res == [3, 3, 3, 3]
+
+
+def test_count_nodes_without_node_comm_is_one():
+    """A missing node communicator means no topology was determined and counts as a single node."""
+    assert mu.count_nodes(comm1(), None) == 1
 
 
 def test_fake_comm_split_groups_by_color_ordered_by_key():

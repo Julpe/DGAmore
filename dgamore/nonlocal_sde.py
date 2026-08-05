@@ -37,7 +37,7 @@ from dgamore.matsubara_frequencies import MFHelper
 from dgamore import memory_estimator
 from dgamore.memory_estimator import SLICE_CHUNK_BYTES
 from dgamore.mpi_utils import MpiDistributor
-from dgamore.n_point_base import SpinChannel
+from dgamore.n_point_base import SpinChannel, deferred_collection
 from dgamore.self_energy import SelfEnergy
 
 
@@ -559,10 +559,12 @@ def calculate_sigma_kernel_r_q(
 
     mpi_dist_irrq.barrier()
 
+    # reported as the full two-fermion auxiliary susceptibility, which the summed object stands in for
     logger.log_memory_usage(
         f"Auxiliary susceptibility ({gchi_aux_q_r_sum.channel.value})",
         gchi_aux_q_r_sum,
-        mpi_dist_irrq.comm.size * 2 * config.box.niv_core,
+        mpi_dist_irrq.comm.size,
+        scale=2 * config.box.niv_core,
     )
     logger.info(f"Non-Local auxiliary susceptibility ({gchi_aux_q_r_sum.channel.value}) calculated.")
 
@@ -1081,25 +1083,28 @@ def _run_fft_sde_pass(
 
     w_first = niw_index_w_pairs[0][0] if niw_index_w_pairs else 0
     sigma = None
-    for w_start in range(w_first, n_w, w_step):
-        w_stop = min(n_w, w_start + w_step)
-        chunk = mpi_utils.exchange_and_map_irrbz_fullbz(
-            kernel_irr.take_wn_slice(w_start, w_stop), mpi_dist_irrk, mpi_dist_fullbz
-        )
-        if negative_w:
-            chunk_neg = chunk.to_negative_niw_range()
-            chunk.free()  # release the full-BZ positive chunk as soon as its negative block is built
-            chunk = chunk_neg
+    # deferred_collection batches the gc pass of the per-chunk frees into one collection at the end of the pass
+    # (a full gc walk per free dominates the wall time of a many-chunk pass otherwise).
+    with deferred_collection():
+        for w_start in range(w_first, n_w, w_step):
+            w_stop = min(n_w, w_start + w_step)
+            chunk = mpi_utils.exchange_and_map_irrbz_fullbz(
+                kernel_irr.take_wn_slice(w_start, w_stop), mpi_dist_irrk, mpi_dist_fullbz
+            )
+            if negative_w:
+                chunk_neg = chunk.to_negative_niw_range()
+                chunk.free()  # release the full-BZ positive chunk as soon as its negative block is built
+                chunk = chunk_neg
 
-        pairs = [(i - w_start, w) for i, w in niw_index_w_pairs if w_start <= i < w_stop]
-        part = calculate_sigma_from_kernel_fft(mpi_dist_irrk, chunk, g_r_local, giwk_niv, pairs, use_gpu)
-        chunk.free(trim=negative_w and w_stop == n_w)  # coarse trim once, on the last (negative) pass's last chunk
+            pairs = [(i - w_start, w) for i, w in niw_index_w_pairs if w_start <= i < w_stop]
+            part = calculate_sigma_from_kernel_fft(mpi_dist_irrk, chunk, g_r_local, giwk_niv, pairs, use_gpu)
+            chunk.free(trim=negative_w and w_stop == n_w)  # coarse trim once, on the last chunk of the negative pass
 
-        if sigma is None:
-            sigma = part
-        else:
-            sigma.mat += part.mat  # accumulate the rank-local R-space partial self-energies (in place)
-            part.free()
+            if sigma is None:
+                sigma = part
+            else:
+                sigma.mat += part.mat  # accumulate the rank-local R-space partial self-energies (in place)
+                part.free()
     return sigma
 
 
@@ -1395,7 +1400,8 @@ def calculate_sigma_proposal(
         comm, sigma_in, mu, config.lattice.hamiltonian.get_ek(), config.sys.beta
     )
 
-    logger.log_memory_usage("giwk", giwk_full, comm.size)
+    # giwk lives in one shared window per node, so the job holds one copy per node - not one per rank
+    logger.log_memory_usage("giwk", giwk_full, mpi_utils.count_nodes(comm, shared_node_comm), per="node")
 
     gchi0_q = BubbleGenerator.create_generalized_chi0_q_fft_auto(
         mpi_dist_irrk,
