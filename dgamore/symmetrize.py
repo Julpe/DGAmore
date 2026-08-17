@@ -243,7 +243,7 @@ def get_worm_components_partial_4dims(num_bands: int) -> list[int]:
     return get_worm_components_4dims(num_bands, orbs)
 
 
-def extract_g2_general(group_string: str, indices: list, file: h5py.File, niw: int, niv: int) -> tuple:
+def extract_g2_general(group_string: str, indices: list, file: h5py.File, n_bands: int, niw: int, niv: int) -> tuple:
     r"""
     Extracts the two-particle Green's function components from the vertex file for given indices and group string.
     Returns the components :math:`G2_{\uparrow\uparrow\uparrow\uparrow}, G2_{\downarrow\downarrow\downarrow\downarrow}`,
@@ -253,6 +253,7 @@ def extract_g2_general(group_string: str, indices: list, file: h5py.File, niw: i
     :param group_string: The HDF5 group path holding the worm components.
     :param indices: The component indices to read.
     :param file: The open input vertex :class:`h5py.File`.
+    :param n_bands: Number of bands.
     :param niw: Number of positive bosonic frequencies.
     :param niv: Number of positive fermionic frequencies.
     :return: The six spin-component arrays ``(g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud)``.
@@ -308,11 +309,12 @@ def extract_g2_general(group_string: str, indices: list, file: h5py.File, niw: i
     return g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud
 
 
-def save_to_file(g2_list: list[np.ndarray], names: list[str], niw: int, nb: int, ineq: int):
+def save_to_file(output_file: h5py.File, g2_list: list[np.ndarray], names: list[str], niw: int, nb: int, ineq: int):
     """
-    Writes the given two-particle Green's functions to the (module-level) output HDF5 file in the per-bosonic-
-    frequency, per-orbital-component layout expected by the DGA input reader.
+    Writes the given two-particle Green's functions to the output HDF5 file in the per-bosonic-frequency,
+    per-orbital-component layout expected by the DGA input reader.
 
+    :param output_file: The open output :class:`h5py.File`.
     :param g2_list: The two-particle Green's function arrays to write.
     :param names: The channel names (one per array, e.g. ``["dens", "magn"]``).
     :param niw: Number of positive bosonic frequencies.
@@ -392,8 +394,6 @@ def main():
 
     ineq_numbers.sort()
 
-    n_bands = int(vertex_file[".config"].attrs[f"atoms.1.nd"])
-
     for ineq in ineq_numbers:
         print("-----------------------------------------")
         print("Processing inequivalent atom number:", ineq)
@@ -414,6 +414,7 @@ def main():
                 continue
 
         niw, niv = get_niw_niv(vertex_file, g4iw_groupstring, indices)
+        n_bands = int(vertex_file[".config"].attrs[f"atoms.{ineq}.nd"])
 
         print("Number of bands:", n_bands)
         print("Number of fermionic Matsubara frequencies:", niv)
@@ -421,7 +422,7 @@ def main():
 
         print(f"Extracting G2 for atom {ineq} ...")
         g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud = extract_g2_general(
-            g4iw_groupstring, indices, vertex_file, niw, niv
+            g4iw_groupstring, indices, vertex_file, n_bands, niw, niv
         )
         print(f"G2 extracted. Calculating G2_dens and G2_magn for atom {ineq} ...")
         g2_dens = 0.5 * (g2_uuuu + g2_dddd + g2_uudd + g2_dduu)
@@ -431,7 +432,7 @@ def main():
         gc.collect()
         print(f"G2_dens and G2_magn for atom {ineq} calculated. Writing to file ...")
 
-        save_to_file([g2_dens, g2_magn], ["dens", "magn"], niw, n_bands, ineq)
+        save_to_file(output_file, [g2_dens, g2_magn], ["dens", "magn"], niw, n_bands, ineq)
         del g2_dens, g2_magn
         gc.collect()
         print(f"G2_dens and G2_magn for atom {ineq} successfully written to file.")
