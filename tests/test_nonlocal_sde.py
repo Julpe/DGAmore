@@ -823,6 +823,11 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     )
     monkeypatch.setattr(nonlocal_sde, "GreensFunction", SimpleNamespace(get_g_full=lambda *a, **k: gf_stub))
     monkeypatch.setattr(nonlocal_sde, "update_mu", lambda *a, **k: 0.5)
+    monkeypatch.setattr(
+        nonlocal_sde,
+        "_update_occ_and_energies_distributed",
+        lambda *a: (1.0, np.zeros((1, 1)), np.zeros((1, 1, 1, 1, 1)), 0.0, 0.0),
+    )
 
     calls = []
 
@@ -1024,6 +1029,103 @@ def test_create_auxiliary_chi_r_q_sum_is_chunk_size_invariant(monkeypatch):
     monkeypatch.setattr(nonlocal_sde, "SLICE_CHUNK_BYTES", 1)
     chunked = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, v_nonloc)
     assert np.allclose(chunked.mat, whole.mat, atol=1e-6)
+
+
+def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(monkeypatch):
+    """The k-distributed occupation/energy evaluation matches the single-rank full-box reference."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, o, niv, niv_dmft, beta, mu = (4, 2, 1), 2, 3, 8, 9.0, 0.4
+    nk_tot = int(np.prod(nk))
+    rng = np.random.default_rng(9)
+    config.sys.beta, config.sys.n_bands, config.sys.mu = beta, o, mu
+    config.lattice.nk = nk
+    config.lattice.k_grid = SimpleNamespace(nk_tot=nk_tot, nk=nk)
+    ek = rng.standard_normal((*nk, o, o))
+    ek = ek + ek.swapaxes(-1, -2)
+    config.lattice.hamiltonian = MagicMock(get_ek=MagicMock(return_value=ek))
+    sig_mat = (rng.standard_normal((nk_tot, o, o, 2 * niv)) * 0.1 + 0.3j).astype(np.complex64)
+    dmft_mat = (rng.standard_normal((1, 1, 1, o, o, 2 * niv_dmft)) * 0.1 + 0.2j).astype(np.complex64)
+    sigma_new = SelfEnergy(sig_mat.copy(), nk, has_compressed_q_dimension=True, beta=beta)
+    sigma_dmft_full = SelfEnergy(dmft_mat.copy(), (1, 1, 1), beta=beta)
+
+    sigma_ref = sigma_new.copy().concatenate_self_energies(sigma_dmft_full)
+    giwk_ref = GreensFunction.get_g_full(sigma_ref, mu, ek, beta)
+    _, occ_ref, occ_k_ref = giwk_ref.get_fill_nonlocal()
+    ekin_ref, epot_ref = giwk_ref.get_ekin(), giwk_ref.get_epot()
+
+    def fn(comm, rank):
+        d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
+        return nonlocal_sde._update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, d_full, mu)
+
+    _, res = run_parallel(2, fn)
+    # occupations reproduce the full-box reference bit-for-bit; only the energy scalars regroup their k-sums
+    for _, occ, occ_k, ekin, epot in res:
+        assert np.array_equal(occ, occ_ref) and np.array_equal(occ_k, occ_k_ref)
+        assert np.allclose([ekin, epot], [ekin_ref, epot_ref], atol=1e-5)
+
+
+def test_update_occ_and_energies_distributed_pins_the_occupation_dtype_across_ranks(monkeypatch):
+    """Ranks whose fill comes out float (all-real eigenvalues) and ranks with complex fill reduce to one complex128 occ_k."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, o, niv, niv_dmft, beta, mu = (4, 2, 1), 2, 3, 8, 9.0, 0.4
+    nk_tot = int(np.prod(nk))
+    rng = np.random.default_rng(11)
+    config.sys.beta, config.sys.n_bands, config.sys.mu = beta, o, mu
+    config.lattice.nk = nk
+    config.lattice.k_grid = SimpleNamespace(nk_tot=nk_tot, nk=nk)
+    ek = rng.standard_normal((*nk, o, o))
+    config.lattice.hamiltonian = MagicMock(get_ek=MagicMock(return_value=ek + ek.swapaxes(-1, -2)))
+    sigma_new = SelfEnergy(
+        (rng.standard_normal((nk_tot, o, o, 2 * niv)) * 0.1 + 0.3j).astype(np.complex64),
+        nk,
+        has_compressed_q_dimension=True,
+        beta=beta,
+    )
+    sigma_dmft_full = SelfEnergy(
+        (rng.standard_normal((1, 1, 1, o, o, 2 * niv_dmft)) * 0.1 + 0.2j).astype(np.complex64), (1, 1, 1), beta=beta
+    )
+
+    def fake_get_g_full(sigma_occ, mu_in, ek_slice, beta_in):
+        # the first slice (rows starting at ek row 0) plays the all-real-eigenvalue rank and returns a float fill
+        n_my = ek_slice.shape[0]
+        is_first = np.allclose(ek_slice[0, 0, 0], config.lattice.hamiltonian.get_ek().reshape(nk_tot, o, o)[0])
+        dtype, value = (np.float64, 0.25) if is_first else (np.complex128, 0.75 + 0.5j)
+        g = MagicMock()
+        g.get_fill_nonlocal.return_value = (0.0, None, np.full((n_my, 1, 1, o, o), value, dtype=dtype))
+        g.get_ekin.return_value = 1.0
+        g.get_epot.return_value = 2.0
+        return g
+
+    def fn(comm, rank):
+        d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
+        return nonlocal_sde._update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, d_full, mu)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(nonlocal_sde.GreensFunction, "get_g_full", fake_get_g_full)
+        _, res = run_parallel(2, fn)
+    for _, occ, occ_k, ekin, epot in res:
+        assert occ_k.dtype == np.complex128
+        assert np.allclose(occ_k.reshape(nk_tot, o, o)[0], 0.25) and np.allclose(
+            occ_k.reshape(nk_tot, o, o)[-1], 0.75 + 0.5j
+        )
+
+
+def test_share_sigma_per_node_gives_each_node_one_shared_buffer_with_rank0_values(monkeypatch):
+    """_share_sigma_per_node leaves every rank viewing its node's single shared buffer holding rank 0's array."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    mixed = (np.arange(2 * 2 * 6).reshape(2, 2, 6) + 1j).astype(np.complex64)
+
+    def fn(comm, rank):
+        sigma = SimpleNamespace(mat=mixed.copy() if rank == 0 else np.zeros_like(mixed))
+        node_comm = comm.Split_type(0)
+        roots_comm = comm.Split(0 if node_comm.rank == 0 else 1)
+        win = nonlocal_sde._share_sigma_per_node(sigma, node_comm, roots_comm)
+        return sigma.mat.copy(), sigma.mat.__array_interface__["data"][0], win is not None
+
+    _, res = run_parallel(4, fn, hostnames=["n0", "n0", "n1", "n1"])
+    pointers = {r[1] for r in res}
+    assert all(np.array_equal(r[0], mixed) for r in res)
+    assert len(pointers) == 2 and all(r[2] for r in res)
 
 
 @pytest.mark.parametrize("negative_w", [False, True])

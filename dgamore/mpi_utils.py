@@ -32,6 +32,7 @@ import socket
 
 import h5py
 import mpi4py.MPI as MPI
+import psutil
 import numpy as np
 import scipy.fft as fft
 
@@ -81,6 +82,55 @@ def build_node_shared_array(node_comm, compute_fn, dtype=DTYPE):
         shared[...] = local
     node_comm.Barrier()
     return shared, win
+
+
+def cgroup_memory_limit(proc_file: str = "/proc/self/cgroup", cgroup_root: str = "/sys/fs/cgroup") -> int | None:
+    """
+    Returns this process's effective cgroup memory limit in bytes, or ``None`` when no limit is set (or none is
+    readable). Batch schedulers such as slurm enforce a job's memory request through a cgroup, which can be far
+    below the node's physical memory, so every memory budget must honor it. The cgroup path is taken from
+    ``proc_file``; on cgroup v2 every ancestor's ``memory.max`` is read up to the root (the limit may sit on the
+    job level rather than the process's own leaf) and the smallest set value wins, on v1 the memory controller's
+    ``memory.limit_in_bytes`` is read directly. Values at or above ``2**62`` mean "unlimited" and are ignored.
+
+    :param proc_file: Path of the process's cgroup membership file.
+    :param cgroup_root: Mount point of the cgroup filesystem.
+    :return: The smallest configured limit in bytes, or ``None`` if unlimited or undeterminable.
+    """
+    limits = []
+    try:
+        entries = dict((line.split(":", 2)[1], line.split(":", 2)[2].strip()) for line in open(proc_file, "r"))
+        if "" in entries:  # cgroup v2: one unified hierarchy, limits possibly on an ancestor
+            path = os.path.normpath(cgroup_root + entries[""])
+            while path.startswith(cgroup_root):
+                try:
+                    value = open(os.path.join(path, "memory.max"), "r").read().strip()
+                    if value != "max":
+                        limits.append(int(value))
+                except OSError:
+                    pass
+                path = os.path.dirname(path)
+        elif "memory" in entries:  # cgroup v1: the memory controller's own hierarchy
+            value = open(cgroup_root + "/memory" + entries["memory"] + "/memory.limit_in_bytes", "r").read()
+            limits.append(int(value))
+    except (OSError, ValueError, IndexError):
+        return None
+    limits = [limit for limit in limits if limit < 2**62]
+    return min(limits) if limits else None
+
+
+def job_memory_total() -> int:
+    """
+    Returns the memory a job may plan with on this node: the hardware total, capped by the cgroup limit when the
+    scheduler sets one (see :func:`cgroup_memory_limit`). Chunk budgets derive from this instead of the free
+    memory, so the chunking - and with it the floating-point reduction order - stays reproducible across reruns
+    (the cgroup limit is part of the job specification, unlike the machine's momentary load).
+
+    :return: The plannable memory of this node in bytes.
+    """
+    total = psutil.virtual_memory().total
+    limit = cgroup_memory_limit()
+    return total if limit is None else min(total, limit)
 
 
 def count_nodes(comm, node_comm) -> int:
@@ -1108,7 +1158,11 @@ def get_pencil_indices(rank: int, size: int, nq: tuple[int, int, int], layout: s
 def _redistribute_p2p(mat, nq, comm, source_layout, target_layout):
     """
     Peer-to-peer redistributes the rows of ``mat`` (indexed by flattened q) from one pencil/flat layout to another,
-    exchanging only the rows each rank pair shares (in below-2 GB byte chunks).
+    exchanging only the rows each rank pair shares (in below-2 GB byte chunks). Every pair's transfer is posted
+    non-blocking at once and completed by a single ``Waitall``: a one-round-per-pair schedule would serialize
+    ``size`` blocking rounds per redistribution, which dominates the FFT step at high rank counts. The staging stays
+    bounded because each source row belongs to exactly one target (and vice versa), so all send copies together hold
+    at most one local slab and all receive stagings at most one target slab.
 
     :param mat: The local array slice, with the q-index on axis 0.
     :param nq: Number of momenta per spatial direction ``(nx, ny, nz)``.
@@ -1127,15 +1181,18 @@ def _redistribute_p2p(mat, nq, comm, source_layout, target_layout):
     src_map = {g_idx: l_idx for l_idx, g_idx in enumerate(src_indices)}
     tgt_map = {g_idx: l_idx for l_idx, g_idx in enumerate(tgt_indices)}
 
-    for shift in range(size):
-        if shift == 0:
-            # Self-overlap: rows this rank both owns (source layout) and needs (target layout). Copy locally instead
-            # of round-tripping the data through MPI to itself.
-            common = np.intersect1d(src_indices, tgt_indices, assume_unique=True)
-            if len(common) > 0:
-                res_mat[[tgt_map[g] for g in common]] = mat[[src_map[g] for g in common]]
-            continue
+    # Self-overlap: rows this rank both owns (source layout) and needs (target layout). Copy locally instead
+    # of round-tripping the data through MPI to itself.
+    common = np.intersect1d(src_indices, tgt_indices, assume_unique=True)
+    if len(common) > 0:
+        res_mat[[tgt_map[g] for g in common]] = mat[[src_map[g] for g in common]]
 
+    # every rank pair's transfer is posted at once and completed by the single Waitall below (see the docstring)
+    reqs = []
+    send_bufs = []  # keep alive until Waitall
+    recv_stagings = []
+
+    for shift in range(1, size):
         target_rank = (rank + shift) % size
         source_rank = (rank - shift) % size
 
@@ -1145,29 +1202,25 @@ def _redistribute_p2p(mat, nq, comm, source_layout, target_layout):
         remote_src_indices = get_pencil_indices(source_rank, size, nq, source_layout)
         to_recv_g = np.intersect1d(tgt_indices, remote_src_indices, assume_unique=True)
 
-        reqs = []
-        send_buf = None  # keep alive until Waitall
-        recv_staging = None
-
         if len(to_send_g) > 0:
             send_l = [src_map[g] for g in to_send_g]
             send_buf = np.ascontiguousarray(mat[send_l])
+            send_bufs.append(send_buf)
             send_view = send_buf.view(np.byte).reshape(-1)
             for i in range(0, send_view.nbytes, MAX_MPI_BYTES):
                 reqs.append(comm.Isend(send_view[i : i + MAX_MPI_BYTES], dest=target_rank, tag=shift))
 
         if len(to_recv_g) > 0:
             recv_staging = np.empty((len(to_recv_g),) + mat.shape[1:], dtype=mat.dtype)
+            recv_stagings.append((recv_staging, [tgt_map[g] for g in to_recv_g]))
             recv_view = recv_staging.view(np.byte).reshape(-1)
             for i in range(0, recv_view.nbytes, MAX_MPI_BYTES):
                 reqs.append(comm.Irecv(recv_view[i : i + MAX_MPI_BYTES], source=source_rank, tag=shift))
 
-        MPI.Request.Waitall(reqs)
+    MPI.Request.Waitall(reqs)
 
-        # Now copy from staging into res_mat at the right rows
-        if len(to_recv_g) > 0:
-            recv_l = [tgt_map[g] for g in to_recv_g]
-            res_mat[recv_l] = recv_staging
+    for recv_staging, recv_l in recv_stagings:
+        res_mat[recv_l] = recv_staging
 
     return res_mat
 

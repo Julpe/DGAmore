@@ -101,6 +101,34 @@ def root_fun(
     return get_total_fill(mu, ek, sigma_mat, beta, smom0) - target_filling
 
 
+# Largest filling residual accepted from a "converged" Newton result; genuine roots sit orders of magnitude below
+# this, while a secant that stalled in a flat filling region leaves a residual of order the filling itself.
+_FILL_RESIDUAL_TOL: float = 1e-3
+
+
+def _find_mu_bracket(
+    mu0: float, args: tuple, initial_width: float = 0.05, max_width: float = 64.0
+) -> tuple[float, float] | None:
+    r"""
+    Expands a symmetric interval around ``mu0``, doubling its half-width each step, until the filling residual
+    :func:`root_fun` changes sign across it. Starting narrow makes the search return an interval around the root
+    closest to ``mu0``, which keeps a self-consistency trajectory in its current basin.
+
+    :param mu0: Center of the search interval.
+    :param args: The :func:`root_fun` arguments after ``mu`` (target filling, dispersion, self-energy, beta, moment).
+    :param initial_width: Half-width of the first interval.
+    :param max_width: Half-width beyond which the search gives up.
+    :return: A bracketing interval ``(lo, hi)``, or ``None`` if no sign change was found.
+    """
+    width = initial_width
+    while width <= max_width:
+        lo, hi = mu0 - width, mu0 + width
+        if root_fun(lo, *args) * root_fun(hi, *args) < 0:
+            return lo, hi
+        width *= 2
+    return None
+
+
 def update_mu(
     mu0: float,
     target_filling: float,
@@ -113,7 +141,9 @@ def update_mu(
 ) -> float:
     r"""
     Updates the chemical potential to match the target filling by using Newton's method to find the optimal
-    :math:`\mu`. On failure to converge the starting value is returned unchanged.
+    :math:`\mu`. A Newton result is only accepted if its filling residual is small; when Newton fails or lands
+    away from an actual root, the root nearest the starting value is found instead with a bracketed Brent search
+    (see :func:`_find_mu_bracket`). The starting value is returned unchanged only if no bracket exists.
 
     :param mu0: Initial guess for the chemical potential.
     :param target_filling: Desired total filling.
@@ -121,18 +151,29 @@ def update_mu(
     :param sigma_mat: Self-energy array, shape ``[k, o1, o2, v]``.
     :param beta: Inverse temperature :math:`\beta`.
     :param smom0: Zeroth moment :math:`\Sigma_\infty` of the self-energy.
-    :param logger: Optional logger; if given, a failed root search is logged at debug level.
-    :param tol: Newton tolerance for the root search.
-    :return: The updated (real) chemical potential, or ``mu0`` if the root search did not converge.
+    :param logger: Optional logger; if given, the bracketed fallback is logged at info level and a fully failed
+        root search at warning level.
+    :param tol: Root search tolerance for the chemical potential.
+    :return: The updated (real) chemical potential, or ``mu0`` if no root was found.
     :raises ValueError: If the converged chemical potential has a non-negligible imaginary part.
     """
     mu = mu0
+    args = (target_filling, ek, sigma_mat, beta, smom0)
     try:
-        mu = opt.newton(root_fun, mu, args=(target_filling, ek, sigma_mat, beta, smom0), tol=tol)
+        mu = opt.newton(root_fun, mu, args=args, tol=tol)
+        # the secant step criterion can also "converge" inside a flat filling region far from any root, so the
+        # residual is verified before the value is accepted
+        if np.abs(root_fun(mu, *args)) > _FILL_RESIDUAL_TOL:
+            raise RuntimeError
     except RuntimeError:
+        bracket = _find_mu_bracket(mu0, args)
+        if bracket is None:
+            if logger is not None:
+                logger.warning("Root finding for chemical potential failed; keeping the previous value.")
+            return mu0
         if logger is not None:
-            logger.debug("Root finding for chemical potential failed.")
-        return mu0
+            logger.info("Newton did not find a chemical potential root; using a bracketed root search.")
+        mu = opt.brentq(root_fun, *bracket, args=args, xtol=tol)
 
     if np.abs(mu.imag) < 1e-8:
         mu = mu.real
@@ -233,7 +274,9 @@ class GreensFunction(TwoPoint):
     def get_g_full(siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float):
         r"""
         Builds the full momentum-dependent Green's function :math:`G^{\mathrm{k}} = [(\imath\nu + \mu) -
-        \varepsilon(\mathbf{k}) - \Sigma^{\mathrm{k}}]^{-1}`.
+        \varepsilon(\mathbf{k}) - \Sigma^{\mathrm{k}}]^{-1}`. The Dyson matrix is assembled and inverted in bounded
+        fermionic-frequency chunks, so beyond the result only one chunk-sized transient is alive at a time (large
+        boxes such as the full DMFT one would otherwise triple the peak).
 
         :param siw: The :class:`SelfEnergy` :math:`\Sigma`.
         :param mu: Chemical potential :math:`\mu`.
@@ -243,15 +286,17 @@ class GreensFunction(TwoPoint):
         """
         eye_bands = np.eye(siw.n_bands, siw.n_bands)
         iv = 1j * MFHelper.vn(siw.niv, beta)
-        iv_bands = iv[None, None, :] * eye_bands[..., None]
-        mu_bands = mu * eye_bands[:, :, None]
-        mat = (
-            iv_bands[None, None, None, ...]
-            + mu_bands[None, None, None, ...]
-            - ek[..., None]
-            - siw.decompress_q_dimension().mat
-        )
-        mat = GreensFunction._invert_last_orbital_block(mat)
+        static_bands = (mu * eye_bands)[None, None, None, :, :, None] - ek[..., None]
+        sigma_mat = siw.decompress_q_dimension().mat
+
+        # a momentum-local sigma ([1, 1, 1, ...]) broadcasts against the dispersion, so the result is always full-k
+        mat = np.empty((*ek.shape[:3], siw.n_bands, siw.n_bands, 2 * siw.niv), dtype=sigma_mat.dtype)
+        step = max(1, _MODEL_EPOT_CHUNK_ELEMENTS // (int(np.prod(ek.shape[:3])) * siw.n_bands**2))
+        for start in range(0, 2 * siw.niv, step):
+            stop = min(2 * siw.niv, start + step)
+            dyson = (iv[start:stop][None, None, :] * eye_bands[..., None])[None, None, None, ...] + static_bands
+            dyson -= sigma_mat[..., start:stop]
+            mat[..., start:stop] = GreensFunction._invert_last_orbital_block(dyson)
         return GreensFunction(mat, siw, ek, siw.full_niv_range, False, False, nk=ek.shape[:3], beta=beta, mu=mu)
 
     @staticmethod

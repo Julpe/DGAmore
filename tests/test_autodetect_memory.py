@@ -14,7 +14,9 @@ from tests.conftest import create_comm_mock
 
 # the q-grid / box parameters the fake_system fixture installs, so tests can reproduce the driver's estimate
 # niv_cut == min(niw_core + niv_full + 10, niv_dmft) == min(32, 50) == 32 with the fixture's niv_dmft below.
-FIXTURE_PARAMS = dict(n_bands=1, nk_tot=256, nk_irr=40, niw_core=10, niv_core=10, niv_full=12, niv_cut=32, niv_pp=5)
+FIXTURE_PARAMS = dict(
+    n_bands=1, nk_tot=256, nk_irr=40, niw_core=10, niv_core=10, niv_full=12, niv_cut=32, niv_dmft=50, niv_pp=5
+)
 
 
 @pytest.fixture

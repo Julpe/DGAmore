@@ -244,13 +244,71 @@ def test_update_mu_without_logger_is_silent_on_failure():
     assert out == mu
 
 
-def test_update_mu_with_logger_logs_on_failure():
-    """update_mu logs a debug message and returns the input mu when root-finding fails."""
+def test_update_mu_with_logger_warns_on_failure():
+    """update_mu logs a warning and returns the input mu when no root exists for the target filling."""
     nk, ek, sig, beta, mu = _toy_inputs()
     logger = MagicMock()
     out = update_mu(mu, 1e9, ek, sig.mat, beta, sig.smom[0], logger=logger)
     assert out == mu
-    logger.debug.assert_called_once()
+    logger.warning.assert_called_once()
+
+
+def test_update_mu_falls_back_to_bracketed_search_when_newton_fails(monkeypatch):
+    """update_mu recovers the true root through the bracketed Brent search when the Newton solver fails."""
+    from dgamore.greens_function import root_fun
+
+    nk, ek, sig, beta, mu = _toy_inputs()
+    target = root_fun(mu + 1.3, 0.0, ek, sig.mat, beta, sig.smom[0])
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.greens_function.opt.newton", MagicMock(side_effect=RuntimeError))
+        out = update_mu(mu, target, ek, sig.mat, beta, sig.smom[0])
+    assert np.allclose(out, mu + 1.3, atol=1e-5)
+
+
+def test_update_mu_rejects_a_false_newton_root_via_the_residual_check(monkeypatch):
+    """update_mu discards a Newton result whose filling residual is large and finds the actual root instead."""
+    from dgamore.greens_function import root_fun
+
+    nk, ek, sig, beta, mu = _toy_inputs()
+    target = root_fun(mu + 1.3, 0.0, ek, sig.mat, beta, sig.smom[0])
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.greens_function.opt.newton", MagicMock(return_value=mu - 60.0))
+        out = update_mu(mu, target, ek, sig.mat, beta, sig.smom[0])
+    assert np.allclose(out, mu + 1.3, atol=1e-5)
+
+
+def test_update_mu_logs_bracketed_fallback_at_info_level(monkeypatch):
+    """update_mu logs the bracketed fallback at info level, not warning, when Newton fails but a root exists."""
+    from dgamore.greens_function import root_fun
+
+    nk, ek, sig, beta, mu = _toy_inputs()
+    target = root_fun(mu + 1.3, 0.0, ek, sig.mat, beta, sig.smom[0])
+    logger = MagicMock()
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.greens_function.opt.newton", MagicMock(side_effect=RuntimeError))
+        update_mu(mu, target, ek, sig.mat, beta, sig.smom[0], logger=logger)
+    logger.info.assert_called_once()
+    logger.warning.assert_not_called()
+
+
+def test_find_mu_bracket_encloses_the_nearest_root(monkeypatch):
+    """_find_mu_bracket returns an interval around the root closest to the start, excluding the farther one."""
+    import dgamore.greens_function as gf_module
+    from dgamore.greens_function import _find_mu_bracket
+
+    mu = 0.3
+    with monkeypatch.context() as mp:
+        mp.setattr(gf_module, "root_fun", lambda x, *a: (x - (mu + 0.1)) * (x - (mu + 3.0)))
+        lo, hi = _find_mu_bracket(mu, ())
+    assert lo < mu + 0.1 < hi and hi < mu + 3.0
+
+
+def test_find_mu_bracket_returns_none_without_sign_change():
+    """_find_mu_bracket gives up with None when the filling residual never changes sign."""
+    from dgamore.greens_function import _find_mu_bracket
+
+    nk, ek, sig, beta, mu = _toy_inputs()
+    assert _find_mu_bracket(mu, (1e9, ek, sig.mat, beta, sig.smom[0])) is None
 
 
 def test_update_mu_forwards_newton_tolerance(monkeypatch):
