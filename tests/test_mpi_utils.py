@@ -266,6 +266,39 @@ def test_get_pencil_indices_partition(layout, size):
     assert np.array_equal(np.sort(allidx), np.arange(n_tot))
 
 
+def test_cgroup_memory_limit_walks_v2_ancestors_to_the_smallest_set_limit(tmp_path):
+    """The v2 reader skips a "max" leaf and returns the smallest configured ancestor memory.max."""
+    (tmp_path / "proc_cgroup").write_text("0::/a/b\n")
+    (tmp_path / "cg" / "a" / "b").mkdir(parents=True)
+    (tmp_path / "cg" / "a" / "b" / "memory.max").write_text("max\n")
+    (tmp_path / "cg" / "a" / "memory.max").write_text("1234567\n")
+    assert mu.cgroup_memory_limit(str(tmp_path / "proc_cgroup"), str(tmp_path / "cg")) == 1234567
+
+
+def test_cgroup_memory_limit_reads_v1_controller_and_ignores_unlimited(tmp_path):
+    """The v1 fallback reads memory.limit_in_bytes and treats huge sentinel values as unlimited."""
+    (tmp_path / "proc_cgroup").write_text("9:memory:/slurm/job1\n")
+    (tmp_path / "cg" / "memory" / "slurm" / "job1").mkdir(parents=True)
+    (tmp_path / "cg" / "memory" / "slurm" / "job1" / "memory.limit_in_bytes").write_text("2222\n")
+    assert mu.cgroup_memory_limit(str(tmp_path / "proc_cgroup"), str(tmp_path / "cg")) == 2222
+    (tmp_path / "cg" / "memory" / "slurm" / "job1" / "memory.limit_in_bytes").write_text(str(2**63 - 4096))
+    assert mu.cgroup_memory_limit(str(tmp_path / "proc_cgroup"), str(tmp_path / "cg")) is None
+
+
+def test_cgroup_memory_limit_returns_none_without_cgroup_information(tmp_path):
+    """A missing cgroup file (or one without limits) yields None, so the caller falls back to host memory."""
+    assert mu.cgroup_memory_limit(str(tmp_path / "absent"), str(tmp_path / "cg")) is None
+
+
+def test_job_memory_total_caps_the_hardware_total_by_the_cgroup_limit(monkeypatch):
+    """job_memory_total returns the hardware total capped by the cgroup limit, or the plain total without one."""
+    monkeypatch.setattr(mu.psutil, "virtual_memory", lambda: SimpleNamespace(total=1000))
+    monkeypatch.setattr(mu, "cgroup_memory_limit", lambda: 200)
+    assert mu.job_memory_total() == 200
+    monkeypatch.setattr(mu, "cgroup_memory_limit", lambda: None)
+    assert mu.job_memory_total() == 1000
+
+
 def test_get_pencil_indices_is_cached():
     """Repeated get_pencil_indices calls with the same arguments are served from the cache with equal content."""
     first = mu.get_pencil_indices(1, 3, (4, 4, 2), "y_pencil")

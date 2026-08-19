@@ -2021,7 +2021,8 @@ def test_streaming_fq_file_has_gather_layout_and_matches_pp_band(setup):
 def test_dispatch_selects_slice_or_streaming_construction_by_save_fq(setup, monkeypatch, save_fq):
     """dispatch_full_vertex_calculation routes to the slice constructor, or to the streaming one under save_fq."""
     config.eliashberg.save_fq = save_fq
-    monkeypatch.setattr(LocalFourPoint, "load", staticmethod(lambda *a, **k: MagicMock(spec=LocalFourPoint)))
+    loader = MagicMock(return_value=(MagicMock(spec=LocalFourPoint), None))
+    monkeypatch.setattr(es.nonlocal_sde, "_load_node_shared_local_vertex", loader)
     slice_mock = MagicMock(return_value="slice")
     streaming_mock = MagicMock(return_value="streamed")
     monkeypatch.setattr(es, "create_pairing_vertex_slice_q_r", slice_mock)
@@ -2034,6 +2035,26 @@ def test_dispatch_selects_slice_or_streaming_construction_by_save_fq(setup, monk
     assert result == ("streamed" if save_fq else "slice")
     assert streaming_mock.call_count == (1 if save_fq else 0)
     assert slice_mock.call_count == (0 if save_fq else 1)
+
+
+def test_dispatch_loads_the_vertex_node_shared_and_frees_its_window(setup, monkeypatch):
+    """dispatch_full_vertex_calculation loads the local vertex through the node-shared loader and frees the window."""
+    config.eliashberg.save_fq = False
+    win = MagicMock()
+    loader = MagicMock(return_value=(MagicMock(spec=LocalFourPoint), win))
+    free_mock = MagicMock()
+    monkeypatch.setattr(es.nonlocal_sde, "_load_node_shared_local_vertex", loader)
+    monkeypatch.setattr(es.nonlocal_sde, "_free_shared_window", free_mock)
+    monkeypatch.setattr(es, "create_pairing_vertex_slice_q_r", MagicMock(return_value="slice"))
+    node_comm = MagicMock()
+
+    result = es.dispatch_full_vertex_calculation(
+        SpinChannel.DENS, MagicMock(), MagicMock(), 2, _make_single_rank_distributor(), node_comm=node_comm
+    )
+
+    assert result == "slice"
+    assert loader.call_args.args[0] is node_comm
+    free_mock.assert_called_once_with(win, node_comm)
 
 
 def test_solver_grid_shape_degenerates_and_caps():
@@ -2091,6 +2112,55 @@ def test_grid_solver_on_one_rank_matches_in_memory_solver():
         assert np.allclose(result[parity][0], reference[parity][0], atol=1e-5)
         for gap_ref, gap_new in zip(reference[parity][1], result[parity][1]):
             assert np.allclose(np.abs(gap_new.mat), np.abs(gap_ref.mat), atol=1e-4)
+
+
+def test_grid_solver_ships_the_bubble_inside_the_grid_only(monkeypatch):
+    """With idle ranks beyond the solver grid, the pp bubble broadcast runs over the grid communicator only."""
+    from copy import deepcopy
+
+    monkeypatch.setattr(es, "MPI", conftest.FAKE_MPI)
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter):
+        # thread-unsafe ARPACK is densified via n identical matvecs per rank, keeping the lockstep collectives aligned
+        n = op.shape[0]
+        dense = np.column_stack([op.matvec(np.eye(n, dtype=np.complex64)[:, i]) for i in range(n)])
+        lam, vec = np.linalg.eig(dense)
+        order = np.argsort(lam.real)[::-1][:k]
+        return lam.real[order], vec[:, order]
+
+    monkeypatch.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+    seen = []
+    real_bcast = mu.bcast_rows
+    monkeypatch.setattr(
+        es.mpi_utils,
+        "bcast_rows",
+        lambda comm, arr, root, **k: seen.append(comm.Get_size()) or real_bcast(comm, arr, root, **k),
+    )
+    nq, o, niv_pp, size = (4, 2, 1), 1, 1, 3
+    _grid_test_config(nq, niv_pp)
+    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 5)
+    nq_tot = int(np.prod(nq))
+    bounds = np.linspace(0, nq_tot, size + 1).astype(int)
+
+    def worker(comm, rank):
+        _grid_test_config(nq, niv_pp)
+        local = FourPoint(
+            gamma.mat[bounds[rank] : bounds[rank + 1]].copy(),
+            SpinChannel.SING,
+            nq,
+            0,
+            2,
+            False,
+            True,
+            True,
+            FrequencyNotation.PP,
+        )
+        return es.solve_eliashberg_lanczos_grid(local, deepcopy(chi0) if rank == 0 else None, comm, 0)
+
+    conftest.run_parallel(size, worker)
+    # the vertex-slice gather is 3 sources x 3 participants; the bubble must add grid-sized (2) calls, never full (3)
+    assert sum(1 for s in seen if s == size) == size * size
+    assert sum(1 for s in seen if s == 2) == 2
 
 
 @pytest.mark.parametrize("size, niv_pp", [(2, 2), (4, 1), (3, 2), (3, 1)])

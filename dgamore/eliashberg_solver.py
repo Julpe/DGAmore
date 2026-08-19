@@ -953,9 +953,19 @@ def solve_eliashberg_lanczos_grid(
     block_mat = _gather_grid_vertex_block(gamma_r_pp, comm, row_slice, col_slice, in_grid)
     gamma_r_pp.free()
 
-    chi0_mat = mpi_utils.bcast_rows(
-        comm, gchi0_q0_pp.mat if comm.rank == bubble_rank else np.empty(0), root=bubble_rank
-    )
+    # the ranks beyond the rows x cols grid never touch the bubble: ship it inside the grid only, so the idle
+    # ranks do not each receive a full-BZ copy (Split keeps the rank order, so the grid root index is bubble_rank)
+    grid_comm = comm.Split(0 if in_grid else 1, comm.rank)
+    if bubble_rank < rows * cols:
+        chi0_mat = (
+            mpi_utils.bcast_rows(grid_comm, gchi0_q0_pp.mat if comm.rank == bubble_rank else None, root=bubble_rank)
+            if in_grid
+            else None
+        )
+    else:
+        chi0_mat = mpi_utils.bcast_rows(
+            comm, gchi0_q0_pp.mat if comm.rank == bubble_rank else np.empty(0), root=bubble_rank
+        )
     if not in_grid:
         return None
 
@@ -1652,6 +1662,7 @@ def dispatch_full_vertex_calculation(
     niv_pp: int,
     mpi_dist: MpiDistributor,
     chunk_bytes: int | None = None,
+    node_comm: MPI.Comm | None = None,
 ) -> FourPoint:
     r"""
     Loads the local irreducible vertex for ``channel`` and builds the full ladder pp vertex through the slice-direct
@@ -1680,14 +1691,21 @@ def dispatch_full_vertex_calculation(
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist: MPI distributor over the irreducible BZ q-points.
     :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
+    :param node_comm: Optional node-local communicator; when given, the multi-GB local vertex is loaded once per
+        node into an MPI shared-memory window instead of once per rank (the build only reads it).
     :return: The full ladder pp vertex :math:`F^{\mathrm{q}}_{r}` as a :class:`FourPoint`.
     """
-    gamma_r = LocalFourPoint.load(os.path.join(config.output.output_path, f"gamma_{channel.value}_loc.npy"), channel)
+    gamma_r, gamma_win = nonlocal_sde._load_node_shared_local_vertex(
+        node_comm, os.path.join(config.output.output_path, f"gamma_{channel.value}_loc.npy"), channel
+    )
     if config.eliashberg.save_fq:
         f_q_r = create_pairing_vertex_streaming_fq(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist, chunk_bytes)
     else:
         f_q_r = create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist, chunk_bytes)
-    gamma_r.free()
+    gamma_r.mat = None
+    if gamma_win is None:
+        gamma_r.free()
+    nonlocal_sde._free_shared_window(gamma_win, node_comm)
     mpi_dist.barrier()
     return f_q_r
 
@@ -1824,11 +1842,16 @@ def solve(
         config.eliashberg.n_eig,
         comm.size,
     )
+    # the node budget honors the scheduler's cgroup memory limit (e.g. slurm --mem), like the driver's fit check
+    node_budget = psutil.virtual_memory().available
+    cgroup_limit = mpi_utils.cgroup_memory_limit()
+    if cgroup_limit is not None:
+        node_budget = min(node_budget, cgroup_limit)
+
     # one full-BZ sector residency per rank picks the in-memory solve, otherwise the grid takes over; rank 0
     # decides and broadcasts, so ranks on differently loaded nodes can never pick different solvers
     use_grid = FORCE_GRID_SOLVER or (
-        comm.size > 1
-        and per_sector_bytes + giwk_dga.mat.nbytes > psutil.virtual_memory().available * NODE_MEMORY_FRACTION
+        comm.size > 1 and per_sector_bytes + giwk_dga.mat.nbytes > node_budget * NODE_MEMORY_FRACTION
     )
     use_grid = comm.bcast(use_grid, root=0)
     if use_grid:
@@ -1850,7 +1873,7 @@ def solve(
         )
     else:
         sing_ranks, trip_ranks = get_ranks_for_lanczos(
-            comm, len(parities), psutil.virtual_memory().available, per_sector_bytes, giwk_dga.mat.nbytes
+            comm, len(parities), node_budget, per_sector_bytes, giwk_dga.mat.nbytes
         )
         bubble_rank = sing_ranks[0]
         n_concurrent = len(set(sing_ranks) | set(trip_ranks))
@@ -1867,11 +1890,15 @@ def solve(
 
     node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED) if comm.size > 1 else None
     chunk_bytes = memory_estimator.dynamic_chunk_budget(
-        psutil.virtual_memory().total, node_comm.size if node_comm is not None else 1
+        mpi_utils.job_memory_total(), node_comm.size if node_comm is not None else 1
     )
 
-    f_dens_pp = dispatch_full_vertex_calculation(SpinChannel.DENS, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes)
-    f_magn_pp = dispatch_full_vertex_calculation(SpinChannel.MAGN, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes)
+    f_dens_pp = dispatch_full_vertex_calculation(
+        SpinChannel.DENS, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes, node_comm
+    )
+    f_magn_pp = dispatch_full_vertex_calculation(
+        SpinChannel.MAGN, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes, node_comm
+    )
 
     delete_files(config.output.eliashberg_path, f"gchi0_q_inv_rank_{comm.rank}.npy")
 
@@ -1957,7 +1984,7 @@ def solve(
 
 
 # Fraction of a node's available host memory the sector packing may occupy (mirrors DGAmore.NODE_MEMORY_FRACTION).
-NODE_MEMORY_FRACTION: float = 0.97
+NODE_MEMORY_FRACTION: float = 0.95
 
 
 def get_ranks_for_lanczos(

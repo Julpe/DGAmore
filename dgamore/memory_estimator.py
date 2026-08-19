@@ -228,6 +228,7 @@ def estimate_peaks(
     niv_core: int,
     niv_full: int,
     niv_cut: int,
+    niv_dmft: int,
     niv_pp: int,
     n_ranks: int,
     with_eliashberg: bool,
@@ -263,6 +264,8 @@ def estimate_peaks(
     :param niv_full: Number of positive fermionic full-region frequencies.
     :param niv_cut: Number of positive fermionic frequencies the full-grid ``giwk_full`` is built at
         (``min(niw_core + niv_full + 10, niv_dmft)`` in :func:`dgamore.nonlocal_sde.calculate_self_energy_q`).
+    :param niv_dmft: Number of positive fermionic frequencies of the DMFT input box (the rank-0 occupation and
+        energy step of every iteration concatenates the self-energy back to it).
     :param niv_pp: Number of positive fermionic frequencies of the pp (Eliashberg) box.
     :param n_ranks: Number of MPI ranks the q-points are distributed over.
     :param with_eliashberg: Whether the Eliashberg step runs (adds the ``"fq"`` and ``"lanczos"`` branches).
@@ -343,7 +346,9 @@ def estimate_peaks(
     # chunk-capped exchange transients (floor modeled - the dynamic budget stays below an eighth of the fair share).
     sde_chunk = min(SLICE_CHUNK_BYTES, DTYPE_BYTES * _bubble_block(qt, nb, wp, vc))
     sde_distributed = scale * _bubble_block(qi, nb, wp, vc) + overhead * SDE_CHUNK_FACTOR * sde_chunk
-    sde_single = scale * 2 * _giwk_rspace(nk_tot, nb, vc)
+    # rank-0 single: the sigma finalize buffers, or the occupation/energy step's DMFT-box sigma + giwk pair
+    # (its concatenation and Dyson-build transients are broadcast-assigned and v-chunked, so only the pair counts)
+    sde_single = scale * max(2 * _giwk_rspace(nk_tot, nb, vc), 2 * _giwk_rspace(nk_tot, nb, 2 * niv_dmft))
     peaks["sde"] = BranchPeak(
         baseline=baseline_sde,
         giwk_shareable=2 * giwk_sde,

@@ -1351,6 +1351,92 @@ def _free_shared_window(win, node_comm) -> None:
     win.Free()
 
 
+def _share_sigma_per_node(sigma: SelfEnergy, node_comm, roots_comm) -> "MPI.Win | None":
+    r"""
+    Replaces the mixed self-energy's array on every rank by a view of one per-node MPI shared-memory window: the
+    node roots receive rank 0's array through a chunked broadcast over ``roots_comm``, then expose it to their
+    node's other ranks (see :func:`dgamore.mpi_utils.build_node_shared_array`). The self-consistency loop thereby
+    holds the full-BZ self-energy **once per node instead of once per rank**. Every rank keeps its own
+    :class:`SelfEnergy` object; only the buffer is shared and must be treated as read-only (every consumer copies
+    via ``cut_niv``/``copy``/``concatenate`` before writing).
+
+    :param sigma: The :class:`SelfEnergy` holding rank 0's mixed array (every rank's ``mat`` is replaced in place
+        by the shared view).
+    :param node_comm: The node-local (shared-memory) communicator.
+    :param roots_comm: Communicator over exactly the node-root ranks (global rank 0 first).
+    :return: The MPI shared-memory window (``None`` for a single-rank node); free it via
+        :func:`_free_shared_window` once no rank reads the buffer anymore.
+    """
+    if node_comm.rank == 0:
+        sigma.mat = mpi_utils.bcast_rows(roots_comm, sigma.mat, root=0)
+    mat, win = mpi_utils.build_node_shared_array(node_comm, lambda: sigma.mat)
+    sigma.mat = mat
+    return win
+
+
+def _update_occ_and_energies_distributed(
+    sigma_new: SelfEnergy, sigma_dmft_full: SelfEnergy, mpi_dist_fullbz: MpiDistributor, mu: float
+) -> tuple[float, np.ndarray, np.ndarray, float, float]:
+    r"""
+    Computes the occupation and the kinetic and potential energies of the mixed self-energy on the DMFT frequency
+    box, distributed over the full-BZ momenta: every rank concatenates and Dyson-inverts only its own momentum
+    slice, evaluates the occupation and energy sums there, and the results are recombined (the former evaluation
+    built the whole DMFT-box Green's function and its asymptotic tail sums on rank 0 while every other rank idled).
+    The self-energy moments are fitted from the momentum-averaged concatenated self-energy, allreduced first so
+    they match the full-box fit on every rank; the k-resolved occupation is allgathered and the k-summed scalars
+    are recombined with each rank's momentum count as weight.
+
+    :param sigma_new: The mixed :class:`SelfEnergy` (full BZ, compressed momenta, identical on every rank).
+    :param sigma_dmft_full: The DMFT :class:`SelfEnergy` supplying the shell frequencies (momentum-local).
+    :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
+    :param mu: Chemical potential :math:`\mu`.
+    :return: The tuple ``(n, occ, occ_k, ekin, epot)``: total filling, k-averaged occupation ``[o1, o2]``,
+        k-resolved occupation ``[kx, ky, kz, o1, o2]``, and the kinetic and potential energies per site.
+    """
+    nk_tot = config.lattice.k_grid.nk_tot
+    n_bands = config.sys.n_bands
+    n_my = mpi_dist_fullbz.my_size
+
+    sigma_slice = SelfEnergy(
+        sigma_new.compress_q_dimension().mat[mpi_dist_fullbz.my_slice],
+        (n_my, 1, 1),
+        has_compressed_q_dimension=True,
+        calc_smom=False,
+        beta=config.sys.beta,
+    )
+    sigma_occ = sigma_slice.concatenate_self_energies(sigma_dmft_full)
+
+    # sigma_new is replicated, so every rank fits the full-box moments locally from the k-mean fit window; the fit
+    # is bit-identical to the momentum-resolved concatenation's fit and needs no reduction
+    sigma_occ._smom0, sigma_occ._smom1 = sigma_new.fit_smom_concatenated(sigma_dmft_full)
+
+    ek = config.lattice.hamiltonian.get_ek()
+    ek_slice = ek.reshape(nk_tot, n_bands, n_bands)[mpi_dist_fullbz.my_slice].reshape(n_my, 1, 1, n_bands, n_bands)
+    giwk_occ = GreensFunction.get_g_full(sigma_occ, mu, ek_slice, config.sys.beta)
+    _, _, occ_k_slice = giwk_occ.get_fill_nonlocal()
+    ekin, epot = giwk_occ.get_ekin(), giwk_occ.get_epot()
+    giwk_occ.free()
+    sigma_occ.free()
+
+    # assembled through the chunked Allreduce of zero-padded slices: each momentum is contributed by exactly one
+    # rank, so the sum is bit-exact and no point-to-point matching is involved. The dtype MUST be pinned: the
+    # fill's dtype is value-dependent (real-matrix eig returns float when a slice's eigenvalues are all real), and
+    # ranks entering a collective with different element types abort with truncated messages.
+    occ_k = np.zeros((nk_tot, n_bands, n_bands), dtype=np.complex128)
+    occ_k[mpi_dist_fullbz.my_slice] = occ_k_slice.reshape(n_my, n_bands, n_bands)
+    if mpi_dist_fullbz.mpi_size > 1:
+        occ_k = mpi_dist_fullbz.allreduce(occ_k)
+    occ_k = occ_k.reshape(*config.lattice.k_grid.nk, n_bands, n_bands)
+    scalars = np.array([ekin, epot]) * n_my
+    if mpi_dist_fullbz.mpi_size > 1:
+        scalars = mpi_dist_fullbz.comm.allreduce(scalars)
+    ekin, epot = scalars / nk_tot
+
+    occ = np.mean(occ_k, axis=(0, 1, 2))
+    occ.real[np.abs(occ) < 1e-12] = 0.0
+    return 2.0 * np.trace(occ).real, occ, occ_k, float(ekin), float(epot)
+
+
 def calculate_sigma_proposal(
     sigma_in: SelfEnergy,
     mu: float,
@@ -1455,10 +1541,8 @@ def calculate_sigma_proposal(
     if config.eliashberg.perform_eliashberg:
         gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
 
-    import psutil
-
     node_ranks = shared_node_comm.size if shared_node_comm is not None else 1
-    chunk_bytes = memory_estimator.dynamic_chunk_budget(psutil.virtual_memory().total, node_ranks)
+    chunk_bytes = memory_estimator.dynamic_chunk_budget(mpi_utils.job_memory_total(), node_ranks)
 
     gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
         shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
@@ -1652,6 +1736,12 @@ def calculate_self_energy_q(
         ntasks=config.lattice.k_grid.nk_tot, comm=comm, name="FBZ", output_path=config.output.output_path
     )
 
+    # the loop's full-BZ self-energy is held once per NODE (mixed on rank 0, broadcast to the node roots, then
+    # window-shared read-only); single-rank runs keep the plain per-rank broadcast
+    sc_node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED) if comm.size > 1 else None
+    sc_roots_comm = comm.Split(0 if sc_node_comm.rank == 0 else 1) if sc_node_comm is not None else None
+    sigma_win = None
+
     sigma_old, starting_iter = get_starting_sigma(sigma_dmft)
     if starting_iter > 0:
         logger.info(
@@ -1729,16 +1819,24 @@ def calculate_self_energy_q(
         # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
 
         sigma_old = sigma_old.cut_niv(config.box.niv_core)
+        # the cut copied everything still needed from the previous iteration's shared sigma buffer
+        _free_shared_window(sigma_win, sc_node_comm)
+        sigma_win = None
 
         logger.info("Applying mixing strategy to the self-energy.")
         sigma_old = sigma_old.concatenate_self_energies(sigma_dmft)
         history_cap = _mixing_history_cap(current_iter, release_iter, anneal_reset_iter)
-        # mixing runs on rank 0 only (all ranks computed identical results before) and the mixed sigma is broadcast
+        # mixing runs on rank 0 only (all ranks computed identical results before); the mixed sigma then reaches the
+        # other ranks once per node through a shared window instead of once per rank
         if comm.rank == 0:
             sigma_new = apply_mixing_strategy(
                 sigma_new, sigma_old, sigma_dmft, current_iter, history_cap, sigma_history
             )
-        sigma_new = mpi_dist_fullbz.bcast_npoint(sigma_new)
+        if sc_node_comm is None:
+            sigma_new = mpi_dist_fullbz.bcast_npoint(sigma_new)
+        else:
+            # compressing first pins one momentum layout on every rank, so the shared buffer matches all metadata
+            sigma_win = _share_sigma_per_node(sigma_new.compress_q_dimension(), sc_node_comm, sc_roots_comm)
         if sigma_history is not None:
             # the in-memory analog of what read_last_n_sigmas_from_files reproduced from the file just saved below
             sigma_history.append(sigma_new.decompress_q_dimension().cut_niv(config.box.niv_core).mat)
@@ -1766,22 +1864,14 @@ def calculate_self_energy_q(
         mu_history.append(config.sys.mu)
         logger.info(f"Updated mu from {old_mu} to {config.sys.mu}.")
 
-        if comm.rank == 0:
-            sigma_occ = sigma_new.copy().concatenate_self_energies(sigma_dmft_full)
-            giwk_occ = GreensFunction.get_g_full(
-                sigma_occ, config.sys.mu, config.lattice.hamiltonian.get_ek(), config.sys.beta
-            )
-            # calculate new occupation matrix from new Green's function (outside asympt region it is the DMFT
-            # lattice Green's function)
-            _, config.sys.occ, config.sys.occ_k = giwk_occ.get_fill_nonlocal()  # n should not change
-
-            ekin = giwk_occ.get_ekin()
-            logger.info(f"Kinetic energy: {ekin:.4f} [t or eV].")
-
-            epot = giwk_occ.get_epot()
-            logger.info(f"Potential energy: {epot:.4f} [t or eV].")
-            logger.info(f"Total energy: {(ekin + epot):.4f} [t or eV].")
-        config.sys.occ, config.sys.occ_k = comm.bcast((config.sys.occ, config.sys.occ_k), root=0)
+        # new occupation matrix and energies from the new Green's function (outside the asympt region it is the
+        # DMFT lattice Green's function); k-distributed, so no rank builds the whole DMFT-box Green's function
+        _, config.sys.occ, config.sys.occ_k, ekin, epot = _update_occ_and_energies_distributed(
+            sigma_new, sigma_dmft_full, mpi_dist_fullbz, config.sys.mu
+        )  # n should not change
+        logger.info(f"Kinetic energy: {ekin:.4f} [t or eV].")
+        logger.info(f"Potential energy: {epot:.4f} [t or eV].")
+        logger.info(f"Total energy: {(ekin + epot):.4f} [t or eV].")
 
         if config.self_consistency.max_iter > 1:
             logger.info("Updated occupation matrix from new Green's function.")
@@ -1871,6 +1961,14 @@ def calculate_self_energy_q(
                 break
         else:
             logger.info("Self-consistency not reached.")
+
+    # the caller-owned result must outlive the loop's shared window; hand back a private copy and release the window
+    if sigma_win is not None:
+        sigma_old.mat = sigma_old.mat.copy()
+        _free_shared_window(sigma_win, sc_node_comm)
+    if sc_node_comm is not None:
+        sc_roots_comm.Free()
+        sc_node_comm.Free()
 
     mpi_dist_irrk.delete_file()
     mpi_dist_fullbz.delete_file()

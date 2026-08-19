@@ -33,6 +33,7 @@ import dgamore.dga_io as dga_io
 import dgamore.eliashberg_solver as eliashberg_solver
 import dgamore.local_sde as local_sde
 import dgamore.memory_estimator as memory_estimator
+import dgamore.mpi_utils as mpi_utils
 import dgamore.nonlocal_sde as nonlocal_sde
 import dgamore.plotting as plotting
 from dgamore import max_ent
@@ -47,42 +48,7 @@ logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
 # Fraction of a node's memory budget a run may occupy at any branch's peak. The remainder is the sole overhead
 # margin (OS/allocator/transients); the estimator's OVERHEAD_FACTOR is 1.0, so the two do not compound.
-NODE_MEMORY_FRACTION: float = 0.97
-
-
-def _cgroup_memory_limit() -> int | None:
-    """
-    Returns this process's effective cgroup memory limit in bytes, or ``None`` when no limit is set (or none is
-    readable). Batch schedulers such as slurm enforce a job's memory request through a cgroup, which can be far
-    below the node's physical memory, so the node budget must honor it. The cgroup path is taken from
-    ``/proc/self/cgroup``; on cgroup v2 every ancestor's ``memory.max`` is read up to the root (the limit may sit on
-    the job level rather than the process's own leaf) and the smallest set value wins, on v1 the controller's
-    ``memory.limit_in_bytes`` is read directly. Values at or above ``2**62`` mean "unlimited" and are ignored.
-
-    :return: The smallest configured limit in bytes, or ``None`` if unlimited or undeterminable.
-    """
-    limits = []
-    try:
-        entries = dict(
-            (line.split(":", 2)[1], line.split(":", 2)[2].strip()) for line in open("/proc/self/cgroup", "r")
-        )
-        if "" in entries:  # cgroup v2: one unified hierarchy, limits possibly on an ancestor
-            path = os.path.normpath("/sys/fs/cgroup" + entries[""])
-            while path.startswith("/sys/fs/cgroup"):
-                try:
-                    value = open(os.path.join(path, "memory.max"), "r").read().strip()
-                    if value != "max":
-                        limits.append(int(value))
-                except OSError:
-                    pass
-                path = os.path.dirname(path)
-        elif "memory" in entries:  # cgroup v1: the memory controller's own hierarchy
-            value = open("/sys/fs/cgroup/memory" + entries["memory"] + "/memory.limit_in_bytes", "r").read()
-            limits.append(int(value))
-    except (OSError, ValueError, IndexError):
-        return None
-    limits = [limit for limit in limits if limit < 2**62]
-    return min(limits) if limits else None
+NODE_MEMORY_FRACTION: float = 0.95
 
 
 def main():
@@ -591,7 +557,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
     transient is held by every rank at once, a *single-rank* transient by one rank while the others idle), minus
     ``(r - 1) * giwk_shareable`` for the branch's node-shared ``giwk_full`` window, and this must not exceed
     ``NODE_MEMORY_FRACTION`` times the node budget - ``psutil.virtual_memory().available``, capped by the cgroup
-    memory limit when the scheduler sets one (see :func:`_cgroup_memory_limit`). Each
+    memory limit when the scheduler sets one (see :func:`dgamore.mpi_utils.cgroup_memory_limit`). Each
     node's rank count and available memory are collected with a single ``allgather`` of
     ``(hostname, available_bytes)``; a branch's path is judged to "fit" only if it fits on **every** node (the flags
     are process-wide, so the tightest node governs, and a single-rank transient may land on any node). The
@@ -608,7 +574,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
     # Gather (hostname, available bytes) from every rank in a single collective and reduce to one entry per node:
     # the rank count and the (minimum, conservative) available memory on that node.
     node_available = psutil.virtual_memory().available
-    cgroup_limit = _cgroup_memory_limit()
+    cgroup_limit = mpi_utils.cgroup_memory_limit()
     if cgroup_limit is not None:
         node_available = min(node_available, cgroup_limit)
     hostname = socket.gethostname()
@@ -630,6 +596,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
         niv_core=config.box.niv_core,
         niv_full=config.box.niv_full,
         niv_cut=niv_cut,
+        niv_dmft=config.box.niv_dmft,
         niv_pp=niv_pp,
         n_ranks=comm.size,
         with_eliashberg=config.eliashberg.perform_eliashberg,

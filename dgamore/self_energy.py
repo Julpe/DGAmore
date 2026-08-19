@@ -245,13 +245,51 @@ class SelfEnergy(TwoPoint):
         self.compress_q_dimension()
         other = other.compress_q_dimension()
 
-        other_mat = np.tile(other.mat, (self.nq_tot, 1, 1, 1)) if other.nq_tot == 1 else other.mat
-        result_mat = np.concatenate(
-            (other_mat[..., :niv_diff], self.mat, other_mat[..., niv_diff + 2 * self.niv :]), axis=-1
-        )
+        # the shell donor's momentum axis broadcasts into the result, so a local tail is never tiled over the BZ
+        result_mat = np.empty(self.current_shape[:-1] + (2 * other.niv,), dtype=self.mat.dtype)
+        result_mat[..., :niv_diff] = other.mat[..., :niv_diff]
+        result_mat[..., niv_diff : niv_diff + 2 * self.niv] = self.mat
+        result_mat[..., niv_diff + 2 * self.niv :] = other.mat[..., niv_diff + 2 * self.niv :]
         return SelfEnergy(
             result_mat, self.nq, self.full_niv_range, self.has_compressed_q_dimension, False, beta=self._beta
         )
+
+    def fit_smom_concatenated(self, other: "SelfEnergy") -> tuple[np.ndarray, np.ndarray]:
+        """
+        Fits the high-frequency moments that :meth:`fit_smom` would report for
+        ``self.concatenate_self_energies(other)``, without building the momentum-resolved concatenation: only the
+        fit window (the top fifth of ``other``'s positive frequencies) is assembled from the same column sources,
+        so the moments are bit-identical to the full concatenation's fit.
+
+        :param other: The self-energy supplying the shell frequencies; must have at least as many frequencies as ``self``.
+        :return: The tuple ``(mom0, mom1)`` of moments, each of shape ``[o1, o2]``.
+        :raises ValueError: If ``other`` has fewer frequencies than ``self``.
+        """
+        if self.niv > other.niv:
+            raise ValueError("Can not concatenate with a self-energy that has less frequencies.")
+        niv_res = other.niv
+        niv_diff = niv_res - self.niv
+        n_freq_fit = max(int(0.2 * niv_res), 4)
+
+        self.compress_q_dimension()
+        other = other.compress_q_dimension()
+
+        # first absolute fit column and the core/shell boundary inside the window (the window never reaches the
+        # negative shell, since it spans at most a fifth of the positive half)
+        lo = 2 * niv_res - n_freq_fit
+        split = min(max(niv_res + self.niv, lo), 2 * niv_res)
+
+        mat_fit = np.empty(self.current_shape[:-1] + (n_freq_fit,), dtype=self.mat.dtype)
+        mat_fit[..., : split - lo] = self.mat[..., lo - niv_diff : split - niv_diff]
+        mat_fit[..., split - lo :] = other.mat[..., split:]
+
+        fitdata = np.mean(mat_fit.reshape(*self.nq, self.n_bands, self.n_bands, n_freq_fit), axis=(0, 1, 2))
+        iv = 1j * MFHelper.vn(niv_res, self._beta, return_only_positive=True)
+        iwfit = iv[niv_res - n_freq_fit :][None, None, :]
+
+        mom0 = np.mean(fitdata.real, axis=-1)
+        mom1 = np.mean(fitdata.imag * iwfit.imag, axis=-1)
+        return mom0, mom1
 
     def fit_polynomial(self, n_fit: int = 4, degree: int = 3, niv_core: int = 0) -> "SelfEnergy":
         """

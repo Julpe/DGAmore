@@ -314,6 +314,29 @@ def test_raises_error_when_concatenating_with_smaller_niv():
         self_energy1.concatenate_self_energies(self_energy2)
 
 
+@pytest.mark.parametrize("niv_core, niv_shell", [(3, 12), (8, 10), (10, 10)])
+def test_fit_smom_concatenated_is_bit_identical_to_the_full_concatenation_fit(niv_core, niv_shell):
+    """fit_smom_concatenated equals the momentum-resolved concatenation's own moment fit bit-for-bit."""
+    nk_odd = (3, 2, 1)
+    rng = np.random.default_rng(7)
+    core_mat = (rng.standard_normal((int(np.prod(nk_odd)), 2, 2, 2 * niv_core)) * 0.1 + 0.3j).astype(np.complex64)
+    shell_mat = (rng.standard_normal((1, 1, 1, 2, 2, 2 * niv_shell)) * 0.1 + 0.2j).astype(np.complex64)
+    core = _se(core_mat, nk=nk_odd, has_compressed_q_dimension=True)
+    shell = _se(shell_mat, nk=(1, 1, 1))
+    ref0, ref1 = core.copy().concatenate_self_energies(shell).smom
+    mom0, mom1 = core.fit_smom_concatenated(shell)
+    assert np.array_equal(mom0, ref0) and np.array_equal(mom1, ref1)
+
+
+def test_fit_smom_concatenated_raises_for_smaller_shell():
+    """fit_smom_concatenated raises when the shell donor has fewer frequencies than the core."""
+    self_energy1 = _se(mat_decompressed, nk=nk, has_compressed_q_dimension=False)
+    smaller_mat = np.random.rand(*nk, 2, 2, 2 * (niv - 1))
+    self_energy2 = _se(smaller_mat, nk=nk, has_compressed_q_dimension=False)
+    with pytest.raises(ValueError, match="Can not concatenate with a self-energy that has less frequencies."):
+        self_energy1.fit_smom_concatenated(self_energy2)
+
+
 def test_concatenates_self_energies_correctly_with_larger_niv():
     """concatenate_self_energies wraps the core in the larger self-energy's tails."""
     self_energy1 = _se(mat_decompressed, nk=nk, has_compressed_q_dimension=False)

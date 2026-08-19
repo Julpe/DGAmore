@@ -180,6 +180,22 @@ def patch_maxent_mpi(monkeypatch):
     monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", _fake_problem)
 
 
+def test_perform_maxent_giwk_prepares_the_continued_g_on_rank0_only(tmp_path, patch_maxent_mpi, monkeypatch):
+    """perform_maxent_giwk builds the full-BZ band-basis input on rank 0 only; other ranks receive their slice."""
+    nk, n_bands, niv_core, w_count = (4, 4, 1), 2, 3, 7
+    _setup_maxent_config(tmp_path, nk, n_bands, niv_core, w_count, seed=7)
+    mat = _build_giwk_mat(nk, n_bands, niv=4, seed=11)
+    calls = []
+    real_rotation = max_ent.orbital_to_band_basis
+    monkeypatch.setattr(max_ent, "orbital_to_band_basis", lambda *a: calls.append(1) or real_rotation(*a))
+
+    def fn(comm, rank):
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
+
+    run_parallel(2, fn)
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("size", [1, 2])
 def test_perform_maxent_giwk_continues_band_diagonal_and_unfolds(tmp_path, patch_maxent_mpi, size):
     """perform_maxent_giwk continues the band-diagonal G and unfolds it, unlike orbital-diagonal continuation."""

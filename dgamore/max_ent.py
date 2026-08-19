@@ -79,21 +79,24 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
     logger = config.logger
 
     logger.info(f"Starting analytic continuation of the {name} Green's function using the maximum entropy method.")
-    giwk_maxent = giwk.cut_niv(config.box.niv_core).to_half_niv_range()
-
-    # Rotate G into the band (H(k)-eigen) basis first, so the band-diagonal below is the band-resolved spectral function
-    # (invariant under lattice symmetries, so the naive irrk_inv unfold is correct); done on the full BZ.
-    hk = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
-    giwk_maxent = giwk_maxent.decompress_q_dimension()
-    orbital_to_band_basis(hk, giwk_maxent.mat)
-
     irrq_list = config.lattice.k_grid.get_irrq_list()
-
     mpi_dist = MpiDistributor(ntasks=len(irrq_list), comm=comm, name="Maxent_G", output_path=config.output.output_path)
 
-    giwk_maxent = giwk_maxent.reduce_q(irrq_list)
+    # The full-BZ preparation runs on rank 0 only: every rank used to build the identical core-cut, band-rotated,
+    # irr-reduced Green's function just to keep its own scatter slice - multi-GB transients times the rank count.
+    g_irr_mat = None
+    if comm.rank == 0:
+        giwk_maxent = giwk.cut_niv(config.box.niv_core).to_half_niv_range()
+
+        # Rotate G into the band (H(k)-eigen) basis first, so the band-diagonal below is the band-resolved spectral
+        # function (invariant under lattice symmetries, so the naive irrk_inv unfold is correct); on the full BZ.
+        hk = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
+        giwk_maxent = giwk_maxent.decompress_q_dimension()
+        orbital_to_band_basis(hk, giwk_maxent.mat)
+        g_irr_mat = giwk_maxent.reduce_q(irrq_list).mat
+
     logger.info("Scattering Green's function in the IBZ to all ranks.")
-    giwk_maxent.mat = mpi_dist.scatter(giwk_maxent.mat)  # each rank now has a slice of the irr BZ
+    g_irr_slice = mpi_dist.scatter(g_irr_mat)  # each rank now has a slice of the irr BZ
 
     wn = np.pi / config.sys.beta * (2 * np.arange(config.box.niv_core) + 1)
     w = (
@@ -109,7 +112,7 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
 
     for band in range(config.sys.n_bands):
         logger.info(f"Processing analytic continuation of band {band+1}.")
-        for k in range(giwk_maxent.mat.shape[0]):
+        for k in range(g_irr_slice.shape[0]):
             # Capture the vendored solver's stdout so its print() diagnostics go through the logger instead of
             # leaking to the output; re-logged (prefixed) below whether the continuation succeeds or fails.
             captured_output = io.StringIO()
@@ -121,7 +124,7 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
                     # The alpha-fit curve_fit inside the solver harmlessly fails to estimate its covariance; mute it.
                     warnings.simplefilter("ignore", OptimizeWarning)
                     probl_maxent = AnalyticContinuationProblem(
-                        im_axis=wn, re_axis=w, im_data=giwk_maxent[k, band, band], beta=config.sys.beta
+                        im_axis=wn, re_axis=w, im_data=g_irr_slice[k, band, band], beta=config.sys.beta
                     )
                     result = probl_maxent.solve(model=model, stdev=stdev)[0]
                     spectral_function[k, band] = result.A_opt.astype(np.float32)

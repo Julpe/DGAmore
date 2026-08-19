@@ -31,6 +31,7 @@ BASE = dict(
     niv_core=30,
     niv_full=40,
     niv_cut=80,  # min(niw_core + niv_full + 10, niv_dmft) == 80 here
+    niv_dmft=120,
     niv_pp=15,
     n_ranks=4,
     with_eliashberg=False,
@@ -44,6 +45,7 @@ TINY = dict(
     niv_core=5,
     niv_full=6,
     niv_cut=15,
+    niv_dmft=20,
     niv_pp=2,
     n_ranks=4,
     with_eliashberg=False,
@@ -247,6 +249,15 @@ def test_sde_transient_is_the_irr_kernel_plus_the_bounded_exchange_chunks():
     chunk = min(SLICE_CHUNK_BYTES, DTYPE_BYTES * qt * nb**4 * wp * vc)
     expected = SCALE * qi * nb**4 * wp * vc + OVERHEAD_FACTOR * SDE_CHUNK_FACTOR * chunk
     assert estimate_peaks(**TINY)["sde"].off_distributed == pytest.approx(expected)
+
+
+def test_sde_single_covers_the_rank0_occupation_step():
+    """The sde single-rank slot grows to the DMFT-box sigma/giwk pair once that exceeds the finalize buffers."""
+    small = estimate_peaks(**{**TINY, "niv_dmft": TINY["niv_core"]})["sde"].off_single
+    big = estimate_peaks(**{**TINY, "niv_dmft": 100 * TINY["niv_core"]})["sde"].off_single
+    nb = TINY["n_bands"]
+    assert big == pytest.approx(SCALE * 2 * TINY["nk_tot"] * nb**2 * 2 * 100 * TINY["niv_core"])
+    assert small < big
 
 
 def test_sde_chunk_term_is_capped_by_the_byte_budget(monkeypatch):
