@@ -426,7 +426,7 @@ def main():
         )
         print(f"G2 extracted. Calculating G2_dens and G2_magn for atom {ineq} ...")
         g2_dens = 0.5 * (g2_uuuu + g2_dddd + g2_uudd + g2_dduu)
-        g2_magn = 0.5 * (g2_uddu + g2_duud)
+        g2_magn = 0.25 * (g2_uddu + g2_duud + g2_uuuu + g2_dddd - g2_uudd - g2_dduu)
 
         del g2_uuuu, g2_dddd, g2_dduu, g2_uudd, g2_uddu, g2_duud
         gc.collect()
