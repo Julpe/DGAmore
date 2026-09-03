@@ -1172,59 +1172,6 @@ def _init_mu_history(starting_iter: int) -> list[float]:
     return [previous_mu]
 
 
-def read_last_n_sigmas_from_files(n: int, output_path: str = "./", previous_sc_path: str = "./") -> list[np.ndarray]:
-    """
-    Reads the last ``n`` total self-energies from the output directory and - if specified - the previous
-    self-consistency path. This is used for the Pulay/Anderson mixing schemes. If one has a history of self-energies
-    from a previous calculation, these will be used as well.
-
-    :param n: Number of most recent self-energies to read.
-    :param output_path: Directory holding the current run's ``sigma_dga_iteration_*.npy`` files.
-    :param previous_sc_path: Directory of a previous self-consistency run to prepend to the history (if set).
-    :return: A list of self-energy arrays (cut to the core box and interpolated onto the k-grid), oldest first.
-    """
-
-    def _get_top_n_files(path: str, pattern: str, regex: re.Pattern) -> list[tuple[int, str]]:
-        """
-        Finds the ``n`` highest-iteration files in ``path`` matching ``pattern``/``regex``.
-
-        :param path: Directory to search.
-        :param pattern: Glob pattern selecting candidate files.
-        :param regex: Regex whose first group captures the iteration number.
-        :return: A list of ``(iteration, filepath)`` tuples, sorted ascending, truncated to the last ``n``.
-        """
-        files = glob.glob(os.path.join(path, pattern))
-        matched = [(int(match.group(1)), f) for f in files if (match := regex.search(f))]
-        return sorted(matched, key=lambda x: x[0])[-n:]
-
-    interp_pattern = "sigma_dga_interpolated_*_iteration_*.npy"
-    interp_regex = re.compile(r"sigma_dga_interpolated_.+_iteration_(\d+)\.npy$")
-
-    normal_pattern = "sigma_dga_iteration_*.npy"
-    normal_regex = re.compile(r"sigma_dga_iteration_(\d+)\.npy$")
-
-    last_iterations_previous_dir = []
-    if previous_sc_path and previous_sc_path.strip():
-        if config.self_consistency.use_interpolated_sigma:
-            last_iterations_previous_dir = _get_top_n_files(previous_sc_path, interp_pattern, interp_regex)
-        else:
-            last_iterations_previous_dir = _get_top_n_files(previous_sc_path, normal_pattern, normal_regex)
-
-    last_iterations_current_dir = _get_top_n_files(output_path, normal_pattern, normal_regex)
-    last_iterations = (last_iterations_previous_dir + last_iterations_current_dir)[-n:]
-
-    sigmas = []
-    for _, file in last_iterations:
-        sigma_mat = np.load(file)
-        sigmas.append(
-            SelfEnergy(sigma_mat, sigma_mat.shape[:3], True, False, False, False, beta=config.sys.beta)
-            .cut_niv(config.box.niv_core)
-            .interpolate_q_grid(config.lattice.k_grid.nk, False)
-            .mat
-        )
-    return sigmas
-
-
 def _load_node_shared_local_vertex(node_comm, path: str, channel: SpinChannel, transform=None) -> tuple:
     r"""
     Loads a local four-point vertex from file **once per node** into an MPI shared-memory window (see
@@ -1750,15 +1697,11 @@ def calculate_self_energy_q(
 
     mu_history = _init_mu_history(starting_iter)
 
-    # rank 0 keeps the accelerated-mixing self-energy history in memory (seeded once from files for resumed runs):
-    # every rank used to re-read/re-interpolate the last n sigma files each iteration - identical data, redundant IO.
-    sigma_history = None
+    # rank 0 keeps the accelerated-mixing (iterate, proposal) pair history in memory; the saved sigma files hold
+    # only post-mixing iterates (no proposals), so resumed runs start empty and re-arm as pairs accumulate
+    mixing_history = None
     if comm.rank == 0 and config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson"):
-        sigma_history = read_last_n_sigmas_from_files(
-            config.self_consistency.mixing_history_length,
-            config.output.output_path,
-            config.self_consistency.previous_sc_path,
-        )
+        mixing_history = []
 
     niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
     sigma_dmft_full = sigma_dmft.copy()
@@ -1829,18 +1772,12 @@ def calculate_self_energy_q(
         # mixing runs on rank 0 only (all ranks computed identical results before); the mixed sigma then reaches the
         # other ranks once per node through a shared window instead of once per rank
         if comm.rank == 0:
-            sigma_new = apply_mixing_strategy(
-                sigma_new, sigma_old, sigma_dmft, current_iter, history_cap, sigma_history
-            )
+            sigma_new = apply_mixing_strategy(sigma_new, sigma_old, history_cap, mixing_history)
         if sc_node_comm is None:
             sigma_new = mpi_dist_fullbz.bcast_npoint(sigma_new)
         else:
             # compressing first pins one momentum layout on every rank, so the shared buffer matches all metadata
             sigma_win = _share_sigma_per_node(sigma_new.compress_q_dimension(), sc_node_comm, sc_roots_comm)
-        if sigma_history is not None:
-            # the in-memory analog of what read_last_n_sigmas_from_files reproduced from the file just saved below
-            sigma_history.append(sigma_new.decompress_q_dimension().cut_niv(config.box.niv_core).mat)
-            del sigma_history[: -config.self_consistency.mixing_history_length]
 
         sigma_new = sigma_new.compress_q_dimension()
         sigma_old = sigma_old.compress_q_dimension()
@@ -1982,28 +1919,33 @@ def calculate_self_energy_q(
 def apply_mixing_strategy(
     sigma_new: SelfEnergy,
     sigma_old: SelfEnergy,
-    sigma_dmft: SelfEnergy,
-    current_iter: int,
     history_cap: int | None = None,
-    sigma_history: list | None = None,
+    mixing_history: list | None = None,
 ) -> SelfEnergy:
     """
     Applies the self-energy mixing strategy for the self-consistency loop. Supports linear mixing as well as the
-    accelerated Pulay (DIIS) and Anderson schemes (which use the self-energy history read from file); the accelerated
-    schemes fall back to linear mixing when their least-squares problem is ill-conditioned or the history is too short.
-    The mixing strategy and parameters are taken from the config.
+    accelerated Pulay (DIIS) and Anderson schemes; the accelerated schemes fall back to linear mixing when their
+    least-squares problem is ill-conditioned or the history is too short. The mixing strategy and parameters are
+    taken from the config.
+
+    The accelerated schemes build their secant history from genuine (iterate, proposal) pairs: each history entry
+    holds an iterate :math:`x` together with the un-mixed proposal :math:`S(x)` the self-energy map produced from
+    it. The post-mixing iterates alone (the per-iteration sigma files) cannot serve as proposals - at mixing
+    parameters below one, ``mix(S(x), x, history) != S(x)``, so pairing consecutive iterates would feed the secant
+    model inconsistent data. This function therefore records the current pair ``(sigma_old, sigma_new)`` (cut to
+    the core window, before mixing overwrites ``sigma_new`` in place) into ``mixing_history`` itself. A
+    momentum-local iterate (the fresh-run starting self-energy) is broadcast over the proposal's momentum grid.
 
     :param sigma_new: The freshly computed self-energy proposal.
     :param sigma_old: The previous iteration's self-energy.
-    :param sigma_dmft: The DMFT self-energy (used to seed the proposal history for the accelerated schemes).
-    :param current_iter: The current self-consistency iteration number.
-    :param history_cap: Optional upper bound on the number of history entries used by the accelerated schemes
+    :param history_cap: Optional upper bound on the number of secant pairs used by the accelerated schemes
         (``None`` for no bound). Used to reset the mixing history after the susceptibility-restriction release, so
-        the accelerated schemes never extrapolate across the restricted-to-unrestricted discontinuity.
-    :param sigma_history: Optional in-memory self-energy history (core-cut arrays, oldest first, the layout of
-        :func:`read_last_n_sigmas_from_files`). When given, the accelerated schemes read it instead of re-loading
-        and re-interpolating the saved sigma files - the caller (rank 0 of the self-consistency loop) maintains it
-        across iterations, so the per-iteration per-rank file reads disappear.
+        the accelerated schemes never extrapolate across the restricted-to-unrestricted discontinuity. Pairs keep
+        being recorded while capped, so the history re-arms from genuine post-release pairs.
+    :param mixing_history: Mutable list of (iterate, proposal) pairs of core-cut decompressed arrays, oldest
+        first, maintained across iterations by the caller (rank 0 of the self-consistency loop). This function
+        appends the current pair and trims the list to the configured history length plus one. ``None`` disables
+        the accelerated schemes (linear mixing).
     :return: The mixed :class:`SelfEnergy` for the next iteration.
     """
     logger = config.logger
@@ -2013,23 +1955,25 @@ def apply_mixing_strategy(
     alpha = config.self_consistency.mixing
 
     last_results, last_proposals = [], []
-    if config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson") and n_hist > 0:
-        if sigma_history is not None:
-            last_results = list(sigma_history[-n_hist:])
-        else:
-            last_results = read_last_n_sigmas_from_files(
-                n_hist, config.output.output_path, config.self_consistency.previous_sc_path
-            )
-        sigma_dmft_stacked = np.tile(
-            sigma_dmft.cut_niv(config.box.niv_core).mat, (config.lattice.k_grid.nk_tot, 1, 1, 1)
-        )
+    if config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson") and mixing_history is not None:
+        niv_core = config.box.niv_core
+        sigma_old.decompress_q_dimension()
+        sigma_new.decompress_q_dimension()
+        niv_o, niv_n = sigma_old.niv, sigma_new.niv
+        proposal = sigma_new.mat[..., niv_n - niv_core : niv_n + niv_core].copy()
+        # broadcast_to expands a momentum-local iterate (the fresh-run starting sigma) over the proposal's
+        # k-grid; the copies must survive the in-place core-window update of sigma_new below
+        iterate = np.broadcast_to(sigma_old.mat[..., niv_o - niv_core : niv_o + niv_core], proposal.shape).copy()
+        mixing_history.append((iterate, proposal))
+        del mixing_history[: -(config.self_consistency.mixing_history_length + 1)]
 
-        last_proposals = [sigma_dmft_stacked] + last_results  # [dmft, s1, ..., s_{n-1}]
-        last_results = last_results + [sigma_new.cut_niv(config.box.niv_core).mat]  # [s1,  s2, ..., s_n]
+        if n_hist > 0:
+            pairs = mixing_history[-(n_hist + 1) :]
+            last_proposals = [iterate for iterate, _ in pairs]  # [x_{n-m}, ..., x_n]
+            last_results = [proposal for _, proposal in pairs]  # [S(x_{n-m}), ..., S(x_n)]
+            logger.info(f"Using the last {len(pairs)} (iterate, proposal) pairs of the mixing history.")
 
-        logger.info(f"Using the last {min(n_hist, len(last_results))} self-energies of the mixing history.")
-
-    accelerated_mixing_condition = current_iter > n_hist and len(last_results) > n_hist and len(last_proposals) > n_hist
+    accelerated_mixing_condition = len(last_results) > n_hist
 
     if config.self_consistency.mixing_strategy.lower() == "pulay" and accelerated_mixing_condition:
         shape = last_results[-1].shape

@@ -17,10 +17,10 @@ lattice:
 self_consistency:
   max_iter: 20 # Maximum number of iterations
   epsilon: 1e-4 # Convergence criterion: relative L2 residual of the self-energy over the positive fermionic core frequencies (niv_core)
-  mixing: 0.2 # Linear Mixing parameter for the self-energy: sigma_new = mixing * sigma_new + (1 - mixing) * sigma_old. Will be
-  # used in every iteration if the mixing strategy is set to 'linear' and only for the first couple iterations if the mixing strategy is set to "pulay".
+  mixing: 0.2 # Linear Mixing parameter for the self-energy: sigma_new = mixing * sigma_new + (1 - mixing) * sigma_old. Used in
+  # every iteration for 'linear'; 'pulay' and 'anderson' use it for their warm-up iterations and to damp the accelerated update.
   mixing_strategy: "linear" # Available mixing strategies: "linear", "pulay" or "anderson".
-  mixing_history_length: 3 # Number of previous iterations used for Pulay mixing. Default: 3
+  mixing_history_length: 3 # Number of (iterate, proposal) pairs used by the accelerated mixing schemes. Default: 3
   previous_sc_path: "" # Path to the previous self-consistency folder. If not specified, the code will start a new calculation from scratch. If specified,
   # the code will start from the last iteration of the previous calculation and does max_iter steps on top
   use_interpolated_sigma: False # If True, the code will use the interpolated self-energy from the previous iteration
