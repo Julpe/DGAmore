@@ -25,7 +25,7 @@ jobs:
 
       # 2. Set up Python (mirrors the Read the Docs build: Python 3.13)
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           cache: 'pip'
