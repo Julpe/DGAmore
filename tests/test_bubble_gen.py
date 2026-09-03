@@ -62,14 +62,14 @@ def test_create_generalized_chi0_matches_reference():
     assert np.allclose(res.mat, ref, atol=1e-4)
 
 
-def test_create_generalized_chi0_q_matches_reference():
-    """create_generalized_chi0_q matches an explicit per-q reference and stays q-compressed."""
+def test_create_generalized_chi0_q_loop_matches_reference():
+    """create_generalized_chi0_q_loop matches an explicit per-q reference and stays q-compressed."""
     nk, nb, niv, niw, beta = (2, 2, 1), 2, 1, 1, 2.0
     g = _make_momentum_g(nk, nb, niv + niw + 1, seed=2)
     q_grid = bz.KGrid(nk, symmetries=[])
     q_list = q_grid.get_q_list()
 
-    res = BubbleGenerator.create_generalized_chi0_q(g, niw, niv, q_list, q_grid, beta, use_gpu=False)
+    res = BubbleGenerator.create_generalized_chi0_q_loop(g, niw, niv, q_list, q_grid, beta)
 
     gcut = g.cut_niv(niv + niw).mat  # [kx,ky,kz,o,o,2*(niv+niw)]
     niv_g = gcut.shape[-1] // 2
@@ -93,14 +93,14 @@ def test_create_generalized_chi0_q_matches_reference():
     assert np.allclose(res.mat, ref, atol=1e-4)
 
 
-def test_create_generalized_chi0_q_no_copy_of_full_green_function():
-    """create_generalized_chi0_q does not mutate its input Green's function."""
+def test_create_generalized_chi0_q_loop_no_copy_of_full_green_function():
+    """create_generalized_chi0_q_loop does not mutate its input Green's function."""
     nk, nb, niv, niw, beta = (2, 2, 1), 2, 1, 1, 2.0
     g = _make_momentum_g(nk, nb, niv + niw + 1, seed=3)
     g_before = g.mat.copy()
     q_grid = bz.KGrid(nk, symmetries=[])
 
-    BubbleGenerator.create_generalized_chi0_q(g, niw, niv, q_grid.get_q_list(), q_grid, beta, use_gpu=False)
+    BubbleGenerator.create_generalized_chi0_q_loop(g, niw, niv, q_grid.get_q_list(), q_grid, beta)
 
     assert np.array_equal(g.mat, g_before)  # input untouched
 
@@ -207,7 +207,7 @@ def test_fft_bubble_matches_direct_einsum_bubble():
     g = _make_momentum_g(nk, nb, niv + niw + 2, seed=7)
     q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
     fft_bubble = _fft_bubble_reference(g, niw, niv, q_grid, beta)
-    direct = BubbleGenerator.create_generalized_chi0_q(g, niw, niv, np.array(q_grid.get_irrq_list()), q_grid, beta)
+    direct = BubbleGenerator.create_generalized_chi0_q_loop(g, niw, niv, np.array(q_grid.get_irrq_list()), q_grid, beta)
     assert fft_bubble.mat.dtype == np.complex64
     assert fft_bubble.mat.shape == direct.mat.shape
     assert np.allclose(fft_bubble.mat, direct.mat, atol=1e-4)
