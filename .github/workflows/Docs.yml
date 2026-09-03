@@ -21,7 +21,7 @@ jobs:
     steps:
       # 1. Checkout repository
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # 2. Set up Python (mirrors the Read the Docs build: Python 3.13)
       - name: Set up Python
