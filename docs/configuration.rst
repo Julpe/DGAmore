@@ -103,12 +103,14 @@ changing by less than a small temperature-dependent threshold between iterations
 
 The ``mixing`` parameter is a floating-point number between zero and one that sets the weight of the new
 self-energy in the update. The accompanying ``mixing_strategy`` selects between ``linear``, ``pulay`` and
-``anderson`` mixing; the latter two build a prediction from the previous ``mixing_history_length`` self-energies and
-fall back to linear mixing while fewer iterations than the history length are available. The ``previous_sc_path``
-field points to the folder of an earlier, possibly unconverged, self-consistency run: the code then resumes from
-its last iterations and continues converging, applying Pulay or Anderson mixing right away if enough previous
-iterations are available. Enabling ``use_interpolated_sigma`` makes the cycle start from the interpolated
-self-energy of the previous run, with the interpolation itself configured in the
+``anderson`` mixing; the latter two build a secant model from the last ``mixing_history_length`` pairs of an
+iterate and the un-mixed self-energy the Schwinger-Dyson map produced from it, collected in memory as the run
+iterates, and mix linearly for the first ``mixing_history_length`` iterations while those pairs accumulate. The
+``previous_sc_path`` field points to the folder of an earlier, possibly unconverged, self-consistency run: the
+code then resumes from its last iteration and chemical potential and continues converging; the accelerated
+schemes rebuild their history during the resumed run's first iterations, since the saved per-iteration files hold
+only the already-mixed self-energies. Enabling ``use_interpolated_sigma`` makes the cycle start from the
+interpolated self-energy of the previous run, with the interpolation itself configured in the
 :ref:`self-energy interpolation section <self-energy-interpolation>`.
 
 .. _stabilization:
