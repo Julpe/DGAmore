@@ -5,8 +5,6 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
-import sys
-import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -346,8 +344,8 @@ def test_vrg_right_is_first_frequency_summed_three_leg_vertex():
     assert np.allclose(vrg_right.mat, ref_right, atol=1e-10)
 
 
-def test_unused_qloop_sigma_variants_agree(monkeypatch):
-    """The unused q-loop self-energy variants (plain, CPU, GPU-stub, auto) agree on synthetic data, locking them."""
+def test_unused_qloop_sigma_variants_agree():
+    """The two unused q-loop self-energy variants (plain and buffered) agree on synthetic data, locking them."""
     nk, o, niw, niv = (4, 4, 1), 2, 3, 4
     config.lattice.nk = nk
     config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
@@ -372,21 +370,9 @@ def test_unused_qloop_sigma_variants_agree(monkeypatch):
         )
 
     sigma_ref = nonlocal_sde.calculate_sigma_from_kernel(make_kernel(), giwk, q_list)
-    sigma_cpu = nonlocal_sde.calculate_sigma_from_kernel_cpu(make_kernel(), giwk, q_list)
+    sigma_loop = nonlocal_sde.calculate_sigma_from_kernel_loop(make_kernel(), giwk, q_list)
 
-    cupy_stub = types.ModuleType("cupy")
-    cupy_stub.zeros, cupy_stub.asarray, cupy_stub.arange = np.zeros, np.asarray, np.arange
-    cupy_stub.einsum, cupy_stub.asnumpy = np.einsum, lambda x: x
-    with monkeypatch.context() as mp:
-        mp.setitem(sys.modules, "cupy", cupy_stub)
-        sigma_gpu = nonlocal_sde.calculate_sigma_from_kernel_gpu(make_kernel(), giwk, q_list)
-    with monkeypatch.context() as mp:
-        mp.setitem(sys.modules, "cupy", None)
-        sigma_auto = nonlocal_sde.calculate_sigma_from_kernel_auto(MagicMock(), make_kernel(), giwk, q_list)
-
-    assert np.allclose(sigma_cpu.mat, sigma_ref.mat, atol=1e-6)
-    assert np.allclose(sigma_gpu.mat, sigma_ref.mat, atol=1e-6)
-    assert np.array_equal(sigma_auto.mat, sigma_cpu.mat)
+    assert np.allclose(sigma_loop.mat, sigma_ref.mat, atol=1e-6)
 
 
 def _chi_from_compound(comp: np.ndarray, o: int):
@@ -1164,7 +1150,7 @@ def test_fft_sde_pass_is_invariant_under_the_w_chunk_size(negative_w, monkeypatc
                 has_compressed_q_dimension=True,
             )
             sigma = nonlocal_sde._run_fft_sde_pass(
-                kernel, d_irr, d_full, g_r_local, niv_g, pairs, False, negative_w, chunk_bytes
+                kernel, d_irr, d_full, g_r_local, niv_g, pairs, negative_w, chunk_bytes
             )
             results.append(sigma.mat.copy())
         return results

@@ -9,7 +9,7 @@ Non-local ladder DGA step - the parallel-heavy core of the code. Starting from t
 the bubble :math:`\chi^{\mathrm{q}\nu}_{0}`, the auxiliary susceptibility :math:`\chi^{*;\mathrm{q}}_{r}`, the three-leg
 vertex :math:`\gamma^{\mathrm{q}\nu}_{r}`, the physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` (with shell and
 optional :math:`\lambda`-correction) and the self-energy kernel, then contract the kernel with the Green's function to
-get the momentum-dependent self-energy :math:`\Sigma^{\mathrm{k}}_{12}`. Several CPU/GPU/FFT variants of the heavy
+get the momentum-dependent self-energy :math:`\Sigma^{\mathrm{k}}_{12}`. Both a q-loop and an FFT variant of the heavy
 contractions are provided, distributed over MPI ranks. The whole thing is wrapped in a self-consistency loop with
 chemical-potential adjustment and self-energy mixing (linear / Pulay / Anderson). Equation numbers refer to the author's
 master's thesis (Chapters 3 & 4).
@@ -389,7 +389,7 @@ def calculate_kernel_r_q(
     (P. Worm's PhD thesis, Eq. (3.70)). The result :math:`M_{1ab2} = [K\,\mathcal{U}^{\mathbf{q}}_{r}]_{1ab2}`
     enters the self-energy as :math:`\Sigma_{12} \propto \sum_{ab} M_{1ab2} G_{ab}` and is therefore stored with
     the orbital permutation ``"abcd->badc"``, so that the existing contraction
-    :math:`\Sigma_{12} \propto \sum_{ab} K'_{a12b} G_{ab}` of :func:`calculate_sigma_from_kernel_fft_cpu` applies
+    :math:`\Sigma_{12} \propto \sum_{ab} K'_{a12b} G_{ab}` of :func:`calculate_sigma_from_kernel_fft` applies
     unchanged.
 
     :param vrg_q_r: The momentum-dependent three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}`.
@@ -655,9 +655,9 @@ def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full
     q-points or using numba could speed it up further.
 
     Currently unused: the pipeline always runs the two-pass FFT contraction (see
-    :func:`calculate_sigma_from_kernel_fft_cpu`), since this q-loop variant restores the full bosonic range on the
-    kernel and therefore peaks *higher* in memory. Kept (with its cpu/gpu/auto siblings) for reference; the
-    variants' mutual parity is unit-tested.
+    :func:`calculate_sigma_from_kernel_fft`), since this q-loop variant restores the full bosonic range on the
+    kernel and therefore peaks *higher* in memory. Kept (with its buffered sibling
+    :func:`calculate_sigma_from_kernel_loop`) for reference; the two variants' mutual parity is unit-tested.
 
     :param kernel: The self-energy kernel :math:`K` (full BZ, scattered across ranks).
     :param giwk: The momentum-dependent :class:`GreensFunction`.
@@ -684,7 +684,7 @@ def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full
     return SelfEnergy(mat, config.lattice.nk, False, beta=config.sys.beta).compress_q_dimension().to_full_niv_range()
 
 
-def calculate_sigma_from_kernel_cpu(
+def calculate_sigma_from_kernel_loop(
     kernel: FourPoint,
     giwk: GreensFunction,
     my_full_q_list: np.ndarray,
@@ -692,9 +692,9 @@ def calculate_sigma_from_kernel_cpu(
     r"""
     Returns :math:`\Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{ab}
     K^{\mathrm{q}\nu}_{a12b} G^{\mathrm{k}-\mathrm{q}}_{ab}`. For very large momentum grids,
-    this function is the slowest part of the code because of its repeated loops. Short of moving the
-    work to a GPU or another accelerator, there is no real way to speed it up further. This is the CPU implementation
-    (Fortran-ordered buffers, preallocated accumulator). Currently unused, see :func:`calculate_sigma_from_kernel`.
+    this function is the slowest part of the code because of its repeated loops. This is the buffered q-loop
+    implementation (Fortran-ordered inputs, preallocated accumulator, precomputed shift indices). Currently unused,
+    see :func:`calculate_sigma_from_kernel`.
 
     :param kernel: The self-energy kernel :math:`K` (full BZ, scattered across ranks).
     :param giwk: The momentum-dependent :class:`GreensFunction`.
@@ -737,97 +737,6 @@ def calculate_sigma_from_kernel_cpu(
     )
 
 
-def calculate_sigma_from_kernel_gpu(
-    kernel: FourPoint,
-    giwk: GreensFunction,
-    my_full_q_list: np.ndarray,
-) -> SelfEnergy:
-    r"""
-    Returns :math:`\Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{ab}
-    K^{\mathrm{q}\nu}_{a12b} G^{\mathrm{k}-\mathrm{q}}_{ab}`. For very large momentum grids,
-    this function is the slowest part of the code because of its repeated loops. This is the GPU
-    implementation using CuPy. Currently unused, see :func:`calculate_sigma_from_kernel`.
-
-    :param kernel: The self-energy kernel :math:`K` (full BZ, scattered across ranks).
-    :param giwk: The momentum-dependent :class:`GreensFunction`.
-    :param my_full_q_list: Array of integer q-point index triplets handled by this rank.
-    :return: The rank-local contribution to the non-local :class:`SelfEnergy` (compressed q, full niv range).
-    """
-    import cupy as cp
-
-    nkx, nky, nkz = config.lattice.k_grid.nk
-    nb = config.sys.n_bands
-    niv_core = config.box.niv_core
-
-    mat_gpu = cp.zeros((nkx, nky, nkz, nb, nb, niv_core), dtype=kernel.mat.dtype, order="F")
-    wn = MFHelper.wn(config.box.niw_core)
-
-    giwk_mat = cp.asarray(giwk.mat, order="F")
-    kernel = cp.asarray(kernel.to_full_niw_range().mat, order="F")[..., niv_core:]
-
-    kxs, kys, kzs = cp.arange(nkx), cp.arange(nky), cp.arange(nkz)
-    kx_indices = [((kxs - q[0]) % nkx) for q in my_full_q_list]
-    ky_indices = [((kys - q[1]) % nky) for q in my_full_q_list]
-    kz_indices = [((kzs - q[2]) % nkz) for q in my_full_q_list]
-
-    for iq in range(len(my_full_q_list)):
-        g_q_view = giwk_mat[
-            kx_indices[iq][:, None, None], ky_indices[iq][None, :, None], kz_indices[iq][None, None, :], ...
-        ]
-
-        for iw, w in enumerate(wn):
-            g_slice = g_q_view[..., giwk.niv - w : giwk.niv + niv_core - w]
-            k_slice = kernel[iq, ..., iw, :]
-            mat_gpu += cp.einsum("xyzadv,aijdv->xyzijv", g_slice, k_slice, optimize=True)
-
-    mat_gpu *= -0.5 / config.sys.beta / config.lattice.k_grid.nk_tot
-    return (
-        SelfEnergy(np.ascontiguousarray(cp.asnumpy(mat_gpu)), config.lattice.nk, False, beta=config.sys.beta)
-        .compress_q_dimension()
-        .to_full_niv_range()
-    )
-
-
-def calculate_sigma_from_kernel_auto(
-    mpi_distributor: MpiDistributor, kernel: FourPoint, giwk: GreensFunction, my_full_q_list: np.ndarray
-) -> SelfEnergy:
-    r"""
-    Dispatches the q-loop self-energy contraction to the GPU (:func:`calculate_sigma_from_kernel_gpu`) when CuPy and
-    a usable CUDA device are available (one GPU per MPI rank, round-robin), otherwise falls back to the CPU
-    implementation (:func:`calculate_sigma_from_kernel_cpu`). Currently unused, see
-    :func:`calculate_sigma_from_kernel`.
-
-    :param mpi_distributor: MPI distributor used to choose the per-rank GPU (see :class:`MpiDistributor`).
-    :param kernel: The self-energy kernel :math:`K` (full BZ, scattered across ranks).
-    :param giwk: The momentum-dependent :class:`GreensFunction`.
-    :param my_full_q_list: Array of integer q-point index triplets handled by this rank.
-    :return: The rank-local contribution to the non-local :class:`SelfEnergy`.
-    """
-    logger = config.logger
-
-    cp = None
-    try:
-        import cupy as cp
-    except ImportError:
-        pass  # CuPy not installed -> CPU
-
-    n_gpus = 0
-    if cp is not None:
-        try:
-            n_gpus = cp.cuda.runtime.getDeviceCount()
-        except cp.cuda.runtime.CUDARuntimeError:
-            n_gpus = 0  # no usable CUDA driver/device -> CPU
-
-    if n_gpus > 0 and cp.cuda.is_available():
-        logger.info(f"CuPy detected {n_gpus} GPU(s). Using GPU acceleration for self-energy calculation.")
-
-        gpu_id = mpi_distributor.my_rank % n_gpus
-        cp.cuda.Device(gpu_id).use()
-        return calculate_sigma_from_kernel_gpu(kernel, giwk, my_full_q_list)
-
-    return calculate_sigma_from_kernel_cpu(kernel, giwk, my_full_q_list)
-
-
 def _build_rspace_giwk_pencil(giwk: GreensFunction, mpi_dist: MpiDistributor, node_comm=None) -> np.ndarray:
     r"""
     Builds this rank's real-space Green's function pencil :math:`F[G](R)` for the FFT self-energy contraction. The
@@ -859,7 +768,7 @@ def _build_rspace_giwk_pencil(giwk: GreensFunction, mpi_dist: MpiDistributor, no
     return g_r_local
 
 
-def calculate_sigma_from_kernel_fft_cpu(
+def calculate_sigma_from_kernel_fft(
     mpi_dist: MpiDistributor,
     kernel: FourPoint,
     g_r_local: np.ndarray,
@@ -867,7 +776,7 @@ def calculate_sigma_from_kernel_fft_cpu(
     niw_index_w_pairs: list[tuple[int, int]],
 ) -> SelfEnergy:
     r"""
-    Computes the self-energy using distributed FFTs (CPU). Replaces the q-loop with a real-space pointwise
+    Computes the self-energy using distributed FFTs. Replaces the q-loop with a real-space pointwise
     multiplication: both the Green's function and the kernel are FFT'd to real space, contracted pointwise per
     rank-local R-slice (the convolution theorem for :math:`\sum_{\mathrm{q}} K^{\mathrm{q}\nu}_{a12b}
     G^{\mathrm{k}-\mathrm{q}}_{ab}`), and accumulated. Returns :math:`\Sigma` in R-space,
@@ -928,120 +837,6 @@ def calculate_sigma_from_kernel_fft_cpu(
     )
 
 
-def calculate_sigma_from_kernel_fft_gpu(
-    mpi_dist: MpiDistributor,
-    kernel: FourPoint,
-    g_r_local: np.ndarray,
-    giwk_niv: int,
-    niw_index_w_pairs: list[tuple[int, int]],
-) -> SelfEnergy:
-    r"""
-    Computes the self-energy using distributed FFTs, running on the GPU (CuPy). Same algorithm as
-    :func:`calculate_sigma_from_kernel_fft_cpu` (including the single-niw-half / ``niw_index_w_pairs`` contraction).
-    Returns :math:`\Sigma` in R-space, positive-:math:`\nu` half only; the caller must ifft over
-    :math:`(k_x, k_y, k_z)` and then call :meth:`SelfEnergy.to_full_niv_range` before use.
-
-    :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
-    :param kernel: The self-energy kernel :math:`K` for one bosonic window (full BZ): a chunk of the positive half
-        or of the negative block from :meth:`LocalNPoint.to_negative_niw_range`.
-    :param g_r_local: This rank's (host) real-space Green's function pencil from :func:`_build_rspace_giwk_pencil`
-        (built once and shared by both niw passes); uploaded to the device here.
-    :param giwk_niv: The central fermionic-frequency index of ``g_r_local`` (``giwk.niv``).
-    :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract (see
-        :func:`calculate_sigma_from_kernel_fft_cpu`).
-    :return: The rank-local R-space :class:`SelfEnergy` (compressed q, half niv range, moments not fitted).
-    """
-    import cupy as cp
-
-    comm = mpi_dist.comm
-    nb = config.sys.n_bands
-    niv_core = config.box.niv_core
-    beta = config.sys.beta
-    nk_tot = config.lattice.k_grid.nk_tot
-
-    g_r_local = cp.asarray(g_r_local)
-
-    # K(q) -> F[K](R): the R-space product with F[G](R) realizes the convolution sum_q K(q) G(k-q). The kernel is
-    # already a single bosonic window (of the positive half or the negative block), never the full niw range.
-    kernel = kernel.to_half_niv_range()
-    kernel = mpi_utils.execute_distributed_fft(kernel, comm)
-    kernel.mat = cp.asarray(kernel.mat)
-
-    # Local R-space contraction; each rank owns a slice of R-points
-    n_r_local = kernel.mat.shape[0]
-    mat = cp.zeros((n_r_local, nb, nb, niv_core), dtype=kernel.mat.dtype)
-
-    for idx, w in niw_index_w_pairs:
-        g_slice = g_r_local[..., giwk_niv - w : giwk_niv + niv_core - w]
-        k_slice = kernel.mat[..., idx, :]
-        mat += cp.einsum("Radv,Raijdv->Rijv", g_slice, k_slice, optimize=True)
-
-    mat *= -0.5 / beta / nk_tot
-    return SelfEnergy(
-        np.ascontiguousarray(cp.asnumpy(mat)),
-        config.lattice.nk,
-        full_niv_range=False,
-        has_compressed_q_dimension=True,
-        calc_smom=False,
-        beta=config.sys.beta,
-    )
-
-
-def select_sigma_fft_device(mpi_distributor: MpiDistributor) -> bool:
-    """
-    Detects whether CuPy and a usable CUDA device are available (one GPU per MPI rank, round-robin), selects this
-    rank's GPU and logs the decision **once**. Intended to be called a single time before the positive- and
-    negative-w FFT passes so the GPU-detection message is not emitted per pass.
-
-    :param mpi_distributor: MPI distributor providing the per-rank GPU choice.
-    :return: True if the GPU implementation should be used, False to fall back to the CPU implementation.
-    """
-    try:
-        import cupy as cp
-    except ImportError:
-        return False  # CuPy not installed -> CPU
-
-    try:
-        n_gpus = cp.cuda.runtime.getDeviceCount()
-    except cp.cuda.runtime.CUDARuntimeError:
-        n_gpus = 0  # no usable CUDA driver/device -> CPU
-
-    if n_gpus > 0 and cp.cuda.is_available():
-        config.logger.info(f"CuPy detected {n_gpus} GPU(s). Using GPU acceleration for self-energy calculation.")
-        cp.cuda.Device(mpi_distributor.my_rank % n_gpus).use()
-        return True
-
-    return False
-
-
-def calculate_sigma_from_kernel_fft(
-    mpi_dist: MpiDistributor,
-    kernel: FourPoint,
-    g_r_local: np.ndarray,
-    giwk_niv: int,
-    niw_index_w_pairs: list[tuple[int, int]],
-    use_gpu: bool,
-) -> SelfEnergy:
-    r"""
-    Dispatches one bosonic-frequency FFT pass to the GPU (:func:`calculate_sigma_from_kernel_fft_gpu`) or CPU
-    (:func:`calculate_sigma_from_kernel_fft_cpu`) implementation according to ``use_gpu`` (decided once by
-    :func:`select_sigma_fft_device`, so no per-pass GPU-detection logging).
-
-    :param mpi_dist: MPI distributor providing the communicator and R-space pencil decomposition.
-    :param kernel: The self-energy kernel :math:`K` for one bosonic window (full BZ).
-    :param g_r_local: This rank's real-space Green's function pencil from :func:`_build_rspace_giwk_pencil` (built
-        once and shared by both niw passes).
-    :param giwk_niv: The central fermionic-frequency index of ``g_r_local`` (``giwk.niv``).
-    :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract (see
-        :func:`calculate_sigma_from_kernel_fft_cpu`).
-    :param use_gpu: Whether to run the GPU implementation (as decided by :func:`select_sigma_fft_device`).
-    :return: The rank-local R-space :class:`SelfEnergy`.
-    """
-    if use_gpu:
-        return calculate_sigma_from_kernel_fft_gpu(mpi_dist, kernel, g_r_local, giwk_niv, niw_index_w_pairs)
-    return calculate_sigma_from_kernel_fft_cpu(mpi_dist, kernel, g_r_local, giwk_niv, niw_index_w_pairs)
-
-
 def _run_fft_sde_pass(
     kernel_irr: FourPoint,
     mpi_dist_irrk: MpiDistributor,
@@ -1049,7 +844,6 @@ def _run_fft_sde_pass(
     g_r_local: np.ndarray,
     giwk_niv: int,
     niw_index_w_pairs: list[tuple[int, int]],
-    use_gpu: bool,
     negative_w: bool,
     chunk_bytes: int | None = None,
 ) -> SelfEnergy:
@@ -1069,8 +863,7 @@ def _run_fft_sde_pass(
         once by the caller and reused by both passes.
     :param giwk_niv: The central fermionic-frequency index of ``g_r_local`` (``giwk.niv``).
     :param niw_index_w_pairs: The ``(kernel_w_index, w)`` pairs to contract (see
-        :func:`calculate_sigma_from_kernel_fft_cpu`).
-    :param use_gpu: Whether to run the GPU implementation (as decided by :func:`select_sigma_fft_device`).
+        :func:`calculate_sigma_from_kernel_fft`).
     :param negative_w: If True, build each chunk's negative-:math:`\omega` block via
         :meth:`LocalNPoint.to_negative_niw_range` before contracting (the negative pass) and trim the kernel peak
         back to the OS on the last chunk's free; if False, contract the mapped chunks directly (the positive pass).
@@ -1100,7 +893,7 @@ def _run_fft_sde_pass(
                 chunk = chunk_neg
 
             pairs = [(i - w_start, w) for i, w in niw_index_w_pairs if w_start <= i < w_stop]
-            part = calculate_sigma_from_kernel_fft(mpi_dist_irrk, chunk, g_r_local, giwk_niv, pairs, use_gpu)
+            part = calculate_sigma_from_kernel_fft(mpi_dist_irrk, chunk, g_r_local, giwk_niv, pairs)
             chunk.free(trim=negative_w and w_stop == n_w)  # coarse trim once, on the last chunk of the negative pass
 
             if sigma is None:
@@ -1439,14 +1232,13 @@ def calculate_sigma_proposal(
     # giwk lives in one shared window per node, so the job holds one copy per node - not one per rank
     logger.log_memory_usage("giwk", giwk_full, mpi_utils.count_nodes(comm, shared_node_comm), per="node")
 
-    gchi0_q = BubbleGenerator.create_generalized_chi0_q_fft_auto(
+    gchi0_q = BubbleGenerator.create_generalized_chi0_q_fft(
         mpi_dist_irrk,
         giwk_full,
         config.box.niw_core,
         config.box.niv_full,
         config.lattice.k_grid,
         config.sys.beta,
-        config.logger,
         node_comm=shared_node_comm,
     )
 
@@ -1547,8 +1339,6 @@ def calculate_sigma_proposal(
     # both bosonic half-sums are walked in budget-bounded w-chunks, so no full-BZ niw-half kernel is ever resident.
     niw = config.box.niw_core
     kernel_irr = kernel  # the (small) irreducible-BZ positive-w kernel, mapped to the full BZ chunk by chunk
-    # Decide CPU/GPU (and select the GPU) once
-    use_gpu = select_sigma_fft_device(mpi_dist_fullbz)
 
     # The R-space Green's function pencil is identical for both niw passes (kernel-independent), so it is FFT-built
     # once here (one full giwk FFT + one node-shared window) and reused by both, instead of once per pass.
@@ -1562,7 +1352,6 @@ def calculate_sigma_proposal(
         g_r_local,
         giwk_niv,
         [(i, i) for i in range(niw + 1)],
-        use_gpu,
         negative_w=False,
         chunk_bytes=chunk_bytes,
     )
@@ -1573,7 +1362,6 @@ def calculate_sigma_proposal(
         g_r_local,
         giwk_niv,
         [(i, -i) for i in range(1, niw + 1)],
-        use_gpu,
         negative_w=True,
         chunk_bytes=chunk_bytes,
     )

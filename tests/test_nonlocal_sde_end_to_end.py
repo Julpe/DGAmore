@@ -4,11 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
-import contextlib
 import os
-import sys
-import types
-from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -66,73 +62,13 @@ def setup_srvo3_cubic(monkeypatch):
     yield folder, comm_mock
 
 
-def make_cupy_mock():
-    """Builds a numpy-backed cupy module stand-in with a single available (no-op) GPU device."""
-    cp = types.ModuleType("cupy")
-
-    cp.asarray = np.asarray
-    cp.zeros = np.zeros
-    cp.empty = np.empty
-    cp.empty_like = np.empty_like
-
-    cp.asnumpy = lambda x: x
-    cp.conj = np.conj
-
-    cp.arange = np.arange
-    cp.take = np.take
-
-    cp.einsum = np.einsum
-    cp.multiply = np.multiply
-
-    cp.fft = types.ModuleType("cupy.fft")
-    cp.fft.ifftn = np.fft.ifftn
-    cp.fft.fftn = np.fft.ifft
-
-    cp.cuda = types.ModuleType("cupy.cuda")
-    cp.cuda.is_available = MagicMock(return_value=True)
-
-    cp.cuda.runtime = types.ModuleType("cupy.cuda.runtime")
-    cp.cuda.runtime.getDeviceCount = MagicMock(return_value=1)
-
-    cp.cuda.Device = MagicMock()
-
-    return cp
-
-
-@contextlib.contextmanager
-def gpu_cpu_context(use_gpu: bool, monkeypatch):
-    """Yields whether the GPU is mocked: real cupy, the numpy stand-in, or disabled when CPU-forced."""
-    mock_gpu = False
-    if use_gpu:
-        try:  # real GPU is available
-            import cupy as cp
-
-            yield mock_gpu
-        except:  # fallback to mocked GPU
-            mock_gpu = True
-            mock_cupy = make_cupy_mock()
-            with monkeypatch.context() as m:
-                m.setitem(sys.modules, "cupy", mock_cupy)
-                m.setitem(sys.modules, "cupy.cuda", mock_cupy.cuda)
-                m.setitem(sys.modules, "cupy.cuda.runtime", mock_cupy.cuda.runtime)
-                yield mock_gpu
-    else:  # force CPU path
-        with monkeypatch.context() as m:
-            m.setitem(sys.modules, "cupy", None)
-            yield mock_gpu
-
-
-@pytest.mark.parametrize(
-    "niw_core, niv_core, niv_shell, use_gpu",
-    [(20, 20, 10, True), (20, 20, 10, False)],
-)
-def test_calculates_nonlocal_sde_correctly(setup, monkeypatch, niw_core, niv_core, niv_shell, use_gpu):
-    """The non-local SDE reproduces the reference self-energy on the CPU and the (mocked) GPU path."""
+def test_calculates_nonlocal_sde_correctly(setup):
+    """The non-local SDE reproduces the reference self-energy."""
     folder, comm_mock = setup
 
-    config.box.niw_core = niw_core
-    config.box.niv_core = niv_core
-    config.box.niv_shell = niv_shell
+    config.box.niw_core = 20
+    config.box.niv_core = 20
+    config.box.niv_shell = 10
     config.dmft.symmetrize_orbitals = []
 
     g_dmft, s_dmft, g2_dens, g2_magn = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
@@ -146,13 +82,12 @@ def test_calculates_nonlocal_sde_correctly(setup, monkeypatch, niw_core, niv_cor
 
     *_, s_loc = local_sde.perform_local_schwinger_dyson(g_dmft, g2_dens, g2_magn, u_loc)
 
-    with gpu_cpu_context(use_gpu, monkeypatch) as mock_gpu:
-        sigma_dga = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft, s_loc)
+    sigma_dga = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft, s_loc)
 
     sigma_dga_mat = sigma_dga.decompress_q_dimension().cut_niv(50).mat
     sigma_dga_ref = np.load(f"{folder}/sigma_dga.npy")
 
-    assert np.allclose(sigma_dga_mat, sigma_dga_ref, atol=3e-5 if not mock_gpu else 1e-3)
+    assert np.allclose(sigma_dga_mat, sigma_dga_ref, atol=3e-5)
 
 
 def test_calculates_srvo3_correctly(setup_srvo3_cubic):
