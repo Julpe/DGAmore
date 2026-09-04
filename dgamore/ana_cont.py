@@ -180,36 +180,39 @@ class AnalyticContinuationProblem:
                 "Parameter im_axis takes only the imaginary part of the imaginary axis (i.e. only real values)"
             )
         self.re_axis = re_axis
-        self.im_data = im_data
-        if self.kernel_mode == "freq_bosonic":
-            pass  # not necessary to do anything additionally here
-        elif self.kernel_mode == "time_bosonic":
+        self.beta = beta
+        if self.kernel_mode in ("time_bosonic", "time_fermionic", "time_fermionic_phsym"):
             self.im_axis = im_axis / beta
             self.re_axis = re_axis * beta
-            self.im_data = im_data * beta
-            self.beta = beta
-        elif self.kernel_mode == "freq_fermionic":
-            pass
+        elif self.kernel_mode not in ("freq_bosonic", "freq_fermionic", "freq_fermionic_phsym"):
+            raise ValueError("Unsupported kernel_mode.")
+        # the solver (kernel, its SVD, the preblur convolution) is built on the first solve and reused afterwards
+        self.solver = None
+        self.update_data(im_data)
+
+    def update_data(self, im_data: np.ndarray):
+        if self.kernel_mode == "time_bosonic":
+            im_data = im_data * self.beta
         elif self.kernel_mode == "freq_fermionic_phsym":
             # check if data are purely imaginary
-            if np.allclose(im_axis.real, 0.0):
-                self.im_data = im_data.imag
-            elif np.allclose(im_axis.imag, 0.0):  # if only the imaginary part is passed
-                self.im_data = im_data.real
+            if np.allclose(self.im_axis.real, 0.0):
+                im_data = im_data.imag
+            elif np.allclose(self.im_axis.imag, 0.0):  # if only the imaginary part is passed
+                im_data = im_data.real
             else:
                 print("The data are neither purely real nor purely imaginary,")
                 print("you cannot use a ph-symmetric kernel in this case.")
                 sys.exit()
-        elif self.kernel_mode == "time_fermionic" or self.kernel_mode == "time_fermionic_phsym":
-            self.im_axis = im_axis / beta
-            self.re_axis = re_axis * beta
-            self.im_data = im_data
-            self.beta = beta
-        else:
-            raise ValueError("Unsupported kernel_mode.")
+        self.im_data = im_data
+        if self.solver is not None:
+            self.solver.set_data(self.im_data)
 
     def solve(self, **kwargs):
-        self.solver = MaxentSolverSVD(self.im_axis, self.re_axis, self.im_data, kernel_mode=self.kernel_mode, **kwargs)
+        # the keyword arguments (model, stdev, ...) configure the solver on its first build only
+        if self.solver is None:
+            self.solver = MaxentSolverSVD(
+                self.im_axis, self.re_axis, self.im_data, kernel_mode=self.kernel_mode, **kwargs
+            )
         sol = self.solver.solve(**kwargs)
         if self.kernel_mode == "time_fermionic":
             sol[0].A_opt *= self.beta
@@ -242,7 +245,6 @@ class MaxentSolverSVD:
                 "Parameter im_axis takes only the imaginary part of the imaginary axis (i.e. only real values)"
             )
         self.re_axis = re_axis
-        self.im_data = im_data
         self.offdiag = offdiag
 
         self.nw = self.re_axis.shape[0]
@@ -264,7 +266,6 @@ class MaxentSolverSVD:
             self.var, self.ucov = np.linalg.eigh(self.cov)  # go to eigenbasis of covariance matrix
             self.var = np.abs(self.var)  # numerically, var can be zero below machine precision
 
-        self.im_data = np.dot(self.ucov.T.conj(), self.im_data)
         self.E = 1.0 / self.var
         self.niw = self.im_axis.shape[0]
 
@@ -282,7 +283,6 @@ class MaxentSolverSVD:
         # special treatment for complex data of fermionic frequency kernel
         if kernel_mode == "freq_fermionic":
             self.niw *= 2
-            self.im_data = np.concatenate((self.im_data.real, self.im_data.imag))
             self.var = np.concatenate((self.var, self.var))
             self.E = np.concatenate((self.E, self.E))
 
@@ -294,8 +294,9 @@ class MaxentSolverSVD:
         self.U_svd = np.array(U[:, : self.n_sv], dtype=np.float64, order="C")
         self.V_svd = np.array(Vt[: self.n_sv, :].T, dtype=np.float64, order="C")  # numpy.svd returns V.T
         self.Xi_svd = S[: self.n_sv]
+        self.eye_sv = np.eye(self.n_sv)
 
-        if not self.offdiag:  # precompute matrices W_ml (W2), W_mil (W3)
+        if not self.offdiag:  # precompute matrix W_ml (W2); W_mil = W_ml V_li is applied in factored form
             self.W2 = np.einsum(
                 "k,km,m,kn,n,ln,l,l->ml",
                 self.E,
@@ -308,7 +309,6 @@ class MaxentSolverSVD:
                 self.model,
                 optimize=True,
             )
-            self.W3 = np.array(self.W2[:, None, :] * (self.V_svd[None, :, :]).transpose((0, 2, 1)), order="C")
 
         else:  # precompute matrices M_ml (M2), M_mil (M3)
             self.M2 = np.einsum(
@@ -324,8 +324,7 @@ class MaxentSolverSVD:
             )
             self.M3 = np.array(self.M2[:, None, :] * (self.V_svd[None, :, :]).transpose((0, 2, 1)), order="C")
 
-        # precompute the evidence vector Evi_m
-        self.Evi = np.einsum("m,km,k,k->m", self.Xi_svd, self.U_svd, self.E, self.im_data, optimize=True)
+        self.set_data(im_data)
 
         # precompute curvature of likelihood function
         self.d2chi2 = np.einsum(
@@ -346,13 +345,22 @@ class MaxentSolverSVD:
         self.uarr = []
         self.bayesConv = []
 
+    def set_data(self, im_data):
+        # everything data independent (kernel, SVD, W2) stays; only the data vector and the evidence are rebuilt
+        im_data = np.dot(self.ucov.T.conj(), im_data)
+        if self.kernel_mode == "freq_fermionic":
+            im_data = np.concatenate((im_data.real, im_data.imag))
+        self.im_data = im_data
+        self.Evi = np.einsum("m,km,k,k->m", self.Xi_svd, self.U_svd, self.E, self.im_data, optimize=True)
+
     def compute_f_J_diag(self, u, alpha):
         v = np.dot(self.V_svd, u)
         w = np.exp(v)
         term_1 = np.dot(self.W2, w)
-        term_2 = np.dot(self.W3, w)
+        # W_mil w_l with W_mil = W_ml V_li, contracted as W2 @ (V * w) instead of through the n_sv^2 x nw tensor
+        term_2 = np.dot(self.W2, self.V_svd * w[:, None])
         f = alpha * u + term_1 - self.Evi
-        J = alpha * np.eye(self.n_sv) + term_2
+        J = alpha * self.eye_sv + term_2
         return f, J
 
     def compute_f_J_offdiag(self, u, alpha):
@@ -424,7 +432,7 @@ class MaxentSolverSVD:
         log_prob = alpha * entr - 0.5 * chisq + np.log(alpha) + 0.5 * eig_sum
         return np.exp(log_prob)
 
-    def maxent_optimization(self, alpha, ustart, use_bayes=False, **kwargs):
+    def maxent_optimization(self, alpha, ustart, use_bayes=False, full_result=True, **kwargs):
         if not self.offdiag:
             self.compute_f_J = self.compute_f_J_diag
             self.singular_to_realspace = self.singular_to_realspace_diag
@@ -443,23 +451,21 @@ class MaxentSolverSVD:
         chisq = self.chi2(A_opt)  # has to be applied before blurring
         norm = np.trapezoid(A_opt, self.re_axis)  # is not changed by blurring
 
-        # result = OptimizationResult()
-        result_dict = {}
-        result_dict.update({"u_opt": u_opt})
-        if self.preblur:
-            result_dict.update({"A_opt": self.kernel.blur(A_opt), "blur_width": self.kernel.blur_width})
-        else:
-            result_dict.update({"A_opt": A_opt, "blur_width": 0.0})
-        result_dict.update(
-            {
-                "alpha": alpha,
-                "entropy": entr,
-                "chi2": chisq,
-                "backtransform": self.backtransform(A_opt),
-                "norm": norm,
-                "Q": alpha * entr - 0.5 * chisq,
-            }
-        )
+        result_dict = {
+            "u_opt": u_opt,
+            "alpha": alpha,
+            "entropy": entr,
+            "chi2": chisq,
+            "norm": norm,
+            "Q": alpha * entr - 0.5 * chisq,
+        }
+        # the alpha ladder consumes only u_opt and chi2, so the blurred spectrum and the backtransform are optional
+        if full_result:
+            if self.preblur:
+                result_dict.update({"A_opt": self.kernel.blur(A_opt), "blur_width": self.kernel.blur_width})
+            else:
+                result_dict.update({"A_opt": A_opt, "blur_width": 0.0})
+            result_dict["backtransform"] = self.backtransform(A_opt)
 
         if use_bayes:
             if not self.offdiag:
@@ -480,7 +486,7 @@ class MaxentSolverSVD:
         ustart = np.zeros((self.n_sv))
         while True:
             try:
-                o = self.maxent_optimization(alpha=alpha, ustart=ustart)
+                o = self.maxent_optimization(alpha=alpha, ustart=ustart, full_result=False)
                 optarr.append(o)
                 ustart = o.u_opt
                 chi.append(o.chi2)
@@ -510,6 +516,10 @@ class MaxentSolverSVD:
 
         a, b, c, d = popt
 
+        # the sigmoid is invariant under (a, b, d) -> (a + b, -b, -d) and curve_fit lands on either branch, so the
+        # mirrored one is folded back before the sign of d is judged
+        if d < 0.0 and b < 0.0:
+            a, b, d = a + b, -b, -d
         if d < 0.0:
             raise RuntimeError("Fermi fit temperature negative.")
 
@@ -573,7 +583,7 @@ class OptimizationResult(object):
 
 
 class NewtonOptimizer(object):
-    def __init__(self, opt_size, max_hist=1, max_iter=20000, initial_guess=None):
+    def __init__(self, opt_size, max_hist=1, max_iter=20000, initial_guess=None, lu_patience=2000):
         if initial_guess is None:
             initial_guess = np.zeros((opt_size))
 
@@ -581,15 +591,26 @@ class NewtonOptimizer(object):
         self.res = []
         self.max_hist = max_hist
         self.max_iter = max_iter
+        # the exact (LU) Newton step is used until it has failed to converge for lu_patience steps or the Jacobian
+        # is singular; the pseudo-inverse step then takes over for the rest of this solve
+        self.lu_patience = lu_patience
+        self.use_pinv = False
         self.opt_size = opt_size
         self.return_object = collections.namedtuple("NewtonResult", ["x", "nfev"])
 
     def iteration_function(self, proposal, function_vector, jacobian_matrix):
-        try:
-            increment = -np.dot(np.linalg.pinv(jacobian_matrix), function_vector)
-        except np.linalg.LinAlgError:
-            print("LinAlgError in Newton Solver, setting increment to zero")
-            increment = np.zeros_like(proposal)
+        increment = None
+        if not self.use_pinv:
+            try:
+                increment = -np.linalg.solve(jacobian_matrix, function_vector)
+            except np.linalg.LinAlgError:
+                self.use_pinv = True
+        if increment is None:
+            try:
+                increment = -np.dot(np.linalg.pinv(jacobian_matrix), function_vector)
+            except np.linalg.LinAlgError:
+                print("LinAlgError in Newton Solver, setting increment to zero")
+                increment = np.zeros_like(proposal)
         step_reduction = 1.0
         significance_limit = 1e-4
         if np.any(np.abs(proposal) > significance_limit):
@@ -608,6 +629,9 @@ class NewtonOptimizer(object):
         counter = 0
         converged = False
         while not converged:
+            # an ill-conditioned Jacobian (small alpha) can keep the clamped exact step oscillating: hand over to pinv
+            if counter >= self.lu_patience:
+                self.use_pinv = True
             prop = self.get_proposal()
             f, J = function_and_jacobian(prop, alpha)
             result = self.iteration_function(prop, f, J)

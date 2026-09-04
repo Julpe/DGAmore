@@ -409,7 +409,7 @@ def main():
                 config.ana_cont.energy_window,
                 config.sys.beta,
                 r"$\mathrm{D}\Gamma\mathrm{A Spectrum}",
-                output_dir=config.output.output_path,
+                output_dir=config.output.plotting_path,
                 name="dga",
             )
             logger.info("Plotted DGA spectrum.")
@@ -436,7 +436,7 @@ def main():
                 config.ana_cont.energy_window,
                 config.sys.beta,
                 r"$\mathrm{DMFT Spectrum}$",
-                output_dir=config.output.output_path,
+                output_dir=config.output.plotting_path,
                 name="dmft",
             )
             logger.info("Plotted DMFT spectrum.")
