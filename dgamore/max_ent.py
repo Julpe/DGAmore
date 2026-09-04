@@ -19,6 +19,7 @@ import warnings
 import numpy as np
 from mpi4py import MPI
 from scipy.optimize import OptimizeWarning
+from threadpoolctl import threadpool_limits
 
 import dgamore.config as config
 from dgamore.ana_cont import AnalyticContinuationProblem, RealFreqTwoPoint
@@ -67,7 +68,8 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
     r"""
     Analytically continues the momentum-dependent Green's function to the real axis via maximum entropy, per
     band and per irreducible-BZ k-point, and assembles the spectral function over the full BZ on rank 0. The
-    k-points are distributed across MPI ranks; failed continuations are set to zero.
+    k-points are distributed across MPI ranks; failed continuations are set to zero. The continuation problem
+    (kernel, its SVD and the preblur convolution) is set up once per rank and reused for every k-point and band.
 
     :param giwk: The momentum-dependent :class:`GreensFunction` to continue.
     :param name: Label of the continued quantity (e.g. ``"DGA"``), used in the log messages and, lowercased, in the
@@ -110,40 +112,47 @@ def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
 
     spectral_function = np.zeros((len(mpi_dist.my_tasks), config.sys.n_bands, len(w)), dtype=np.float32)
 
-    for band in range(config.sys.n_bands):
-        logger.info(f"Processing analytic continuation of band {band+1}.")
-        for k in range(g_irr_slice.shape[0]):
-            # Capture the vendored solver's stdout so its print() diagnostics go through the logger instead of
-            # leaking to the output; re-logged (prefixed) below whether the continuation succeeds or fails.
-            captured_output = io.StringIO()
-            try:
-                with warnings.catch_warnings(), contextlib.redirect_stdout(captured_output):
-                    # Escalate numpy/scipy RuntimeWarnings (divide/invalid/overflow) to exceptions so a numerically
-                    # broken continuation falls through to the A(k, w) = 0 fallback below (its own errors are caught too).
-                    warnings.simplefilter("error", RuntimeWarning)
-                    # The alpha-fit curve_fit inside the solver harmlessly fails to estimate its covariance; mute it.
-                    warnings.simplefilter("ignore", OptimizeWarning)
-                    probl_maxent = AnalyticContinuationProblem(
-                        im_axis=wn, re_axis=w, im_data=g_irr_slice[k, band, band], beta=config.sys.beta
-                    )
-                    result = probl_maxent.solve(model=model, stdev=stdev)[0]
-                    spectral_function[k, band] = result.A_opt.astype(np.float32)
+    # One continuation problem per rank: kernel, SVD and preblur convolution are data independent, so only the
+    # Green's function data are swapped per (k, band). BLAS stays single threaded: the solver's matrices are small.
+    probl_maxent = None
+    with threadpool_limits(limits=1):
+        for band in range(config.sys.n_bands):
+            logger.info(f"Processing analytic continuation of band {band+1}.")
+            for k in range(g_irr_slice.shape[0]):
+                # Capture the vendored solver's stdout so its print() diagnostics go through the logger instead of
+                # leaking to the output; re-logged (prefixed) below whether the continuation succeeds or fails.
+                captured_output = io.StringIO()
+                try:
+                    with warnings.catch_warnings(), contextlib.redirect_stdout(captured_output):
+                        # Escalate numpy/scipy RuntimeWarnings (divide/invalid/overflow) to exceptions so a numerically
+                        # broken continuation falls through to the A(k, w) = 0 fallback below (own errors caught too).
+                        warnings.simplefilter("error", RuntimeWarning)
+                        # The alpha-fit curve_fit inside the solver harmlessly fails to estimate its covariance; mute.
+                        warnings.simplefilter("ignore", OptimizeWarning)
+                        if probl_maxent is None:
+                            probl_maxent = AnalyticContinuationProblem(
+                                im_axis=wn, re_axis=w, im_data=g_irr_slice[k, band, band], beta=config.sys.beta
+                            )
+                        else:
+                            probl_maxent.update_data(g_irr_slice[k, band, band])
+                        result = probl_maxent.solve(model=model, stdev=stdev)[0]
+                        spectral_function[k, band] = result.A_opt.astype(np.float32)
 
-                del probl_maxent, result
-                gc.collect()
-            except Exception:
-                kpt = tuple(int(c) for c in irrq_list[mpi_dist.my_tasks[k]])
-                logger.info(
-                    f"Failed to determine analytic continuation of k={kpt} (band {band + 1}), "
-                    f"setting A(k={kpt}, w) = 0.0."
-                )
-                spectral_function[k, band] = 0.0
-            finally:
-                for message in captured_output.getvalue().splitlines():
-                    if message.strip():
-                        logger.info(f"ana_cont: {message}")
-        mpi_dist.comm.barrier()
-        logger.info(f"Completed analytic continuation of band {band+1}.")
+                    del result
+                    gc.collect()
+                except Exception:
+                    kpt = tuple(int(c) for c in irrq_list[mpi_dist.my_tasks[k]])
+                    logger.info(
+                        f"Failed to determine analytic continuation of k={kpt} (band {band + 1}), "
+                        f"setting A(k={kpt}, w) = 0.0."
+                    )
+                    spectral_function[k, band] = 0.0
+                finally:
+                    for message in captured_output.getvalue().splitlines():
+                        if message.strip():
+                            logger.info(f"ana_cont: {message}")
+            mpi_dist.comm.barrier()
+            logger.info(f"Completed analytic continuation of band {band+1}.")
     spectral_function = mpi_dist.gather(spectral_function)
     logger.info("Analytic continuation of Green's function finished.")
 
