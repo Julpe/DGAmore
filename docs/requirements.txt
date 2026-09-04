@@ -4,7 +4,7 @@
 # Pinned: the pydata theme's navbar/sidebar options and layout change across minor releases, so an unpinned
 # upgrade can silently shift the rendered docs. Bump these deliberately and re-check the navbar/sidebar locally.
 sphinx~=9.1
-pydata-sphinx-theme~=0.19.0
+pydata-sphinx-theme~=0.21.0
 
 # Runtime imports that autodoc must resolve while importing the package.
 numpy~=2.2
