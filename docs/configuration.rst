@@ -118,7 +118,8 @@ interpolated self-energy of the previous run, with the interpolation itself conf
 Stabilization
 -------------
 
-This section collects the convergence-stabilization options of the self-consistency cycle.
+This section collects the convergence-stabilization options of the self-consistency cycle. How the three techniques
+work, what they have in common and when to reach for which is discussed on the :doc:`cooldown` page.
 
 .. code-block:: yaml
 
@@ -369,7 +370,8 @@ before entering the self-consistency cycle.
 The interpolation runs when ``do_interpolation`` is ``True``. It applies a linear inter- or extrapolation for the
 lowest frequencies and a PCHIP interpolation for the remaining ones. The resulting self-energy, now at the new
 inverse temperature ``target_beta`` and the new number of positive fermionic frequencies ``target_niv``, is written
-to the output folder for each iteration.
+to the output folder for each iteration. The step-by-step procedure for chaining runs this way is described on the
+:doc:`cooldown` page.
 
 Output
 ------
