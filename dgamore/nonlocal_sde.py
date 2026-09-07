@@ -1549,17 +1549,18 @@ def calculate_self_energy_q(
         )
         # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
 
-        sigma_old = sigma_old.cut_niv(config.box.niv_core)
-        # the cut copied everything still needed from the previous iteration's shared sigma buffer
+        # only rank 0 mixes and measures the residual, so only rank 0 keeps a private copy of the previous iterate
+        # (the cut copies everything still needed from the previous iteration's shared sigma buffer)
+        sigma_old = sigma_old.cut_niv(config.box.niv_core) if comm.rank == 0 else None
         _free_shared_window(sigma_win, sc_node_comm)
         sigma_win = None
 
         logger.info("Applying mixing strategy to the self-energy.")
-        sigma_old = sigma_old.concatenate_self_energies(sigma_dmft)
         history_cap = _mixing_history_cap(current_iter, release_iter, anneal_reset_iter)
         # mixing runs on rank 0 only (all ranks computed identical results before); the mixed sigma then reaches the
         # other ranks once per node through a shared window instead of once per rank
         if comm.rank == 0:
+            sigma_old = sigma_old.concatenate_self_energies(sigma_dmft)
             sigma_new = apply_mixing_strategy(sigma_new, sigma_old, history_cap, mixing_history)
         if sc_node_comm is None:
             sigma_new = mpi_dist_fullbz.bcast_npoint(sigma_new)
@@ -1568,10 +1569,11 @@ def calculate_self_energy_q(
             sigma_win = _share_sigma_per_node(sigma_new.compress_q_dimension(), sc_node_comm, sc_roots_comm)
 
         sigma_new = sigma_new.compress_q_dimension()
-        sigma_old = sigma_old.compress_q_dimension()
 
         # Post-mixing step residual (the historical convergence measure; shrinks with the mixing parameter)
-        relative_residual = _relative_sigma_residual(sigma_new, sigma_old)
+        relative_residual = (
+            _relative_sigma_residual(sigma_new, sigma_old.compress_q_dimension()) if comm.rank == 0 else None
+        )
 
         old_mu = mu_history[-1]
         if comm.rank == 0:

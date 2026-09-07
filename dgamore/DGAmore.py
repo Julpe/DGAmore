@@ -651,6 +651,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> None:
     verify_only = (
         ("chi0q", "Bare bubble"),
         ("chiq_aux", "Auxiliary susceptibility"),
+        ("sigma_loop", "self-consistency self-energy step"),
         ("fq", "Pairing-vertex construction"),
         ("lanczos", "Eliashberg solver"),
     )
