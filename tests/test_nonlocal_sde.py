@@ -5,6 +5,7 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -830,10 +831,41 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     v_nonloc.copy.return_value = v_nonloc
     v_nonloc.reduce_q.return_value = v_nonloc
 
-    def run():
-        return nonlocal_sde.calculate_self_energy_q(create_comm_mock(), None, v_nonloc, sigma_dmft, sigma_dmft.copy())
+    def run(comm=None):
+        comm = create_comm_mock() if comm is None else comm
+        return nonlocal_sde.calculate_self_energy_q(comm, None, v_nonloc, sigma_dmft, sigma_dmft.copy())
 
     return run, calls, logger
+
+
+def _run_loop_on_two_node_ranks(monkeypatch, tmp_path, spied_name, spied_owner):
+    """Runs the loop on two fake ranks of one node, returning the thread names of the in-loop calls of the spy."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0)
+    original = getattr(spied_owner, spied_name)
+    seen = []
+
+    def spy(*args, **kwargs):
+        if calls:  # the loop has started: everything before the first proposal is setup, not the iteration
+            seen.append(threading.current_thread().name)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(spied_owner, spied_name, spy)
+    run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
+    return seen
+
+
+def test_loop_concatenates_the_previous_iterate_on_rank0_only(monkeypatch, tmp_path):
+    """Only rank 0 rebuilds the previous iterate on the DMFT tail each iteration; the other ranks never copy it."""
+    seen = _run_loop_on_two_node_ranks(monkeypatch, tmp_path, "concatenate_self_energies", SelfEnergy)
+    assert seen == ["rank0"] * 3
+
+
+def test_loop_measures_the_step_residual_on_rank0_only(monkeypatch, tmp_path):
+    """The step residual only decides convergence on rank 0, so no other rank evaluates it."""
+    seen = _run_loop_on_two_node_ranks(monkeypatch, tmp_path, "_relative_sigma_residual", nonlocal_sde)
+    assert seen == ["rank0"] * 3
 
 
 def test_loop_annealing_runs_pure_phase_after_mass_snaps_to_zero(monkeypatch, tmp_path):

@@ -254,7 +254,10 @@ def estimate_peaks(
     which is node-shared like giwk itself when the shared window is active (its ``giwk_shareable`` covers both). The
     Eliashberg branches run after the self-consistency loop with ``sigma_dga`` freed on every rank and ``giwk_dga``
     surviving on the bubble-building rank only, so they carry no per-rank baseline (``giwk_shareable = 0``); the
-    surviving copy is counted in their single-rank slots.
+    surviving copy is counted in their single-rank slots. The ``sigma_loop`` branch is the loop's replicated
+    self-energy step after the SDE (proposal tail and mixing point, every window already released): the per-rank
+    private proposal and, on rank 0 only, the previous iterate's rebuild and the linear-mixing transients; it
+    carries no baseline either.
 
     :param n_bands: Number of bands :math:`B`.
     :param nk_tot: Total number of momentum points (full BZ).
@@ -388,6 +391,21 @@ def estimate_peaks(
             on_distributed=solver_grid,
             on_single=pairing_gather + giwk_dga_single,
         )
+
+    # Replicated loop self-energy step (flag-less, verify-only): per rank the private proposal through its Hartree/Fock
+    # chain (three core copies) or its tail concatenation; rank 0 adds the previous iterate's rebuild + 3 mix copies.
+    sigma_core = _giwk_rspace(nk_tot, nb, vc)
+    sigma_full = _giwk_rspace(nk_tot, nb, 2 * niv_cut)
+    sigma_loop_distributed = scale * max(3 * sigma_core, sigma_core + sigma_full)
+    sigma_loop_single = scale * (sigma_core + 4 * sigma_full)
+    peaks["sigma_loop"] = BranchPeak(
+        baseline=0.0,
+        giwk_shareable=0.0,
+        off_distributed=sigma_loop_distributed,
+        off_single=sigma_loop_single,
+        on_distributed=sigma_loop_distributed,
+        on_single=sigma_loop_single,
+    )
 
     # Rank-0-serial local SDE (flag-less, verify-only): both channels' outputs (gamma + chi at the core box, full
     # vertex at niv_full) + the two halved inputs + the dominant chi-tilde shell transient at niv_full.

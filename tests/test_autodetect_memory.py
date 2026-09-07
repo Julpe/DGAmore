@@ -241,6 +241,21 @@ def test_flagless_sde_step_is_verified_and_raises_on_overflow(fake_system, monke
         dgamore_main.autodetect_memory_settings(_mock_comm())
 
 
+def test_self_consistency_sigma_step_is_verified_and_raises_on_overflow(fake_system, monkeypatch):
+    """The loop's replicated self-energy step is budget-checked: silent when it fits, names the step on overflow."""
+    fake_system(1)
+    small, big = 1024.0**2, 100 * 1024.0**2
+    peaks = {"sigma_loop": _mock_branch(off_distributed=big, off_single=small, on_distributed=big, on_single=small)}
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: peaks)
+
+    monkeypatch.setattr(dgamore_main.psutil, "virtual_memory", lambda: SimpleNamespace(available=int(10 * big)))
+    dgamore_main.autodetect_memory_settings(_mock_comm())
+
+    monkeypatch.setattr(dgamore_main.psutil, "virtual_memory", lambda: SimpleNamespace(available=int(10 * small)))
+    with pytest.raises(MemoryError, match="self-consistency"):
+        dgamore_main.autodetect_memory_settings(_mock_comm())
+
+
 def test_lanczos_single_rank_peak_doubled_on_single_node_multi_rank(fake_system, monkeypatch):
     """The doubled in-memory peak on a single node raises only when the grid fallback does not fit either."""
     fake_system(1)

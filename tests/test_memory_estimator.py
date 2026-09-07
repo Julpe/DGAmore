@@ -70,13 +70,13 @@ def test_constants():
 
 
 def test_keys_without_eliashberg():
-    """Without Eliashberg the estimator reports the chi0q, chiq_aux and sde branches."""
-    assert set(_peaks(with_eliashberg=False)) == {"chi0q", "chiq_aux", "sde", "local"}
+    """Without Eliashberg the estimator reports the chi0q, chiq_aux, sde, sigma_loop and local branches."""
+    assert set(_peaks(with_eliashberg=False)) == {"chi0q", "chiq_aux", "sde", "sigma_loop", "local"}
 
 
 def test_keys_with_eliashberg():
     """With Eliashberg the estimator adds the fq and lanczos branches."""
-    assert set(_peaks(with_eliashberg=True)) == {"chi0q", "chiq_aux", "sde", "fq", "lanczos", "local"}
+    assert set(_peaks(with_eliashberg=True)) == {"chi0q", "chiq_aux", "sde", "sigma_loop", "fq", "lanczos", "local"}
 
 
 def test_every_branch_has_positive_baseline_and_off_transient():
@@ -266,6 +266,18 @@ def test_sde_chunk_term_is_capped_by_the_byte_budget(monkeypatch):
     small = estimate_peaks(**TINY)["sde"].off_distributed
     big = estimate_peaks(**{**TINY, "nk_tot": 4 * TINY["nk_tot"]})["sde"].off_distributed
     assert big == pytest.approx(small)
+
+
+def test_sigma_loop_counts_the_private_proposal_per_rank_and_the_rank0_mixing_copies():
+    """sigma_loop counts the per-rank proposal and tail concatenation plus rank 0's previous-iterate and mix copies."""
+    nk, nb = TINY["nk_tot"], TINY["n_bands"]
+    core = nk * nb**2 * 2 * TINY["niv_core"]
+    full = nk * nb**2 * 2 * TINY["niv_cut"]
+    bp = estimate_peaks(**TINY)["sigma_loop"]
+    assert bp.baseline == 0.0 and bp.giwk_shareable == 0.0
+    assert bp.off_distributed == pytest.approx(SCALE * max(3 * core, core + full))
+    assert bp.off_single == pytest.approx(SCALE * (core + 4 * full))
+    assert (bp.on_distributed, bp.on_single) == (bp.off_distributed, bp.off_single)
 
 
 def test_sde_off_and_on_slots_are_identical():
