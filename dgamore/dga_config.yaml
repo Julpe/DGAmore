@@ -66,7 +66,8 @@ eliashberg:
   subfolder_name: "Eliashberg" # name for the subfolder where certain outputs are generated
 
 self_energy_interpolation:
-  do_interpolation: False # If True, the code will interpolate the self-energy to a different frequency and beta in each iteration
+  do_interpolation: False # If True, the final self-energy is also saved re-gridded to target_beta and target_niv
+  # (below the innermost source frequency: same-sign branch extrapolation, MiniPole at flagged k-points; see the docs)
   target_beta: 1.0 # Target inverse temperature for the interpolation
   target_niv: 10 # Target number of positive fermionic frequencies for the interpolation
 

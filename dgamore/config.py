@@ -266,7 +266,7 @@ class SelfEnergyInterpolationConfig:
     r"""
     Stores the self-energy interpolation parameters (re-gridding to a different temperature/frequency box).
 
-    :ivar bool do_interpolation: Whether to additionally save an interpolated self-energy each iteration.
+    :ivar bool do_interpolation: Whether to save the final self-energy re-gridded to ``beta_target``.
     :ivar float beta_target: Target inverse temperature :math:`\beta` of the interpolation.
     :ivar int niv_target: Target number of positive fermionic frequencies of the interpolation.
     """
