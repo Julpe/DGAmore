@@ -232,8 +232,8 @@ hand-over file carries no metadata, so the :math:`\beta = 25` rung takes its con
 goes unnoticed. ``target_niv`` is ``60``, the ``niv_core`` of the next rung. A larger value is harmless: the next
 rung cuts the file to its core box anyway and fills the tail from its own DMFT self-energy, so a generous value
 only costs disk space. A smaller value means the DMFT self-energy also has to fill the rest of the core box. The
-interpolated self-energy is written in every iteration, and the next rung picks the file with the highest
-iteration number, i.e. the converged one if the rung converged. The ratio :math:`25/20 = 1.25` keeps the
+interpolated self-energy is written once, from the rung's final self-energy, the converged one if the rung
+converged. The ratio :math:`25/20 = 1.25` keeps the
 re-gridding mild: only the lowest target frequency lands on the straight-line guess. On the :math:`\beta = 25`
 rung the interpolation is switched off because the ladder ends there; to go on to :math:`\beta = 30` one would
 leave it on with ``target_beta: 30.0``.
@@ -272,11 +272,12 @@ What happens at the hand-over
 
 At the start of the cycle, the predecessor's result becomes the rung's starting point in the following steps.
 
-* The cycle picks the file ``sigma_dga_interpolated_*_iteration_<i>.npy`` with the highest iteration number in
-  ``previous_sc_path`` (without ``use_interpolated_sigma`` it looks for the raw ``sigma_dga_iteration_<i>.npy``
-  files instead). The file carries no metadata, so its content is taken to be a self-energy at the rung's own
-  inverse temperature. A predecessor whose ``target_beta`` does not match this rung's temperature therefore goes
-  *undetected* and quietly mislabels the frequencies.
+* The cycle looks for ``sigma_dga_interpolated_beta<b>_niv<n>.npy`` in ``previous_sc_path`` and, if several exist,
+  takes the one whose ``<b>`` is closest to the rung's inverse temperature. Without ``use_interpolated_sigma`` it
+  takes the raw ``sigma_dga_iteration_<i>.npy`` with the highest ``<i>`` instead. Either way the iteration count
+  continues from the highest raw iterate. Beyond its name the file carries no metadata, so its content is taken at
+  face value as a self-energy at the rung's own temperature; a predecessor aimed at the wrong ``target_beta`` is
+  only caught when a better-matching file sits next to it.
 * The self-energy is cut to the rung's ``niv_core``. If the rung uses a different momentum grid, it is re-sampled
   onto it, exactly by striding when the new grid is a sub-lattice of the old one and by band-limited Fourier
   interpolation otherwise, so the grid may be refined along the ladder. Beyond the core box, the rung's own DMFT

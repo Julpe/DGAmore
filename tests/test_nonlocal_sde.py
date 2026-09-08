@@ -33,8 +33,9 @@ from dgamore.nonlocal_sde import (
     get_hartree_fock,
     perform_ornstein_zernike_fit,
 )
+from dgamore.matsubara_frequencies import MFHelper
 from dgamore.self_energy import SelfEnergy
-from tests.conftest import FAKE_MPI, create_comm_mock, run_parallel
+from tests.conftest import FAKE_MPI, create_comm_mock, patch_mini_pole_with_exact_single_pole_fit, run_parallel
 
 LOCAL_SDE_DATA = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/local_sde"
 
@@ -61,6 +62,81 @@ def test_init_mu_history_from_previous_syncs_global_mu(monkeypatch, tmp_path):
 
     assert mu_history == [previous_mu]
     assert config.sys.mu == previous_mu
+
+
+def _previous_run_folder(tmp_path, monkeypatch, names, beta=25.0):
+    """Creates empty predecessor files and a np.load stub returning a constant self-energy tagged by the file name."""
+    config.logger = MagicMock()
+    config.sys.beta = beta
+    config.box.niv_core = 2
+    config.lattice.nk = (2, 2, 1)
+    config.lattice.k_grid = bz.KGrid(config.lattice.nk, symmetries=bz.two_dimensional_square_symmetries())
+    config.self_consistency.previous_sc_path = str(tmp_path)
+    for name in names:
+        (tmp_path / name).touch()
+    loaded = []
+
+    def fake_load(path, *args, **kwargs):
+        loaded.append(os.path.basename(path))
+        return np.full((2, 2, 1, 1, 1, 8), float(len(loaded)), dtype=complex)
+
+    monkeypatch.setattr(np, "load", fake_load)
+    return loaded
+
+
+def test_get_starting_sigma_picks_the_interpolated_file_closest_in_beta_and_counts_the_raw_iterates(
+    monkeypatch, tmp_path
+):
+    """With use_interpolated_sigma the interpolated file closest in beta is loaded and the iterate count is kept."""
+    names = ("sigma_dga_iteration_2.npy", "sigma_dga_iteration_7.npy", "sigma_dga_interpolated_beta20.0_niv4.npy")
+    loaded = _previous_run_folder(tmp_path, monkeypatch, names + ("sigma_dga_interpolated_beta25.0_niv4.npy",))
+    config.self_consistency.use_interpolated_sigma = True
+
+    sigma, starting_iter = nonlocal_sde.get_starting_sigma(MagicMock())
+
+    assert loaded == ["sigma_dga_interpolated_beta25.0_niv4.npy"]
+    assert starting_iter == 7
+    assert sigma.mat.shape == (2, 2, 1, 1, 1, 4)
+
+
+def test_get_starting_sigma_without_interpolation_loads_the_highest_raw_iterate(monkeypatch, tmp_path):
+    """Without use_interpolated_sigma the raw iterate with the highest number is loaded."""
+    names = ("sigma_dga_iteration_2.npy", "sigma_dga_iteration_7.npy", "sigma_dga_interpolated_beta25.0_niv4.npy")
+    loaded = _previous_run_folder(tmp_path, monkeypatch, names)
+    config.self_consistency.use_interpolated_sigma = False
+
+    _, starting_iter = nonlocal_sde.get_starting_sigma(MagicMock())
+
+    assert loaded == ["sigma_dga_iteration_7.npy"]
+    assert starting_iter == 7
+
+
+def test_get_starting_sigma_warns_when_use_interpolated_sigma_has_no_previous_path():
+    """With use_interpolated_sigma but an empty previous_sc_path the default self-energy is returned with a warning."""
+    config.logger = MagicMock()
+    config.self_consistency.previous_sc_path = ""
+    config.self_consistency.use_interpolated_sigma = True
+    default = MagicMock()
+
+    sigma, starting_iter = nonlocal_sde.get_starting_sigma(default)
+
+    assert sigma is default
+    assert starting_iter == 0
+    config.logger.warning.assert_called_once()
+
+
+def test_get_starting_sigma_falls_back_to_the_default_and_warns_without_an_interpolated_file(monkeypatch, tmp_path):
+    """With use_interpolated_sigma but no interpolated file the default self-energy is returned with a warning."""
+    loaded = _previous_run_folder(tmp_path, monkeypatch, ("sigma_dga_iteration_3.npy",))
+    config.self_consistency.use_interpolated_sigma = True
+    default = MagicMock()
+
+    sigma, starting_iter = nonlocal_sde.get_starting_sigma(default)
+
+    assert sigma is default
+    assert starting_iter == 0
+    assert loaded == []
+    config.logger.warning.assert_called_once()
 
 
 def test_nonlocal_hartree_fock_matches_local_reference():
@@ -1190,3 +1266,49 @@ def test_fft_sde_pass_is_invariant_under_the_w_chunk_size(negative_w, monkeypatc
     _, res = run_parallel(3, fn)
     for whole, chunked in res:
         assert np.allclose(chunked, whole, atol=1e-5)
+
+
+def test_interpolate_sigma_unfolds_distributed_pole_fits_to_the_full_bz(monkeypatch):
+    """interpolate_sigma fits the flagged irreducible momenta across ranks and unfolds everything to the full BZ."""
+    config.logger = MagicMock()
+    beta, x, hartree, niv = 10.0, -0.3, 1.5, 200
+    config.lattice.nk = (4, 4, 1)
+    config.lattice.k_grid = bz.KGrid(config.lattice.nk, symmetries=bz.two_dimensional_square_symmetries())
+    kx, ky = np.meshgrid(2 * np.pi * np.arange(4) / 4, 2 * np.pi * np.arange(4) / 4, indexing="ij")
+    # square-symmetric pole weight, negative (non-causal, hence flagged) around the M point only
+    weight = (0.3 * (np.cos(kx) + np.cos(ky)) - 0.2)[..., None, None, None, None]
+    vn = MFHelper.vn(niv, beta)
+    sigma = SelfEnergy(hartree + weight / (1j * vn - x), nk=(4, 4, 1), has_compressed_q_dimension=False, beta=beta)
+    patch_mini_pole_with_exact_single_pole_fit(monkeypatch, x)
+
+    def fn(comm, rank):
+        return nonlocal_sde.interpolate_sigma(sigma, beta_target=2.0 * beta, niv_target=niv, comm=comm).mat
+
+    _, results = run_parallel(2, fn)
+    single = nonlocal_sde.interpolate_sigma(sigma, 2.0 * beta, niv, create_comm_mock()).mat
+
+    target_vn = MFHelper.vn(niv, 2.0 * beta)
+    inner = np.abs(target_vn) < vn[niv]
+    flagged = sigma.pole_fit_mask().reshape(4, 4, 1)
+    expected_inner = hartree + weight / (1j * target_vn[inner] - x)
+    plain = sigma.interpolate(2.0 * beta, niv).mat
+    assert 0 < flagged.sum() < flagged.size
+    assert np.array_equal(results[0], results[1])
+    assert np.array_equal(results[0], single)
+    assert np.allclose(results[0][flagged][..., inner], expected_inner[flagged], atol=1e-5)
+    assert np.allclose(results[0][~flagged][..., inner], plain[~flagged][..., inner])
+    assert np.allclose(results[0][..., ~inner], plain[..., ~inner])
+
+
+def test_interpolate_sigma_without_flagged_momenta_equals_the_plain_interpolation():
+    """interpolate_sigma returns the plain interpolation when no momentum needs a pole fit."""
+    config.lattice.nk = (2, 2, 1)
+    config.lattice.k_grid = bz.KGrid(config.lattice.nk, symmetries=bz.two_dimensional_square_symmetries())
+    vn = MFHelper.vn(6, 1.0)
+    signal = 1.0 - 1j * np.sign(vn) * (0.1 + 0.2 * np.abs(vn))
+    sigma = SelfEnergy(np.broadcast_to(signal, (2, 2, 1, 1, 1, vn.size)).copy(), nk=(2, 2, 1), beta=1.0)
+
+    result = nonlocal_sde.interpolate_sigma(sigma, beta_target=2.0, niv_target=6, comm=create_comm_mock())
+
+    assert not sigma.pole_fit_mask().any()
+    assert np.array_equal(result.mat, sigma.interpolate(2.0, 6).mat)

@@ -905,10 +905,12 @@ def _run_fft_sde_pass(
 
 
 def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
-    """
-    Tries to retrieve the last calculated self-energy from a previous self-consistency calculation as a starting point
-    for the next calculation. Whether the normal or interpolated sigma is chosen depends on the setting. If no
-    ``sigma_dga_*_N.npy`` file is found, we use the DMFT self-energy as a starting point.
+    r"""
+    Retrieves the starting self-energy of the self-consistency cycle from a previous run. With
+    ``use_interpolated_sigma`` this is the predecessor's final self-energy re-gridded to this temperature,
+    ``sigma_dga_interpolated_beta<b>_niv<n>.npy`` (the file with ``<b>`` closest to the current :math:`\beta` if
+    several exist); otherwise it is the raw iterate ``sigma_dga_iteration_<i>.npy`` with the highest ``<i>``. The
+    iteration count comes from the raw iterates in both cases. Without a usable file the DMFT self-energy is returned.
 
     :param default_sigma: The fallback (DMFT) :class:`SelfEnergy` used when no previous result is found.
     :return: A tuple of the starting :class:`SelfEnergy` (cut to the core box and interpolated onto the k-grid) and
@@ -917,24 +919,30 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
     previous_sc_path = config.self_consistency.previous_sc_path
 
     if previous_sc_path is None or previous_sc_path == "" or not os.path.exists(previous_sc_path):
+        if config.self_consistency.use_interpolated_sigma:
+            config.logger.warning(
+                "use_interpolated_sigma is set but previous_sc_path is empty or missing; starting from DMFT."
+            )
         return default_sigma, 0
 
-    if config.self_consistency.use_interpolated_sigma:
-        glob_pattern = "sigma_dga_interpolated_*_iteration_*.npy"
-        iteration_regex = re.compile(r"sigma_dga_interpolated_.+_iteration_(\d+)\.npy$")
-    else:
-        glob_pattern = "sigma_dga_iteration_*.npy"
-        iteration_regex = re.compile(r"sigma_dga_iteration_(\d+)\.npy$")
-
-    files = glob.glob(os.path.join(previous_sc_path, glob_pattern))
-
-    if not files or len(files) == 0:
-        return default_sigma, 0
-    iterations = [(int(match.group(1)), f) for f in files if (match := iteration_regex.search(f))]
-
-    if not iterations or len(iterations) == 0:
+    iteration_regex = re.compile(r"sigma_dga_iteration_(\d+)\.npy$")
+    iterates = glob.glob(os.path.join(previous_sc_path, "sigma_dga_iteration_*.npy"))
+    iterations = [(int(match.group(1)), f) for f in iterates if (match := iteration_regex.search(f))]
+    if not iterations:
         return default_sigma, 0
     max_iter, max_file = max(iterations, key=lambda x: x[0])
+
+    if config.self_consistency.use_interpolated_sigma:
+        beta_regex = re.compile(r"sigma_dga_interpolated_beta([0-9.eE+-]+)_niv\d+\.npy$")
+        candidates = glob.glob(os.path.join(previous_sc_path, "sigma_dga_interpolated_beta*_niv*.npy"))
+        betas = [
+            (abs(float(match.group(1)) - config.sys.beta), f) for f in candidates if (match := beta_regex.search(f))
+        ]
+        if not betas:
+            config.logger.warning(f"No interpolated self-energy found in {previous_sc_path}; starting from DMFT.")
+            return default_sigma, 0
+        max_file = min(betas, key=lambda x: x[0])[1]
+    config.logger.info(f"Starting the self-consistency from {max_file} (iteration {max_iter}).")
 
     mat = np.load(max_file)
     return (
@@ -1395,6 +1403,40 @@ def calculate_sigma_proposal(
     return sigma_prop
 
 
+def interpolate_sigma(sigma: SelfEnergy, beta_target: float, niv_target: int, comm: MPI.Comm) -> SelfEnergy:
+    r"""
+    Re-grids the self-energy to ``beta_target``. The plain interpolation (:meth:`SelfEnergy.interpolate`) runs on the
+    irreducible Brillouin zone; at the momenta flagged by :meth:`SelfEnergy.pole_fit_mask` the target frequencies
+    below the innermost source frequency are replaced by the MiniPole extrapolation of
+    :meth:`SelfEnergy.pole_extrapolate`, with the fits distributed over the ranks and rejected fits keeping the plain
+    values. The result is unfolded to the full Brillouin zone with :meth:`SelfEnergy.map_to_full_bz`, orbital
+    rotations included. Collective over ``comm``; every rank returns the full result.
+
+    :param sigma: The momentum-dependent :class:`SelfEnergy` on the full Brillouin zone.
+    :param beta_target: Inverse temperature :math:`\beta` of the target grid.
+    :param niv_target: Number of positive fermionic frequencies of the target grid.
+    :param comm: The MPI communicator.
+    :return: The re-gridded :class:`SelfEnergy` on the full Brillouin zone, momentum layout ``[kx, ky, kz, ...]``.
+    """
+    k_grid = config.lattice.k_grid
+    sigma_irr = sigma.reduce_q(k_grid.get_irrq_list())
+    interpolated = sigma_irr.interpolate(beta_target, niv_target)
+
+    flagged = np.flatnonzero(sigma_irr.pole_fit_mask())
+    if flagged.size > 0:
+        dist = MpiDistributor.create_distributor(ntasks=flagged.size, comm=comm, name="PoleFit")
+        mine = flagged[dist.my_slice]
+        values, accepted = sigma_irr.pole_extrapolate(beta_target, niv_target, mine, interpolated)
+        # the flags travel as uint8: a bool buffer has no fixed MPI datatype in the Allgatherv
+        values, accepted = dist.allgather(values), dist.allgather(accepted.astype(np.uint8)).astype(bool)
+        interpolated.replace_innermost(flagged[accepted], values[accepted])
+        config.logger.info(
+            f"MiniPole extrapolation below the innermost frequency accepted at {accepted.sum()} of {flagged.size} "
+            f"flagged irreducible k-points."
+        )
+    return interpolated.map_to_full_bz(k_grid).decompress_q_dimension()
+
+
 def _relative_sigma_residual(sigma_new: SelfEnergy, sigma_old: SelfEnergy) -> float:
     r"""
     Returns the relative L2 residual :math:`\lVert\Sigma_{\mathrm{new}} - \Sigma_{\mathrm{old}}\rVert /
@@ -1609,17 +1651,6 @@ def calculate_self_energy_q(
             )
             logger.info(f"Saved sigma for iteration {current_iter}.")
 
-            if config.self_energy_interpolation.do_interpolation:
-                beta_target = config.self_energy_interpolation.beta_target
-                niv_target = config.self_energy_interpolation.niv_target
-                sigma_new.decompress_q_dimension().interpolate(beta_target, niv_target).save(
-                    name=f"sigma_dga_interpolated_beta{beta_target}_niv{niv_target}_iteration_{current_iter}",
-                    output_dir=config.output.output_path,
-                )
-                logger.info(
-                    f"Interpolated sigma for iteration {current_iter} to beta={beta_target} and niv={niv_target}."
-                )
-
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
             # Convergence is declared on the post-mixing step residual (the returned iterate). The un-mixed proposal
@@ -1702,6 +1733,16 @@ def calculate_self_energy_q(
 
     np.save(os.path.join(config.output.output_path, "mu_history.npy"), mu_history)
     logger.info("Saved mu history as numpy array.")
+
+    if config.self_energy_interpolation.do_interpolation:
+        beta_target = config.self_energy_interpolation.beta_target
+        niv_target = config.self_energy_interpolation.niv_target
+        sigma_interpolated = interpolate_sigma(sigma_old, beta_target, niv_target, comm)
+        if comm.rank == 0:
+            sigma_interpolated.save(
+                name=f"sigma_dga_interpolated_beta{beta_target}_niv{niv_target}", output_dir=config.output.output_path
+            )
+            logger.info(f"Interpolated the final sigma to beta={beta_target} and niv={niv_target}.")
 
     return sigma_old
 

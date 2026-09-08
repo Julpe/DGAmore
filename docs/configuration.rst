@@ -367,11 +367,35 @@ before entering the self-consistency cycle.
      target_beta: 1.0        # float
      target_niv: 10          # int
 
-The interpolation runs when ``do_interpolation`` is ``True``. It applies a linear inter- or extrapolation for the
-lowest frequencies and a PCHIP interpolation for the remaining ones. The resulting self-energy, now at the new
-inverse temperature ``target_beta`` and the new number of positive fermionic frequencies ``target_niv``, is written
-to the output folder for each iteration. The step-by-step procedure for chaining runs this way is described on the
-:doc:`cooldown` page.
+The interpolation runs when ``do_interpolation`` is ``True``, once, on the final self-energy of the run. The result
+lives on the grid of the new inverse temperature ``target_beta`` with ``target_niv`` positive fermionic frequencies
+and is written to the output folder as ``sigma_dga_interpolated_beta<b>_niv<n>.npy``. How to chain runs this way is
+described on the :doc:`cooldown` page. Wherever the source grid covers a target frequency, the value is interpolated
+per momentum and orbital pair: linearly among the innermost four source frequencies, with shape-preserving PCHIP
+splines above.
+
+Cooling is the interesting case. With ``target_beta`` above the current :math:`\beta`, the innermost target frequency
+falls below the innermost source frequency :math:`\nu_0`, and there is nothing to interpolate between. The code
+extrapolates this point from the same-sign branch of the source data with PCHIP and does not clip the result. The
+obvious alternative, interpolating straight across :math:`\nu = 0`, is wrong for a self-energy: the imaginary part
+is odd, so the chord forces it toward zero at small frequencies, although
+:math:`\mathrm{Im}\,\Sigma(i0^+) = -\Gamma(0)` stays finite. In practice the chord rescales
+:math:`\mathrm{Im}\,\Sigma(i\nu_0)` by :math:`\beta_{\mathrm{source}} / \beta_{\mathrm{target}}` at every momentum.
+
+A ladder self-energy can turn non-causal in parts of the Brillouin zone on cooling, with a diagonal element
+:math:`\mathrm{Im}\,\Sigma_{11}(i\nu_0) > 0`. Such momenta get a second treatment for the target frequencies below
+:math:`\nu_0`: a minimal pole representation (MiniPole, the ``mini_pole`` package) fitted to the positive branch of
+every orbital pair separately, with the static part :math:`\Sigma_\infty` removed and restored. The fits run over
+the irreducible Brillouin zone, distributed over the MPI ranks, and are unfolded with the lattice symmetries. Two
+guards decide whether a fit replaces the plain extrapolation. It must not place a pole in the upper half plane,
+where the target frequencies lie; such fits are over-fitting artifacts of near-noiseless data. Its value must also
+stay within one source step, :math:`|\Sigma_{12}(i\nu_0) - \Sigma_{12}(i\nu_1)|`, of the plain extrapolation,
+which rules out fits that reproduce the grid points through canceling poles. A non-causal self-energy as such is
+never rejected; poles in the lower half plane with negative weights represent it. Pole-like shapes, where the
+scattering keeps growing toward :math:`\nu \to 0` as in a pseudogap, stay with the plain extrapolation: at the noise
+level of a DGA self-energy their pole fits are not stable. Expect about one second per flagged momentum and orbital
+pair. ``mini_pole`` and its dependency ``kneed`` are research codes and therefore pinned to exact versions in
+``requirements.txt``.
 
 Output
 ------
