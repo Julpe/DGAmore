@@ -76,10 +76,11 @@ On a SLURM-based cluster, a typical job submission script looks as follows:
    mpirun -np $SLURM_NTASKS DGAmore -p "<path to config>" -c "<name of config>.yaml"
 
 The ``-o`` and ``-e`` options set the files for the job output and errors; here both are written to the same file,
-but separate files may be used instead. Before the heavy steps start, DGAmore verifies that the run fits the memory
-of every node it received; on a batch system this check honors the job's cgroup memory limit (e.g. slurm's
-``--mem``), so request as much memory as the job may actually use rather than relying on the node total. The
-results of a completed run are written to a subdirectory of the output
+but separate files may be used instead. Should any rank fail, it writes its traceback to the error stream and
+aborts the whole job, so the remaining ranks never wait for it indefinitely. Before the heavy steps start, DGAmore
+verifies that the run fits the memory of every node it received; on a batch system this check honors the job's
+cgroup memory limit (e.g. slurm's ``--mem``), so request as much memory as the job may actually use rather than
+relying on the node total. The results of a completed run are written to a subdirectory of the output
 folder, whose name encodes run-specific parameters such as the momentum-grid size and the frequency box. The
 :doc:`output` page lists every file such a run produces and the array layout of each stored quantity.
 

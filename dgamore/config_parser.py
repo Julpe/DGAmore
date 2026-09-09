@@ -50,11 +50,11 @@ class ConfigParser:
         parser.add_argument("-c", "--config", nargs="?", default=name, type=str, help=" Config file name. ")
         parser.add_argument("-p", "--path", nargs="?", default=path, type=str, help=" Path to the config file. ")
 
+        config.logger = DgaLogger(comm)
+
         if comm.rank == 0:
             args = parser.parse_args()
             self._config_file = YAML().load(open(os.path.join(args.path, args.config)))
-
-        config.logger = DgaLogger(comm)
 
         self._config_file = comm.bcast(self._config_file, root=0)
 

@@ -122,6 +122,16 @@ class DgaLogger:
         """
         self._log("::WARNING:: " + message, level=logging.WARNING, allowed_ranks=allowed_ranks)
 
+    def error(self, message: str, allowed_ranks: tuple = (0,)):
+        """
+        Logs an error message. This is intended for failures that terminate the run.
+
+        :param message: The message to log.
+        :param allowed_ranks: The MPI rank(s) permitted to emit this message.
+        :return: None.
+        """
+        self._log("::ERROR:: " + message, level=logging.ERROR, allowed_ranks=allowed_ranks)
+
     def log_memory_usage(
         self, obj_name: str, obj, n_copies: int = 1, allowed_ranks: tuple = (0,), per: str = "rank", scale: float = 1.0
     ):
