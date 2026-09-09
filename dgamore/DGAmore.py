@@ -17,6 +17,8 @@ import itertools as it
 import logging
 import os
 import socket
+import sys
+import traceback
 
 # OpenMPI: exclude the UCX one-sided (RMA) component before MPI init. Some OpenMPI 5.x builds fail its own
 # component-query and print a benign "OSC UCX component priority set inside component query failed" warning otherwise.
@@ -53,15 +55,35 @@ NODE_MEMORY_FRACTION: float = 0.95
 
 def main():
     """
-    Runs the complete DGA pipeline end to end: config parsing and folder setup, DMFT input loading, the local
-    Schwinger-Dyson step (per inequivalent atom, assembled into full multi-band quantities), the non-local
-    ladder-DGA self-energy and Green's function, optional analytic continuation, and the optional Eliashberg
-    solution -- saving and plotting results throughout. This is the console-script entry point.
+    Console-script entry point. Runs :func:`run_dga_routine` on every rank; when any rank leaves it through an
+    exception, that rank logs its traceback, flushes the log and aborts the whole MPI job, so the other ranks cannot
+    block forever in a collective the failed rank never joins.
 
     :return: None.
     """
     comm = MPI.COMM_WORLD
+    try:
+        run_dga_routine(comm)
+    except BaseException:
+        config.logger.error(
+            f"Rank {comm.rank} failed, aborting all ranks.\n{traceback.format_exc()}", allowed_ranks=(comm.rank,)
+        )
+        sys.stdout.flush()
+        logging.shutdown()
+        comm.Abort(1)
+    MPI.Finalize()
 
+
+def run_dga_routine(comm: MPI.Comm) -> None:
+    """
+    Runs the complete DGA pipeline end to end: config parsing and folder setup, DMFT input loading, the local
+    Schwinger-Dyson step (per inequivalent atom, assembled into full multi-band quantities), the non-local
+    ladder-DGA self-energy and Green's function, optional analytic continuation, and the optional Eliashberg
+    solution -- saving and plotting results throughout.
+
+    :param comm: The MPI communicator.
+    :return: None.
+    """
     config_parser = ConfigParser().parse_config(comm)
     logger = config.logger
     logger.info("Starting DGA routine.")
@@ -541,7 +563,6 @@ def main():
             logger.info("Plotted singlet and triplet gap functions.")
 
     logger.info("Exiting ...")
-    MPI.Finalize()
 
 
 def autodetect_memory_settings(comm: MPI.Comm) -> None:

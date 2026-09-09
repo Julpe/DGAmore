@@ -226,17 +226,16 @@ rung make sure the path names the folder you mean. ``use_interpolated_sigma`` is
 each of them starts from a warmer predecessor. The first rung of the ladder is the only one that leaves
 ``previous_sc_path`` empty and starts cold from DMFT; it still has the interpolation switched on.
 
-**The interpolation.** On the :math:`\beta = 20` rung, ``do_interpolation`` is on and ``target_beta`` is
-``25.0``, the inverse temperature of the DMFT data in ``/data/beta25/``. The two have to match exactly: the
-hand-over file carries no metadata, so the :math:`\beta = 25` rung takes its content at face value, and a mismatch
-goes unnoticed. ``target_niv`` is ``60``, the ``niv_core`` of the next rung. A larger value is harmless: the next
-rung cuts the file to its core box anyway and fills the tail from its own DMFT self-energy, so a generous value
-only costs disk space. A smaller value means the DMFT self-energy also has to fill the rest of the core box. The
-interpolated self-energy is written once, from the rung's final self-energy, the converged one if the rung
-converged. The ratio :math:`25/20 = 1.25` keeps the
-re-gridding mild: only the lowest target frequency lands on the straight-line guess. On the :math:`\beta = 25`
-rung the interpolation is switched off because the ladder ends there; to go on to :math:`\beta = 30` one would
-leave it on with ``target_beta: 30.0``.
+**The interpolation.** On the :math:`\beta = 20` rung, ``do_interpolation`` is on and ``target_beta`` is ``25.0``, the
+inverse temperature of the DMFT data in ``/data/beta25/``. The two have to match exactly: the hand-over file carries
+no metadata, so the :math:`\beta = 25` rung takes its content at face value, and a mismatch goes unnoticed.
+``target_niv`` is ``60``, the ``niv_core`` of the next rung. A larger value is harmless: the next rung cuts the file
+to its core box anyway and fills the tail from its own DMFT self-energy, so a generous value only costs disk space. A
+smaller value means the DMFT self-energy also has to fill the rest of the core box. The interpolated self-energy is
+written once, from the rung's final self-energy, the converged one if the rung converged. The ratio :math:`25/20 =
+1.25` keeps the re-gridding mild: only the lowest target frequency has to be extrapolated below the source grid. On
+the :math:`\beta = 25` rung the interpolation is switched off because the ladder ends there; to go on to :math:`\beta
+= 30` one would leave it on with ``target_beta: 30.0``.
 
 **The mixing.** Both rungs use Anderson mixing with ``mixing: 0.4`` and a history of four pairs. After the
 hand-over the first four iterations mix linearly at :math:`0.4` while pairs of the new map accumulate (the log
@@ -296,22 +295,29 @@ At the start of the cycle, the predecessor's result becomes the rung's starting 
 
 The re-gridding treats real and imaginary parts separately on the full signed frequency axis. The innermost
 frequencies, where the grid is sparsest, are interpolated linearly and everything above them with shape-preserving
-PCHIP splines. Target frequencies smaller in magnitude than the lowest source frequency fall onto the straight line
-between the lowest negative and the lowest positive source frequency. Since a shape-preserving interpolant never
-overshoots its data, a causal self-energy stays causal under the hand-over.
+PCHIP splines; between source points a shape-preserving interpolant never overshoots its data, so a causal self-energy
+stays causal there. Target frequencies smaller in magnitude than the lowest source frequency are extrapolated with
+PCHIP from the same-sign branch alone rather than across :math:`\nu = 0`, because the odd imaginary part does not
+vanish at the origin, :math:`\mathrm{Im}\,\Sigma(i0^+) = -\Gamma(0)`; nothing is clipped, so a sign change below the
+innermost frequency is followed. At momenta whose diagonal self-energy is non-causal at the innermost frequency,
+:math:`\mathrm{Im}\,\Sigma_{11}(i\nu_0) > 0`, that branch extrapolation is replaced by a minimal pole representation
+(MiniPole) of the momentum's own self-energy with its static part removed and restored, the fits distributed over the
+ranks; a fit is kept only if it places no pole in the upper half plane and stays within one source step of the branch
+values, otherwise the branch values remain. The log reports how many of the flagged irreducible k-points accepted the
+fit.
 
 How demanding the re-gridding is depends on the *ratio* of the two inverse temperatures, not on their difference.
 The Matsubara grids :math:`\nu_n = (2n + 1)\pi/\beta` of two temperatures are related by a pure rescaling. Which
 source frequencies bracket a given target frequency, and how many target frequencies drop below the lowest source
-frequency and must be taken from the straight-line guess, is therefore fixed by :math:`\beta_{k+1}/\beta_k` alone.
+frequency and must be extrapolated from the branch, is therefore fixed by :math:`\beta_{k+1}/\beta_k` alone.
 Going from :math:`\beta = 5` to :math:`10` is the same interpolation task as going from :math:`20` to :math:`40`,
 while :math:`20` to :math:`25` is far milder than :math:`5` to :math:`10` despite the equal difference. To see why,
 note that the source run has data only at its own Matsubara frequencies. Its lowest positive one,
 :math:`\pi/\beta_k`, has nothing below it but its negative partner, so every target frequency of smaller magnitude
-has to come from the straight line joining the two. A target frequency :math:`(2m + 1)\pi/\beta_{k+1}` lies below
+has to be extrapolated from the same-sign branch. A target frequency :math:`(2m + 1)\pi/\beta_{k+1}` lies below
 :math:`\pi/\beta_k` exactly when :math:`2m + 1 < \beta_{k+1}/\beta_k`. For :math:`m = 0` this always holds when
 cooling; the second target frequency only drops into the gap once the ratio exceeds three, the third once it
-exceeds five. Below a ratio of three the straight-line guess is thus confined to the single lowest target
+exceeds five. Below a ratio of three the branch extrapolation is thus confined to the single lowest target
 frequency, and everything above it is interpolated between actual source values.
 
 The only positive evidence that the chain engaged is the log line
@@ -348,7 +354,7 @@ unconverged iterate mean nothing. A few practices keep a ladder trustworthy.
 * **Step in ratios, not differences.** Since the hand-over depends on :math:`\beta_{k+1}/\beta_k` alone (see
   above), lay the ladder out geometrically rather than in equal steps of :math:`\beta`. Consecutive ratios between
   about 1.25 and 1.5 are a typical choice; beyond a ratio of three the second target frequency, too, ends up on the
-  straight-line guess. The warm start has to land inside the basin of attraction of the new fixed point. A rung
+  branch extrapolation. The warm start has to land inside the basin of attraction of the new fixed point. A rung
   that needs many more iterations than its predecessor, or that reports pole warnings (see below) in its first
   iterations, was probably stepped too far, and an intermediate temperature should be inserted.
 * **Budget the iterations.** Near the cold end of the ladder a rung may need tens of iterations, and that count is

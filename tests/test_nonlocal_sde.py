@@ -14,6 +14,7 @@ import pytest
 
 import dgamore.brillouin_zone as bz
 import dgamore.config as config
+import dgamore.memory_estimator as memory_estimator
 import dgamore.mpi_utils as mpi_utils
 import dgamore.nonlocal_sde as nonlocal_sde
 from dgamore.four_point import FourPoint
@@ -186,7 +187,7 @@ def test_nonlocal_fock_fft_matches_explicit_momentum_sum():
     config.sys.occ_k = occ_k
     config.sys.occ = occ_k.mean(axis=(0, 1, 2))
 
-    uq = (u_loc + v_nonloc).permute_orbitals("abcd->adcb").mat.reshape(nk_tot, nb, nb, nb, nb)  # [q,a,d,c,b]
+    uq = (u_loc + v_nonloc).mat.reshape(nk_tot, nb, nb, nb, nb)
     q_list = np.array([np.unravel_index(i, nk) for i in range(nk_tot)])
     fock_ref = np.zeros((nk_tot, nb, nb), dtype=np.complex64)
     for d in range(nb):
@@ -194,11 +195,29 @@ def test_nonlocal_fock_fft_matches_explicit_momentum_sum():
             occ_qk = np.array([np.roll(occ_k[..., d, c], tuple(q), axis=(0, 1, 2)) for q in q_list]).reshape(
                 nk_tot, nk_tot
             )
-            fock_ref += np.einsum("qab,qk->kab", uq[:, :, d, c, :], occ_qk, optimize=True)
+            # -sum_q (U + V^q)_{1ab2} n^{k-q}_{ba}: external orbitals on the outer slots of uq[q, o1, o2, o3, o4]
+            fock_ref += np.einsum("qab,qk->kab", uq[:, :, c, d, :], occ_qk, optimize=True)
     fock_ref *= -1.0 / nk_tot
 
     _, fock = get_hartree_fock(u_loc, v_nonloc)
     assert np.allclose(fock[..., 0], fock_ref, atol=1e-4)
+
+
+def test_nonlocal_hartree_fock_matches_the_local_one_for_a_generic_tensor():
+    """For V = 0 and a generic (non-Kanamori) local tensor the non-local Hartree-Fock equals the local SDE's."""
+    nb, nk = 2, (2, 2, 1)
+    nk_tot = int(np.prod(nk))
+    config.lattice.nk = nk
+    config.sys.n_bands = nb
+    rng = np.random.default_rng(5)
+    occ = rng.standard_normal((nb, nb))
+    occ = occ + occ.T
+    config.sys.occ = occ
+    config.sys.occ_k = np.broadcast_to(occ, nk + (nb, nb)).copy()
+    u_loc = LocalInteraction(rng.standard_normal((nb, nb, nb, nb)), SpinChannel.NONE)
+    v_zero = Interaction(np.zeros((nk_tot, nb, nb, nb, nb)), SpinChannel.NONE, nk, has_compressed_q_dimension=True)
+    hartree, fock = get_hartree_fock(u_loc, v_zero)
+    assert np.allclose((hartree + fock)[0, ..., 0], get_local_hartree_fock(u_loc, occ), atol=1e-6)
 
 
 def _constant_chi(mat: np.ndarray):
@@ -312,12 +331,10 @@ def _bse_assembly_inputs(rng, o=2, nqi=3, nw=3, niv=2, beta=12.5):
     return gamma, gchi0_q_inv, u_loc, v_nonloc
 
 
-def _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc):
-    """Evaluates the pre-fusion two-block expression (chi0^-1 + Gamma/beta^2) - (U + V^q)/beta^2 via the object API."""
+def _bse_assembly_reference(gamma, gchi0_q_inv, u_loc):
+    """Evaluates the pre-fusion two-block expression (chi0^-1 + Gamma/beta^2) - U_r/beta^2 via the object API."""
     beta = config.sys.beta
-    return (gchi0_q_inv.copy() + 1.0 / beta**2 * gamma.copy()) - 1.0 / beta**2 * (
-        v_nonloc.as_channel(gamma.channel) + u_loc.as_channel(gamma.channel)
-    )
+    return (gchi0_q_inv.copy() + 1.0 / beta**2 * gamma.copy()) - 1.0 / beta**2 * u_loc.as_channel(gamma.channel)
 
 
 def test_create_inverse_auxiliary_chi_r_q_matches_two_block_expression():
@@ -325,8 +342,8 @@ def test_create_inverse_auxiliary_chi_r_q_matches_two_block_expression():
     rng = np.random.default_rng(21)
     gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
     gamma_before, chi0_before = gamma.mat.copy(), gchi0_q_inv.mat.copy()
-    ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc)
-    u_r = v_nonloc.as_channel(gamma.channel) + u_loc.as_channel(gamma.channel)
+    ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc)
+    u_r = u_loc.as_channel(gamma.channel)
     fused = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
     assert np.array_equal(fused.mat, ref.mat)
     assert fused.channel == SpinChannel.DENS
@@ -338,8 +355,8 @@ def test_create_inverse_auxiliary_chi_r_q_matches_two_block_expression():
 def test_create_inverse_auxiliary_chi_r_q_accepts_half_niw_gamma():
     """A gamma already in the half bosonic range assembles identically to its full-range twin."""
     rng = np.random.default_rng(22)
-    gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
-    u_r = v_nonloc.as_channel(gamma.channel) + u_loc.as_channel(gamma.channel)
+    gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(rng)
+    u_r = u_loc.as_channel(gamma.channel)
     full = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
     half = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma.copy().to_half_niw_range(), gchi0_q_inv, u_r)
     assert np.array_equal(full.mat, half.mat)
@@ -348,10 +365,28 @@ def test_create_inverse_auxiliary_chi_r_q_accepts_half_niw_gamma():
 def test_create_auxiliary_chi_r_q_matches_explicit_reference():
     """The full-inversion variant reproduces the explicit two-block expression inverted in compound space."""
     rng = np.random.default_rng(24)
-    gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
-    ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc, v_nonloc).invert(False)
-    out = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc, v_nonloc)
+    gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(rng)
+    ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc).invert(False)
+    out = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc)
     assert np.allclose(out.mat, ref.mat, atol=1e-10)
+
+
+def test_auxiliary_chi_r_q_chain_resums_to_the_ladder_with_the_nonlocal_rung():
+    """[(sum chi*)^-1 + U_r + V_r]^-1 equals the summed BSE with Gamma^w_r + V^q_r (the rung enters via chi_phys)."""
+    rng = np.random.default_rng(25)
+    gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
+    beta, channel = config.sys.beta, gamma.channel
+    chi_star_sum = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc).sum_over_all_vn(beta)
+    # zero shell correction (same sum added and subtracted); direct = chi0^-1 + (Gamma^w + V_r)/beta^2 via -V_r
+    chain = nonlocal_sde.create_generalized_chi_q_with_shell_correction(
+        chi_star_sum, chi_star_sum, chi_star_sum, u_loc, v_nonloc
+    )
+    direct = (
+        nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, -v_nonloc.as_channel(channel))
+        .invert(False)
+        .sum_over_all_vn(beta)
+    )
+    assert np.allclose(chain.mat, direct.mat, atol=1e-8)
 
 
 def test_calculate_kernel_r_q_matches_rewired_reference():
@@ -1108,9 +1143,9 @@ def test_sigma_dc_kernel_sums_the_stored_first_fermionic_index_over_the_full_box
 def test_create_auxiliary_chi_r_q_sum_matches_full_inversion_reference():
     """The chunked auxiliary-susceptibility sum equals the full compound inversion summed over the last frequency."""
     rng = np.random.default_rng(31)
-    gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
-    ref = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc, v_nonloc).sum_over_vn(config.sys.beta)
-    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, v_nonloc)
+    gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(rng)
+    ref = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc).sum_over_vn(config.sys.beta)
+    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
     assert np.allclose(out.mat, ref.mat, atol=1e-5)
     assert out.channel == gamma.channel and not out.full_niw_range and out.num_vn_dimensions == 1
 
@@ -1118,15 +1153,15 @@ def test_create_auxiliary_chi_r_q_sum_matches_full_inversion_reference():
 def test_create_auxiliary_chi_r_q_sum_is_chunk_size_invariant(monkeypatch):
     """A one-element chunk budget reproduces the whole-box result of the chunked auxiliary-susceptibility sum."""
     rng = np.random.default_rng(32)
-    gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
-    whole = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, v_nonloc)
+    gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(rng)
+    whole = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
     monkeypatch.setattr(nonlocal_sde, "SLICE_CHUNK_BYTES", 1)
-    chunked = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, v_nonloc)
+    chunked = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
     assert np.allclose(chunked.mat, whole.mat, atol=1e-6)
 
 
 def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(monkeypatch):
-    """The k-distributed occupation/energy evaluation matches the single-rank full-box reference."""
+    """The k-distributed occupation/energy evaluation matches the single-rank full-box reference with its offset."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     nk, o, niv, niv_dmft, beta, mu = (4, 2, 1), 2, 3, 8, 9.0, 0.4
     nk_tot = int(np.prod(nk))
@@ -1142,7 +1177,9 @@ def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(mon
     sigma_new = SelfEnergy(sig_mat.copy(), nk, has_compressed_q_dimension=True, beta=beta)
     sigma_dmft_full = SelfEnergy(dmft_mat.copy(), (1, 1, 1), beta=beta)
 
-    sigma_ref = sigma_new.copy().concatenate_self_energies(sigma_dmft_full)
+    sigma_ref = sigma_new.copy().concatenate_self_energies(
+        sigma_dmft_full, shell_offset=sigma_new.shell_offset_from(sigma_dmft_full)
+    )
     giwk_ref = GreensFunction.get_g_full(sigma_ref, mu, ek, beta)
     _, occ_ref, occ_k_ref = giwk_ref.get_fill_nonlocal()
     ekin_ref, epot_ref = giwk_ref.get_ekin(), giwk_ref.get_epot()
@@ -1155,6 +1192,41 @@ def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(mon
     # occupations reproduce the full-box reference bit-for-bit; only the energy scalars regroup their k-sums
     for _, occ, occ_k, ekin, epot in res:
         assert np.array_equal(occ, occ_ref) and np.array_equal(occ_k, occ_k_ref)
+        assert np.allclose([ekin, epot], [ekin_ref, epot_ref], atol=1e-5)
+
+
+def test_update_occ_and_energies_distributed_carries_the_shell_offset_of_the_mixed_sigma(monkeypatch):
+    """A momentum-dependent constant in sigma's shell is carried into the DMFT-box extension on every rank."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, o, niv_core, niv, niv_dmft, beta, mu = (4, 2, 1), 2, 2, 4, 8, 9.0, 0.4
+    nk_tot = int(np.prod(nk))
+    rng = np.random.default_rng(13)
+    config.sys.beta, config.sys.n_bands, config.sys.mu = beta, o, mu
+    config.lattice.nk = nk
+    config.lattice.k_grid = SimpleNamespace(nk_tot=nk_tot, nk=nk)
+    ek = rng.standard_normal((*nk, o, o))
+    config.lattice.hamiltonian = MagicMock(get_ek=MagicMock(return_value=ek + ek.swapaxes(-1, -2)))
+    dmft_mat = (rng.standard_normal((1, 1, 1, o, o, 2 * niv_dmft)) * 0.1 + 0.2j).astype(np.complex64)
+    offset = rng.standard_normal((nk_tot, o, o))
+    # the mixed sigma: DMFT shell plus a k-dependent constant everywhere, a random core box inside
+    sig_mat = np.broadcast_to(dmft_mat[0, 0, 0, ..., niv_dmft - niv : niv_dmft + niv], (nk_tot, o, o, 2 * niv)).copy()
+    sig_mat += offset[..., None]
+    sig_mat[..., niv - niv_core : niv + niv_core] = rng.standard_normal((nk_tot, o, o, 2 * niv_core)) * 0.1 + 0.3j
+    sigma_new = SelfEnergy(sig_mat.astype(np.complex64), nk, has_compressed_q_dimension=True, beta=beta)
+    sigma_dmft_full = SelfEnergy(dmft_mat.copy(), (1, 1, 1), beta=beta)
+
+    sigma_ref = sigma_new.copy().concatenate_self_energies(sigma_dmft_full, shell_offset=offset)
+    giwk_ref = GreensFunction.get_g_full(sigma_ref, mu, ek + ek.swapaxes(-1, -2), beta)
+    _, occ_ref, occ_k_ref = giwk_ref.get_fill_nonlocal()
+    ekin_ref, epot_ref = giwk_ref.get_ekin(), giwk_ref.get_epot()
+
+    def fn(comm, rank):
+        d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
+        return nonlocal_sde._update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, d_full, mu)
+
+    _, res = run_parallel(2, fn)
+    for _, occ, occ_k, ekin, epot in res:
+        assert np.allclose(occ, occ_ref, atol=1e-6) and np.allclose(occ_k, occ_k_ref, atol=1e-6)
         assert np.allclose([ekin, epot], [ekin_ref, epot_ref], atol=1e-5)
 
 
@@ -1266,6 +1338,76 @@ def test_fft_sde_pass_is_invariant_under_the_w_chunk_size(negative_w, monkeypatc
     _, res = run_parallel(3, fn)
     for whole, chunked in res:
         assert np.allclose(chunked, whole, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "chunk_bytes, expected",
+    [
+        (  # one w per chunk: the positive pass logs its halfway and last chunk, the negative pass only its last
+            1,
+            [
+                "Self-energy FFT pass (positive w): 2 of 4 bosonic chunks done.",
+                "Self-energy FFT pass (positive w): 4 of 4 bosonic chunks done.",
+                "Self-energy FFT pass (negative w): 3 of 3 bosonic chunks done.",
+            ],
+        ),
+        (  # a single chunk per pass: halfway and last chunk coincide, one line per pass
+            2**62,
+            [
+                "Self-energy FFT pass (positive w): 1 of 1 bosonic chunks done.",
+                "Self-energy FFT pass (negative w): 1 of 1 bosonic chunks done.",
+            ],
+        ),
+    ],
+)
+def test_fft_sde_pass_logs_progress_at_the_halfway_and_last_chunk(chunk_bytes, expected, monkeypatch):
+    """The positive pass logs its halfway and last chunk, the negative pass only its last one; one chunk logs once."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, o, niw, niv, beta = (4, 4, 1), 1, 3, 2, 12.5
+    rng = np.random.default_rng(5)
+    niv_g = niv + niw
+    g_mat = (rng.standard_normal((*nk, o, o, 2 * niv_g)) + 0j).astype(np.complex64)
+    n_irr = bz.KGrid(nk, bz.two_dimensional_square_symmetries()).nk_irr
+    kernel_mat = (rng.standard_normal((n_irr, o, o, o, o, niw + 1, 2 * niv)) + 0j).astype(np.complex64)
+    config.logger = MagicMock()
+
+    def fn(comm, rank):
+        config.lattice.nk = nk
+        config.lattice.k_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+        config.box.niw_core, config.box.niv_core = niw, niv
+        config.sys.n_bands, config.sys.beta = o, beta
+        d_irr = mpi_utils.MpiDistributor(ntasks=n_irr, comm=comm)
+        d_full = mpi_utils.MpiDistributor(ntasks=int(np.prod(nk)), comm=comm)
+        g_r_local = nonlocal_sde._build_rspace_giwk_pencil(
+            GreensFunction(g_mat.copy(), calc_filling=False, nk=nk, beta=beta), d_irr
+        )
+        for negative_w in (False, True):
+            pairs = [(i, -i) for i in range(1, niw + 1)] if negative_w else [(i, i) for i in range(niw + 1)]
+            kernel = FourPoint(
+                kernel_mat[d_irr.my_slice].copy(),
+                SpinChannel.NONE,
+                nk,
+                1,
+                1,
+                full_niw_range=False,
+                has_compressed_q_dimension=True,
+            )
+            nonlocal_sde._run_fft_sde_pass(kernel, d_irr, d_full, g_r_local, niv_g, pairs, negative_w, chunk_bytes)
+
+    run_parallel(1, fn)
+    assert [call.args[0] for call in config.logger.info.call_args_list] == expected
+
+
+def test_sde_chunk_budget_is_the_job_wide_minimum(monkeypatch):
+    """Every rank gets the smallest node budget, so all ranks walk the same collective chunk schedule."""
+    monkeypatch.setattr(mpi_utils, "job_memory_total", lambda: 2**40)
+    node_sizes = (8, 64, 512)  # per-node budgets: capped at 4 GiB, 2 GiB, floored at 256 MiB
+
+    def fn(comm, rank):
+        return nonlocal_sde._sde_chunk_budget(comm, SimpleNamespace(size=node_sizes[rank]))
+
+    _, budgets = run_parallel(3, fn)
+    assert budgets == [memory_estimator.SLICE_CHUNK_BYTES] * 3
 
 
 def test_interpolate_sigma_unfolds_distributed_pole_fits_to_the_full_bz(monkeypatch):

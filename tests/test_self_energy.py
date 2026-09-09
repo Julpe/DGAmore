@@ -350,6 +350,26 @@ def test_pole_extrapolate_evaluates_the_fitted_poles_on_the_inner_target_frequen
     assert np.allclose(values[0, ..., :n_pos], np.conj(np.swapaxes(values[0, ..., n_pos:], 0, 1))[..., ::-1])
 
 
+def test_pole_extrapolate_removes_the_static_part_per_momentum(monkeypatch):
+    """pole_extrapolate subtracts each momentum's own Sigma_inf, so a k-dependent static part leaves no residual."""
+    beta, x, niv = 10.0, -0.3, 200
+    hartree = np.array([1.5, 2.5])
+    weight = np.array([[1.0, 0.5], [0.5, 2.0]])
+    vn = MFHelper.vn(niv, beta)
+    mat = hartree[:, None, None, None] + (weight[..., None] / (1j * vn - x))[None]
+    self_energy = _se(mat, nk=(2, 1, 1), has_compressed_q_dimension=True, beta=beta)
+    patch_mini_pole_with_exact_single_pole_fit(monkeypatch, x)
+
+    reference = self_energy.interpolate(2.0 * beta, niv)
+    values, accepted = self_energy.pole_extrapolate(2.0 * beta, niv, np.array([0, 1]), reference)
+
+    target_vn = MFHelper.vn(niv, 2.0 * beta)
+    inner = np.abs(target_vn) < vn[niv]
+    expected = hartree[:, None, None, None] + (weight[..., None] / (1j * target_vn[inner] - x))[None]
+    assert np.array_equal(accepted, [True, True])
+    assert np.allclose(values, expected, atol=1e-6)
+
+
 def test_pole_extrapolate_rejects_upper_half_plane_poles_failed_fits_and_implausible_values(monkeypatch):
     """pole_extrapolate rejects a momentum on an upper-half-plane pole, a failed fit or an implausible value."""
     self_energy = _build_linear_self_energy(niv_value=6, beta_value=1.0, has_compressed_q_dimension=False)
@@ -477,6 +497,51 @@ def test_fit_smom_concatenated_is_bit_identical_to_the_full_concatenation_fit(ni
     ref0, ref1 = core.copy().concatenate_self_energies(shell).smom
     mom0, mom1 = core.fit_smom_concatenated(shell)
     assert np.array_equal(mom0, ref0) and np.array_equal(mom1, ref1)
+
+
+def _offset_setup(seed, niv_core=3, niv_shell=8, nk_odd=(3, 2, 1)):
+    """Builds (core, shell, offset): a compressed core, a momentum-local shell donor and a [q, o1, o2] constant."""
+    rng = np.random.default_rng(seed)
+    nq = int(np.prod(nk_odd))
+    core_mat = (rng.standard_normal((nq, 2, 2, 2 * niv_core)) * 0.1 + 0.3j).astype(np.complex64)
+    shell_mat = (rng.standard_normal((1, 1, 1, 2, 2, 2 * niv_shell)) * 0.1 + 0.2j).astype(np.complex64)
+    offset = rng.standard_normal((nq, 2, 2))
+    return _se(core_mat, nk=nk_odd, has_compressed_q_dimension=True), _se(shell_mat, nk=(1, 1, 1)), offset
+
+
+def test_concatenate_self_energies_adds_the_shell_offset_outside_the_core_only():
+    """A [q, o1, o2] shell offset is added to the donor's shell frequencies and leaves the core untouched."""
+    core, shell, offset = _offset_setup(8)
+    plain = core.copy().concatenate_self_energies(shell)
+    result = core.copy().concatenate_self_energies(shell, shell_offset=offset)
+    niv_diff = shell.niv - core.niv
+    expected = plain.mat.copy()
+    expected[..., :niv_diff] += offset[..., None]
+    expected[..., niv_diff + 2 * core.niv :] += offset[..., None]
+    assert np.allclose(result.mat, expected, atol=1e-6)
+    assert np.array_equal(result.mat[..., niv_diff : niv_diff + 2 * core.niv], core.mat)
+
+
+def test_fit_smom_concatenated_with_shell_offset_is_bit_identical_to_the_offset_concatenation_fit():
+    """fit_smom_concatenated with a shell offset equals the offset concatenation's own moment fit bit-for-bit."""
+    core, shell, offset = _offset_setup(9)
+    ref0, ref1 = core.copy().concatenate_self_energies(shell, shell_offset=offset).smom
+    mom0, mom1 = core.fit_smom_concatenated(shell, shell_offset=offset)
+    assert np.array_equal(mom0, ref0) and np.array_equal(mom1, ref1)
+
+
+@pytest.mark.parametrize("compressed", [True, False])
+def test_shell_offset_from_recovers_the_constant_carried_in_the_shell(compressed):
+    """shell_offset_from reads the [q, o1, o2] constant of the outermost frequency back from either momentum layout."""
+    core, shell, offset = _offset_setup(10)
+    carrier = core.copy().concatenate_self_energies(shell, shell_offset=offset)
+    big_mat = (np.random.default_rng(11).standard_normal((1, 1, 1, 2, 2, 2 * 12)) * 0.1).astype(np.complex64)
+    big_mat[..., 12 - shell.niv : 12 + shell.niv] = shell.mat
+    big = _se(big_mat, nk=(1, 1, 1))
+    if not compressed:
+        carrier = carrier.decompress_q_dimension()
+    assert np.allclose(carrier.shell_offset_from(big), offset, atol=1e-6)
+    assert np.allclose(shell.shell_offset_from(big), 0.0)
 
 
 def test_fit_smom_concatenated_raises_for_smaller_shell():

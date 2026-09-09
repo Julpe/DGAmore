@@ -74,6 +74,26 @@ the code read the interaction from the file referenced in ``interaction_input``,
 real-space Hamiltonian file but with four orbital indices instead of two and may also encode non-local
 interactions.
 
+The custom interaction file follows the layout of a ``wannier_hr.dat`` file without its leading comment line (no
+comments or empty lines anywhere): the first line gives the number of orbitals, the second the number of lattice
+vectors (including ``0 0 0``), the third lists one weight per lattice vector in the order the vectors first appear
+(each vector's contribution to :math:`V^{\mathbf{q}}` is divided by its weight, the wannier90 degeneracy convention;
+``R`` and ``-R`` both have to be listed; a tensor violating the pair-exchange or reality symmetry of a real Coulomb
+interaction is rejected), and every further line holds one tensor element as ``Rx Ry Rz o1 o2 o3 o4 Re Im`` with
+1-based orbital indices (the imaginary part is ignored). Energies are in the unit of the Wannier Hamiltonian and the
+lattice vectors in its lattice-vector basis, so the two files have to match. Rows with ``R = 0`` form the local
+:math:`U`, all other rows the non-local :math:`V^{\mathbf{q}} = \sum_{\mathbf{R} \neq 0}
+e^{i\mathbf{q}\cdot\mathbf{R}} V(\mathbf{R})`. The orbital slots follow the w2dynamics convention of the Kanamori
+builder: the intra-orbital :math:`U` sits at ``a a a a``, the inter-orbital density-density :math:`U'` at ``a b a b``
+and the Hund's :math:`J` at ``a a b b`` and ``a b b a``; a density-density interaction between orbital ``a`` at ``R``
+and orbital ``b`` at the origin therefore goes to ``a b a b`` as well. The example below describes two orbitals with
+:math:`U = 3.2` eV, :math:`J = 0.4` eV and :math:`U' = U - 2J`, plus a density-density tail :math:`V(\mathbf{R}) =
+0.4\,\mathrm{eV}/|\mathbf{R}|` on the square lattice up to the next-nearest neighbors. The numbers are illustrative
+only and do not describe a real material; they serve to show the file layout and the index convention:
+
+.. literalinclude:: u_matrix.dat
+   :caption: ``u_matrix.dat``
+
 Finally, ``nk`` sets the size of the momentum grid, which is shared by the one-particle quantities and the
 ladder (the q-grid always equals the k-grid).
 
