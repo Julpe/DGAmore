@@ -942,9 +942,9 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     v_nonloc.copy.return_value = v_nonloc
     v_nonloc.reduce_q.return_value = v_nonloc
 
-    def run(comm=None):
+    def run(comm=None, **kwargs):
         comm = create_comm_mock() if comm is None else comm
-        return nonlocal_sde.calculate_self_energy_q(comm, None, v_nonloc, sigma_dmft, sigma_dmft.copy())
+        return nonlocal_sde.calculate_self_energy_q(comm, None, v_nonloc, sigma_dmft, sigma_dmft.copy(), **kwargs)
 
     return run, calls, logger
 
@@ -965,6 +965,22 @@ def _run_loop_on_two_node_ranks(monkeypatch, tmp_path, spied_name, spied_owner):
     monkeypatch.setattr(spied_owner, spied_name, spy)
     run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
     return seen
+
+
+def test_loop_forwards_the_chunk_budgets_to_every_proposal(monkeypatch, tmp_path):
+    """The chunk budgets handed to the loop reach every proposal evaluation; None is forwarded as None."""
+    run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
+    fake, seen = nonlocal_sde.calculate_sigma_proposal, []
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["chunk_budgets"])
+        return fake(*args, **kwargs)
+
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", spy)
+    budgets = memory_estimator.ChunkBudgets(12345, 678, 9)
+    run(chunk_budgets=budgets)
+    run()
+    assert seen == [budgets, budgets, None, None]
 
 
 def test_loop_concatenates_the_previous_iterate_on_rank0_only(monkeypatch, tmp_path):
@@ -1150,14 +1166,18 @@ def test_create_auxiliary_chi_r_q_sum_matches_full_inversion_reference():
     assert out.channel == gamma.channel and not out.full_niw_range and out.num_vn_dimensions == 1
 
 
-def test_create_auxiliary_chi_r_q_sum_is_chunk_size_invariant(monkeypatch):
-    """A one-element chunk budget reproduces the whole-box result of the chunked auxiliary-susceptibility sum."""
+def test_create_auxiliary_chi_r_q_sum_is_bit_invariant_under_the_chunk_budget(monkeypatch):
+    """Single slices, w-chunks, q-groups and the whole box give the same bits, so the budget may follow free memory."""
     rng = np.random.default_rng(32)
-    gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(rng)
-    whole = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    o, nqi, nw, niv = 2, 4, 3, 2
+    gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(rng, o=o, nqi=nqi, nw=nw, niv=niv)
+    whole = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, 2**62)
+    one_wn = (2 * niv) ** 2 * o**4 * gamma.mat.itemsize
+    for budget in (1, 2 * one_wn, nw * one_wn, 2 * nw * one_wn):  # single slice, w-chunk, one q, q-group of two
+        chunked = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, budget)
+        assert np.array_equal(chunked.mat, whole.mat)
     monkeypatch.setattr(nonlocal_sde, "SLICE_CHUNK_BYTES", 1)
-    chunked = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
-    assert np.allclose(chunked.mat, whole.mat, atol=1e-6)
+    assert np.array_equal(nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc).mat, whole.mat)
 
 
 def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(monkeypatch):

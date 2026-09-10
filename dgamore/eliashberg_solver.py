@@ -1796,7 +1796,12 @@ def _solve_sectors_in_memory(
 
 
 def solve(
-    giwk_dga: GreensFunction, g_dmft: GreensFunction, u_loc: LocalInteraction, v_nonloc: Interaction, comm: MPI.Comm
+    giwk_dga: GreensFunction,
+    g_dmft: GreensFunction,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    comm: MPI.Comm,
+    chunk_budgets: memory_estimator.ChunkBudgets | None = None,
 ):
     r"""
     Drives the Eliashberg step: assembles the singlet and triplet pairing vertices from the saved
@@ -1810,6 +1815,9 @@ def solve(
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param comm: The MPI communicator.
+    :param chunk_budgets: Chunk byte budgets sized by the driver from the memory estimate, of which the pairing-vertex
+        budget is used; ``None`` gives the fair-share budget of
+        :func:`~dgamore.memory_estimator.dynamic_chunk_budget`.
     :return: A dict keyed by ``(channel, parity_label)`` mapping to ``(lambdas, gaps)`` of the leading eigenvalues
         and :class:`GapFunction` objects for each solved physical frequency-parity sector. When
         ``config.eliashberg.resolve_frequency_parity`` is set the parity labels are ``"even"`` and ``"odd"``,
@@ -1886,8 +1894,10 @@ def solve(
         giwk_dga.free()
 
     node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED) if comm.size > 1 else None
-    chunk_bytes = memory_estimator.dynamic_chunk_budget(
-        mpi_utils.job_memory_total(), node_comm.size if node_comm is not None else 1
+    chunk_bytes = (
+        memory_estimator.dynamic_chunk_budget(mpi_utils.job_memory_total(), node_comm.size if node_comm else 1)
+        if chunk_budgets is None
+        else chunk_budgets.fq
     )
 
     f_dens_pp = dispatch_full_vertex_calculation(

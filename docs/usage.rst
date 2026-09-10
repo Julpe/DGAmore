@@ -104,8 +104,10 @@ folder, whose name encodes run-specific parameters such as the momentum-grid siz
 
 Memory is managed automatically: every heavy step runs a single chunk-bounded or distributed algorithm, and before
 the heavy part of a run begins, DGAmore verifies from the memory available on every node together with an analytic
-estimate of each step's peak (as a node total over all ranks placed there) that the run fits - the one runtime
-choice left is the Eliashberg solver's automatic fallback from its in-memory solve to the block-distributed grid.
+estimate of each step's peak (as a node total over all ranks placed there) that the run fits, and sizes the chunks
+of the auxiliary-susceptibility build, the self-energy passes and the pairing-vertex build from the memory that
+estimate leaves free on the tightest node - the one runtime choice left is the Eliashberg solver's automatic
+fallback from its in-memory solve to the block-distributed grid.
 Replicated full-grid objects are always deduplicated into one shared-memory window per node. There are no memory
 switches in the configuration file; if some step does not fit, the run stops upfront with a :class:`MemoryError`
 recommending more nodes, fewer ranks per node, or a smaller box.

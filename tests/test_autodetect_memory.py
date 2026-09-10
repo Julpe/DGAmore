@@ -9,7 +9,16 @@ import pytest
 
 import dgamore.config as config
 import dgamore.DGAmore as dgamore_main
-from dgamore.memory_estimator import BranchPeak, estimate_peaks
+from dgamore.memory_estimator import (
+    MAX_CHUNK_BUDGET_BYTES,
+    RANK_BASELINE_BYTES,
+    SDE_CHUNK_FACTOR,
+    SDE_HEADROOM_SHARE,
+    SLICE_CHUNK_BYTES,
+    BranchPeak,
+    ChunkBudgets,
+    estimate_peaks,
+)
 from tests.conftest import create_comm_mock
 
 # the q-grid / box parameters the fake_system fixture installs, so tests can reproduce the driver's estimate
@@ -32,6 +41,10 @@ def fake_system(monkeypatch):
     config.logger = MagicMock()
 
     monkeypatch.setattr(dgamore_main.MPI, "Get_processor_name", lambda: "node0", raising=False)
+    # the job memory total follows whatever available memory a test installs, unless a test overrides it
+    monkeypatch.setattr(
+        dgamore_main.mpi_utils, "job_memory_total", lambda: dgamore_main.psutil.virtual_memory().available
+    )
 
     def _set_available(num_bytes):
         monkeypatch.setattr(
@@ -74,17 +87,75 @@ def _mock_branch(
 
 
 def test_large_memory_passes_verification(fake_system):
-    """A large free-memory budget on a tiny problem passes every branch verification without raising."""
+    """A large memory budget on a tiny problem passes every verification; the chunked builds get whole blocks."""
     fake_system(64 * 1024**3)
-    dgamore_main.autodetect_memory_settings(_mock_comm())
+    whole, floor = MAX_CHUNK_BUDGET_BYTES, SLICE_CHUNK_BYTES
+    assert dgamore_main.autodetect_memory_settings(_mock_comm()) == ChunkBudgets(whole, whole, floor)  # no fq
 
 
-def test_chiq_aux_overflow_raises_while_lighter_branches_fit(fake_system):
-    """A budget between the lighter branches and the chiq_aux node total raises on the heaviest branch."""
-    chiq_aux = _node_total("chiq_aux", "off", r=1)
-    floor = max(_node_total(k, "off", r=1) for k in ("chi0q", "sde", "local"))
-    assert floor < chiq_aux  # sanity: chiq_aux is the heaviest branch here
-    fake_system(int(0.5 * (floor + chiq_aux) / dgamore_main.NODE_MEMORY_FRACTION))
+def _linear_chunk_branches(**kw):
+    """Synthetic chunked branches whose per-rank transient is three times their chunk budget."""
+    budgets = kw["chunk_budgets"]
+    return {key: _mock_branch(off_distributed=3 * getattr(budgets, key)) for key in ("chiq_aux", "sde", "fq")}
+
+
+def test_chunk_budgets_are_the_largest_that_keep_each_branch_inside_its_line(fake_system, monkeypatch):
+    """aux-chi and fq fill the available line; sde stops at its share of the headroom below the job memory total."""
+    avail = 3 * 1024**3
+    fake_system(avail)
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", _linear_chunk_branches)
+    budgets = dgamore_main.autodetect_memory_settings(_mock_comm())
+    line = avail * dgamore_main.NODE_MEMORY_FRACTION  # the fixture's job memory total equals its available memory
+    assert line / 3 - 2**20 <= budgets.chiq_aux <= line / 3
+    assert line / 3 - 2**20 <= budgets.fq <= line / 3
+    assert SDE_HEADROOM_SHARE * line / 3 - 2**20 <= budgets.sde <= SDE_HEADROOM_SHARE * line / 3
+
+
+def test_chunk_budgets_take_the_minimum_over_the_nodes(fake_system, monkeypatch):
+    """With nodes of different memory the tightest node's headroom sizes every chunk budget."""
+    fake_system(1)
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", _linear_chunk_branches)
+    big, small = 8 * 1024**3, 2 * 1024**3
+    two_nodes = lambda obj: [("node0", big, big), ("node1", small, small)]
+    budgets = dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=two_nodes))
+    tight = small * dgamore_main.NODE_MEMORY_FRACTION / 3
+    assert tight - 2**20 <= budgets.chiq_aux <= tight
+
+
+def test_chunk_budgets_floor_when_only_the_floor_fits(fake_system, monkeypatch):
+    """A budget line just above the residents plus the floored transient yields the floor and still passes."""
+    resident = 1024**3
+
+    def heavy(**kw):
+        return {"chiq_aux": _mock_branch(baseline=resident, off_distributed=3 * kw["chunk_budgets"].chiq_aux)}
+
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", heavy)
+    fake_system(int((resident + 3 * SLICE_CHUNK_BYTES + 2**20) / dgamore_main.NODE_MEMORY_FRACTION))
+    budget = dgamore_main.autodetect_memory_settings(_mock_comm()).chiq_aux
+    assert SLICE_CHUNK_BYTES <= budget < SLICE_CHUNK_BYTES + 2**20
+    fake_system(int((resident + 3 * SLICE_CHUNK_BYTES - 2**20) / dgamore_main.NODE_MEMORY_FRACTION))
+    with pytest.raises(MemoryError, match="Auxiliary susceptibility"):
+        dgamore_main.autodetect_memory_settings(_mock_comm())
+
+
+def test_sde_chunk_budget_falls_back_to_the_floor_when_the_available_memory_does_not_hold_it(fake_system, monkeypatch):
+    """A total-sized sde budget that overflows the available memory is replaced by the floor, with a warning."""
+    fake_system(2 * 1024**3)
+    monkeypatch.setattr(dgamore_main.mpi_utils, "job_memory_total", lambda: 100 * 1024**3)
+
+    def sde_only(**kw):
+        return {"sde": _mock_branch(off_distributed=SDE_CHUNK_FACTOR * kw["chunk_budgets"].sde)}
+
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", sde_only)
+    assert dgamore_main.autodetect_memory_settings(_mock_comm()).sde == SLICE_CHUNK_BYTES
+    assert config.logger.warning.call_count == 1
+
+
+def test_heaviest_branch_overflow_raises_while_lighter_branches_fit(fake_system):
+    """A budget between the second-heaviest and the heaviest branch's node total raises on the heaviest branch."""
+    totals = sorted(_node_total(k, "off", r=1) for k in ("chi0q", "chiq_aux", "sde", "sigma_loop", "local"))
+    assert totals[-2] < totals[-1]  # sanity: a budget strictly between the two exists
+    fake_system(int(0.5 * (totals[-2] + totals[-1]) / dgamore_main.NODE_MEMORY_FRACTION))
     with pytest.raises(MemoryError):
         dgamore_main.autodetect_memory_settings(_mock_comm())
 
@@ -276,7 +347,7 @@ def test_lanczos_single_rank_peak_doubled_on_single_node_multi_rank(fake_system,
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: grid_rescues)
     dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=lambda obj: [obj, obj]))
 
-    two_nodes = lambda obj: [("node0", obj[1]), ("node1", obj[1])]
+    two_nodes = lambda obj: [("node0", obj[1], obj[2]), ("node1", obj[1], obj[2])]
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: both_too_big)
     dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=two_nodes))
 
@@ -293,9 +364,10 @@ def test_local_step_overflow_raises_before_the_flag_loop(fake_system, monkeypatc
     monkeypatch.setattr(config.box, "niv_full", 100)
     params = {**FIXTURE_PARAMS, "niv_full": 100, "niv_cut": 50}  # niv_cut = min(10 + 100 + 10, niv_dmft=50)
     peaks = estimate_peaks(**params, n_ranks=1, with_eliashberg=False)
-    totals = {k: bp.baseline + bp.off_distributed + bp.off_single for k, bp in peaks.items()}
+    # array totals without the per-rank footprint every branch carries alike
+    totals = {k: bp.baseline - RANK_BASELINE_BYTES + bp.off_distributed + bp.off_single for k, bp in peaks.items()}
     local = totals.pop("local")
     assert max(totals.values()) < 0.9 * local
-    fake_system(int(0.95 * local / dgamore_main.NODE_MEMORY_FRACTION))
+    fake_system(int((RANK_BASELINE_BYTES + 0.95 * local) / dgamore_main.NODE_MEMORY_FRACTION))
     with pytest.raises(MemoryError, match="local Schwinger-Dyson"):
         dgamore_main.autodetect_memory_settings(_mock_comm())
