@@ -29,7 +29,9 @@ through the U-range method. Here ``niw_core`` is the number of positive bosonic 
 ``niv_core`` the number of positive fermionic ones, so that the objects carry ``2 * niw_core + 1`` bosonic and
 ``2 * niv_core`` fermionic frequencies in total. Setting either core size to ``-1`` instructs the code to take the
 full number of positive frequencies available from the DMFT calculation; if a smaller box is requested, the DMFT
-vertices are cut down to the specified size.
+vertices are cut down to the specified size. Setting ``niv_shell`` to ``-1`` takes the largest shell the
+one-particle DMFT box admits, ``niv_dmft - niv_core - niw_core``, since the bubble on the full box reads the
+Green's function up to ``niv_full + niw_core``; a larger ``niv_shell`` is clamped to that value.
 
 Lattice and symmetries
 -----------------------

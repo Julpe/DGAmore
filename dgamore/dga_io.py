@@ -81,12 +81,11 @@ def load_from_dmft_file_and_update_config() -> (
         g2_magn = dmft_interface.get_g2iw(SpinChannel.MAGN, ineq)
         g2_magn_per_ineq.append(g2_magn)
 
-        update_frequency_boxes(g2_dens.niw, g2_dens.niv)
-
         g_dmft = dmft_interface.get_giw(ineq)
         g_per_ineq.append(g_dmft)
-
         config.box.niv_dmft = g_dmft.niv
+
+        update_frequency_boxes(g2_dens.niw, g2_dens.niv, g_dmft.niv)
 
         sigma_dmft = dmft_interface.get_siw(ineq)
         sigma_per_ineq.append(sigma_dmft)
@@ -139,14 +138,17 @@ def load_from_dmft_file_and_update_config() -> (
     return g_per_ineq, sigma_per_ineq, g2_dens_per_ineq, g2_magn_per_ineq
 
 
-def update_frequency_boxes(niw: int, niv: int) -> None:
+def update_frequency_boxes(niw: int, niv: int, niv_dmft: int) -> None:
     """
-    Updates the global frequency-box sizes from the frequencies available in the DMFT four-point object: unset
-    (``-1``) boxes are filled with the available counts, and over-large requested boxes are clamped to what is
-    available. Recomputes ``niv_full``.
+    Updates the global frequency-box sizes from the frequencies available in the DMFT input: unset (``-1``) core
+    boxes are filled with the counts available in the four-point object, over-large requested core boxes are clamped
+    to what is available, and the shell is filled (``-1``) with or clamped to the largest shell the one-particle box
+    admits, ``niv_dmft - niv_core - niw_core`` (the bubble on the full box reads the Green's function up to
+    ``niv_full + niw_core``). Recomputes ``niv_full``.
 
-    :param niw: Number of positive bosonic frequencies available in the DMFT input.
-    :param niv: Number of positive fermionic frequencies available in the DMFT input.
+    :param niw: Number of positive bosonic frequencies available in the DMFT four-point object.
+    :param niv: Number of positive fermionic frequencies available in the DMFT four-point object.
+    :param niv_dmft: Number of positive fermionic frequencies available in the DMFT one-particle input.
     :return: None.
     """
     logger = config.logger
@@ -169,6 +171,17 @@ def update_frequency_boxes(niw: int, niv: int) -> None:
         logger.info(
             f"Number of fermionic Matsubara frequencies cannot exceed available "
             f"frequencies in the DMFT four-point object. Using niv = {niv}."
+        )
+
+    niv_shell_max = max(niv_dmft - config.box.niv_core - config.box.niw_core, 0)
+    if config.box.niv_shell == -1:
+        config.box.niv_shell = niv_shell_max
+        logger.info(f"Number of shell frequencies is set to '-1'. Using niv_shell = {niv_shell_max}.")
+    elif config.box.niv_shell > niv_shell_max:
+        config.box.niv_shell = niv_shell_max
+        logger.info(
+            f"Number of shell frequencies cannot exceed available frequencies in the DMFT one-particle object "
+            f"(niv_dmft - niv_core - niw_core). Using niv_shell = {niv_shell_max}."
         )
 
     config.box.niv_full = config.box.niv_core + config.box.niv_shell
