@@ -1,7 +1,8 @@
 box_sizes:
   niw_core: -1 # Number of bosonic frequencies used from G2(w,v,v'); default: -1 (all)
   niv_core: -1 # Number of fermionic frequencies used from G2(w,v,v'); default: -1 (all)
-  niv_shell: 0 # Number of fermionic frequencies used for explicit asymptotics. If left at 0, no asymptotics are used. Default: 0
+  niv_shell: 0 # Number of fermionic frequencies used for explicit asymptotics. If left at 0, no asymptotics are used;
+  # -1 takes the largest shell the DMFT input allows (niv_dmft - niv_core - niw_core), larger values are clamped to it. Default: 0
 
 lattice:
   symmetries: "auto" # Specify lattice symmetry group. For availability, check out the file 'brillouin_zone.py'
@@ -66,7 +67,8 @@ eliashberg:
   subfolder_name: "Eliashberg" # name for the subfolder where certain outputs are generated
 
 self_energy_interpolation:
-  do_interpolation: False # If True, the code will interpolate the self-energy to a different frequency and beta in each iteration
+  do_interpolation: False # If True, the final self-energy is also saved re-gridded to target_beta and target_niv
+  # (below the innermost source frequency: same-sign branch extrapolation, MiniPole at flagged k-points; see the docs)
   target_beta: 1.0 # Target inverse temperature for the interpolation
   target_niv: 10 # Target number of positive fermionic frequencies for the interpolation
 

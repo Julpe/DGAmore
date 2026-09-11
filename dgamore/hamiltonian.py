@@ -251,8 +251,8 @@ class Hamiltonian:
         for a, b, c, d in it.product(range(n_tot), repeat=4):
             bands = [a + 1, b + 1, c + 1, d + 1]
 
-            # choose parameters based on (a,b) pair (equivalently (c,d))
-            u, j, v = get_params(a, b)
+            # parameters of the two orbitals the element couples: (a, b), or (a, c) for the pair-hopping U_{aabb}
+            u, j, v = get_params(a, b if a != b else c)
 
             if a == b == c == d:  # U_{llll}
                 interaction_elements.append(InteractionElement(r_loc, bands, u))
@@ -469,24 +469,36 @@ class Hamiltonian:
     def read_umatrix(self, filename: str) -> "Hamiltonian":
         """
         Reads a file and creates the interaction matrix from it. The file should contain the number of bands in the
-        first line and the number of r values in the second line. From the third line onwards it should contain the
-        interaction matrix entries. It looks very similar to the format of a wannier_hr.dat file. The format is:
-        r_lat_x r_lat_y r_lat_z orb1 orb2 orb3 orb4 realvalue imagvalue, where r_lat is the relative lattice vector
-        and orb1-4 are the orbital indices. The interaction is assumed to be purely real. The ordering of the entries
-        themselves does not matter. Note: The file must not contain any comments or empty lines.
+        first line, the number of r values in the second line and one weight per r value in the third line. As in
+        wannier90, the i-th weight belongs to the i-th distinct lattice vector in order of appearance and divides that
+        vector's contribution to the Fourier transform. From the fourth line onwards it should contain the interaction
+        matrix entries. It looks very similar to the format of a wannier_hr.dat file. The format is: r_lat_x r_lat_y
+        r_lat_z orb1 orb2 orb3 orb4 realvalue imagvalue, where r_lat is the relative lattice vector and orb1-4 are the
+        (1-based) orbital indices. The interaction is assumed to be purely real. The ordering of the entries themselves
+        does not matter. Note: The file must not contain any comments or empty lines. The orbital slots follow the
+        Kanamori builder: the intra-orbital U sits at the ``aaaa`` slots, the inter-orbital density-density U' at
+        ``abab`` and the Hund's J at ``aabb`` and ``abba``; a density-density non-local term between orbital a at
+        r_lat and orbital b at the origin goes to ``abab`` as well.
 
         :param filename: Path to the umatrix file.
         :return: ``self`` (for chaining).
+        :raises ValueError: If the number of distinct lattice vectors in the entries differs from the header, or an
+            entry is listed twice.
         """
         umatrix_file = pd.read_csv(filename, skiprows=0, names=np.arange(15), sep=r"\s+", dtype=float, engine="python")
         values = umatrix_file.values
 
         nr = values[1][0].astype(int)
         values = values[~np.isnan(values)]
+        weights = values[2 : 2 + nr].astype(float)
 
         n_cols = 9
         n_rows = np.size(values[2 + nr :]) // n_cols
         values = np.reshape(values[2 + nr :], (n_rows, n_cols))
+
+        r_order = list(dict.fromkeys(tuple(r) for r in values[:, 0:3].astype(int).tolist()))
+        if len(r_order) != nr:
+            raise ValueError(f"The file lists {len(r_order)} distinct lattice vectors, but its header announces {nr}.")
 
         interaction_elements = []
         for i in range(len(values)):
@@ -498,7 +510,7 @@ class Hamiltonian:
                 )
             )
 
-        return self._add_interaction_term(interaction_elements)
+        return self._add_interaction_term(interaction_elements, dict(zip(r_order, weights)))
 
     def get_ek(self, k_grid: bz.KGrid = None) -> np.ndarray:
         r"""
@@ -571,23 +583,39 @@ class Hamiltonian:
             self._insert_er_element(self._er, r_to_index, he.r_lat, *he.orbs, he.value)
         return self
 
-    def _add_interaction_term(self, interaction_elements: list) -> "Hamiltonian":
+    def _add_interaction_term(
+        self, interaction_elements: list, r_weights: dict[tuple[int, int, int], float] | None = None
+    ) -> "Hamiltonian":
         """
         Builds the local and non-local interaction terms from a list of interaction elements (the local part is
         stored separately, so the ``[0,0,0]`` lattice vector is removed from the non-local grid).
 
         :param interaction_elements: List of :class:`InteractionElement` (or dicts convertible to one).
+        :param r_weights: Weight per lattice vector, by which that vector's contribution to the Fourier transform is
+            divided (the wannier90 degeneracy convention); ``None`` weights every vector with one.
         :return: ``self`` (for chaining).
+        :raises ValueError: If a (lattice vector, orbital quadruple) combination occurs more than once, or the tensor
+            violates a symmetry checked by :meth:`_check_interaction_swapping_symmetry`.
         """
         interaction_elements = self._parse_elements(interaction_elements, InteractionElement)
+        keys = [(ie.r_lat, tuple(ie.orbs)) for ie in interaction_elements]
+        if len(set(keys)) != len(keys):
+            first = next(k for k in keys if keys.count(k) > 1)
+            raise ValueError(f"Interaction element {first} is a duplicate; every tensor element may be listed once.")
         r_to_index, n_rp, n_orbs = self._prepare_lattice_indices_and_orbs(interaction_elements)
-        # we need local interactions in a separate object, hence we do not care about the [0,0,0] r_lat in here
-        n_rp -= 1
+        # we need local interactions in a separate object, hence we do not care about the [0,0,0] r_lat in here;
+        # re-enumerate so the remaining lattice vectors index the non-local array contiguously
         r_to_index.pop((0, 0, 0))
+        r_to_index = {r_vec: index for index, r_vec in enumerate(r_to_index)}
+        n_rp -= 1
 
         self._ur_r_grid = self._create_ur_grid(r_to_index, n_orbs)
         self._ur_orbs = self._create_ur_orbs(n_rp, n_orbs)
-        self._ur_r_weights = np.ones(n_rp)[:, None]
+        weights = np.ones(n_rp)
+        if r_weights is not None:
+            for r_vec, index in r_to_index.items():
+                weights[index] = r_weights[r_vec]
+        self._ur_r_weights = weights[:, None]
 
         self._ur_local = np.zeros((n_orbs, n_orbs, n_orbs, n_orbs))
         self._ur_nonlocal = np.zeros((n_rp, n_orbs, n_orbs, n_orbs, n_orbs))
@@ -596,6 +624,7 @@ class Hamiltonian:
                 self._insert_ur_element(self._ur_local, None, None, *ie.orbs, ie.value)
             else:
                 self._insert_ur_element(self._ur_nonlocal, r_to_index, ie.r_lat, *ie.orbs, ie.value)
+        self._check_interaction_swapping_symmetry(r_to_index)
         return self
 
     def _create_er_grid(self, r_to_index: dict[list, int], n_orbs: int) -> np.ndarray:
@@ -769,22 +798,29 @@ class Hamiltonian:
         n_orbs = int(max(np.array([el.orbs for el in elements]).flatten()))
         return r_to_index, n_rp, n_orbs
 
-    def _check_interaction_swapping_symmetry(self, uq_local: np.ndarray, uq_nonlocal: np.ndarray):
+    def _check_interaction_swapping_symmetry(self, r_to_index: dict[tuple[int, int, int], int]) -> None:
         r"""
-        Checks the interaction swapping symmetry: :math:`U_{lmm'l'} = U_{mll'm'}` for the local part and
-        :math:`V^{\mathbf{q}}_{lmm'l'} = V^{-\mathbf{q}}_{mll'm'}` for the non-local part. NOTE: The check for the
-        non-local :math:`V^{\mathbf{q}}` needs to be revised because a straight inversion of the first axis is not
-        correct.
+        Checks the symmetries every real Coulomb tensor has, in the stored orbital-slot convention: the pair-exchange
+        symmetry :math:`U_{1234} = U_{2143}` and the reality symmetry :math:`U_{1234} = U_{3412}` of the local part,
+        and for the non-local part :math:`V_{1234}(\mathbf{R}) = V_{2143}(-\mathbf{R})`, which requires every listed
+        lattice vector to come with its mirror image, and :math:`V_{1234}(\mathbf{R}) = V_{3412}(\mathbf{R})`.
 
-        :param uq_local: The local interaction tensor :math:`U_{1234}`.
-        :param uq_nonlocal: The non-local interaction tensor :math:`V_{1234}(\mathbf{q})`.
+        :param r_to_index: Mapping from lattice-vector tuple to its row in the non-local interaction array.
         :return: None.
-        :raises AssertionError: If either swapping symmetry is violated.
+        :raises ValueError: If a symmetry is violated or a mirrored lattice vector is missing.
         """
-        assert np.allclose(
-            uq_local, np.einsum("abcd->badc", uq_local)
-        ), "Swapping symmetry of the interaction is not satisfied!"
+        u = self._ur_local
+        if not np.allclose(u, np.einsum("abcd->badc", u)):
+            raise ValueError("The local interaction violates the pair-exchange symmetry U_{1234} = U_{2143}.")
+        if not np.allclose(u, np.einsum("abcd->cdab", u)):
+            raise ValueError("The local interaction violates the reality symmetry U_{1234} = U_{3412}.")
 
-        assert np.allclose(
-            uq_nonlocal, np.einsum("qabcd->qbadc", np.flip(uq_nonlocal, axis=0))
-        ), "Swapping symmetry of the interaction is not satisfied!"
+        v = self._ur_nonlocal
+        for r_vec, index in r_to_index.items():
+            mirrored = tuple(-x for x in r_vec)
+            if mirrored not in r_to_index:
+                raise ValueError(f"The non-local interaction lists the lattice vector {r_vec} but not {mirrored}.")
+            if not np.allclose(v[index], np.einsum("abcd->badc", v[r_to_index[mirrored]])):
+                raise ValueError(f"The non-local interaction violates the pair-exchange symmetry at R = {r_vec}.")
+            if not np.allclose(v[index], np.einsum("abcd->cdab", v[index])):
+                raise ValueError(f"The non-local interaction violates the reality symmetry at R = {r_vec}.")

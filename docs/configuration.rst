@@ -29,7 +29,9 @@ through the U-range method. Here ``niw_core`` is the number of positive bosonic 
 ``niv_core`` the number of positive fermionic ones, so that the objects carry ``2 * niw_core + 1`` bosonic and
 ``2 * niv_core`` fermionic frequencies in total. Setting either core size to ``-1`` instructs the code to take the
 full number of positive frequencies available from the DMFT calculation; if a smaller box is requested, the DMFT
-vertices are cut down to the specified size.
+vertices are cut down to the specified size. Setting ``niv_shell`` to ``-1`` takes the largest shell the
+one-particle DMFT box admits, ``niv_dmft - niv_core - niw_core``, since the bubble on the full box reads the
+Green's function up to ``niv_full + niw_core``; a larger ``niv_shell`` is clamped to that value.
 
 Lattice and symmetries
 -----------------------
@@ -73,6 +75,26 @@ the Kanamori interaction tensor; in both cases ``interaction_input`` is ignored.
 the code read the interaction from the file referenced in ``interaction_input``, which is structured like a
 real-space Hamiltonian file but with four orbital indices instead of two and may also encode non-local
 interactions.
+
+The custom interaction file follows the layout of a ``wannier_hr.dat`` file without its leading comment line (no
+comments or empty lines anywhere): the first line gives the number of orbitals, the second the number of lattice
+vectors (including ``0 0 0``), the third lists one weight per lattice vector in the order the vectors first appear
+(each vector's contribution to :math:`V^{\mathbf{q}}` is divided by its weight, the wannier90 degeneracy convention;
+``R`` and ``-R`` both have to be listed; a tensor violating the pair-exchange or reality symmetry of a real Coulomb
+interaction is rejected), and every further line holds one tensor element as ``Rx Ry Rz o1 o2 o3 o4 Re Im`` with
+1-based orbital indices (the imaginary part is ignored). Energies are in the unit of the Wannier Hamiltonian and the
+lattice vectors in its lattice-vector basis, so the two files have to match. Rows with ``R = 0`` form the local
+:math:`U`, all other rows the non-local :math:`V^{\mathbf{q}} = \sum_{\mathbf{R} \neq 0}
+e^{i\mathbf{q}\cdot\mathbf{R}} V(\mathbf{R})`. The orbital slots follow the w2dynamics convention of the Kanamori
+builder: the intra-orbital :math:`U` sits at ``a a a a``, the inter-orbital density-density :math:`U'` at ``a b a b``
+and the Hund's :math:`J` at ``a a b b`` and ``a b b a``; a density-density interaction between orbital ``a`` at ``R``
+and orbital ``b`` at the origin therefore goes to ``a b a b`` as well. The example below describes two orbitals with
+:math:`U = 3.2` eV, :math:`J = 0.4` eV and :math:`U' = U - 2J`, plus a density-density tail :math:`V(\mathbf{R}) =
+0.4\,\mathrm{eV}/|\mathbf{R}|` on the square lattice up to the next-nearest neighbors. The numbers are illustrative
+only and do not describe a real material; they serve to show the file layout and the index convention:
+
+.. literalinclude:: u_matrix.dat
+   :caption: ``u_matrix.dat``
 
 Finally, ``nk`` sets the size of the momentum grid, which is shared by the one-particle quantities and the
 ladder (the q-grid always equals the k-grid).
@@ -118,7 +140,8 @@ interpolated self-energy of the previous run, with the interpolation itself conf
 Stabilization
 -------------
 
-This section collects the convergence-stabilization options of the self-consistency cycle.
+This section collects the convergence-stabilization options of the self-consistency cycle. How the three techniques
+work, what they have in common and when to reach for which is discussed on the :doc:`cooldown` page.
 
 .. code-block:: yaml
 
@@ -366,10 +389,35 @@ before entering the self-consistency cycle.
      target_beta: 1.0        # float
      target_niv: 10          # int
 
-The interpolation runs when ``do_interpolation`` is ``True``. It applies a linear inter- or extrapolation for the
-lowest frequencies and a PCHIP interpolation for the remaining ones. The resulting self-energy, now at the new
-inverse temperature ``target_beta`` and the new number of positive fermionic frequencies ``target_niv``, is written
-to the output folder for each iteration.
+The interpolation runs when ``do_interpolation`` is ``True``, once, on the final self-energy of the run. The result
+lives on the grid of the new inverse temperature ``target_beta`` with ``target_niv`` positive fermionic frequencies
+and is written to the output folder as ``sigma_dga_interpolated_beta<b>_niv<n>.npy``. How to chain runs this way is
+described on the :doc:`cooldown` page. Wherever the source grid covers a target frequency, the value is interpolated
+per momentum and orbital pair: linearly among the innermost four source frequencies, with shape-preserving PCHIP
+splines above.
+
+Cooling is the interesting case. With ``target_beta`` above the current :math:`\beta`, the innermost target frequency
+falls below the innermost source frequency :math:`\nu_0`, and there is nothing to interpolate between. The code
+extrapolates this point from the same-sign branch of the source data with PCHIP and does not clip the result. The
+obvious alternative, interpolating straight across :math:`\nu = 0`, is wrong for a self-energy: the imaginary part
+is odd, so the chord forces it toward zero at small frequencies, although
+:math:`\mathrm{Im}\,\Sigma(i0^+) = -\Gamma(0)` stays finite. In practice the chord rescales
+:math:`\mathrm{Im}\,\Sigma(i\nu_0)` by :math:`\beta_{\mathrm{source}} / \beta_{\mathrm{target}}` at every momentum.
+
+A ladder self-energy can turn non-causal in parts of the Brillouin zone on cooling, with a diagonal element
+:math:`\mathrm{Im}\,\Sigma_{11}(i\nu_0) > 0`. Such momenta get a second treatment for the target frequencies below
+:math:`\nu_0`: a minimal pole representation (MiniPole, the ``mini_pole`` package) fitted to the positive branch of
+every orbital pair separately, with the static part :math:`\Sigma_\infty` removed and restored. The fits run over
+the irreducible Brillouin zone, distributed over the MPI ranks, and are unfolded with the lattice symmetries. Two
+guards decide whether a fit replaces the plain extrapolation. It must not place a pole in the upper half plane,
+where the target frequencies lie; such fits are over-fitting artifacts of near-noiseless data. Its value must also
+stay within one source step, :math:`|\Sigma_{12}(i\nu_0) - \Sigma_{12}(i\nu_1)|`, of the plain extrapolation,
+which rules out fits that reproduce the grid points through canceling poles. A non-causal self-energy as such is
+never rejected; poles in the lower half plane with negative weights represent it. Pole-like shapes, where the
+scattering keeps growing toward :math:`\nu \to 0` as in a pseudogap, stay with the plain extrapolation: at the noise
+level of a DGA self-energy their pole fits are not stable. Expect about one second per flagged momentum and orbital
+pair. ``mini_pole`` and its dependency ``kneed`` are research codes and therefore pinned to exact versions in
+``requirements.txt``.
 
 Output
 ------

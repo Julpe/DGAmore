@@ -447,3 +447,17 @@ def run_parallel(size, fn, hostnames=None):
         if e is not None:
             raise AssertionError(f"rank {r} raised:\n{e[1]}") from e[0]
     return comm, results
+
+
+def patch_mini_pole_with_exact_single_pole_fit(monkeypatch, x: float):
+    """Replaces SelfEnergy's MiniPole by an exact single-pole fitter at x; the real cal_G_vector is kept."""
+    from dgamore import self_energy as self_energy_module
+
+    def fit(G_w, w, **kwargs):
+        return _types.SimpleNamespace(
+            pole_location=np.array([x + 0.0j]), pole_weight=np.array([[[G_w[0] * (1j * w[0] - x)]]])
+        )
+
+    mini_pole = MagicMock(side_effect=fit)
+    mini_pole.cal_G_vector = self_energy_module.MiniPole.cal_G_vector
+    monkeypatch.setattr(self_energy_module, "MiniPole", mini_pole)
