@@ -57,7 +57,9 @@ class BoxConfig:
 
     :ivar int niw_core: Number of positive bosonic core frequencies :math:`\omega`.
     :ivar int niv_core: Number of positive fermionic core frequencies :math:`\nu`.
-    :ivar int niv_shell: Number of positive fermionic shell frequencies (asymptotic correction region).
+    :ivar int niv_shell: Number of positive fermionic shell frequencies (asymptotic correction region); ``-1``
+        takes, and a larger request is clamped to, the largest shell the DMFT one-particle box admits,
+        ``niv_dmft - niv_core - niw_core``.
     :ivar int niv_full: Number of positive fermionic full-region frequencies (core + shell).
     :ivar int niv_dmft: Number of positive fermionic frequencies available in the DMFT 1-particle input.
     """
@@ -266,7 +268,7 @@ class SelfEnergyInterpolationConfig:
     r"""
     Stores the self-energy interpolation parameters (re-gridding to a different temperature/frequency box).
 
-    :ivar bool do_interpolation: Whether to additionally save an interpolated self-energy each iteration.
+    :ivar bool do_interpolation: Whether to save the final self-energy re-gridded to ``beta_target``.
     :ivar float beta_target: Target inverse temperature :math:`\beta` of the interpolation.
     :ivar int niv_target: Target number of positive fermionic frequencies of the interpolation.
     """

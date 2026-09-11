@@ -53,6 +53,9 @@ def mock_logger(monkeypatch):
         (-1, 20, 10),
         (20, -1, 10),
         (-1, -1, 10),
+        (20, 20, -1),
+        (-1, -1, -1),
+        (20, 20, 100),
     ],
 )
 def test_extracts_dmft_quantities_correctly(setup, niw_core, niv_core, niv_shell):
@@ -69,6 +72,11 @@ def test_extracts_dmft_quantities_correctly(setup, niw_core, niv_core, niv_shell
         assert config.box.niw_core == 20
     if niv_core == -1:
         assert config.box.niv_core == 20
+    niv_shell_max = config.box.niv_dmft - config.box.niv_core - config.box.niw_core
+    if niv_shell == -1 or niv_shell > niv_shell_max:
+        assert config.box.niv_shell == niv_shell_max
+    else:
+        assert config.box.niv_shell == niv_shell
 
     assert config.box.niv_full == config.box.niv_core + config.box.niv_shell
 
@@ -84,7 +92,7 @@ def test_extracts_dmft_quantities_correctly(setup, niw_core, niv_core, niv_shell
     )
 
     niv = 100
-    cut = config.box.niw_core + config.box.niv_full + 10
+    cut = min(config.box.niw_core + config.box.niv_full + 10, niv)
 
     g_dmft_ref_mat = np.load(f"{folder}/g_dmft.npy")[..., niv - cut : niv + cut]
     s_dmft_ref_mat = np.load(f"{folder}/sigma_dmft.npy")[..., niv - cut : niv + cut]

@@ -4,6 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -88,3 +89,12 @@ def test_log_memory_usage_respects_allowed_ranks(logger_and_stream):
     calls_before = stream.log.call_count
     logger.log_memory_usage("giwk", _obj(1.5), 4, allowed_ranks=(1,))
     assert stream.log.call_count == calls_before
+
+
+def test_error_emits_at_error_level_with_the_error_prefix(logger_and_stream):
+    """An error message carries the ``::ERROR::`` prefix and the logging.ERROR level."""
+    logger, stream = logger_and_stream
+    logger.error("rank 3 failed")
+    level, message = stream.log.call_args.args
+    assert level == logging.ERROR
+    assert message.endswith("::ERROR:: rank 3 failed")

@@ -76,10 +76,11 @@ On a SLURM-based cluster, a typical job submission script looks as follows:
    mpirun -np $SLURM_NTASKS DGAmore -p "<path to config>" -c "<name of config>.yaml"
 
 The ``-o`` and ``-e`` options set the files for the job output and errors; here both are written to the same file,
-but separate files may be used instead. Before the heavy steps start, DGAmore verifies that the run fits the memory
-of every node it received; on a batch system this check honors the job's cgroup memory limit (e.g. slurm's
-``--mem``), so request as much memory as the job may actually use rather than relying on the node total. The
-results of a completed run are written to a subdirectory of the output
+but separate files may be used instead. Should any rank fail, it writes its traceback to the error stream and
+aborts the whole job, so the remaining ranks never wait for it indefinitely. Before the heavy steps start, DGAmore
+verifies that the run fits the memory of every node it received; on a batch system this check honors the job's
+cgroup memory limit (e.g. slurm's ``--mem``), so request as much memory as the job may actually use rather than
+relying on the node total. The results of a completed run are written to a subdirectory of the output
 folder, whose name encodes run-specific parameters such as the momentum-grid size and the frequency box. The
 :doc:`output` page lists every file such a run produces and the array layout of each stored quantity.
 
@@ -103,8 +104,10 @@ folder, whose name encodes run-specific parameters such as the momentum-grid siz
 
 Memory is managed automatically: every heavy step runs a single chunk-bounded or distributed algorithm, and before
 the heavy part of a run begins, DGAmore verifies from the memory available on every node together with an analytic
-estimate of each step's peak (as a node total over all ranks placed there) that the run fits - the one runtime
-choice left is the Eliashberg solver's automatic fallback from its in-memory solve to the block-distributed grid.
+estimate of each step's peak (as a node total over all ranks placed there) that the run fits, and sizes the chunks
+of the auxiliary-susceptibility build, the self-energy passes and the pairing-vertex build from the memory that
+estimate leaves free on the tightest node - the one runtime choice left is the Eliashberg solver's automatic
+fallback from its in-memory solve to the block-distributed grid.
 Replicated full-grid objects are always deduplicated into one shared-memory window per node. There are no memory
 switches in the configuration file; if some step does not fit, the run stops upfront with a :class:`MemoryError`
 recommending more nodes, fewer ranks per node, or a smaller box.
