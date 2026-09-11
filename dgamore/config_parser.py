@@ -50,11 +50,11 @@ class ConfigParser:
         parser.add_argument("-c", "--config", nargs="?", default=name, type=str, help=" Config file name. ")
         parser.add_argument("-p", "--path", nargs="?", default=path, type=str, help=" Path to the config file. ")
 
+        config.logger = DgaLogger(comm)
+
         if comm.rank == 0:
             args = parser.parse_args()
             self._config_file = YAML().load(open(os.path.join(args.path, args.config)))
-
-        config.logger = DgaLogger(comm)
 
         self._config_file = comm.bcast(self._config_file, root=0)
 
@@ -109,7 +109,7 @@ class ConfigParser:
         conf.niw_core = self._try_parse(section, "niw_core", conf.niw_core)
         conf.niv_core = self._try_parse(section, "niv_core", conf.niv_core)
         conf.niv_shell = self._try_parse(section, "niv_shell", conf.niv_shell)
-        if conf.niv_shell <= 0:
+        if conf.niv_shell != -1 and conf.niv_shell <= 0:
             config.logger.info(f"'niv_shell' is set to {conf.niv_shell}. No asymptotics will be used.")
             conf.niv_shell = 0
         conf.niv_full = conf.niv_core + conf.niv_shell

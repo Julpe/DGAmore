@@ -4,6 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -11,8 +12,10 @@ import pytest
 
 from dgamore import config
 from dgamore.matsubara_frequencies import MFHelper
+from dgamore import self_energy as self_energy_module
 from dgamore.self_energy import SelfEnergy
 from dgamore.config import sys
+from tests.conftest import patch_mini_pole_with_exact_single_pole_fit
 
 sys.beta = 1.0
 nk = (4, 4, 1)
@@ -267,6 +270,174 @@ def test_interpolate_reproduces_linear_frequency_dependence_on_a_new_grid():
     assert np.allclose(result.mat, expected, atol=1e-4)
 
 
+@pytest.mark.parametrize("has_compressed_q_dimension", [True, False])
+def test_interpolate_extrapolates_from_the_same_sign_branch_below_the_innermost_source_frequency(
+    has_compressed_q_dimension,
+):
+    """interpolate extrapolates target frequencies below the innermost source frequency from the same-sign branch."""
+    beta_source = 1.0
+    beta_target = 2.0
+    self_energy = _build_branch_self_energy(6, beta_source, -1.5, -0.25, has_compressed_q_dimension)
+
+    result = self_energy.interpolate(beta_target=beta_target, niv_target=6)
+
+    target_vn = MFHelper.vn(6, beta_target)
+    expected = _branch_signal(target_vn, im_offset=-1.5, im_slope=-0.25)
+    inner = np.abs(target_vn) < MFHelper.vn(6, beta_source)[6]
+    assert inner.sum() == 2
+    assert np.allclose(result.mat[..., inner], expected[inner], atol=1e-4)
+    assert np.allclose(result.mat[..., ~inner], expected[~inner], atol=1e-4)
+
+
+def test_interpolate_follows_the_branch_trend_through_zero_on_every_element():
+    """interpolate follows the branch trend below the innermost source frequency even through a sign change of Im."""
+    beta_source = 1.0
+    beta_target = 4.0
+    # Im = -0.01 at the innermost source frequency pi and steep above it, so the extrapolation to pi/4 crosses zero
+    im_offset, im_slope = -0.01 + 2.0 * np.pi, -2.0
+    self_energy = _build_branch_self_energy(niv_value=6, beta_value=beta_source, im_offset=im_offset, im_slope=im_slope)
+
+    result = self_energy.interpolate(beta_target=beta_target, niv_target=6)
+
+    target_vn = MFHelper.vn(6, beta_target)
+    inner = np.abs(target_vn) < MFHelper.vn(6, beta_source)[6]
+    expected = _branch_signal(target_vn, im_offset=im_offset, im_slope=im_slope)
+    assert np.all(np.sign(expected[inner].imag) == np.sign(target_vn[inner]))
+    assert np.allclose(result.mat[..., inner], expected[inner], atol=1e-4)
+
+
+def test_fit_smom_is_independent_of_the_momentum_layout():
+    """fit_smom returns the same moments for the compressed and the decompressed momentum layout."""
+    decompressed = _se(mat_decompressed, nk=nk, has_compressed_q_dimension=False)
+    compressed = _se(mat_decompressed.reshape(-1, *mat_decompressed.shape[3:]), nk=nk, has_compressed_q_dimension=True)
+
+    assert np.allclose(decompressed.fit_smom()[0], compressed.fit_smom()[0])
+    assert np.allclose(decompressed.fit_smom()[1], compressed.fit_smom()[1])
+
+
+def test_pole_fit_mask_flags_non_causal_and_pole_like_momenta():
+    """pole_fit_mask flags only a non-causal diagonal element at nu_0, not an off-diagonal one or a pole-like shape."""
+    vn = MFHelper.vn(4, 1.0)
+    mat = np.zeros((3, 1, 1, 2, 2, vn.size), dtype=complex)
+    mat[..., :] = -1j * np.sign(vn) * (0.1 + 0.2 * np.abs(vn))  # baseline; k=0 off-diag, k=1 diag, k=2 pole-like
+    mat[0, 0, 0, 0, 1, 4] = 0.5j
+    mat[1, 0, 0, 1, 1, 4] = 0.05j
+    mat[2, 0, 0, 0, 0, 4:6] = [-0.8j, -0.4j]
+    self_energy = _se(mat, nk=(3, 1, 1), has_compressed_q_dimension=False, beta=1.0)
+
+    assert np.array_equal(self_energy.pole_fit_mask(), [False, True, False])
+
+
+def test_pole_extrapolate_evaluates_the_fitted_poles_on_the_inner_target_frequencies(monkeypatch):
+    """pole_extrapolate fits every orbital pair without Sigma_inf, restores it and mirrors the negative frequencies."""
+    beta, x, hartree, niv = 10.0, -0.3, 1.5, 200
+    weight = np.array([[1.0, 0.5], [0.5, 2.0]])
+    vn = MFHelper.vn(niv, beta)
+    mat = (hartree + weight[..., None] / (1j * vn - x))[None, None, None]
+    self_energy = _se(mat, nk=(1, 1, 1), has_compressed_q_dimension=False, beta=beta)
+    patch_mini_pole_with_exact_single_pole_fit(monkeypatch, x)
+
+    reference = self_energy.interpolate(2.0 * beta, niv)
+    values, accepted = self_energy.pole_extrapolate(2.0 * beta, niv, np.array([0]), reference)
+
+    target_vn = MFHelper.vn(niv, 2.0 * beta)
+    inner = np.abs(target_vn) < vn[niv]
+    expected = hartree + weight[..., None] / (1j * target_vn[inner] - x)
+    n_pos = inner.sum() // 2
+    assert values.shape == (1, 2, 2, inner.sum())
+    assert np.array_equal(accepted, [True])
+    assert np.allclose(values[0], expected, atol=1e-6)
+    assert np.allclose(values[0, ..., :n_pos], np.conj(np.swapaxes(values[0, ..., n_pos:], 0, 1))[..., ::-1])
+
+
+def test_pole_extrapolate_removes_the_static_part_per_momentum(monkeypatch):
+    """pole_extrapolate subtracts each momentum's own Sigma_inf, so a k-dependent static part leaves no residual."""
+    beta, x, niv = 10.0, -0.3, 200
+    hartree = np.array([1.5, 2.5])
+    weight = np.array([[1.0, 0.5], [0.5, 2.0]])
+    vn = MFHelper.vn(niv, beta)
+    mat = hartree[:, None, None, None] + (weight[..., None] / (1j * vn - x))[None]
+    self_energy = _se(mat, nk=(2, 1, 1), has_compressed_q_dimension=True, beta=beta)
+    patch_mini_pole_with_exact_single_pole_fit(monkeypatch, x)
+
+    reference = self_energy.interpolate(2.0 * beta, niv)
+    values, accepted = self_energy.pole_extrapolate(2.0 * beta, niv, np.array([0, 1]), reference)
+
+    target_vn = MFHelper.vn(niv, 2.0 * beta)
+    inner = np.abs(target_vn) < vn[niv]
+    expected = hartree[:, None, None, None] + (weight[..., None] / (1j * target_vn[inner] - x))[None]
+    assert np.array_equal(accepted, [True, True])
+    assert np.allclose(values, expected, atol=1e-6)
+
+
+def test_pole_extrapolate_rejects_upper_half_plane_poles_failed_fits_and_implausible_values(monkeypatch):
+    """pole_extrapolate rejects a momentum on an upper-half-plane pole, a failed fit or an implausible value."""
+    self_energy = _build_linear_self_energy(niv_value=6, beta_value=1.0, has_compressed_q_dimension=False)
+    fits = [
+        SimpleNamespace(pole_location=np.array([-0.2 + 0.1j]), pole_weight=np.array([[[1.0]]])),
+        Exception("Could not find controlled approximation!"),
+        SimpleNamespace(pole_location=np.array([-0.2 + 0.0j]), pole_weight=np.array([[[50.0]]])),
+    ]
+    mini_pole = MagicMock(side_effect=[fits[0]] * 4 + [fits[1]] * 4 + [fits[2]] * 4)
+    mini_pole.cal_G_vector = self_energy_module.MiniPole.cal_G_vector
+    monkeypatch.setattr(self_energy_module, "MiniPole", mini_pole)
+    reference = self_energy.interpolate(2.0, 6)
+
+    values, accepted = self_energy.pole_extrapolate(2.0, 6, np.array([0, 0, 0]), reference)
+
+    assert np.array_equal(accepted, [False, False, False])
+    assert np.allclose(values[:2], 0.0)
+    assert not np.allclose(values[2], 0.0)
+
+
+def test_pole_extrapolate_accepts_a_noisy_non_causal_three_pole_self_energy_with_the_real_mini_pole():
+    """pole_extrapolate with the real MiniPole accepts a noisy non-causal three-pole Sigma close to the exact value."""
+    beta, niv = 20.0, 150
+    poles = np.array([-0.392 - 0.19j, 1.983 - 0.365j, 17.783 - 37.723j])
+    weights = np.array([0.119 + 0.183j, 2.517 - 0.529j, -0.43 + 0.977j])
+    exact = lambda z: 1.3577 + np.sum(weights[:, None] / (np.atleast_1d(z)[None, :] - poles[:, None]), axis=0)
+    vn = MFHelper.vn(niv, beta)
+    rng = np.random.default_rng(1)
+    positive = exact(1j * vn[niv:]) + 1e-3 * (rng.standard_normal(niv) + 1j * rng.standard_normal(niv))
+    signal = np.concatenate((np.conj(positive[::-1]), positive))
+    self_energy = _se(signal[None, None, None, None, None], nk=(1, 1, 1), has_compressed_q_dimension=False, beta=beta)
+    reference = self_energy.interpolate(25.0, niv)
+
+    values, accepted = self_energy.pole_extrapolate(25.0, niv, np.array([0]), reference)
+
+    nu_target = MFHelper.vn(niv, 25.0)[niv]
+    assert self_energy.pole_fit_mask()[0]
+    assert np.array_equal(accepted, [True])
+    assert abs(values[0, 0, 0, 1] - exact(1j * nu_target)[0]) < 3e-2
+    assert np.allclose(values[0, 0, 0, 0], np.conj(values[0, 0, 0, 1]))
+
+
+def test_replace_innermost_overwrites_only_the_central_frequencies_of_the_given_momenta():
+    """replace_innermost writes the values into the innermost frequencies of the selected momenta and nothing else."""
+    self_energy = _se(np.zeros((2, 2, 1, 2, 2, 8), dtype=complex), nk=(2, 2, 1), has_compressed_q_dimension=False)
+    values = np.arange(1, 17, dtype=complex).reshape(1, 2, 2, 4)
+
+    result = self_energy.replace_innermost(np.array([3]), values)
+
+    assert result is self_energy
+    assert np.array_equal(self_energy.mat[1, 1, 0, :, :, 2:6], values[0])
+    assert np.count_nonzero(self_energy.mat) == 16
+
+
+def _branch_signal(vn: np.ndarray, im_offset: float, im_slope: float) -> np.ndarray:
+    """Even real part; Im = im_offset + im_slope * |nu| on the positive branch, mirrored (odd) below nu = 0."""
+    return (2.5 + 0.125 * np.abs(vn)) + 1j * np.sign(vn) * (im_offset + im_slope * np.abs(vn))
+
+
+def _build_branch_self_energy(
+    niv_value: int, beta_value: float, im_offset: float, im_slope: float, has_compressed_q_dimension: bool = False
+) -> SelfEnergy:
+    signal = _branch_signal(MFHelper.vn(niv_value, beta_value), im_offset, im_slope)
+    shape = (1, 2, 2, signal.size) if has_compressed_q_dimension else (1, 1, 1, 2, 2, signal.size)
+    mat = np.broadcast_to(signal, shape).copy()
+    return _se(mat, nk=(1, 1, 1), has_compressed_q_dimension=has_compressed_q_dimension, beta=beta_value)
+
+
 def _build_linear_self_energy(niv_value: int, beta_value: float, has_compressed_q_dimension: bool) -> SelfEnergy:
     vn = MFHelper.vn(niv_value, beta_value)
     signal = (2.5 + 0.125 * vn) + 1j * (-1.5 + 0.25 * vn)
@@ -326,6 +497,51 @@ def test_fit_smom_concatenated_is_bit_identical_to_the_full_concatenation_fit(ni
     ref0, ref1 = core.copy().concatenate_self_energies(shell).smom
     mom0, mom1 = core.fit_smom_concatenated(shell)
     assert np.array_equal(mom0, ref0) and np.array_equal(mom1, ref1)
+
+
+def _offset_setup(seed, niv_core=3, niv_shell=8, nk_odd=(3, 2, 1)):
+    """Builds (core, shell, offset): a compressed core, a momentum-local shell donor and a [q, o1, o2] constant."""
+    rng = np.random.default_rng(seed)
+    nq = int(np.prod(nk_odd))
+    core_mat = (rng.standard_normal((nq, 2, 2, 2 * niv_core)) * 0.1 + 0.3j).astype(np.complex64)
+    shell_mat = (rng.standard_normal((1, 1, 1, 2, 2, 2 * niv_shell)) * 0.1 + 0.2j).astype(np.complex64)
+    offset = rng.standard_normal((nq, 2, 2))
+    return _se(core_mat, nk=nk_odd, has_compressed_q_dimension=True), _se(shell_mat, nk=(1, 1, 1)), offset
+
+
+def test_concatenate_self_energies_adds_the_shell_offset_outside_the_core_only():
+    """A [q, o1, o2] shell offset is added to the donor's shell frequencies and leaves the core untouched."""
+    core, shell, offset = _offset_setup(8)
+    plain = core.copy().concatenate_self_energies(shell)
+    result = core.copy().concatenate_self_energies(shell, shell_offset=offset)
+    niv_diff = shell.niv - core.niv
+    expected = plain.mat.copy()
+    expected[..., :niv_diff] += offset[..., None]
+    expected[..., niv_diff + 2 * core.niv :] += offset[..., None]
+    assert np.allclose(result.mat, expected, atol=1e-6)
+    assert np.array_equal(result.mat[..., niv_diff : niv_diff + 2 * core.niv], core.mat)
+
+
+def test_fit_smom_concatenated_with_shell_offset_is_bit_identical_to_the_offset_concatenation_fit():
+    """fit_smom_concatenated with a shell offset equals the offset concatenation's own moment fit bit-for-bit."""
+    core, shell, offset = _offset_setup(9)
+    ref0, ref1 = core.copy().concatenate_self_energies(shell, shell_offset=offset).smom
+    mom0, mom1 = core.fit_smom_concatenated(shell, shell_offset=offset)
+    assert np.array_equal(mom0, ref0) and np.array_equal(mom1, ref1)
+
+
+@pytest.mark.parametrize("compressed", [True, False])
+def test_shell_offset_from_recovers_the_constant_carried_in_the_shell(compressed):
+    """shell_offset_from reads the [q, o1, o2] constant of the outermost frequency back from either momentum layout."""
+    core, shell, offset = _offset_setup(10)
+    carrier = core.copy().concatenate_self_energies(shell, shell_offset=offset)
+    big_mat = (np.random.default_rng(11).standard_normal((1, 1, 1, 2, 2, 2 * 12)) * 0.1).astype(np.complex64)
+    big_mat[..., 12 - shell.niv : 12 + shell.niv] = shell.mat
+    big = _se(big_mat, nk=(1, 1, 1))
+    if not compressed:
+        carrier = carrier.decompress_q_dimension()
+    assert np.allclose(carrier.shell_offset_from(big), offset, atol=1e-6)
+    assert np.allclose(shell.shell_offset_from(big), 0.0)
 
 
 def test_fit_smom_concatenated_raises_for_smaller_shell():
