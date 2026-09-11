@@ -109,7 +109,7 @@ class ConfigParser:
         conf.niw_core = self._try_parse(section, "niw_core", conf.niw_core)
         conf.niv_core = self._try_parse(section, "niv_core", conf.niv_core)
         conf.niv_shell = self._try_parse(section, "niv_shell", conf.niv_shell)
-        if conf.niv_shell <= 0:
+        if conf.niv_shell != -1 and conf.niv_shell <= 0:
             config.logger.info(f"'niv_shell' is set to {conf.niv_shell}. No asymptotics will be used.")
             conf.niv_shell = 0
         conf.niv_full = conf.niv_core + conf.niv_shell
