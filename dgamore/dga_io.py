@@ -107,9 +107,14 @@ def load_from_dmft_file_and_update_config() -> (
     config.output.output_path = uniquify_path(os.path.join(config.output.output_path, output_format))
     config.output.plotting_path = os.path.join(config.output.output_path, config.output.plotting_subfolder_name)
     config.output.eliashberg_path = os.path.join(config.output.output_path, config.eliashberg.subfolder_name)
+    config.output.sigma_iterates_path = os.path.join(
+        config.output.output_path, config.output.sigma_iterates_subfolder_name
+    )
 
     if not os.path.exists(config.output.output_path):
         os.makedirs(config.output.output_path)
+    if not os.path.exists(config.output.sigma_iterates_path):
+        os.makedirs(config.output.sigma_iterates_path)
     if not os.path.exists(config.output.plotting_path) and config.output.do_plotting:
         os.makedirs(config.output.plotting_path)
     if not os.path.exists(config.output.eliashberg_path) and config.eliashberg.perform_eliashberg:

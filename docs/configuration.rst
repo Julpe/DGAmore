@@ -123,17 +123,20 @@ the previous one - taken over the full momentum grid, all orbital combinations a
 frequencies of the core box (reported in the log every iteration). The chemical potential must also settle,
 changing by less than a small temperature-dependent threshold between iterations.
 
-The ``mixing`` parameter is a floating-point number between zero and one that sets the weight of the new
-self-energy in the update. The accompanying ``mixing_strategy`` selects between ``linear``, ``pulay`` and
-``anderson`` mixing; the latter two build a secant model from the last ``mixing_history_length`` pairs of an
-iterate and the un-mixed self-energy the Schwinger-Dyson map produced from it, collected in memory as the run
-iterates, and mix linearly for the first ``mixing_history_length`` iterations while those pairs accumulate. The
-``previous_sc_path`` field points to the folder of an earlier, possibly unconverged, self-consistency run: the
-code then resumes from its last iteration and chemical potential and continues converging; the accelerated
-schemes rebuild their history during the resumed run's first iterations, since the saved per-iteration files hold
-only the already-mixed self-energies. Enabling ``use_interpolated_sigma`` makes the cycle start from the
-interpolated self-energy of the previous run, with the interpolation itself configured in the
-:ref:`self-energy interpolation section <self-energy-interpolation>`.
+The ``mixing`` parameter is a floating-point number between zero and one that sets the weight of the new self-energy
+in the update. The accompanying ``mixing_strategy`` selects between ``linear``, ``pulay`` and ``anderson`` mixing; the
+latter two build a secant model from the last ``mixing_history_length`` pairs of an iterate and the un-mixed
+self-energy the Schwinger-Dyson map produced from it, collected in memory as the run iterates, and mix linearly for
+the first ``mixing_history_length`` iterations while those pairs accumulate. The ``previous_sc_path`` field points to
+the folder (``LDGA_...``) of an earlier, possibly unconverged, self-consistency run: the code then resumes from the
+last iteration found in its ``Sigma_Iterates`` subfolder (or in the run folder itself for older runs) and from its
+chemical potential, and continues converging. Every iteration also writes the un-mixed proposal
+(``sigma_dga_proposal_iteration_<i>.npy``) next to the mixed self-energy. The resumed run rebuilds the
+accelerated-mixing history from scratch, mixing linearly for the first ``mixing_history_length`` iterations: the
+previous run's pairs sample a different map, and seeding a secant model with them lets the fit cancel the new residual
+and stall at the old solution. Enabling ``use_interpolated_sigma`` makes the cycle start from the interpolated
+self-energy of the previous run, with the interpolation itself configured in the :ref:`self-energy interpolation
+section <self-energy-interpolation>`.
 
 .. _stabilization:
 
@@ -149,6 +152,7 @@ work, what they have in common and when to reach for which is discussed on the :
      use_lambda_correction: False      # bool
      use_chi_phys_restriction: False   # bool
      use_lambda_annealing: False       # bool
+     use_jacobian_stabilization: False # bool
 
 Setting ``use_lambda_correction`` to ``True`` applies the lambda correction to the physical susceptibilities
 in every iteration of the cycle. The correction is dispatched by the band count (and the choice is logged):
@@ -161,6 +165,11 @@ below purely to stabilize convergence (it always corrects both channels). In bot
 the *uncorrected* self-consistent solution to the full ``epsilon``, so the corrected susceptibilities never enter
 the final result. It is independent of the one-shot ``perform_lambda_correction`` of the
 :ref:`lambda correction section <lambda-correction>`, which takes precedence when both are enabled.
+
+The per-iteration single-band search differs from the one-shot one in two points: it brackets the root inside the
+branch of the sum rule that is anchored at the static divergence bound and closed at the next pole above it, and it
+warm-starts from the previous iteration's :math:`\lambda`. The one-shot correction is unchanged by this. The reason
+is described on the :doc:`cooldown` page.
 
 The multi-band scheme mimics the scalar correction without being derived from it: instead of one scalar per channel
 it calibrates a full :math:`n_{\mathrm{o}}^2 \times n_{\mathrm{o}}^2` real-symmetric mass matrix
@@ -207,6 +216,30 @@ verdict that no stable physical fixed point was found. It is mutually exclusive 
 susceptibility-reshaping options - the lambda correction and ``use_chi_phys_restriction`` (the sum rule must not be
 calibrated on mass-shifted susceptibilities, and the two scaffolds would fight); if combined, a lambda correction
 or ``use_chi_phys_restriction`` takes precedence and the annealing scaffold is disabled with a warning.
+
+Setting ``use_jacobian_stabilization`` to ``True`` turns on :mod:`dgamore.jacobian_stabilization`: the cycle tracks
+the leading eigenvalues of the Jacobian of the self-energy map from its own (iterate, proposal) history at no extra
+proposal evaluation (a secant Rayleigh-Ritz estimate, refreshed every iteration), and stabilizes the physical fixed
+point by flipping the sign of the damping on the certified unstable eigendirections - the modified iteration of
+arXiv:2606.04936, Eqs. 25-26, built on Phys. Rev. Lett. doi:10.1103/zjy7-4jqd - reflecting the proposal residual on
+the unstable subspace before the configured mixing (linear, Pulay or Anderson) acts on it. The cycle also lowers the
+mixing parameter to the largest value the measured spectrum allows (arXiv:2606.04936 Eq. 13, with a safety factor),
+never above ``self_consistency.mixing``, on every damped step (linear mixing, and the warm-up and fallbacks of the
+accelerated schemes). An accelerated step is damped instead by the largest damping the flipped directions alone
+allow while a flip is in force, since a flipped direction is stable only under that bound, and it keeps its
+configured parameter without a flip, because a whole-spectrum bound describes the damped Picard iteration and not
+the damping of a quasi-Newton step. The estimate needs three recorded pairs, so the
+first steps of a cold run are taken at the configured ``mixing`` with nothing measured yet; a run started from a
+predecessor with the flag on carries that predecessor's spectrum in (``jacobian_spectrum.npz`` in its run folder)
+and starts with its damping and its flips, see the :ref:`cooldown procedure <cooldown-jacobian>`.
+The tracker follows at most six directions (the secant window it estimates from), so it addresses an instability
+carried by a few unstable modes; a post-divergence instability whose unstable directions form a band growing with
+the grid size (arXiv:2606.04936, appendix D.1) is beyond its reach.
+It composes with the three susceptibility-reshaping scaffolds above: monitoring runs throughout, flips are paused
+while a scaffold is active (the scaffolded map is not the physical map) and resume after its release. It is not
+compatible with the one-shot ``perform_lambda_correction`` of the :ref:`lambda correction section <lambda-correction>`
+(a single iteration has no history): if both are enabled, ``use_jacobian_stabilization`` is disabled automatically
+with a warning.
 
 .. _lambda-correction:
 

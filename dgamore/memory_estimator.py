@@ -39,6 +39,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from dgamore.jacobian_stabilization import TRACKER_PAIRS
+
 from dgamore.n_point_base import DTYPE
 
 # Bytes per stored element (from the global DTYPE, so it tracks a switch to e.g. complex128).
@@ -312,6 +314,33 @@ def _giwk_rspace(nk_tot: int, nb: int, nv: int) -> int:
     return nk_tot * nb**2 * nv
 
 
+def jacobian_tracker_bytes(nk_tot: int, nb: int, nv: int, mixing_history_length: int) -> int:
+    """
+    Bytes the rank-0 Jacobian tracker holds at its peak: ``3 * (max(m, TRACKER_PAIRS) + 1)`` complex core-window
+    arrays of the mixing history (iterate, raw proposal, reflected proposal per entry), the complex Ritz vectors of
+    up to two resident sets (``TRACKER_PAIRS - 1`` columns each: the snapshot kept for the spectrum file plus a
+    newer uncertified estimate; a carried run holds one more set, ``_carried_set``/``_pending``, until it is
+    installed or released) and the transient of one update, nine ``[n_real, TRACKER_PAIRS - 1]`` float64 arrays
+    with ``n_real = 2 * nk_tot * nb^2 * nv``. The secant step sets that count: the two increment stacks, the tall
+    QR factor together with the copies its factorization and the triangular solve make, the kept basis and its
+    image, and the complex Ritz vectors built from them, a real-to-complex promotion of the basis included. The
+    reflector build (the certified real columns, their pseudo-inverse and the flipped basis) stays below it.
+
+    :param nk_tot: Total number of momentum points (full BZ).
+    :param nb: Number of bands.
+    :param nv: Number of fermionic frequencies (single axis length).
+    :param mixing_history_length: The accelerated-mixing history length ``m``.
+    :return: The peak in bytes.
+    """
+    core = nk_tot * nb**2 * nv
+    history = 3 * (max(mixing_history_length, TRACKER_PAIRS) + 1) * DTYPE_BYTES * core
+    # two resident Ritz sets: the snapshot kept for the spectrum file plus a newer uncertified estimate (a carried
+    # run holds _carried_set/_pending on top of them until it is installed or released)
+    ritz_vectors = 2 * np.dtype(np.complex128).itemsize * 2 * core * (TRACKER_PAIRS - 1)
+    transient = 9 * np.dtype(np.float64).itemsize * 2 * core * (TRACKER_PAIRS - 1)
+    return history + ritz_vectors + transient
+
+
 def estimate_peaks(
     *,
     n_bands: int,
@@ -327,6 +356,8 @@ def estimate_peaks(
     with_eliashberg: bool,
     save_pairing_vertex: bool = False,
     n_eig: int = 1,
+    with_jacobian_tracker: bool = False,
+    mixing_history_length: int = 0,
     overhead: float = OVERHEAD_FACTOR,
     chunk_budgets: ChunkBudgets = ChunkBudgets(),
 ) -> dict[str, BranchPeak]:
@@ -371,6 +402,13 @@ def estimate_peaks(
         (``config.eliashberg.save_pairing_vertex``); a single-rank peak of the ``lanczos`` branch.
     :param n_eig: Number of requested eigenpairs (``config.eliashberg.n_eig``); sets the ARPACK Lanczos basis size
         ``ncv = max(2 * n_eig + 1, 20)`` held per solving rank.
+    :param with_jacobian_tracker: Whether the Jacobian tracker runs
+        (``config.stabilization.use_jacobian_stabilization``); adds its rank-0 peak to the ``sde`` single-rank
+        slots: the (iterate, raw proposal, reflected proposal) triples of the core window kept for
+        ``max(mixing_history_length, TRACKER_PAIRS) + 1`` entries and the float64 secant transient (the increments,
+        the kept basis and its image, ``TRACKER_PAIRS - 1`` columns each).
+    :param mixing_history_length: The accelerated-mixing history length
+        (``config.self_consistency.mixing_history_length``).
     :param overhead: Global multiplicative factor accounting for un-modeled transient arrays.
     :param chunk_budgets: Chunk byte budgets of the three chunked builds (see :class:`ChunkBudgets` and
         :func:`max_chunk_budget`); each modeled chunk is clamped to at least one slice of its build (a ``(q, w)``
@@ -461,6 +499,8 @@ def estimate_peaks(
     # rank-0 single: the sigma finalize buffers, or the occupation/energy step's DMFT-box sigma + giwk pair
     # (its concatenation and Dyson-build transients are broadcast-assigned and v-chunked, so only the pair counts)
     sde_single = scale * max(2 * _giwk_rspace(nk_tot, nb, vc), 2 * _giwk_rspace(nk_tot, nb, 2 * niv_dmft))
+    if with_jacobian_tracker:
+        sde_single += overhead * jacobian_tracker_bytes(nk_tot, nb, vc, mixing_history_length)
     peaks["sde"] = BranchPeak(
         baseline=baseline_sde + rank_base,
         giwk_shareable=2 * giwk_sde,

@@ -473,3 +473,22 @@ def test_dynamic_chunk_budget_scales_floors_and_caps():
     assert floor < mid < cap
     assert dynamic_chunk_budget(total_bytes=4000 * 2**30, node_ranks=2) == cap
     assert dynamic_chunk_budget(total_bytes=600 * 2**30, node_ranks=48) == 2 * mid
+
+
+def test_sde_single_adds_the_jacobian_tracker_term():
+    """The tracker flag adds its rank-0 history, its doubled ritz_vectors resident set and its transient to sde."""
+    from dgamore.jacobian_stabilization import TRACKER_PAIRS
+    from dgamore.memory_estimator import jacobian_tracker_bytes
+
+    off = _peaks(overhead=1.0)
+    on = _peaks(overhead=1.0, with_jacobian_tracker=True, mixing_history_length=3)
+    core = BASE["nk_tot"] * BASE["n_bands"] ** 2 * (2 * BASE["niv_core"])
+    history = 3 * (TRACKER_PAIRS + 1) * DTYPE_BYTES * core
+    ritz_vectors = 2 * np.dtype(np.complex128).itemsize * 2 * core * (TRACKER_PAIRS - 1)
+    transient = 9 * np.dtype(np.float64).itemsize * 2 * core * (TRACKER_PAIRS - 1)
+    extra = jacobian_tracker_bytes(BASE["nk_tot"], BASE["n_bands"], 2 * BASE["niv_core"], 3)
+    assert extra == pytest.approx(history + ritz_vectors + transient)
+    assert on["sde"].off_single == pytest.approx(off["sde"].off_single + extra)
+    assert on["sde"].on_single == pytest.approx(off["sde"].on_single + extra)
+    assert on["sde"].off_distributed == pytest.approx(off["sde"].off_distributed)
+    assert on["chiq_aux"].off_single == pytest.approx(off["chiq_aux"].off_single)
