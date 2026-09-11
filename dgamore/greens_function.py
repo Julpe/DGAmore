@@ -348,24 +348,80 @@ class GreensFunction(TwoPoint):
         r"""
         Computes the filling and occupation from the momentum-resolved Green's function, using the analytic
         density-matrix of the model (moment) Green's function plus the box correction to accelerate convergence.
+        Delegates to :meth:`get_fill_nonlocal_from_sigma`, i.e. the frequency sum is evaluated in bounded chunks
+        rebuilt from the self-energy in double precision (the held ``mat`` may be single precision), so no second
+        full-box ``[k, o, o, v]`` array is materialized.
 
         :return: A tuple of (i) the total filling :math:`n`, (ii) the k-averaged occupation (shape ``[o1, o2]``),
             and (iii) the k-resolved occupation (shape ``[kx, ky, kz, o1, o2]``).
         """
-        mat = self._get_gfull_mat()
-        g_model = self._get_g_model_k_mat()
-        smom0 = self._sigma.smom[0][None, None, None, ...]
+        self._n, self._occ, self._occ_k = GreensFunction.get_fill_nonlocal_from_sigma(
+            self._sigma, self._mu, self._ek, self._beta
+        )
+        return self._n, self._occ, self._occ_k
 
-        mu_bands: np.ndarray = self._mu * np.eye(self.n_bands)[None, None, None, ...]
+    @staticmethod
+    def get_fill_nonlocal_from_sigma(
+        siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float
+    ) -> tuple[float, np.ndarray, np.ndarray]:
+        r"""
+        Computes the k-resolved occupation :math:`n_{\mathbf{k}} = \rho_{\mathbf{k}} + \frac{1}{\beta}\sum_\nu
+        \mathrm{Re}[G^{\mathbf{k}} - G^{\mathbf{k}}_{\mathrm{mod}}]` (and the filling / k-averaged occupation derived
+        from it) directly from a self-energy, without ever holding the full momentum-dependent Green's function:
 
-        rho_k = _fermi_dirac_density(self._ek.real + smom0 - mu_bands, self._beta)
-        occ_k = rho_k + np.sum(mat.real - g_model.real, axis=-1) / self._beta
+        * the interacting part is built, inverted and frequency-summed in Dyson chunks of at most
+          ``_MODEL_EPOT_CHUNK_ELEMENTS`` elements (one inversion pass over the box),
+        * the model part :math:`G_{\mathrm{mod}} = [\imath\nu + \mu - \varepsilon_{\mathbf{k}} -
+          \Sigma_\infty]^{-1}` is summed analytically in the eigenbasis of :math:`\varepsilon_{\mathbf{k}} +
+          \Sigma_\infty` (one eigendecomposition per k instead of a second inversion pass).
+
+        Use this whenever only the filling is needed (e.g. for the starting self-energy on the full DMFT box); it
+        reports the same numbers as ``get_g_full(...).get_fill_nonlocal()``.
+
+        :param siw: The :class:`SelfEnergy` :math:`\Sigma` (momentum-local or full-k; decompressed in place).
+        :param mu: Chemical potential :math:`\mu`.
+        :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`, shape ``[kx, ky, kz, o1, o2]``.
+        :param beta: Inverse temperature :math:`\beta`.
+        :return: A tuple of the total filling :math:`n`, the k-averaged occupation ``[o1, o2]`` and the k-resolved
+            occupation ``[kx, ky, kz, o1, o2]``.
+        """
+        nk = ek.shape[:3]
+        nk_tot = int(np.prod(nk))
+        n_bands, niv = siw.n_bands, siw.niv
+        eye_bands = np.eye(n_bands, n_bands)
+        iv = 1j * MFHelper.vn(niv, beta)
+        smom0 = siw.smom[0]
+        mu_bands = mu * eye_bands
+
+        # in-box sum of the interacting G in double-precision Dyson chunks (a single-precision sigma is promoted)
+        static_bands = mu_bands[None, None, None, :, :, None] - ek[..., None]
+        sigma_mat = siw.decompress_q_dimension().mat
+        box_sum = np.zeros((*nk, n_bands, n_bands))
+        step = max(1, _MODEL_EPOT_CHUNK_ELEMENTS // (nk_tot * n_bands**2))
+        for start in range(0, 2 * niv, step):
+            stop = min(2 * niv, start + step)
+            dyson = (iv[start:stop][None, None, :] * eye_bands[..., None])[None, None, None, ...] + static_bands
+            dyson -= sigma_mat[..., start:stop]
+            box_sum += np.sum(GreensFunction._invert_last_orbital_block(dyson).real, axis=-1)
+
+        # in-box sum of the model G: sum_v G_mod = U diag(sum_v 1/(iv + mu - lambda)) U^-1 with h_k = eps_k + Sigma_inf
+        # = U diag(lambda) U^-1, evaluated in [k, band, v]-chunks; only the [k, o, o] result is rotated back
+        h = (ek + smom0[None, None, None]).reshape(nk_tot, n_bands, n_bands)
+        lam, u = np.linalg.eig(h)
+        u_inv = np.linalg.inv(u)
+        step = max(1, _MODEL_EPOT_CHUNK_ELEMENTS // (nk_tot * n_bands))
+        model_diag_sum = np.zeros((nk_tot, n_bands), dtype=np.complex128)
+        for start in range(0, 2 * niv, step):
+            model_diag_sum += (1.0 / (iv[None, None, start : start + step] + mu - lam[:, :, None])).sum(axis=-1)
+        box_sum -= ((u * model_diag_sum[:, None, :]) @ u_inv).real.reshape(*nk, n_bands, n_bands)
+
+        rho_k = _fermi_dirac_density(ek.real + smom0[None, None, None] - mu_bands[None, None, None], beta)
+        occ_k = rho_k + box_sum / beta
         occ_k.real[np.abs(occ_k) < 1e-12] = 0.0
 
         occ_mean = np.mean(occ_k, axis=(0, 1, 2))
         occ_mean.real[np.abs(occ_mean) < 1e-12] = 0.0
         n_el = 2.0 * np.trace(occ_mean).real
-        self._n, self._occ, self._occ_k = n_el, occ_mean, occ_k
         return n_el, occ_mean, occ_k
 
     def get_ekin(self) -> float:
@@ -468,18 +524,6 @@ class GreensFunction(TwoPoint):
         :return: The local Green's function array, shape ``[o1, o2, v]``.
         """
         return np.mean(self._get_gfull_mat(), axis=(0, 1, 2))
-
-    def _get_g_model_k_mat(self) -> np.ndarray:
-        """
-        Builds the k-resolved model Green's function from the zeroth self-energy moment and the band dispersion.
-        Subtracting it accelerates the Matsubara sum convergence when computing the k-resolved occupation.
-
-        :return: The k-resolved model Green's function array, shape ``[kx, ky, kz, o1, o2, v]``.
-        """
-        iv_bands, mu_bands = self._get_g_params_local()
-        smom0 = self._sigma.smom[0][None, None, None, ...]
-        mat = iv_bands[None, None, None] + mu_bands[None, None, None] - self._ek[..., None] - smom0[..., None]
-        return self._invert_last_orbital_block(mat)
 
     def _get_g_params_local(self):
         r"""

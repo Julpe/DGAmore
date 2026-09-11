@@ -246,6 +246,9 @@ class ConfigParser:
             section, "use_chi_phys_restriction", conf.use_chi_phys_restriction
         )
         conf.use_lambda_annealing = self._try_parse(section, "use_lambda_annealing", conf.use_lambda_annealing)
+        conf.use_jacobian_stabilization = self._try_parse(
+            section, "use_jacobian_stabilization", conf.use_jacobian_stabilization
+        )
 
         return conf
 

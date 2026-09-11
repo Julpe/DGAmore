@@ -35,6 +35,11 @@ stabilization:
   use_lambda_annealing: False # If True, protects the cycle with the lambda-annealing scaffold: a bosonic mass (measured automatically from the susceptibility
   # spectrum) is added to 1/chi per channel, held constant per convergence phase and halved between phases until it is exactly zero - the final result is always
   # pure self-consistency. Multi-orbital-safe, like the matrix lambda correction (with which it must not be combined).
+  use_jacobian_stabilization: False # If True, tracks the leading Jacobian eigenvalues of the self-energy map from the cycle's own (iterate, proposal) history
+  # (no extra proposal evaluation) and flips the sign of the damping on the certified unstable eigendirections; it also lowers the mixing parameter to what the
+  # measured spectrum allows (never above self_consistency.mixing) on damped steps and while a flip is in force. Composes with the three scaffolds above; disabled if perform_lambda_correction is on.
+  # A run started from a previous one with the flag on carries that run's certified spectrum in (its
+  # jacobian_spectrum.npz).
 
 lambda_correction:
   perform_lambda_correction: False # If True, the code will perform a one-shot DGA with lambda correction: max_iter is overridden to 1 and mixing to 1.0. Dispatched by the
@@ -88,5 +93,3 @@ ana_cont:
   # for the plot of the spectral function. The format is a list of lists, where each sub-list contains the 3d k-point in
   # fractional coordinates in the primitive (not conventional!) k-space basis, and the label for the plot.
   energy_window: [ -2, 3 ] # Energy window for the plot of the spectral function in eV.
-
-  # shared-memory windows (computed only by the node's first rank)

@@ -27,6 +27,7 @@ import os
 
 import numpy as np
 from mpi4py import MPI
+from scipy import optimize as opt
 
 from dgamore import config
 from dgamore.four_point import FourPoint
@@ -41,7 +42,16 @@ class LambdaCorrection:
     single constant :math:`\lambda` (per channel) so its momentum sum matches the corresponding local sum rule.
     Single-band only, since a multi-orbital correction would be a non-unique multidimensional problem. All methods
     are stateless (the sum-rule targets and the determined :math:`\lambda` are read/written from files/config).
+
+    The one-shot correction searches :math:`\lambda` with a Newton iteration started just above the static
+    divergence bound (:meth:`find_lambda`). The per-iteration correction of the self-consistency loop brackets the
+    root inside the branch anchored at that same bound (:meth:`get_lambda_branch`) and warm-starts the bracket from
+    the previous iteration's value (:meth:`find_lambda_bounded`).
     """
+
+    _BRACKET_OFFSET = 1e-6  # relative offset of each bracket end inside the branch
+    _MAX_BRACKET_DOUBLINGS = 60  # doublings of the open upper end's distance from the lower one before giving up
+    _BRACKET_SCAN_POINTS = 64  # equal steps scanned across a closed branch whose upper end has no sign change
 
     @staticmethod
     def get_lambda_start(chi_r: np.ndarray) -> float:
@@ -56,6 +66,27 @@ class LambdaCorrection:
         """
         w0 = chi_r.shape[-1] // 2
         return -np.min(1.0 / chi_r[..., w0].real)
+
+    @staticmethod
+    def get_lambda_branch(chi_r: np.ndarray) -> tuple[float, float]:
+        r"""
+        Returns the interval of :math:`\lambda` that carries the physical root of the sum-rule function
+        :math:`\sum_{\mathrm{q}} (1/\chi^{\mathrm{q}}_{r} + \lambda)^{-1}`. It is anchored at the static bound
+        of :meth:`get_lambda_start`, which lies above every pole of the :math:`\omega = 0` slice and therefore
+        keeps the corrected static susceptibility positive at every momentum, and it is closed at the next pole
+        above that bound. Every entry of the susceptibility contributes a pole at :math:`-1/\chi`, and only the
+        entries with a negative real part place theirs above the static bound, at any bosonic frequency; the branch
+        stays open upward when none does. It spans the same values as the one-shot Newton search whenever no
+        negative entry sits above the static bound.
+
+        :param chi_r: Physical susceptibility in the irreducible BZ with a trailing bosonic frequency axis,
+            shape ``[q, w]``.
+        :return: A tuple of (i) the static bound anchoring the branch and (ii) the next pole above it, infinite
+            when no entry places one there.
+        """
+        lower = float(LambdaCorrection.get_lambda_start(chi_r))
+        poles = -1.0 / chi_r.real[chi_r.real < 0.0]
+        return lower, float(np.min(poles, initial=np.inf, where=poles > lower))
 
     @staticmethod
     def apply_lambda(chi_r: np.ndarray, lambda_: float) -> np.ndarray:
@@ -115,7 +146,107 @@ class LambdaCorrection:
         return lambda_
 
     @staticmethod
-    def perform_single(chi_r: FourPoint, chi_r_loc_sum: complex) -> tuple[FourPoint, float]:
+    def find_lambda_bounded(
+        chi_r_mat: np.ndarray,
+        chi_r_loc_sum: complex,
+        lambda_previous: float | None = None,
+        delta: float = 0.1,
+        eps: float = 1e-7,
+    ) -> float:
+        r"""
+        Finds :math:`\lambda` such that the momentum-summed corrected susceptibility matches the local sum
+        ``chi_r_loc_sum``, searching inside the branch of :meth:`get_lambda_branch`. The sum-rule residual falls
+        off from the static bound the branch is anchored at, so the root is bracketed and solved with Brent's
+        method instead of with a Newton iteration that can step across a pole. Both bracket ends sit a relative
+        ``1e-6`` inside the branch; a ``lambda_previous`` inside the branch halves the bracket, and an upper end
+        left open by an everywhere-positive susceptibility is moved outward by doubling its distance from the lower
+        end until the residual turns negative. A closed upper end whose residual is not negative - the imaginary
+        part of the susceptibility softens the pole there into a feature that can be wider than the branch - is
+        replaced by the first of ``64`` equal steps across the branch that is. The residual is evaluated in double
+        precision, in which the near-pole ends are resolved.
+
+        :param chi_r_mat: Physical susceptibility in the irreducible BZ, shape ``[q, w]``.
+        :param chi_r_loc_sum: Target value: the local susceptibility sum (already divided by :math:`\beta`).
+        :param lambda_previous: The previous iteration's :math:`\lambda`, which halves the bracket when it lies
+            inside the branch.
+        :param delta: Offset above the lower end of the branch for the initial open upper end and for the returned
+            value when the residual has no sign change on the branch.
+        :param eps: Absolute tolerance on :math:`\lambda`.
+        :return: The :math:`\lambda` solving the sum rule inside the branch; when the residual has no sign
+            change there, ``lambda_previous`` when it lies inside the bracket, else the branch midpoint on a
+            closed branch or the anchoring bound plus ``delta`` on an open one; or the last upper end when an
+            open branch never closes (all three log a warning).
+        """
+        chi_r_mat = chi_r_mat.astype(np.complex128, copy=False)
+        lambda_lo, lambda_hi = LambdaCorrection.get_lambda_branch(chi_r_mat)
+        factor = 1 / config.sys.beta / config.lattice.k_grid.nk_tot
+        offset = LambdaCorrection._BRACKET_OFFSET
+
+        def residual(lambda_: float) -> float:
+            chi_lam = LambdaCorrection.apply_lambda(chi_r_mat, lambda_)
+            return ((config.lattice.k_grid.irrk_count[:, None] * chi_lam).sum() * factor - chi_r_loc_sum).real
+
+        lower = lambda_lo + offset * max(1.0, abs(lambda_lo))
+        upper = np.inf if np.isinf(lambda_hi) else lambda_hi - offset * max(1.0, abs(lambda_hi))
+        branch_lower, branch_upper = lower, upper
+
+        if lambda_previous is not None and lower < lambda_previous < upper:
+            if residual(lambda_previous) > 0.0:
+                lower = lambda_previous
+            else:
+                upper = lambda_previous
+
+        if np.isinf(upper):
+            upper = max(lower, lambda_lo + delta)
+            for _ in range(LambdaCorrection._MAX_BRACKET_DOUBLINGS):
+                if residual(upper) < 0.0:
+                    break
+                upper = lambda_lo + 2.0 * (upper - lambda_lo)
+            else:
+                config.logger.warning("Lambda correction could not bracket the sum-rule root inside the branch.")
+                return upper
+        elif residual(upper) >= 0.0:
+            scan = np.linspace(lower, upper, LambdaCorrection._BRACKET_SCAN_POINTS)
+            upper = next((trial for trial in scan if residual(trial) < 0.0), lower)
+
+        if upper <= lower or residual(lower) <= 0.0:
+            if lambda_previous is not None and branch_lower < lambda_previous < branch_upper:
+                fallback, which = lambda_previous, f"the previous iteration's lambda {lambda_previous:.6f}"
+            elif np.isinf(branch_upper):
+                fallback, which = lambda_lo + delta, "the lower end plus delta"
+            else:
+                midpoint = 0.5 * (branch_lower + branch_upper)
+                fallback = min(lambda_lo + delta, midpoint)
+                which = "the branch midpoint" if fallback == midpoint else "the lower end plus delta"
+            config.logger.warning(
+                f"Lambda correction found no sum-rule root on the branch ({lambda_lo:.6f}, {lambda_hi:.6f}); "
+                f"keeping {which}."
+            )
+            return fallback
+
+        return float(opt.brentq(residual, lower, upper, xtol=eps))
+
+    @staticmethod
+    def _warm_start_suffix(lambda_previous: dict | None, channel: SpinChannel) -> str:
+        r"""
+        Returns the log line's suffix naming the warm start the bracketed search was seeded with, or an empty string
+        when the Newton search ran.
+
+        :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, keyed by the channel
+            value, or ``None`` for the one-shot correction.
+        :param channel: Spin channel of the object (see :class:`SpinChannel`).
+        :return: The suffix appended to the determined-lambda log line.
+        """
+        if lambda_previous is None:
+            return ""
+        previous = lambda_previous.get(channel.value)
+        start = "none" if previous is None else f"{previous:.6f}"
+        return f" (bounded, warm start from {start})"
+
+    @staticmethod
+    def perform_single(
+        chi_r: FourPoint, chi_r_loc_sum: complex, lambda_previous: dict | None = None
+    ) -> tuple[FourPoint, float]:
         r"""
         Performs the :math:`\lambda`-correction on the physical susceptibility for a single spin channel. Only
         works for single-band systems, since a multi-orbital correction would be a non-unique multidimensional
@@ -123,17 +254,26 @@ class LambdaCorrection:
 
         :param chi_r: Physical (single-band) susceptibility in the irreducible BZ.
         :param chi_r_loc_sum: Target local susceptibility sum (already divided by :math:`\beta`).
+        :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, keyed by the channel
+            value: when given, :meth:`find_lambda_bounded` runs warm-started with this channel's entry and writes
+            the determined :math:`\lambda` back into the dict; ``None`` runs :meth:`find_lambda`.
         :return: A tuple of (i) the corrected susceptibility in the irreducible BZ and half bosonic frequency
             range, and (ii) the determined :math:`\lambda`.
         """
         chi_r = chi_r.to_full_niw_range()
         chi_r_mat = chi_r.compress_q_dimension().mat.squeeze()
-        lambda_r = LambdaCorrection.find_lambda(chi_r_mat, chi_r_loc_sum)
+        if lambda_previous is None:
+            lambda_r = LambdaCorrection.find_lambda(chi_r_mat, chi_r_loc_sum)
+        else:
+            lambda_r = LambdaCorrection.find_lambda_bounded(
+                chi_r_mat, chi_r_loc_sum, lambda_previous.get(chi_r.channel.value)
+            )
+            lambda_previous[chi_r.channel.value] = lambda_r
         chi_r.mat = LambdaCorrection.apply_lambda(chi_r_mat, lambda_r)[:, None, None, None, None, :]
         return chi_r.to_half_niw_range(), lambda_r
 
     @staticmethod
-    def perform(chi_phys_q_r: FourPoint, quiet: bool = False) -> FourPoint:
+    def perform(chi_phys_q_r: FourPoint, quiet: bool = False, lambda_previous: dict | None = None) -> FourPoint:
         r"""
         Performs the :math:`\lambda`-correction on the physical susceptibility. If 'spch' is specified, the lambda
         correction is performed on both the density and magnetic channel, whereas only the magnetic channel is
@@ -145,6 +285,9 @@ class LambdaCorrection:
         :param quiet: If ``True``, the determined :math:`\lambda` is not appended to the lambda text file. Note the
             'sp' type reads the *saved* density susceptibility from file, so quiet evaluations use the last
             really-saved one.
+        :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, keyed by the channel
+            value: when given, the correction uses the bracketed search of :meth:`find_lambda_bounded`, warm-started
+            from this dict and written back into it; ``None`` uses the Newton search of :meth:`find_lambda`.
         :return: The :math:`\lambda`-corrected physical susceptibility (unchanged for 'sp' in non-magnetic
             channels).
         :raises ValueError: If the configured lambda-correction type is neither 'spch' nor 'sp'.
@@ -163,13 +306,14 @@ class LambdaCorrection:
                 chi_phys_q_r.channel,
                 num_vn_dimensions=0,
             ).to_full_niw_range()
+            suffix = LambdaCorrection._warm_start_suffix(lambda_previous, chi_phys_q_r.channel)
             chi_phys_q_r, lambda_r = LambdaCorrection.perform_single(
-                chi_phys_q_r, chi_r_loc.mat.sum() / config.sys.beta
+                chi_phys_q_r, chi_r_loc.mat.sum() / config.sys.beta, lambda_previous
             )
             chi_r_loc.free()
             logger.info(
                 f"Lambda correction for the {chi_phys_q_r.channel.value} channel applied with lambda = "
-                f"{lambda_r:.6f}."
+                f"{lambda_r:.6f}.{suffix}"
             )
 
             if not quiet:
@@ -203,8 +347,11 @@ class LambdaCorrection:
         chi_magn_loc_sum = (chi_dens_loc.mat + chi_magn_loc.mat).sum() - 1 / config.lattice.k_grid.nk_tot * (
             config.lattice.k_grid.irrk_count[:, None, None, None, None, None] * chi_phys_q_dens.mat
         ).sum()
-        chi_phys_q_r, lambda_r = LambdaCorrection.perform_single(chi_phys_q_r, chi_magn_loc_sum / config.sys.beta)
-        logger.info(f"Lambda correction 'sp' applied. Lambda for magn channel is: {lambda_r:.6f}.")
+        suffix = LambdaCorrection._warm_start_suffix(lambda_previous, chi_phys_q_r.channel)
+        chi_phys_q_r, lambda_r = LambdaCorrection.perform_single(
+            chi_phys_q_r, chi_magn_loc_sum / config.sys.beta, lambda_previous
+        )
+        logger.info(f"Lambda correction 'sp' applied. Lambda for magn channel is: {lambda_r:.6f}.{suffix}")
 
         if not quiet:
             with open(os.path.join(config.output.output_path, f"lambda_{config.lambda_correction.type}.txt"), "a") as f:

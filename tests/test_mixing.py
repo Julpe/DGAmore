@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+from dgamore.jacobian_stabilization import JacobianTracker, to_mat, to_vec
 from dgamore.self_energy import SelfEnergy
 from dgamore.nonlocal_sde import apply_mixing_strategy
 
@@ -32,9 +33,29 @@ def make_sigma_mat(value: complex, nk: tuple[int, int, int] = NK, nb: int = NB, 
     return np.full((*nk, nb, nb, 2 * niv), value, dtype=np.complex64)
 
 
-def make_pairs(values: list[tuple[complex, complex]]) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Builds a mixing history of (iterate, proposal) pairs from constant fill-value tuples, oldest first."""
-    return [(make_sigma_mat(x), make_sigma_mat(f)) for x, f in values]
+def make_pairs(
+    values: list[tuple[complex, complex]], nk: tuple[int, int, int] = NK
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Builds a mixing history of (iterate, raw proposal, used proposal) triples from fill values, oldest first."""
+    entries = []
+    for x, f in values:
+        proposal = make_sigma_mat(f, nk=nk)
+        entries.append((make_sigma_mat(x, nk=nk), proposal, proposal))
+    return entries
+
+
+def make_flip_basis() -> np.ndarray:
+    """Returns a normalized single-column real basis of one direction of the vectorized core window."""
+    direction = np.arange(2 * NIV_CORE, dtype=np.complex64).reshape(*NK, NB, NB, 2 * NIV_CORE) + 1.0j
+    vec = to_vec(direction)
+    return (vec / np.linalg.norm(vec))[:, None]
+
+
+def reflect_by_hand(q: np.ndarray, iterate: np.ndarray, proposal: np.ndarray) -> np.ndarray:
+    """Reflects the residual of a proposal on the subspace spanned by q, without going through the tracker."""
+    x = to_vec(iterate)
+    residual = to_vec(proposal) - x
+    return to_mat(x + (residual - 2.0 * q @ (q.T @ residual)), proposal.shape).astype(proposal.dtype)
 
 
 def make_config_mock(strategy: str = "linear", mixing: float = 0.5, n_hist: int = 3, niv_core: int = NIV_CORE):
@@ -63,9 +84,10 @@ def run_pulay(
     mixing: float = 0.5,
     n_hist: int = 3,
     niv_core: int = NIV_CORE,
+    tracker: JacobianTracker | None = None,
 ) -> SelfEnergy:
     with patch_config(strategy="pulay", mixing=mixing, n_hist=n_hist, niv_core=niv_core):
-        return apply_mixing_strategy(sigma_new, sigma_old, mixing_history=list(history_pairs))
+        return apply_mixing_strategy(sigma_new, sigma_old, mixing_history=list(history_pairs), tracker=tracker)
 
 
 def run_anderson(
@@ -75,12 +97,13 @@ def run_anderson(
     mixing: float = 0.5,
     n_hist: int = 3,
     niv_core: int = NIV_CORE,
+    tracker: JacobianTracker | None = None,
 ) -> SelfEnergy:
     with patch_config(strategy="anderson", mixing=mixing, n_hist=n_hist, niv_core=niv_core):
-        return apply_mixing_strategy(sigma_new, sigma_old, mixing_history=list(history_pairs))
+        return apply_mixing_strategy(sigma_new, sigma_old, mixing_history=list(history_pairs), tracker=tracker)
 
 
-def make_affine_history(j: float, fixed_point: complex, alpha: float, n_pairs: int):
+def make_affine_history(j: float, fixed_point: complex, alpha: float, n_pairs: int, nk: tuple[int, int, int] = NK):
     """Simulates linear-mixing iterations of the affine map S(x) = fp + j*(x - fp) and returns pairs, x_n, S(x_n)."""
     s = lambda x: fixed_point + j * (x - fixed_point)
     x = 0.0 + 0.0j
@@ -88,7 +111,7 @@ def make_affine_history(j: float, fixed_point: complex, alpha: float, n_pairs: i
     for _ in range(n_pairs):
         pairs.append((x, s(x)))
         x = alpha * s(x) + (1 - alpha) * x
-    return make_pairs(pairs), x, s(x)
+    return make_pairs(pairs, nk=nk), x, s(x)
 
 
 def test_linear_mixing_basic():
@@ -423,8 +446,7 @@ def test_accelerated_mixing_accepts_compressed_input():
     fixed_point = 2.0 + 1.0j
     alpha = 0.2
     nk = (2, 2, 1)
-    pairs, x_n, s_x_n = make_affine_history(j=0.5, fixed_point=fixed_point, alpha=alpha, n_pairs=3)
-    pairs = [(np.tile(x, (*nk, 1, 1, 1)), np.tile(f, (*nk, 1, 1, 1))) for x, f in pairs]
+    pairs, x_n, s_x_n = make_affine_history(j=0.5, fixed_point=fixed_point, alpha=alpha, n_pairs=3, nk=nk)
     sigma_new = make_sigma(s_x_n, nk=nk).compress_q_dimension()
     sigma_old = make_sigma(x_n, nk=nk).compress_q_dimension()
 
@@ -510,3 +532,201 @@ def test_history_cap_zero_still_records_the_pair():
 
     assert len(history) == 4
     assert np.allclose(history[-1][0], 1.0, atol=1e-6)
+
+
+def test_linear_mixing_records_pair_when_history_given():
+    """Linear mixing records its genuine pair too, with the used proposal being the raw one."""
+    history = []
+
+    with patch_config(strategy="linear", mixing=0.5):
+        apply_mixing_strategy(make_sigma(2.0), make_sigma(1.0), mixing_history=history)
+
+    assert len(history) == 1
+    assert history[0][2] is history[0][1]
+    assert np.allclose(history[0][0], 1.0, atol=1e-6)
+    assert np.allclose(history[0][1], 2.0, atol=1e-6)
+
+
+def test_no_tracker_keeps_raw_proposal_object():
+    """Without a tracker the recorded used proposal is the raw proposal object itself, not a copy."""
+    history = []
+
+    with patch_config(strategy="anderson", mixing=0.5, n_hist=3):
+        apply_mixing_strategy(make_sigma(2.0), make_sigma(1.0), mixing_history=history)
+
+    assert history[-1][2] is history[-1][1]
+
+
+def test_recorded_proposal_used_is_reflected_when_tracker_active():
+    """An active tracker makes the recorded used proposal the reflected one, and linear mixing mixes that one."""
+    q = make_flip_basis()
+    tracker = JacobianTracker(p_config=0.5)
+    tracker.q = q
+    history = []
+
+    with patch_config(strategy="linear", mixing=0.5):
+        result = apply_mixing_strategy(make_sigma(2.0 + 1.0j), make_sigma(1.0), mixing_history=history, tracker=tracker)
+
+    iterate, raw, used = history[-1]
+    expected = reflect_by_hand(q, iterate, raw)
+    assert np.allclose(used, expected, atol=1e-6)
+    assert np.allclose(result.mat, tracker.p_eff * expected + (1 - tracker.p_eff) * make_sigma_mat(1.0), atol=1e-6)
+
+
+def test_active_tracker_reflects_without_history():
+    """An active tracker reflects the proposal and mixes it in even when mixing_history is None."""
+    q = make_flip_basis()
+    tracker = JacobianTracker(p_config=0.5)
+    tracker.q = q
+
+    with patch_config(strategy="linear", mixing=0.5):
+        result = apply_mixing_strategy(make_sigma(2.0 + 1.0j), make_sigma(1.0), tracker=tracker)
+
+    expected = reflect_by_hand(q, make_sigma_mat(1.0), make_sigma_mat(2.0 + 1.0j))
+    assert np.allclose(result.mat, tracker.p_eff * expected + (1 - tracker.p_eff) * make_sigma_mat(1.0), atol=1e-6)
+
+
+def test_anderson_accelerates_reflected_map():
+    """An active tracker makes Anderson accelerate the reflected map, matching a tracker-free run on reflected input."""
+    q = make_flip_basis()
+    tracker = JacobianTracker(p_config=0.5)
+    tracker.q = q
+    alpha = tracker.p_eff
+    shape = (*NK, NB, NB, 2 * NIV_CORE)
+    rng = np.random.default_rng(0)
+    mats = [(rng.standard_normal(shape) + 1.0j * rng.standard_normal(shape)).astype(np.complex64) for _ in range(8)]
+    iterates, raws = mats[:4], mats[4:]
+
+    history = [(it, raw, reflect_by_hand(q, it, raw)) for it, raw in zip(iterates[:3], raws[:3])]
+    result = run_anderson(
+        SelfEnergy(raws[3].copy(), NK, beta=BETA),
+        SelfEnergy(iterates[3].copy(), NK, beta=BETA),
+        history,
+        mixing=alpha,
+        tracker=tracker,
+    )
+
+    reflected = [(it, used, used) for it, _, used in history]
+    expected = run_anderson(
+        SelfEnergy(reflect_by_hand(q, iterates[3], raws[3]), NK, beta=BETA),
+        SelfEnergy(iterates[3].copy(), NK, beta=BETA),
+        reflected,
+        mixing=alpha,
+    )
+    assert np.allclose(result.mat, expected.mat, atol=1e-6)
+
+    raw_history = [(it, raw, raw) for it, raw in zip(iterates[:3], raws[:3])]
+    result_without_tracker = run_anderson(
+        SelfEnergy(raws[3].copy(), NK, beta=BETA),
+        SelfEnergy(iterates[3].copy(), NK, beta=BETA),
+        raw_history,
+        mixing=alpha,
+    )
+    # discriminating check: the tracker's reflection must actually change the accelerated step
+    assert not np.allclose(result.mat, result_without_tracker.mat, atol=1e-6)
+
+
+def test_pulay_accelerates_reflected_map():
+    """An active tracker makes Pulay accelerate the reflected map, matching a tracker-free run on reflected input."""
+    q = make_flip_basis()
+    tracker = JacobianTracker(p_config=0.5)
+    tracker.q = q
+    alpha = tracker.p_eff
+    shape = (*NK, NB, NB, 2 * NIV_CORE)
+    rng = np.random.default_rng(0)
+    mats = [(rng.standard_normal(shape) + 1.0j * rng.standard_normal(shape)).astype(np.complex64) for _ in range(8)]
+    iterates, raws = mats[:4], mats[4:]
+
+    history = [(it, raw, reflect_by_hand(q, it, raw)) for it, raw in zip(iterates[:3], raws[:3])]
+    result = run_pulay(
+        SelfEnergy(raws[3].copy(), NK, beta=BETA),
+        SelfEnergy(iterates[3].copy(), NK, beta=BETA),
+        history,
+        mixing=alpha,
+        tracker=tracker,
+    )
+
+    reflected = [(it, used, used) for it, _, used in history]
+    expected = run_pulay(
+        SelfEnergy(reflect_by_hand(q, iterates[3], raws[3]), NK, beta=BETA),
+        SelfEnergy(iterates[3].copy(), NK, beta=BETA),
+        reflected,
+        mixing=alpha,
+    )
+    assert np.allclose(result.mat, expected.mat, atol=1e-6)
+
+    raw_history = [(it, raw, raw) for it, raw in zip(iterates[:3], raws[:3])]
+    result_without_tracker = run_pulay(
+        SelfEnergy(raws[3].copy(), NK, beta=BETA),
+        SelfEnergy(iterates[3].copy(), NK, beta=BETA),
+        raw_history,
+        mixing=alpha,
+    )
+    # discriminating check: the tracker's reflection must actually change the accelerated step
+    assert not np.allclose(result.mat, result_without_tracker.mat, atol=1e-6)
+
+
+def test_tracker_p_eff_overrides_configured_mixing():
+    """The tracker's effective damping replaces the configured mixing parameter."""
+    tracker = JacobianTracker(p_config=0.5)
+    tracker.p_eff = 0.1
+
+    with patch_config(strategy="linear", mixing=0.5):
+        result = apply_mixing_strategy(make_sigma(2.0), make_sigma(1.0), tracker=tracker)
+
+    assert np.allclose(result.mat, 1.1, atol=1e-6)
+
+
+@pytest.mark.parametrize("run", [run_anderson, run_pulay])
+def test_accelerated_step_takes_the_flip_bound_only_with_a_basis(run):
+    """An accelerated step keeps the configured mixing while no basis is installed and takes the flip bound with one."""
+    shape = (*NK, NB, NB, 2 * NIV_CORE)
+    rng = np.random.default_rng(0)
+    mats = [(rng.standard_normal(shape) + 1.0j * rng.standard_normal(shape)).astype(np.complex64) for _ in range(8)]
+    iterates, raws = mats[:4], mats[4:]
+    x_n, s_x_n = iterates[3], raws[3]
+    pairs = [(it, raw, raw) for it, raw in zip(iterates[:3], raws[:3])]
+    tracker = JacobianTracker(p_config=0.5)
+    tracker.p_eff = 0.1
+    tracker.p_flip = 0.3
+    with_bound_ignored = run(
+        SelfEnergy(s_x_n.copy(), NK, beta=BETA),
+        SelfEnergy(x_n.copy(), NK, beta=BETA),
+        pairs,
+        mixing=0.5,
+        tracker=tracker,
+    )
+    reference = run(SelfEnergy(s_x_n.copy(), NK, beta=BETA), SelfEnergy(x_n.copy(), NK, beta=BETA), pairs, mixing=0.5)
+    assert np.allclose(with_bound_ignored.mat, reference.mat, atol=1e-6)
+    tracker.q = make_flip_basis()
+    reflected_pairs = [(it, raw, reflect_by_hand(tracker.q, it, raw)) for it, raw, _ in pairs]
+    with_bound = run(
+        SelfEnergy(s_x_n.copy(), NK, beta=BETA),
+        SelfEnergy(x_n.copy(), NK, beta=BETA),
+        reflected_pairs,
+        mixing=0.5,
+        tracker=tracker,
+    )
+    expected = run(
+        SelfEnergy(reflect_by_hand(tracker.q, x_n, s_x_n), NK, beta=BETA),
+        SelfEnergy(x_n.copy(), NK, beta=BETA),
+        [(it, used, used) for it, _, used in reflected_pairs],
+        mixing=0.3,
+    )
+    assert np.allclose(with_bound.mat, expected.mat, atol=1e-6)
+
+
+def test_history_window_uses_tracker_n_pairs():
+    """The trimming keeps the tracker's pair window when a tracker is given and the configured one otherwise."""
+    tracker = JacobianTracker(p_config=0.5)
+    with_tracker, without_tracker = [], []
+    n_hist = 2
+
+    with patch_config(strategy="linear", mixing=0.5, n_hist=n_hist):
+        for step in range(10):
+            sigma_old = make_sigma(float(step))
+            apply_mixing_strategy(make_sigma(step + 1.0), sigma_old, mixing_history=with_tracker, tracker=tracker)
+            apply_mixing_strategy(make_sigma(step + 1.0), sigma_old, mixing_history=without_tracker)
+
+    assert len(with_tracker) == tracker.n_pairs + 1
+    assert len(without_tracker) == n_hist + 1

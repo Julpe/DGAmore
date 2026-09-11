@@ -18,6 +18,7 @@ master's thesis (Chapters 3 & 4).
 import glob
 import os
 import re
+from collections.abc import Callable
 
 import mpi4py.MPI as MPI
 import numpy as np
@@ -31,6 +32,15 @@ from dgamore.bubble_gen import BubbleGenerator
 from dgamore.four_point import FourPoint
 from dgamore.greens_function import GreensFunction, update_mu
 from dgamore.interaction import LocalInteraction, Interaction
+from dgamore.jacobian_stabilization import (
+    DAMPING_FILE,
+    EIGENVALUE_FILE,
+    EIGENVALUE_RESIDUAL_FILE,
+    JacobianTracker,
+    SPECTRUM_FILE,
+    load_spectrum,
+    to_vec,
+)
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.lambda_ops import LambdaAnnealer, LambdaCorrection, MultiOrbitalLambdaCorrection
 from dgamore.matsubara_frequencies import MFHelper
@@ -39,6 +49,8 @@ from dgamore.memory_estimator import SLICE_CHUNK_BYTES
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel, deferred_collection
 from dgamore.self_energy import SelfEnergy
+
+_JACOBIAN_ROW_WIDTH = 3  # leading Ritz values per row of the per-iteration eigenvalue files
 
 
 def get_hartree_fock(u_loc: LocalInteraction, v_nonloc: Interaction) -> tuple[np.ndarray, np.ndarray]:
@@ -507,7 +519,7 @@ def calculate_and_save_chi_q_r_rpa(
         config.logger.info(f"Calculated RPA susceptibility ({channel.value}).")
 
 
-def _select_and_apply_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
+def _select_and_apply_lambda_correction(chi_phys_q_r: FourPoint, lambda_previous: dict | None = None) -> FourPoint:
     r"""
     Applies the configured lambda correction to the (rank-0 gathered) physical susceptibility and returns it. The
     correction runs when either the one-shot ``config.lambda_correction.perform_lambda_correction`` or the
@@ -517,11 +529,14 @@ def _select_and_apply_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
 
     :param chi_phys_q_r: The rank-0 gathered physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` in the irreducible
         BZ.
+    :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, kept by the
+        self-consistency loop across its iterations; ``None`` for the one-shot correction (see
+        :meth:`~dgamore.lambda_ops.LambdaCorrection.perform`).
     :return: The (possibly corrected) physical susceptibility.
     """
     if config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction:
         if config.sys.n_bands == 1:
-            return LambdaCorrection.perform(chi_phys_q_r)
+            return LambdaCorrection.perform(chi_phys_q_r, lambda_previous=lambda_previous)
         return MultiOrbitalLambdaCorrection.perform(chi_phys_q_r)
     return chi_phys_q_r
 
@@ -536,6 +551,7 @@ def calculate_sigma_kernel_r_q(
     mpi_dist_irrq: MpiDistributor,
     annealer: "LambdaAnnealer | None" = None,
     chunk_bytes: int | None = None,
+    lambda_previous: dict | None = None,
 ) -> FourPoint:
     r"""
     Returns the kernel for the self-energy calculation in a specific spin channel. Calculates the auxiliary
@@ -553,6 +569,8 @@ def calculate_sigma_kernel_r_q(
     :param annealer: The active :class:`LambdaAnnealer` (its boson mass is applied to the physical susceptibility),
         or ``None`` when annealing is off.
     :param chunk_bytes: Chunk byte budget of the auxiliary-susceptibility build (``None`` uses the floor).
+    :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, kept by the
+        self-consistency loop across its iterations; ``None`` for the one-shot correction.
     :return: The self-energy kernel for this channel as a :class:`FourPoint`.
     """
     logger = config.logger
@@ -616,7 +634,7 @@ def calculate_sigma_kernel_r_q(
 
     chi_phys_q_r.mat = mpi_dist_irrq.gather(chi_phys_q_r.mat)
     if mpi_dist_irrq.comm.rank == 0:
-        chi_phys_q_r = _select_and_apply_lambda_correction(chi_phys_q_r)
+        chi_phys_q_r = _select_and_apply_lambda_correction(chi_phys_q_r, lambda_previous)
         chi_phys_q_r.save(name=f"chi_phys_q_{chi_phys_q_r.channel.value}", output_dir=config.output.output_path)
 
         # perform Ornstein-Zernike fit
@@ -936,7 +954,9 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
     ``use_interpolated_sigma`` this is the predecessor's final self-energy re-gridded to this temperature,
     ``sigma_dga_interpolated_beta<b>_niv<n>.npy`` (the file with ``<b>`` closest to the current :math:`\beta` if
     several exist); otherwise it is the raw iterate ``sigma_dga_iteration_<i>.npy`` with the highest ``<i>``. The
-    iteration count comes from the raw iterates in both cases. Without a usable file the DMFT self-energy is returned.
+    iteration count comes from the raw iterates in both cases, read from the run's ``Sigma_Iterates`` subfolder or,
+    for a run written before that subfolder existed, from the run folder itself. Without a usable file the DMFT
+    self-energy is returned.
 
     :param default_sigma: The fallback (DMFT) :class:`SelfEnergy` used when no previous result is found.
     :return: A tuple of the starting :class:`SelfEnergy` (cut to the core box and interpolated onto the k-grid) and
@@ -951,12 +971,11 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
             )
         return default_sigma, 0
 
-    iteration_regex = re.compile(r"sigma_dga_iteration_(\d+)\.npy$")
-    iterates = glob.glob(os.path.join(previous_sc_path, "sigma_dga_iteration_*.npy"))
-    iterations = [(int(match.group(1)), f) for f in iterates if (match := iteration_regex.search(f))]
-    if not iterations:
+    files = _iteration_files(previous_sc_path, "sigma_dga_iteration_*.npy")
+    if not files:
         return default_sigma, 0
-    max_iter, max_file = max(iterations, key=lambda x: x[0])
+    max_iter = max(files)
+    max_file = files[max_iter]
 
     if config.self_consistency.use_interpolated_sigma:
         beta_regex = re.compile(r"sigma_dga_interpolated_beta([0-9.eE+-]+)_niv\d+\.npy$")
@@ -969,14 +988,35 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
             return default_sigma, 0
         max_file = min(betas, key=lambda x: x[0])[1]
     config.logger.info(f"Starting the self-consistency from {max_file} (iteration {max_iter}).")
+    return _load_saved_sigma(max_file), max_iter
 
-    mat = np.load(max_file)
-    return (
-        SelfEnergy(mat, mat.shape[:3], True, False, beta=config.sys.beta)
-        .cut_niv(config.box.niv_core)
-        .interpolate_q_grid(config.lattice.k_grid.nk, False),
-        max_iter,
+
+def _iteration_files(path: str, glob_pattern: str) -> dict[int, str]:
+    """
+    Maps the iteration number to the file for every per-iteration file of a previous run matching a pattern
+    (file names ending in ``iteration_<i>.npy``). The files are looked up in the run's ``Sigma_Iterates``
+    subfolder and, when that holds none, in the run folder itself.
+
+    :param path: Folder of the previous self-consistency run.
+    :param glob_pattern: File-name glob of the wanted per-iteration files.
+    :return: Dictionary ``{iteration: file path}``.
+    """
+    files = glob.glob(os.path.join(path, config.output.sigma_iterates_subfolder_name, glob_pattern)) or glob.glob(
+        os.path.join(path, glob_pattern)
     )
+    return {int(match.group(1)): f for f in files if (match := re.search(r"iteration_(\d+)\.npy$", f))}
+
+
+def _load_saved_sigma(path: str) -> SelfEnergy:
+    """
+    Loads a saved self-energy, cut to the core box and interpolated onto the current momentum grid.
+
+    :param path: Path of the saved ``.npy`` self-energy.
+    :return: The :class:`SelfEnergy`.
+    """
+    mat = np.load(path)
+    sigma = SelfEnergy(mat, mat.shape[:3], True, False, beta=config.sys.beta).cut_niv(config.box.niv_core)
+    return sigma.interpolate_q_grid(config.lattice.k_grid.nk, False)
 
 
 def _init_mu_history(starting_iter: int) -> list[float]:
@@ -997,6 +1037,22 @@ def _init_mu_history(starting_iter: int) -> list[float]:
     previous_mu = float(np.load(os.path.join(config.self_consistency.previous_sc_path, "mu_history.npy"))[-1])
     config.sys.mu = previous_mu
     return [previous_mu]
+
+
+def _save_sigma_iteration(sigma: SelfEnergy, base_name: str, current_iter: int) -> None:
+    """
+    Saves a self-energy of the current iteration into the run's ``Sigma_Iterates`` subfolder as
+    ``<base_name>_iteration_<i>``.
+
+    :param sigma: The :class:`SelfEnergy` to save (the mixed iterate or the raw proposal).
+    :param base_name: File-name prefix.
+    :param current_iter: The current self-consistency iteration number.
+    :return: None.
+    """
+    sigma.decompress_q_dimension().save(
+        name=f"{base_name}_iteration_{current_iter}", output_dir=config.output.sigma_iterates_path
+    )
+    config.logger.info(f"Saved {base_name} for iteration {current_iter}.")
 
 
 def _load_node_shared_local_vertex(node_comm, path: str, channel: SpinChannel, transform=None) -> tuple:
@@ -1231,6 +1287,7 @@ def calculate_sigma_proposal(
     current_iter: int,
     annealer: "LambdaAnnealer | None" = None,
     chunk_budgets: memory_estimator.ChunkBudgets | None = None,
+    lambda_previous: dict | None = None,
 ) -> SelfEnergy:
     r"""
     Returns the raw (un-mixed) DGA self-energy proposal :math:`S(\Sigma_{\mathrm{in}})` at chemical potential
@@ -1261,6 +1318,8 @@ def calculate_sigma_proposal(
     :param chunk_budgets: Chunk byte budgets of the auxiliary-susceptibility build and the self-energy passes (sized
         by the driver from the memory estimate); ``None`` gives both the job-wide fair-share budget of
         :func:`_sde_chunk_budget`.
+    :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, kept by the
+        self-consistency loop across its iterations; ``None`` for the one-shot correction.
     :return: The raw full-BZ proposal :class:`SelfEnergy` (replicated on every rank, DMFT tail attached).
     """
     logger = config.logger
@@ -1345,6 +1404,7 @@ def calculate_sigma_proposal(
             mpi_dist_irrk,
             annealer,
             aux_chunk_bytes,
+            lambda_previous,
         ),
         copy=False,
     )
@@ -1369,6 +1429,7 @@ def calculate_sigma_proposal(
             mpi_dist_irrk,
             annealer,
             aux_chunk_bytes,
+            lambda_previous,
         ).scale(3.0),
         copy=False,
     )
@@ -1502,23 +1563,191 @@ def _relative_sigma_residual(sigma_new: SelfEnergy, sigma_old: SelfEnergy) -> fl
     return float(np.linalg.norm(new_core - old_core) / np.linalg.norm(old_core))
 
 
+def _jacobian_expander(state: dict) -> Callable[[np.ndarray], np.ndarray] | None:
+    r"""
+    Builds the mapping of one stored column of a predecessor's spectrum file to the real vector on this run's window:
+    the column, a complex :math:`(k_x, k_y, k_z, n_b, n_b, 2\nu)` array on the predecessor's grid, is re-gridded on
+    the frequency axis by :meth:`SelfEnergy.interpolate` (the hand-over's PCHIP, without the MiniPole path, which is
+    for self-energies), re-sampled onto this run's momentum grid by
+    :meth:`~dgamore.n_point_base.IAmNonLocal.interpolate_q_grid`, zeroed on every target frequency beyond the
+    predecessor's highest source frequency (an eigenvector is not extrapolated) and flattened with
+    :func:`~dgamore.jacobian_stabilization.to_vec`. Identical windows skip the re-gridding. Refused, with a warning,
+    for another orbital count.
+
+    The chain is an approximation for an eigenvector, not an exact mapping of one. PCHIP derivatives depend
+    nonlinearly on the data they are built from, so the real and the imaginary part of a column are re-gridded
+    independently and the relative weighting inside the column pair of a complex mode is not preserved exactly, and
+    the same-sign-branch extrapolation below the innermost source frequency was designed for the causal shape of a
+    self-energy rather than for a Ritz vector. The :class:`~dgamore.self_energy.SelfEnergy` the column travels in
+    also fits high-frequency moments and estimates a core box on it, which is wasted work on a vector.
+
+    :param state: The carried spectrum (``shape`` and ``beta`` are read).
+    :return: The callable, or ``None`` when the carry-over is refused.
+    """
+    shape_src = tuple(int(n) for n in state["shape"])
+    beta_src = float(state["beta"])
+    nb = config.sys.n_bands
+    if shape_src[3:5] != (nb, nb):
+        config.logger.warning("The carried Jacobian spectrum belongs to another orbital count; nothing carried.")
+        return None
+    nk_tgt, niv_tgt, beta_tgt = tuple(int(n) for n in config.lattice.k_grid.nk), config.box.niv_core, config.sys.beta
+    nk_src, niv_src = shape_src[:3], shape_src[-1] // 2
+    if nk_src == nk_tgt and niv_src == niv_tgt and beta_src == beta_tgt:
+        return lambda column: to_vec(np.asarray(column, dtype=np.complex128).reshape(shape_src))
+    inside = np.abs(MFHelper.vn(niv_tgt, beta_tgt)) <= np.abs(MFHelper.vn(niv_src, beta_src)).max()
+
+    def expand(column: np.ndarray) -> np.ndarray:
+        window = np.asarray(column, dtype=np.complex128).reshape(shape_src)
+        sigma = SelfEnergy(window, nk_src, True, False, calc_smom=False, beta=beta_src)
+        sigma = sigma.interpolate(beta_tgt, niv_tgt).interpolate_q_grid(nk_tgt, False)
+        return to_vec(sigma.mat * inside)
+
+    return expand
+
+
+def _carry_jacobian_spectrum(tracker: JacobianTracker, annealer: LambdaAnnealer | None) -> None:
+    """
+    Hands the predecessor's certified Jacobian spectrum to the tracker before the first iteration of a resumed run,
+    read from ``jacobian_spectrum.npz`` in ``previous_sc_path`` (see :meth:`JacobianTracker.save_spectrum`). A
+    predecessor that did not reach the pure fixed point is carried with a warning; a predecessor the expander
+    refuses (see :func:`_jacobian_expander`) is not carried. Flips are kept pending while a susceptibility-reshaping
+    scaffold is on, as in :func:`_update_jacobian_tracker`.
+
+    :param tracker: The rank-0 tracker of this run.
+    :param annealer: The :class:`~dgamore.lambda_ops.LambdaAnnealer`, or ``None`` while annealing is off.
+    :return: None.
+    """
+    path = os.path.join(config.self_consistency.previous_sc_path, SPECTRUM_FILE)
+    if not os.path.isfile(path):
+        config.logger.info(f"No Jacobian spectrum file in {config.self_consistency.previous_sc_path}; nothing carried.")
+        return
+    state = load_spectrum(path)
+    if not bool(state["converged"]):
+        config.logger.warning(
+            f"The predecessor's Jacobian spectrum in {path} belongs to a run that did not reach the pure fixed point."
+        )
+    expand = _jacobian_expander(state)
+    if expand is None:
+        return
+    allow_flip = not (
+        config.stabilization.use_chi_phys_restriction
+        or config.stabilization.use_lambda_correction
+        or (annealer is not None and annealer.mass_present)
+    )
+    tracker.carry_in(state, expand, allow_flip=allow_flip)
+
+
+def _save_jacobian_spectrum(tracker: JacobianTracker, converged: bool) -> None:
+    """
+    Writes the tracker's certified spectrum to ``jacobian_spectrum.npz`` in the output folder for a successor run
+    (see :meth:`JacobianTracker.save_spectrum`), on the full momentum grid.
+
+    :param tracker: The rank-0 tracker of this run.
+    :param converged: Whether the run reached the pure fixed point (a scaffolded phase that ended on the last
+        iteration does not count).
+    :return: None.
+    """
+    nb = config.sys.n_bands
+    shape = (*(int(n) for n in config.lattice.k_grid.nk), nb, nb, 2 * config.box.niv_core)
+    tracker.save_spectrum(os.path.join(config.output.output_path, SPECTRUM_FILE), shape, config.sys.beta, converged)
+
+
+def _append_jacobian_eigenvalues(tracker: JacobianTracker, rows_lam: list, rows_res: list, rows_damping: list) -> None:
+    """
+    Appends this iteration's leading Jacobian Ritz values, residuals and damping to the running rows and rewrites
+    ``jacobian_eigenvalues.npy``, ``jacobian_eigenvalue_residuals.npy`` and ``jacobian_damping.npy`` in the output
+    folder.
+
+    An iteration whose tracker update produced no estimate (see :attr:`JacobianTracker.estimated`) appends a row
+    of ``nan`` to the first two, so the three files end up with exactly one row per iteration of this run, readable
+    as the leading eigenvalue's approach to the instability and the damping the tracker ran at. The damping row
+    always carries numbers, since the effective damping and the flipped-direction bound hold their last values
+    through an iteration without an estimate.
+
+    :param tracker: The rank-0 tracker owning the last update.
+    :param rows_lam: The Ritz value rows collected so far, oldest first, extended in place.
+    :param rows_res: The matching Ritz residual rows collected so far, oldest first, extended in place.
+    :param rows_damping: The matching ``(p_eff, p_flip)`` rows collected so far, oldest first, extended in place.
+    :return: None.
+    """
+    if tracker.estimated:
+        lam_pi, res = tracker.leading(_JACOBIAN_ROW_WIDTH)
+    else:
+        lam_pi, res = (
+            np.full(_JACOBIAN_ROW_WIDTH, np.nan, dtype=np.complex128),
+            np.full(_JACOBIAN_ROW_WIDTH, np.nan, dtype=np.float64),
+        )
+    rows_lam.append(lam_pi)
+    rows_res.append(res)
+    rows_damping.append((tracker.p_eff, tracker.p_flip))
+    np.save(os.path.join(config.output.output_path, EIGENVALUE_FILE), np.array(rows_lam, dtype=np.complex128))
+    np.save(os.path.join(config.output.output_path, EIGENVALUE_RESIDUAL_FILE), np.array(rows_res, dtype=np.float64))
+    np.save(os.path.join(config.output.output_path, DAMPING_FILE), np.array(rows_damping, dtype=np.float64))
+
+
 def _mixing_history_cap(
-    current_iter: int, release_iter: int | None, anneal_reset_iter: int | None = None
+    current_iter: int,
+    release_iter: int | None,
+    anneal_reset_iter: int | None = None,
+    extra_event_iter: int | None = None,
 ) -> int | None:
     """
-    Returns the accelerated-mixing history cap for this iteration: the number of iterations since the most recent
-    map-switching event - the susceptibility-restriction release or a change of the lambda-annealing mass.
-    Anderson/Pulay must not extrapolate across any of these discontinuities, so their usable history is capped to
-    the post-event iterations (``None`` when no event has occurred).
+    Returns the history cap for this iteration: the number of iterations since the most recent map-switching event
+    - the susceptibility-restriction release, a change of the lambda-annealing mass, or the extra event the caller
+    tracks (the accelerated mixing passes the iteration the Jacobian tracker last changed the reflected map on; the
+    tracker's own raw window passes none). Nothing may extrapolate across such a discontinuity, so the usable
+    history is capped to the post-event iterations (``None`` when no event has occurred).
 
     :param current_iter: The current self-consistency iteration number.
     :param release_iter: The iteration the susceptibility restriction was released on (``None`` if never).
     :param anneal_reset_iter: The iteration the annealing mass last changed on (``None`` if never).
+    :param extra_event_iter: The iteration of the caller's own map-switching event (``None`` if never).
     :return: The history cap, or ``None`` for no cap.
     """
-    events = (release_iter, anneal_reset_iter)
+    events = (release_iter, anneal_reset_iter, extra_event_iter)
     last_reset_iter = max((it for it in events if it is not None), default=None)
     return None if last_reset_iter is None else max(0, current_iter - last_reset_iter - 1)
+
+
+def _update_jacobian_tracker(
+    tracker: JacobianTracker,
+    mixing_history: list,
+    current_iter: int,
+    release_iter: int | None,
+    anneal_reset_iter: int | None,
+    annealer: LambdaAnnealer | None,
+) -> bool:
+    r"""
+    Runs one monitoring step of the Jacobian tracker on the raw :math:`(x, S(x))` pairs the mixing has just
+    recorded.
+
+    The tracker's window restarts on a scaffold event only - the susceptibility-restriction or lambda-correction
+    release and a change of the annealing mass - because a pair recorded under a scaffolded map samples a different
+    map; the pair recorded AT such an event was still computed with the scaffolded map and is dropped with it,
+    leaving the pairs of the iterations after it including the current one. It deliberately does not restart on the
+    tracker's own events: the raw pairs do not depend on which directions were reflected afterwards, so the whole
+    window stays a sample of one and the same map. Flips are paused while any scaffold is active, which leaves the
+    tracker measuring the spectrum and releasing a subspace installed from the physical map.
+
+    :param tracker: The tracker owning the flipped subspace and the effective damping.
+    :param mixing_history: The (iterate, raw proposal, used proposal) triples recorded by the mixing, oldest first.
+    :param current_iter: The current self-consistency iteration number.
+    :param release_iter: The iteration a susceptibility-reshaping scaffold was released on (``None`` if never).
+    :param anneal_reset_iter: The iteration the annealing mass last changed on (``None`` if never).
+    :param annealer: The :class:`~dgamore.lambda_ops.LambdaAnnealer`, or ``None`` while annealing is off.
+    :return: Whether the tracked subspace changed, i.e. the reflected map the accelerated mixing sees switched.
+    """
+    raw_cap = _mixing_history_cap(current_iter, release_iter, anneal_reset_iter)
+    n_entries = len(mixing_history) if raw_cap is None else min(len(mixing_history), raw_cap + 1)
+    entries = mixing_history[len(mixing_history) - n_entries :]
+    allow_flip = not (
+        config.stabilization.use_chi_phys_restriction
+        or config.stabilization.use_lambda_correction
+        or (annealer is not None and annealer.mass_present)
+    )
+    iterates = [entry[0] for entry in entries]
+    proposals = [entry[1] for entry in entries]
+    return tracker.update(iterates, proposals, allow_flip=allow_flip)
 
 
 def calculate_self_energy_q(
@@ -1534,6 +1763,14 @@ def calculate_self_energy_q(
     the double-counting correction and the kernel in the density and magnetic channel. Finally, calculates the
     non-local self-energy from the kernel and the Green's function. Also takes care of the self-consistency loop and
     the chemical potential adjustment as well as the self-energy mixing, etc.
+
+    With ``config.stabilization.use_jacobian_stabilization`` enabled, a
+    :class:`~dgamore.jacobian_stabilization.JacobianTracker` measures the leading eigenvalues of the self-energy
+    map from the raw (iterate, proposal) pairs the mixing records on rank 0, so that the mixing reflects the
+    proposal residual on the certified unstable directions and a change of that reflected map restarts the
+    accelerated-mixing history like the scaffold releases do. The tracker also measures the largest damping the
+    certified spectrum allows, which the mixing applies to every damped Picard step and to every iteration with a
+    reflection in force; a quasi-Newton step without one keeps the configured parameter.
 
     :param comm: The MPI communicator.
     :param u_loc: The bare local interaction :math:`U`.
@@ -1581,6 +1818,16 @@ def calculate_self_energy_q(
     if comm.rank == 0 and config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson"):
         mixing_history = []
 
+    # the tracker is built on every rank (a few floats) but only rank 0, which owns the pair history, ever feeds it
+    tracker = None
+    rows_lam, rows_res, rows_damping = None, None, None
+    if config.stabilization.use_jacobian_stabilization:
+        tracker = JacobianTracker(config.self_consistency.mixing, logger=logger)
+        rows_lam, rows_res, rows_damping = [], [], []
+        if comm.rank == 0 and mixing_history is None:
+            mixing_history = []
+    stab_event_iter = None
+
     niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
     sigma_dmft_full = sigma_dmft.copy()
 
@@ -1593,11 +1840,11 @@ def calculate_self_energy_q(
 
         sigma_old = sigma_old.concatenate_self_energies(sigma_dmft_full)
 
-        giwk_full = GreensFunction.get_g_full(
+        # only the filling is needed here: sum the Dyson chunks directly instead of holding a second full-k Green's
+        # function on the full DMFT frequency box (tens of GB at production scale)
+        config.sys.n, config.sys.occ, config.sys.occ_k = GreensFunction.get_fill_nonlocal_from_sigma(
             sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek(), config.sys.beta
         )
-        config.sys.n, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
-        giwk_full.free()
 
     config.sys.n, config.sys.occ, config.sys.occ_k = comm.bcast(
         (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
@@ -1616,8 +1863,18 @@ def calculate_self_energy_q(
     v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
 
     annealer = LambdaAnnealer() if config.stabilization.use_lambda_annealing else None
+    # the per-iteration correction keeps one dict for the whole run, so every channel's search warm-starts from the
+    # lambda of the previous iteration; the one-shot correction takes precedence and searches without a warm start
+    lambda_previous = (
+        {}
+        if config.stabilization.use_lambda_correction and not config.lambda_correction.perform_lambda_correction
+        else None
+    )
+    if tracker is not None and comm.rank == 0 and starting_iter > 0:
+        _carry_jacobian_spectrum(tracker, annealer)
     anneal_reset_iter = None
     release_iter = None
+    pure_converged = False
     for current_iter in range(starting_iter + 1, starting_iter + config.self_consistency.max_iter + 1):
         logger.info("----------------------------------------")
         logger.info(f"Starting iteration {current_iter}.")
@@ -1638,6 +1895,7 @@ def calculate_self_energy_q(
             current_iter,
             annealer=annealer,
             chunk_budgets=chunk_budgets,
+            lambda_previous=lambda_previous,
         )
         # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
 
@@ -1649,12 +1907,20 @@ def calculate_self_energy_q(
         sigma_win = None
 
         logger.info("Applying mixing strategy to the self-energy.")
-        history_cap = _mixing_history_cap(current_iter, release_iter, anneal_reset_iter)
+        history_cap = _mixing_history_cap(current_iter, release_iter, anneal_reset_iter, stab_event_iter)
         # mixing runs on rank 0 only (all ranks computed identical results before); the mixed sigma then reaches the
         # other ranks once per node through a shared window instead of once per rank
         if comm.rank == 0:
             sigma_old = sigma_old.concatenate_self_energies(sigma_dmft, shell_offset=shell_offset)
-            sigma_new = apply_mixing_strategy(sigma_new, sigma_old, history_cap, mixing_history)
+            if config.stabilization.use_jacobian_stabilization:
+                _save_sigma_iteration(sigma_new, "sigma_dga_proposal", current_iter)
+            sigma_new = apply_mixing_strategy(sigma_new, sigma_old, history_cap, mixing_history, tracker)
+            if tracker is not None:
+                if _update_jacobian_tracker(
+                    tracker, mixing_history, current_iter, release_iter, anneal_reset_iter, annealer
+                ):
+                    stab_event_iter = current_iter
+                _append_jacobian_eigenvalues(tracker, rows_lam, rows_res, rows_damping)
         if sc_node_comm is None:
             sigma_new = mpi_dist_fullbz.bcast_npoint(sigma_new)
         else:
@@ -1697,10 +1963,7 @@ def calculate_self_energy_q(
             logger.info("Updated occupation matrix from new Green's function.")
 
         if comm.rank == 0:
-            sigma_new.decompress_q_dimension().save(
-                name=f"sigma_dga_iteration_{current_iter}", output_dir=config.output.output_path
-            )
-            logger.info(f"Saved sigma for iteration {current_iter}.")
+            _save_sigma_iteration(sigma_new, "sigma_dga", current_iter)
 
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
@@ -1766,7 +2029,14 @@ def calculate_self_energy_q(
                         "self-consistency."
                     )
             else:
+                pure_converged = True
                 logger.info(f"Self-consistency of sigma and mu reached at iteration {current_iter}.")
+                if tracker is not None and comm.rank == 0:
+                    logger.info(
+                        f"Jacobian tracker at convergence: {0 if tracker.q is None else tracker.q.shape[1]} flipped "
+                        f"directions, p_eff={tracker.p_eff:.4f}, p_flip={tracker.p_flip:.4f}, "
+                        f"rho={tracker.predicted_rate():.4f}."
+                    )
                 break
         else:
             logger.info("Self-consistency not reached.")
@@ -1784,6 +2054,9 @@ def calculate_self_energy_q(
 
     np.save(os.path.join(config.output.output_path, "mu_history.npy"), mu_history)
     logger.info("Saved mu history as numpy array.")
+
+    if tracker is not None and comm.rank == 0:
+        _save_jacobian_spectrum(tracker, pure_converged)
 
     if config.self_energy_interpolation.do_interpolation:
         beta_target = config.self_energy_interpolation.beta_target
@@ -1803,20 +2076,35 @@ def apply_mixing_strategy(
     sigma_old: SelfEnergy,
     history_cap: int | None = None,
     mixing_history: list | None = None,
+    tracker: JacobianTracker | None = None,
 ) -> SelfEnergy:
-    """
+    r"""
     Applies the self-energy mixing strategy for the self-consistency loop. Supports linear mixing as well as the
     accelerated Pulay (DIIS) and Anderson schemes; the accelerated schemes fall back to linear mixing when their
-    least-squares problem is ill-conditioned or the history is too short. The mixing strategy and parameters are
-    taken from the config.
+    least-squares problem is ill-conditioned or the history is too short. The mixing strategy is taken from the
+    config. So is the mixing parameter, unless ``tracker`` is given: its bound :attr:`JacobianTracker.p_eff` then
+    damps every damped Picard step below (linear mixing, the warm-up and the fallbacks of the accelerated schemes);
+    an accelerated step takes :attr:`JacobianTracker.p_flip`, the bound of the flipped directions alone, while a
+    reflected basis is installed and keeps the configured parameter otherwise, since the whole-spectrum bound
+    describes the damped iteration and not a quasi-Newton step.
 
     The accelerated schemes build their secant history from genuine (iterate, proposal) pairs: each history entry
     holds an iterate :math:`x` together with the un-mixed proposal :math:`S(x)` the self-energy map produced from
     it. The post-mixing iterates alone (the per-iteration sigma files) cannot serve as proposals - at mixing
     parameters below one, ``mix(S(x), x, history) != S(x)``, so pairing consecutive iterates would feed the secant
-    model inconsistent data. This function therefore records the current pair ``(sigma_old, sigma_new)`` (cut to
-    the core window, before mixing overwrites ``sigma_new`` in place) into ``mixing_history`` itself. A
-    momentum-local iterate (the fresh-run starting self-energy) is broadcast over the proposal's momentum grid.
+    model inconsistent data. This function therefore records the current pair (cut to the core window, before
+    mixing overwrites ``sigma_new`` in place) into ``mixing_history`` itself, under every strategy, since the
+    Jacobian tracker measures the spectrum of the map from the same pairs. A momentum-local iterate (the fresh-run
+    starting self-energy) is broadcast over the proposal's momentum grid.
+
+    Whenever the tracker has a flipped basis :math:`Q` installed, the proposal is reflected on it,
+
+    .. math:: \tilde{S}(x) = x + (\mathbb{1} - 2 Q Q^{T})\,(S(x) - x),
+
+    before anything else touches it: the reflected proposal enters the core window of ``sigma_new`` and is what
+    every mixing strategy below acts on, regardless of whether ``mixing_history`` is given. When it is, the raw
+    proposal is what gets recorded, since the tracker estimates the spectrum from it, and the reflected one is what
+    the accelerated schemes take as their map result.
 
     :param sigma_new: The freshly computed self-energy proposal.
     :param sigma_old: The previous iteration's self-energy.
@@ -1824,36 +2112,50 @@ def apply_mixing_strategy(
         (``None`` for no bound). Used to reset the mixing history after the susceptibility-restriction release, so
         the accelerated schemes never extrapolate across the restricted-to-unrestricted discontinuity. Pairs keep
         being recorded while capped, so the history re-arms from genuine post-release pairs.
-    :param mixing_history: Mutable list of (iterate, proposal) pairs of core-cut decompressed arrays, oldest
-        first, maintained across iterations by the caller (rank 0 of the self-consistency loop). This function
-        appends the current pair and trims the list to the configured history length plus one. ``None`` disables
-        the accelerated schemes (linear mixing).
+    :param mixing_history: Mutable list of (iterate, raw proposal, used proposal) triples of core-cut decompressed
+        arrays, oldest first, maintained across iterations by the caller (rank 0 of the self-consistency loop).
+        This function appends the current triple and trims the list to the longer of the configured history length
+        and the tracker's pair window, plus one. ``None`` disables both the recording and the accelerated schemes.
+    :param tracker: The :class:`JacobianTracker` owning the flipped subspace and the damping bound, or ``None`` to
+        mix the raw proposal with the configured mixing parameter.
     :return: The mixed :class:`SelfEnergy` for the next iteration.
     """
     logger = config.logger
     n_hist = config.self_consistency.mixing_history_length
     if history_cap is not None:
         n_hist = min(n_hist, history_cap)
-    alpha = config.self_consistency.mixing
+    p_config = config.self_consistency.mixing
+    alpha = tracker.p_eff if tracker is not None else p_config
+    tracker_active = tracker is not None and tracker.active
+    # a quasi-Newton step is damped by the flip bound only while a reflection is in force (see JacobianTracker)
+    alpha_accelerated = tracker.p_flip if tracker_active else p_config
 
     last_results, last_proposals = [], []
-    if config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson") and mixing_history is not None:
+    if tracker_active or mixing_history is not None:
         niv_core = config.box.niv_core
         sigma_old.decompress_q_dimension()
         sigma_new.decompress_q_dimension()
         niv_o, niv_n = sigma_old.niv, sigma_new.niv
-        proposal = sigma_new.mat[..., niv_n - niv_core : niv_n + niv_core].copy()
+        core_window = slice(niv_n - niv_core, niv_n + niv_core)
+        proposal_raw = sigma_new.mat[..., core_window].copy()
         # broadcast_to expands a momentum-local iterate (the fresh-run starting sigma) over the proposal's
         # k-grid; the copies must survive the in-place core-window update of sigma_new below
-        iterate = np.broadcast_to(sigma_old.mat[..., niv_o - niv_core : niv_o + niv_core], proposal.shape).copy()
-        mixing_history.append((iterate, proposal))
-        del mixing_history[: -(config.self_consistency.mixing_history_length + 1)]
+        iterate = np.broadcast_to(sigma_old.mat[..., niv_o - niv_core : niv_o + niv_core], proposal_raw.shape).copy()
+        proposal_used = proposal_raw
+        if tracker_active:
+            proposal_used = tracker.reflect(proposal_raw, iterate)
+            sigma_new.mat[..., core_window] = proposal_used
 
-        if n_hist > 0:
-            pairs = mixing_history[-(n_hist + 1) :]
-            last_proposals = [iterate for iterate, _ in pairs]  # [x_{n-m}, ..., x_n]
-            last_results = [proposal for _, proposal in pairs]  # [S(x_{n-m}), ..., S(x_n)]
-            logger.info(f"Using the last {len(pairs)} (iterate, proposal) pairs of the mixing history.")
+        if mixing_history is not None:
+            mixing_history.append((iterate, proposal_raw, proposal_used))
+            n_keep = max(config.self_consistency.mixing_history_length, tracker.n_pairs if tracker is not None else 0)
+            del mixing_history[: -(n_keep + 1)]
+
+            if config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson") and n_hist > 0:
+                pairs = mixing_history[-(n_hist + 1) :]
+                last_proposals = [entry[0] for entry in pairs]  # [x_{n-m}, ..., x_n]
+                last_results = [entry[2] for entry in pairs]  # [S(x_{n-m}), ..., S(x_n)]
+                logger.info(f"Using the last {len(pairs)} (iterate, proposal) pairs of the mixing history.")
 
     accelerated_mixing_condition = len(last_results) > n_hist
 
@@ -1909,7 +2211,7 @@ def apply_mixing_strategy(
         coeffs = vh[mask].T @ ((u[:, mask].T @ f_i) / s[mask])
 
         # Pulay update: x_{n+1} = x_n + alpha*f_i - (R + alpha*F) @ c
-        update = alpha * f_i - (r_matrix + alpha * f_matrix) @ coeffs
+        update = alpha_accelerated * f_i - (r_matrix + alpha_accelerated * f_matrix) @ coeffs
         norm_u = np.linalg.norm(update)
         if norm_f > 0 and norm_u > 10.0 * norm_f:
             update *= 10.0 * norm_f / norm_u
@@ -1921,7 +2223,7 @@ def apply_mixing_strategy(
         niv_core = config.box.niv_core
         sigma_new.mat[..., niv - niv_core : niv + niv_core] = get_proposal(-1).reshape(shape) + update.reshape(shape)
 
-        logger.info(f"Pulay mixing applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}).")
+        logger.info(f"Pulay mixing applied (m={n_hist}, alpha={alpha_accelerated:.3f}, norm_f={norm_f:.3e}).")
 
         return sigma_new
     if config.self_consistency.mixing_strategy.lower() == "anderson" and accelerated_mixing_condition:
@@ -1975,7 +2277,7 @@ def apply_mixing_strategy(
 
         # Damp between old proposal and Anderson proposal
         x_n_complex = x_n
-        candidate = (1 - alpha) * x_n_complex + alpha * x_anderson.reshape(-1)
+        candidate = (1 - alpha_accelerated) * x_n_complex + alpha_accelerated * x_anderson.reshape(-1)
 
         # Safety clamp
         update = candidate - x_n_complex
@@ -1989,7 +2291,7 @@ def apply_mixing_strategy(
         niv_core = config.box.niv_core
         sigma_new.mat[..., niv - niv_core : niv + niv_core] = candidate.reshape(shape)
 
-        logger.info(f"Anderson acceleration applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}).")
+        logger.info(f"Anderson acceleration applied (m={n_hist}, alpha={alpha_accelerated:.3f}, norm_f={norm_f:.3e}).")
 
         return sigma_new
 

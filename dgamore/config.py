@@ -134,7 +134,7 @@ class StabilizationConfig:
     r"""
     Stores the convergence-stabilization options of the self-consistency loop. The susceptibility-reshaping options
     (the per-iteration lambda correction, ``use_chi_phys_restriction`` and ``use_lambda_annealing``) are mutually
-    exclusive.
+    exclusive; the Jacobian tracking of ``use_jacobian_stabilization`` composes with any of them.
 
     :ivar bool use_lambda_correction: Whether the self-consistency loop applies the Moriya lambda correction to the
         physical susceptibility in every iteration, dispatched by the band count: single-band input uses the scalar
@@ -152,12 +152,29 @@ class StabilizationConfig:
         target and annealed to exactly zero between converged phases - the final result is always pure self-consistency (the schedule and
         state live in :class:`~dgamore.lambda_ops.LambdaAnnealer`, owned by the loop). Multi-orbital-safe,
         unlike the sum-rule lambda correction.
+    :ivar bool use_jacobian_stabilization: Whether the self-consistency loop tracks the leading eigenvalues of the
+        Jacobian of the self-energy map from the iteration's own history - the genuine (iterate, proposal) pairs
+        the mixing records - at no extra proposal evaluation (a secant Rayleigh-Ritz estimate, refreshed every
+        iteration, see :class:`~dgamore.jacobian_stabilization.JacobianTracker`), and stabilizes the physical
+        fixed point by flipping the sign of the damping on the certified unstable eigendirections (the modified
+        iteration of arXiv:2606.04936, Eqs. 25-26, built on Phys. Rev. Lett. doi:10.1103/zjy7-4jqd): the proposal
+        residual is reflected on the unstable subspace before the configured mixing (linear, Pulay or Anderson)
+        acts on it. The loop also lowers the mixing parameter to the largest value the measured spectrum allows
+        (arXiv:2606.04936 Eq. 13, with a safety factor), never above ``self_consistency.mixing``, on every damped
+        Picard step (linear mixing, the warm-up and fallbacks of the accelerated schemes) and on every iteration with
+        a flip in force; an accelerated step without a flip keeps the configured parameter. Compatible with the
+        three susceptibility-reshaping scaffolds: monitoring runs throughout, flips are paused
+        while a scaffold is active (the scaffolded map is not the physical map) and resume after its release. Not
+        compatible with the one-shot ``lambda_correction.perform_lambda_correction`` (a single iteration has no
+        history): disabled with a warning in that case. A run started from a previous one with the flag on carries
+        that run's certified spectrum in (its ``jacobian_spectrum.npz``) and starts with its damping and its flips.
     """
 
     def __init__(self):
         self.use_lambda_correction: bool = False
         self.use_chi_phys_restriction: bool = False
         self.use_lambda_annealing: bool = False
+        self.use_jacobian_stabilization: bool = False
 
 
 class EliashbergConfig:
@@ -287,7 +304,11 @@ class OutputConfig:
     :ivar bool do_plotting: Whether to produce plots (rank 0 only).
     :ivar str plotting_path: Directory where plots are written.
     :ivar str plotting_subfolder_name: Subfolder name (under ``plotting_path``) for the plots.
+    :ivar str sigma_iterates_subfolder_name: Subfolder name (under ``output_path``) for the per-iteration
+        self-energies of the self-consistency loop.
     :ivar str eliashberg_path: Directory where Eliashberg results are written.
+    :ivar str sigma_iterates_path: Directory where the per-iteration self-energies of the self-consistency loop are
+        written (the fixed subfolder ``Sigma_Iterates`` of ``output_path``).
     """
 
     def __init__(self):
@@ -295,7 +316,9 @@ class OutputConfig:
         self.do_plotting: bool = True
         self.plotting_path: str = "./Plots/"
         self.plotting_subfolder_name: str = "Plots"
+        self.sigma_iterates_subfolder_name: str = "Sigma_Iterates"
         self.eliashberg_path: str = "./Eliashberg/"
+        self.sigma_iterates_path: str = "./Sigma_Iterates/"
 
 
 class AnaContConfig:
