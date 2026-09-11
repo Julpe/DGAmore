@@ -100,10 +100,47 @@ def test_add_interaction_term_local_and_nonlocal():
     inter = [
         InteractionElement([0, 0, 0], [1, 1, 1, 1], 5.0),
         InteractionElement([1, 0, 0], [1, 1, 1, 1], 2.0),
+        InteractionElement([-1, 0, 0], [1, 1, 1, 1], 2.0),
     ]
     h._add_interaction_term(inter)
     assert h._ur_local[0, 0, 0, 0] == 5.0
     assert np.any(h._ur_nonlocal != 0)
+
+
+def _two_band_local(extra):
+    """Builds a symmetric two-band local tensor (U on the diagonal) plus the given extra (orbs, value) elements."""
+    elements = [InteractionElement([0, 0, 0], [a, a, a, a], 3.0) for a in (1, 2)]
+    return elements + [InteractionElement([0, 0, 0], list(orbs), value) for orbs, value in extra]
+
+
+def test_add_interaction_term_raises_for_a_local_tensor_without_pair_exchange_symmetry():
+    """A local element U_{1211} without its pair-exchange partner U_{2111} is rejected."""
+    with pytest.raises(ValueError, match="pair-exchange"):
+        Hamiltonian()._add_interaction_term(_two_band_local([((1, 2, 1, 1), 0.3)]))
+
+
+def test_add_interaction_term_raises_for_a_local_tensor_without_reality_symmetry():
+    """A pair-exchange symmetric pair U_{1112} = U_{1121} without its reality partners U_{1211} and U_{2111} raises."""
+    with pytest.raises(ValueError, match="reality"):
+        Hamiltonian()._add_interaction_term(_two_band_local([((1, 1, 1, 2), 0.3), ((1, 1, 2, 1), 0.3)]))
+
+
+def test_add_interaction_term_raises_when_the_mirrored_lattice_vector_is_missing():
+    """A non-local vector listed without its mirror image -R is rejected."""
+    inter = [InteractionElement([0, 0, 0], [1, 1, 1, 1], 5.0), InteractionElement([1, 0, 0], [1, 1, 1, 1], 2.0)]
+    with pytest.raises(ValueError, match=r"\(-1, 0, 0\)"):
+        Hamiltonian()._add_interaction_term(inter)
+
+
+def test_add_interaction_term_raises_for_a_nonlocal_tensor_without_pair_exchange_symmetry():
+    """V(R) and V(-R) that are not pair-exchange images of each other are rejected."""
+    inter = [
+        InteractionElement([0, 0, 0], [1, 1, 1, 1], 5.0),
+        InteractionElement([1, 0, 0], [1, 1, 1, 1], 2.0),
+        InteractionElement([-1, 0, 0], [1, 1, 1, 1], 1.0),
+    ]
+    with pytest.raises(ValueError, match="pair-exchange"):
+        Hamiltonian()._add_interaction_term(inter)
 
 
 def test_single_band_interaction_sets_correct_u():
@@ -197,6 +234,27 @@ def test_kanamori_p_basic():
                         assert np.isclose(u[a, b, c, d], 0.0)
 
 
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda h: h.single_band_interaction(4.0),
+        lambda h: h.interaction_orbital_diagonal(4.0, 3),
+        lambda h: h.kanamori_interaction_d(3, udd=4.0, jdd=0.6),
+        lambda h: h.kanamori_interaction_p(2, upp=3.0, jpp=0.5, vpp=1.5),
+        lambda h: h.kanamori_interaction_dp(
+            nd_bands=2, np_bands=1, udd=4.0, upp=3.0, udp=2.0, jdd=0.6, jpp=0.4, jdp=0.3
+        ),
+        lambda h: h.read_umatrix(f"{os.path.dirname(os.path.abspath(__file__))}/test_data/local_sde/u_matrix.dat"),
+        lambda h: h.read_umatrix(f"{os.path.dirname(os.path.abspath(__file__))}/../docs/u_matrix.dat"),
+    ],
+    ids=["single_band", "orbital_diagonal", "kanamori_d", "kanamori_p", "kanamori_dp", "umatrix_file", "docs_example"],
+)
+def test_common_interaction_types_pass_the_symmetry_check(build):
+    """Every builder and shipped interaction file satisfies the pair-exchange and reality symmetries without raising."""
+    h = build(Hamiltonian())
+    assert h.get_local_u().mat.shape[0] >= 1
+
+
 def test_kanamori_dp_block_structure():
     """kanamori_interaction_dp produces the expected d/p block U/J/V structure."""
     ham = Hamiltonian()
@@ -221,9 +279,11 @@ def test_kanamori_dp_block_structure():
             for c in range(nd + npb):
                 for d in range(nd + npb):
 
-                    if is_d(a) and is_d(b):
+                    # the element couples orbitals a and b, or a and c for the pair hopping U_{aabb}
+                    other = b if a != b else c
+                    if is_d(a) and is_d(other):
                         uu, jj, vv = udd, jdd, vdd
-                    elif (not is_d(a)) and (not is_d(b)):
+                    elif (not is_d(a)) and (not is_d(other)):
                         uu, jj, vv = upp, jpp, vpp
                     else:
                         uu, jj, vv = 0, jdp, udp
@@ -318,6 +378,55 @@ def test_get_vq_returns_interaction():
     vq = h.get_vq(kg)
     assert hasattr(vq, "mat")
     assert vq.mat.shape[-4:] == (1, 1, 1, 1)
+
+
+def test_read_umatrix_example_and_vq_match_the_documented_lattice_sum():
+    """The documented u_matrix.dat parses into the stated local U, and get_vq equals sum_{R!=0} e^{iqR} V(R)."""
+    path = f"{os.path.dirname(os.path.abspath(__file__))}/../docs/u_matrix.dat"
+    h = Hamiltonian().read_umatrix(path)
+    u = h.get_local_u().mat
+    assert np.allclose([u[0, 0, 0, 0], u[0, 1, 0, 1], u[0, 0, 1, 1], u[0, 1, 1, 0]], [3.2, 2.4, 0.4, 0.4])
+
+    rows = np.loadtxt(path, skiprows=3)
+    rows = rows[np.any(rows[:, :3] != 0, axis=1)]
+    kg = KGrid(nk=(4, 4, 1), symmetries=[])
+    q = kg.kmesh.reshape(3, -1)
+    ref = np.zeros((q.shape[1], 2, 2, 2, 2), dtype=complex)
+    for rx, ry, rz, o1, o2, o3, o4, re, _ in rows:
+        ref[:, int(o1) - 1, int(o2) - 1, int(o3) - 1, int(o4) - 1] += re * np.exp(
+            1j * (rx * q[0] + ry * q[1] + rz * q[2])
+        )
+    vq = h.get_vq(kg).mat.reshape(-1, 2, 2, 2, 2)
+    assert np.allclose(vq, ref, atol=1e-5)
+    assert np.allclose(vq[0, 0, 1, 0, 1], 4 * 0.4 + 4 * 0.283, atol=1e-5)  # q = 0 is the plain lattice sum
+
+
+def test_read_umatrix_applies_the_lattice_vector_weights_in_the_fourier_transform(tmp_path):
+    """Each lattice vector's contribution to V^q is divided by its weight, matched to the vectors in file order."""
+    path = tmp_path / "u_matrix.dat"
+    path.write_text("1\n3\n1.0 2.0 1.0\n0 0 0 1 1 1 1 2.0 0.0\n1 0 0 1 1 1 1 1.0 0.0\n-1 0 0 1 1 1 1 1.0 0.0\n")
+    h = Hamiltonian().read_umatrix(str(path))
+    kg = KGrid(nk=(4, 1, 1), symmetries=[])
+    q = kg.kmesh.reshape(3, -1)[0]
+    ref = np.exp(1j * q) / 2.0 + np.exp(-1j * q)
+    assert np.allclose(h.get_local_u().mat, 2.0)
+    assert np.allclose(h.get_vq(kg).mat.reshape(-1), ref, atol=1e-6)
+
+
+def test_read_umatrix_raises_when_the_header_count_disagrees_with_the_listed_vectors(tmp_path):
+    """A header announcing more lattice vectors than the rows contain raises instead of misassigning the weights."""
+    path = tmp_path / "u_matrix.dat"
+    path.write_text("1\n3\n1.0 1.0 1.0\n0 0 0 1 1 1 1 2.0 0.0\n1 0 0 1 1 1 1 1.0 0.0\n")
+    with pytest.raises(ValueError, match="lattice vectors"):
+        Hamiltonian().read_umatrix(str(path))
+
+
+def test_read_umatrix_raises_on_a_duplicate_tensor_element(tmp_path):
+    """A repeated (lattice vector, orbital quadruple) row raises instead of silently overwriting the earlier value."""
+    path = tmp_path / "u_matrix.dat"
+    path.write_text("1\n2\n1.0 1.0\n0 0 0 1 1 1 1 2.0 0.0\n1 0 0 1 1 1 1 1.0 0.0\n1 0 0 1 1 1 1 0.5 0.0\n")
+    with pytest.raises(ValueError, match="duplicate"):
+        Hamiltonian().read_umatrix(str(path))
 
 
 def test_read_write_hr_hk_files():

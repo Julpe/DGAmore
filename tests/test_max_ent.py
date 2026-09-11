@@ -109,9 +109,15 @@ def test_orbital_to_band_basis_band_diagonal_is_symmetry_invariant():
 
 
 def _fake_problem(im_axis, re_axis, im_data, beta):
-    """AnalyticContinuationProblem stand-in: encodes the first im-axis data value into a constant real-freq spectrum."""
-    a_opt = np.full(len(re_axis), float(np.imag(im_data[0])))
-    return MagicMock(solve=MagicMock(side_effect=lambda *args, **kwargs: [SimpleNamespace(A_opt=a_opt.copy())]))
+    """AnalyticContinuationProblem stand-in: encodes the first im-axis value of its current data as a flat spectrum."""
+    state = {"im_data": im_data}
+
+    def solve(*args, **kwargs):
+        return [SimpleNamespace(A_opt=np.full(len(re_axis), float(np.imag(state["im_data"][0]))))]
+
+    return MagicMock(
+        solve=MagicMock(side_effect=solve), update_data=MagicMock(side_effect=lambda d: state.update(im_data=d))
+    )
 
 
 def _problem_from_solve(solve):
@@ -194,6 +200,26 @@ def test_perform_maxent_giwk_prepares_the_continued_g_on_rank0_only(tmp_path, pa
 
     run_parallel(2, fn)
     assert len(calls) == 1
+
+
+def test_perform_maxent_giwk_sets_up_one_continuation_problem_per_rank(tmp_path, monkeypatch):
+    """perform_maxent_giwk builds the continuation problem once per rank and only swaps the data per (k, band)."""
+    nk, n_bands, w_count = (4, 4, 1), 2, 7
+    _setup_maxent_config(tmp_path, nk, n_bands, w_count=w_count, seed=7)
+    mat = _build_giwk_mat(nk, n_bands, niv=4, seed=11)
+    instance = MagicMock(solve=MagicMock(return_value=[SimpleNamespace(A_opt=np.zeros(w_count))]))
+    problem = MagicMock(return_value=instance)
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(max_ent, "AnalyticContinuationProblem", problem)
+
+    def fn(comm, rank):
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
+
+    run_parallel(1, fn)
+    n_solves = config.lattice.k_grid.nk_irr * n_bands
+    assert problem.call_count == 1
+    assert instance.update_data.call_count == n_solves - 1
+    assert instance.solve.call_count == n_solves
 
 
 @pytest.mark.parametrize("size", [1, 2])

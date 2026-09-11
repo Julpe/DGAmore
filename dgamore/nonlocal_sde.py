@@ -47,19 +47,18 @@ def get_hartree_fock(u_loc: LocalInteraction, v_nonloc: Interaction) -> tuple[np
     the sum over the spins of the first term in Eq. (4.55) in Anna Galler's thesis results in a simple factor of 2. This
     can be seen in my master's thesis, Eq. (3.55). The Hartree-Fock term is given by
 
-    .. math:: \Sigma^{\mathbf{k}}_{\mathrm{HF}} = 2(U_{acbd} + V^{\mathbf{q}=0}_{acbd}) n_{dc}
-        - 1/n_{\mathbf{q}} \sum_{\mathbf{q}} (U_{abcd} + V^{\mathbf{q}}_{abcd}) n^{\mathbf{k}-\mathbf{q}}_{dc}
+    .. math:: \Sigma^{\mathbf{k}}_{\mathrm{HF};12} = 2\sum_{ab}(U_{1a2b} + V^{\mathbf{q}=0}_{1a2b}) n_{ba}
+        - \frac{1}{n_{\mathbf{q}}} \sum_{\mathbf{q}ab} (U_{1ab2} + V^{\mathbf{q}}_{1ab2}) n^{\mathbf{k}-\mathbf{q}}_{ba}
 
-    where the Hartree term reads :math:`\Sigma_{\mathrm{H}} = 2(U_{acbd} + V^{\mathbf{q}=0}_{acbd}) n_{dc}` and the Fock
-    term reads :math:`\Sigma^{\mathbf{k}}_{\mathrm{F}} = - 1/n_{\mathbf{q}} \sum_{\mathbf{q}} (U_{abcd} +
-    V^{\mathbf{q}}_{abcd}) n^{\mathbf{k}-\mathbf{q}}_{dc}`. The Hartree contraction uses the middle-index-swapped
-    ``U_{acbd}`` so it picks up the inter-orbital density :math:`U'` (stored at :math:`U_{abab}`); see
-    :func:`dgamore.local_sde.get_local_hartree_fock`.
+    where the first sum is the Hartree and the second the Fock term. The Hartree contraction places the external
+    orbitals on the first and third slot, so it picks up the inter-orbital density :math:`U'` stored at the ``abab``
+    slots, and the Fock contraction carries them on the outer slots, exactly as
+    :func:`dgamore.local_sde.get_local_hartree_fock` does.
 
     The Fock momentum sum is a circular convolution over the periodic Brillouin zone, so it is evaluated with the
     convolution theorem instead of an explicit q-loop: :math:`\Sigma^{\mathbf{k}}_{\mathrm{F}} =
     -\tfrac{1}{n_{\mathbf{q}}}\,\mathcal{F}^{-1}
-    \big[\mathcal{F}[(U+V)^{\mathbf{q}}_{abcd}]\,\mathcal{F}[n_{dc}]\big]` (a plain convolution, since the shift
+    \big[\mathcal{F}[(U+V)^{\mathbf{q}}_{1ab2}]\,\mathcal{F}[n_{ba}]\big]` (a plain convolution, since the shift
     is :math:`n^{\mathbf{k}-\mathbf{q}}`). This is
     :math:`O(n_{\mathbf{k}} \log n_{\mathbf{k}})` and materializes only R-space ``[k, o^4]``/``[k, o^2]`` arrays, never
     a ``[q, k]`` occupation block, so the whole full-BZ term is computed on every rank without a q-distribution.
@@ -69,31 +68,33 @@ def get_hartree_fock(u_loc: LocalInteraction, v_nonloc: Interaction) -> tuple[np
     :return: The tuple ``(hartree, fock)`` of self-energy contributions, broadcastable to ``[k, o1, o2, v]``.
     """
     v_q0 = v_nonloc.find_q((0, 0, 0))
-    # The inter-orbital density U' is stored at U_{abab}, so the Hartree term contracts "qacbd" (swapping the middle
-    # indices) to pick it up; the Fock term below contracts U_{abcd} n_{dc}. See local_sde.get_local_hartree_fock.
+    # U' is stored at the abab slots, so the Hartree term contracts "qacbd" (external orbitals on slots 1 and 3);
+    # the Fock term below puts them on the outer slots, like local_sde.get_local_hartree_fock
     hartree = 2 * (u_loc + v_q0).times("qacbd,dc->ab", config.sys.occ)
 
     nb = config.sys.n_bands
     nk_tot = np.prod(config.lattice.nk)
 
-    # Fourier the interaction (U+V^q)_{abcd} (stored "adcb"-permuted so the einsum labels line up) and n_{dc} to
-    # R-space, contract the summed orbitals pointwise per R, transform back: convolution theorem for the n^{k-q} sum.
-    w_r = (u_loc + v_nonloc).permute_orbitals("abcd->adcb").fft(copy=False)
-    w_r_mat = w_r.decompress_q_dimension().mat  # [kx, ky, kz, a, d, c, b]
+    # Fourier the interaction and the occupation to R-space, contract the summed orbitals pointwise per R and
+    # transform back: convolution theorem for the n^{k-q} sum.
+    w_r = (u_loc + v_nonloc).fft(copy=False)
+    w_r_mat = w_r.decompress_q_dimension().mat  # [kx, ky, kz, a, b, c, d]
     occ_r = sp.fft.fftn(config.sys.occ_k.astype(w_r_mat.dtype, copy=False), axes=(0, 1, 2))  # [kx, ky, kz, d, c]
 
-    fock_r = np.einsum("xyzadcb,xyzdc->xyzab", w_r_mat, occ_r, optimize=True)
+    fock_r = np.einsum("xyzacdb,xyzdc->xyzab", w_r_mat, occ_r, optimize=True)
     fock = sp.fft.ifftn(fock_r, axes=(0, 1, 2), overwrite_x=True).reshape(nk_tot, nb, nb)
     fock *= -1.0 / nk_tot
     return hartree[None, ..., None], fock[..., None]  # [k,o1,o2,v]
 
 
-def create_inverse_auxiliary_chi_r_q(gamma_r: LocalFourPoint, gchi0_q_inv: FourPoint, u_r: Interaction) -> FourPoint:
+def create_inverse_auxiliary_chi_r_q(
+    gamma_r: LocalFourPoint, gchi0_q_inv: FourPoint, u_r: LocalInteraction
+) -> FourPoint:
     r"""
     Assembles the Bethe-Salpeter matrix whose inversion yields the auxiliary susceptibility (Eq. (3.60) in my
     master's thesis),
 
-    .. math:: M^{\mathrm{q}\nu\nu'}_{1234} = (\chi^{\mathrm{q}\nu}_{0;1234})^{-1}\delta_{\nu\nu'} + (\Gamma^{\omega\nu\nu'}_{r;1234}-\mathcal{U}^{\mathbf{q}}_{r;1234})/\beta^2,
+    .. math:: M^{\mathrm{q}\nu\nu'}_{1234} = (\chi^{\mathrm{q}\nu}_{0;1234})^{-1}\delta_{\nu\nu'} + (\Gamma^{\omega\nu\nu'}_{r;1234}-U_{r;1234})/\beta^2,
 
     in a **single** two-fermion block: the result is broadcast-filled with the scaled local vertex over the momentum
     axis, the inverse bubble is added on the fermionic frequency diagonal in place (see
@@ -105,8 +106,11 @@ def create_inverse_auxiliary_chi_r_q(gamma_r: LocalFourPoint, gchi0_q_inv: FourP
         half-range view).
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (half bosonic range, one
         fermionic dimension).
-    :param u_r: The channel-projected total interaction :math:`\mathcal{U}^{\mathbf{q}}_{r} = U_{r} +
-        V^{\mathbf{q}}_{r}`.
+    :param u_r: The channel-projected local interaction :math:`U_{r}`. The non-local :math:`V^{\mathbf{q}}_{r}` does
+        not enter: the ladder vertex :math:`\Gamma^{\mathrm{q}}_{r} = \Gamma^{\omega}_{r} + V^{\mathbf{q}}_{r}` minus the
+        crossing-symmetric :math:`\mathcal{U}^{\mathbf{q}}_{r} = U_{r} + V^{\mathbf{q}}_{r}` leaves
+        :math:`\Gamma^{\omega}_{r} - U_{r}`, so :math:`V^{\mathbf{q}}` reaches the ladder only through the physical
+        susceptibility and the self-energy kernel.
     :return: The assembled matrix :math:`M^{\mathrm{q}}` as a :class:`FourPoint` (half niw range, two fermionic
         dimensions).
     """
@@ -125,9 +129,7 @@ def create_inverse_auxiliary_chi_r_q(gamma_r: LocalFourPoint, gchi0_q_inv: FourP
     )
 
 
-def create_auxiliary_chi_r_q(
-    gamma_r: LocalFourPoint, gchi0_q_inv: FourPoint, u_loc: LocalInteraction, v_nonloc: Interaction
-) -> FourPoint:
+def create_auxiliary_chi_r_q(gamma_r: LocalFourPoint, gchi0_q_inv: FourPoint, u_loc: LocalInteraction) -> FourPoint:
     r"""
     Returns the auxiliary susceptibility, see Eq. (3.60) in my master's thesis,
 
@@ -138,10 +140,9 @@ def create_auxiliary_chi_r_q(
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :return: The momentum-dependent auxiliary susceptibility :math:`\chi^{*;\mathrm{q}}_{r}` as a :class:`FourPoint`.
     """
-    u_r = v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel)
+    u_r = u_loc.as_channel(gamma_r.channel)
     return create_inverse_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_r).invert(False)
 
 
@@ -149,13 +150,12 @@ def create_auxiliary_chi_r_q_sum(
     gamma_r: LocalFourPoint,
     gchi0_q_inv: FourPoint,
     u_loc: LocalInteraction,
-    v_nonloc: Interaction,
     chunk_bytes: int | None = None,
 ) -> FourPoint:
     r"""
     Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis,
 
-    .. math:: \sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r;abcd} = \sum_{\nu'}((\chi^{\mathrm{q}\nu}_{0;abcd})^{-1} + (\Gamma^{\omega\nu\nu'}_{r;abcd}-U_{r;abcd}-V^{\mathbf{q}}_{r;abcd})/\beta^2)^{-1},
+    .. math:: \sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r;1234} = \sum_{\nu'}((\chi^{\mathrm{q}\nu}_{0;1234})^{-1} + (\Gamma^{\omega\nu\nu'}_{r;1234}-U_{r;1234})/\beta^2)^{-1},
 
     walking the rank-local momenta and their bosonic axis in byte-bounded chunks: each chunk assembles its window of
     the Bethe-Salpeter matrix (see :func:`create_inverse_auxiliary_chi_r_q`) and back-substitutes only the
@@ -166,13 +166,13 @@ def create_auxiliary_chi_r_q_sum(
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` (full or half bosonic range).
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :param chunk_bytes: Chunk byte budget of the build; defaults to the :data:`SLICE_CHUNK_BYTES` floor (callers pass
-        the dynamic budget of :func:`~dgamore.memory_estimator.dynamic_chunk_budget`).
+    :param chunk_bytes: Chunk byte budget of the build; defaults to the :data:`SLICE_CHUNK_BYTES` floor (the
+        pipeline passes the budget the driver sizes from the memory estimate, see
+        :func:`~dgamore.memory_estimator.max_chunk_budget`). Every budget yields the same bits.
     :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` as a
         :class:`FourPoint` (half niw range, one fermionic dimension).
     """
-    u_r = v_nonloc.as_channel(gamma_r.channel) + u_loc.as_channel(gamma_r.channel)
+    u_r = u_loc.as_channel(gamma_r.channel)
     gamma_half = gamma_r.copy().to_half_niw_range() if gamma_r.full_niw_range else gamma_r
 
     budget = SLICE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
@@ -188,11 +188,10 @@ def create_auxiliary_chi_r_q_sum(
         for q_start in range(0, n_q, q_group):
             q_stop = min(n_q, q_start + q_group)
             gchi0_q = gchi0_q_inv.take_q_index_slice(q_start, q_stop)
-            u_q = u_r.take_q_index_slice(q_start, q_stop)
             for w_start in range(0, n_w, w_chunk):
                 w_stop = min(n_w, w_start + w_chunk)
                 chunk = create_inverse_auxiliary_chi_r_q(
-                    gamma_half.take_wn_slice(w_start, w_stop), gchi0_q.take_wn_slice(w_start, w_stop), u_q
+                    gamma_half.take_wn_slice(w_start, w_stop), gchi0_q.take_wn_slice(w_start, w_stop), u_r
                 )
                 chi_r_q_sum_mat[q_start:q_stop, ..., w_start:w_stop, :] = chunk.invert_and_sum_over_last_vn_v2(
                     config.sys.beta
@@ -558,7 +557,7 @@ def calculate_sigma_kernel_r_q(
     """
     logger = config.logger
 
-    gchi_aux_q_r_sum = create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc, v_nonloc, chunk_bytes)
+    gchi_aux_q_r_sum = create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc, chunk_bytes)
 
     mpi_dist_irrq.barrier()
 
@@ -854,7 +853,9 @@ def _run_fft_sde_pass(
     R-space Green's function pencil, and freed before the next chunk - so neither a full-BZ niw-half kernel nor the
     exchange's send/receive staging for one is ever resident. ``kernel_irr`` is only read; the caller frees it after
     both passes. The chunk schedule is derived from rank-independent sizes, so every rank walks the same bosonic
-    windows (the peer-to-peer exchange is collective).
+    windows (the peer-to-peer exchange is collective). Progress is logged at the halfway chunk of the positive pass
+    and at the last chunk of either pass, so the whole self-energy step emits at most three progress lines
+    regardless of the chunk count.
 
     :param kernel_irr: The rank-local irreducible-BZ kernel slice (half niw range); read-only, shared by both passes.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
@@ -867,7 +868,8 @@ def _run_fft_sde_pass(
     :param negative_w: If True, build each chunk's negative-:math:`\omega` block via
         :meth:`LocalNPoint.to_negative_niw_range` before contracting (the negative pass) and trim the kernel peak
         back to the OS on the last chunk's free; if False, contract the mapped chunks directly (the positive pass).
-    :param chunk_bytes: Chunk byte budget of one exchanged full-BZ bosonic window (``None`` uses the floor).
+    :param chunk_bytes: Chunk byte budget of one exchanged full-BZ bosonic window (``None`` uses the floor). The
+        bosonic sum is reassociated at the chunk boundaries, so the result depends on the budget at the rounding level.
     :return: The rank-local R-space :class:`SelfEnergy` of this pass.
     """
     budget = SLICE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
@@ -878,11 +880,14 @@ def _run_fft_sde_pass(
     w_step = max(1, int(budget // max(one_wn_bytes, 1)))
 
     w_first = niw_index_w_pairs[0][0] if niw_index_w_pairs else 0
+    w_starts = list(range(w_first, n_w, w_step))
+    report_at = {len(w_starts)} if negative_w else {-(-len(w_starts) // 2), len(w_starts)}
+    label = "negative" if negative_w else "positive"
     sigma = None
     # deferred_collection batches the gc pass of the per-chunk frees into one collection at the end of the pass
     # (a full gc walk per free dominates the wall time of a many-chunk pass otherwise).
     with deferred_collection():
-        for w_start in range(w_first, n_w, w_step):
+        for n_done, w_start in enumerate(w_starts, start=1):
             w_stop = min(n_w, w_start + w_step)
             chunk = mpi_utils.exchange_and_map_irrbz_fullbz(
                 kernel_irr.take_wn_slice(w_start, w_stop), mpi_dist_irrk, mpi_dist_fullbz
@@ -901,14 +906,37 @@ def _run_fft_sde_pass(
             else:
                 sigma.mat += part.mat  # accumulate the rank-local R-space partial self-energies (in place)
                 part.free()
+            if n_done in report_at:
+                config.logger.info(
+                    f"Self-energy FFT pass ({label} w): {n_done} of {len(w_starts)} bosonic chunks done."
+                )
     return sigma
 
 
-def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
+def _sde_chunk_budget(comm: MPI.Comm, shared_node_comm) -> int:
+    r"""
+    Returns the chunk byte budget of the self-energy section, identical on every rank: each rank derives its node's
+    budget (see :func:`dgamore.memory_estimator.dynamic_chunk_budget`) and the job-wide minimum is taken, so the
+    node with the least memory per rank bounds the chunking everywhere. The chunk schedule of
+    :func:`_run_fft_sde_pass` follows from this budget and its per-chunk exchange is collective, so ranks with
+    different budgets would walk different chunk counts and deadlock.
+
+    :param comm: The MPI communicator.
+    :param shared_node_comm: The node-local communicator (``None`` counts as one rank per node).
+    :return: The chunk budget in bytes.
     """
-    Tries to retrieve the last calculated self-energy from a previous self-consistency calculation as a starting point
-    for the next calculation. Whether the normal or interpolated sigma is chosen depends on the setting. If no
-    ``sigma_dga_*_N.npy`` file is found, we use the DMFT self-energy as a starting point.
+    node_ranks = shared_node_comm.size if shared_node_comm is not None else 1
+    chunk_bytes = memory_estimator.dynamic_chunk_budget(mpi_utils.job_memory_total(), node_ranks)
+    return comm.allreduce(chunk_bytes, op=MPI.MIN) if comm.size > 1 else chunk_bytes
+
+
+def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
+    r"""
+    Retrieves the starting self-energy of the self-consistency cycle from a previous run. With
+    ``use_interpolated_sigma`` this is the predecessor's final self-energy re-gridded to this temperature,
+    ``sigma_dga_interpolated_beta<b>_niv<n>.npy`` (the file with ``<b>`` closest to the current :math:`\beta` if
+    several exist); otherwise it is the raw iterate ``sigma_dga_iteration_<i>.npy`` with the highest ``<i>``. The
+    iteration count comes from the raw iterates in both cases. Without a usable file the DMFT self-energy is returned.
 
     :param default_sigma: The fallback (DMFT) :class:`SelfEnergy` used when no previous result is found.
     :return: A tuple of the starting :class:`SelfEnergy` (cut to the core box and interpolated onto the k-grid) and
@@ -917,24 +945,30 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
     previous_sc_path = config.self_consistency.previous_sc_path
 
     if previous_sc_path is None or previous_sc_path == "" or not os.path.exists(previous_sc_path):
+        if config.self_consistency.use_interpolated_sigma:
+            config.logger.warning(
+                "use_interpolated_sigma is set but previous_sc_path is empty or missing; starting from DMFT."
+            )
         return default_sigma, 0
 
-    if config.self_consistency.use_interpolated_sigma:
-        glob_pattern = "sigma_dga_interpolated_*_iteration_*.npy"
-        iteration_regex = re.compile(r"sigma_dga_interpolated_.+_iteration_(\d+)\.npy$")
-    else:
-        glob_pattern = "sigma_dga_iteration_*.npy"
-        iteration_regex = re.compile(r"sigma_dga_iteration_(\d+)\.npy$")
-
-    files = glob.glob(os.path.join(previous_sc_path, glob_pattern))
-
-    if not files or len(files) == 0:
-        return default_sigma, 0
-    iterations = [(int(match.group(1)), f) for f in files if (match := iteration_regex.search(f))]
-
-    if not iterations or len(iterations) == 0:
+    iteration_regex = re.compile(r"sigma_dga_iteration_(\d+)\.npy$")
+    iterates = glob.glob(os.path.join(previous_sc_path, "sigma_dga_iteration_*.npy"))
+    iterations = [(int(match.group(1)), f) for f in iterates if (match := iteration_regex.search(f))]
+    if not iterations:
         return default_sigma, 0
     max_iter, max_file = max(iterations, key=lambda x: x[0])
+
+    if config.self_consistency.use_interpolated_sigma:
+        beta_regex = re.compile(r"sigma_dga_interpolated_beta([0-9.eE+-]+)_niv\d+\.npy$")
+        candidates = glob.glob(os.path.join(previous_sc_path, "sigma_dga_interpolated_beta*_niv*.npy"))
+        betas = [
+            (abs(float(match.group(1)) - config.sys.beta), f) for f in candidates if (match := beta_regex.search(f))
+        ]
+        if not betas:
+            config.logger.warning(f"No interpolated self-energy found in {previous_sc_path}; starting from DMFT.")
+            return default_sigma, 0
+        max_file = min(betas, key=lambda x: x[0])[1]
+    config.logger.info(f"Starting the self-consistency from {max_file} (iteration {max_iter}).")
 
     mat = np.load(max_file)
     return (
@@ -1124,7 +1158,9 @@ def _update_occ_and_energies_distributed(
     built the whole DMFT-box Green's function and its asymptotic tail sums on rank 0 while every other rank idled).
     The self-energy moments are fitted from the momentum-averaged concatenated self-energy, allreduced first so
     they match the full-box fit on every rank; the k-resolved occupation is allgathered and the k-summed scalars
-    are recombined with each rank's momentum count as weight.
+    are recombined with each rank's momentum count as weight. The momentum-dependent constant the mixed
+    self-energy carries in its shell (see :meth:`SelfEnergy.shell_offset_from`) is carried into the DMFT-box
+    extension and its moment fit.
 
     :param sigma_new: The mixed :class:`SelfEnergy` (full BZ, compressed momenta, identical on every rank).
     :param sigma_dmft_full: The DMFT :class:`SelfEnergy` supplying the shell frequencies (momentum-local).
@@ -1144,11 +1180,14 @@ def _update_occ_and_energies_distributed(
         calc_smom=False,
         beta=config.sys.beta,
     )
-    sigma_occ = sigma_slice.concatenate_self_energies(sigma_dmft_full)
+    shell_offset = sigma_new.shell_offset_from(sigma_dmft_full)
+    sigma_occ = sigma_slice.concatenate_self_energies(
+        sigma_dmft_full, shell_offset=shell_offset[mpi_dist_fullbz.my_slice]
+    )
 
     # sigma_new is replicated, so every rank fits the full-box moments locally from the k-mean fit window; the fit
     # is bit-identical to the momentum-resolved concatenation's fit and needs no reduction
-    sigma_occ._smom0, sigma_occ._smom1 = sigma_new.fit_smom_concatenated(sigma_dmft_full)
+    sigma_occ._smom0, sigma_occ._smom1 = sigma_new.fit_smom_concatenated(sigma_dmft_full, shell_offset=shell_offset)
 
     ek = config.lattice.hamiltonian.get_ek()
     ek_slice = ek.reshape(nk_tot, n_bands, n_bands)[mpi_dist_fullbz.my_slice].reshape(n_my, 1, 1, n_bands, n_bands)
@@ -1191,11 +1230,14 @@ def calculate_sigma_proposal(
     comm: MPI.Comm,
     current_iter: int,
     annealer: "LambdaAnnealer | None" = None,
+    chunk_budgets: memory_estimator.ChunkBudgets | None = None,
 ) -> SelfEnergy:
     r"""
     Returns the raw (un-mixed) DGA self-energy proposal :math:`S(\Sigma_{\mathrm{in}})` at chemical potential
     :math:`\mu`: Hartree/Fock, the Dyson Green's function, the bubble, the double-counting, density and magnetic
-    kernels, and the FFT Schwinger-Dyson contraction, finished with the noise-removal term and the DMFT tail.
+    kernels, and the FFT Schwinger-Dyson contraction, finished with the noise-removal term and the DMFT tail. The
+    tail carries the momentum-dependent part of the Hartree-Fock term, i.e. the contribution of
+    :math:`V^{\mathbf{q}}`, which the impurity self-energy does not contain.
 
     Single source of truth for the proposal map: it is called once per self-consistency iteration by
     :func:`calculate_self_energy_q`. The local irreducible vertex is frozen, so every
@@ -1216,6 +1258,9 @@ def calculate_sigma_proposal(
     :param current_iter: The current iteration number (the RPA susceptibility is saved only on iteration 1).
     :param annealer: The active :class:`LambdaAnnealer` threaded into the kernel step, or ``None`` when annealing
         is off.
+    :param chunk_budgets: Chunk byte budgets of the auxiliary-susceptibility build and the self-energy passes (sized
+        by the driver from the memory estimate); ``None`` gives both the job-wide fair-share budget of
+        :func:`_sde_chunk_budget`.
     :return: The raw full-BZ proposal :class:`SelfEnergy` (replicated on every rank, DMFT tail attached).
     """
     logger = config.logger
@@ -1223,6 +1268,9 @@ def calculate_sigma_proposal(
     # The FFT Fock term uses the full q-grid interaction and occupation (both replicated on every rank), so each
     # rank computes the identical full-BZ Hartree/Fock directly - no q-distribution and no allreduce.
     hartree, fock = get_hartree_fock(u_loc, v_nonloc_full)
+    # the V^q part of Hartree-Fock is absent from the impurity self-energy padding the shell, so it is re-added there
+    hartree_v, fock_v = get_hartree_fock(LocalInteraction(np.zeros_like(u_loc.mat)), v_nonloc_full)
+    hf_v = (hartree_v + fock_v)[..., 0]
     logger.info("Calculated Hartree and Fock terms.")
 
     giwk_full, giwk_win, shared_node_comm = _build_giwk_full(
@@ -1280,8 +1328,8 @@ def calculate_sigma_proposal(
     if config.eliashberg.perform_eliashberg:
         gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
 
-    node_ranks = shared_node_comm.size if shared_node_comm is not None else 1
-    chunk_bytes = memory_estimator.dynamic_chunk_budget(mpi_utils.job_memory_total(), node_ranks)
+    chunk_bytes = _sde_chunk_budget(comm, shared_node_comm) if chunk_budgets is None else chunk_budgets.sde
+    aux_chunk_bytes = chunk_bytes if chunk_budgets is None else chunk_budgets.chiq_aux
 
     gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
         shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
@@ -1296,7 +1344,7 @@ def calculate_sigma_proposal(
             v_nonloc,
             mpi_dist_irrk,
             annealer,
-            chunk_bytes,
+            aux_chunk_bytes,
         ),
         copy=False,
     )
@@ -1320,7 +1368,7 @@ def calculate_sigma_proposal(
             v_nonloc,
             mpi_dist_irrk,
             annealer,
-            chunk_bytes,
+            aux_chunk_bytes,
         ).scale(3.0),
         copy=False,
     )
@@ -1391,8 +1439,42 @@ def calculate_sigma_proposal(
     # This is done to minimize noise. We remove some fluctuations from dmft that are included in the local self-energy
     # calculated in this code and add the smooth dmft self-energy
     sigma_prop += delta_sigma
-    sigma_prop = sigma_prop.concatenate_self_energies(sigma_dmft)
+    sigma_prop = sigma_prop.concatenate_self_energies(sigma_dmft, shell_offset=hf_v)
     return sigma_prop
+
+
+def interpolate_sigma(sigma: SelfEnergy, beta_target: float, niv_target: int, comm: MPI.Comm) -> SelfEnergy:
+    r"""
+    Re-grids the self-energy to ``beta_target``. The plain interpolation (:meth:`SelfEnergy.interpolate`) runs on the
+    irreducible Brillouin zone; at the momenta flagged by :meth:`SelfEnergy.pole_fit_mask` the target frequencies
+    below the innermost source frequency are replaced by the MiniPole extrapolation of
+    :meth:`SelfEnergy.pole_extrapolate`, with the fits distributed over the ranks and rejected fits keeping the plain
+    values. The result is unfolded to the full Brillouin zone with :meth:`SelfEnergy.map_to_full_bz`, orbital
+    rotations included. Collective over ``comm``; every rank returns the full result.
+
+    :param sigma: The momentum-dependent :class:`SelfEnergy` on the full Brillouin zone.
+    :param beta_target: Inverse temperature :math:`\beta` of the target grid.
+    :param niv_target: Number of positive fermionic frequencies of the target grid.
+    :param comm: The MPI communicator.
+    :return: The re-gridded :class:`SelfEnergy` on the full Brillouin zone, momentum layout ``[kx, ky, kz, ...]``.
+    """
+    k_grid = config.lattice.k_grid
+    sigma_irr = sigma.reduce_q(k_grid.get_irrq_list())
+    interpolated = sigma_irr.interpolate(beta_target, niv_target)
+
+    flagged = np.flatnonzero(sigma_irr.pole_fit_mask())
+    if flagged.size > 0:
+        dist = MpiDistributor.create_distributor(ntasks=flagged.size, comm=comm, name="PoleFit")
+        mine = flagged[dist.my_slice]
+        values, accepted = sigma_irr.pole_extrapolate(beta_target, niv_target, mine, interpolated)
+        # the flags travel as uint8: a bool buffer has no fixed MPI datatype in the Allgatherv
+        values, accepted = dist.allgather(values), dist.allgather(accepted.astype(np.uint8)).astype(bool)
+        interpolated.replace_innermost(flagged[accepted], values[accepted])
+        config.logger.info(
+            f"MiniPole extrapolation below the innermost frequency accepted at {accepted.sum()} of {flagged.size} "
+            f"flagged irreducible k-points."
+        )
+    return interpolated.map_to_full_bz(k_grid).decompress_q_dimension()
 
 
 def _relative_sigma_residual(sigma_new: SelfEnergy, sigma_old: SelfEnergy) -> float:
@@ -1440,7 +1522,12 @@ def _mixing_history_cap(
 
 
 def calculate_self_energy_q(
-    comm: MPI.Comm, u_loc: LocalInteraction, v_nonloc: Interaction, sigma_dmft: SelfEnergy, sigma_local: SelfEnergy
+    comm: MPI.Comm,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    sigma_dmft: SelfEnergy,
+    sigma_local: SelfEnergy,
+    chunk_budgets: memory_estimator.ChunkBudgets | None = None,
 ) -> SelfEnergy:
     r"""
     Runs the non-local DGA self-energy calculation. Calculates the Hartree- and Fock terms, the bubble,
@@ -1453,6 +1540,9 @@ def calculate_self_energy_q(
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param sigma_dmft: The DMFT self-energy (used as the starting point and for the shell/tail correction).
     :param sigma_local: The locally recomputed self-energy (used for smoothing out the DGA :class:`SelfEnergy`).
+    :param chunk_budgets: Chunk byte budgets of the auxiliary-susceptibility build and the self-energy passes (sized
+        by the driver from the memory estimate); ``None`` gives both the job-wide fair-share budget of
+        :func:`_sde_chunk_budget`.
     :return: The converged (or last-iteration) momentum-dependent DGA :class:`SelfEnergy`.
     """
     logger = config.logger
@@ -1516,6 +1606,7 @@ def calculate_self_energy_q(
     sigma_old = sigma_old.cut_niv(niv_cut)
     sigma_dmft = sigma_dmft.cut_niv(niv_cut)
 
+    # the starting iterate keeps the plain DMFT tail; the first proposal attaches the V^q Hartree-Fock offset
     if sigma_old.niv < niv_cut:
         sigma_old = sigma_old.concatenate_self_energies(sigma_dmft)
 
@@ -1546,20 +1637,23 @@ def calculate_self_energy_q(
             comm,
             current_iter,
             annealer=annealer,
+            chunk_budgets=chunk_budgets,
         )
         # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
 
-        sigma_old = sigma_old.cut_niv(config.box.niv_core)
-        # the cut copied everything still needed from the previous iteration's shared sigma buffer
+        # only rank 0 mixes and measures the residual, so only rank 0 keeps a private copy of the previous iterate
+        # (the cut copies everything still needed from the previous iteration's shared sigma buffer)
+        shell_offset = sigma_old.shell_offset_from(sigma_dmft) if comm.rank == 0 else None
+        sigma_old = sigma_old.cut_niv(config.box.niv_core) if comm.rank == 0 else None
         _free_shared_window(sigma_win, sc_node_comm)
         sigma_win = None
 
         logger.info("Applying mixing strategy to the self-energy.")
-        sigma_old = sigma_old.concatenate_self_energies(sigma_dmft)
         history_cap = _mixing_history_cap(current_iter, release_iter, anneal_reset_iter)
         # mixing runs on rank 0 only (all ranks computed identical results before); the mixed sigma then reaches the
         # other ranks once per node through a shared window instead of once per rank
         if comm.rank == 0:
+            sigma_old = sigma_old.concatenate_self_energies(sigma_dmft, shell_offset=shell_offset)
             sigma_new = apply_mixing_strategy(sigma_new, sigma_old, history_cap, mixing_history)
         if sc_node_comm is None:
             sigma_new = mpi_dist_fullbz.bcast_npoint(sigma_new)
@@ -1568,10 +1662,11 @@ def calculate_self_energy_q(
             sigma_win = _share_sigma_per_node(sigma_new.compress_q_dimension(), sc_node_comm, sc_roots_comm)
 
         sigma_new = sigma_new.compress_q_dimension()
-        sigma_old = sigma_old.compress_q_dimension()
 
         # Post-mixing step residual (the historical convergence measure; shrinks with the mixing parameter)
-        relative_residual = _relative_sigma_residual(sigma_new, sigma_old)
+        relative_residual = (
+            _relative_sigma_residual(sigma_new, sigma_old.compress_q_dimension()) if comm.rank == 0 else None
+        )
 
         old_mu = mu_history[-1]
         if comm.rank == 0:
@@ -1606,17 +1701,6 @@ def calculate_self_energy_q(
                 name=f"sigma_dga_iteration_{current_iter}", output_dir=config.output.output_path
             )
             logger.info(f"Saved sigma for iteration {current_iter}.")
-
-            if config.self_energy_interpolation.do_interpolation:
-                beta_target = config.self_energy_interpolation.beta_target
-                niv_target = config.self_energy_interpolation.niv_target
-                sigma_new.decompress_q_dimension().interpolate(beta_target, niv_target).save(
-                    name=f"sigma_dga_interpolated_beta{beta_target}_niv{niv_target}_iteration_{current_iter}",
-                    output_dir=config.output.output_path,
-                )
-                logger.info(
-                    f"Interpolated sigma for iteration {current_iter} to beta={beta_target} and niv={niv_target}."
-                )
 
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
@@ -1700,6 +1784,16 @@ def calculate_self_energy_q(
 
     np.save(os.path.join(config.output.output_path, "mu_history.npy"), mu_history)
     logger.info("Saved mu history as numpy array.")
+
+    if config.self_energy_interpolation.do_interpolation:
+        beta_target = config.self_energy_interpolation.beta_target
+        niv_target = config.self_energy_interpolation.niv_target
+        sigma_interpolated = interpolate_sigma(sigma_old, beta_target, niv_target, comm)
+        if comm.rank == 0:
+            sigma_interpolated.save(
+                name=f"sigma_dga_interpolated_beta{beta_target}_niv{niv_target}", output_dir=config.output.output_path
+            )
+            logger.info(f"Interpolated the final sigma to beta={beta_target} and niv={niv_target}.")
 
     return sigma_old
 

@@ -295,8 +295,9 @@ separate momentum axes.
      - Self-energy after self-consistency iteration ``i`` (also read back when a run is resumed)
      - ``[nkx, nky, nkz, no, no, 2 niv]``
    * - | ``sigma_dga_interpolated``
-       | ``_beta<b>_niv<n>_iteration_<i>.npy``
-     - The same self-energy interpolated to the target temperature and frequency box
+       | ``_beta<b>_niv<n>.npy``
+     - The final self-energy re-gridded to the target temperature and frequency box (see the
+       :ref:`self-energy interpolation section <self-energy-interpolation>`)
      - ``[nkx, nky, nkz, no, no, 2 n]``
    * - ``mu_history.npy``
      - Chemical potential of every self-consistency iteration, ``float64``

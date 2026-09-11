@@ -164,7 +164,6 @@ def _build_ladder_vertex_chunk(
     vrg_q_r_right: FourPoint,
     chi_phys_q_r: FourPoint,
     u_loc: LocalInteraction,
-    v_nonloc: Interaction,
     u_r: Interaction,
     w_start: int,
     w_stop: int,
@@ -180,7 +179,6 @@ def _build_ladder_vertex_chunk(
     :param vrg_q_r_right: The single-q "right-side" three-leg vertex :math:`\tilde\gamma^{\mathrm{q}\nu}_{r}`.
     :param chi_phys_q_r: The single-q physical susceptibility :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}`.
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` restricted to this momentum.
     :param u_r: The channel-projected total interaction :math:`\mathcal{U}^{\mathbf{q}}_{r}`.
     :param w_start: First bosonic index of the window.
     :param w_stop: One past the last bosonic index of the window.
@@ -190,7 +188,7 @@ def _build_ladder_vertex_chunk(
     gamma_w = gamma_r.take_wn_slice(w_start, w_stop)
 
     # eager rebinding releases chi* right after the first matmul; the bubble term enters on the diagonal in place
-    f_chunk = nonlocal_sde.create_auxiliary_chi_r_q(gamma_w, gchi0_w, u_loc, v_nonloc)
+    f_chunk = nonlocal_sde.create_auxiliary_chi_r_q(gamma_w, gchi0_w, u_loc)
     f_chunk = gchi0_w @ f_chunk
     f_chunk = f_chunk @ gchi0_w
     f_chunk = f_chunk.scale(-config.sys.beta**2).add_on_vn_diagonal(gchi0_w, factor=config.sys.beta**2)
@@ -305,7 +303,6 @@ def _build_pairing_vertex_pp(
                     vrg_right_grp,
                     chi_phys_grp,
                     u_loc,
-                    v_nonloc_grp,
                     u_r,
                     w_start,
                     min(w_start + w_chunk, niw_build + 1),
@@ -1799,7 +1796,12 @@ def _solve_sectors_in_memory(
 
 
 def solve(
-    giwk_dga: GreensFunction, g_dmft: GreensFunction, u_loc: LocalInteraction, v_nonloc: Interaction, comm: MPI.Comm
+    giwk_dga: GreensFunction,
+    g_dmft: GreensFunction,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    comm: MPI.Comm,
+    chunk_budgets: memory_estimator.ChunkBudgets | None = None,
 ):
     r"""
     Drives the Eliashberg step: assembles the singlet and triplet pairing vertices from the saved
@@ -1813,6 +1815,9 @@ def solve(
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param comm: The MPI communicator.
+    :param chunk_budgets: Chunk byte budgets sized by the driver from the memory estimate, of which the pairing-vertex
+        budget is used; ``None`` gives the fair-share budget of
+        :func:`~dgamore.memory_estimator.dynamic_chunk_budget`.
     :return: A dict keyed by ``(channel, parity_label)`` mapping to ``(lambdas, gaps)`` of the leading eigenvalues
         and :class:`GapFunction` objects for each solved physical frequency-parity sector. When
         ``config.eliashberg.resolve_frequency_parity`` is set the parity labels are ``"even"`` and ``"odd"``,
@@ -1889,8 +1894,10 @@ def solve(
         giwk_dga.free()
 
     node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED) if comm.size > 1 else None
-    chunk_bytes = memory_estimator.dynamic_chunk_budget(
-        mpi_utils.job_memory_total(), node_comm.size if node_comm is not None else 1
+    chunk_bytes = (
+        memory_estimator.dynamic_chunk_budget(mpi_utils.job_memory_total(), node_comm.size if node_comm else 1)
+        if chunk_budgets is None
+        else chunk_budgets.fq
     )
 
     f_dens_pp = dispatch_full_vertex_calculation(

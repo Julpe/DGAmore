@@ -11,10 +11,13 @@ beyond the core, to polynomial-fit the tail, and to interpolate the self-energy 
 obtained by fitting the highest available Matsubara frequencies.
 """
 
+import contextlib
+import io
 import itertools as it
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator, interp1d
+from mini_pole import MiniPole
 
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore.two_point import TwoPoint
@@ -74,6 +77,16 @@ class SelfEnergy(TwoPoint):
         """
         return self._smom0, self._smom1
 
+    @staticmethod
+    def _n_freq_fit(niv: int) -> int:
+        """
+        Returns the number of positive frequencies the moment fits use: the top fifth of ``niv``, at least four.
+
+        :param niv: Number of positive fermionic frequencies.
+        :return: The fit-window length.
+        """
+        return max(int(0.2 * niv), 4)
+
     def fit_smom(self):
         r"""
         Fits the first two high-frequency moments of the (k-averaged) self-energy from the highest stored Matsubara
@@ -82,26 +95,17 @@ class SelfEnergy(TwoPoint):
 
         :return: The tuple ``(mom0, mom1)`` of moments, each of shape ``[o1, o2]``.
         """
-        compress = False
-        if self.has_compressed_q_dimension:
-            compress = True
-            self.decompress_q_dimension()
-
-        mat_half_v = np.mean(self.mat[..., self.niv :], axis=(0, 1, 2))
+        # k-average over whatever momenta are stored (full or irreducible BZ, either momentum layout)
+        mat_half_v = np.mean(self.mat[..., self.niv :].reshape(-1, self.n_bands, self.n_bands, self.niv), axis=0)
         iv = 1j * MFHelper.vn(self.niv, self._beta, return_only_positive=True)
 
-        n_freq_fit = int(0.2 * self.niv)
-        if n_freq_fit < 4:
-            n_freq_fit = 4
+        n_freq_fit = self._n_freq_fit(self.niv)
 
         iwfit = iv[self.niv - n_freq_fit :][None, None, :]  # * np.eye(self.n_bands)[:, :, None]
         fitdata = mat_half_v[..., self.niv - n_freq_fit :]
 
         mom0 = np.mean(fitdata.real, axis=-1)
         mom1 = np.mean(fitdata.imag * iwfit.imag, axis=-1)
-
-        if compress:
-            self.compress_q_dimension()
         return mom0, mom1
 
     def create_with_asympt_up_to_core(self) -> "SelfEnergy":
@@ -229,12 +233,15 @@ class SelfEnergy(TwoPoint):
         """
         return self._add(other, subtract=True)
 
-    def concatenate_self_energies(self, other: "SelfEnergy") -> "SelfEnergy":
+    def concatenate_self_energies(self, other: "SelfEnergy", shell_offset: np.ndarray | None = None) -> "SelfEnergy":
         """
         Builds a self-energy that keeps ``self`` inside its core box and uses ``other`` for the shell, up to
-        ``other.niv``.
+        ``other.niv``. An optional momentum-dependent constant is added to the shell frequencies only, e.g. the
+        momentum-dependent part of the Hartree-Fock term that a momentum-local shell donor does not carry.
 
         :param other: The self-energy supplying the shell frequencies; must have at least as many frequencies as ``self``.
+        :param shell_offset: Constant added to every shell frequency, shape ``[q, o1, o2]`` in the compressed momentum
+            layout (or broadcastable to it); ``None`` adds nothing.
         :return: A new :class:`SelfEnergy` spanning ``other``'s frequency box.
         :raises ValueError: If ``other`` has fewer frequencies than ``self``.
         """
@@ -250,18 +257,26 @@ class SelfEnergy(TwoPoint):
         result_mat[..., :niv_diff] = other.mat[..., :niv_diff]
         result_mat[..., niv_diff : niv_diff + 2 * self.niv] = self.mat
         result_mat[..., niv_diff + 2 * self.niv :] = other.mat[..., niv_diff + 2 * self.niv :]
+        if shell_offset is not None:
+            offset = np.asarray(shell_offset)[..., None]
+            result_mat[..., :niv_diff] += offset
+            result_mat[..., niv_diff + 2 * self.niv :] += offset
         return SelfEnergy(
             result_mat, self.nq, self.full_niv_range, self.has_compressed_q_dimension, False, beta=self._beta
         )
 
-    def fit_smom_concatenated(self, other: "SelfEnergy") -> tuple[np.ndarray, np.ndarray]:
+    def fit_smom_concatenated(
+        self, other: "SelfEnergy", shell_offset: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Fits the high-frequency moments that :meth:`fit_smom` would report for
-        ``self.concatenate_self_energies(other)``, without building the momentum-resolved concatenation: only the
-        fit window (the top fifth of ``other``'s positive frequencies) is assembled from the same column sources,
-        so the moments are bit-identical to the full concatenation's fit.
+        ``self.concatenate_self_energies(other, shell_offset)``, without building the momentum-resolved
+        concatenation: only the fit window (the top fifth of ``other``'s positive frequencies) is assembled from the
+        same column sources, so the moments are bit-identical to the full concatenation's fit.
 
         :param other: The self-energy supplying the shell frequencies; must have at least as many frequencies as ``self``.
+        :param shell_offset: Constant added to every shell frequency, shape ``[q, o1, o2]`` in the compressed momentum
+            layout (or broadcastable to it); ``None`` adds nothing.
         :return: The tuple ``(mom0, mom1)`` of moments, each of shape ``[o1, o2]``.
         :raises ValueError: If ``other`` has fewer frequencies than ``self``.
         """
@@ -269,7 +284,7 @@ class SelfEnergy(TwoPoint):
             raise ValueError("Can not concatenate with a self-energy that has less frequencies.")
         niv_res = other.niv
         niv_diff = niv_res - self.niv
-        n_freq_fit = max(int(0.2 * niv_res), 4)
+        n_freq_fit = self._n_freq_fit(niv_res)
 
         self.compress_q_dimension()
         other = other.compress_q_dimension()
@@ -282,6 +297,8 @@ class SelfEnergy(TwoPoint):
         mat_fit = np.empty(self.current_shape[:-1] + (n_freq_fit,), dtype=self.mat.dtype)
         mat_fit[..., : split - lo] = self.mat[..., lo - niv_diff : split - niv_diff]
         mat_fit[..., split - lo :] = other.mat[..., split:]
+        if shell_offset is not None:
+            mat_fit[..., split - lo :] += np.asarray(shell_offset)[..., None]
 
         fitdata = np.mean(mat_fit.reshape(*self.nq, self.n_bands, self.n_bands, n_freq_fit), axis=(0, 1, 2))
         iv = 1j * MFHelper.vn(niv_res, self._beta, return_only_positive=True)
@@ -290,6 +307,26 @@ class SelfEnergy(TwoPoint):
         mom0 = np.mean(fitdata.real, axis=-1)
         mom1 = np.mean(fitdata.imag * iwfit.imag, axis=-1)
         return mom0, mom1
+
+    def shell_offset_from(self, other: "SelfEnergy") -> np.ndarray:
+        """
+        Returns the momentum-dependent constant by which the outermost stored frequency of ``self`` deviates from
+        ``other`` at the same frequency, i.e. the shell offset ``self`` carries on top of the momentum-local donor
+        (see :meth:`concatenate_self_energies`). Since it is read from the last positive frequency, it is exact for
+        any self-energy whose outermost frequency lies in the donor-padded shell, including linear mixtures of such
+        self-energies, and it vanishes for a self-energy padded without an offset.
+
+        :param other: The self-energy supplying the shell frequencies; must have at least as many frequencies as
+            ``self``.
+        :return: The offset of shape ``[q, o1, o2]`` in the compressed momentum layout.
+        :raises ValueError: If ``other`` has fewer frequencies than ``self``.
+        """
+        if self.niv > other.niv:
+            raise ValueError("Can not concatenate with a self-energy that has less frequencies.")
+        nb = self.n_bands
+        last = self.mat.reshape(-1, nb, nb, self.mat.shape[-1])[..., -1]
+        donor = other.mat.reshape(-1, nb, nb, other.mat.shape[-1])[..., other.niv + self.niv - 1]
+        return last - donor
 
     def fit_polynomial(self, n_fit: int = 4, degree: int = 3, niv_core: int = 0) -> "SelfEnergy":
         """
@@ -339,6 +376,11 @@ class SelfEnergy(TwoPoint):
         interpolated with shape-preserving (PCHIP) splines. Re/Im are handled
         separately on the full signed grid. All target frequencies are returned.
 
+        Below the innermost source frequency the target values are extrapolated with PCHIP from the same-sign branch
+        alone; interpolating across :math:`\nu = 0` would pull the odd imaginary part toward zero, although
+        :math:`\mathrm{Im}\,\Sigma(i0^+) = -\Gamma(0)` is finite. Nothing is clipped, so a sign change of the
+        imaginary part below the innermost frequency is followed.
+
         :param beta_target: Inverse temperature :math:`\beta` of the target grid.
         :param niv_target: Number of positive fermionic frequencies of the target grid.
         :param niv_linear: Number of innermost positive source frequencies interpolated linearly (PCHIP above).
@@ -376,7 +418,97 @@ class SelfEnergy(TwoPoint):
         im = np.where(use_lin, lin_im(vn_out), pchip_im(vn_out))
         sigma_out = re + 1j * im
 
+        # below the innermost source frequency: same-sign branch extrapolation instead of the chord across nu = 0
+        for mask, branch in (
+            ((vn_out > 0) & (vn_out < vn_in[self.niv]), slice(self.niv, None)),
+            ((vn_out < 0) & (vn_out > vn_in[self.niv - 1]), slice(None, self.niv)),
+        ):
+            re_b = PchipInterpolator(vn_in[branch], self.mat[..., branch].real, axis=-1, extrapolate=True)(vn_out[mask])
+            im_b = PchipInterpolator(vn_in[branch], self.mat[..., branch].imag, axis=-1, extrapolate=True)(vn_out[mask])
+            sigma_out[..., mask] = re_b + 1j * im_b
+
         return SelfEnergy(sigma_out, self.nq, False, self.has_compressed_q_dimension, True, beta=beta_target)
+
+    def pole_fit_mask(self) -> np.ndarray:
+        r"""
+        Flags the momenta whose diagonal self-energy is non-causal at the innermost positive frequency,
+        :math:`\mathrm{Im}\,\Sigma_{11}(i\nu_0) > 0`. There the pole extrapolation below :math:`\nu_0` beats the
+        plain one. Pole-like shapes, with the scattering still growing toward :math:`\nu \to 0`, are not flagged; at
+        the noise level of the self-energy their pole fits are not stable. Off-diagonal elements have no sign
+        constraint and are ignored.
+
+        :return: Boolean array over the flattened (row-major) momentum axis.
+        """
+        im = np.diagonal(self.mat[..., self.niv].imag, axis1=-2, axis2=-1)  # [..., o]
+        return np.any(im > 0, axis=-1).reshape(-1)
+
+    def pole_extrapolate(
+        self, beta_target: float, niv_target: int, k_indices: np.ndarray, reference: "SelfEnergy"
+    ) -> tuple[np.ndarray, np.ndarray]:
+        r"""
+        Extrapolates the self-energy below the innermost source frequency with a minimal pole representation
+        (MiniPole). Every orbital pair of every given momentum is fitted on its own, on the positive branch, with the
+        static part :math:`\Sigma_\infty` of that momentum (fitted over the same high-frequency window as
+        :meth:`fit_smom`) removed and restored, so a momentum-dependent static part leaves no constant behind that a
+        pole sum could not represent; the negative target frequencies follow from
+        :math:`\Sigma_{12}(-i\nu) = [\Sigma_{21}(i\nu)]^*`. Three things reject a momentum, in which case the caller
+        keeps ``reference``: the fit fails, it places a pole in the upper half plane where the target frequencies lie
+        (such a fit is an artifact there), or its value departs from ``reference`` by more than the source step
+        :math:`|\Sigma_{12}(i\nu_0) - \Sigma_{12}(i\nu_1)|` (a fit reproducing the grid points through canceling
+        poles). Positive :math:`\mathrm{Im}\,\Sigma` in the data is no reason for rejection; poles in the lower half
+        plane with negative weights represent it.
+
+        :param beta_target: Inverse temperature :math:`\beta` of the target grid.
+        :param niv_target: Number of positive fermionic frequencies of the target grid.
+        :param k_indices: Flattened (row-major) momentum indices to fit.
+        :param reference: The plainly re-gridded :class:`SelfEnergy` on the target grid (same momenta as ``self``);
+            its values below the innermost source frequency are the fallback.
+        :return: The tuple ``(values, accepted)``: ``values`` of shape ``[k, o1, o2, v]`` on the target frequencies
+            below the innermost source frequency (ascending), ``accepted`` of shape ``[k]`` marking the momenta whose
+            fits passed for every orbital pair.
+        """
+        vn_pos = MFHelper.vn(self.niv, float(self._beta), return_only_positive=True)
+        vn_out = MFHelper.vn(niv_target, float(beta_target))
+        z_pos = 1j * vn_out[(vn_out > 0) & (vn_out < vn_pos[0])]
+        n_pos = z_pos.size
+
+        mat = self.mat.reshape(-1, self.n_bands, self.n_bands, 2 * self.niv)[k_indices].astype(np.complex128)
+        # the static part per momentum: the k-averaged moment would leave the k-dependent remainder in the fit input
+        n_fit = self._n_freq_fit(self.niv)
+        sinf = mat[..., 2 * self.niv - n_fit :].real.mean(axis=-1)
+        values = np.zeros((len(k_indices), self.n_bands, self.n_bands, 2 * n_pos), dtype=np.complex128)
+        accepted = np.ones(len(k_indices), dtype=bool)
+        for k, o1, o2 in it.product(range(len(k_indices)), range(self.n_bands), range(self.n_bands)):
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):  # MiniPole prints its tolerance diagnostics
+                    fit = MiniPole(mat[k, o1, o2, self.niv :] - sinf[k, o1, o2], vn_pos, n0=0, err=1e-6, err_type="rel")
+            except Exception:
+                accepted[k] = False
+                continue
+            if fit.pole_location.imag.max() > 0:
+                accepted[k] = False
+                continue
+            weights = fit.pole_weight.reshape(fit.pole_location.size, -1)
+            values[k, o1, o2, n_pos:] = MiniPole.cal_G_vector(z_pos, weights, fit.pole_location)[:, 0] + sinf[k, o1, o2]
+        values[..., :n_pos] = np.conj(np.swapaxes(values[..., n_pos:], -3, -2))[..., ::-1]
+        step = np.abs(mat[..., self.niv] - mat[..., self.niv + 1])[..., None]
+        plain = reference.mat.reshape(-1, self.n_bands, self.n_bands, 2 * niv_target)[k_indices]
+        plain = plain[..., niv_target - n_pos : niv_target + n_pos]
+        accepted &= np.all(np.abs(values - plain) <= step, axis=(-3, -2, -1))
+        return values, accepted
+
+    def replace_innermost(self, k_indices: np.ndarray, values: np.ndarray) -> "SelfEnergy":
+        r"""
+        Overwrites the innermost frequencies of the given momenta, symmetric around :math:`\nu = 0`, with ``values``.
+
+        :param k_indices: Flattened (row-major) momentum indices to overwrite.
+        :param values: Replacement values of shape ``[k, o1, o2, v]``; ``v`` innermost frequencies are overwritten.
+        :return: ``self`` with the values written in place.
+        """
+        n_inner = values.shape[-1]
+        flat = self.mat.reshape(-1, self.n_bands, self.n_bands, 2 * self.niv)
+        flat[k_indices, :, :, self.niv - n_inner // 2 : self.niv + n_inner // 2] = values
+        return self
 
     def _estimate_niv_core(self, err: float = 1e-5):
         """
@@ -393,8 +525,8 @@ class SelfEnergy(TwoPoint):
         max_ind_imag = 0
 
         for i, j in it.product(range(self.n_bands), repeat=2):
-            k_mean = np.mean(self.mat[:, :, :, i, j, :], axis=(0, 1, 2))
-            asympt_mean = np.mean(asympt.mat[:, :, :, i, j, :], axis=(0, 1, 2))
+            k_mean = np.mean(self.mat[..., i, j, :].reshape(-1, 2 * self.niv), axis=0)
+            asympt_mean = np.mean(asympt.mat[..., i, j, :].reshape(-1, 2 * self.niv), axis=0)
             ind_real = np.argmax(np.abs(k_mean.real - asympt_mean.real) < err)
             ind_imag = np.argmax(np.abs(k_mean.imag - asympt_mean.imag) < err)
 
