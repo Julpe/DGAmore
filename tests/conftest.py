@@ -14,6 +14,7 @@ import pytest
 
 import dgamore.brillouin_zone as bz
 import dgamore.config as config
+import dgamore.local_n_point as local_n_point
 
 
 def pytest_addoption(parser):
@@ -61,6 +62,7 @@ def mock_numpy_save(monkeypatch):
 
     monkeypatch.setattr(np, "save", fake_save)
     monkeypatch.setattr(np, "savetxt", fake_save)
+    monkeypatch.setattr(local_n_point, "_flush_and_drop", lambda path: None)  # nothing was written to flush
     yield
 
 

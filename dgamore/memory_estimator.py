@@ -81,8 +81,8 @@ MAX_SLICE_CHUNK_BYTES: int = 2**32
 MAX_CHUNK_BUDGET_BYTES: int = 2**40
 
 # Share of the total-memory headroom the self-energy passes' chunks may take; the rest stays free for the gap between
-# the job memory total the sizing reads and the available memory the fit check reads, and for un-modeled residents.
-SDE_HEADROOM_SHARE: float = 0.9
+# the job memory total the sizing reads and the available memory the fit check reads, and for un-modeled memory.
+SDE_HEADROOM_SHARE: float = 0.85
 
 
 @dataclass(frozen=True)

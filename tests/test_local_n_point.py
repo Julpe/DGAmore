@@ -5,12 +5,17 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import itertools
+import os
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
+import dgamore.local_n_point as local_n_point
 from dgamore.local_n_point import LocalNPoint
+
+# captured at import time, before the autouse fixtures replace them with no-ops
+_real_np_save, _real_flush_and_drop = np.save, local_n_point._flush_and_drop
 
 
 def test_initializes_with_valid_parameters():
@@ -434,6 +439,28 @@ def test_raises_error_when_swapping_with_less_than_two_fermionic_dimensions(num_
     obj = LocalNPoint(mat, 4, 1, num_vn_dimensions)
     with pytest.raises(ValueError):
         obj.swap_fermionic_frequency_axes()
+
+
+def test_save_writes_the_file_then_syncs_it_and_drops_it_from_the_page_cache(monkeypatch, tmp_path):
+    """save writes the half-range matrix, fsyncs the written file and advises the kernel to drop its pages."""
+    monkeypatch.setattr(np, "save", _real_np_save)
+    monkeypatch.setattr(local_n_point, "_flush_and_drop", _real_flush_and_drop)
+    synced, advised, real_fsync = [], [], os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd)))
+    monkeypatch.setattr(
+        os,
+        "posix_fadvise",
+        lambda fd, offset, length, advice: advised.append((fd, offset, length, advice)),
+        raising=False,
+    )
+    monkeypatch.setattr(os, "POSIX_FADV_DONTNEED", 4, raising=False)
+
+    mat = (np.arange(4 * 4 * 5 * 6) + 1j).reshape(4, 4, 5, 6).astype(np.complex64)
+    LocalNPoint(mat, 2, 1, 1, full_niw_range=False).save(output_dir=str(tmp_path), name="dump")
+
+    assert np.array_equal(np.load(tmp_path / "dump.npy"), mat)
+    assert len(synced) == 1 and isinstance(synced[0], int)
+    assert advised == [(synced[0], 0, 0, 4)]
 
 
 def test_saves_matrix_calls_to_full_niw_range_when_full_range(monkeypatch):

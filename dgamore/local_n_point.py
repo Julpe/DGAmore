@@ -18,6 +18,25 @@ import numpy as np
 from dgamore.n_point_base import IHaveMat
 
 
+def _flush_and_drop(path: str) -> None:
+    """
+    Forces a freshly written file to disk and drops its pages from the page cache. Without this a large dump lingers
+    as dirty, not yet evictable memory until the kernel's writeback catches up (Linux keeps dirty pages up to
+    ``vm.dirty_ratio``), memory that the budget of the following steps cannot see. ``posix_fadvise`` exists on
+    Linux only; other platforms just sync.
+
+    :param path: Path of the file just written.
+    :return: None.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        if hasattr(os, "posix_fadvise"):
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
 class LocalNPoint(IHaveMat):
     """
     Base class for all (Local)NPoint objects, such as the (Full/Irreducible) Vertex functions, Susceptibilities,
@@ -527,13 +546,17 @@ class LocalNPoint(IHaveMat):
     def save(self, output_dir: str = "./", name: str = "please_give_me_a_name") -> None:
         """
         Saves the content of the matrix to a numpy file. Always saves it in half the niw range to save storage space.
+        The file is forced to disk and dropped from the page cache right away (see :func:`_flush_and_drop`), so the
+        dumps of a rank never accumulate as dirty page cache next to its arrays.
 
         :param output_dir: Directory to write the ``.npy`` file to.
         :param name: File name (without extension).
         :return: None.
         """
         is_self_full_niw_range = self.full_niw_range
-        np.save(os.path.join(output_dir, f"{name}.npy"), self.to_half_niw_range().mat, allow_pickle=False)
+        path = os.path.join(output_dir, f"{name}.npy")
+        np.save(path, self.to_half_niw_range().mat, allow_pickle=False)
+        _flush_and_drop(path)
         if is_self_full_niw_range:
             self.to_full_niw_range()
 
