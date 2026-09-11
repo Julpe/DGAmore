@@ -1981,8 +1981,8 @@ def test_slice_constructor_matches_streaming_route(setup, no):
     assert np.allclose(result.mat, reference.mat, atol=1e-5 * np.max(np.abs(reference.mat)))
 
 
-def test_slice_constructor_is_chunk_size_invariant(setup, monkeypatch):
-    """A one-frequency chunk budget reproduces the single-chunk result, pinning the chunk-boundary bookkeeping."""
+def test_slice_constructor_is_bit_invariant_under_the_chunk_budget(setup, monkeypatch):
+    """Single-w chunks, w-chunks, whole momenta and momentum groups all reproduce the single-chunk bits exactly."""
     no = 2
     config.sys.n_bands = no
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
@@ -1991,10 +1991,15 @@ def test_slice_constructor_is_chunk_size_invariant(setup, monkeypatch):
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
     one_chunk = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
 
+    one_wn = no**4 * (2 * NIV) ** 2 * np.dtype(es.DTYPE).itemsize
+    for budget in (1, 2 * one_wn, N_W * one_wn, 2 * N_W * one_wn):
+        gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
+        chunked = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist, chunk_bytes=budget)
+        assert np.array_equal(one_chunk.mat, chunked.mat)
+
     monkeypatch.setattr(es, "SLICE_CHUNK_BYTES", 1)
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
     per_w = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
-
     assert np.array_equal(one_chunk.mat, per_w.mat)
 
 

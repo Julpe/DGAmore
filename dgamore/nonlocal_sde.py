@@ -166,8 +166,9 @@ def create_auxiliary_chi_r_q_sum(
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` (full or half bosonic range).
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
     :param u_loc: The bare local interaction :math:`U`.
-    :param chunk_bytes: Chunk byte budget of the build; defaults to the :data:`SLICE_CHUNK_BYTES` floor (callers pass
-        the dynamic budget of :func:`~dgamore.memory_estimator.dynamic_chunk_budget`).
+    :param chunk_bytes: Chunk byte budget of the build; defaults to the :data:`SLICE_CHUNK_BYTES` floor (the
+        pipeline passes the budget the driver sizes from the memory estimate, see
+        :func:`~dgamore.memory_estimator.max_chunk_budget`). Every budget yields the same bits.
     :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` as a
         :class:`FourPoint` (half niw range, one fermionic dimension).
     """
@@ -867,7 +868,8 @@ def _run_fft_sde_pass(
     :param negative_w: If True, build each chunk's negative-:math:`\omega` block via
         :meth:`LocalNPoint.to_negative_niw_range` before contracting (the negative pass) and trim the kernel peak
         back to the OS on the last chunk's free; if False, contract the mapped chunks directly (the positive pass).
-    :param chunk_bytes: Chunk byte budget of one exchanged full-BZ bosonic window (``None`` uses the floor).
+    :param chunk_bytes: Chunk byte budget of one exchanged full-BZ bosonic window (``None`` uses the floor). The
+        bosonic sum is reassociated at the chunk boundaries, so the result depends on the budget at the rounding level.
     :return: The rank-local R-space :class:`SelfEnergy` of this pass.
     """
     budget = SLICE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
@@ -1228,6 +1230,7 @@ def calculate_sigma_proposal(
     comm: MPI.Comm,
     current_iter: int,
     annealer: "LambdaAnnealer | None" = None,
+    chunk_budgets: memory_estimator.ChunkBudgets | None = None,
 ) -> SelfEnergy:
     r"""
     Returns the raw (un-mixed) DGA self-energy proposal :math:`S(\Sigma_{\mathrm{in}})` at chemical potential
@@ -1255,6 +1258,9 @@ def calculate_sigma_proposal(
     :param current_iter: The current iteration number (the RPA susceptibility is saved only on iteration 1).
     :param annealer: The active :class:`LambdaAnnealer` threaded into the kernel step, or ``None`` when annealing
         is off.
+    :param chunk_budgets: Chunk byte budgets of the auxiliary-susceptibility build and the self-energy passes (sized
+        by the driver from the memory estimate); ``None`` gives both the job-wide fair-share budget of
+        :func:`_sde_chunk_budget`.
     :return: The raw full-BZ proposal :class:`SelfEnergy` (replicated on every rank, DMFT tail attached).
     """
     logger = config.logger
@@ -1322,7 +1328,8 @@ def calculate_sigma_proposal(
     if config.eliashberg.perform_eliashberg:
         gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
 
-    chunk_bytes = _sde_chunk_budget(comm, shared_node_comm)
+    chunk_bytes = _sde_chunk_budget(comm, shared_node_comm) if chunk_budgets is None else chunk_budgets.sde
+    aux_chunk_bytes = chunk_bytes if chunk_budgets is None else chunk_budgets.chiq_aux
 
     gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
         shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
@@ -1337,7 +1344,7 @@ def calculate_sigma_proposal(
             v_nonloc,
             mpi_dist_irrk,
             annealer,
-            chunk_bytes,
+            aux_chunk_bytes,
         ),
         copy=False,
     )
@@ -1361,7 +1368,7 @@ def calculate_sigma_proposal(
             v_nonloc,
             mpi_dist_irrk,
             annealer,
-            chunk_bytes,
+            aux_chunk_bytes,
         ).scale(3.0),
         copy=False,
     )
@@ -1515,7 +1522,12 @@ def _mixing_history_cap(
 
 
 def calculate_self_energy_q(
-    comm: MPI.Comm, u_loc: LocalInteraction, v_nonloc: Interaction, sigma_dmft: SelfEnergy, sigma_local: SelfEnergy
+    comm: MPI.Comm,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    sigma_dmft: SelfEnergy,
+    sigma_local: SelfEnergy,
+    chunk_budgets: memory_estimator.ChunkBudgets | None = None,
 ) -> SelfEnergy:
     r"""
     Runs the non-local DGA self-energy calculation. Calculates the Hartree- and Fock terms, the bubble,
@@ -1528,6 +1540,9 @@ def calculate_self_energy_q(
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param sigma_dmft: The DMFT self-energy (used as the starting point and for the shell/tail correction).
     :param sigma_local: The locally recomputed self-energy (used for smoothing out the DGA :class:`SelfEnergy`).
+    :param chunk_budgets: Chunk byte budgets of the auxiliary-susceptibility build and the self-energy passes (sized
+        by the driver from the memory estimate); ``None`` gives both the job-wide fair-share budget of
+        :func:`_sde_chunk_budget`.
     :return: The converged (or last-iteration) momentum-dependent DGA :class:`SelfEnergy`.
     """
     logger = config.logger
@@ -1622,6 +1637,7 @@ def calculate_self_energy_q(
             comm,
             current_iter,
             annealer=annealer,
+            chunk_budgets=chunk_budgets,
         )
         # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
 
