@@ -983,6 +983,41 @@ def test_loop_forwards_the_chunk_budgets_to_every_proposal(monkeypatch, tmp_path
     assert seen == [budgets, budgets, None, None]
 
 
+def test_resumed_run_shares_the_starting_iterate_per_node_before_the_first_proposal(monkeypatch, tmp_path):
+    """A resumed run reads its iterate on rank 0 only and hands it to the node-shared window before iteration one."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [config.sys.mu])  # no history file
+    original, before, loads = nonlocal_sde._share_sigma_per_node, [], []
+
+    def spy(sigma, node_comm, roots_comm):
+        win = original(sigma, node_comm, roots_comm)
+        if not calls:  # before the first proposal: the starting iterate, not the loop's mixed one
+            before.append((threading.current_thread().name, complex(sigma.mat.reshape(-1)[0])))
+        return win
+
+    monkeypatch.setattr(nonlocal_sde, "_share_sigma_per_node", spy)
+
+    mat = np.full((1, 1, 1, 16), 0.5 + 0.2j, dtype=np.complex64)
+
+    def loaded(default):
+        loads.append(threading.current_thread().name)
+        return SelfEnergy(mat.copy(), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0), 3
+
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", loaded)
+    run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
+    assert loads == ["rank0"]  # only rank 0 reads the file
+    value = complex(np.complex64(0.5 + 0.2j))
+    assert sorted(before) == [("rank0", value), ("rank1", value)]  # both ranks see rank 0's values
+
+    before.clear()
+    calls.clear()
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (default, 0))  # a fresh run
+    run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
+    assert before == []
+
+
 def test_loop_concatenates_the_previous_iterate_on_rank0_only(monkeypatch, tmp_path):
     """Only rank 0 rebuilds the previous iterate on the DMFT tail each iteration; the other ranks never copy it."""
     seen = _run_loop_on_two_node_ranks(monkeypatch, tmp_path, "concatenate_self_energies", SelfEnergy)

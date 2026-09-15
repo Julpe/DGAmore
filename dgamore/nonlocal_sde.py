@@ -1567,7 +1567,9 @@ def calculate_self_energy_q(
     sc_roots_comm = comm.Split(0 if sc_node_comm.rank == 0 else 1) if sc_node_comm is not None else None
     sigma_win = None
 
-    sigma_old, starting_iter = get_starting_sigma(sigma_dmft)
+    # only rank 0 reads a previous run's iterate; the other ranks receive it below, once per node
+    sigma_old, starting_iter = get_starting_sigma(sigma_dmft) if comm.rank == 0 else (sigma_dmft, 0)
+    starting_iter = comm.bcast(starting_iter, root=0)
     if starting_iter > 0:
         logger.info(
             f"Using previous calculation and starting the self-consistency loop at iteration {starting_iter + 1}."
@@ -1609,6 +1611,12 @@ def calculate_self_energy_q(
     # the starting iterate keeps the plain DMFT tail; the first proposal attaches the V^q Hartree-Fock offset
     if sigma_old.niv < niv_cut:
         sigma_old = sigma_old.concatenate_self_energies(sigma_dmft)
+
+    # rank 0 holds a resumed run's full-BZ starting iterate: spread it like the loop's mixed iterate, one window
+    # per node (the loop frees this window after the first proposal)
+    if starting_iter > 0 and sc_node_comm is not None:
+        sigma_old = mpi_dist_fullbz.bcast_npoint(sigma_old)
+        sigma_win = _share_sigma_per_node(sigma_old.compress_q_dimension(), sc_node_comm, sc_roots_comm)
 
     delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_local.cut_niv(config.box.niv_core)
 
