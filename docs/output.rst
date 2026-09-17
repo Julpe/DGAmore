@@ -238,7 +238,8 @@ a single momentum point and keep three leading axes of length one.
      - Full vertex :math:`F_{\mathrm{r}}`, both fermionic axes on the core box
      - ``[no, no, no, no, niw_core + 1, 2 niv_core, 2 niv_core]``
    * - ``f_dc_loc.npy``
-     - Magnetic full vertex for the double-counting kernel, first fermionic axis on the full asymptotic box
+     - Double-counting vertex :math:`\tfrac12(F_{\mathrm{d}} + 3F_{\mathrm{m}})`, first fermionic axis on the full
+       asymptotic box
      - ``[no, no, no, no, niw_core + 1, 2 niv_full, 2 niv_core]``
    * - ``vrg_dens_loc.npy``, ``vrg_magn_loc.npy``
      - Three-leg vertex :math:`\gamma_{\mathrm{r}}`

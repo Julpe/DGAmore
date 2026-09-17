@@ -1064,18 +1064,25 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         if num_vn_dimensions not in (1, 2):
             raise ValueError("Invalid number of fermionic frequency dimensions.")
         full_shape = (n_bands,) * 4 + (2 * niw + 1,) + (2 * niv,) * num_vn_dimensions
+        if num_vn_dimensions == 1:
+            # no fermionic structure is left on one axis: unravel the [w, x1, x2] eye and repeat it over v
+            eye = np.tile(np.eye(n_bands**2, dtype=DTYPE)[None], (2 * niw + 1, 1, 1))
+            ident = LocalFourPoint(
+                eye, num_vn_dimensions=0, full_niw_range=full_niw_range, frequency_notation=frequency_notation
+            )
+            mat = np.repeat(ident.to_full_indices(full_shape[:-1]).mat[..., None], 2 * niv, axis=-1)
+            return LocalFourPoint(
+                mat, num_vn_dimensions=1, full_niw_range=full_niw_range, frequency_notation=frequency_notation
+            )
         compound_index_size = 2 * niv * n_bands**2
         mat = np.tile(np.eye(compound_index_size, dtype=DTYPE)[None, ...], (2 * niw + 1, 1, 1))
 
-        result = LocalFourPoint(
+        return LocalFourPoint(
             mat,
             num_vn_dimensions=num_vn_dimensions,
             full_niw_range=full_niw_range,
             frequency_notation=frequency_notation,
         ).to_full_indices(full_shape)
-        if num_vn_dimensions == 1:
-            return result.take_vn_diagonal()
-        return result
 
     @staticmethod
     def identity_like(other: "LocalFourPoint") -> "LocalFourPoint":

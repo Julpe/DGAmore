@@ -47,18 +47,18 @@ def get_hartree_fock(u_loc: LocalInteraction, v_nonloc: Interaction) -> tuple[np
     the sum over the spins of the first term in Eq. (4.55) in Anna Galler's thesis results in a simple factor of 2. This
     can be seen in my master's thesis, Eq. (3.55). The Hartree-Fock term is given by
 
-    .. math:: \Sigma^{\mathbf{k}}_{\mathrm{HF};12} = 2\sum_{ab}(U_{1a2b} + V^{\mathbf{q}=0}_{1a2b}) n_{ba}
-        - \frac{1}{n_{\mathbf{q}}} \sum_{\mathbf{q}ab} (U_{1ab2} + V^{\mathbf{q}}_{1ab2}) n^{\mathbf{k}-\mathbf{q}}_{ba}
+    .. math:: \Sigma^{\mathbf{k}}_{\mathrm{HF};12} = 2\sum_{ab}(U_{12ab} + V^{\mathbf{q}=0}_{12ab}) n_{ba}
+        - \frac{1}{n_{\mathbf{q}}} \sum_{\mathbf{q}ab} (U_{1ba2} + V^{\mathbf{q}}_{1ba2}) n^{\mathbf{k}-\mathbf{q}}_{ba}
 
-    where the first sum is the Hartree and the second the Fock term. The Hartree contraction places the external
-    orbitals on the first and third slot, so it picks up the inter-orbital density :math:`U'` stored at the ``abab``
-    slots, and the Fock contraction carries them on the outer slots, exactly as
+    where the first sum is the Hartree and the second the Fock term, both in the stored equation layout
+    (:math:`U'` at ``aabb``, see :meth:`~dgamore.hamiltonian.Hamiltonian.read_umatrix`): the Hartree contraction
+    places the external orbitals on the first two slots and the Fock contraction on the outer slots, exactly as
     :func:`dgamore.local_sde.get_local_hartree_fock` does.
 
     The Fock momentum sum is a circular convolution over the periodic Brillouin zone, so it is evaluated with the
     convolution theorem instead of an explicit q-loop: :math:`\Sigma^{\mathbf{k}}_{\mathrm{F}} =
     -\tfrac{1}{n_{\mathbf{q}}}\,\mathcal{F}^{-1}
-    \big[\mathcal{F}[(U+V)^{\mathbf{q}}_{1ab2}]\,\mathcal{F}[n_{ba}]\big]` (a plain convolution, since the shift
+    \big[\mathcal{F}[(U+V)^{\mathbf{q}}_{1ba2}]\,\mathcal{F}[n_{ba}]\big]` (a plain convolution, since the shift
     is :math:`n^{\mathbf{k}-\mathbf{q}}`). This is
     :math:`O(n_{\mathbf{k}} \log n_{\mathbf{k}})` and materializes only R-space ``[k, o^4]``/``[k, o^2]`` arrays, never
     a ``[q, k]`` occupation block, so the whole full-BZ term is computed on every rank without a q-distribution.
@@ -68,9 +68,9 @@ def get_hartree_fock(u_loc: LocalInteraction, v_nonloc: Interaction) -> tuple[np
     :return: The tuple ``(hartree, fock)`` of self-energy contributions, broadcastable to ``[k, o1, o2, v]``.
     """
     v_q0 = v_nonloc.find_q((0, 0, 0))
-    # U' is stored at the abab slots, so the Hartree term contracts "qacbd" (external orbitals on slots 1 and 3);
-    # the Fock term below puts them on the outer slots, like local_sde.get_local_hartree_fock
-    hartree = 2 * (u_loc + v_q0).times("qacbd,dc->ab", config.sys.occ)
+    # equation layout: Hartree 2 U_{12ab} n_{ba} with the external orbitals on the first two slots; the Fock term
+    # below is -U_{1ba2} n_{ba} with them on the outer slots, like local_sde.get_local_hartree_fock
+    hartree = 2 * (u_loc + v_q0).times("qabcd,dc->ab", config.sys.occ)
 
     nb = config.sys.n_bands
     nk_tot = np.prod(config.lattice.nk)
@@ -81,7 +81,7 @@ def get_hartree_fock(u_loc: LocalInteraction, v_nonloc: Interaction) -> tuple[np
     w_r_mat = w_r.decompress_q_dimension().mat  # [kx, ky, kz, a, b, c, d]
     occ_r = sp.fft.fftn(config.sys.occ_k.astype(w_r_mat.dtype, copy=False), axes=(0, 1, 2))  # [kx, ky, kz, d, c]
 
-    fock_r = np.einsum("xyzacdb,xyzdc->xyzab", w_r_mat, occ_r, optimize=True)
+    fock_r = np.einsum("xyzadcb,xyzdc->xyzab", w_r_mat, occ_r, optimize=True)
     fock = sp.fft.ifftn(fock_r, axes=(0, 1, 2), overwrite_x=True).reshape(nk_tot, nb, nb)
     fock *= -1.0 / nk_tot
     return hartree[None, ..., None], fock[..., None]  # [k,o1,o2,v]
@@ -327,25 +327,27 @@ def min_static_compound_eigenvalue(chi_phys_q_r: FourPoint) -> float:
 
 def calculate_sigma_dc_kernel(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, u_loc: LocalInteraction) -> FourPoint:
     r"""
-    Returns the double-counting kernel for the self-energy calculation - the local *magnetic* contribution that
-    the two ladder terms of the Schwinger-Dyson equation count twice,
+    Returns the double-counting kernel for the self-energy calculation - the local contribution that the two
+    ladder terms of the Schwinger-Dyson equation count twice, closed with the exchange attachment,
 
     .. math:: -\Sigma^{\mathrm{dc}}_{12} = +\frac{1}{\beta}\sum_{\mathrm{q}\nu'} U_{acb2}\,
-        F^{\omega\nu\nu'}_{\mathrm{magn};1dfe}\,\chi^{\mathrm{q}\nu'}_{0;efcb}\,G^{\mathrm{k}-\mathrm{q}}_{da},
+        F^{\omega\nu\nu'}_{\mathrm{dc};1dfe}\,\chi^{\mathrm{q}\nu'}_{0;efcb}\,G^{\mathrm{k}-\mathrm{q}}_{da},
 
     assembled in the contraction layout of :func:`calculate_kernel_r_q` (the factor :math:`-2` relative to the
     global :math:`-\tfrac12` prefactor of the sigma contraction realizes the sign above). Keeping the full ladder
     vertices in both bracket terms and adding this correction leaves exactly one local copy, so the local limit of
-    the total reproduces the local Schwinger-Dyson equation; equivalent placements (subtracting the local density
-    part of the direct term, or the full local part of the transversal term) differ only by closures of
-    :math:`F^{\omega}_{\uparrow\uparrow}`, which vanish for a crossing-symmetric impurity vertex. The frequency sum
-    acts on the *second* fermionic argument of the local magnetic vertex; since ``f_dc_loc`` stores the asymmetric
+    the total reproduces the local Schwinger-Dyson equation. The closed vertex :math:`F_{\mathrm{dc}}` is the local
+    part of the transversal term, :math:`\tfrac12(F_{\mathrm{d}} + 3F_{\mathrm{m}})` (see
+    :func:`~dgamore.local_sde.double_counting_vertex`), whose local content cancels term by term against the
+    density form of the local equation for any band count. The frequency sum acts on the
+    *second* fermionic argument of the local double-counting vertex; since ``f_dc_loc`` stores the asymmetric
     :math:`2 n_{\nu,\mathrm{full}} \times 2 n_{\nu,\mathrm{core}}` box with the **first** index on the full box
     (see :func:`~dgamore.local_sde.create_full_vertex_from_gamma`), the compound symmetry of the symmetrized local
     vertex, :math:`F^{\omega\nu\nu'}_{1234} = F^{\omega\nu'\nu}_{4321}`, is used to read the stored first index as
     the summed :math:`\nu'`.
 
-    :param f_dc_loc: The local full vertex :math:`F_{\mathrm{magn}}` used for the double-counting correction.
+    :param f_dc_loc: The local double-counting vertex :math:`F_{\mathrm{dc}}` (see
+        :func:`~dgamore.local_sde.double_counting_vertex`).
     :param gchi0_q: The momentum-dependent bare bubble :math:`\chi^{\mathrm{q}\nu}_{0}` (full fermionic box).
     :param u_loc: The bare local interaction :math:`U`.
     :return: The double-counting kernel (contraction layout) as a :class:`FourPoint`, cut to the core fermionic box.

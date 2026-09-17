@@ -192,10 +192,10 @@ def test_nonlocal_fock_fft_matches_explicit_momentum_sum():
     fock_ref = np.zeros((nk_tot, nb, nb), dtype=np.complex64)
     for d in range(nb):
         for c in range(nb):
-            occ_qk = np.array([np.roll(occ_k[..., d, c], tuple(q), axis=(0, 1, 2)) for q in q_list]).reshape(
+            occ_qk = np.array([np.roll(occ_k[..., c, d], tuple(q), axis=(0, 1, 2)) for q in q_list]).reshape(
                 nk_tot, nk_tot
             )
-            # -sum_q (U + V^q)_{1ab2} n^{k-q}_{ba}: external orbitals on the outer slots of uq[q, o1, o2, o3, o4]
+            # -sum_q (U + V^q)_{1ab2} n^{k-q}_{ab}: external orbitals on the outer slots of uq[q, o1, o2, o3, o4]
             fock_ref += np.einsum("qab,qk->kab", uq[:, :, c, d, :], occ_qk, optimize=True)
     fock_ref *= -1.0 / nk_tot
 
