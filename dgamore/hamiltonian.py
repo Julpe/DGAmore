@@ -197,6 +197,12 @@ class Hamiltonian:
         the exchange interaction J and the inter-orbital density-density interaction V or sometimes U'.
         vdd (vpp) (vdp) are optional parameters, if left empty, they are set to V=U-2J.
 
+        The tensor is stored in the layout of the equations, :math:`U_{1234} c^{\dagger}_1 c_2 c^{\dagger}_3 c_4`:
+        :math:`U` at ``aaaa``, the inter-orbital density-density :math:`V` at ``aabb``, Hund's :math:`J` at ``abba``
+        and the pair hopping :math:`J` at ``abab``. This is the layout every dynamic contraction reads (the channel
+        projections, the Schwinger-Dyson attachments, the kernels); the w2dynamics ``umatrix`` file layout (:math:`V`
+        at ``abab``) is converted on reading, see :meth:`read_umatrix`.
+
         :param nd_bands: Number of d orbitals (placed first in the orbital ordering).
         :param np_bands: Number of p orbitals (placed after the d orbitals).
         :param udd: Intra-orbital Hubbard :math:`U_{dd}`.
@@ -251,15 +257,15 @@ class Hamiltonian:
         for a, b, c, d in it.product(range(n_tot), repeat=4):
             bands = [a + 1, b + 1, c + 1, d + 1]
 
-            # parameters of the two orbitals the element couples: (a, b), or (a, c) for the pair-hopping U_{aabb}
+            # parameters of the two orbitals the element couples: (a, b), or (a, c) for the density-density U_{aabb}
             u, j, v = get_params(a, b if a != b else c)
 
             if a == b == c == d:  # U_{llll}
                 interaction_elements.append(InteractionElement(r_loc, bands, u))
-            elif (a == d and b == c) or (a == b and c == d):  # U_{lmml}, U_{llmm}
-                interaction_elements.append(InteractionElement(r_loc, bands, j))
-            elif a == c and b == d:  # U_{lmlm}
+            elif a == b and c == d:  # U_{llmm}: inter-orbital density-density
                 interaction_elements.append(InteractionElement(r_loc, bands, v))
+            elif (a == d and b == c) or (a == c and b == d):  # U_{lmml} Hund's exchange, U_{lmlm} pair hopping
+                interaction_elements.append(InteractionElement(r_loc, bands, j))
 
         return self._add_interaction_term(interaction_elements)
 
@@ -467,7 +473,7 @@ class Hamiltonian:
         f.close()
 
     def read_umatrix(self, filename: str) -> "Hamiltonian":
-        """
+        r"""
         Reads a file and creates the interaction matrix from it. The file should contain the number of bands in the
         first line, the number of r values in the second line and one weight per r value in the third line. As in
         wannier90, the i-th weight belongs to the i-th distinct lattice vector in order of appearance and divides that
@@ -475,10 +481,13 @@ class Hamiltonian:
         matrix entries. It looks very similar to the format of a wannier_hr.dat file. The format is: r_lat_x r_lat_y
         r_lat_z orb1 orb2 orb3 orb4 realvalue imagvalue, where r_lat is the relative lattice vector and orb1-4 are the
         (1-based) orbital indices. The interaction is assumed to be purely real. The ordering of the entries themselves
-        does not matter. Note: The file must not contain any comments or empty lines. The orbital slots follow the
-        Kanamori builder: the intra-orbital U sits at the ``aaaa`` slots, the inter-orbital density-density U' at
-        ``abab`` and the Hund's J at ``aabb`` and ``abba``; a density-density non-local term between orbital a at
-        r_lat and orbital b at the origin goes to ``abab`` as well.
+        does not matter. Note: The file must not contain any comments or empty lines. The **file** follows the
+        w2dynamics layout :math:`C_{ijkl}` (pairs :math:`(i,k)` and :math:`(j,l)`): the intra-orbital U at ``aaaa``,
+        the inter-orbital density-density U' at ``abab``, Hund's J at ``abba`` and the pair hopping J at ``aabb``; a
+        density-density non-local term between orbital a at r_lat and orbital b at the origin goes to ``abab`` as
+        well. The tensor is **stored** in the layout of the equations,
+        :math:`U_{1234} c^{\dagger}_1 c_2 c^{\dagger}_3 c_4` (U' at ``aabb``, pair hopping at ``abab``), so the
+        middle two orbital indices are swapped on reading, exactly as :meth:`kanamori_interaction_dp` builds them.
 
         :param filename: Path to the umatrix file.
         :return: ``self`` (for chaining).
@@ -502,10 +511,11 @@ class Hamiltonian:
 
         interaction_elements = []
         for i in range(len(values)):
+            # file element C_{ijkl} (pairs (i,k),(j,l)) is stored as U_{ikjl} (pairs (1,2),(3,4)): middle slots swapped
             interaction_elements.append(
                 InteractionElement(
                     r_lat=values[i, 0:3].astype(int).tolist(),
-                    orbs=values[i, 3:7].astype(int).tolist(),
+                    orbs=values[i, [3, 5, 4, 6]].astype(int).tolist(),
                     value=values[i, 7].astype(float),
                 )
             )
@@ -800,10 +810,11 @@ class Hamiltonian:
 
     def _check_interaction_swapping_symmetry(self, r_to_index: dict[tuple[int, int, int], int]) -> None:
         r"""
-        Checks the symmetries every real Coulomb tensor has, in the stored orbital-slot convention: the pair-exchange
-        symmetry :math:`U_{1234} = U_{2143}` and the reality symmetry :math:`U_{1234} = U_{3412}` of the local part,
-        and for the non-local part :math:`V_{1234}(\mathbf{R}) = V_{2143}(-\mathbf{R})`, which requires every listed
-        lattice vector to come with its mirror image, and :math:`V_{1234}(\mathbf{R}) = V_{3412}(\mathbf{R})`.
+        Checks the symmetries every real Coulomb tensor has, in the stored orbital-slot convention
+        :math:`U_{1234} c^{\dagger}_1 c_2 c^{\dagger}_3 c_4`: the reality symmetry :math:`U_{1234} = U_{2143}` and
+        the pair-exchange symmetry :math:`U_{1234} = U_{3412}` of the local part, and for the non-local part
+        :math:`V_{1234}(\mathbf{R}) = V_{2143}(\mathbf{R})` and :math:`V_{1234}(\mathbf{R}) = V_{3412}(-\mathbf{R})`,
+        which requires every listed lattice vector to come with its mirror image.
 
         :param r_to_index: Mapping from lattice-vector tuple to its row in the non-local interaction array.
         :return: None.
@@ -811,16 +822,16 @@ class Hamiltonian:
         """
         u = self._ur_local
         if not np.allclose(u, np.einsum("abcd->badc", u)):
-            raise ValueError("The local interaction violates the pair-exchange symmetry U_{1234} = U_{2143}.")
+            raise ValueError("The local interaction violates the reality symmetry U_{1234} = U_{2143}.")
         if not np.allclose(u, np.einsum("abcd->cdab", u)):
-            raise ValueError("The local interaction violates the reality symmetry U_{1234} = U_{3412}.")
+            raise ValueError("The local interaction violates the pair-exchange symmetry U_{1234} = U_{3412}.")
 
         v = self._ur_nonlocal
         for r_vec, index in r_to_index.items():
+            if not np.allclose(v[index], np.einsum("abcd->badc", v[index])):
+                raise ValueError(f"The non-local interaction violates the reality symmetry at R = {r_vec}.")
             mirrored = tuple(-x for x in r_vec)
             if mirrored not in r_to_index:
                 raise ValueError(f"The non-local interaction lists the lattice vector {r_vec} but not {mirrored}.")
-            if not np.allclose(v[index], np.einsum("abcd->badc", v[r_to_index[mirrored]])):
+            if not np.allclose(v[index], np.einsum("abcd->cdab", v[r_to_index[mirrored]])):
                 raise ValueError(f"The non-local interaction violates the pair-exchange symmetry at R = {r_vec}.")
-            if not np.allclose(v[index], np.einsum("abcd->cdab", v[index])):
-                raise ValueError(f"The non-local interaction violates the reality symmetry at R = {r_vec}.")

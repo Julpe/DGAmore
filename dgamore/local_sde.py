@@ -369,27 +369,36 @@ def get_local_hartree_fock(u_loc: LocalInteraction, occ: np.ndarray) -> np.ndarr
     the bare interaction and the local occupation, i.e. the density-channel interaction contracted with the occupation,
     see Eq. (3.55) in my master's thesis.
 
-    The interaction tensor is stored with the inter-orbital density :math:`U'` at :math:`U_{1212}` (the convention
-    of :meth:`Hamiltonian.kanamori_interaction_dp` and the w2dynamics ``umatrix`` files), whereas the density-channel
-    projection contracted as ``"abcd,dc->ab"`` picks up :math:`U_{1122}`. The middle two orbital indices are
-    therefore swapped (``"abcd->acbd"``) before the projection, so that the Hartree term uses :math:`U'` while the
-    Fock term still uses :math:`U_{1432}`. This only affects multi-orbital systems with off-diagonal interactions;
-    single-orbital and purely orbital-diagonal interactions are unchanged.
+    The interaction tensor is stored in the layout of the equations (:math:`U_{1234} c^{\dagger}_1 c_2 c^{\dagger}_3
+    c_4`, inter-orbital density :math:`U'` at :math:`U_{1122}`, see :meth:`Hamiltonian.read_umatrix`), so the
+    density-channel projection contracted as ``"abcd,dc->ab"``, :math:`\sum_{ab} (2U_{12ab} - U_{1ba2}) n_{ba}`, is
+    the Hartree term with :math:`U'` and the Fock term with the exchange element without any slot permutation.
 
     :param u_loc: The bare local interaction :math:`U`.
     :param occ: The local occupation matrix :math:`n_{12}`, shape ``[n_bands, n_bands]``.
     :return: The Hartree-Fock self-energy, shape ``[n_bands, n_bands]``.
     """
-    return u_loc.permute_orbitals("abcd->acbd").as_channel(SpinChannel.DENS).times("abcd,dc->ab", occ)
+    return u_loc.as_channel(SpinChannel.DENS).times("abcd,dc->ab", occ)
+
+
+def double_counting_vertex(f_dens_full: LocalFourPoint, f_magn_full: LocalFourPoint) -> LocalFourPoint:
+    r"""
+    Returns the local vertex the double-counting kernel of the non-local Schwinger-Dyson equation subtracts with the
+    exchange attachment: the local part of the transversal ladder term, :math:`\tfrac12(F_{\mathrm{d}} +
+    3F_{\mathrm{m}})`, carrying the magnetic metadata (so the kernel wiring stays that of the magnetic vertex) and
+    built from a single scaled copy of the magnetic vertex. Together with the density form of the local
+    Schwinger-Dyson equation its local content cancels term by term on any finite frequency box and for any band
+    count. Both inputs are expected on the same (asymmetric) frequency box and are left untouched.
+
+    :param f_dens_full: The local density full vertex :math:`F_{\mathrm{d}}`.
+    :param f_magn_full: The local magnetic full vertex :math:`F_{\mathrm{m}}`.
+    :return: The vertex to store as ``f_dc_loc``.
+    """
+    return f_magn_full.scale(3.0, copy=True).add(f_dens_full, copy=False).scale(0.5)
 
 
 def get_loc_self_energy_vrg(
-    vrg_dens: LocalFourPoint,
-    vrg_magn: LocalFourPoint,
-    gchi_dens_sum: LocalFourPoint,
-    gchi_magn_sum: LocalFourPoint,
-    g_dmft: GreensFunction,
-    u_loc: LocalInteraction,
+    vrg_dens: LocalFourPoint, gchi_dens_sum: LocalFourPoint, g_dmft: GreensFunction, u_loc: LocalInteraction
 ) -> SelfEnergy:
     r"""
     Performs the local self-energy calculation using the Schwinger-Dyson equation, i.e. the local variant of Eq. (3.64)
@@ -397,20 +406,22 @@ def get_loc_self_energy_vrg(
     vertex and the local susceptibility against the DMFT self-energy. Note that there will never be a perfect match due
     to the sampling method of w2dynamics and the stochastic nature of the CTQMC solver. Nevertheless, the results should
     be very close. For more details, see also Paul Worm's PhD thesis, Eq. (3.70) and Anna Galler's PhD Thesis, P. 76 ff.
+    The equation takes the density form :math:`\eta_{\mathrm{d}} - \mathbb{1}` with
+    :math:`\eta_{\mathrm{d}} = \gamma_{\mathrm{d}}(\mathbb{1} - U_{\mathrm{d}}\chi_{\mathrm{d}})`, whose local
+    content cancels against the double-counting kernel of the non-local equation (see :func:`double_counting_vertex`).
 
     :param vrg_dens: The density three-leg vertex :math:`\gamma_{\mathrm{dens}}`.
-    :param vrg_magn: The magnetic three-leg vertex :math:`\gamma_{\mathrm{magn}}`.
     :param gchi_dens_sum: The frequency-summed density susceptibility :math:`\chi_{\mathrm{dens}}^{\omega}`.
-    :param gchi_magn_sum: The frequency-summed magnetic susceptibility :math:`\chi_{\mathrm{magn}}^{\omega}`.
     :param g_dmft: The local (DMFT) :class:`GreensFunction`.
     :param u_loc: The bare local interaction :math:`U`.
     :return: The local :class:`SelfEnergy` (including the Hartree-Fock term).
     """
     # 1=i, 2=j, 3=k, 4=l, 7=o, 8=p
     g_wv = g_dmft.get_g_wv(MFHelper.wn(config.box.niw_core), config.box.niv_core)
-    inner = vrg_dens - vrg_dens @ u_loc.as_channel(SpinChannel.DENS) @ gchi_dens_sum
-    inner -= vrg_magn - vrg_magn @ u_loc.as_channel(SpinChannel.MAGN) @ gchi_magn_sum
-    inner = 0.5 * inner.to_full_niw_range()
+    # eta_d - 1; the identity is sized on the full bosonic range (where niw is correct) and the in-place
+    # subtraction hands the result back on the half range
+    inner = (vrg_dens - vrg_dens @ u_loc.as_channel(SpinChannel.DENS) @ gchi_dens_sum).to_full_niw_range()
+    inner = inner.sub(LocalFourPoint.identity_like(inner), copy=False).to_full_niw_range()
     sigma_sum = -1.0 / config.sys.beta * u_loc.times("kjop,ilpowv,lkwv->ijv", inner, g_wv)
     hartree_fock = get_local_hartree_fock(u_loc, config.sys.occ_dmft)[..., None]
     return SelfEnergy((hartree_fock + sigma_sum)[None, None, None, ...], beta=config.sys.beta)
@@ -456,7 +467,7 @@ def perform_local_schwinger_dyson(
             f"{', '.join(str(o) for o in config.dmft.symmetrize_orbitals)}."
         )
 
-    sigma_loc = get_loc_self_energy_vrg(vrg_d, vrg_m, gchi_d_sum, gchi_m_sum, g_dmft, u_loc)
+    sigma_loc = get_loc_self_energy_vrg(vrg_d, gchi_d_sum, g_dmft, u_loc)
 
     if config.dmft.symmetrize_orbitals:
         sigma_loc = sigma_loc.symmetrize_orbitals(config.dmft.symmetrize_orbitals)

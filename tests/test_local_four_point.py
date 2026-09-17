@@ -956,6 +956,15 @@ def test_identity_like_works_for_vn_1():
     assert ident.mat.shape == other.mat.shape
 
 
+@pytest.mark.parametrize("notation", [FrequencyNotation.PH, FrequencyNotation.PP])
+def test_identity_with_one_fermionic_axis_is_the_diagonal_of_the_two_axis_identity(notation):
+    """The one-axis identity is delta_{14} delta_{23} on every (w, v), the vn diagonal of the compound-index eye."""
+    two_axis = LocalFourPoint.identity(3, 2, 3, num_vn_dimensions=2, full_niw_range=True, frequency_notation=notation)
+    one_axis = LocalFourPoint.identity(3, 2, 3, num_vn_dimensions=1, full_niw_range=True, frequency_notation=notation)
+    assert np.array_equal(one_axis.mat, two_axis.take_vn_diagonal().mat)
+    assert one_axis.frequency_notation == notation and one_axis.full_niw_range and one_axis.mat.dtype == np.complex64
+
+
 def test_add_dunder_calls_add(monkeypatch):
     """__add__ delegates to add."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)

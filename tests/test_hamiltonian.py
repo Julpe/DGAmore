@@ -113,15 +113,15 @@ def _two_band_local(extra):
     return elements + [InteractionElement([0, 0, 0], list(orbs), value) for orbs, value in extra]
 
 
-def test_add_interaction_term_raises_for_a_local_tensor_without_pair_exchange_symmetry():
-    """A local element U_{1211} without its pair-exchange partner U_{2111} is rejected."""
-    with pytest.raises(ValueError, match="pair-exchange"):
+def test_add_interaction_term_raises_for_a_local_tensor_without_reality_symmetry():
+    """A local element U_{1211} without its reality partner U_{2111} = U_{1211} is rejected."""
+    with pytest.raises(ValueError, match="reality"):
         Hamiltonian()._add_interaction_term(_two_band_local([((1, 2, 1, 1), 0.3)]))
 
 
-def test_add_interaction_term_raises_for_a_local_tensor_without_reality_symmetry():
-    """A pair-exchange symmetric pair U_{1112} = U_{1121} without its reality partners U_{1211} and U_{2111} raises."""
-    with pytest.raises(ValueError, match="reality"):
+def test_add_interaction_term_raises_for_a_local_tensor_without_pair_exchange_symmetry():
+    """A reality-symmetric pair U_{1112} = U_{1121} without its pair-exchange partners U_{1211} and U_{2111} raises."""
+    with pytest.raises(ValueError, match="pair-exchange"):
         Hamiltonian()._add_interaction_term(_two_band_local([((1, 1, 1, 2), 0.3), ((1, 1, 2, 1), 0.3)]))
 
 
@@ -140,6 +140,31 @@ def test_add_interaction_term_raises_for_a_nonlocal_tensor_without_pair_exchange
         InteractionElement([-1, 0, 0], [1, 1, 1, 1], 1.0),
     ]
     with pytest.raises(ValueError, match="pair-exchange"):
+        Hamiltonian()._add_interaction_term(inter)
+
+
+def test_add_interaction_term_accepts_a_nonlocal_density_density_tensor_without_inversion_symmetry():
+    """V_{1122}(R) = V_{2211}(-R) with V_{1122}(R) != V_{1122}(-R) satisfies pair exchange and reality as stored."""
+    inter = _two_band_local([]) + [
+        InteractionElement([1, 0, 0], [1, 1, 2, 2], 0.5),
+        InteractionElement([-1, 0, 0], [2, 2, 1, 1], 0.5),
+        InteractionElement([1, 0, 0], [2, 2, 1, 1], 0.2),
+        InteractionElement([-1, 0, 0], [1, 1, 2, 2], 0.2),
+    ]
+    vq = Hamiltonian()._add_interaction_term(inter).get_vq(KGrid(nk=(4, 1, 1), symmetries=[])).mat
+
+    assert np.allclose([vq[1, 0, 0, 0, 0, 1, 1], vq[1, 0, 0, 1, 1, 0, 0]], [0.3j, -0.3j], atol=1e-6)
+
+
+def test_add_interaction_term_raises_for_a_nonlocal_tensor_without_reality_symmetry():
+    """V_{1212}(R) != V_{2121}(R) violates the reality symmetry even when V(R) and V(-R) are pair-exchange images."""
+    inter = _two_band_local([]) + [
+        InteractionElement([1, 0, 0], [1, 2, 1, 2], 0.4),
+        InteractionElement([-1, 0, 0], [1, 2, 1, 2], 0.4),
+        InteractionElement([1, 0, 0], [2, 1, 2, 1], 0.1),
+        InteractionElement([-1, 0, 0], [2, 1, 2, 1], 0.1),
+    ]
+    with pytest.raises(ValueError, match="reality"):
         Hamiltonian()._add_interaction_term(inter)
 
 
@@ -162,7 +187,7 @@ def test_kanamori_interaction_with_vdd_1_band():
 
 
 def test_kanamori_interaction_with_vdd_2_band():
-    """kanamori_interaction_d for two bands sets the U/V/J Kanamori entries."""
+    """kanamori_interaction_d for two bands puts V on aabb and J on abba (Hund) and abab (pair hopping)."""
     params = {
         "udd": np.random.rand(),
         "jdd": np.random.rand(),
@@ -175,11 +200,9 @@ def test_kanamori_interaction_with_vdd_2_band():
     assert np.isclose(h._ur_local[1, 1, 1, 1], params["udd"])
 
     for i, j in [(0, 1), (1, 0)]:
-        assert np.isclose(h._ur_local[i, j, i, j], params["vdd"])
+        assert np.isclose(h._ur_local[i, i, j, j], params["vdd"])
         assert np.isclose(h._ur_local[i, j, j, i], params["jdd"])
-
-    assert np.isclose(h._ur_local[0, 0, 1, 1], params["jdd"])
-    assert np.isclose(h._ur_local[1, 1, 0, 0], params["jdd"])
+        assert np.isclose(h._ur_local[i, j, i, j], params["jdd"])
 
 
 def test_kanamori_d_basic():
@@ -200,10 +223,10 @@ def test_kanamori_d_basic():
                 for d in range(n):
                     if a == b == c == d:
                         assert np.isclose(u[a, b, c, d], u_val)
-                    elif (a == d and b == c) or (a == b and c == d):
-                        assert np.isclose(u[a, b, c, d], j)
-                    elif a == c and b == d:
+                    elif a == b and c == d:
                         assert np.isclose(u[a, b, c, d], v)
+                    elif (a == d and b == c) or (a == c and b == d):
+                        assert np.isclose(u[a, b, c, d], j)
                     else:
                         assert np.isclose(u[a, b, c, d], 0.0)
 
@@ -226,10 +249,10 @@ def test_kanamori_p_basic():
                 for d in range(n):
                     if a == b == c == d:
                         assert np.isclose(u[a, b, c, d], u_val)
-                    elif (a == d and b == c) or (a == b and c == d):
-                        assert np.isclose(u[a, b, c, d], j)
-                    elif a == c and b == d:
+                    elif a == b and c == d:
                         assert np.isclose(u[a, b, c, d], v)
+                    elif (a == d and b == c) or (a == c and b == d):
+                        assert np.isclose(u[a, b, c, d], j)
                     else:
                         assert np.isclose(u[a, b, c, d], 0.0)
 
@@ -279,7 +302,7 @@ def test_kanamori_dp_block_structure():
             for c in range(nd + npb):
                 for d in range(nd + npb):
 
-                    # the element couples orbitals a and b, or a and c for the pair hopping U_{aabb}
+                    # the element couples orbitals a and b, or a and c for the density-density U_{aabb}
                     other = b if a != b else c
                     if is_d(a) and is_d(other):
                         uu, jj, vv = udd, jdd, vdd
@@ -290,10 +313,10 @@ def test_kanamori_dp_block_structure():
 
                     if a == b == c == d:
                         assert np.isclose(u[a, b, c, d], uu)
-                    elif (a == d and b == c) or (a == b and c == d):
-                        assert np.isclose(u[a, b, c, d], jj)
-                    elif a == c and b == d:
+                    elif a == b and c == d:
                         assert np.isclose(u[a, b, c, d], vv)
+                    elif (a == d and b == c) or (a == c and b == d):
+                        assert np.isclose(u[a, b, c, d], jj)
                     else:
                         assert np.isclose(u[a, b, c, d], 0.0)
 
@@ -311,8 +334,9 @@ def test_kanamori_dp_index_split():
     assert np.isclose(u[0, 0, 0, 0], 10.0)
     assert np.isclose(u[1, 1, 1, 1], 5.0)
 
-    assert np.isclose(u[0, 1, 0, 1], 2.0)
+    assert np.isclose(u[0, 0, 1, 1], 2.0)
     assert np.isclose(u[0, 1, 1, 0], 0.1)
+    assert np.isclose(u[0, 1, 0, 1], 0.1)
 
 
 def test_kanamori_dp_no_unexpected_terms():
@@ -381,11 +405,11 @@ def test_get_vq_returns_interaction():
 
 
 def test_read_umatrix_example_and_vq_match_the_documented_lattice_sum():
-    """The documented u_matrix.dat parses into the stated local U, and get_vq equals sum_{R!=0} e^{iqR} V(R)."""
+    """The documented u_matrix.dat gives the stated U (slots middle-swapped) and get_vq = sum_{R!=0} e^{iqR} V(R)."""
     path = f"{os.path.dirname(os.path.abspath(__file__))}/../docs/u_matrix.dat"
     h = Hamiltonian().read_umatrix(path)
     u = h.get_local_u().mat
-    assert np.allclose([u[0, 0, 0, 0], u[0, 1, 0, 1], u[0, 0, 1, 1], u[0, 1, 1, 0]], [3.2, 2.4, 0.4, 0.4])
+    assert np.allclose([u[0, 0, 0, 0], u[0, 0, 1, 1], u[0, 1, 0, 1], u[0, 1, 1, 0]], [3.2, 2.4, 0.4, 0.4])
 
     rows = np.loadtxt(path, skiprows=3)
     rows = rows[np.any(rows[:, :3] != 0, axis=1)]
@@ -393,12 +417,12 @@ def test_read_umatrix_example_and_vq_match_the_documented_lattice_sum():
     q = kg.kmesh.reshape(3, -1)
     ref = np.zeros((q.shape[1], 2, 2, 2, 2), dtype=complex)
     for rx, ry, rz, o1, o2, o3, o4, re, _ in rows:
-        ref[:, int(o1) - 1, int(o2) - 1, int(o3) - 1, int(o4) - 1] += re * np.exp(
+        ref[:, int(o1) - 1, int(o3) - 1, int(o2) - 1, int(o4) - 1] += re * np.exp(
             1j * (rx * q[0] + ry * q[1] + rz * q[2])
         )
     vq = h.get_vq(kg).mat.reshape(-1, 2, 2, 2, 2)
     assert np.allclose(vq, ref, atol=1e-5)
-    assert np.allclose(vq[0, 0, 1, 0, 1], 4 * 0.4 + 4 * 0.283, atol=1e-5)  # q = 0 is the plain lattice sum
+    assert np.allclose(vq[0, 0, 0, 1, 1], 4 * 0.4 + 4 * 0.283, atol=1e-5)  # q = 0 is the plain lattice sum
 
 
 def test_read_umatrix_applies_the_lattice_vector_weights_in_the_fourier_transform(tmp_path):
@@ -457,3 +481,27 @@ def test_read_write_hr_hk_files():
     wannier_hk_twoband, _ = Hamiltonian().read_hk_w2k(f"{folder}/wannier_twoband_24x24.hk")
     ek_ref = wannier_hk_twoband.get_ek(k_grid).reshape(ek.shape)
     assert np.allclose(ek, ek_ref)
+
+
+def test_read_umatrix_converts_the_w2dynamics_slots_to_the_equation_layout(tmp_path):
+    """File rows are w2dynamics C_ijkl (U' at abab, J_pair at aabb); stored is U_1234 (U' at aabb, J_pair at abab)."""
+    u, u_prime, j_hund, j_pair = 3.79, 2.39, 0.61, 0.17  # distinct J's so the two exchange slots cannot be confused
+    rows = [
+        (1, 1, 1, 1, u),
+        (2, 2, 2, 2, u),
+        (1, 2, 1, 2, u_prime),
+        (2, 1, 2, 1, u_prime),
+        (1, 2, 2, 1, j_hund),
+        (2, 1, 1, 2, j_hund),
+        (1, 1, 2, 2, j_pair),
+        (2, 2, 1, 1, j_pair),
+    ]
+    path = tmp_path / "u_matrix.dat"
+    path.write_text("2\n1\n1.0\n" + "".join(f"0 0 0 {a} {b} {c} {d} {v} 0.0\n" for a, b, c, d, v in rows))
+
+    stored = Hamiltonian().read_umatrix(str(path)).get_local_u().mat.real
+
+    assert np.allclose([stored[0, 0, 0, 0], stored[1, 1, 1, 1]], u)
+    assert np.allclose([stored[0, 0, 1, 1], stored[1, 1, 0, 0]], u_prime)
+    assert np.allclose([stored[0, 1, 1, 0], stored[1, 0, 0, 1]], j_hund)
+    assert np.allclose([stored[0, 1, 0, 1], stored[1, 0, 1, 0]], j_pair)

@@ -85,11 +85,14 @@ interaction is rejected), and every further line holds one tensor element as ``R
 1-based orbital indices (the imaginary part is ignored). Energies are in the unit of the Wannier Hamiltonian and the
 lattice vectors in its lattice-vector basis, so the two files have to match. Rows with ``R = 0`` form the local
 :math:`U`, all other rows the non-local :math:`V^{\mathbf{q}} = \sum_{\mathbf{R} \neq 0}
-e^{i\mathbf{q}\cdot\mathbf{R}} V(\mathbf{R})`. The orbital slots follow the w2dynamics convention of the Kanamori
-builder: the intra-orbital :math:`U` sits at ``a a a a``, the inter-orbital density-density :math:`U'` at ``a b a b``
-and the Hund's :math:`J` at ``a a b b`` and ``a b b a``; a density-density interaction between orbital ``a`` at ``R``
-and orbital ``b`` at the origin therefore goes to ``a b a b`` as well. The example below describes two orbitals with
-:math:`U = 3.2` eV, :math:`J = 0.4` eV and :math:`U' = U - 2J`, plus a density-density tail :math:`V(\mathbf{R}) =
+e^{i\mathbf{q}\cdot\mathbf{R}} V(\mathbf{R})`. The orbital slots of the **file** follow the w2dynamics convention
+:math:`C_{ijkl}` (pairs :math:`(i,k)` and :math:`(j,l)`): the intra-orbital :math:`U` sits at ``a a a a``, the
+inter-orbital density-density :math:`U'` at ``a b a b``, Hund's :math:`J` at ``a b b a`` and the pair hopping at
+``a a b b``; a density-density interaction between orbital ``a`` at ``R`` and orbital ``b`` at the origin therefore
+goes to ``a b a b`` as well. Internally the tensor is stored in the layout of the equations,
+:math:`U_{1234} c^{\dagger}_1 c_2 c^{\dagger}_3 c_4` (:math:`U'` at ``a a b b``): the reader swaps the middle two
+orbital indices, so file and equations never need to be reconciled by hand. The example below describes two orbitals
+with :math:`U = 3.2` eV, :math:`J = 0.4` eV and :math:`U' = U - 2J`, plus a density-density tail :math:`V(\mathbf{R}) =
 0.4\,\mathrm{eV}/|\mathbf{R}|` on the square lattice up to the next-nearest neighbors. The numbers are illustrative
 only and do not describe a real material; they serve to show the file layout and the index convention:
 
@@ -252,7 +255,9 @@ two-particle results. The two-particle Green's function is always symmetrized un
 fermionic frequencies :math:`(\nu, \nu')` on load: this is the time-reversal-plus-inversion symmetry that makes the
 right three-leg vertex the first-frequency-summed transpose of the left one, so both are obtained from a single
 auxiliary susceptibility sum. The same symmetry lets the double-counting kernel of the Schwinger-Dyson equation
-read its summed (second) frequency argument off the stored first axis of the local vertex.
+read its summed (second) frequency argument off the stored first axis of the local vertex. That kernel subtracts
+the local part of the transversal ladder term, :math:`\tfrac12(F_{\mathrm{d}} + 3F_{\mathrm{m}})` (see
+:func:`dgamore.local_sde.double_counting_vertex`), paired with the density form of the local equation.
 
 The ``symmetrize_orbitals`` field allows the local DMFT quantities, namely the self-energy and the one- and
 two-particle Green's functions, to be symmetrized over orbitals, which is well defined because these quantities are

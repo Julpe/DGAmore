@@ -6,6 +6,7 @@
 
 import pytest
 import numpy as np
+from dgamore.hamiltonian import Hamiltonian
 from dgamore.interaction import Interaction, LocalInteraction, SpinChannel
 
 u_loc = np.random.rand(2, 2, 2, 2)
@@ -391,3 +392,15 @@ def test_nonlocal_interaction_rsub_has_correct_sign():
     other = np.zeros_like(mat)
     result = v.__rsub__(other)  # directly call __rsub__ to test B - A = C
     assert np.allclose(result.mat, -mat, atol=1e-2)
+
+
+def test_density_and_magnetic_projections_of_the_kanamori_tensor_carry_the_inter_orbital_density():
+    """aabb: U_d = 2U' - J, U_m = -J; abba (Hund): U_d = 2J - U', U_m = -U'; abab (pair hopping): U_d = J, U_m = -J."""
+    u, u_prime, j = 5.0, 3.5, 0.75
+    u_loc = Hamiltonian().kanamori_interaction_d(n_bands=2, udd=u, jdd=j, vdd=u_prime).get_local_u()
+    u_d = u_loc.as_channel(SpinChannel.DENS).mat.real
+    u_m = u_loc.as_channel(SpinChannel.MAGN).mat.real
+
+    slots = [(0, 0, 0, 0), (0, 0, 1, 1), (0, 1, 1, 0), (0, 1, 0, 1)]
+    assert np.allclose([u_d[s] for s in slots], [u, 2 * u_prime - j, 2 * j - u_prime, j])
+    assert np.allclose([u_m[s] for s in slots], [-u, -j, -u_prime, -j])
