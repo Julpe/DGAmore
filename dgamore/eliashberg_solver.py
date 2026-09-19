@@ -7,16 +7,20 @@ r"""
 Linearized Eliashberg equation solver. Starting from the ladder-DGA full vertex (saved per channel by the non-local SDE
 step), this module assembles the particle-particle pairing vertex in the singlet/triplet channels at :math:`\omega = 0`,
 optionally adds the local reducible diagrams, and solves the linearized gap equation :math:`\lambda \Delta =
-\pm\frac{1}{2\beta n_{\mathbf{q}}}\, \Gamma^{\mathrm{pp}}\, \chi_0^{\mathrm{pp}}\, \Delta` with a matrix-free
-ARPACK/Lanczos eigensolver (in memory when one sector's full-BZ pairing vertex fits on a rank, and on a
-block-distributed frequency grid otherwise). The leading
-eigenvalue :math:`\lambda` signals the pairing instability and the eigenvector is the gap function
-:math:`\Delta^{\mathrm{k}}_{12}`. Equation numbers refer to the author's master's thesis (Chapter 4).
+\pm\frac{1}{2\beta n_{\mathbf{k}}}\, \Gamma^{\mathrm{pp}}\, \chi_0^{\mathrm{pp}}\, \Delta` with a matrix-free
+ARPACK/Lanczos eigensolver: in memory when a node holds one channel's full-BZ pairing vertex (as a team solve over
+one node-shared vertex window per channel on a multi-rank job, sector after sector on a single rank) and on a
+block-distributed frequency grid otherwise. The leading eigenvalue :math:`\lambda` signals the pairing instability
+and the eigenvector is the gap function :math:`\Delta^{\mathrm{k}}_{12}`. Equation numbers refer to the author's
+master's thesis (Chapter 4).
 """
 
 import os
 import socket
+import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import lru_cache
 
 import mpi4py.MPI as MPI
@@ -26,6 +30,7 @@ from threadpoolctl import ThreadpoolController, threadpool_limits
 
 import dgamore.config as config
 from dgamore import nonlocal_sde, mpi_utils
+from dgamore.brillouin_zone import KGrid
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.four_point import FourPoint
 from dgamore.gap_function import GapFunction
@@ -34,10 +39,17 @@ from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore import memory_estimator
-from dgamore.memory_estimator import SLICE_CHUNK_BYTES, lanczos_solver_bytes, solver_grid_shape
+from dgamore.memory_estimator import (
+    SLICE_CHUNK_BYTES,
+    lanczos_ncv,
+    lanczos_solver_bytes,
+    lanczos_team_bytes,
+    solver_grid_shape,
+    team_build_columns,
+)
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE, deferred_collection
-from dgamore.symmetry_reduction import find_coordinate_mirror_orbital_unitaries
+from dgamore.symmetry_reduction import find_coordinate_mirror_orbital_unitaries, point_group_orbits
 
 
 def delete_files(filepath: str, *args) -> None:
@@ -726,6 +738,214 @@ def _project_gap_to_sector(vec: np.ndarray, gap_shape: tuple, eps_t: int, eps_po
     return g.reshape(-1).astype(vec.dtype, copy=False)
 
 
+def _project_frequency_block(gap: np.ndarray, v0: int, v1: int, eps_t: int, eps_po: int) -> np.ndarray:
+    r"""
+    Returns the fermionic-frequency block ``[..., v0:v1]`` of the sector projection of a gap ``[kx, ky, kz, o1, o2, v]``
+    (see :func:`_project_gap_to_sector`), computed from that block and its frequency mirror alone: the T projector
+    pairs :math:`\nu` with :math:`-\nu` and the P.O projector acts within one frequency, so every element is formed
+    by the same operations, in the same order, as in the projection of the whole gap.
+
+    :param gap: The gap in shape ``[kx, ky, kz, o1, o2, v]``.
+    :param v0: First frequency index of the block.
+    :param v1: One past the last frequency index of the block.
+    :param eps_t: The requested T-parity, :math:`+1` (even) or :math:`-1` (odd).
+    :param eps_po: The forced combined ``P.O`` parity, :math:`\mathrm{sign}\cdot\varepsilon_T`.
+    :return: The projected block, shape ``[kx, ky, kz, o1, o2, v1 - v0]``.
+    """
+    nv = gap.shape[-1]
+    mirror = gap[..., nv - v1 : nv - v0][..., ::-1]  # np.flip(gap, axis=-1)[..., v0:v1]
+    g = 0.5 * (gap[..., v0:v1] + eps_t * mirror)
+    return 0.5 * (g + eps_po * np.roll(np.flip(g.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2)))
+
+
+def _sector_seed(base_seed: np.ndarray, gap_shape: tuple, eps_t: int | None, eps_po: int | None) -> np.ndarray:
+    r"""
+    Returns the eigensolver's starting vector of one sector: the base seed projected onto the sector, with a
+    deterministic random fallback when the projection of the seed collapses (a seed whose parity is orthogonal to
+    the requested sector) and the nonzero base seed itself when the sector is empty on the grid (e.g. every
+    :math:`\mathbf{k}` equals :math:`-\mathbf{k}`); the ``"none"`` sector (``eps_t`` of ``None``) uses the base
+    seed unchanged. Identical on every rank for identical inputs.
+
+    :param base_seed: The flattened initial gap seed.
+    :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
+    :param eps_t: The requested T-parity, or ``None`` for the raw kernel.
+    :param eps_po: The forced combined ``P.O`` parity.
+    :return: The flattened seed of the sector.
+    """
+    if eps_t is None:
+        return base_seed
+    seed = _project_gap_to_sector(base_seed, gap_shape, eps_t, eps_po)
+    if np.linalg.norm(seed) >= 1e-10 * max(np.linalg.norm(base_seed), 1e-30):
+        return seed
+    rng = np.random.default_rng(0)
+    fallback = (rng.standard_normal(gap_shape) + 1j * rng.standard_normal(gap_shape)).flatten()
+    fallback = _project_gap_to_sector(fallback.astype(base_seed.dtype, copy=False), gap_shape, eps_t, eps_po)
+    return fallback if np.linalg.norm(fallback) > 0 else base_seed
+
+
+def _finish_sector(
+    lambdas: np.ndarray,
+    gaps: np.ndarray,
+    gap_shape: tuple,
+    channel: SpinChannel,
+    nq: tuple,
+    label: str,
+    orbital_mirrors: dict,
+    ranks: tuple,
+) -> tuple[np.ndarray, list[GapFunction]]:
+    r"""
+    Orders one solved sector's eigenpairs by descending eigenvalue, symmetrizes degenerate gaps when configured,
+    logs the eigenvalues and wraps the eigenvectors as :class:`GapFunction` objects (as many as the eigensolver
+    returned, each a contiguous copy so the eigenvector matrix is released).
+
+    :param lambdas: The eigenvalues.
+    :param gaps: The eigenvectors as columns, ``[n, len(lambdas)]``.
+    :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
+    :param channel: The pairing channel (used to label outputs).
+    :param nq: The momentum-grid shape carried onto each :class:`GapFunction`.
+    :param label: The sector label for the log.
+    :param orbital_mirrors: The orbital mirror unitaries for the degenerate-gap symmetrization.
+    :param ranks: The ranks tuple used for logging.
+    :return: ``(lambdas, [GapFunction, ...])``.
+    """
+    order = lambdas.argsort()[::-1]
+    if not np.array_equal(order, np.arange(len(order))):
+        lambdas, gaps = lambdas[order], gaps[:, order]
+    if config.eliashberg.symmetrize_degenerate_gaps:
+        gaps = symmetrize_degenerate_gaps(lambdas, gaps, gap_shape, orbital_mirrors=orbital_mirrors)
+    plural = "" if config.eliashberg.n_eig == 1 else "s"
+    config.logger.info(
+        f"Largest eigenvalue{plural} for {label}: " + ", ".join(f"{lam:.6f}" for lam in lambdas), allowed_ranks=ranks
+    )
+    gaps = [np.ascontiguousarray(gaps[:, i]).reshape(gap_shape) for i in range(gaps.shape[1])]
+    return lambdas, [GapFunction(gap, channel, nq) for gap in gaps]
+
+
+def _team_arnoldi(
+    apply_block: Callable,
+    seed_block: np.ndarray,
+    n_eig: int,
+    ncv: int,
+    tol: float,
+    maxiter: int,
+    team_comm: MPI.Comm,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, float]:
+    r"""
+    Krylov-Schur (restarted Arnoldi) iteration for the eigenpairs of largest real part of an operator whose vectors
+    are split over the ranks of a team: every rank holds its own block of each basis vector, ``apply_block`` maps a
+    rank's block of a vector to its block of the operator's image (a collective call over the team), and every
+    inner product is a team allreduce, so all ranks walk the same iteration with the same scalars. The basis is
+    orthogonalized by classical Gram-Schmidt, repeated once when the first pass removed more than a fixed share of
+    the new vector (:data:`REORTHOGONALIZE_BELOW`, the criterion ARPACK uses), so a well-conditioned step streams
+    the basis twice instead of four times. When the ``ncv``-vector basis is full, the Ritz pairs of the
+    Rayleigh quotient are formed; a pair counts as converged when its residual estimate :math:`|\beta_m|\,|y_m|` is
+    at most ``tol`` times the modulus of its Ritz value. Otherwise the Schur form of the Rayleigh quotient is
+    reordered so that the ``n_eig`` wanted Ritz values and half of the rest lead, and the basis is compacted to
+    those Schur vectors plus the residual direction before the iteration continues. Stops when the wanted pairs have
+    converged or after ``maxiter`` restarts, returning the converged pairs in either case; the eigenvalues are
+    returned as real parts, the way scipy's ``eigsh`` reports a complex operator's spectrum.
+
+    :param apply_block: The operator, ``block -> block`` on this rank's slice.
+    :param seed_block: This rank's block of the starting vector.
+    :param n_eig: Number of wanted eigenpairs.
+    :param ncv: Size of the Krylov basis (``n_eig < ncv``).
+    :param tol: Relative residual tolerance of a Ritz pair.
+    :param maxiter: Maximum number of restarts.
+    :param team_comm: The team communicator.
+    :return: ``(lambdas, ritz, basis, n_matvec, matvec_seconds)``: the converged eigenvalues in descending order,
+        their Ritz coefficients as columns (this rank's block of eigenvector ``i`` is ``ritz[:, i] @ basis``, of unit
+        norm up to rounding), this rank's blocks of the basis vectors as rows, the number of operator applications
+        and the time spent in them.
+    """
+    dtype = seed_block.dtype
+    basis = np.empty((ncv, seed_block.size), dtype=dtype)
+    rayleigh = np.zeros((ncv, ncv), dtype=np.complex128)
+    n_matvec, matvec_seconds = 0, 0.0
+
+    def dots(vectors: np.ndarray, w: np.ndarray) -> np.ndarray:
+        # conjugating the one vector instead of the basis slice spares a basis-sized copy per call (bit-identical)
+        return team_comm.allreduce((vectors @ w.conj()).conj())
+
+    def norm(w: np.ndarray) -> float:
+        return float(np.sqrt(team_comm.allreduce(float(np.vdot(w, w).real))))
+
+    basis[0] = seed_block.reshape(-1) / norm(seed_block.reshape(-1))
+    j, restarts = 0, 0
+    while True:
+        start = time.perf_counter()
+        w = apply_block(basis[j].copy()).reshape(-1).astype(dtype, copy=False)
+        matvec_seconds += time.perf_counter() - start
+        n_matvec += 1
+        w_norm = norm(w)
+        h = dots(basis[: j + 1], w)
+        w = w - h @ basis[: j + 1]
+        beta = norm(w)
+        if beta < REORTHOGONALIZE_BELOW * w_norm:
+            correction = dots(basis[: j + 1], w)
+            w = w - correction @ basis[: j + 1]
+            h += correction
+            beta = norm(w)
+        rayleigh[: j + 1, j] = h
+        if j + 1 < ncv:
+            rayleigh[j + 1, j] = beta
+            basis[j + 1] = w / beta
+            j += 1
+            continue
+        # the basis is full: Ritz pairs of the Rayleigh quotient, largest real part first
+        theta, ritz = np.linalg.eig(rayleigh)
+        order = np.argsort(-theta.real)
+        theta, ritz = theta[order], ritz[:, order]
+        converged = beta * np.abs(ritz[-1]) <= tol * np.abs(theta)
+        if converged[:n_eig].all() or restarts >= maxiter:
+            chosen = [i for i in range(n_eig) if converged[i]]
+            return theta[chosen].real, ritz[:, chosen], basis, n_matvec, matvec_seconds
+        # Krylov-Schur restart: the wanted Ritz values and half of the rest lead the reordered Schur form
+        threshold = theta.real[n_eig + (ncv - n_eig) // 2 - 1]
+        schur, vectors, n_leading = sp.linalg.schur(rayleigh, output="complex", sort=lambda z: z.real >= threshold)
+        kept = min(n_leading, ncv - 1)
+        # compacted in column chunks, so the transient stays a fraction of the basis
+        chunk = max(1, basis.shape[1] // 8)
+        for c0 in range(0, basis.shape[1], chunk):
+            basis[:kept, c0 : c0 + chunk] = vectors[:, :kept].T @ basis[:, c0 : c0 + chunk]
+        basis[kept] = w / beta
+        rayleigh[...] = 0.0
+        rayleigh[:kept, :kept] = schur[:kept, :kept]
+        rayleigh[kept, :kept] = beta * vectors[-1, :kept]
+        j = kept
+        restarts += 1
+
+
+def _bubble_is_frequency_even(chi0_mm: np.ndarray, rtol: float = 1e-6) -> bool:
+    r"""
+    Whether the pp bubble in matmul layout ``[x, y, z, v, o2, o2]`` is even in the fermionic frequency,
+    :math:`\chi_0^{\mathbf{k}\nu} = \chi_0^{\mathbf{k},-\nu}`, to a relative tolerance on every element; checked
+    one momentum row at a time so no bubble-sized temporary is formed.
+
+    :param chi0_mm: The bubble in matmul layout (see :func:`_chi0_to_matmul_layout`).
+    :param rtol: Relative tolerance per element.
+    :return: True when every element passes.
+    """
+    return all(np.allclose(row, np.flip(row, axis=2), rtol=rtol, atol=0.0) for row in chi0_mm)
+
+
+def _crossed_from_direct(direct: np.ndarray, sign: int, eps_t: int) -> np.ndarray:
+    r"""
+    Forms the crossed term of the pairing kernel from the direct term for one band in a projected sector: with a
+    frequency-even bubble and a gap of T-parity :math:`\varepsilon_T`, the flipped right-hand side equals
+    :math:`\varepsilon_T` times the direct one, so the crossed term is :math:`\mathrm{sign}\,\varepsilon_T` times
+    the momentum-flipped direct term and the second vertex contraction is not needed.
+
+    :param direct: The direct term in real space, ``[x, y, z, o1, o2, v]`` or a frequency block of it.
+    :param sign: The channel sign (:math:`+1` singlet, :math:`-1` triplet).
+    :param eps_t: The T-parity of the sector.
+    :return: The crossed term, a new array of the same shape.
+    """
+    crossed = np.roll(np.flip(direct.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+    if sign * eps_t != 1:
+        crossed *= sign * eps_t
+    return crossed
+
+
 def gap_parity_diagnostics(gap: np.ndarray, gap_shape: tuple) -> dict[str, complex]:
     r"""
     Reports the parity Rayleigh quotients :math:`\langle \Delta, X \Delta \rangle / \langle \Delta, \Delta \rangle`
@@ -969,10 +1189,9 @@ def solve_eliashberg_lanczos_grid(
     block = FourPoint(block_mat, channel, k_grid.nk, 0, 2, False, True, True, FrequencyNotation.PP)
     block = block.map_to_full_bz(k_grid, k_grid.nk).decompress_q_dimension().fft(False)
     logger.log_memory_usage(f"Gamma_pp_{channel.value} grid block", block, rows * cols, allowed_ranks=(0,))
-    gamma_mm = _gamma_to_matmul_layout(block.mat)
+    # the kernel prefactor is folded into the persistent vertex once, exactly as the in-memory solve does
+    gamma_mm = _gamma_to_matmul_layout(block.mat, scale=0.5 / k_grid.nk_tot / config.sys.beta)
     block.free()
-    # fold the kernel prefactor into the persistent vertex once, exactly as the in-memory solve does
-    gamma_mm *= 0.5 / k_grid.nk_tot / config.sys.beta
 
     chi0_full = FourPoint(chi0_mat, SpinChannel.NONE, k_grid.nk, 0, 1, False, True, True, FrequencyNotation.PP)
     chi0_full = chi0_full.decompress_q_dimension()
@@ -1031,9 +1250,28 @@ def solve_eliashberg_lanczos_grid(
         gather_comm.Allgatherv(send, [recv, (row_counts, row_displs)])
         return np.moveaxis(recv, 0, -1).flatten()
 
+    def sector_mv(gap: np.ndarray, eps_t: int | None, eps_po: int | None) -> np.ndarray:
+        # a projected sector applies Pi mv Pi with the projector of _project_gap_to_sector
+        if eps_t is None:
+            return mv(gap)
+        return _project_gap_to_sector(
+            mv(_project_gap_to_sector(gap, gap_shape, eps_t, eps_po)), gap_shape, eps_t, eps_po
+        )
+
     # get_initial_gap_function draws from a fixed-seed generator, so every lockstep rank computes the same seed
     seed = get_initial_gap_function(gap_shape, channel)
-    return _solve_pairing_sectors(mv, gap_shape, sign, channel, k_grid.nk, None, (0,), seed.flatten())
+    return _solve_pairing_sectors(
+        sector_mv,
+        gap_shape,
+        sign,
+        channel,
+        k_grid.nk,
+        None,
+        (0,),
+        seed.flatten(),
+        None,
+        gamma_mm.dtype,
+    )
 
 
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
@@ -1395,20 +1633,25 @@ def _apply_gchi0_pp(
     return np.moveaxis(out[..., 0], 3, -1).reshape(nqx, nqy, nqz, n_bands, n_bands, v)
 
 
-def _gamma_to_matmul_layout(gamma_mat: np.ndarray) -> np.ndarray:
+def _gamma_to_matmul_layout(gamma_mat: np.ndarray, scale: float = 1.0) -> np.ndarray:
     r"""
     Materializes the pp pairing vertex in batched-matmul layout ``[x, y, z, o2*nv, o2*np]`` (rows ``(a, b, v)``,
-    columns ``(c, d, p)``) for :func:`_apply_gamma_pp`. The einsum layout is ``[x, y, z, a, c, b, d, v, p]`` with the
-    orbitals interleaved (``a, c, b, d``), so a transpose to ``(a, b, v, c, d, p)`` precedes the (copying) reshape.
-    The per-matvec ``np.matmul`` then allocates only the gap-sized output.
+    columns ``(c, d, p)``) for :func:`_apply_gamma_pp`, scaled by ``scale``. The einsum layout is
+    ``[x, y, z, a, c, b, d, v, p]`` with the orbitals interleaved (``a, c, b, d``), so a transpose to
+    ``(a, b, v, c, d, p)`` precedes the copying reshape; a scale factor other than one rides along with that single
+    pass (the same one multiply per element as scaling the layout afterwards). The per-matvec ``np.matmul`` then
+    allocates only the gap-sized output.
 
     :param gamma_mat: The pp vertex, shape ``[x, y, z, a, c, b, d, v, p]`` (``v`` may be a frequency slice).
+    :param scale: Factor multiplied onto every element, e.g. the kernel prefactor (one leaves the values untouched).
     :return: A contiguous array ``[x, y, z, o2*nv, o2*np]`` in matmul layout.
     """
     nqx, nqy, nqz, nb = gamma_mat.shape[:4]
     nv, npp = gamma_mat.shape[-2], gamma_mat.shape[-1]
-    transposed = np.ascontiguousarray(np.transpose(gamma_mat, (0, 1, 2, 3, 5, 7, 4, 6, 8)))  # [x,y,z,a,b,v,c,d,p]
-    return transposed.reshape(nqx, nqy, nqz, nb * nb * nv, nb * nb * npp)
+    out = np.empty((nqx, nqy, nqz, nb * nb * nv, nb * nb * npp), dtype=gamma_mat.dtype)
+    transposed = np.transpose(gamma_mat, (0, 1, 2, 3, 5, 7, 4, 6, 8))  # [x,y,z,a,b,v,c,d,p]
+    np.multiply(transposed, scale, out=out.reshape(nqx, nqy, nqz, nb, nb, nv, nb, nb, npp))
+    return out
 
 
 def _apply_gamma_pp(
@@ -1453,6 +1696,547 @@ def _apply_gamma_pp(
     return out[..., 0].reshape(nqx, nqy, nqz, n_bands, n_bands, nv)
 
 
+@lru_cache(maxsize=1)
+def _wedge_orbits(k_grid: KGrid) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    r"""
+    Groups the flat indices of the real-space grid into the stars of the grid's point-like symmetry operations
+    (index permutations with orbital rotations, no translations, no antiunitary members), under which the
+    Fourier-transformed vertex obeys :math:`\Gamma(P\mathbf{R}) = U_P\,\Gamma(\mathbf{R})\,U_P^\dagger` with the same
+    rotation as in momentum space. On an explicit-symmetry grid these are the grid's own irreducible-BZ maps; on an
+    auto-symmetry grid they come from :func:`~dgamore.symmetry_reduction.point_group_orbits`. The result of the last
+    grid is cached.
+
+    :param k_grid: The momentum grid (its index maps apply to the real-space grid alike).
+    :return: ``(points, offsets, order, us)``: the representative grid index of every star, the star boundaries
+        into ``order``, every grid index sorted by star, and per grid index the rotation carrying the representative
+        onto it (``None`` when the grid applies no orbital rotation).
+    """
+    if k_grid.is_auto:
+        rep, us = point_group_orbits(k_grid._auto_group, tuple(k_grid.nk))
+        reps, inv = np.unique(rep, return_inverse=True)
+    else:
+        reps, inv, us = k_grid.irrk_ind, k_grid.irrk_inv.ravel(), None
+    order = np.argsort(inv, kind="stable")
+    offsets = np.concatenate(([0], np.cumsum(np.bincount(inv, minlength=len(reps)))))
+    return reps, offsets, order, us
+
+
+def wedge_window_points(k_grid: KGrid) -> int:
+    r"""
+    Returns the number of real-space points a channel's vertex window holds in the team solve: the star
+    representatives of the grid's point-like operations (see :func:`_wedge_orbits`), i.e. the whole grid when they
+    reduce nothing.
+
+    :param k_grid: The momentum grid.
+    :return: The number of window points.
+    """
+    return len(_wedge_orbits(k_grid)[0])
+
+
+def _build_shared_vertex_window(
+    gamma_r_pp: FourPoint, node_comm: MPI.Comm, norm: float, wedge_points: np.ndarray | None = None
+) -> tuple[np.ndarray, MPI.Win | None]:
+    r"""
+    Puts one channel's pairing vertex, in matmul layout, into a single MPI shared-memory window of its node. The
+    node root holds the gathered irreducible-BZ vertex on entry and publishes it through a temporary node-shared
+    window; every rank of the node then builds its share of the full-BZ matmul layout straight into the vertex
+    window, one column block at a time (one fermionic frequency :math:`\nu` and a range of :math:`\nu'` columns,
+    sized by :data:`~dgamore.memory_estimator.TEAM_BUILD_CHUNK_BYTES`): each block runs through the same
+    :class:`FourPoint` chain as the single-rank build (map to the full BZ, Fourier transform over the momenta,
+    reorder the legs ``abcd->badc``) and is written scaled by the kernel prefactor. Every step acts on each column
+    independently, so the window equals the layout the single-rank solve builds bit for bit. With ``wedge_points``
+    only the rows of those real-space points are kept (the star representatives of :func:`_wedge_orbits`). The
+    node holds the windows, the irreducible source and one block per rank; the vertex is **consumed** on the node
+    root.
+
+    :param gamma_r_pp: The channel's pairing vertex, the whole irreducible BZ on the node root (ignored elsewhere).
+    :param node_comm: The node-local communicator.
+    :param norm: The kernel prefactor :math:`1 / (2 \beta n_{\mathbf{k}})` folded into the vertex.
+    :param wedge_points: Flat indices of the real-space points to keep, or ``None`` for the whole grid.
+    :return: ``(gamma_mm, win)`` - the shared matmul-layout vertex, ``[x, y, z, o2*nv, o2*np]`` on the full grid or
+        ``[r, o2*nv, o2*np]`` on the wedge, and its window.
+    """
+    k_grid = config.lattice.k_grid
+    size, rank = node_comm.Get_size(), node_comm.Get_rank()
+    irr_shape, dtype = node_comm.bcast((gamma_r_pp.mat.shape, gamma_r_pp.mat.dtype) if rank == 0 else None, root=0)
+    irr, irr_win = gamma_r_pp.mat, None
+    if size > 1:
+        irr, irr_win = mpi_utils.allocate_node_shared_array(node_comm, irr_shape, dtype)
+        if rank == 0:
+            irr[...] = gamma_r_pp.mat
+            gamma_r_pp.free()
+        node_comm.Barrier()
+
+    nb, nv, npp = irr_shape[1], irr_shape[-2], irr_shape[-1]
+    rows, cols = nb * nb * nv, nb * nb * npp
+    shape = tuple(k_grid.nk) + (rows, cols) if wedge_points is None else (len(wedge_points), rows, cols)
+    gamma_mm, win = mpi_utils.allocate_node_shared_array(node_comm, shape, dtype)
+    target = gamma_mm.reshape(-1, nb, nb, nv, nb, nb, npp)
+    columns = team_build_columns(k_grid.nk_tot, nb, npp)
+    chunks = [(v, p0, min(p0 + columns, npp)) for v in range(nv) for p0 in range(0, npp, columns)]
+    for i in np.array_split(np.arange(len(chunks)), size)[rank]:
+        v, p0, p1 = chunks[i]
+        block = FourPoint(
+            irr[..., v, p0:p1], gamma_r_pp.channel, k_grid.nk, 0, 1, False, True, True, FrequencyNotation.PP
+        )
+        block = block.map_to_full_bz(k_grid, k_grid.nk).decompress_q_dimension().fft(False)
+        block = block.permute_orbitals("abcd->badc", False).mat.reshape(-1, nb, nb, nb, nb, p1 - p0)
+        if wedge_points is not None:
+            block = block[wedge_points]
+        np.multiply(np.transpose(block, (0, 1, 3, 2, 4, 5)), norm, out=target[:, :, :, v, :, :, p0:p1])
+    del irr, target
+    node_comm.Barrier()
+    nonlocal_sde._free_shared_window(irr_win, node_comm)
+    if size == 1:
+        gamma_r_pp.free()
+    return gamma_mm, win
+
+
+def _team_matvec(
+    team_comm: MPI.Comm,
+    gamma_by_channel: dict[SpinChannel, np.ndarray],
+    chi0_mm: np.ndarray,
+    scratch: list[np.ndarray],
+    gap_shape: tuple,
+    n_bands: int,
+    orbits: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None] | None = None,
+    shortcut: bool = False,
+) -> tuple[Callable, tuple[int, int]]:
+    r"""
+    Builds the pairing-kernel matvec of a team of ranks that share their node's vertex windows. Every rank holds one
+    frequency block of the vectors and every matvec runs in lockstep stages over the team's gap-sized scratch
+    windows (the gap, its dressed transform, the direct and the crossed term), each rank working on its own share:
+    the sector projection of the input (see :func:`_project_frequency_block`), the bubble multiply and the momentum
+    FFT on a contiguous block of fermionic frequencies, the two vertex contractions on a contiguous block of momenta,
+    the crossed-term reassembly with the inverse FFT again on the frequency block, and for a projected sector the
+    projection of the result on that block. Every element is computed by the same operations as in the single-rank
+    sector matvec, so the result is bit-identical to it. With ``orbits`` the windows hold the irreducible wedge of
+    the real-space grid and each rank contracts the stars of its irreducible points instead, one matrix product per
+    star with the members' direct and flipped right-hand sides as columns (rotated into and out of the irreducible
+    point's orbital frame on an auto-symmetry grid: the layout's row and column pairs both carry the conjugate
+    unitary, so :math:`W_{(12),(ab)} = U^*_{1a} U^*_{2b}` enters as :math:`W^\dagger` on the right-hand sides and
+    as :math:`W` on the result); the result then equals the
+    single-rank one to rounding. With ``shortcut`` (one band, frequency-even bubble) a projected sector forms the
+    crossed term from the direct one (see :func:`_crossed_from_direct`).
+
+    :param team_comm: The team communicator (rank 0 is the lead).
+    :param gamma_by_channel: The node-shared matmul-layout vertices per channel, ``[x, y, z, o2*nv, o2*np]`` on the
+        full grid or ``[r, o2*nv, o2*np]`` on the wedge.
+    :param chi0_mm: The node-shared bubble in matmul layout (see :func:`_chi0_to_matmul_layout`).
+    :param scratch: Four gap-shaped team-shared arrays.
+    :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
+    :param n_bands: Number of orbitals ``o``.
+    :param orbits: The stars of :func:`_wedge_orbits` for wedge windows, else ``None``.
+    :param shortcut: Whether a projected sector may form the crossed term from the direct one.
+    :return: ``(apply_block, (v0, v1))``: the collective sector matvec on this rank's frequency block
+        ``[..., v0:v1]`` of the gap, ``apply_block(channel, eps_t, eps_po, block) -> block`` (``eps_t`` of ``None``
+        applies the raw kernel; every team rank calls it with the same sector), and the block bounds.
+    """
+    gap_w, gg_w, direct_w, crossed_w = scratch
+    size, rank = team_comm.Get_size(), team_comm.Get_rank()
+    nqx, nqy, nqz = gap_shape[:3]
+    nk, nv, oo = nqx * nqy * nqz, gap_shape[-1], n_bands * n_bands
+    rows = oo * nv
+    columns = np.linspace(0, nv, size + 1).astype(int)
+    v0, v1 = int(columns[rank]), int(columns[rank + 1])
+    chunks = np.linspace(0, nk, size + 1).astype(int)
+    k0, k1 = int(chunks[rank]), int(chunks[rank + 1])
+    gg_flat = gg_w.reshape(nk, rows, 1)
+    direct_flat = direct_w.reshape(nk, rows, 1)
+    crossed_flat = crossed_w.reshape(nk, rows, 1)
+    if orbits is not None:
+        _, offsets, order, us = orbits
+        # this rank's irreducible points, balanced by the number of star members (the matrix-product columns)
+        bounds = np.searchsorted(offsets, np.linspace(0, nk, size + 1))
+        r0, r1 = int(bounds[rank]), int(bounds[rank + 1])
+        rotations = None
+        if us is not None:
+            members = us[order[offsets[r0] : offsets[r1]]]
+            rotations = np.einsum("kab,kcd->kacbd", members.conj(), members.conj()).reshape(len(members), oo, oo)
+
+    def contract_stars(gamma_irr: np.ndarray, with_crossed: bool) -> None:
+        for r in range(r0, r1):
+            members = order[offsets[r] : offsets[r + 1]]
+            m = len(members)
+            rhs = gg_flat[members, :, 0].T  # [(c, d, p), m]
+            if with_crossed:
+                flipped = np.flip(rhs.reshape(oo, nv, m), axis=1).reshape(rows, m)
+                rhs = np.concatenate([rhs, flipped], axis=1)
+            if rotations is not None:
+                w = rotations[offsets[r] - offsets[r0] : offsets[r + 1] - offsets[r0]]
+                w = np.concatenate([w, w]) if with_crossed else w
+                rhs = np.einsum("jab,apj->bpj", w.conj(), rhs.reshape(oo, nv, -1)).reshape(rows, -1)
+            out = gamma_irr[r] @ rhs
+            if rotations is not None:
+                out = np.einsum("jab,bvj->avj", w, out.reshape(oo, nv, -1)).reshape(rows, -1)
+            direct_flat[members, :, 0] = out[:, :m].T
+            if with_crossed:
+                crossed_flat[members, :, 0] = out[:, m:].T
+
+    def run(channel: SpinChannel, eps_t: int | None, eps_po: int | None) -> None:
+        gamma_flat = gamma_by_channel[channel].reshape(-1, rows, rows)
+        sign = 1 if channel == SpinChannel.SING else -1
+        from_direct = shortcut and eps_t is not None
+        team_comm.Barrier()
+        if v1 > v0:
+            block = gap_w[..., v0:v1] if eps_t is None else _project_frequency_block(gap_w, v0, v1, eps_t, eps_po)
+            dressed = _apply_gchi0_pp(chi0_mm[:, :, :, v0:v1], block, n_bands)
+            gg_w[..., v0:v1] = sp.fft.fftn(dressed, axes=(0, 1, 2), overwrite_x=True)
+            del block, dressed
+        team_comm.Barrier()
+        if orbits is not None:
+            contract_stars(gamma_flat, not from_direct)
+        elif k1 > k0:
+            np.matmul(gamma_flat[k0:k1], gg_flat[k0:k1], out=direct_flat[k0:k1])
+            if not from_direct:
+                # crossed term: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]; the
+                # flipped RHS is materialized contiguously so np.matmul stays on the BLAS fast path
+                flipped = np.ascontiguousarray(np.flip(gg_w.reshape(nk, n_bands, n_bands, nv)[k0:k1], axis=-1))
+                np.matmul(gamma_flat[k0:k1], flipped.reshape(k1 - k0, rows, 1), out=crossed_flat[k0:k1])
+        team_comm.Barrier()
+        if v1 > v0:
+            if from_direct:
+                crossed = _crossed_from_direct(direct_w[..., v0:v1], sign, eps_t)
+            else:
+                crossed = np.roll(
+                    np.flip(crossed_w.swapaxes(3, 4)[..., v0:v1], axis=(0, 1, 2)), shift=1, axis=(0, 1, 2)
+                )
+                if sign != 1:
+                    crossed *= -1
+            direct_w[..., v0:v1] += crossed
+            del crossed
+            direct_w[..., v0:v1] = sp.fft.ifftn(direct_w[..., v0:v1], axes=(0, 1, 2), overwrite_x=True)
+        team_comm.Barrier()
+        if eps_t is not None:
+            # the projected result goes to the (no longer needed) gap window; every rank reads the mirror block
+            if v1 > v0:
+                gap_w[..., v0:v1] = _project_frequency_block(direct_w, v0, v1, eps_t, eps_po)
+            team_comm.Barrier()
+
+    def apply_block(channel: SpinChannel, eps_t: int | None, eps_po: int | None, block: np.ndarray) -> np.ndarray:
+        gap_w[..., v0:v1] = block.reshape(gap_shape[:-1] + (v1 - v0,))
+        run(channel, eps_t, eps_po)
+        return (direct_w if eps_t is None else gap_w)[..., v0:v1].copy()
+
+    return apply_block, (v0, v1)
+
+
+@dataclass(frozen=True)
+class LanczosTeam:
+    """
+    One team of the Eliashberg team solve: the ranks of one node that solve the given sectors together, sharing
+    their node's vertex windows.
+
+    :ivar host: The node's hostname.
+    :ivar node_root: The lowest rank of the node (the rank that builds the node's vertex windows).
+    :ivar ranks: The team's ranks in ascending order; the first is the lead that drives the eigensolver.
+    :ivar sectors: The ``(channel, parity)`` sectors the lead solves, one after the other.
+    """
+
+    host: str
+    node_root: int
+    ranks: tuple[int, ...]
+    sectors: tuple[tuple[SpinChannel, str], ...]
+
+
+def plan_lanczos_teams(
+    comm: MPI.Comm, node_comm: MPI.Comm, available_bytes: int, niv_pp: int
+) -> tuple[tuple[LanczosTeam, ...], ...] | None:
+    r"""
+    Plans the team solve: the ``(channel, parity)`` sectors are spread as evenly as possible over the nodes (one
+    node hosts all of them, two nodes one channel each, four nodes one sector each; nodes beyond the sector count
+    host nothing), each channel's pairing vertex is built into a shared window on every node that hosts one of its
+    sectors, and a node's ranks are split into one team per sector hosted there (a node with fewer ranks than
+    sectors gives every rank a team of one that solves several sectors in turn). The nodes are the groups of
+    ``node_comm``, keyed by the lowest rank of each, so the plan and the windows it drives can never disagree on
+    who shares memory with whom. Every hosting node is checked against its own free memory with
+    :func:`~dgamore.memory_estimator.lanczos_team_bytes`: when a node cannot hold its share at once the channels are
+    solved in two rounds, each spread over the nodes the same way, and when even that does not fit the plan is
+    ``None`` (the grid solver takes over).
+
+    :param comm: The MPI communicator.
+    :param node_comm: The node-local communicator.
+    :param available_bytes: This rank's free host memory, allgathered and reduced (minimum) per node.
+    :param niv_pp: Number of positive fermionic frequencies of the pp box.
+    :return: The rounds of the solve, each a tuple of teams that run concurrently, or ``None`` when no round fits.
+    """
+    info = comm.allgather((node_comm.bcast(comm.rank, root=0), socket.gethostname(), available_bytes))
+    node_ranks: dict[int, list[int]] = {}
+    node_host: dict[int, str] = {}
+    node_available: dict[int, int] = {}
+    for rank, (node_root, host, avail) in enumerate(info):
+        node_ranks.setdefault(node_root, []).append(rank)
+        node_host[node_root] = host
+        node_available[node_root] = min(node_available.get(node_root, avail), avail)
+    nodes = list(node_ranks)
+    parities = [label for label, _ in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)]
+    sectors = [(channel, parity) for channel in (SpinChannel.SING, SpinChannel.TRIP) for parity in parities]
+
+    def spread(group: list[tuple[SpinChannel, str]]) -> dict[int, list[tuple[SpinChannel, str]]]:
+        # ponytail: at most one node per sector; splitting one matvec across nodes is the grid solver's job
+        chunks = np.array_split(np.arange(len(group)), min(len(nodes), len(group)))
+        return {nodes[i]: [group[j] for j in chunk] for i, chunk in enumerate(chunks)}
+
+    def fits(plan: list[dict[int, list[tuple[SpinChannel, str]]]]) -> bool:
+        for hosted in plan:
+            for node, node_sectors in hosted.items():
+                need = lanczos_team_bytes(
+                    config.sys.n_bands,
+                    config.lattice.k_grid.nk_tot,
+                    config.lattice.k_grid.nk_irr,
+                    niv_pp,
+                    config.eliashberg.n_eig,
+                    len({channel for channel, _ in node_sectors}),
+                    len(node_sectors),
+                    len(node_ranks[node]),
+                    wedge_window_points(config.lattice.k_grid),
+                )
+                if need > node_available[node] * NODE_MEMORY_FRACTION:
+                    return False
+        return True
+
+    plan = [spread(sectors)]
+    if not fits(plan):
+        plan = [spread([s for s in sectors if s[0] == channel]) for channel in (SpinChannel.SING, SpinChannel.TRIP)]
+        if not fits(plan):
+            return None
+
+    rounds = []
+    for hosted in plan:
+        teams = []
+        for node, node_sectors in hosted.items():
+            ranks = node_ranks[node]
+            n_teams = min(len(node_sectors), len(ranks))
+            for i, group in enumerate(np.array_split(np.array(ranks), n_teams)):
+                teams.append(
+                    LanczosTeam(node_host[node], node, tuple(int(r) for r in group), tuple(node_sectors[i::n_teams]))
+                )
+        rounds.append(tuple(teams))
+    return tuple(rounds)
+
+
+def _solve_sectors_in_teams(
+    mpi_dist_irrk: MpiDistributor,
+    comm: MPI.Comm,
+    node_comm: MPI.Comm,
+    gamma_sing_pp: FourPoint,
+    gamma_trip_pp: FourPoint,
+    giwk_dga: GreensFunction,
+    niv_pp: int,
+    rounds: tuple[tuple[LanczosTeam, ...], ...],
+) -> dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]]:
+    r"""
+    Solves every ``(channel, parity)`` sector with the teams of :func:`plan_lanczos_teams`. The pp bubble is built
+    once on rank 0, shipped to the other hosting node roots and exposed through one shared window per node; per
+    round, each channel's pairing vertex is gathered onto the root of every node hosting one of its sectors and
+    written into a node-shared matmul-layout window there (see :func:`_build_shared_vertex_window`), so a node holds
+    one copy per hosted channel instead of one per sector; every team then runs the lockstep matvec of
+    :func:`_team_matvec` over that window while its lead drives the eigensolver. On a symmetry-reduced grid with
+    unitary operations the windows hold the irreducible wedge of the real-space grid and the matvec contracts one
+    star at a time (see :func:`_wedge_orbits`). Both pairing vertices are **consumed**. The eigenvalues of
+    every sector reach every rank; the gap functions travel from the lead to rank 0 only (the rank that writes
+    them), one blocking transfer per gap, their number following the eigenvalues actually returned.
+
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :param comm: The MPI communicator.
+    :param node_comm: The node-local communicator.
+    :param gamma_sing_pp: The singlet pairing vertex (irr-BZ q-distributed on entry; consumed).
+    :param gamma_trip_pp: The triplet pairing vertex (irr-BZ q-distributed on entry; consumed).
+    :param giwk_dga: The DGA Green's function (held on rank 0; used to build the bubble).
+    :param niv_pp: Number of positive fermionic frequencies of the pp box.
+    :param rounds: The team plan.
+    :return: ``{(channel, parity): (lambdas, gaps)}`` for every sector; ``lambdas`` on every rank, ``gaps`` on rank 0
+        (an empty list elsewhere).
+    """
+    logger = config.logger
+    my_rank = comm.rank
+    k_grid = config.lattice.k_grid
+    norm = 0.5 / k_grid.nk_tot / config.sys.beta
+    n_bands = gamma_sing_pp.n_bands
+    gap_shape = k_grid.nk + (n_bands, n_bands, 2 * gamma_sing_pp.niv)
+    my_node_root = node_comm.bcast(my_rank, root=0)
+    hosting_roots = sorted({team.node_root for teams in rounds for team in teams})
+    orbits = _wedge_orbits(k_grid) if wedge_window_points(k_grid) < k_grid.nk_tot else None
+    wedge = orbits is not None
+
+    # the pp bubble: built on rank 0, shipped to the other hosting node roots, one shared window per hosting node
+    gchi0_q_pp = None
+    if my_rank == 0:
+        gchi0_q_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(giwk_dga, niv_pp, k_grid).decompress_q_dimension()
+        giwk_dga.free()
+        logger.info("Created the bare bubble susceptibility in pp notation.")
+    for root in hosting_roots:
+        if root == 0:
+            continue
+        if my_rank == 0:
+            mpi_dist_irrk.send_to_rank(gchi0_q_pp, dest=root, base_tag=BUBBLE_TAG)
+        elif my_rank == root:
+            gchi0_q_pp = mpi_dist_irrk.recv_from_rank(source=0, base_tag=BUBBLE_TAG)
+    chi0_mm, chi0_win, shortcut = None, None, False
+    if my_node_root in hosting_roots:
+        chi0_shared, chi0_win = mpi_utils.build_node_shared_array(node_comm, lambda: gchi0_q_pp.mat)
+        chi0_mm = _chi0_to_matmul_layout(chi0_shared)
+        del chi0_shared
+        # one band with a frequency-even bubble lets a projected sector skip the crossed contraction
+        shortcut = n_bands == 1 and _bubble_is_frequency_even(chi0_mm) if node_comm.Get_rank() == 0 else None
+        shortcut = node_comm.bcast(shortcut, root=0)
+    if gchi0_q_pp is not None:
+        gchi0_q_pp.free()
+
+    results: dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]] = {}
+    for teams in rounds:
+        gamma_by_channel: dict[SpinChannel, np.ndarray] = {}
+        vertex_wins = []
+        for channel, gamma_pp in ((SpinChannel.SING, gamma_sing_pp), (SpinChannel.TRIP, gamma_trip_pp)):
+            roots = sorted({team.node_root for team in teams if any(c == channel for c, _ in team.sectors)})
+            if not roots:
+                continue
+            local = gamma_pp.mat
+            for root in roots:
+                gathered = mpi_dist_irrk.gather(local, root=root)
+                if my_rank == root:
+                    gamma_pp.mat = gathered
+            # the gathers are complete; these names would otherwise keep the rank's share alive
+            del gathered, local
+            if my_rank not in roots:
+                gamma_pp.free()
+            if my_node_root in roots:
+                gamma_by_channel[channel], win = _build_shared_vertex_window(
+                    gamma_pp, node_comm, norm, None if orbits is None else orbits[0]
+                )
+                vertex_wins.append(win)
+                logger.info(
+                    f"Gamma_pp_{channel.value} window ({'irreducible wedge' if wedge else 'full grid'}): "
+                    f"{gamma_by_channel[channel].nbytes / 1024**3:.3f} GB, shared by the {node_comm.Get_size()} "
+                    f"rank(s) of its node.",
+                    allowed_ranks=tuple(roots),
+                )
+
+        my_team = next((team for team in teams if my_rank in team.ranks), None)
+        team_comm = comm.Split(teams.index(my_team) if my_team is not None else len(teams), my_rank)
+        local: dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]] = {}
+        if my_team is not None:
+            dtype = next(iter(gamma_by_channel.values())).dtype
+            scratch = [mpi_utils.allocate_node_shared_array(team_comm, gap_shape, dtype) for _ in range(4)]
+            apply_block, (v0, v1) = _team_matvec(
+                team_comm,
+                gamma_by_channel,
+                chi0_mm,
+                [array for array, _ in scratch],
+                gap_shape,
+                n_bands,
+                orbits,
+                shortcut,
+            )
+            # ponytail: one BLAS thread per team rank (production binds one rank per core); a per-rank executor
+            # if few-rank jobs on wide nodes ever matter
+            with threadpool_limits(limits=1):
+                local = _solve_team_sectors(team_comm, my_team, apply_block, (v0, v1), scratch[0][0], gap_shape)
+            # every view into a window dies before the window is freed (the matvec closure holds the scratch
+            # arrays and the vertex dict)
+            scratch_wins = [win for _, win in scratch]
+            del apply_block, scratch
+            for win in scratch_wins:
+                nonlocal_sde._free_shared_window(win, team_comm)
+        team_comm.Free()
+
+        for team in teams:
+            for sector in team.sectors:
+                lead, mine, tag = team.ranks[0], local.get(sector), SECTOR_TAG * (1 + len(results))
+                lambdas = mpi_dist_irrk.bcast(mine[0] if mine is not None else None, root=lead)
+                gaps = mine[1] if mine is not None else []
+                if my_rank == lead != 0:
+                    for gap in gaps:
+                        mpi_dist_irrk.send_to_rank(gap, dest=0, base_tag=tag)
+                    gaps = []
+                elif my_rank == 0 != lead:
+                    gaps = [mpi_dist_irrk.recv_from_rank(source=lead, base_tag=tag) for _ in range(len(lambdas))]
+                results[sector] = (lambdas, gaps)
+        gamma_by_channel.clear()
+        for win in vertex_wins:
+            nonlocal_sde._free_shared_window(win, node_comm)
+    del chi0_mm
+    nonlocal_sde._free_shared_window(chi0_win, node_comm)
+    return results
+
+
+def _solve_team_sectors(
+    team_comm: MPI.Comm,
+    team: LanczosTeam,
+    apply_block: Callable,
+    bounds: tuple[int, int],
+    gap_w: np.ndarray,
+    gap_shape: tuple,
+) -> dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]]:
+    r"""
+    Solves the sectors of one team with the team-distributed Krylov-Schur iteration (:func:`_team_arnoldi`): every
+    rank of the team runs the same iteration on its frequency block of the vectors, the sector seeds and projectors
+    are those of the single-rank solve, and the converged eigenvectors are assembled through the team's gap window
+    onto the lead, which orders, symmetrizes and wraps them (see :func:`_finish_sector`). The lead alone holds the
+    results.
+
+    :param team_comm: The team communicator (rank 0 is the lead).
+    :param team: The team and its sectors.
+    :param apply_block: The collective sector matvec of :func:`_team_matvec`.
+    :param bounds: This rank's frequency block ``(v0, v1)``.
+    :param gap_w: The team's gap-shaped scratch window used to assemble the eigenvectors.
+    :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
+    :return: ``{(channel, parity): (lambdas, gaps)}`` on the lead, an empty dict elsewhere.
+    """
+    logger = config.logger
+    lead = team_comm.Get_rank() == 0
+    v0, v1 = bounds
+    n_eig, tol = config.eliashberg.n_eig, config.eliashberg.epsilon
+    ncv = min(lanczos_ncv(n_eig), int(np.prod(gap_shape)))
+    orbital_mirrors = _gap_orbital_mirrors(gap_shape[3]) if config.eliashberg.symmetrize_degenerate_gaps else {}
+    eps_by_parity = dict(_frequency_parity_sectors(config.eliashberg.resolve_frequency_parity))
+    ranks = (team.ranks[0],)
+    labels = [_sector_log_label(channel, [parity]) for channel, parity in team.sectors]
+    logger.info(f"Lanczos team for {', '.join(labels)}: {len(team.ranks)} rank(s) on {team.host}.", allowed_ranks=ranks)
+    results: dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]] = {}
+    seeded_channel = None
+    for (channel, parity), label in zip(team.sectors, labels):
+        sign = 1 if channel == SpinChannel.SING else -1
+        eps_t = eps_by_parity[parity]
+        eps_po = None if eps_t is None else sign * eps_t
+        logger.info(f"Starting Lanczos method for {label}.", allowed_ranks=ranks)
+        if channel != seeded_channel:
+            base_seed, seeded_channel = get_initial_gap_function(gap_shape, channel).flatten(), channel
+        seed = _sector_seed(base_seed, gap_shape, eps_t, eps_po).reshape(gap_shape)[..., v0:v1]
+        start = time.perf_counter()
+        lambdas, ritz, basis, n_matvec, matvec_seconds = _team_arnoldi(
+            lambda block: apply_block(channel, eps_t, eps_po, block), seed, n_eig, ncv, tol, 10000, team_comm
+        )
+        logger.info(
+            f"Lanczos for {label}: {n_matvec} matvecs, {matvec_seconds:.1f} s in the matvec "
+            f"({1e3 * matvec_seconds / max(n_matvec, 1):.0f} ms each), {time.perf_counter() - start:.1f} s "
+            f"in the solve.",
+            allowed_ranks=ranks,
+        )
+        if len(lambdas) < n_eig:
+            logger.warning(
+                f"Lanczos for {label} did not converge within the restart limit; keeping the {len(lambdas)} of "
+                f"{n_eig} converged eigenpair(s).",
+                allowed_ranks=ranks,
+            )
+        # the eigenvectors travel block by block through the shared gap window to the lead
+        gaps = np.empty((int(np.prod(gap_shape)), len(lambdas)), dtype=basis.dtype) if lead else None
+        for i in range(len(lambdas)):
+            block = ritz[:, i] @ basis
+            block /= np.sqrt(team_comm.allreduce(float(np.vdot(block, block).real)))
+            gap_w[..., v0:v1] = block.reshape(gap_shape[:-1] + (v1 - v0,))
+            team_comm.Barrier()
+            if lead:
+                gaps[:, i] = gap_w.reshape(-1)
+            team_comm.Barrier()
+        if lead:
+            results[(channel, parity)] = _finish_sector(
+                lambdas, gaps, gap_shape, channel, tuple(gap_shape[:3]), label, orbital_mirrors, ranks
+            )
+    logger.info(f"Finished solving the Eliashberg equation for {', '.join(labels)}.", allowed_ranks=ranks)
+    return results
+
+
 def _solve_pairing_sectors(
     mv,
     gap_shape: tuple,
@@ -1463,15 +2247,17 @@ def _solve_pairing_sectors(
     ranks,
     base_seed: np.ndarray,
     parities: list[str] | None = None,
+    dtype: np.dtype = DTYPE,
 ) -> dict[str, tuple[np.ndarray, list[GapFunction]]]:
     r"""
     Runs the ARPACK/Lanczos solve of the pairing kernel ``mv`` once per physical frequency-parity sector selected by
     ``config.eliashberg.resolve_frequency_parity`` and returns the leading ``n_eig`` eigenpairs of each. Every projected
-    sector wraps the matvec and the seed in the Hermitian sector projector :math:`\Pi` (T-parity ``eps_T`` and the
-    Pauli-forced combined parity ``eps_PO = sign * eps_T``); the ``"none"`` sector runs the raw kernel unchanged. The
-    passed ``executor`` (the momentum-batch thread pool, or ``None``) is shut down before returning.
+    sector hands the matvec its Hermitian sector projector :math:`\Pi` (T-parity ``eps_T`` and the Pauli-forced
+    combined parity ``eps_PO = sign * eps_T``) and projects the seed with it; the ``"none"`` sector runs the raw kernel
+    unchanged. The passed ``executor`` (the momentum-batch thread pool, or ``None``) is shut down before returning.
 
-    :param mv: The flattened pairing-kernel matvec (maps a full-length gap vector to a full-length gap vector).
+    :param mv: The sector matvec ``mv(gap, eps_t, eps_po)`` (maps a full-length gap vector to a full-length gap
+        vector, projected onto the sector unless ``eps_t`` is ``None``).
     :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
     :param sign: The channel sign (:math:`+1` singlet, :math:`-1` triplet).
     :param channel: The pairing channel (used to label outputs).
@@ -1479,37 +2265,15 @@ def _solve_pairing_sectors(
     :param executor: The momentum-batch thread pool (or ``None``); shut down on return.
     :param ranks: The ranks tuple used for logging.
     :param base_seed: The flattened initial gap seed, identical on every rank (drawn from a fixed-seed
-        generator); projected into each sector, with a deterministic random fallback when the
-        projection of the seed collapses (a seed whose parity is orthogonal to the requested sector).
-    :param parities: An optional subset of parity labels to solve; ``None`` solves every configured sector. Used to
-        hand different sectors to different ranks.
+        generator); projected into each sector by :func:`_sector_seed`.
+    :param parities: An optional subset of parity labels to solve; ``None`` solves every configured sector.
+    :param dtype: The dtype ``mv`` returns (that of the pairing vertex); declared on the eigensolver's operator so
+        scipy does not probe it with an extra matvec.
     :return: ``{parity_label: (lambdas, [GapFunction, ...])}`` for each solved sector.
     """
     logger = config.logger
     n_eig = config.eliashberg.n_eig
-    plural = "" if n_eig == 1 else "s"
     shape_flat = int(np.prod(gap_shape))
-
-    def sector_matvec(eps_t: int | None, eps_po: int | None):
-        if eps_t is None:
-            return mv
-        return lambda gap: _project_gap_to_sector(
-            mv(_project_gap_to_sector(gap, gap_shape, eps_t, eps_po)), gap_shape, eps_t, eps_po
-        )
-
-    def sector_seed(eps_t: int | None, eps_po: int | None) -> np.ndarray:
-        if eps_t is None:
-            return base_seed
-        seed = _project_gap_to_sector(base_seed, gap_shape, eps_t, eps_po)
-        if np.linalg.norm(seed) >= 1e-10 * max(np.linalg.norm(base_seed), 1e-30):
-            return seed
-        # the seed's parity is orthogonal to this sector; reseed deterministically so every rank agrees
-        rng = np.random.default_rng(0)
-        fallback = (rng.standard_normal(gap_shape) + 1j * rng.standard_normal(gap_shape)).flatten()
-        fallback = _project_gap_to_sector(fallback, gap_shape, eps_t, eps_po)
-        # a sector empty on this grid (e.g. every k equals -k) leaves nothing to project onto: fall back to the
-        # nonzero base seed so the eigensolver gets a valid deterministic start (the projected operator returns ~0)
-        return fallback if np.linalg.norm(fallback) > 0 else base_seed
 
     sectors = _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)
     if parities is not None:
@@ -1524,30 +2288,46 @@ def _solve_pairing_sectors(
             eps_po = None if eps_t is None else sign * eps_t
             label = _sector_log_label(channel, [parity])
             logger.info(f"Starting Lanczos method for {label}.", allowed_ranks=ranks)
-            mat = sp.sparse.linalg.LinearOperator(shape=(shape_flat, shape_flat), matvec=sector_matvec(eps_t, eps_po))
+            n_matvec, matvec_seconds = 0, 0.0
+
+            def counted_matvec(gap: np.ndarray, eps_t=eps_t, eps_po=eps_po) -> np.ndarray:
+                nonlocal n_matvec, matvec_seconds
+                start = time.perf_counter()
+                result = mv(gap, eps_t, eps_po)
+                n_matvec += 1
+                matvec_seconds += time.perf_counter() - start
+                return result
+
+            mat = sp.sparse.linalg.LinearOperator(shape=(shape_flat, shape_flat), matvec=counted_matvec, dtype=dtype)
+            eigsh_start = time.perf_counter()
             # BLAS is pinned to one thread for the solve (threadpool_limits resizes the live pool; an environment
             # change would be ignored) so the momentum-batch threads never nest BLAS threads underneath.
             with threadpool_limits(limits=1 if executor is not None else None):
-                lambdas, gaps = sp.sparse.linalg.eigsh(
-                    mat,
-                    k=n_eig,
-                    tol=config.eliashberg.epsilon,
-                    v0=sector_seed(eps_t, eps_po),
-                    which="LA",
-                    maxiter=10000,
-                )
-            order = lambdas.argsort()[::-1]  # sort eigenvalues in descending order
-            lambdas = lambdas[order]
-            gaps = gaps[:, order]
-            if config.eliashberg.symmetrize_degenerate_gaps:
-                gaps = symmetrize_degenerate_gaps(lambdas, gaps, gap_shape, orbital_mirrors=orbital_mirrors)
+                try:
+                    lambdas, gaps = sp.sparse.linalg.eigsh(
+                        mat,
+                        k=n_eig,
+                        tol=config.eliashberg.epsilon,
+                        v0=_sector_seed(base_seed, gap_shape, eps_t, eps_po),
+                        ncv=min(lanczos_ncv(n_eig), shape_flat),
+                        which="LA",
+                        maxiter=10000,
+                    )
+                except sp.sparse.linalg.ArpackNoConvergence as exc:
+                    # the converged subset is kept; the delivery sizes the gap transfer off what came back
+                    lambdas, gaps = exc.eigenvalues.real, exc.eigenvectors
+                    logger.warning(
+                        f"Lanczos for {label} did not converge within the iteration limit; keeping the "
+                        f"{len(lambdas)} of {n_eig} converged eigenpair(s).",
+                        allowed_ranks=ranks,
+                    )
             logger.info(
-                f"Largest eigenvalue{plural} for {label}: " + ", ".join(f"{lam:.6f}" for lam in lambdas),
+                f"Lanczos for {label}: {n_matvec} matvecs, {matvec_seconds:.1f} s in the matvec "
+                f"({1e3 * matvec_seconds / max(n_matvec, 1):.0f} ms each), {time.perf_counter() - eigsh_start:.1f} s "
+                f"in eigsh.",
                 allowed_ranks=ranks,
             )
-            # ARPACK may return fewer eigenpairs than requested, so size the list off what actually came back
-            gap_list = [GapFunction(gaps[:, i].reshape(gap_shape), channel, nq) for i in range(gaps.shape[1])]
-            results[parity] = (lambdas, gap_list)
+            results[parity] = _finish_sector(lambdas, gaps, gap_shape, channel, nq, label, orbital_mirrors, ranks)
     finally:
         if executor is not None:
             executor.shutdown()
@@ -1574,12 +2354,12 @@ def solve_eliashberg_lanczos(
         channel; consumed by the solve.
     :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{\mathrm{pp}}` at :math:`\omega = 0`.
     :param ranks: The ranks used for logging.
-    :param parities: An optional subset of parity labels to solve on this rank (``None`` solves every configured
-        sector); the caller assigns different parities to different ranks so the sectors solve concurrently.
+    :param parities: An optional subset of parity labels to solve (``None`` solves every configured sector).
     :return: A dict ``{parity_label: (lambdas, gaps)}`` of the leading eigenvalues and :class:`GapFunction` objects
         per solved physical frequency-parity sector (a single ``"none"`` key when no projection is requested).
     """
     logger = config.logger
+    import psutil
 
     logger.info(
         f"Starting to solve the Eliashberg equation for the {gamma_r_pp.channel.value}let channel.",
@@ -1602,52 +2382,85 @@ def solve_eliashberg_lanczos(
 
     n_bands = gamma_r_pp.n_bands
     norm = 0.5 / config.lattice.k_grid.nk_tot / config.sys.beta
-    # the other ranks idle at the post-solve broadcast during this in-memory solve, so the solver rank may spread
-    # the bandwidth-bound matvec over every core its affinity mask allows (momentum-batch threads, BLAS kept at 1)
+    # the single rank spreads the bandwidth-bound matvec over every core its affinity mask allows (momentum-batch
+    # threads, BLAS kept at 1)
     n_threads = _solver_thread_budget()
     executor = ThreadPoolExecutor(max_workers=n_threads) if n_threads > 1 else None
+    logger.info(
+        f"Solver thread budget for {_sector_log_label(gamma_r_pp.channel, parities)}: {n_threads} thread(s), from "
+        f"the CPU affinity mask.",
+        allowed_ranks=ranks,
+    )
 
     chi0_mm = _chi0_to_matmul_layout(gchi0_q0_pp.mat)
     # The pairing vertex arrives in w2dynamics G2 leg order (c cdag c cdag), whereas _apply_gamma_pp expects the
     # TRIQS order (cdag c cdag c), see https://triqs.github.io/tprf/latest/theory/eliashberg.html
-    gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.permute_orbitals("abcd->badc", False).mat)
+    # the kernel prefactor is folded into the persistent vertex once: both matvec terms inherit it by linearity, so
+    # the per-matvec full-gap multiply is dropped.
+    gamma_mm = _gamma_to_matmul_layout(gamma_r_pp.permute_orbitals("abcd->badc", False).mat, scale=norm)
     gamma_r_pp.free()
-    # fold the kernel prefactor into the persistent vertex once: both matvec terms inherit it by linearity, so the
-    # per-matvec full-gap multiply is dropped.
-    gamma_mm *= norm
+    resident_gb = psutil.Process().memory_info().rss / 1024**3
+    logger.info(
+        f"Solver rank resident set after the matmul-layout build: {resident_gb:.3f} GB "
+        f"({_sector_log_label(gamma_r_pp.channel, parities)}).",
+        allowed_ranks=ranks,
+    )
 
     sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
+    shortcut = n_bands == 1 and _bubble_is_frequency_even(chi0_mm)
 
-    def mv(gap: np.ndarray):
+    def mv(gap: np.ndarray, eps_t: int | None, eps_po: int | None) -> np.ndarray:
         r"""
-        Applies the pairing kernel to a flattened gap vector (the matrix-vector product for the eigensolver): multiplies
-        by :math:`\chi_0^{\mathrm{pp}}`, FFTs to real space, contracts with the pairing vertex (direct plus the crossed
-        term, the latter reusing the direct vertex via gap-sized index shuffles), and transforms back. The orbital
-        contractions are batched ``np.matmul`` products and the BZ transforms run in place through ``scipy.fft`` (both
-        threaded up to the solver thread budget).
+        Applies the pairing kernel of one sector to a flattened gap vector (the matrix-vector product for the
+        eigensolver): projects onto the sector (unless ``eps_t`` is ``None``), multiplies by
+        :math:`\chi_0^{\mathrm{pp}}`, FFTs to real space, contracts with the pairing vertex (direct plus the crossed
+        term, the latter reusing the direct vertex via gap-sized index shuffles, or formed from the direct term for
+        one band with a frequency-even bubble, see :func:`_crossed_from_direct`), transforms back and projects again.
+        The orbital contractions are batched ``np.matmul`` products and the BZ transforms run in place through
+        ``scipy.fft`` (both threaded up to the solver thread budget).
 
         :param gap: The flattened gap vector.
-        :return: The flattened result of applying the pairing kernel to ``gap``.
+        :param eps_t: The T-parity of the sector, or ``None`` for the raw kernel.
+        :param eps_po: The forced combined ``P.O`` parity of the sector.
+        :return: The flattened result of applying the sector kernel to ``gap``.
         """
+        if eps_t is not None:
+            gap = _project_gap_to_sector(gap, gap_shape, eps_t, eps_po)
         gap_gg = sp.fft.fftn(
-            _apply_gchi0_pp(chi0_mm, gap, n_bands), axes=(0, 1, 2), overwrite_x=True, workers=n_threads
+            _apply_gchi0_pp(chi0_mm, gap, n_bands, executor, n_threads),
+            axes=(0, 1, 2),
+            overwrite_x=True,
+            workers=n_threads,
         )
         gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands, executor, n_threads)
-        # crossed term: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]; the flipped
-        # RHS is materialized contiguously so np.matmul stays on the BLAS fast path (a single-band flip is a view).
-        crossed = _apply_gamma_pp(
-            gamma_mm, np.ascontiguousarray(np.flip(gap_gg, axis=-1)), n_bands, executor, n_threads
-        )
-        crossed = np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-        if sign != 1:
-            crossed *= sign
+        if shortcut and eps_t is not None:
+            crossed = _crossed_from_direct(gap_new, sign, eps_t)
+        else:
+            # crossed term: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]; the flipped
+            # RHS is materialized contiguously so np.matmul stays on the BLAS fast path (a single-band flip is a view).
+            crossed = _apply_gamma_pp(
+                gamma_mm, np.ascontiguousarray(np.flip(gap_gg, axis=-1)), n_bands, executor, n_threads
+            )
+            crossed = np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+            if sign != 1:
+                crossed *= sign
         gap_new += crossed
         gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True, workers=n_threads)
-        return gap_new.flatten()
+        out = gap_new.flatten()
+        return out if eps_t is None else _project_gap_to_sector(out, gap_shape, eps_t, eps_po)
 
     base_seed = get_initial_gap_function(gap_shape, gamma_r_pp.channel).flatten()
     return _solve_pairing_sectors(
-        mv, gap_shape, sign, gamma_r_pp.channel, gamma_r_pp.nq, executor, ranks, base_seed, parities
+        mv,
+        gap_shape,
+        sign,
+        gamma_r_pp.channel,
+        gamma_r_pp.nq,
+        executor,
+        ranks,
+        base_seed,
+        parities,
+        gamma_mm.dtype,
     )
 
 
@@ -1713,85 +2526,29 @@ def _solve_sectors_in_memory(
     gamma_trip_pp: FourPoint,
     giwk_dga: GreensFunction,
     niv_pp: int,
-    sing_ranks: list[int],
-    trip_ranks: list[int],
-    bubble_rank: int,
     parities: list[str],
 ) -> dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]]:
     r"""
-    Distributes the singlet and triplet pairing vertices and the bare pp bubble across the sector ranks and solves
-    every ``(channel, parity)`` sector on its assigned rank so they run concurrently (the in-memory Lanczos path).
-    Each channel's vertex is gathered to every rank that owns one of its sectors (the distinct-node assignment of
-    :func:`get_ranks_for_lanczos` keeps this at one copy per node); the bubble is built once on ``bubble_rank`` (the
-    only rank still holding ``giwk_dga``) and shipped to the other solving ranks. The results are broadcast from each
-    sector's owning rank so every rank returns the full dict.
+    Solves every ``(channel, parity)`` sector in turn on the single rank of the job (the in-memory path of a
+    single-rank run): the pp bubble is built once from ``giwk_dga``, then the singlet and the triplet channel run
+    through :func:`solve_eliashberg_lanczos` one after the other, each over the requested parity sectors. Both
+    pairing vertices are **consumed**.
 
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :param gamma_sing_pp: The singlet pairing vertex (irr-BZ q-distributed on entry; consumed).
-    :param gamma_trip_pp: The triplet pairing vertex (irr-BZ q-distributed on entry; consumed).
-    :param giwk_dga: The DGA Green's function (held only on ``bubble_rank``; used to build the bubble).
-    :param niv_pp: The pp fermionic box size.
-    :param sing_ranks: The rank owning each singlet parity sector (index ``i`` -> ``parities[i]``).
-    :param trip_ranks: The rank owning each triplet parity sector.
-    :param bubble_rank: The rank that builds the pp bubble (``sing_ranks[0]``).
+    :param gamma_sing_pp: The singlet pairing vertex (the whole irreducible BZ; consumed).
+    :param gamma_trip_pp: The triplet pairing vertex (the whole irreducible BZ; consumed).
+    :param giwk_dga: The DGA Green's function (used to build the bubble).
+    :param niv_pp: Number of positive fermionic frequencies of the pp box.
     :param parities: The parity labels to solve.
-    :return: ``{(channel, parity): (lambdas, gaps)}`` for every sector, identical on every rank.
+    :return: ``{(channel, parity): (lambdas, gaps)}`` for every sector.
     """
-    logger = config.logger
-    my_rank = mpi_dist_irrk.my_rank
-    n_eig = config.eliashberg.n_eig
-    distinct_sing = list(dict.fromkeys(sing_ranks))
-    distinct_trip = list(dict.fromkeys(trip_ranks))
-
-    local_sing = gamma_sing_pp.mat
-    for target in distinct_sing:
-        gathered = mpi_dist_irrk.gather(local_sing, root=target)
-        if my_rank == target:
-            gamma_sing_pp.mat = gathered
-    if my_rank not in distinct_sing:
-        gamma_sing_pp.free()
-    local_trip = gamma_trip_pp.mat
-    for target in distinct_trip:
-        gathered = mpi_dist_irrk.gather(local_trip, root=target)
-        if my_rank == target:
-            gamma_trip_pp.mat = gathered
-    if my_rank not in distinct_trip:
-        gamma_trip_pp.free()
-
-    gchi0_q_pp = None
-    if my_rank == bubble_rank:
-        gchi0_q_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(giwk_dga, niv_pp, config.lattice.k_grid)
-        logger.info("Created the bare bubble susceptibility in pp notation.", allowed_ranks=(bubble_rank,))
-    for target in dict.fromkeys(distinct_sing + distinct_trip):
-        if target == bubble_rank:
-            continue
-        if my_rank == bubble_rank:
-            mpi_dist_irrk.send_to_rank(gchi0_q_pp, dest=target, base_tag=0)
-        elif my_rank == target:
-            gchi0_q_pp = mpi_dist_irrk.recv_from_rank(source=bubble_rank, base_tag=0)
-
-    my_sing = [parities[i] for i in range(len(parities)) if sing_ranks[i] == my_rank]
-    my_trip = [parities[i] for i in range(len(parities)) if trip_ranks[i] == my_rank]
-    sectors_sing = sectors_trip = None
-    if my_sing:
-        sectors_sing = solve_eliashberg_lanczos(gamma_sing_pp, gchi0_q_pp, tuple(distinct_sing), my_sing)
-    if my_trip:
-        sectors_trip = solve_eliashberg_lanczos(gamma_trip_pp, gchi0_q_pp, tuple(distinct_trip), my_trip)
-
-    mpi_dist_irrk.delete_file()
-
+    gchi0_q_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(giwk_dga, niv_pp, config.lattice.k_grid)
+    config.logger.info("Created the bare bubble susceptibility in pp notation.")
     results: dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]] = {}
-    for channel, sectors, ranks_list in (
-        (SpinChannel.SING, sectors_sing, sing_ranks),
-        (SpinChannel.TRIP, sectors_trip, trip_ranks),
-    ):
-        for i, parity in enumerate(parities):
-            owner = ranks_list[i]
-            local = sectors[parity] if (sectors is not None and parity in sectors) else None
-            lambdas = mpi_dist_irrk.bcast(local[0] if local is not None else None, root=owner)
-            gaps = local[1] if local is not None else [GapFunction(np.empty(0)) for _ in range(n_eig)]
-            gaps = [mpi_dist_irrk.bcast_npoint(gap, root=owner) for gap in gaps]
-            results[(channel, parity)] = (lambdas, gaps)
+    for gamma_pp in (gamma_sing_pp, gamma_trip_pp):
+        sectors = solve_eliashberg_lanczos(gamma_pp, gchi0_q_pp, (0,), parities)
+        results.update({(gamma_pp.channel, parity): sectors[parity] for parity in parities})
+    mpi_dist_irrk.delete_file()
     return results
 
 
@@ -1806,9 +2563,10 @@ def solve(
     r"""
     Drives the Eliashberg step: assembles the singlet and triplet pairing vertices from the saved
     ladder-DGA full vertices (optionally adding the local reducible diagrams), then solves the linearized gap equation
-    for each channel and returns the leading eigenvalues and gap functions. Solves in memory with concurrent
-    (channel x parity) sectors when one sector's residency fits on a rank, and on the block-distributed solver grid
-    otherwise (decided automatically from the available node memory).
+    for each channel and returns the leading eigenvalues and gap functions. A single rank solves in memory, sector
+    after sector; a multi-rank job solves in memory as concurrent (channel x parity) sector teams that share one
+    vertex window per channel and node when a node holds such a window (see :func:`plan_lanczos_teams`, decided
+    from the available node memory), and on the block-distributed solver grid otherwise.
 
     :param giwk_dga: The converged momentum-dependent DGA :class:`GreensFunction`.
     :param g_dmft: The local (DMFT) :class:`GreensFunction` (used for the local diagrams).
@@ -1819,7 +2577,8 @@ def solve(
         budget is used; ``None`` gives the fair-share budget of
         :func:`~dgamore.memory_estimator.dynamic_chunk_budget`.
     :return: A dict keyed by ``(channel, parity_label)`` mapping to ``(lambdas, gaps)`` of the leading eigenvalues
-        and :class:`GapFunction` objects for each solved physical frequency-parity sector. When
+        and :class:`GapFunction` objects for each solved physical frequency-parity sector; the eigenvalues are
+        present on every rank, the gap functions on rank 0 only (an empty list elsewhere). When
         ``config.eliashberg.resolve_frequency_parity`` is set the parity labels are ``"even"`` and ``"odd"``,
         otherwise a single unprojected ``"none"`` sector is returned.
     """
@@ -1837,8 +2596,8 @@ def solve(
     parities = [parity for parity, _ in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)]
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
 
-    # per-node memory drives the solver choice and how many (channel, parity) sectors run concurrently; the
-    # residencies come from the one memory_estimator formula, so dispatch and estimate can never drift apart
+    # one sector's single-rank residency, from the memory_estimator formula the driver's fit check reads as well;
+    # it is what a single rank holds, and the figure the solver log lines quote
     per_sector_bytes, _ = lanczos_solver_bytes(
         config.sys.n_bands,
         config.lattice.k_grid.nk_tot,
@@ -1853,15 +2612,15 @@ def solve(
     if cgroup_limit is not None:
         node_budget = min(node_budget, cgroup_limit)
 
-    # one full-BZ sector residency per rank picks the in-memory solve, otherwise the grid takes over; rank 0
-    # decides and broadcasts, so ranks on differently loaded nodes can never pick different solvers
-    use_grid = FORCE_GRID_SOLVER or (
-        comm.size > 1 and per_sector_bytes + giwk_dga.mat.nbytes > node_budget * NODE_MEMORY_FRACTION
-    )
-    use_grid = comm.bcast(use_grid, root=0)
+    node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED) if comm.size > 1 else None
+    # on a multi-rank job the team plan (an allgather, so identical on every rank) decides: it is None when no
+    # node holds even one channel's windows, and the grid takes over; a single rank solves in memory
+    rounds = None
+    if comm.size > 1 and not FORCE_GRID_SOLVER:
+        rounds = plan_lanczos_teams(comm, node_comm, node_budget, niv_pp)
+    use_grid = FORCE_GRID_SOLVER or (comm.size > 1 and rounds is None)
+    bubble_rank = 0
     if use_grid:
-        sing_ranks = trip_ranks = None
-        bubble_rank = 0
         _, grid_bytes = lanczos_solver_bytes(
             config.sys.n_bands,
             config.lattice.k_grid.nk_tot,
@@ -1872,40 +2631,46 @@ def solve(
         )
         rows, cols = solver_grid_shape(comm.size, 2 * niv_pp)
         logger.info(
-            f"Eliashberg solver: one sector needs {per_sector_bytes / 1024**3:.3f} GB, exceeding the single-rank "
-            f"budget -> block-distributed {rows}x{cols} grid, sectors sequential, {grid_bytes / 1024**3:.3f} GB "
-            f"per rank."
+            f"Eliashberg solver: no node holds one channel's vertex windows -> block-distributed {rows}x{cols} grid, "
+            f"sectors sequential, {grid_bytes / 1024**3:.3f} GB per rank (one full-BZ sector residency is "
+            f"{per_sector_bytes / 1024**3:.3f} GB; niv_pp = {niv_pp}, node budget {node_budget / 1024**3:.3f} GB)."
         )
     else:
-        sing_ranks, trip_ranks = get_ranks_for_lanczos(
-            comm, len(parities), node_budget, per_sector_bytes, giwk_dga.mat.nbytes
-        )
-        bubble_rank = sing_ranks[0]
-        n_concurrent = len(set(sing_ranks) | set(trip_ranks))
-        n_sectors = 2 * len(parities)
-        logger.info(
-            f"Eliashberg solver: {n_sectors} (channel x parity) sector(s) on {n_concurrent} rank(s) "
-            f"({'fully concurrent' if n_concurrent == n_sectors else 'partly sequential'}; singlet on rank(s) "
-            f"{sorted(set(sing_ranks))}, triplet on rank(s) {sorted(set(trip_ranks))}), each holding at most "
-            f"{per_sector_bytes / 1024**3:.3f} GB."
-        )
+        if rounds is None:
+            logger.info(
+                f"Eliashberg solver: {2 * len(parities)} (channel x parity) sector(s) in turn on the single rank, "
+                f"holding at most {per_sector_bytes / 1024**3:.3f} GB (niv_pp = {niv_pp})."
+            )
+        else:
+            hosts = sorted({team.host for teams in rounds for team in teams})
+            sizes = sorted({len(team.ranks) for teams in rounds for team in teams})
+            logger.info(
+                f"Eliashberg solver: {2 * len(parities)} (channel x parity) sector(s) solved by "
+                f"{sum(len(teams) for teams in rounds)} team(s) of {'-'.join(map(str, sizes))} rank(s) on "
+                f"{len(hosts)} node(s), "
+                f"{'all sectors at once' if len(rounds) == 1 else 'one channel at a time'}; one vertex window per "
+                f"channel and hosting node (niv_pp = {niv_pp}, node budget {node_budget / 1024**3:.3f} GB)."
+            )
     # giwk_dga is consumed only by the pp-bubble build on bubble_rank, so every other rank drops its copy
     if comm.rank != bubble_rank:
         giwk_dga.free()
 
-    node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED) if comm.size > 1 else None
     chunk_bytes = (
         memory_estimator.dynamic_chunk_budget(mpi_utils.job_memory_total(), node_comm.size if node_comm else 1)
         if chunk_budgets is None
         else chunk_budgets.fq
     )
 
+    build_start = time.perf_counter()
     f_dens_pp = dispatch_full_vertex_calculation(
         SpinChannel.DENS, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes, node_comm
     )
+    logger.info(f"Built the density full ladder vertex in pp notation in {time.perf_counter() - build_start:.1f} s.")
+    build_start = time.perf_counter()
     f_magn_pp = dispatch_full_vertex_calculation(
         SpinChannel.MAGN, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes, node_comm
     )
+    logger.info(f"Built the magnetic full ladder vertex in pp notation in {time.perf_counter() - build_start:.1f} s.")
 
     delete_files(config.output.eliashberg_path, f"gchi0_q_inv_rank_{comm.rank}.npy")
 
@@ -1938,8 +2703,6 @@ def solve(
     # special treatment of local full vertex that is subtracted with a different frequency notation and is
     # different from the regular pp
     f_ud_loc_transf_w0 = _compute_once_per_node(node_comm, lambda: create_local_f_ud_transformed_w0(niv_pp))
-    if node_comm is not None:
-        node_comm.Free()
 
     # Eqs. (4.49)-(4.52): the assembled vertex holds the negative crossed slot, so the local full vertex enters with
     # a relative minus and the pp-reducible diagrams phi with a plus, both in crossed-slot form ((v, -v'), 1432).
@@ -1975,98 +2738,28 @@ def solve(
             for parity in parities:
                 local = sectors[parity] if sectors is not None else None
                 lambdas = comm.bcast(local[0] if local is not None else None, root=0)
-                gaps = (
-                    local[1]
-                    if local is not None
-                    else [GapFunction(np.empty(0)) for _ in range(config.eliashberg.n_eig)]
-                )
-                gaps = [mpi_dist_irrk.bcast_npoint(gap, root=0) for gap in gaps]
-                results[(channel, parity)] = (lambdas, gaps)
+                # every grid rank holds the sector's gaps; only rank 0 writes them, the others drop theirs
+                results[(channel, parity)] = (lambdas, local[1] if comm.rank == 0 else [])
+            sectors = None
+    elif rounds is None:
+        results = _solve_sectors_in_memory(mpi_dist_irrk, gamma_sing_pp, gamma_trip_pp, giwk_dga, niv_pp, parities)
     else:
-        results = _solve_sectors_in_memory(
-            mpi_dist_irrk, gamma_sing_pp, gamma_trip_pp, giwk_dga, niv_pp, sing_ranks, trip_ranks, bubble_rank, parities
+        results = _solve_sectors_in_teams(
+            mpi_dist_irrk, comm, node_comm, gamma_sing_pp, gamma_trip_pp, giwk_dga, niv_pp, rounds
         )
+    if node_comm is not None:
+        node_comm.Free()
 
     return results
 
 
 # Fraction of a node's available host memory the sector packing may occupy (mirrors DGAmore.NODE_MEMORY_FRACTION).
 NODE_MEMORY_FRACTION: float = 0.95
+# Base MPI tags of the point-to-point transfers of the sector solves: the pp bubble ship to the hosting node roots,
+# and one block per delivered sector (its gaps at SECTOR_TAG * (1 + sector_index)), clear of the gathers' tags.
+BUBBLE_TAG: int = 900
+SECTOR_TAG: int = 1000
 
-
-def get_ranks_for_lanczos(
-    comm: MPI.Comm,
-    n_parities: int = 1,
-    available_bytes: int | None = None,
-    per_sector_bytes: int | None = None,
-    giwk_bytes: int = 0,
-) -> tuple[list[int], list[int]]:
-    r"""
-    Assigns MPI ranks to the singlet and triplet frequency-parity sectors so that as many as fit run concurrently.
-    When a per-sector memory estimate is supplied, each node is packed with as many concurrent sector solves as its
-    free memory holds (one full pairing vertex per solving rank, capped by the node's rank count), so several sectors
-    may share a node when it has the headroom - never exceeding ``available_bytes * NODE_MEMORY_FRACTION`` per node,
-    hence never overcommitting. The bubble node (the first solving rank) additionally reserves ``giwk_bytes``. Sectors
-    beyond a node's capacity reuse an already-assigned rank of the same channel and are solved sequentially there
-    (one vertex copy). Without the estimate (``per_sector_bytes is None``) it falls back to the proven 2-way: singlet
-    on one node, triplet on another (or a second rank of the sole node), each channel's parities solved sequentially.
-
-    :param comm: The MPI communicator.
-    :param n_parities: The number of frequency-parity sectors per channel (2 when resolving parity, else 1).
-    :param available_bytes: This rank's free host memory (:func:`psutil.virtual_memory().available`), allgathered and
-        reduced (minimum) per node; ``None`` selects the memory-unaware 2-way fallback.
-    :param per_sector_bytes: The estimated peak host memory of one in-memory sector solve (dominated by the full-BZ
-        pairing vertex); ``None`` selects the fallback.
-    :param giwk_bytes: The DGA Green's function size held on the bubble node while it builds the pp bubble.
-    :return: ``(singlet_ranks, triplet_ranks)``, each a list of ``n_parities`` ranks (the rank that owns parity ``i``).
-    """
-    info = comm.allgather((socket.gethostname(), available_bytes))
-    node_to_ranks: dict = {}
-    node_available: dict = {}
-    for r, (host, avail) in enumerate(info):
-        node_to_ranks.setdefault(host, []).append(r)
-        if avail is not None:
-            node_available[host] = avail if host not in node_available else min(node_available[host], avail)
-    nodes = list(node_to_ranks)
-
-    if per_sector_bytes is None or not node_available:
-        # no memory estimate: the proven 2-way (channels concurrent, a channel's parities sequential on its rank)
-        if len(nodes) >= 2:
-            singlet_rank, triplet_rank = node_to_ranks[nodes[0]][0], node_to_ranks[nodes[1]][0]
-        else:
-            ranks_on_node = node_to_ranks[nodes[0]]
-            singlet_rank = ranks_on_node[0]
-            triplet_rank = ranks_on_node[1] if len(ranks_on_node) > 1 else ranks_on_node[0]
-        return [singlet_rank] * n_parities, [triplet_rank] * n_parities
-
-    # concurrent vertices a node can hold (the first node also stores the giwk for the bubble build)
-    capacity = {}
-    for i, host in enumerate(nodes):
-        budget = node_available[host] * NODE_MEMORY_FRACTION - (giwk_bytes if i == 0 else 0)
-        capacity[host] = max(1, min(len(node_to_ranks[host]), int(budget // per_sector_bytes)))
-
-    # distinct solving ranks (one vertex each), filled round-robin across nodes up to each node's capacity
-    n_sectors = 2 * n_parities
-    slots: list[int] = []
-    used = {host: 0 for host in nodes}
-    while len(slots) < n_sectors:
-        progressed = False
-        for host in nodes:
-            if used[host] < capacity[host]:
-                slots.append(node_to_ranks[host][used[host]])
-                used[host] += 1
-                progressed = True
-                if len(slots) >= n_sectors:
-                    break
-        if not progressed:
-            break
-
-    if len(slots) <= 1:
-        rank = slots[0] if slots else node_to_ranks[nodes[0]][0]
-        return [rank] * n_parities, [rank] * n_parities
-
-    singlet_count = min(n_parities, (len(slots) + 1) // 2)
-    singlet_slots, triplet_slots = slots[:singlet_count], slots[singlet_count:]
-    singlet_ranks = [singlet_slots[i % len(singlet_slots)] for i in range(n_parities)]
-    triplet_ranks = [triplet_slots[i % len(triplet_slots)] for i in range(n_parities)]
-    return singlet_ranks, triplet_ranks
+# The team Arnoldi step orthogonalizes a second time only when the first pass left less than this share of the
+# vector's norm (ARPACK's DGKS test), so the basis is streamed twice per step instead of four times.
+REORTHOGONALIZE_BELOW: float = 0.717

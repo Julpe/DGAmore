@@ -5,6 +5,8 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
+from contextlib import nullcontext
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -39,7 +41,6 @@ from dgamore.eliashberg_solver import (
     create_local_gamma_ud_pp_w0,
     create_local_gamma_ud_pp_w0_per_ineq,
     _gamma_to_matmul_layout,
-    get_ranks_for_lanczos,
     solve_eliashberg_lanczos,
     symmetrize_degenerate_gaps,
     transform_vertex_loc_frequencies_w0,
@@ -47,8 +48,10 @@ from dgamore.eliashberg_solver import (
 from dgamore.four_point import FourPoint
 from dgamore.greens_function import GreensFunction
 from dgamore.local_four_point import LocalFourPoint
+from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import FrequencyNotation, SpinChannel
 from tests import conftest
+from tests.conftest import FAKE_MPI, run_parallel
 
 
 def test_apply_gchi0_pp_matches_einsum():
@@ -427,7 +430,7 @@ def test_degenerate_decoupled_bands_reproduce_single_band_kernel(monkeypatch, ch
 
     captured = []
 
-    def fake_eigsh(op, k, tol, v0, which, maxiter):
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
         n = op.shape[0]
         dense = np.column_stack([op.matvec(np.eye(n, dtype=np.complex64)[:, i]) for i in range(n)])
         captured.append(dense)
@@ -589,7 +592,7 @@ def test_solve_eliashberg_lanczos_runs_eigsh_inside_thread_budget(monkeypatch):
         FrequencyNotation.PP,
     )
 
-    def fake_eigsh(op, k, tol, v0, which, maxiter):
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
         return np.ones(k), np.ones((op.shape[0], k), dtype=np.complex64)
 
     limits_seen = []
@@ -606,6 +609,674 @@ def test_solve_eliashberg_lanczos_runs_eigsh_inside_thread_budget(monkeypatch):
         mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
         solve_eliashberg_lanczos(gamma, chi0, (0, 0))
     assert limits_seen == [1]
+
+
+def test_solve_eliashberg_lanczos_declares_the_dtype_and_logs_matvecs_thread_budget_and_resident_set(monkeypatch):
+    """The operator carries the vertex dtype (no probe matvec) and the solve logs its matvecs, threads and RSS."""
+    nq, niv_pp = (4, 2, 1), 2
+    _grid_test_config(nq, niv_pp)
+    config.eliashberg.resolve_frequency_parity = False
+    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, 1, niv_pp, 3)
+    seen = []
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
+        seen.append(op.dtype)
+        for _ in range(3):
+            op.matvec(v0)
+        return np.ones(k), np.ones((op.shape[0], k), dtype=np.complex64)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(es, "_solver_thread_budget", MagicMock(return_value=1))
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        solve_eliashberg_lanczos(gamma, chi0, (0, 0))
+    messages = [call.args[0] for call in config.logger.info.call_args_list]
+    assert seen == [np.dtype(np.complex64)]
+    assert any("3 matvecs" in message and "ms each" in message for message in messages)
+    assert any("thread budget" in message and ": 1 thread(s)" in message for message in messages)
+    assert any("resident set" in message and "GB" in message for message in messages)
+
+
+def test_in_memory_matvec_threads_the_bubble_multiply(monkeypatch):
+    """With a thread budget above one the in-memory matvec hands its executor to the bubble multiply as well."""
+    from unittest.mock import create_autospec
+
+    nq, niv_pp = (4, 2, 1), 2
+    _grid_test_config(nq, niv_pp)
+    config.eliashberg.resolve_frequency_parity = False
+    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, 1, niv_pp, 3)
+    spy = create_autospec(es._apply_gchi0_pp, wraps=es._apply_gchi0_pp)
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
+        op.matvec(v0)
+        return np.ones(k), np.ones((op.shape[0], k), dtype=np.complex64)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(es, "_solver_thread_budget", MagicMock(return_value=3))
+        mp.setattr(es, "_apply_gchi0_pp", spy)
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        solve_eliashberg_lanczos(gamma, chi0, (0, 0))
+    assert spy.call_count == 1 and spy.call_args.args[3] is not None and spy.call_args.args[4] == 3
+
+
+def test_solve_eliashberg_lanczos_parities_subset_solves_only_requested(monkeypatch):
+    """Passing an explicit parities subset restricts the solve (and eigsh calls) to just those sectors."""
+    nq, niv_pp = (4, 4, 1), 2
+    config.eliashberg.n_eig = 2
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetry = "random"
+    config.eliashberg.resolve_frequency_parity = True
+    gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=13)
+
+    calls = []
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
+        calls.append(1)
+        n = op.shape[0]
+        return np.arange(k, 0, -1).astype(float), np.ones((n, k), dtype=np.complex64)
+
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        result = solve_eliashberg_lanczos(gamma, chi0, (0, 0), parities=["odd"])
+
+    assert set(result) == {"odd"} and len(calls) == 1
+
+
+def test_solve_eliashberg_lanczos_hands_eigsh_the_floored_basis_size(monkeypatch):
+    """eigsh is called with ncv = max(2 n_eig + 1, 12), capped to the problem size."""
+    nq, niv_pp = (4, 4, 1), 2
+    config.eliashberg.n_eig = 2
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetry = "random"
+    config.eliashberg.resolve_frequency_parity = False
+    gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=13)
+    seen = []
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
+        seen.append(ncv)
+        return np.arange(k, 0, -1).astype(float), np.ones((op.shape[0], k), dtype=np.complex64)
+
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        solve_eliashberg_lanczos(gamma, chi0, (0, 0))
+
+    assert seen == [12]
+
+
+def test_bubble_is_frequency_even_accepts_an_even_bubble_and_rejects_a_perturbed_one():
+    """The evenness guard passes a bubble that is symmetric in the fermionic frequency and fails one that is not."""
+    rng = np.random.default_rng(2)
+    chi0 = rng.standard_normal((3, 2, 1, 6, 4, 4)) + 1j * rng.standard_normal((3, 2, 1, 6, 4, 4))
+    even = 0.5 * (chi0 + np.flip(chi0, axis=3))
+    assert es._bubble_is_frequency_even(even)
+    odd = even.copy()
+    odd[1, 0, 0, 0, 2, 3] *= 1 + 1e-4
+    assert not es._bubble_is_frequency_even(odd)
+
+
+@pytest.mark.parametrize("channel", [SpinChannel.SING, SpinChannel.TRIP])
+def test_single_band_sector_matvec_forms_the_crossed_term_from_the_direct_one_on_an_even_bubble(monkeypatch, channel):
+    """For one band and an exactly even bubble the shortcut sector matvec equals the two-contraction one bit for bit."""
+    nq, niv_pp = (4, 2, 1), 2
+    _grid_test_config(nq, niv_pp)
+    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, 1, niv_pp, 3)
+    gamma.channel = channel
+    chi0.mat = 0.5 * (chi0.mat + np.flip(chi0.mat, axis=-1))
+    gap_shape = nq + (1, 1, 2 * niv_pp)
+    rng = np.random.default_rng(8)
+    probes = [
+        (rng.standard_normal(gap_shape) + 1j * rng.standard_normal(gap_shape)).ravel().astype(np.complex64)
+        for _ in range(3)
+    ]
+    captured = []
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
+        captured.append(op)
+        return np.ones(k), np.ones((op.shape[0], k), dtype=np.complex64)
+
+    outputs = {}
+    for guard in (True, False):
+        with monkeypatch.context() as mp:
+            mp.setattr(es, "_bubble_is_frequency_even", lambda chi0_mm, rtol=1e-6: guard)
+            mp.setattr(es, "_solver_thread_budget", MagicMock(return_value=1))
+            mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+            solve_eliashberg_lanczos(deepcopy(gamma), deepcopy(chi0), (0, 0))
+        outputs[guard] = [[op.matvec(x) for x in probes] for op in captured[-2:]]
+    for got, ref in zip(outputs[True], outputs[False]):
+        assert all(np.array_equal(a, b) for a, b in zip(got, ref))
+
+
+def test_solve_eliashberg_lanczos_keeps_the_converged_subset_when_arpack_does_not_converge(monkeypatch):
+    """An ArpackNoConvergence keeps the eigenpairs that did converge, sized off what came back, with a warning."""
+    nq, niv_pp = (4, 4, 1), 2
+    config.eliashberg.n_eig = 3
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetry = "random"
+    config.eliashberg.resolve_frequency_parity = False
+    gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=13)
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
+        n = op.shape[0]
+        raise es.sp.sparse.linalg.ArpackNoConvergence("no", np.array([0.5]), np.ones((n, 1), dtype=np.complex64))
+
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        result = solve_eliashberg_lanczos(gamma, chi0, (0, 0))
+
+    lambdas, gaps = result["none"]
+    assert np.array_equal(lambdas, [0.5]) and len(gaps) == 1
+    assert any("did not converge" in call.args[0] for call in config.logger.warning.call_args_list)
+
+
+def _team_plan(hostnames, available=10**15, niv_pp=2):
+    """Plans the team solve for fake ranks on the given hosts; ``available`` is one figure or a per-host dict."""
+    comm, node_comm = MagicMock(), MagicMock()
+    free = available if isinstance(available, dict) else {host: available for host in hostnames}
+    comm.allgather.side_effect = lambda payload: [(hostnames.index(host), host, free[host]) for host in hostnames]
+    return es.plan_lanczos_teams(comm, node_comm, 0, niv_pp)
+
+
+def test_plan_lanczos_teams_gives_every_sector_of_one_node_its_own_team():
+    """One node with enough ranks and memory hosts both channels at once, one team of equal size per sector."""
+    _grid_test_config((4, 2, 1), 2)
+    (round_one,) = _team_plan(["n0"] * 12)
+    assert [team.ranks for team in round_one] == [(0, 1, 2), (3, 4, 5), (6, 7, 8), (9, 10, 11)]
+    assert all(team.host == "n0" and team.node_root == 0 for team in round_one)
+    assert [team.sectors for team in round_one] == [
+        ((SpinChannel.SING, "even"),),
+        ((SpinChannel.SING, "odd"),),
+        ((SpinChannel.TRIP, "even"),),
+        ((SpinChannel.TRIP, "odd"),),
+    ]
+
+
+def test_plan_lanczos_teams_places_the_channels_on_different_nodes():
+    """With two nodes the singlet channel lives on the first and the triplet on the second, each split into teams."""
+    _grid_test_config((4, 2, 1), 2)
+    (round_one,) = _team_plan(["a"] * 4 + ["b"] * 4)
+    assert [(team.host, team.node_root, team.ranks) for team in round_one] == [
+        ("a", 0, (0, 1)),
+        ("a", 0, (2, 3)),
+        ("b", 4, (4, 5)),
+        ("b", 4, (6, 7)),
+    ]
+    assert {channel for team in round_one[:2] for channel, _ in team.sectors} == {SpinChannel.SING}
+    assert {channel for team in round_one[2:] for channel, _ in team.sectors} == {SpinChannel.TRIP}
+
+
+def test_plan_lanczos_teams_solves_the_channels_one_after_another_when_both_windows_do_not_fit(monkeypatch):
+    """A single node that cannot hold both vertex windows solves the channels in two rounds over all its ranks."""
+    _grid_test_config((4, 2, 1), 2)
+    monkeypatch.setattr(es, "lanczos_team_bytes", lambda *args: 1000 * args[5])
+    rounds = _team_plan(["n0"] * 4, available=1500 / es.NODE_MEMORY_FRACTION)
+    assert len(rounds) == 2
+    assert [team.ranks for team in rounds[0]] == [(0, 1), (2, 3)]
+    assert [team.sectors for team in rounds[0]] == [((SpinChannel.SING, "even"),), ((SpinChannel.SING, "odd"),)]
+    assert [team.sectors for team in rounds[1]] == [((SpinChannel.TRIP, "even"),), ((SpinChannel.TRIP, "odd"),)]
+
+
+def test_plan_lanczos_teams_spreads_the_sectors_evenly_over_the_nodes():
+    """Three nodes host 2-1-1 sectors, four nodes one sector each with all of a node's ranks, and a fifth node idles."""
+    _grid_test_config((4, 2, 1), 2)
+    (round_one,) = _team_plan(["a", "a", "b", "b", "c", "c"])
+    assert [(team.host, team.ranks, team.sectors) for team in round_one] == [
+        ("a", (0,), ((SpinChannel.SING, "even"),)),
+        ("a", (1,), ((SpinChannel.SING, "odd"),)),
+        ("b", (2, 3), ((SpinChannel.TRIP, "even"),)),
+        ("c", (4, 5), ((SpinChannel.TRIP, "odd"),)),
+    ]
+    (round_one,) = _team_plan(["a", "a", "b", "b", "c", "c", "d", "d", "e", "e"])
+    assert [(team.host, team.ranks) for team in round_one] == [
+        ("a", (0, 1)),
+        ("b", (2, 3)),
+        ("c", (4, 5)),
+        ("d", (6, 7)),
+    ]
+    assert [team.sectors for team in round_one] == [
+        ((channel, parity),) for channel in (SpinChannel.SING, SpinChannel.TRIP) for parity in ("even", "odd")
+    ]
+
+
+def test_plan_lanczos_teams_spreads_each_channel_over_the_nodes_when_a_node_cannot_hold_its_share(monkeypatch):
+    """Two nodes that cannot hold two sectors each solve the singlet then the triplet, one sector per node per round."""
+    _grid_test_config((4, 2, 1), 2)
+    monkeypatch.setattr(es, "lanczos_team_bytes", lambda *args: 1000 * args[6])
+    rounds = _team_plan(["a", "a", "b", "b"], available=1500 / es.NODE_MEMORY_FRACTION)
+    assert len(rounds) == 2
+    assert [(team.host, team.ranks, team.sectors) for team in rounds[0]] == [
+        ("a", (0, 1), ((SpinChannel.SING, "even"),)),
+        ("b", (2, 3), ((SpinChannel.SING, "odd"),)),
+    ]
+    assert [(team.host, team.sectors) for team in rounds[1]] == [
+        ("a", ((SpinChannel.TRIP, "even"),)),
+        ("b", ((SpinChannel.TRIP, "odd"),)),
+    ]
+
+
+def test_plan_lanczos_teams_budgets_the_windows_with_their_real_point_count(monkeypatch):
+    """The planner hands the byte model the number of points a window holds: the wedge's stars, else the grid."""
+    _grid_test_config((4, 4, 1), 2)
+    seen = []
+    monkeypatch.setattr(es, "lanczos_team_bytes", lambda *args: seen.append(args) or 0)
+    _team_plan(["n0"] * 4)
+    assert seen[-1][8] == 16
+    grid = bz.KGrid((4, 4, 1), symmetries=[bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV])
+    config.lattice.k_grid = grid
+    _team_plan(["n0"] * 4)
+    assert seen[-1][8] == len(es._wedge_orbits(grid)[0]) < 16
+
+
+def test_plan_lanczos_teams_is_none_when_no_node_holds_one_channel(monkeypatch):
+    """When even one channel's windows exceed a node's memory the plan is None and the grid solver takes over."""
+    _grid_test_config((4, 2, 1), 2)
+    monkeypatch.setattr(es, "lanczos_team_bytes", lambda *args: 1000 * args[5])
+    assert _team_plan(["n0"] * 4, available=900 / es.NODE_MEMORY_FRACTION) is None
+
+
+def test_plan_lanczos_teams_checks_every_hosting_node_against_its_own_memory(monkeypatch):
+    """A two-node plan fails on the triplet node's memory alone, although the singlet node has plenty."""
+    _grid_test_config((4, 2, 1), 2)
+    monkeypatch.setattr(es, "lanczos_team_bytes", lambda *args: 1000 * args[5])
+    assert _team_plan(["a", "a", "b", "b"], available={"a": 10**9, "b": 900 / es.NODE_MEMORY_FRACTION}) is None
+    (round_one,) = _team_plan(["a", "a", "b", "b"], available={"a": 10**9, "b": 1100 / es.NODE_MEMORY_FRACTION})
+    assert [team.host for team in round_one] == ["a", "a", "b", "b"]
+
+
+def test_plan_lanczos_teams_hands_a_short_node_several_sectors_per_team():
+    """Fewer ranks than sectors on a node give every rank a team of one that solves its sectors in turn."""
+    _grid_test_config((4, 2, 1), 2)
+    (round_one,) = _team_plan(["n0"] * 3)
+    assert [team.ranks for team in round_one] == [(0,), (1,), (2,)]
+    assert round_one[0].sectors == ((SpinChannel.SING, "even"), (SpinChannel.TRIP, "odd"))
+    assert round_one[1].sectors == ((SpinChannel.SING, "odd"),)
+    assert round_one[2].sectors == ((SpinChannel.TRIP, "even"),)
+    (lone,) = _team_plan(["n0"])
+    assert lone[0].ranks == (0,) and len(lone[0].sectors) == 4
+
+
+def _single_rank_matmul_layout(gamma, norm):
+    """Prepares the pairing vertex the way the single-rank solve does and returns its scaled matmul layout."""
+    k_grid = config.lattice.k_grid
+    prepared = deepcopy(gamma).map_to_full_bz(k_grid, k_grid.nk).decompress_q_dimension().fft(False)
+    layout = _gamma_to_matmul_layout(prepared.permute_orbitals("abcd->badc", False).mat)
+    layout *= norm
+    return layout
+
+
+def _auto_symmetry_vertex(nq, o, niv_pp, seed):
+    """Installs an auto-symmetry cubic grid with antiunitary operations and draws a vertex on its irreducible BZ."""
+    kx, ky, kz = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nq), indexing="ij")
+    h_k = np.zeros(nq + (o, o), dtype=complex)
+    for band in range(o):
+        h_k[..., band, band] = -2.0 * (np.cos(kx) + np.cos(ky) + np.cos(kz)) + 0.1 * band
+    grid = bz.KGrid(nk=nq, symmetries=[bz.KnownSymmetries.AUTO])
+    grid.specify_auto_symmetries(h_k, include_antiunitary=True)
+    config.lattice.nk, config.lattice.k_grid = nq, grid
+    rng = np.random.default_rng(seed)
+    n2 = 2 * niv_pp
+    mat = (rng.standard_normal((grid.nk_irr, o, o, o, o, n2, n2)) * 0.1 + 0.1j).astype(np.complex64)
+    return FourPoint(mat, SpinChannel.SING, nq, 0, 2, False, True, True, FrequencyNotation.PP)
+
+
+@pytest.mark.parametrize("chunk_bytes", [None, 2048])
+@pytest.mark.parametrize("auto", [False, True])
+def test_shared_vertex_window_matches_the_single_rank_layout_on_every_node_rank(monkeypatch, chunk_bytes, auto):
+    """The node's ranks build the scaled matmul layout block-wise into one window equal to the single-rank one."""
+    monkeypatch.setattr("dgamore.mpi_utils.MPI", conftest.FAKE_MPI)
+    if chunk_bytes is not None:
+        monkeypatch.setattr("dgamore.memory_estimator.TEAM_BUILD_CHUNK_BYTES", chunk_bytes)
+    nq, o, niv_pp = (4, 2, 1), 2, 2
+    _grid_test_config(nq, niv_pp)
+    gamma = _auto_symmetry_vertex(nq, o, niv_pp, 3) if auto else _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)[0]
+    assert config.lattice.k_grid.is_auto == auto
+    norm = 0.5 / config.lattice.k_grid.nk_tot / config.sys.beta
+    expected = _single_rank_matmul_layout(gamma, norm)
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(conftest.FAKE_MPI.COMM_TYPE_SHARED)
+        source = deepcopy(gamma) if node_comm.Get_rank() == 0 else FourPoint(np.empty(0), SpinChannel.SING, nq)
+        gamma_mm, win = es._build_shared_vertex_window(source, node_comm, norm)
+        seen = np.array(gamma_mm)
+        node_comm.Barrier()
+        if win is not None:
+            win.Free()
+        return seen, source.mat is None
+
+    _, res = conftest.run_parallel(3, fn, hostnames=["h", "h", "h"])
+    assert all(np.array_equal(seen, expected) for seen, _ in res)
+    assert res[0][1]
+
+
+def test_project_frequency_block_matches_the_block_of_the_full_projection():
+    """Each frequency block of the sector projector, formed from the block and its mirror, equals the full one."""
+    gap_shape = (4, 2, 1, 2, 2, 6)
+    rng = np.random.default_rng(5)
+    gap = (rng.standard_normal(gap_shape) + 1j * rng.standard_normal(gap_shape)).astype(np.complex64)
+    for eps_t in (1, -1):
+        for eps_po in (1, -1):
+            full = es._project_gap_to_sector(gap.reshape(-1), gap_shape, eps_t, eps_po).reshape(gap_shape)
+            for v0, v1 in ((0, 6), (0, 2), (2, 5), (5, 6)):
+                assert np.array_equal(es._project_frequency_block(gap, v0, v1, eps_t, eps_po), full[..., v0:v1])
+
+
+def _matvec_references(monkeypatch, gamma, chi0, gap_shape, eps_list):
+    """Captures the single-rank sector matvecs of both channels on random probes, keyed by (channel, eps_t)."""
+    rng = np.random.default_rng(8)
+    n = int(np.prod(gap_shape))
+    probes = [(rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex64) for _ in range(2)]
+    references, captured = {}, []
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
+        captured.append(op)
+        return np.ones(k), np.ones((op.shape[0], k), dtype=np.complex64)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(es, "_solver_thread_budget", MagicMock(return_value=1))
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        for channel in (SpinChannel.SING, SpinChannel.TRIP):
+            source = deepcopy(gamma)
+            source.channel = channel
+            solve_eliashberg_lanczos(source, deepcopy(chi0), (0, 0))
+            for eps_t, op in zip(eps_list, captured[-len(eps_list) :]):
+                references[(channel, eps_t)] = [op.matvec(x) for x in probes]
+    return probes, references
+
+
+def _team_matvec_blocks(size, gamma, chi0, norm, gap_shape, o, probes, references, orbits, shortcut=False):
+    """Runs the team matvec on ``size`` fake ranks of one node and returns every rank's output blocks per sector."""
+    nq = gap_shape[:3]
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(conftest.FAKE_MPI.COMM_TYPE_SHARED)
+        chi0_shared, chi0_win = mu.build_node_shared_array(
+            node_comm, lambda: deepcopy(chi0).decompress_q_dimension().mat
+        )
+        windows, wins = {}, [chi0_win]
+        for channel in (SpinChannel.SING, SpinChannel.TRIP):
+            source = deepcopy(gamma) if node_comm.Get_rank() == 0 else FourPoint(np.empty(0), channel, nq)
+            source.channel = channel
+            points = None if orbits is None else orbits[0]
+            windows[channel], win = es._build_shared_vertex_window(source, node_comm, norm, wedge_points=points)
+            wins.append(win)
+        scratch = [mu.allocate_node_shared_array(comm, gap_shape, windows[SpinChannel.SING].dtype) for _ in range(4)]
+        apply_block, (v0, v1) = es._team_matvec(
+            comm, windows, _chi0_to_matmul_layout(chi0_shared), [a for a, _ in scratch], gap_shape, o, orbits, shortcut
+        )
+        outputs = {}
+        for channel, eps_t in references:
+            eps_po = None if eps_t is None else (1 if channel == SpinChannel.SING else -1) * eps_t
+            outputs[(channel, eps_t)] = [
+                apply_block(channel, eps_t, eps_po, x.reshape(gap_shape)[..., v0:v1]) for x in probes
+            ]
+        comm.Barrier()
+        for win in wins + [w for _, w in scratch]:
+            if win is not None:
+                win.Free()
+        return outputs
+
+    return conftest.run_parallel(size, fn, hostnames=["h"] * size)[1]
+
+
+def _assemble_blocks(res, key, i):
+    """Joins the ranks' frequency blocks of one matvec output back into the flattened gap vector."""
+    return np.concatenate([r[key][i] for r in res], axis=-1).reshape(-1)
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 5])
+@pytest.mark.parametrize("o", [1, 2])
+@pytest.mark.parametrize("projected", [False, True])
+def test_team_matvec_matches_the_single_rank_matvec_bit_for_bit(monkeypatch, size, o, projected):
+    """The team matvec over node-shared windows equals the single-rank sector matvec bit for bit, raw and projected."""
+    nq, niv_pp = (4, 2, 1), 2
+    _grid_test_config(nq, niv_pp)
+    config.eliashberg.resolve_frequency_parity = projected
+    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)
+    gap_shape = nq + (o, o, 2 * niv_pp)
+    probes, references = _matvec_references(monkeypatch, gamma, chi0, gap_shape, (1, -1) if projected else (None,))
+    norm = 0.5 / config.lattice.k_grid.nk_tot / config.sys.beta
+    monkeypatch.setattr("dgamore.mpi_utils.MPI", conftest.FAKE_MPI)
+    res = _team_matvec_blocks(size, gamma, chi0, norm, gap_shape, o, probes, references, None)
+    for key, expected in references.items():
+        for i, ref in enumerate(expected):
+            assert np.array_equal(_assemble_blocks(res, key, i), ref)
+
+
+def _wedge_vertex(nq, o, niv_pp, seed, grid):
+    """Installs ``grid`` as the config grid and draws a symmetric random pairing vertex on its irreducible wedge."""
+    from dgamore import symmetry_reduction as sr
+
+    config.lattice.nk, config.lattice.k_grid = nq, grid
+    rng = np.random.default_rng(seed)
+    nk, n2 = grid.nk_tot, 2 * niv_pp
+    full = rng.standard_normal((nk, o, o, o, o, n2, n2)) * 0.1 + 0.1j
+    if grid.is_auto:
+        # average over the discovered group so the vertex carries every operation, little groups included
+        elements = {tuple(sr._g_action_on_kgrid(g, nq)): g for g in grid._auto_group}
+        symmetric = np.zeros_like(full)
+        for action, g in elements.items():
+            symmetric[list(action)] += np.einsum(
+                "ap,bq,cr,ds,kpqrs...->kabcd...", g.U, g.U.conj(), g.U, g.U.conj(), full
+            )
+        full = symmetric / len(elements)
+        us = grid._auto_us.reshape(nk, o, o)[grid.irrk_ind]
+        wedge = np.stack(
+            [
+                np.einsum("ap,bq,cr,ds,pqrs...->abcd...", u.conj().T, u.T, u.conj().T, u.T, full[r])
+                for r, u in zip(grid.irrk_ind, us)
+            ]
+        )
+    else:
+        wedge = full[grid.irrk_ind]
+    return FourPoint(wedge.astype(np.complex64), SpinChannel.SING, nq, 0, 2, False, True, True, FrequencyNotation.PP)
+
+
+def _rotating_auto_grid(nq, phase=0.0):
+    """Builds an auto-symmetry grid of a two-orbital p_x/p_y model whose x-y mirror rotates the orbitals."""
+    kx, ky, _ = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nq), indexing="ij")
+    h_k = np.zeros(nq + (2, 2), dtype=complex)
+    h_k[..., 0, 0] = -2.0 * np.cos(kx) - 0.6 * np.cos(ky)
+    h_k[..., 1, 1] = -2.0 * np.cos(ky) - 0.6 * np.cos(kx)
+    h_k[..., 0, 1] = 0.3 * np.exp(1j * phase) * np.sin(kx) * np.sin(ky)
+    h_k[..., 1, 0] = np.conj(h_k[..., 0, 1])
+    grid = bz.KGrid(nk=nq, symmetries=[bz.KnownSymmetries.AUTO])
+    grid.specify_auto_symmetries(h_k)
+    return grid
+
+
+def test_wedge_window_points_shrink_only_under_point_like_operations():
+    """Point-like operations shrink the window below the grid; a symmetry-free grid keeps every point."""
+    nq = (4, 4, 1)
+    assert es.wedge_window_points(bz.KGrid(nq, symmetries=[])) == 16
+    assert es.wedge_window_points(bz.KGrid(nq, symmetries=[bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV])) < 16
+    assert es.wedge_window_points(_rotating_auto_grid(nq)) < 16
+
+
+def test_wedge_orbits_partition_the_grid_by_star():
+    """Every grid index appears once, grouped by star, and the auto grid's translation members split the stars."""
+    grid = bz.KGrid((4, 4, 1), symmetries=[bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV])
+    points, offsets, order, us = es._wedge_orbits(grid)
+    assert sorted(order.tolist()) == list(range(grid.nk_tot)) and offsets[-1] == grid.nk_tot and us is None
+    inv = grid.irrk_inv.ravel()
+    for r in range(grid.nk_irr):
+        assert set(inv[order[offsets[r] : offsets[r + 1]]]) == {r} and inv[points[r]] == r
+    auto = _rotating_auto_grid((4, 4, 1))
+    points, offsets, order, us = es._wedge_orbits(auto)
+    assert auto.nk_irr < len(points) < auto.nk_tot and us.shape == (auto.nk_tot, 2, 2)
+    assert all(np.allclose(us[point], np.eye(2)) for point in points)
+
+
+def test_team_matvec_forms_the_crossed_term_from_the_direct_one_on_an_even_bubble(monkeypatch):
+    """With one band and an even bubble the team matvec's shortcut sectors equal the single-rank sector matvec."""
+    nq, niv_pp, o = (4, 2, 1), 2, 1
+    _grid_test_config(nq, niv_pp)
+    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)
+    chi0.mat = 0.5 * (chi0.mat + np.flip(chi0.mat, axis=-1))
+    gap_shape = nq + (o, o, 2 * niv_pp)
+    probes, references = _matvec_references(monkeypatch, gamma, chi0, gap_shape, (1, -1))
+    norm = 0.5 / config.lattice.k_grid.nk_tot / config.sys.beta
+    monkeypatch.setattr("dgamore.mpi_utils.MPI", conftest.FAKE_MPI)
+    res = _team_matvec_blocks(3, gamma, chi0, norm, gap_shape, o, probes, references, None, shortcut=True)
+    for key, expected in references.items():
+        for i, ref in enumerate(expected):
+            assert np.array_equal(_assemble_blocks(res, key, i), ref)
+
+
+@pytest.mark.parametrize("size", [1, 3])
+@pytest.mark.parametrize("grid_kind", ["explicit", "auto", "auto-complex"])
+def test_wedge_team_matvec_matches_the_single_rank_matvec_to_rounding(monkeypatch, size, grid_kind):
+    """Star-grouped contractions on the real-space wedge reproduce the full-grid sector matvec to rounding."""
+    nq, niv_pp, o = (4, 4, 1), 2, 2
+    _grid_test_config(nq, niv_pp)
+    if grid_kind == "explicit":
+        symmetries = [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV, bz.KnownSymmetries.X_Y_SYM]
+        grid = bz.KGrid(nq, symmetries=symmetries)
+    else:
+        grid = _rotating_auto_grid(nq, phase=np.pi / 4 if grid_kind == "auto-complex" else 0.0)
+        assert not np.allclose(grid._auto_us, np.eye(2))
+        assert (np.max(np.abs(grid._auto_us.imag)) > 0.5) == (grid_kind == "auto-complex")
+    gamma = _wedge_vertex(nq, o, niv_pp, 3, grid)
+    _, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 5)
+    gap_shape = nq + (o, o, 2 * niv_pp)
+    probes, references = _matvec_references(monkeypatch, gamma, chi0, gap_shape, (1, -1))
+    norm = 0.5 / grid.nk_tot / config.sys.beta
+    monkeypatch.setattr("dgamore.mpi_utils.MPI", conftest.FAKE_MPI)
+    res = _team_matvec_blocks(size, gamma, chi0, norm, gap_shape, o, probes, references, es._wedge_orbits(grid))
+    for key, expected in references.items():
+        for i, ref in enumerate(expected):
+            got = _assemble_blocks(res, key, i)
+            assert np.max(np.abs(got - ref)) <= 1e-5 * np.max(np.abs(ref))
+
+
+def _power_loop_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
+    """Deterministic stand-in for eigsh: a short power iteration over the real matvec."""
+    vec = v0.astype(np.complex64)
+    for _ in range(6):
+        vec = op.matvec(vec)
+        vec /= np.linalg.norm(vec)
+    lam = np.vdot(vec, op.matvec(vec)).real
+    return np.array([lam] * k), np.repeat(vec[:, None], k, axis=1)
+
+
+def _power_loop_team_arnoldi(apply_block, seed, n_eig, ncv, tol, maxiter, comm):
+    """Deterministic stand-in for the team Krylov-Schur: the same short power iteration on distributed blocks."""
+    vec = seed.reshape(-1).astype(np.complex64)
+    for _ in range(6):
+        vec = apply_block(vec).reshape(-1)
+        vec /= np.sqrt(comm.allreduce(float(np.vdot(vec, vec).real)))
+    lam = comm.allreduce(float(np.vdot(vec, apply_block(vec).reshape(-1)).real))
+    return np.array([lam] * n_eig), np.ones((1, n_eig)), vec[None], 7, 0.0
+
+
+def _sectors_match(res, expected, rank):
+    """Asserts one rank's sector results match the reference eigenvalues and, on rank 0, the gaps."""
+    assert set(res) == set(expected)
+    for key, (lambdas, gaps) in expected.items():
+        assert np.allclose(res[key][0], lambdas, atol=1e-5)
+        assert len(res[key][1]) == (len(gaps) if rank == 0 else 0)
+        for got, ref in zip(res[key][1], gaps):
+            assert np.allclose(got.mat, ref.mat, atol=1e-4)
+
+
+def _test_matrix(n, seed, hermitian):
+    """Draws a random complex matrix with a real spectrum: Hermitian, or a non-normal similarity transform of one."""
+    rng = np.random.default_rng(seed)
+    a = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+    h = (a + a.conj().T) / 2
+    if hermitian:
+        return h
+    similarity = np.eye(n) + 0.3 * (rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))) / np.sqrt(n)
+    return similarity @ h @ np.linalg.inv(similarity)
+
+
+@pytest.mark.parametrize("size", [1, 3])
+@pytest.mark.parametrize("hermitian", [True, False])
+def test_team_arnoldi_finds_the_eigenpairs_of_largest_real_part_on_distributed_blocks(size, hermitian):
+    """The team Krylov-Schur returns the eigenpairs of largest real part, identical on every rank, Hermitian or not."""
+    n, n_eig = 60, 3
+    h = _test_matrix(n, 1, hermitian)
+    expected = np.sort(np.linalg.eigvals(h).real)[::-1][:n_eig]
+    seed = np.random.default_rng(2).standard_normal(n) + 0j
+
+    def fn(comm, rank):
+        bounds = np.linspace(0, n, comm.Get_size() + 1).astype(int)
+        s0, s1 = int(bounds[rank]), int(bounds[rank + 1])
+        apply_block = lambda block: (h @ np.concatenate(comm.allgather(block)))[s0:s1]
+        lambdas, ritz, basis, n_matvec, _ = es._team_arnoldi(apply_block, seed[s0:s1], n_eig, 12, 1e-10, 300, comm)
+        return lambdas, np.concatenate(comm.allgather(ritz.T @ basis), axis=1), n_matvec
+
+    _, res = run_parallel(size, fn)
+    for lambdas, vectors, n_matvec in res:
+        assert np.allclose(lambdas, expected, atol=1e-7) and n_matvec < 4 * n
+        for lam, vec in zip(lambdas, vectors):
+            assert np.linalg.norm(h @ vec - lam * vec) <= 1e-6 * abs(lam) and abs(np.linalg.norm(vec) - 1) < 1e-8
+
+
+def test_team_arnoldi_returns_the_converged_subset_at_the_restart_limit():
+    """Without restarts only the Ritz pairs converged in the first basis return, each within its residual bound."""
+    n, n_eig = 60, 3
+    h = _test_matrix(n, 4, False)
+    seed = np.random.default_rng(5).standard_normal(n) + 0j
+    comm = conftest.run_parallel(1, lambda comm, rank: comm)[1][0]
+    lambdas, ritz, basis, _, _ = es._team_arnoldi(lambda block: h @ block, seed, n_eig, 12, 1e-2, 0, comm)
+    blocks = ritz.T @ basis
+    assert 0 < len(lambdas) < n_eig and blocks.shape == (len(lambdas), n)
+    for lam, vec in zip(lambdas, blocks):
+        assert np.linalg.norm(h @ vec - lam * vec) <= 1e-1 * abs(lam)
+
+
+@pytest.mark.parametrize(
+    "hostnames, budget, wedge",
+    [
+        (h, 10**15, False)
+        for h in (["a", "a", "b", "b"], ["a"] * 4, ["a"] * 3, ["a", "b", "c", "d"], ["a", "a", "b", "b", "c"])
+    ]
+    + [(["a", "a", "b", "b"], 1500 / es.NODE_MEMORY_FRACTION, False), (["a", "a", "b", "b"], 10**15, True)],
+)
+def test_solve_sectors_in_teams_reproduces_the_single_rank_sectors_and_delivers_the_gaps_to_rank_0(
+    monkeypatch, hostnames, budget, wedge
+):
+    """Every team-solved sector (two rounds, wedge windows included) matches the single-rank solve; gaps on rank 0."""
+    # the ranks are threads here: concurrent per-rank BLAS pins would race and leave the whole process single-threaded
+    monkeypatch.setattr(es, "threadpool_limits", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr("dgamore.mpi_utils.MPI", FAKE_MPI)
+    monkeypatch.setattr(es, "MPI", FAKE_MPI)
+    monkeypatch.setattr(es, "socket", conftest.FAKE_SOCKET)
+    monkeypatch.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", _power_loop_eigsh)
+    monkeypatch.setattr(es, "_team_arnoldi", _power_loop_team_arnoldi)
+    if budget < 10**15:
+        monkeypatch.setattr(es, "lanczos_team_bytes", lambda *args: 1000 * args[6])
+    nq, o, niv_pp = ((4, 4, 1) if wedge else (4, 2, 1)), 1, 2
+    _grid_test_config(nq, niv_pp)
+    if wedge:
+        grid = bz.KGrid(nq, symmetries=[bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV])
+        gamma_sing, gamma_trip = _wedge_vertex(nq, o, niv_pp, 3, grid), _wedge_vertex(nq, o, niv_pp, 5, grid)
+        _, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 7)
+    else:
+        gamma_sing, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)
+        gamma_trip, _ = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 5)
+    gamma_trip.channel = SpinChannel.TRIP
+    ntasks = config.lattice.k_grid.nk_irr
+    monkeypatch.setattr(BubbleGenerator, "create_generalized_chi0_q_pp_w0", lambda giwk, niv, k_grid: deepcopy(chi0))
+
+    expected = {}
+    for gamma in (gamma_sing, gamma_trip):
+        for parity, value in solve_eliashberg_lanczos(deepcopy(gamma), deepcopy(chi0), (0, 0)).items():
+            expected[(gamma.channel, parity)] = value
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        dist = MpiDistributor(ntasks=ntasks, comm=comm)
+        shares = [
+            FourPoint(gamma.mat[dist.my_slice].copy(), gamma.channel, nq, 0, 2, False, True, True, FrequencyNotation.PP)
+            for gamma in (gamma_sing, gamma_trip)
+        ]
+        giwk = GreensFunction(np.zeros(nq + (o, o, 10), dtype=np.complex64), nk=nq)
+        rounds = es.plan_lanczos_teams(comm, node_comm, budget, niv_pp)
+        assert len(rounds) == (2 if budget < 10**15 else 1)
+        return es._solve_sectors_in_teams(dist, comm, node_comm, shares[0], shares[1], giwk, niv_pp, rounds)
+
+    _, results = run_parallel(len(hostnames), fn, hostnames=hostnames)
+    for rank, res in enumerate(results):
+        _sectors_match(res, expected, rank)
 
 
 def _make_p_wave_doublet(nk: int = 6, n2: int = 4) -> tuple[np.ndarray, np.ndarray, tuple]:
@@ -1128,7 +1799,7 @@ def test_solve_eliashberg_lanczos_both_projects_matvec_and_v0_into_each_sector(m
 
     seen = []
 
-    def fake_eigsh(op, k, tol, v0, which, maxiter):
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
         n = op.shape[0]
         rng = np.random.default_rng(1)
         probe = op.matvec(rng.standard_normal(n) + 1j * rng.standard_normal(n))
@@ -1162,7 +1833,7 @@ def _densify_pairing_kernel(monkeypatch, gamma_arr: np.ndarray, chi0_arr: np.nda
     config.logger = MagicMock()
     dense = []
 
-    def fake_eigsh(op, k, tol, v0, which, maxiter):
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
         n = op.shape[0]
         dense.append(np.column_stack([op.matvec(np.eye(n, dtype=np.complex128)[:, i]) for i in range(n)]))
         return np.ones(k), np.ones((n, k), dtype=np.complex128)
@@ -1225,7 +1896,7 @@ def test_solve_eliashberg_lanczos_reseeds_when_symmetry_seed_orthogonal_to_secto
 
     seeds = []
 
-    def fake_eigsh(op, k, tol, v0, which, maxiter):
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
         seeds.append(v0.copy())
         n = op.shape[0]
         return np.arange(k, 0, -1).astype(float), np.ones((n, k), dtype=np.complex64)
@@ -1252,7 +1923,7 @@ def test_solve_eliashberg_lanczos_seeds_empty_sector_with_nonzero_base(monkeypat
 
     seeds = []
 
-    def fake_eigsh(op, k, tol, v0, which, maxiter):
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
         seeds.append(v0.copy())
         n = op.shape[0]
         return np.zeros(k), np.zeros((n, k), dtype=np.complex64)
@@ -1275,7 +1946,7 @@ def test_solve_eliashberg_lanczos_none_returns_single_unprojected_sector(monkeyp
 
     calls = []
 
-    def fake_eigsh(op, k, tol, v0, which, maxiter):
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
         calls.append(op)
         n = op.shape[0]
         return np.arange(k, 0, -1).astype(float), np.ones((n, k), dtype=np.complex64)
@@ -1286,127 +1957,52 @@ def test_solve_eliashberg_lanczos_none_returns_single_unprojected_sector(monkeyp
 
     assert set(result) == {"none"}
     assert len(calls) == 1 and len(result["none"][1]) == config.eliashberg.n_eig
+    assert all(gap.mat.flags.c_contiguous for gap in result["none"][1])
 
 
-@pytest.mark.parametrize(
-    "info, per_sector, giwk, expected",
-    [
-        # 4 nodes (one rank each), memory fits one vertex per node -> the four sectors spread over the four nodes
-        ([("n0", 100), ("n1", 100), ("n2", 100), ("n3", 100)], 90, 0, ([0, 1], [2, 3])),
-        # one node with four ranks and ample memory -> all four sectors run concurrently on that node
-        ([("n0", 10000)] * 4, 10, 0, ([0, 1], [2, 3])),
-        # one node whose memory only fits two vertices -> the singlet/triplet 2-way (sectors sequential per channel)
-        ([("n0", 250)] * 4, 100, 0, ([0, 0], [1, 1])),
-        # the bubble-node giwk reservation eats the memory down to one vertex -> everything sequential on one rank
-        ([("n0", 1000)] * 4, 100, 800, ([0, 0], [0, 0])),
-    ],
-)
-def test_get_ranks_for_lanczos_packs_sectors_by_node_memory(info, per_sector, giwk, expected):
-    """get_ranks_for_lanczos packs as many concurrent sector solves per node as free memory fits (giwk reserved)."""
-    comm = MagicMock()
-    comm.allgather.side_effect = lambda payload: info
-    assert get_ranks_for_lanczos(comm, 2, info[0][1], per_sector, giwk) == expected
-
-
-@pytest.mark.parametrize(
-    "hostnames, n_parities, expected",
-    [
-        (["n0", "n0", "n1", "n1"], 2, ([0, 0], [2, 2])),
-        (["n0", "n0", "n0", "n0"], 2, ([0, 0], [1, 1])),
-        (["n0"], 2, ([0, 0], [0, 0])),
-        (["n0", "n1"], 1, ([0], [1])),
-    ],
-)
-def test_get_ranks_for_lanczos_falls_back_to_two_way_without_memory_info(hostnames, n_parities, expected):
-    """Without a per-sector memory estimate get_ranks_for_lanczos returns the 2-way split, parities sequential."""
-    comm = MagicMock()
-    comm.allgather.side_effect = lambda payload: [(h, None) for h in hostnames]
-    assert get_ranks_for_lanczos(comm, n_parities) == expected
-
-
-def test_solve_eliashberg_lanczos_parities_subset_solves_only_requested(monkeypatch):
-    """Passing an explicit parities subset restricts the solve (and eigsh calls) to just those sectors."""
-    nq, niv_pp = (4, 4, 1), 2
-    config.eliashberg.n_eig = 2
-    config.eliashberg.epsilon = 1e-10
-    config.eliashberg.symmetry = "random"
-    config.eliashberg.resolve_frequency_parity = True
-    gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=13)
-
-    calls = []
-
-    def fake_eigsh(op, k, tol, v0, which, maxiter):
-        calls.append(1)
-        n = op.shape[0]
-        return np.arange(k, 0, -1).astype(float), np.ones((n, k), dtype=np.complex64)
-
-    with monkeypatch.context() as mp:
-        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
-        result = solve_eliashberg_lanczos(gamma, chi0, (0, 0), parities=["odd"])
-
-    assert set(result) == {"odd"} and len(calls) == 1
-
-
-def test_solve_sectors_in_memory_runs_each_sector_on_its_assigned_rank(monkeypatch):
-    """The in-memory sector distribution solves every (channel, parity) sector on its assigned rank."""
-    import dgamore.eliashberg_solver as es
-    from dgamore.bubble_gen import BubbleGenerator
+def test_solve_sectors_in_memory_solves_both_channels_in_turn_on_the_single_rank(monkeypatch):
+    """The single-rank path builds the bubble once and solves the singlet then the triplet sectors."""
     from dgamore.gap_function import GapFunction
-    from dgamore.greens_function import GreensFunction
-    from dgamore.mpi_utils import MpiDistributor
-    from tests.conftest import FAKE_MPI, _tls, run_parallel
 
-    monkeypatch.setattr("dgamore.mpi_utils.MPI", FAKE_MPI)
-    nq, o, niv_pp, ntasks = (2, 2, 1), 1, 2, 8
+    nq, o, niv_pp = (2, 2, 1), 1, 2
     n2 = 2 * niv_pp
     config.lattice.nk = nq
     config.lattice.k_grid = bz.KGrid(nq, symmetries=[])
-    config.sys.beta = 10.0
     config.eliashberg.n_eig = 2
     config.logger = MagicMock()
+    solved, built = [], []
 
     def fake_solver(gamma, gchi0, ranks, parities=None):
-        rank = getattr(_tls, "rank", 0)
-        n_eig = config.eliashberg.n_eig
-        return {
-            p: (
-                np.array([rank + 1] * n_eig, dtype=float),
-                [GapFunction(np.zeros(nq + (o, o, n2), dtype=np.complex64)) for _ in range(n_eig)],
-            )
-            for p in parities
-        }
+        solved.append((gamma.channel, ranks, tuple(parities)))
+        marker = len(solved)
+        gap = np.full(nq + (o, o, n2), marker, dtype=np.complex64)
+        return {p: (np.full(2, marker, dtype=float), [GapFunction(gap[:, ::-1]) for _ in range(2)]) for p in parities}
 
     def fake_bubble(giwk, niv, k_grid):
+        built.append(niv)
         return FourPoint(
-            np.zeros((ntasks, 1, 1, 1, 1, n2)), SpinChannel.NONE, nq, 0, 1, True, True, True, FrequencyNotation.PP
+            np.zeros((4, 1, 1, 1, 1, n2)), SpinChannel.NONE, nq, 0, 1, True, True, True, FrequencyNotation.PP
         )
 
     monkeypatch.setattr(es, "solve_eliashberg_lanczos", fake_solver)
     monkeypatch.setattr(BubbleGenerator, "create_generalized_chi0_q_pp_w0", fake_bubble)
+    shape = (4, o, o, o, o, n2, n2)
+    gsing = FourPoint(
+        np.zeros(shape, dtype=np.complex64), SpinChannel.SING, nq, 0, 2, True, True, True, FrequencyNotation.PP
+    )
+    gtrip = FourPoint(
+        np.zeros(shape, dtype=np.complex64), SpinChannel.TRIP, nq, 0, 2, True, True, True, FrequencyNotation.PP
+    )
+    giwk = GreensFunction(np.zeros(nq + (o, o, 10), dtype=np.complex64), nk=nq)
+    results = es._solve_sectors_in_memory(_make_single_rank_distributor(), gsing, gtrip, giwk, niv_pp, ["even", "odd"])
 
-    def fn(comm, rank):
-        dist = MpiDistributor(ntasks=ntasks, comm=comm)
-        shape = (dist.my_size, o, o, o, o, n2, n2)
-        gsing = FourPoint(
-            np.zeros(shape, dtype=np.complex64), SpinChannel.SING, nq, 0, 2, True, True, True, FrequencyNotation.PP
-        )
-        gtrip = FourPoint(
-            np.zeros(shape, dtype=np.complex64), SpinChannel.TRIP, nq, 0, 2, True, True, True, FrequencyNotation.PP
-        )
-        giwk = GreensFunction(np.zeros(nq + (o, o, 10), dtype=np.complex64), nk=nq)
-        return es._solve_sectors_in_memory(dist, gsing, gtrip, giwk, niv_pp, [0, 2], [1, 3], 0, ["even", "odd"])
-
-    _, results = run_parallel(4, fn)
-    owners = {
-        (SpinChannel.SING, "even"): 1,
-        (SpinChannel.SING, "odd"): 3,
-        (SpinChannel.TRIP, "even"): 2,
-        (SpinChannel.TRIP, "odd"): 4,
-    }
-    for res in results:
-        assert set(res) == set(owners)
-        for key, expected_marker in owners.items():
-            assert res[key][0][0] == expected_marker and len(res[key][1]) == config.eliashberg.n_eig
+    assert built == [niv_pp]
+    assert solved == [(SpinChannel.SING, (0,), ("even", "odd")), (SpinChannel.TRIP, (0,), ("even", "odd"))]
+    assert set(results) == {(c, p) for c in (SpinChannel.SING, SpinChannel.TRIP) for p in ("even", "odd")}
+    for (channel, _), (lambdas, gaps) in results.items():
+        marker = 1 if channel == SpinChannel.SING else 2
+        assert lambdas[0] == marker and len(gaps) == 2
+        assert all(np.all(gap.mat == marker) for gap in gaps)
 
 
 def test_compute_once_per_node_evaluates_the_builder_only_on_the_node_root():
@@ -1873,7 +2469,7 @@ def test_solve_pairing_sectors_passes_the_orbital_mirrors_into_the_symmetrizatio
     config.logger = MagicMock()
 
     es._solve_pairing_sectors(
-        mv=lambda gap: gap,
+        mv=lambda gap, eps_t, eps_po: gap,
         gap_shape=gap_shape,
         sign=1,
         channel=SpinChannel.SING,
@@ -2125,7 +2721,7 @@ def test_grid_solver_ships_the_bubble_inside_the_grid_only(monkeypatch):
 
     monkeypatch.setattr(es, "MPI", conftest.FAKE_MPI)
 
-    def fake_eigsh(op, k, tol, v0, which, maxiter):
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
         # thread-unsafe ARPACK is densified via n identical matvecs per rank, keeping the lockstep collectives aligned
         n = op.shape[0]
         dense = np.column_stack([op.matvec(np.eye(n, dtype=np.complex64)[:, i]) for i in range(n)])
@@ -2175,7 +2771,7 @@ def test_grid_solver_multi_rank_matches_in_memory_solver(monkeypatch, size, niv_
 
     monkeypatch.setattr(es, "MPI", conftest.FAKE_MPI)
 
-    def fake_eigsh(op, k, tol, v0, which, maxiter):
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
         # thread-unsafe ARPACK is densified via n identical matvecs per rank, keeping the lockstep collectives aligned
         n = op.shape[0]
         dense = np.column_stack([op.matvec(np.eye(n, dtype=np.complex64)[:, i]) for i in range(n)])

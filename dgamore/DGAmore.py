@@ -696,9 +696,20 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
             budgets = dataclasses.replace(budgets, sde=memory_estimator.SLICE_CHUNK_BYTES)
             peaks = estimate(chunk_budgets=budgets)
 
-    # The singlet and triplet in-memory Eliashberg solves run concurrently on two ranks; on a single-node multi-rank
-    # job both land on the same node, so its lanczos fast-path single-rank peak is doubled.
-    single_node_multi_rank = len(nodes) == 1 and comm.size >= 2
+    def team_need(n_ranks: int) -> float:
+        """Node peak of the team solve's leanest round (one channel's sectors per node), as its planner models it."""
+        n_parities = 2 if config.eliashberg.resolve_frequency_parity else 1
+        return n_ranks * memory_estimator.RANK_BASELINE_BYTES + memory_estimator.lanczos_team_bytes(
+            config.sys.n_bands,
+            config.lattice.k_grid.nk_tot,
+            config.lattice.k_grid.nk_irr,
+            niv_pp,
+            config.eliashberg.n_eig,
+            1,
+            n_parities,
+            n_ranks,
+            eliashberg_solver.wedge_window_points(config.lattice.k_grid),
+        )
 
     logger.info(f"Auto memory detection (node-total budget): {len(nodes)} node(s).")
 
@@ -735,7 +746,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
                 f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory. Use a smaller frequency box or fewer bands."
             )
     # Single-path branches: the bubble always runs the FFT evaluation, the pairing vertex the chunked slice build,
-    # and the solver falls back from in-memory (single-rank peak doubled when sectors run concurrently) to the grid.
+    # and the solver falls back from in-memory (a multi-rank job: the team solve's own node formula) to the grid.
     verify_only = (
         ("chi0q", "Bare bubble"),
         ("chiq_aux", "Auxiliary susceptibility"),
@@ -747,11 +758,12 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         if key not in peaks:
             continue
         bp = peaks[key]
-        single = bp.off_single * (2 if key == "lanczos" and single_node_multi_rank else 1)
-        fits_in_memory = fits_everywhere(bp, bp.off_distributed, single)
+        fits_in_memory = fits_everywhere(bp, bp.off_distributed, bp.off_single)
+        if key == "lanczos" and comm.size > 1:
+            fits_in_memory = all(team_need(r) <= avail * NODE_MEMORY_FRACTION for r, avail, _ in nodes.values())
         fits_grid = key == "lanczos" and fits_everywhere(bp, bp.on_distributed, bp.on_single)
         if not fits_in_memory and not fits_grid:
-            worst = max(node_total(bp, bp.off_distributed, single, r) for r, *_ in nodes.values())
+            worst = max(node_total(bp, bp.off_distributed, bp.off_single, r) for r, *_ in nodes.values())
             raise MemoryError(
                 f"The {label} needs {worst / 1024**3:.3f} GB on a node, which exceeds "
                 f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory. Use more nodes, fewer ranks per node, "

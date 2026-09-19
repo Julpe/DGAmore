@@ -327,11 +327,14 @@ def test_self_consistency_sigma_step_is_verified_and_raises_on_overflow(fake_sys
         dgamore_main.autodetect_memory_settings(_mock_comm())
 
 
-def test_lanczos_single_rank_peak_doubled_on_single_node_multi_rank(fake_system, monkeypatch):
-    """The doubled in-memory peak on a single node raises only when the grid fallback does not fit either."""
+def test_lanczos_multi_rank_gate_uses_the_team_formula_per_node(fake_system, monkeypatch):
+    """On a multi-rank job the in-memory gate is the team solve node formula and raises only when the grid fails too."""
     fake_system(1)
     single = 10 * 1024.0**2
-    budget = 1.5 * single  # fits one in-memory solver per node, not two concurrent ones
+    budget = 1.5 * single  # holds one rank's team need per node, not two
+    monkeypatch.setattr(dgamore_main.memory_estimator, "RANK_BASELINE_BYTES", 0)
+    monkeypatch.setattr(dgamore_main.memory_estimator, "lanczos_team_bytes", lambda *args: args[7] * single)
+    monkeypatch.setattr(dgamore_main.eliashberg_solver, "wedge_window_points", lambda grid: grid.nk_tot)
     monkeypatch.setattr(
         dgamore_main.psutil,
         "virtual_memory",
