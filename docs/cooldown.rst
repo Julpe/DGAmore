@@ -277,21 +277,36 @@ At the start of the cycle, the predecessor's result becomes the rung's starting 
   continues from the highest raw iterate. Beyond its name the file carries no metadata, so its content is taken at
   face value as a self-energy at the rung's own temperature; a predecessor aimed at the wrong ``target_beta`` is
   only caught when a better-matching file sits next to it.
+* The raw iterates ``sigma_dga_iteration_<i>.npy`` live in the ``Sigma_Iterates`` subfolder of the run folder (a
+  predecessor written before that subfolder existed keeps them in the run folder itself, which is searched as the
+  fallback), together with the un-mixed proposals ``sigma_dga_proposal_iteration_<i>.npy``, which a run writes only
+  with ``use_jacobian_stabilization`` on and which are never read back.
 * The self-energy is cut to the rung's ``niv_core``. If the rung uses a different momentum grid, it is re-sampled
   onto it, exactly by striding when the new grid is a sub-lattice of the old one and by band-limited Fourier
   interpolation otherwise, so the grid may be refined along the ladder. Beyond the core box, the rung's own DMFT
   self-energy supplies the tail, as in any cold run.
 * The chemical potential starts at the last entry of the predecessor's ``mu_history.npy`` and gets re-adjusted to
   the filling from the first iteration on.
-* The iteration count carries on. A predecessor that ended at iteration :math:`N` hands over to iteration
-  :math:`N + 1`, the rung performs up to ``max_iter`` further iterations on top, and its per-iteration files keep
-  that numbering.
-* The accelerated mixing schemes start with an empty history. For the first ``mixing_history_length`` iterations
-  the rung mixes linearly with the configured ``mixing`` while (iterate, proposal) pairs of the *new* map
-  accumulate; only then do Pulay or Anderson take over. Secant pairs from the previous temperature are deliberately
-  left behind. They describe a different map, and an accelerated scheme fed with them explains the new residual
-  through the old map and parks the iteration at the predecessor's solution while the step residual reports
-  convergence.
+* The mixing history starts empty, so the first steps of an accelerated scheme are damped steps. With
+  ``use_jacobian_stabilization`` on both runs, the predecessor's certified Jacobian spectrum is handed over as well:
+  its run folder holds ``jacobian.npz``, and the rung installs the damping bound of that certified spectrum
+  before its first step, together with a reflection on the directions that were already unstable or that the two
+  preceding rungs extrapolate across the boundary, and the own damping of every carried direction, the ones within a
+  small band of the boundary included, each of them
+  re-gridded to the rung's frequencies and momenta like the self-energy (without the pole fit, and
+  zeroed beyond the predecessor's highest frequency instead of a DMFT tail) (see the
+  :ref:`Jacobian tracking <cooldown-jacobian>` section). For a direction that re-gridding is an approximation and
+  not an exact map: the spline derivatives depend nonlinearly on the data, so the real and the imaginary part of a
+  carried vector are re-gridded on their own and the weighting inside the column pair of a complex mode shifts a
+  little, and the branch extrapolation below the innermost frequency was designed for a self-energy. Without the
+  flag on the predecessor, nothing but the self-energy and the chemical potential is handed over.
+* The iteration count carries on. A predecessor that ended at iteration :math:`N` hands over to iteration :math:`N +
+  1`, the rung performs up to ``max_iter`` further iterations on top, and its per-iteration files keep that numbering.
+* The accelerated mixing schemes start with an empty history. For the first ``mixing_history_length`` iterations the
+  rung mixes linearly with the configured ``mixing`` while (iterate, proposal) pairs of the *new* map accumulate; only
+  then do Pulay or Anderson take over. Secant pairs from the previous temperature are deliberately left behind. They
+  describe a different map, and an accelerated scheme fed with them explains the new residual through the old map and
+  parks the iteration at the predecessor's solution while the step residual reports convergence.
 
 The re-gridding treats real and imaginary parts separately on the full signed frequency axis. The innermost
 frequencies, where the grid is sparsest, are interpolated linearly and everything above them with shape-preserving
@@ -366,7 +381,9 @@ unconverged iterate mean nothing. A few practices keep a ladder trustworthy.
   such a mode, and heavy damping starves exactly that correction. Anderson or Pulay mixing with moderate damping
   and a history of a few pairs is therefore the recommended setting for a ladder. Both ``mixing`` and
   ``mixing_history_length`` decide whether and how fast a rung converges, and they are worth tuning on the warm
-  rungs, where experiments are cheap.
+  rungs, where experiments are cheap. Whether a rung struggles with an overshooting mode, which a smaller
+  ``mixing`` cures, or with an expanding one, which it cannot, is what the Jacobian tracking described below reads
+  off the cycle's own iterates.
 * **Choose the threshold for the observable.** The step residual says something about the returned iterate, not
   about the fixed-point equation. A direction along which the map contracts very slowly contributes almost nothing
   to the step, yet it can still separate states with different low-frequency self-energies, chemical potentials and
@@ -382,14 +399,18 @@ unconverged iterate mean nothing. A few practices keep a ladder trustworthy.
   drag the ladder through a pole the physics does not have, and it shifts the temperature at which the unstabilized
   cycle stops converging.
 
-When a rung does not converge, there are three remedies, in increasing order of intervention. The rung can be
-resumed at the same temperature: point ``previous_sc_path`` at its own output folder with ``use_interpolated_sigma``
-set to ``False``, and it gets another ``max_iter`` iterations. The temperature ratio can be reduced by inserting an
-intermediate rung. Or, once the ladder approaches the instability, one of the stabilization techniques described
-next is switched on. The symptoms that call for it are repeated warnings about an unphysical (past-pole) branch and
-a step residual that stalls or bounces instead of decaying. Ladder plus scaffold is the standard route into the
-low-temperature regime: the ladder keeps the start close to the solution, the scaffold keeps the iteration on the
-physical branch on the way there.
+When a rung does not converge, there are three remedies, in increasing order of intervention. The rung can be resumed
+at the same temperature: point ``previous_sc_path`` at its own output folder with ``use_interpolated_sigma`` set to
+``False``, and it gets another ``max_iter`` iterations. The temperature ratio can be reduced by inserting an
+intermediate rung. The rung can be restarted with a smaller ``mixing`` for its first steps, which removes a bad first
+step. Or, once the
+ladder approaches the instability, one of the stabilization techniques described next is switched on. Before reaching
+for a scaffold it pays to rerun the rung with ``use_jacobian_stabilization`` switched on, which costs no extra
+evaluation of the map and writes the leading eigenvalues of the map to the log every iteration; the :ref:`Jacobian
+tracking <cooldown-jacobian>` section below explains how to read them. The symptoms that call for it are repeated
+warnings about an unphysical (past-pole) branch and a step residual that stalls or bounces instead of decaying. Ladder
+plus scaffold is the standard route into the low-temperature regime: the ladder keeps the start close to the solution,
+the scaffold keeps the iteration on the physical branch on the way there.
 
 Stabilization techniques
 ------------------------
@@ -426,7 +447,8 @@ solution and are taken away before the result counts. Four mechanics are common 
 * **Release and history reset.** Once a scaffolded phase converges, the scaffold is removed (or reduced, in the case
   of the annealing) and the cycle carries on with the changed map. Every such switch resets the accelerated mixing
   history, because secant pairs of the previous map would extrapolate across the discontinuity; the next
-  ``mixing_history_length`` iterations mix linearly while pairs of the new map accumulate.
+  ``mixing_history_length`` iterations mix linearly while pairs of the new map accumulate. A change of the
+  reflected directions of the Jacobian tracking below resets the history in the same way.
 * **Only the pure phase counts.** The result is the fixed point of the unmodified map, converged to the full
   ``epsilon``. If ``max_iter`` runs out before that, the run is not converged. Should the scaffold happen to be
   released on the very last iteration, the log also warns that the returned self-energy is a scaffolded-phase
@@ -438,6 +460,220 @@ solution and are taken away before the result counts. Four mechanics are common 
   ``perform_lambda_correction`` of the :ref:`lambda correction section <lambda-correction>` is something else
   entirely. It runs a single iteration with the correction applied and left in place, which makes it a one-shot DΓA
   rather than a stabilization of the cycle, and when it is enabled it overrides all three techniques.
+
+A fourth option, ``use_jacobian_stabilization``, is not a scaffold and leaves the susceptibility alone; it acts on
+the iteration instead of on the map and composes with any of the three. It has its own section next.
+
+.. _cooldown-jacobian:
+
+Jacobian tracking
+~~~~~~~~~~~~~~~~~
+
+Whether damped iteration can converge to the fixed point is decided by the Jacobian of the map :math:`\Sigma \mapsto
+\Sigma'` there. Write :math:`\lambda_\Pi` for the eigenvalues of :math:`1 - \partial\Sigma'/ \partial\Sigma`. Linear
+mixing with parameter :math:`p` multiplies the error along such a direction by :math:`1 - p\lambda_\Pi` per iteration,
+so a direction with a positive real part of :math:`\lambda_\Pi` is tamed by a small enough :math:`p`, whereas one with a
+negative real part expands at every :math:`p` and is exactly the expanding direction of the previous section. With
+``use_jacobian_stabilization`` the cycle estimates the leading :math:`\lambda_\Pi` from the (iterate, proposal) pairs
+the mixing records anyway, a secant Rayleigh-Ritz estimate on the last seven pairs that costs no additional evaluation
+of the map, and refreshes it every iteration. Each estimate carries a residual; only estimates whose residual passes a
+gate count as *certified*, and every decision is based on certified ones alone. Two things follow from the estimate. A
+direction certified with a negative real part on three consecutive iterations is *flipped*: the proposal residual is
+reflected on it before the mixing acts, which turns the sign of the damping on that direction and makes the physical
+fixed point attractive there, the modified iteration of arXiv:2606.04936. The flip also lands ahead of the crossing:
+the certified directions of consecutive estimates are identified by the overlap of their eigenvectors (a complex pair
+by its real plane), and a direction whose real part fell monotonically over three consecutive matched estimates is
+flipped on the estimate whose linear extrapolation one iteration ahead lies below the boundary by more than the
+undecidable band plus an error bar (the larger Ritz residual of the last two estimates plus twice the scatter of the
+three points about a line), logged as ``Jacobian tracker: predicted crossing of lambda_Pi=<v> (extrapolated <p>, band
+<m>, error bar <d>), flipped ahead of its crossing.``; only the real part is extrapolated, since a complex pair whose
+modulus factor passes one while its real part is still positive is the case the damping bound cures. A direction whose
+eigenvalue jumps through a pole, from a certified positive to a certified negative real part at a modulus beyond 5 with
+the step of its inverse continuing the previous one, is flipped on the iteration of the jump (``Jacobian tracker: pole
+crossing of lambda_Pi from <a> to <b>, flipped at once.``), and a direction approaching a pole with a growing modulus
+beyond 5 is left alone until it has jumped (``Jacobian tracker: pole-type approach of lambda_Pi=<v> (modulus <r>
+growing), no prediction.``), since flipping it before the pole would make it diverge. A predicted flip goes through the
+same reflection, refusals and releases as a certified one and is undone by the calm release once the real part turns
+back up. And the largest damping the certified spectrum
+allows is applied to every damped step, i.e. to linear mixing and to the linear warm-up and fallbacks of the accelerated
+schemes, never above the configured ``mixing``; an Anderson or Pulay step keeps the configured value, because a
+whole-spectrum bound describes damped iteration and not a quasi-Newton step. The safety factor ``c`` in ``(0, 1)`` of
+that bound (arXiv:2606.04936 Eq. 13, smaller values widening the basin) is taken at the vertex of the stability
+parabola, arXiv:2609.11405 App. F. That scalar applies only to the directions the estimate does not certify: on a damped
+step every certified direction is taken out of the mixed result and given the step its own eigenvalue allows instead,
+capped at one rather than at ``mixing`` and with the reversed sign where it is flipped (Eq. 27 of arXiv:2606.04936 and
+Eq. 21 of arXiv:2609.11405, with the split of the latter's App. G1), so a stiff certified mode is damped hard while a
+flat one advances its whole residual in a single step, whatever the damping did to it. An Anderson or Pulay step is left
+alone: its secant model of the certified span comes from the same secants that certified the span, so its step there is
+the better informed one, and overwriting it with a Picard damping pins the flat certified directions to the damped rate.
+The per-direction damping gave no speed-up for the parquet iteration of arXiv:2606.04936 and looked less stable there
+than uniform damping, while arXiv:2609.11405 finds that it helps TRILEX and SBE, whose iterated object carries the
+self-energy and the screened interaction (in SBE the couplings beside them), and that uniform mixing is more stable for
+MBE, which that paper attributes to MBE being affected by vertex divergences the way the parquet iteration is. Ladder
+DGA iterates the self-energy alone, but the beta ladder takes it close to those divergences, so its benefit here is a
+hypothesis for the ladder to confirm and not a settled result. That per-direction damping is installed on the first
+iteration that certifies a direction, with or without a flip, so a run that never flips is still accelerated on its
+certified flat directions, and once installed it stays in force until the next iteration that certifies something
+rebuilds it (an iteration that certifies nothing leaves it in place), until the residual grows on three consecutive
+iterations, which releases it and holds it off for three further informative iterations (an iteration frozen below the
+noise floor does not count) before the estimate may install it again, until the calm release of the reflection beside it
+drops it until the next certifying iteration, or until a scaffold pauses the flips. The projector that takes the
+certified span out of the damped step is the oblique one along the uncertified subspace, so an uncertified direction
+keeps exactly the mixed step; where the two subspaces are too close to separate that way, the orthogonal projector is
+used instead and the log records it. The per-direction damping is rebuilt from the current estimate on every iteration
+that certifies something, so a direction certified stable again takes its own positive damping right away, and the
+three-iteration rule above gates the reversed sign in it exactly as it gates the reflection; until that rule admits a
+flip and its reflection is built, the direction is no part of the map and keeps the step the mixing gave it.
+
+The log carries one line per iteration once three pairs exist,
+
+.. code-block:: text
+
+   Jacobian tracker: lambda_Pi=+4.4529+0.0000j (res 4.9e-02, certified, stable), lambda_Pi=+2.6498-2.0341j
+   (res 5.4e-01, uncertified), ...; 0 flipped, p_eff=0.2246, rho=0.0000.
+
+listing the four largest eigenvalues with their residual and verdict (``certified`` with ``stable``, ``flip``,
+``predicted flip``, ``marginal`` or, for a clearly unstable mode while a scaffold pauses flips,
+``unstable, suppressed``, or ``uncertified``), the number of flipped directions, the damping ``p_eff`` the whole
+spectrum allows
+and the convergence rate ``rho`` the certified directions predict under the damping each of them actually takes, and
+at convergence a summary line with the same three numbers. A run that converges in fewer iterations than the
+``ceil(1 / (eps p))`` of arXiv:2609.11405 App. G4, taken per certified mode outside its undecidable band with
+``eps`` its distance from the
+stability boundary and ``p`` the damping that mode actually gets, i.e. the damping of the installed per-direction
+map where it acts on the mode (a flat mode at a damping of one needs ``ceil(1 / eps)`` iterations) and the undamped
+mixing the spectrum allows elsewhere, adds a warning there that a flat direction may not have settled; the warning
+prints the smallest such ``eps`` and the damping in force ``p_eff``; the count divides every damping, the map's own
+included, by the vertex constant to recover ``p`` and clips it at one, the largest count over the modes is the
+minimum,
+it is capped at 15000 and the control flow is unchanged.
+Reading it is the point of the flag as much as the flip is. Certified
+eigenvalues with large positive real parts (values of 4 to 10 are common near the instability) mean the map overshoots:
+damped iteration bounces along those directions, a smaller ``mixing`` or the automatic bound cures it, and Anderson
+mixing handles it once its secant history describes the map, which it does not in the first steps of a rung. A certified
+negative real part means the pure fixed point repels along that direction; the reflection is applied, and a scaffold is
+the alternative if the flip does not carry the rung. Estimates that stay ``uncertified`` for many iterations, with
+residuals of order one and eigenvalues jumping between iterations, mean that the iterate is not in a neighborhood where
+the map is linear, typically because it crosses a pole every few iterations; the tracker then correctly does nothing,
+and the remedy is the ladder step or a scaffold, not the flip. The tracker also freezes once the step between iterates
+drops to the rounding noise of the stored self-energy, :math:`10^{3}\,\epsilon_{\mathrm{mach}}` of the storage
+precision, which is :math:`1.2 \cdot 10^{-4}` relative for single-precision iterates and
+:math:`2.2 \cdot 10^{-13}` for double-precision ones. That sits
+just above the default ``epsilon`` of :math:`10^{-4}`, so the tracker is frozen over the final approach of a
+converging rung and a tighter ``epsilon`` only lengthens that stretch; it is harmless, since the last estimate stays
+in force.
+
+The three leading eigenvalues and their residuals of every iteration are also written to ``jacobian.npz`` in the run
+folder, as the arrays ``eigenvalues`` and ``eigenvalue_residuals``, one row per iteration, ``nan`` where no estimate
+exists, and the damping the tracker ran at goes into the same file as ``damping``, one ``p_eff`` per iteration, for
+plotting the approach to the instability. Row 0 is the run's first iteration (``starting_iter + 1`` on a resumed
+rung), and iterations measured while a susceptibility-reshaping or annealing scaffold shaped the map are included,
+unlike the certified spectrum that joins the file when the loop ends, which holds the last certification made with
+flips allowed, the set the run carried in, or no mode at all.
+
+A run that starts from a predecessor with the flag on begins with that predecessor's spectrum (the log says
+``Jacobian tracker: carried <k> certified modes (lambda_Pi ...), <m> with a usable vector, p_eff=<p>.`` and, when the
+set is installed, ``Jacobian tracker: carried set installed on <n> directions, <m> of them reflected.``). Every
+certified mode whose real part lies below the storage band of :math:`+0.1` carries a vector, a band distinct from the
+flip band :math:`-\max(10^{-2}, \mathrm{res})`, so the set holds the flipped modes together with the stable ones
+close to the boundary; it acts through the reflection of the flipped columns and through the per-direction damping
+built on all of them, a flipped direction taking its own reversed damping and a stable one its own positive damping
+instead of the scalar bound of the step. Where two carried columns of opposite sign lie too close for any bounded
+weighting to
+reverse one and keep the other, the per-direction damping of the set is refused and the reflection alone carries the
+install, logged as ``Jacobian tracker: carried set installed on its reflector alone over <m> directions, its signs
+carrying no per-direction damping.``; a flipped carried column lying in the span of the others beyond the condition
+cap refuses the whole set instead, reflection or not, logged as ``Jacobian tracker: no column was collected from the
+carried modes, or a flipped one lies in the span of the others beyond the condition cap 1000, nothing installed.``,
+while a stable column in that position is dropped from the per-direction damping alone and the rest of the set is
+installed, logged as ``Jacobian tracker: <k> stable carried column(s) of lambda_Pi <v> lie in the span of the others
+beyond the condition cap 1000 and are dropped.``
+When there is no predecessor spectrum, the log notes
+``No jacobian.npz in <path>; nothing carried.``, a predecessor whose
+``jacobian.npz`` holds only the per-iteration traces, the mark of a run that never ended its loop, is passed over with
+``<path> holds no certified spectrum (the run did not end its loop); nothing carried.``; a predecessor
+spectrum recorded for a different orbital count is refused with the warning
+``The carried Jacobian spectrum belongs to another orbital count; nothing carried.``; and a predecessor that did not
+reach the pure fixed point is still carried, with the warning
+``The predecessor's Jacobian spectrum in <path> belongs to a run that did not reach the pure fixed point.`` The bound
+the carried spectrum allows applies from the first step to every damped step; a file that holds no certified mode
+carries no bound, and the rung starts at the configured ``mixing``. The damping the predecessor ended with is written to
+the file as a record and is not read back, so that a single early transient cannot pin every later rung of a ladder to
+the value it forced; where the predecessor's tracker ended well below the configured ``mixing``, lowering ``mixing`` for
+the next rung is a deliberate choice, not an automatic one. An accelerated step keeps the configured ``mixing``
+whether or not a reflection is installed. A carried reflection is held until a certified stable mode
+overlaps it on three consecutive updates, until the residual grows on three consecutive updates, until the tracker's own
+certified flip replaces it, until a scaffold pauses the flips, or until the run converges and the loop ends; the calm
+release of a tracker-installed reflection does not apply to it, because the carried direction is the one the first
+iterations cannot yet certify. A scaffold pauses a carried flip rather than discarding
+it: a reflection carried in while a scaffold is already on waits and is installed on the first update after the release,
+and one installed before an annealing mass appears is withdrawn while the mass shapes the map and re-installed once
+flips are allowed again. Both the forced release and the re-install happen only on an update that clears the tracker's
+own early gates (three recorded pairs after a window restart, a step above the noise floor), so a reflector carried in
+at iteration 1 stays in force through the first scaffolded iterations after the annealing mass appears, and returns two
+to three iterations after the mass goes. A refined momentum grid is followed like the self-energy's. A carried mode
+still on the stable side of the boundary is flipped ahead of its crossing when two rungs say it will cross, the
+preemptive flip both papers recommend for a carried Jacobian (arXiv:2606.04936 flips the modes with a very small
+positive real part or approaching a pole, and the supplement of the PRL says the same in its Sec. VI): the file a rung
+writes holds, beside each mode's eigenvalue at the rung's own :math:`\beta_2`, the value of the mode it matched among
+the predecessor's carried columns at :math:`\beta_1` (``lam_prev``, ``res_prev``, ``beta_prev``, matched by the same
+eigenvector overlap once both live on the rung's window), and the next rung at :math:`\beta_3` extrapolates the real
+part linearly in :math:`\beta`, :math:`\mathrm{Re}\,\lambda^{(2)} + (\mathrm{Re}\,\lambda^{(2)} -
+\mathrm{Re}\,\lambda^{(1)})\,(\beta_3 - \beta_2) / (\beta_2 - \beta_1)`, and pre-flips a falling mode whose
+extrapolation lies below the boundary by more than the undecidable band plus the larger residual times one plus the
+step ratio, logged as ``Jacobian tracker: cross-rung prediction: lambda_Pi=<v> at beta=<b2> from <v1> at beta=<b1>
+extrapolates to <p> at beta=<b3>, flipped ahead of its crossing.``. A mode whose inverse, extrapolated the same way,
+changes sign before :math:`\beta_3` while its modulus grew beyond 5 sits past a pole at the new rung and is pre-flipped
+as well (the same line with ``(past the pole)``); the damping bound is then taken over the predicted spectrum too. The
+extrapolation is refused, and the mode carried as before, when the new rung is more than twice the previous step away
+(``Jacobian tracker: lambda_Pi=<v> has a step ratio <r> in beta above the cap 2, no cross-rung prediction.``), when
+the predecessor did not reach the pure fixed point (``Jacobian tracker: the predecessor did not reach the pure fixed
+point, no cross-rung prediction.``), or when the mode has no matched predecessor value, which is also what a file
+written before these keys existed gives. A carried spectrum whose modes all lie above the storage band stores no
+vector at all: it carries its damping bound and nothing else.
+
+Four limits are worth knowing. The flip presumes an iterate inside the linear neighborhood of the physical fixed
+point, as the underlying method does; it cannot carry an iteration across a pole surface, where the map is
+singular, and it cannot resolve a direction whose contribution to the step lies below the rounding noise. The
+reflection is built from the invariant subspace the flipped directions span, so an unstable direction that overlaps
+a certified stable one (the rule rather than the exception for this non-normal map) is flipped while that stable one
+keeps its own damping instead of the reflection; where a flipped and a stable eigenvalue nearly coincide, the two
+subspaces cannot be separated, no reflection is installed, and the log says so, while a pair close enough to make
+that separation steep but not singular is reflected orthogonally instead, which the log also records. Two certified
+eigenvalues that nearly coincide are likewise not separable per direction, and the whole certified span then takes
+one uniform damping, the smallest of theirs, as it does whenever the per-direction map would come out larger than
+twice the damping it encodes; the log says so in both cases. That uniform damping keeps the sign of every certified
+direction on its own eigenvector, not on the axis of the basis the span happens to be written in, which means that
+two certified directions of opposite sign lying closer than about fifty degrees have no bounded uniform damping
+either: no linear map can reverse one of two nearly parallel directions and fix the other. The per-direction damping
+is then refused outright, the log says so, and every certified direction takes the damped step at the scalar bound
+instead. What stays in force there is the reflection, and in that geometry it is the orthogonal one, since the
+obliquity cap above has already fired: it reverses the flipped directions exactly and, being unable to fix a stable
+neighbor that close, reverses those too. Measured on the small non-normal maps this was checked on, a certified
+stable direction sees a Rayleigh quotient between -0.88 and -0.996 under the installed reflection, i.e. essentially
+the same reversal the flipped direction gets, so its residual enters the step with the opposite sign instead of its
+own. What bounds that is the damping the reflected residual then reaches the mixing at, ``p_eff`` on a damped step
+and the configured ``mixing`` on an accelerated one, and the fact that the per-direction step never overwrites an
+accelerated step.
+Flips are paused while a scaffold shapes the map, since the scaffolded map is not the physical one, and resume
+after the release. And a flipped direction is dropped again as soon as the certified spectrum no longer supports
+it, or when the residual keeps growing with the flip in force, so a flip decided on a noisy estimate is undone by
+the same rule that made it. Either release can cycle: a flipped direction that has contracted below the noise floor
+stops being certified, the calm release drops it after three such updates, and it then regrows at
+:math:`1 + p\,|\mathrm{Re}\,\lambda_\Pi|` per step until it certifies again and is flipped anew, which costs
+iterations away from convergence; a growth release resets the persistence streak, so a re-install costs three fresh
+certifications. The papers keep a flip in place once it is made. Such a cycle also starves the accelerated mixing:
+every install and every release of a reflection is an event that empties the Pulay or Anderson history (the
+per-direction damping alone is none), so a wrong flip that is
+re-installed and released every three updates leaves the scheme in its damped warm-up steps for as long as the
+cycle lasts, a safe fallback but a slow one. The per-direction damping itself reaches the damped steps only, so a
+rung that spends most of its iterations on accelerated steps sees it on its warm-up and its fallbacks alone; the
+reflection, a preconditioner of the map rather than a step, reaches every iteration. And the tracker is blind at
+the start of a run
+unless a spectrum is carried in: a cold run needs three pairs before it estimates anything, and pairs taken over
+steps that grow from one iteration to the next do not certify, so the bound cannot protect the first steps of a
+run without a carried predecessor. The flag is disabled with a warning under the one-shot
+``perform_lambda_correction``, which has no iteration history to read.
 
 Lambda correction as a releasing scaffold
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -451,17 +687,29 @@ momentum- and frequency-summed corrected susceptibility reproduces the local sum
    \lambda_{\mathrm{r}}\right]^{-1} = \frac{1}{\beta} \sum_{\omega} \chi^{\omega}_{\mathrm{r},\mathrm{loc}} .
 
 Near its pole the ladder overestimates the susceptibility. The sum rule caps the total weight it may accumulate, so
-the calibrated mass comes out just large enough to pull the static susceptibility back from the pole. Which
-correction runs depends on the band count. For a single band, :math:`\lambda_{\mathrm{r}}` is one number per
-channel, found by a Newton iteration that starts just above the value at which the corrected static susceptibility
-would diverge. The ``type`` field of the lambda correction section selects whether both channels are corrected
-(``spch``) or only the magnetic one (``sp``, with the density sum rule folded into the magnetic target). For several
-bands the mass is a real-symmetric :math:`n_{\mathrm{o}}^2 \times n_{\mathrm{o}}^2` matrix
-:math:`\Lambda_{\mathrm{r}}` per channel that matches the sum rule component by component. It comes from a damped
-Newton iteration whose line search keeps the static susceptibility gap positive; both channels are always corrected,
-and the momentum sum runs over the full Brillouin zone because symmetry-related momenta carry orbitally rotated
-susceptibility matrices. The single-band scheme is the derived Moriya correction. The matrix scheme is a heuristic
-that mimics it, and inside the cycle both do the same job of stabilizing the iteration.
+the calibrated mass comes out just large enough to pull the static susceptibility back from the pole. Which correction
+runs depends on the band count. For a single band, :math:`\lambda_{\mathrm{r}}` is one number per channel. Inside the
+cycle the search is confined to one branch of the sum rule and the bracket starts from the previous iteration's
+:math:`\lambda`, because a warm-started state can carry a negative susceptibility at a finite frequency whose pole
+lies above the static bound, and an unbounded search then jumps between poles instead of converging. Every entry of
+the susceptibility contributes a pole to the sum rule at :math:`-1/\chi^{\mathrm{q}}_{\mathrm{r}}`, and the sum
+rule falls off from one pole to the next. The branch is anchored at the static bound, the value that lies above
+every pole of the :math:`\omega = 0` slice, because only there is the corrected static susceptibility positive at
+every momentum, which is what the correction exists to secure; and it is closed at the next pole above that bound,
+which the negative entries place there, at any bosonic frequency. Both ends coincide with the values the one-shot
+search walks whenever no negative entry sits above the static bound. Anchoring the branch at the largest pole of
+all entries alike instead does not work: the high-frequency tail of a computed susceptibility is near zero and
+slightly negative, an artifact of the truncated vertex box, and every one of those entries places a pole thousands
+above the physical root, so the search reports no root at all. The one-shot correction of
+``perform_lambda_correction`` keeps its Newton iteration started just above the static bound. The ``type`` field of
+the lambda correction section selects whether both channels are corrected (``spch``) or only the magnetic one
+(``sp``, with the density sum rule folded into the magnetic target). For several bands the mass is a
+real-symmetric :math:`n_{\mathrm{o}}^2 \times n_{\mathrm{o}}^2`
+matrix :math:`\Lambda_{\mathrm{r}}` per channel that matches the sum rule component by component. It comes from a
+damped Newton iteration whose line search keeps the static susceptibility gap positive; both channels are always
+corrected, and the momentum sum runs over the full Brillouin zone because symmetry-related momenta carry orbitally
+rotated susceptibility matrices. The single-band scheme is the derived Moriya correction. The matrix scheme is a
+heuristic that mimics it, and inside the cycle both do the same job of stabilizing the iteration.
 
 The schedule has two phases. The correction is applied in every iteration until the cycle converges at the relaxed
 threshold. At that point the log announces
@@ -477,7 +725,8 @@ of the intervention can be followed throughout the scaffolded phase. By construc
 pure fixed point is stable once the iteration gets close to it. At temperatures where the pure map has an expanding
 direction even right next to its fixed point, the released phase tears away again and the run ends at ``max_iter``
 with the verdict that no stable pure fixed point was found from that start. The converged lambda-corrected iterate
-of the release iteration is then still on disk as ``sigma_dga_iteration_<i>.npy``. It is a well-defined object in
+of the release iteration is then still on disk as ``Sigma_Iterates/sigma_dga_iteration_<i>.npy``. It is a
+well-defined object in
 its own right, but a lambda-corrected DΓA solution rather than a self-consistent one.
 
 Eigenvalue restriction of the susceptibility
@@ -582,10 +831,19 @@ Choosing a technique
      - a first, minimal intervention when only a few modes cross the pole
      - a gradual descent when the pure map is expected to be stable but hard to reach
 
+The Jacobian tracking is not in the table because it is not a fourth scaffold: the three above reshape the
+susceptibility and change the map, while the tracking leaves the map alone and changes the iteration that walks it.
+It is therefore the first thing to switch on, and the only one that costs nothing when it is not needed: a rung
+whose certified spectrum holds no unstable direction never flips, and runs exactly as it would without the flag.
+What it buys is a rung whose start sits near a direction the map has already turned unstable, the usual situation
+after a large cooling step, where the reflection and the measured bound keep the iteration on the physical branch
+until the mixing can take over. What it does not do is choose the fixed point: it makes the physical one attractive
+where the estimate reaches, and a start that contracts into another one still lands there.
+
 None of the three is tied to a cooldown; each can just as well support a cold run at a temperature where the plain
-cycle fails. Whatever the technique, the result is certified the same way as above: a converged pure phase, a
-non-negative static susceptibility in both channels on the final iteration, no pole warnings at the end, and
-agreement with a second route to the same temperature.
+cycle fails, and the Jacobian tracking can accompany any of them. Whatever the technique, the result is certified the
+same way as above: a converged pure phase, a non-negative static susceptibility in both channels on the final
+iteration, no pole warnings at the end, and agreement with a second route to the same temperature.
 
 Summary
 -------
@@ -605,18 +863,25 @@ The cooldown, step by step:
    only its ``previous_sc_path`` would be empty.
 4. Run the rung and confirm in the log that it converged (``Self-consistency of sigma and mu reached``), that the
    final ``Minimum static compound eigenvalue of chi_phys`` of both channels is not negative beyond the small
-   truncation offset, and that the last iterations show no past-pole warning. Note the run folder
-   ``LDGA_Nk<nk_tot>_Nq<nk_tot>_wc<niw_core>_vc<niv_core>_vs<niv_shell>`` it created.
+   truncation offset, and that no iteration of the run raised a past-pole warning. Look at the Eliashberg sectors
+   as well: coinciding sectors and a jump from the previous rung are the signature of a wrong fixed point. Note the
+   run folder
+   ``LDGA_Nk<nk_tot>_Nq<nk_tot>_wc<niw_core>_vc<niv_core>_vs<niv_shell>`` it created, and the ``p_eff`` of the
+   tracker's convergence line.
 5. Configure the next rung: ``input_path`` set to its own DMFT data, ``previous_sc_path`` set to the predecessor's
    run folder, ``use_interpolated_sigma: True``, and the interpolation section aimed at the rung after it. Leave
    the interpolation off on the last rung. The example file :ref:`dga_config_beta25.yaml <cooldown-config-beta25>`
-   marks the three entries that change from one rung to the next.
+   marks the three entries that change from one rung to the next. If the predecessor's tracker ended well below
+   the configured ``mixing``, a smaller ``mixing`` for this rung is worth considering. With the flag
+   on, the rung also reads the predecessor's ``jacobian.npz``; nothing has to be configured for that.
 6. Run it and check the log for ``Using previous calculation and starting the self-consistency loop at iteration
    N`` with an iteration number that continues from the predecessor; without that line the rung started cold.
 7. If the rung stops at ``max_iter``, do not chain from it. Either resume it at the same temperature
    (``previous_sc_path`` pointing at its own folder, ``use_interpolated_sigma: False``), insert an intermediate
    temperature, or switch on one flag of the :ref:`stabilization section <stabilization>` for that rung and rerun
-   it.
+   it; rerunning with ``use_jacobian_stabilization`` first shows in the log whether the map overshoots or expands.
+   If the rung converged but its Eliashberg sectors look like those of step 4, do not resume it either; rerun it
+   from its predecessor with a changed start.
 8. Repeat steps 4 to 7 down the ladder. Solve the Eliashberg equation on converged rungs only.
 9. Before quoting results, reproduce at least one rung by a second route or on a finer momentum grid and confirm
    that the self-energy and the Eliashberg eigenvalues agree.
