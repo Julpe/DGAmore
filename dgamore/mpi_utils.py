@@ -47,7 +47,7 @@ from dgamore.n_point_base import DTYPE
 MAX_MPI_BYTES = 2**31 - 1
 
 
-def build_node_shared_array(node_comm, compute_fn, dtype=DTYPE):
+def build_node_shared_array(node_comm, compute_fn, dtype=None):
     r"""
     Build an array once per node and expose it to every rank on that node through a single MPI shared-memory window,
     so a large replicated quantity (e.g. the full-grid Green's function ``giwk_full``) is stored **once per node
@@ -64,7 +64,7 @@ def build_node_shared_array(node_comm, compute_fn, dtype=DTYPE):
 
     :param node_comm: The node-local (shared-memory) communicator.
     :param compute_fn: Zero-argument callable returning the array; invoked only on the node root.
-    :param dtype: Storage dtype of the shared buffer (defaults to the global ``DTYPE``, complex64).
+    :param dtype: Storage dtype of the shared buffer; ``None`` takes the dtype of the array the root computed.
     :return: The tuple ``(array, win)`` - the (shared) numpy array on every rank and the MPI window (``None`` for a
         single-rank node).
     """
@@ -72,16 +72,34 @@ def build_node_shared_array(node_comm, compute_fn, dtype=DTYPE):
     local = compute_fn() if is_root else None
     if node_comm.Get_size() == 1:
         return local, None
-    shape = node_comm.bcast(local.shape if is_root else None)
-    itemsize = np.dtype(dtype).itemsize
-    nbytes = int(np.prod(shape)) * itemsize if is_root else 0
-    win = MPI.Win.Allocate_shared(nbytes, itemsize, comm=node_comm)
-    buf, _ = win.Shared_query(0)
-    shared = np.ndarray(buffer=buf, dtype=dtype, shape=shape)
+    shape, dtype = node_comm.bcast((local.shape, dtype or local.dtype) if is_root else None)
+    shared, win = allocate_node_shared_array(node_comm, shape, dtype)
     if is_root:
         shared[...] = local
     node_comm.Barrier()
     return shared, win
+
+
+def allocate_node_shared_array(node_comm, shape: tuple, dtype=DTYPE):
+    r"""
+    Allocates one MPI shared-memory window holding an array of the given shape on a shared-memory communicator and
+    returns an (uninitialized) numpy view of it on every rank; the caller fills the array and owns the window (free
+    it once every rank is done reading, after a barrier). A single-rank communicator, or ``None``, gets a private
+    array and ``win = None`` instead, which keeps single-rank and mock communicators working.
+
+    :param node_comm: The node-local (shared-memory) communicator, or ``None``.
+    :param shape: Shape of the shared array.
+    :param dtype: Storage dtype of the shared buffer (defaults to the global ``DTYPE``, complex64).
+    :return: The tuple ``(array, win)`` - the shared numpy array on every rank and the MPI window (``None`` for a
+        single-rank communicator).
+    """
+    if node_comm is None or node_comm.Get_size() == 1:
+        return np.empty(shape, dtype=dtype), None
+    itemsize = np.dtype(dtype).itemsize
+    nbytes = int(np.prod(shape)) * itemsize if node_comm.Get_rank() == 0 else 0
+    win = MPI.Win.Allocate_shared(nbytes, itemsize, comm=node_comm)
+    buf, _ = win.Shared_query(0)
+    return np.ndarray(buffer=buf, dtype=dtype, shape=shape), win
 
 
 def cgroup_memory_limit(proc_file: str = "/proc/self/cgroup", cgroup_root: str = "/sys/fs/cgroup") -> int | None:

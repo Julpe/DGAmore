@@ -410,7 +410,7 @@ def test_lanczos_fast_counts_layout_build_vertices_bubble_and_arpack_basis():
     nb, vpp = p["n_bands"], 2 * p["niv_pp"]
     vertex = p["nk_tot"] * nb**4 * vpp * vpp
     chi0 = p["nk_tot"] * nb**4 * vpp
-    arpack = (max(2 * 1 + 1, 20) + ARPACK_EXTRA_VECTORS) * p["nk_tot"] * nb**2 * vpp
+    arpack = (memory_estimator.lanczos_ncv(1) + ARPACK_EXTRA_VECTORS) * p["nk_tot"] * nb**2 * vpp
     giwk_dga = p["nk_tot"] * nb**2 * 2 * p["niv_cut"]
     expected = SCALE * (LANCZOS_VERTEX_FACTOR * vertex + chi0 + arpack + giwk_dga)
     assert estimate_peaks(**p)["lanczos"].off_single == pytest.approx(expected)
@@ -439,6 +439,47 @@ def test_lanczos_arpack_workspace_grows_with_n_eig():
     default = _peaks(with_eliashberg=True, n_eig=1)["lanczos"]
     many = _peaks(with_eliashberg=True, n_eig=30)["lanczos"]
     assert many.off_single > default.off_single
+
+
+def test_lanczos_ncv_is_two_n_eig_plus_one_above_the_floor():
+    """The Lanczos basis size is 2 n_eig + 1, floored at LANCZOS_NCV_FLOOR."""
+    assert memory_estimator.lanczos_ncv(1) == memory_estimator.LANCZOS_NCV_FLOOR == 12
+    assert memory_estimator.lanczos_ncv(12) == 25
+
+
+def test_lanczos_team_bytes_on_the_wedge_holds_irreducible_windows(monkeypatch):
+    """With wedge windows the per-channel term is the irreducible block instead of the full-BZ one."""
+    monkeypatch.setattr(memory_estimator, "TEAM_BUILD_CHUNK_BYTES", 1000 * memory_estimator.DTYPE_BYTES)
+    full = memory_estimator.lanczos_team_bytes(2, 64, 10, 3, 4, 2, 2, 3)
+    wedge = memory_estimator.lanczos_team_bytes(2, 64, 10, 3, 4, 2, 2, 3, 10)
+    vertex = memory_estimator._two_fermion_block(64, 2, 1, 6)
+    irr = memory_estimator._two_fermion_block(10, 2, 1, 6)
+    assert full - wedge == 2 * memory_estimator.DTYPE_BYTES * (vertex - irr)
+
+
+def test_lanczos_team_bytes_counts_windows_source_build_blocks_bubble_and_sectors(monkeypatch):
+    """The team-solve node peak is the windows, the irr source beside the build blocks, the bubble and the sectors."""
+    monkeypatch.setattr(memory_estimator, "TEAM_BUILD_CHUNK_BYTES", 1000 * memory_estimator.DTYPE_BYTES)
+    one = memory_estimator.lanczos_team_bytes(2, 64, 10, 3, 4, 1, 2, 3)
+    two = memory_estimator.lanczos_team_bytes(2, 64, 10, 3, 4, 2, 2, 3)
+    more_sectors = memory_estimator.lanczos_team_bytes(2, 64, 10, 3, 4, 2, 4, 3)
+    many_ranks = memory_estimator.lanczos_team_bytes(2, 64, 10, 3, 4, 1, 2, 10**6)
+    vertex = memory_estimator._two_fermion_block(64, 2, 1, 6)
+    irr = memory_estimator._two_fermion_block(10, 2, 1, 6)
+    vectors = (
+        memory_estimator.lanczos_ncv(4)
+        + memory_estimator.TEAM_SCRATCH_VECTORS
+        + 2 * 4
+        + memory_estimator.TEAM_MATVEC_TRANSIENT_VECTORS
+    )
+    per_sector = vectors * memory_estimator._giwk_rspace(64, 2, 6)
+    bubble = memory_estimator._bubble_block(64, 2, 1, 6)
+    block = 64 * 2**4 * memory_estimator.team_build_columns(64, 2, 6)
+    assert memory_estimator.team_build_columns(64, 2, 6) == 1
+    assert two - one == memory_estimator.DTYPE_BYTES * vertex
+    assert more_sectors - two == 2 * memory_estimator.DTYPE_BYTES * per_sector
+    assert one == memory_estimator.DTYPE_BYTES * (vertex + irr + max(irr, 6 * block) + bubble + 2 * per_sector)
+    assert many_ranks == memory_estimator.DTYPE_BYTES * (3 * vertex + irr + bubble + 2 * per_sector)
 
 
 def test_save_pairing_vertex_enters_the_single_rank_gather_peak():
