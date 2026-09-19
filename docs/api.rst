@@ -19,6 +19,7 @@ API Reference
    dgamore.greens_function
    dgamore.hamiltonian
    dgamore.interaction
+   dgamore.jacobian_stabilization
    dgamore.lambda_ops
    dgamore.local_four_point
    dgamore.local_n_point

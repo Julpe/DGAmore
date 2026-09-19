@@ -7,7 +7,9 @@ configuration section, in a run-specific subdirectory whose name encodes the mom
 following the pattern ``LDGA_Nk<nk_tot>_Nq<nk_tot>_wc<niw_core>_vc<niv_core>_vs<niv_shell>``. That directory is
 referred to as ``output_path`` below and holds the main results; the quantities of the Eliashberg step go to the
 subfolder ``eliashberg_path`` and the figures to the subfolder ``plotting_path``, both named in the configuration
-file and described on the :doc:`configuration` page.
+file and described on the :doc:`configuration` page, and the per-iteration self-energies of the self-consistency
+loop to the fixed subfolder ``Sigma_Iterates`` (a resumed run reads them from there, or from the run folder itself
+for runs written before that subfolder existed).
 
 Because a ``.npy`` file stores only the array, none of the metadata that the corresponding class carries survives the
 round trip: the spin channel, the frequency notation, the momentum layout and the two frequency ranges have to be
@@ -93,6 +95,7 @@ explicitly, since the file itself carries no metadata. The examples below assume
 
    run = "LDGA_Nk1024_Nq1024_wc60_vc60_vs200"   # the run's output directory
    eliashberg = f"{run}/Eliashberg"             # its Eliashberg subfolder, named in the configuration
+   iterates = f"{run}/Sigma_Iterates"           # its per-iteration self-energies
    nk = (32, 32, 1)                             # the momentum grid the run used
    beta = 12.5                                  # the run's inverse temperature
 
@@ -292,7 +295,7 @@ separate momentum axes.
    * - ``g_latt_dmft.npy``
      - Lattice Green's function built from the DMFT self-energy
      - ``[nkx, nky, nkz, no, no, 2 niv]``
-   * - ``sigma_dga_iteration_<i>.npy``
+   * - ``Sigma_Iterates/sigma_dga_iteration_<i>.npy``
      - Self-energy after self-consistency iteration ``i`` (also read back when a run is resumed)
      - ``[nkx, nky, nkz, no, no, 2 niv]``
    * - | ``sigma_dga_interpolated``
@@ -300,6 +303,39 @@ separate momentum axes.
      - The final self-energy re-gridded to the target temperature and frequency box (see the
        :ref:`self-energy interpolation section <self-energy-interpolation>`)
      - ``[nkx, nky, nkz, no, no, 2 n]``
+   * - ``Sigma_Iterates/sigma_dga_proposal_iteration_<i>.npy``
+     - Un-mixed self-energy proposal of iteration ``i``, the map's output for ``sigma_dga_iteration_<i-1>``
+       (``use_jacobian_stabilization`` only, as the offline record of the pairs the tracker reads from memory)
+     - ``[nkx, nky, nkz, no, no, 2 niv]``
+   * - ``jacobian.npz``
+     - The one Jacobian record of a run (``use_jacobian_stabilization`` only), rewritten every iteration with the
+       three per-iteration traces and completed at the end of the loop with the certified spectrum. Traces:
+       ``eigenvalues``, the three leading Ritz values :math:`\lambda_\Pi` of every iteration's estimate, largest
+       modulus first, ``nan`` where the tracker produced no estimate on that iteration (row 0 is the run's first
+       iteration, ``starting_iter + 1`` on a resumed rung, and rows measured while a susceptibility-reshaping or
+       annealing scaffold shaped the map are included); ``eigenvalue_residuals``, the matching Ritz residuals,
+       ``nan`` likewise; ``damping``, the effective damping ``p_eff`` the tracker ran at, a number on every row
+       since it holds its last value through an iteration without an estimate. Spectrum, from the tracker's last
+       update that certified a mode with flips allowed (or the set it carried in): every certified Ritz value
+       (``lam_pi``) with its residual (``res``), its flip decision (``flip``) and whether that flip was predicted
+       (``predicted``), for every mode whose real part lies below the storage band :math:`+0.1` (``stored``, a band
+       distinct from the flip band :math:`-\max(10^{-2}, \mathrm{res})`) its Ritz vector on the full momentum
+       grid in the precision the loop stores its self-energies in (``u_re``, ``u_im``), per mode the eigenvalue,
+       residual and inverse temperature of the predecessor mode it matched (``lam_prev``, ``res_prev``,
+       ``beta_prev``, ``nan`` without a match or a predecessor), plus the window ``shape``, ``beta``, ``p_eff``
+       and whether the run ``converged``. A run that never ends its loop leaves the traces alone, which a
+       successor does not carry. Read by a successor run started from this folder, which re-derives the flip
+       decisions and the damping from ``lam_pi``, ``res``, ``lam_prev``, ``res_prev``, ``beta_prev`` and the
+       vectors (``flip``, ``predicted`` and ``p_eff`` are records and never read back). Size: about
+       :math:`8\,n_{\mathbf{k}}\,n_{\mathrm{o}}^{2}\,2\,\mathrm{niv}_{\mathrm{core}}` bytes per stored mode in
+       single precision, twice that in double (4.6 MB on a :math:`64 \times 64` grid with 70 core frequencies,
+       one band; 7.5 GB on a :math:`50^3` grid with five bands and 150 core frequencies); a complex-conjugate-pair
+       member costs twice that. At most six modes are stored, a few kilobytes plus the traces when no mode
+       qualifies.
+     - ``[n, 3]`` for ``eigenvalues``, ``eigenvalue_residuals``; ``[n]`` for ``damping``; ``[m]`` for ``lam_pi``,
+       ``res``, ``flip``, ``predicted``, ``stored``, ``lam_prev``, ``res_prev``, ``beta_prev``; ``[n_w, k]`` for
+       ``u_re``, ``u_im`` (``n_w`` the window size, ``k`` the stored count); ``shape`` as ``[6]``; ``beta``,
+       ``p_eff`` and ``converged`` as scalars
    * - ``mu_history.npy``
      - Chemical potential of every self-consistency iteration, ``float64``
      - ``[n_iterations]``

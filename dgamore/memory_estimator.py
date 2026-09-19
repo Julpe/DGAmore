@@ -39,6 +39,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from dgamore.jacobian_stabilization import TRACKER_PAIRS
+
 from dgamore.n_point_base import DTYPE
 
 # Bytes per stored element (from the global DTYPE, so it tracks a switch to e.g. complex128).
@@ -49,7 +51,8 @@ OVERHEAD_FACTOR: float = 1.0
 # ~170 MB per rank measured on a single-band run; counted in every branch's baseline.
 RANK_BASELINE_BYTES: int = 2**28
 
-# fq: single-block BSE assembly + eagerly rebound matmuls (f = gchi0_q_inv @ f, then f @ gchi0_q_inv), ~2 blocks live.
+# fq: the eagerly rebound matmuls (f = gchi0_q_inv @ f, then f @ gchi0_q_inv) hold this many window copies next to
+# the assembled ladder window at the per-rank peak (~2.7 windows in total measured across ranks in lockstep).
 FQ_MATMUL_FACTOR: int = 2
 
 # FFT SDE per-chunk transient: the exchanged full-BZ bosonic window plus the peer-to-peer exchange's in-flight
@@ -285,18 +288,18 @@ def _chiq_aux_transient(chunk: int, per_q_box: int, one_slice: int, vc: int) -> 
     return chunk + min(chunk, per_q_box) + one_slice + chunk // vc
 
 
-def _fq_transient(chunk: int, per_q_box: int, pp_ratio: float) -> int:
+def _fq_transient(chunk: int, per_q_box: int) -> int:
     """
-    Returns the per-rank transient bytes of one chunk of the pairing-vertex build: the larger of the matmul phase
-    (the assembled ladder window and its eagerly rebound copy, ``FQ_MATMUL_FACTOR`` windows) and the write phase
-    (the window plus its two pp-box cuts), together with the sliced local vertex (at most one momentum's box).
+    Returns the per-rank transient bytes of one chunk of the pairing-vertex build at its peak: the assembled ladder
+    window plus the ``FQ_MATMUL_FACTOR`` window copies the eagerly rebound matmuls hold next to it, together with
+    the sliced local vertex (at most one momentum's box). Every rank of a node reaches this peak at the same time,
+    so the node total is the rank count times this value, not a time average.
 
     :param chunk: Bytes of the assembled two-fermion window.
     :param per_q_box: Bytes of one momentum's full two-fermion box.
-    :param pp_ratio: Size of the pp box relative to the core box, ``(2 niv_pp / 2 niv_core)^2``.
     :return: The transient bytes.
     """
-    return max(FQ_MATMUL_FACTOR * chunk, chunk + int(2 * pp_ratio * chunk)) + min(chunk, per_q_box)
+    return (FQ_MATMUL_FACTOR + 1) * chunk + min(chunk, per_q_box)
 
 
 def _giwk_rspace(nk_tot: int, nb: int, nv: int) -> int:
@@ -310,6 +313,39 @@ def _giwk_rspace(nk_tot: int, nb: int, nv: int) -> int:
     :return: The number of complex elements.
     """
     return nk_tot * nb**2 * nv
+
+
+def jacobian_tracker_bytes(nk_tot: int, nb: int, nv: int, mixing_history_length: int) -> int:
+    """
+    Bytes the rank-0 Jacobian tracker holds at its peak, which falls on the secant step of one update: the
+    ``3 * (max(m, TRACKER_PAIRS) + 1)`` complex core-window arrays of the mixing history (iterate, raw proposal,
+    reflected proposal per entry), the complex Ritz vectors of up to three resident sets (``TRACKER_PAIRS - 1``
+    columns each: the snapshot kept for the spectrum file, a newer uncertified estimate, and the predecessor's
+    columns a carried run keeps on its own window until its spectrum is saved, which also serve as its carried
+    set while that is installed or pending), the four tall float64 arrays
+    the tracker keeps between updates (the reflector's basis and dual rows and the map's span and dual rows, each
+    ``[n_real, k]`` or its transpose with ``k <= TRACKER_PAIRS - 1``), and the transient of the secant step, nine
+    ``[n_real, TRACKER_PAIRS - 1]`` float64 arrays with ``n_real = 2 * nk_tot * nb^2 * nv``: the two increment
+    stacks, the tall QR factor together with the copies its factorization and the triangular solve make, the kept
+    basis and its image, and the complex Ritz vectors built from them, a real-to-complex promotion of the basis
+    included. The reflector and the map are rebuilt after that step, while the old four tall arrays are still
+    alive, but below its peak.
+
+    :param nk_tot: Total number of momentum points (full BZ).
+    :param nb: Number of bands.
+    :param nv: Number of fermionic frequencies (single axis length).
+    :param mixing_history_length: The accelerated-mixing history length ``m``.
+    :return: The peak in bytes.
+    """
+    core = nk_tot * nb**2 * nv
+    history = 3 * (max(mixing_history_length, TRACKER_PAIRS) + 1) * DTYPE_BYTES * core
+    # three resident Ritz sets: the snapshot kept for the spectrum file, a newer uncertified estimate and the
+    # predecessor's re-gridded columns a carried run keeps until its own spectrum is saved
+    ritz_vectors = 3 * np.dtype(np.complex128).itemsize * 2 * core * (TRACKER_PAIRS - 1)
+    # the reflector's basis and dual rows and the map's span and dual rows, alive through the secant step
+    tall = 4 * np.dtype(np.float64).itemsize * 2 * core * (TRACKER_PAIRS - 1)
+    transient = 9 * np.dtype(np.float64).itemsize * 2 * core * (TRACKER_PAIRS - 1)
+    return history + ritz_vectors + tall + transient
 
 
 def estimate_peaks(
@@ -327,6 +363,8 @@ def estimate_peaks(
     with_eliashberg: bool,
     save_pairing_vertex: bool = False,
     n_eig: int = 1,
+    with_jacobian_tracker: bool = False,
+    mixing_history_length: int = 0,
     overhead: float = OVERHEAD_FACTOR,
     chunk_budgets: ChunkBudgets = ChunkBudgets(),
 ) -> dict[str, BranchPeak]:
@@ -371,6 +409,14 @@ def estimate_peaks(
         (``config.eliashberg.save_pairing_vertex``); a single-rank peak of the ``lanczos`` branch.
     :param n_eig: Number of requested eigenpairs (``config.eliashberg.n_eig``); sets the ARPACK Lanczos basis size
         ``ncv = max(2 * n_eig + 1, 20)`` held per solving rank.
+    :param with_jacobian_tracker: Whether the Jacobian tracker runs
+        (``config.stabilization.use_jacobian_stabilization``); adds its rank-0 peak to the ``sde`` single-rank
+        slots: the (iterate, raw proposal, reflected proposal) triples of the core window kept for
+        ``max(mixing_history_length, TRACKER_PAIRS) + 1`` entries, the resident Ritz sets, the reflector rows and
+        the map's span and dual rows, and the float64 secant transient (the increments, the kept basis and its
+        image, ``TRACKER_PAIRS - 1`` columns each).
+    :param mixing_history_length: The accelerated-mixing history length
+        (``config.self_consistency.mixing_history_length``).
     :param overhead: Global multiplicative factor accounting for un-modeled transient arrays.
     :param chunk_budgets: Chunk byte budgets of the three chunked builds (see :class:`ChunkBudgets` and
         :func:`max_chunk_budget`); each modeled chunk is clamped to at least one slice of its build (a ``(q, w)``
@@ -461,6 +507,8 @@ def estimate_peaks(
     # rank-0 single: the sigma finalize buffers, or the occupation/energy step's DMFT-box sigma + giwk pair
     # (its concatenation and Dyson-build transients are broadcast-assigned and v-chunked, so only the pair counts)
     sde_single = scale * max(2 * _giwk_rspace(nk_tot, nb, vc), 2 * _giwk_rspace(nk_tot, nb, 2 * niv_dmft))
+    if with_jacobian_tracker:
+        sde_single += overhead * jacobian_tracker_bytes(nk_tot, nb, vc, mixing_history_length)
     peaks["sde"] = BranchPeak(
         baseline=baseline_sde + rank_base,
         giwk_shareable=2 * giwk_sde,
@@ -472,11 +520,11 @@ def estimate_peaks(
 
     if with_eliashberg:
         # Slice-direct pairing-vertex build: pp accumulator + three loaded one-fermion inputs + the chunk transient
-        # (matmul pair, sliced local vertex, pp cuts) at the driver-sized budget, slice/block clamped.
+        # (window + matmul copies + sliced local vertex) at the driver-sized budget, slice/block clamped.
         fq_chunk = min(max(chunk_budgets.fq, one_slice), rank_block)
         fq_distributed = scale * (
             _two_fermion_block(qi, nb, 1, vpp) + 3 * _bubble_block(qi, nb, wp, vc)
-        ) + overhead * _fq_transient(fq_chunk, per_q_box, (vpp / vc) ** 2)
+        ) + overhead * _fq_transient(fq_chunk, per_q_box)
         peaks["fq"] = BranchPeak(
             baseline=rank_base,
             giwk_shareable=0.0,

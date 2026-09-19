@@ -641,6 +641,8 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         with_eliashberg=config.eliashberg.perform_eliashberg,
         save_pairing_vertex=config.eliashberg.save_pairing_vertex,
         n_eig=config.eliashberg.n_eig,
+        with_jacobian_tracker=config.stabilization.use_jacobian_stabilization,
+        mixing_history_length=config.self_consistency.mixing_history_length,
     )
 
     def node_total(bp: memory_estimator.BranchPeak, distributed: float, single: float, n_ranks: int) -> float:
@@ -767,7 +769,9 @@ def _resolve_option_exclusivity() -> None:
     ``use_chi_phys_restriction`` and the lambda-annealing scaffold - all modify the physical susceptibility and cannot run
     together (a sum-rule calibration must not see a floored or mass-shifted chi, and the two scaffolds would fight).
     Precedence: lambda correction > use_chi_phys_restriction > lambda annealing. Conflicting options are disabled
-    with a warning.
+    with a warning. Separately, ``use_jacobian_stabilization`` cannot run with the one-shot
+    ``perform_lambda_correction`` (a single iteration has no history) and is disabled with a warning if both are
+    enabled.
 
     :return: None.
     """
@@ -787,6 +791,9 @@ def _resolve_option_exclusivity() -> None:
                 f"'{name}' was enabled together with {kept} - these are mutually exclusive. Keeping {kept} and "
                 f"disabling '{name}'."
             )
+
+    if config.lambda_correction.perform_lambda_correction and config.stabilization.use_jacobian_stabilization:
+        disable_option("use_jacobian_stabilization", "the one-shot lambda correction")
 
     if config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction:
         disable_option("use_chi_phys_restriction", "the lambda correction")
