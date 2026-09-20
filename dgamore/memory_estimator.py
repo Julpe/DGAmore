@@ -67,6 +67,20 @@ LANCZOS_VERTEX_FACTOR: int = 2
 # Gap-sized matvec temporaries beyond the ARPACK basis (chi0*gap, its flipped copy, the output) in both variants.
 ARPACK_EXTRA_VECTORS: int = 3
 
+# Smallest Lanczos basis handed to the eigensolver (scipy's own floor is 20): ncv = max(2 n_eig + 1, this floor).
+LANCZOS_NCV_FLOOR: int = 12
+
+# Gap-sized scratch windows of one team matvec (the gap, its dressed transform, the direct and the crossed term).
+TEAM_SCRATCH_VECTORS: int = 4
+
+# Gap-sized temporaries of one team beyond its basis and eigenvectors, summed over the team's ranks: the four-block
+# peak of the sector projection plus the Krylov iteration's input copy (measured 4.5 gap vectors).
+TEAM_MATVEC_TRANSIENT_VECTORS: int = 5
+
+# Bytes of one column block a node rank expands, transforms and writes at a time while the team solve builds a
+# channel's full-BZ vertex window from the node-shared irreducible source.
+TEAM_BUILD_CHUNK_BYTES: int = 64 * 1024**2
+
 # Local SDE dominant transient: the chi-tilde shell chain at niv_full (extended inverted bubble carrying the +U, its
 # dense compound inversion output, LAPACK workspace) - ~3 niv_full two-fermion blocks beyond the persistent outputs.
 LOCAL_SHELL_INVERT_FACTOR: int = 3
@@ -164,6 +178,17 @@ def solver_grid_shape(n_ranks: int, n_freq: int) -> tuple[int, int]:
     return rows, cols
 
 
+def lanczos_ncv(n_eig: int) -> int:
+    """
+    Returns the Lanczos basis size ``ncv`` for ``n_eig`` requested eigenpairs, ``max(2 n_eig + 1, LANCZOS_NCV_FLOOR)``
+    (the solver caps it to the problem size).
+
+    :param n_eig: Number of requested eigenpairs.
+    :return: The basis size.
+    """
+    return max(2 * n_eig + 1, LANCZOS_NCV_FLOOR)
+
+
 def lanczos_solver_bytes(
     n_bands: int, nk_tot: int, nk_irr: int, niv_pp: int, n_eig: int, n_ranks: int, overhead: float = OVERHEAD_FACTOR
 ) -> tuple[float, float]:
@@ -171,8 +196,8 @@ def lanczos_solver_bytes(
     Per-rank host-memory residency of the two Eliashberg solver variants, in bytes: the in-memory solve (one full-BZ
     sector residency - the matmul-layout vertex and its build copy, the pp bubble and the ARPACK Lanczos basis) and
     the block-distributed grid solve (this rank's vertex block plus the bubble transient, basis and gather buffer).
-    The single shared formula that both :func:`estimate_peaks` and the solver dispatch consume, so the two can never
-    drift apart.
+    The single shared formula that both :func:`estimate_peaks` and the single-rank solve consume, so the two can
+    never drift apart; a multi-rank job's team solve is planned per node from :func:`lanczos_team_bytes` instead.
 
     :param n_bands: Number of bands :math:`B`.
     :param nk_tot: Total number of momentum points (full BZ).
@@ -187,7 +212,7 @@ def lanczos_solver_bytes(
     vpp = 2 * niv_pp
     vertex_pp_full = _two_fermion_block(nk_tot, n_bands, 1, vpp)
     chi0_pp_full = _bubble_block(nk_tot, n_bands, 1, vpp)
-    ncv = max(2 * n_eig + 1, 20)
+    ncv = lanczos_ncv(n_eig)
     arpack_ws = (ncv + ARPACK_EXTRA_VECTORS) * _giwk_rspace(nk_tot, n_bands, vpp)
     per_sector = LANCZOS_VERTEX_FACTOR * vertex_pp_full + chi0_pp_full + arpack_ws
     if n_ranks == 1:
@@ -200,6 +225,77 @@ def lanczos_solver_bytes(
         + 2 * _giwk_rspace(nk_tot, n_bands, vpp)
     )
     return scale * per_sector, scale * grid_share
+
+
+def team_build_columns(nk_tot: int, n_bands: int, npp: int) -> int:
+    r"""
+    Returns the number of vertex columns one node rank expands, transforms and writes at a time while the team solve
+    builds a channel's vertex window: as many as fit :data:`TEAM_BUILD_CHUNK_BYTES` per full-BZ column, at least one.
+
+    :param nk_tot: Total number of momentum points (full BZ).
+    :param n_bands: Number of bands :math:`B`.
+    :param npp: Number of columns of one fermionic row of the pp vertex (``2 niv_pp``).
+    :return: The number of columns per block.
+    """
+    return max(1, min(npp, TEAM_BUILD_CHUNK_BYTES // max(1, nk_tot * n_bands**4 * DTYPE_BYTES)))
+
+
+def lanczos_team_bytes(
+    n_bands: int,
+    nk_tot: int,
+    nk_irr: int,
+    niv_pp: int,
+    n_eig: int,
+    n_channels: int,
+    n_sectors: int,
+    n_node_ranks: int,
+    nk_window: int | None = None,
+    overhead: float = OVERHEAD_FACTOR,
+) -> float:
+    r"""
+    Node-peak host memory of the team solve of the Eliashberg equation, in bytes, with ``n_channels`` pairing
+    vertices resident in node-shared windows of ``nk_window`` momentum points each (the full BZ, or the star
+    representatives of the real-space grid) and ``n_sectors`` (channel x parity) sectors solved on the node: the
+    windows, the node-shared irreducible-BZ source of the last window next to either the node root's private
+    gathered copy of it or the column blocks the node's ranks expand at once (one block of
+    :func:`team_build_columns` full-BZ columns per rank, counted twice for the expansion temporary, at most twice
+    the full-BZ vertex), the node-shared pp bubble, and per sector the Krylov basis (``ncv`` gap vectors,
+    split over the team), the scratch windows of the team matvec, the lead's assembled eigenvectors with their one
+    reordering or symmetrization copy (``2 n_eig``) and the block-sized temporaries. Read by the team planner to
+    decide whether a node may hold both channels at once, one at a time, or none.
+
+    :param n_bands: Number of bands :math:`B`.
+    :param nk_tot: Total number of momentum points (full BZ).
+    :param nk_irr: Number of momentum points in the irreducible BZ.
+    :param niv_pp: Number of positive fermionic frequencies of the pp (Eliashberg) box.
+    :param n_eig: Number of requested eigenpairs (sets the ARPACK basis size).
+    :param n_channels: Number of pairing vertices resident on the node at once (1 or 2).
+    :param n_sectors: Number of sectors solved on the node while those vertices are resident.
+    :param n_node_ranks: Number of MPI ranks on the node (each expands one column block at a time).
+    :param nk_window: Number of momentum points each resident window holds; ``None`` means the full BZ.
+    :param overhead: Safety factor multiplied onto the raw byte counts.
+    :return: The node-peak bytes.
+    """
+    vpp = 2 * niv_pp
+    ncv = lanczos_ncv(n_eig)
+    per_sector = (ncv + TEAM_SCRATCH_VECTORS + 2 * n_eig + TEAM_MATVEC_TRANSIENT_VECTORS) * _giwk_rspace(
+        nk_tot, n_bands, vpp
+    )
+    vertex_full = _two_fermion_block(nk_tot, n_bands, 1, vpp)
+    vertex_irr = _two_fermion_block(nk_irr, n_bands, 1, vpp)
+    block = nk_tot * n_bands**4 * team_build_columns(nk_tot, n_bands, vpp)
+    build = min(2 * vertex_full, 2 * n_node_ranks * block)
+    return (
+        DTYPE_BYTES
+        * overhead
+        * (
+            n_channels * _two_fermion_block(nk_tot if nk_window is None else nk_window, n_bands, 1, vpp)
+            + vertex_irr
+            + max(vertex_irr, build)
+            + _bubble_block(nk_tot, n_bands, 1, vpp)
+            + n_sectors * per_sector
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -370,7 +466,7 @@ def estimate_peaks(
     :param save_pairing_vertex: Whether both pp pairing vertices are gathered on one rank for saving
         (``config.eliashberg.save_pairing_vertex``); a single-rank peak of the ``lanczos`` branch.
     :param n_eig: Number of requested eigenpairs (``config.eliashberg.n_eig``); sets the ARPACK Lanczos basis size
-        ``ncv = max(2 * n_eig + 1, 20)`` held per solving rank.
+        ``ncv`` of :func:`lanczos_ncv` held per solving rank.
     :param overhead: Global multiplicative factor accounting for un-modeled transient arrays.
     :param chunk_budgets: Chunk byte budgets of the three chunked builds (see :class:`ChunkBudgets` and
         :func:`max_chunk_budget`); each modeled chunk is clamped to at least one slice of its build (a ``(q, w)``

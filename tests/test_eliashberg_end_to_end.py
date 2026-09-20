@@ -138,7 +138,7 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeyp
     def capture_solver(gamma_r_pp, gchi0_q0_pp, ranks, parities=None):
         dense_holder = []
 
-        def fake_eigsh(op, k, tol, v0, which, maxiter):
+        def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
             n = op.shape[0]
             dense_holder.append(np.column_stack([op.matvec(np.eye(n, dtype=np.complex64)[:, i]) for i in range(n)]))
             lam, vec = np.linalg.eig(dense_holder[0])
