@@ -853,6 +853,36 @@ def _g_action_on_kgrid(g, nk):
     return _translate_kgrid(idx, tuple(g.q), nk)
 
 
+def point_group_orbits(group, nk: tuple) -> tuple[np.ndarray, np.ndarray]:
+    r"""
+    Collapses the grid into the orbits of the point-like part of a closed symmetry group: the unitary elements whose
+    action on the axes with more than one point is a signed permutation without translation, i.e. the elements that
+    act on the real-space grid exactly as on the momentum grid. Returns, per flat grid index, the smallest flat index
+    of its orbit and the orbital unitary of the element carrying that representative onto the index, so that
+    :math:`T(\mathbf{k}) = U_{\mathbf{k}} T(\mathbf{k}_{\mathrm{rep}}) U^\dagger_{\mathbf{k}}` for a two-index tensor
+    (four-index tensors transform with the same unitary on every leg pair).
+
+    :param group: The closed symmetry group (iterable of group elements).
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+    :return: ``(rep, us)`` of shapes ``(nktot,)`` and ``(nktot, nb, nb)``.
+    """
+    active = [axis for axis in range(3) if nk[axis] > 1]
+
+    def point_like(g) -> bool:
+        m = g.M[np.ix_(active, active)]
+        signed_permutation = np.array_equal(m.T @ m, np.eye(len(active), dtype=np.int64))
+        return not g.conj and signed_permutation and all(int(g.q[axis]) % nk[axis] == 0 for axis in active)
+
+    elements = [g for g in group if point_like(g)]
+    idx_maps = np.stack([_g_action_on_kgrid(g, nk) for g in elements])
+    # the identity first, so a representative is carried onto itself by the identity rather than by a stabilizer
+    first = np.argsort([not np.array_equal(m, np.arange(len(m))) for m in idx_maps], kind="stable")
+    elements, idx_maps = [elements[j] for j in first], idx_maps[first]
+    carriers = [_inverse(g, nk).U for g in elements]
+    us = np.asarray(carriers)[idx_maps.argmin(axis=0)]
+    return idx_maps.min(axis=0), us
+
+
 def _orbit_collapse(H, group):
     """
     Collapses the k-grid into symmetry orbits under the closed group, choosing the smallest flat index as each

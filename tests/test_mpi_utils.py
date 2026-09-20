@@ -1115,6 +1115,41 @@ def test_isend_rows_rejects_non_contiguous():
         mu._isend_rows(comm1(), arr, dest=0)
 
 
+def test_allocate_node_shared_array_single_rank_returns_private_array():
+    """A single-rank (or absent) communicator gets a private array of the requested shape and dtype and no window."""
+    arr, win = mu.allocate_node_shared_array(None, (2, 3), np.complex128)
+    assert arr.shape == (2, 3) and arr.dtype == np.complex128 and win is None
+
+    def fn(comm, rank):
+        arr, win = mu.allocate_node_shared_array(comm.Split_type(MPI.COMM_TYPE_SHARED), (4,), np.complex64)
+        return arr.shape, arr.dtype, win
+
+    _, res = run_parallel(1, fn)
+    assert res[0] == ((4,), np.dtype(np.complex64), None)
+
+
+def test_allocate_node_shared_array_exposes_one_buffer_to_every_node_rank():
+    """What the node root writes into the allocated window is what every other rank of the node reads back."""
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+        arr, win = mu.allocate_node_shared_array(node_comm, (2, 3), np.complex64)
+        if node_comm.Get_rank() == 0:
+            arr[...] = np.arange(6, dtype=np.complex64).reshape(2, 3) + 1j
+        node_comm.Barrier()
+        seen = np.array(arr)
+        node_comm.Barrier()
+        if win is not None:
+            win.Free()
+        node_comm.Free()
+        return seen, win is not None
+
+    _, res = run_parallel(3, fn, hostnames=["h", "h", "h"])
+    expected = np.arange(6, dtype=np.complex64).reshape(2, 3) + 1j
+    assert all(np.array_equal(seen, expected) for seen, _ in res)
+    assert all(shared for _, shared in res)
+
+
 def test_build_node_shared_array_single_rank_returns_private_array():
     """A single-rank node short-circuits to a private array (no window) and still computes once."""
     calls = []
@@ -1159,6 +1194,23 @@ def test_build_node_shared_array_computes_once_and_shares_within_node():
     for seen, has_win in res:
         assert has_win
         assert np.array_equal(seen, np.full((2, 3), 7.0, dtype=np.complex64))
+
+
+def test_build_node_shared_array_takes_the_dtype_of_the_root_array():
+    """Without an explicit dtype the window is allocated in the dtype the root computed, on every node rank."""
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+        arr, win = mu.build_node_shared_array(node_comm, lambda: np.full((2, 2), 1 + 1j, dtype=np.complex128))
+        seen = np.array(arr)
+        node_comm.Barrier()
+        win.Free()
+        node_comm.Free()
+        return seen
+
+    _, res = run_parallel(3, fn, hostnames=["h", "h", "h"])
+    for seen in res:
+        assert seen.dtype == np.complex128 and np.array_equal(seen, np.full((2, 2), 1 + 1j))
 
 
 def test_build_node_shared_array_isolates_between_nodes():

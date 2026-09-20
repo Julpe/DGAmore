@@ -412,6 +412,7 @@ class KGrid:
         self._auto_us = None  # shape (nx, ny, nz, nb, nb), complex
         self._auto_sigmas = None  # shape (nx, ny, nz), float (+/-1)
         self._auto_conjs = None  # shape (nx, ny, nz), bool
+        self._auto_group = None  # the closed group of discovered operations
 
         self.nk = nk
         self.set_k_axes()
@@ -507,6 +508,7 @@ class KGrid:
         self._auto_us = res["Us"]
         self._auto_sigmas = res["sigmas"]
         self._auto_conjs = res["conjs"]
+        self._auto_group = res["group"]
 
         # fbz2sym is kept as built by the trivial set_fbz2irrk path on the auto sentinel; it is not consumed by
         # _map_to_full_bz in auto mode and remains for backwards compatibility only.

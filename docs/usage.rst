@@ -85,29 +85,36 @@ folder, whose name encodes run-specific parameters such as the momentum-grid siz
 :doc:`output` page lists every file such a run produces and the array layout of each stored quantity.
 
 .. note::
-   During the in-memory Eliashberg solve, the singlet and triplet channels (and, with
-   ``resolve_frequency_parity``, their frequency-even and frequency-odd sectors) each get their own rank, so up to
-   four solves run concurrently. How many actually run at once on a given node depends on its free host memory:
-   the solver packs as many sector solves per node as fit, each solving rank holding one full pairing vertex, so a
-   node with enough headroom runs all four while a memory-tight node runs fewer and does the rest sequentially.
-   Spreading the ranks over several nodes therefore gives the most concurrency. Since only a handful of ranks
-   compute while the rest wait, DGAmore also threads the solver ranks' matrix-vector products for exactly this
-   phase, using as many threads as each rank's CPU affinity mask allows. The results are bit-identical to the
-   single-threaded ones, and ``OMP_NUM_THREADS=1`` stays correct for the rest of the run. The threading only helps
-   if the launcher leaves the affinity mask wider than one core - with a strict one-core-per-rank binding it is a
-   no-op. On Eliashberg-heavy runs, prefer a binding that lets the solver ranks spread (e.g.
-   ``srun --cpu-bind=sockets`` or ``mpirun --bind-to socket``/``--bind-to none``). When one sector's full-BZ pairing
-   vertex does not fit on a single rank, the solver instead distributes it over a two-dimensional frequency-block
-   grid spanning all ranks: the sectors then run sequentially on the whole grid, every rank holds and contracts one
-   vertex block, and the eigensolver iterates in lockstep with one block-sized reduction and one gap-sized gather
-   per iteration.
+   The in-memory Eliashberg solve spreads the (channel, parity) sectors as evenly as possible over the nodes: one
+   node hosts all of them, two nodes one channel each, four nodes one sector each (with ``resolve_frequency_parity``
+   there are four sectors; nodes beyond that idle through the solve). Each channel's pairing vertex is built into
+   an MPI shared-memory window on every node that hosts one of its sectors, by all of that node's ranks in column
+   blocks; on a symmetry-reduced grid only the irreducible wedge of the real-space grid is kept (the vertex at every
+   other point follows from a point-group operation), and each matrix-vector product then contracts one star of
+   symmetry-related points at a time. The node's ranks are split into one team per sector hosted there, and the
+   team runs the whole eigensolver together: a restarted Krylov-Schur iteration whose basis vectors are split over
+   the team's ranks by fermionic frequency, so every rank handles its block of momenta in the vertex contractions
+   and its block of frequencies in the sector projections, the bubble multiply, the Fourier transforms and the
+   orthogonalizations. The eigenvalues agree with a single-rank solve to the solver tolerance (the matrix-vector
+   product is bit-identical on a symmetry-free grid and equal to rounding on a reduced one), so ``OMP_NUM_THREADS=1``
+   with one rank per core is the right binding here as everywhere else. When a node cannot hold its share of vertex
+   windows at once, the channels are solved one after the other, each spread over the nodes the same way. On a
+   single-rank run the sectors are solved in turn on that rank with scipy's eigensolver, with the matrix-vector
+   products threaded over the rank's CPU affinity mask. In both in-memory solves, for one band with a frequency-even
+   pp bubble the crossed term of a projected sector is formed from the direct one, which halves the vertex
+   contractions. When no node
+   holds even one channel's window, the solver instead distributes the vertex over a two-dimensional
+   frequency-block grid spanning all ranks: the sectors then run sequentially on the whole grid, every rank holds
+   and contracts one vertex block, and the eigensolver iterates in lockstep with one block-sized reduction and one
+   gap-sized gather per iteration.
 
 Memory is managed automatically: every heavy step runs a single chunk-bounded or distributed algorithm, and before
 the heavy part of a run begins, DGAmore verifies from the memory available on every node together with an analytic
 estimate of each step's peak (as a node total over all ranks placed there) that the run fits, and sizes the chunks
 of the auxiliary-susceptibility build, the self-energy passes and the pairing-vertex build from the memory that
-estimate leaves free on the tightest node - the one runtime choice left is the Eliashberg solver's automatic
-fallback from its in-memory solve to the block-distributed grid.
+estimate leaves free on the tightest node - the runtime choices left are the Eliashberg solver's automatic
+fallback from its in-memory solve to the block-distributed grid and whether a node holds every vertex window of
+its sectors at once or one channel at a time.
 Replicated full-grid objects are always deduplicated into one shared-memory window per node. There are no memory
 switches in the configuration file; if some step does not fit, the run stops upfront with a :class:`MemoryError`
 recommending more nodes, fewer ranks per node, or a smaller box.

@@ -181,7 +181,7 @@ class IHaveMat(ABC):
         """
         return self.mat.nbytes / (1024**3)
 
-    def copy(self) -> "IHaveMat":
+    def copy(self):
         """
         Returns an independent deep copy of the object -- a thin wrapper around :func:`copy.deepcopy` used in place of
         a bare ``deepcopy(obj)`` throughout the package. Mutating the returned object (including its ``mat``) does not
@@ -191,7 +191,7 @@ class IHaveMat(ABC):
         """
         return deepcopy(self)
 
-    def __mul__(self, other) -> "IHaveMat":
+    def __mul__(self, other):
         """
         Multiplies the object by a scalar number, returning a new (deep-copied) object.
 
@@ -206,7 +206,7 @@ class IHaveMat(ABC):
         copy.mat *= other
         return copy
 
-    def __rmul__(self, other) -> "IHaveMat":
+    def __rmul__(self, other):
         """
         Reflected scalar multiplication ``other * self``; see :meth:`__mul__`.
 
@@ -215,7 +215,7 @@ class IHaveMat(ABC):
         """
         return self.__mul__(other)
 
-    def __neg__(self) -> "IHaveMat":
+    def __neg__(self):
         """
         Negates the matrix (``-self``); see :meth:`__mul__`.
 
@@ -223,7 +223,7 @@ class IHaveMat(ABC):
         """
         return self.__mul__(-1.0)
 
-    def __truediv__(self, other) -> "IHaveMat":
+    def __truediv__(self, other):
         """
         Divides the object by a scalar number; see :meth:`__mul__`.
 
@@ -235,7 +235,7 @@ class IHaveMat(ABC):
             raise ValueError("Division only supported with numbers.")
         return self.__mul__(1.0 / other)
 
-    def scale(self, factor, copy: bool = False) -> "IHaveMat":
+    def scale(self, factor, copy: bool = False):
         """
         Multiplies the matrix by a scalar. The in-place branch (``copy=False``, the default here) mutates and
         returns ``self`` without allocating a copy -- the memory-lean counterpart of the non-destructive
