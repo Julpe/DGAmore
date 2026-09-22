@@ -84,7 +84,7 @@ The rung at :math:`\beta = 20`, ``dga_config_beta20.yaml``:
      symmetries: "auto"
      type: "from_wannier90"
      hr_input: "/data/wannier_hr.dat"
-     interaction_type: "one_band_from_dmft"
+     interaction_type: "from_dmft"
      interaction_input: ""
      nk: [ 64, 64, 1 ]
 
@@ -151,7 +151,7 @@ The rung at :math:`\beta = 25`, ``dga_config_beta25.yaml``, differs in exactly t
      symmetries: "auto"
      type: "from_wannier90"
      hr_input: "/data/wannier_hr.dat"
-     interaction_type: "one_band_from_dmft"
+     interaction_type: "from_dmft"
      interaction_input: ""
      nk: [ 64, 64, 1 ]
 

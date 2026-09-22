@@ -101,7 +101,7 @@ def create_default_config(config, folder: str):
     config.lattice.nk = (4, 4, 1)
     config.lattice.k_grid = bz.KGrid(config.lattice.nk, symmetries=bz.two_dimensional_square_symmetries())
     config.lattice.type = "from_wannierHK"
-    config.lattice.interaction_type = "kanamori_from_dmft"
+    config.lattice.interaction_type = "from_dmft"
     config.lattice.er_input = f"{folder}/wannier.hk"
     config.dmft.input_path = folder
     config.dmft.n_ineq = 1

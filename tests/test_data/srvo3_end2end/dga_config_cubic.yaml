@@ -7,12 +7,10 @@ lattice:
   symmetries: "three_dimensional_cubic" # Specify lattice symmetry group. For availability, check out the file 'brillouin_zone.py'
   type: "from_wannierHK" # Specifies the hopping elements, either from a wannier90 file 'from_wannier90', from a hk file 'from_wannierHK' or from tight-binding parameters 't_tp_tpp'
   hr_input: "/home/julpe/Documents/repos/DGAmore/tests/test_data/srvo3_end2end/wan_4x4.hk" # full path to the wannier_hr.dat/wannier.hk file or list of tight-binding parameters [t, tp, tpp] (only for single-orbital)
-  interaction_type: "kanamori_from_dmft" # Type of interaction. Available: ['one_band_from_dmft', 'kanamori_from_dmft', 'custom'].
-  # If 'one_band_from_dmft' or if interaction_type is left empty, we use the single-band interaction from DMFT. If 'kanamori_from_dmft', the interaction is parsed from the DMFT
-  # calculation. If 'custom', please specify the full path to a file in 'interaction_input' containing orbital and spacial entries for the interaction matrix
-  # (similar to how a wannier_hr.dat file is structured, but with 4 orbital indices).
-  interaction_input: [ 1, 0, 0, 0 ] # Full path to the interaction file or list of interaction parameters [n_bands, U, J, U'] (U' is optional; if left empty, U' is set to U-2J)
-  # this parameter will only be used if interaction_type is either 'kanamori' or 'custom'
+  interaction_type: "from_dmft" # Type of interaction. Available: ['from_dmft', 'custom'].
+  # 'from_dmft' reads U, J and V from the DMFT calculation per inequivalent atom and gives each atom its own Kanamori block; one band reduces to the plain
+  # Hubbard U. 'custom' reads the file named in 'interaction_input', a wannier_hr.dat layout with 4 orbital indices. Anything else means 'from_dmft'.
+  interaction_input: "" # Full path to the interaction file if interaction_type is 'custom', otherwise the interaction data will be taken from DMFT
   orbital_basis: "t2g"
   nk: [ 4,4,4 ] # Number of k-points in x, y and z-direction. Default: [ 16, 16, 1 ]
 

@@ -63,10 +63,6 @@ def load_from_dmft_file_and_update_config() -> (
 
     config.sys.beta = dmft_interface.get_beta()
 
-    config.lattice.interaction.udd = dmft_interface.get_udd()
-    config.lattice.interaction.jdd = dmft_interface.get_jdd()
-    config.lattice.interaction.vdd = dmft_interface.get_vdd()
-
     config.sys.mu = dmft_interface.get_mu()
     config.sys.mu_dmft = config.sys.mu
     config.sys.n = dmft_interface.get_totdens()
@@ -75,6 +71,9 @@ def load_from_dmft_file_and_update_config() -> (
     for ineq in range(1, config.dmft.n_ineq + 1):
         config.dmft.n_bands_per_ineq.append(dmft_interface.get_nd(ineq))
         config.sys.occ_dmft_per_ineq.append(dmft_interface.get_occ(ineq))
+        config.lattice.interaction.udd_per_ineq.append(dmft_interface.get_udd(ineq))
+        config.lattice.interaction.jdd_per_ineq.append(dmft_interface.get_jdd(ineq))
+        config.lattice.interaction.vdd_per_ineq.append(dmft_interface.get_vdd(ineq))
 
         g2_dens = dmft_interface.get_g2iw(SpinChannel.DENS, ineq)
         g2_dens_per_ineq.append(g2_dens)
@@ -193,18 +192,20 @@ def set_hamiltonian(er_type: str, er_input: str | list, int_type: str, int_input
     The kinetic part can be set in two ways: \n
     1. By providing the single-band hopping parameters t, tp, tpp. \n
     2. By providing the path + filename to the wannier_hr / wannier_hk file. \n
-    The interaction can be set in three ways: \n
-    1. By retrieving the data from the DMFT files. \n
-    2. By providing the Kanamori interaction parameters [n_bands, U, J, (V)]. \n
-    3. By providing the full path + filename to the U-matrix file. \n
+    The interaction can be set in two ways: \n
+    1. By retrieving U, J and V from the DMFT files, once per inequivalent atom. Each atom gets its own Kanamori
+    block on its own orbitals, with no interaction between the blocks; a single band leaves J and V without an
+    orbital pair, so that block reduces to the plain Hubbard U. This is what any interaction type other than the
+    U-matrix one falls back to. \n
+    2. By providing the full path + filename to the U-matrix file. \n
 
     :param er_type: The kinetic-input type (``"t_tp_tpp"``, ``"from_wannier90"`` or ``"from_wannierhk"``).
     :param er_input: The kinetic input: the ``[t, tp, tpp]`` list, or a path to the hopping file.
-    :param int_type: The interaction type (``"one_band_from_dmft"``, ``"kanamori_from_dmft"`` or ``"custom"``).
+    :param int_type: The interaction type: ``"custom"``, or ``"from_dmft"`` for anything else.
     :param int_input: The interaction input (path to the U-matrix file for the ``"custom"`` type).
     :return: The constructed :class:`Hamiltonian` with kinetic and interaction terms.
     :raises ValueError: If a kinetic/interaction input has the wrong type.
-    :raises NotImplementedError: If the kinetic or interaction type is unsupported.
+    :raises NotImplementedError: If the kinetic type is unsupported.
     """
     ham = Hamiltonian()
     if er_type.lower() == "t_tp_tpp":
@@ -228,18 +229,22 @@ def set_hamiltonian(er_type: str, er_input: str | list, int_type: str, int_input
     else:
         raise NotImplementedError(f"Hamiltonian type {er_type} not supported.")
 
-    if int_type.lower() == "one_band_from_dmft" or int_type == "" or int_type is None:
-        return ham.single_band_interaction(config.lattice.interaction.udd)
-    elif int_type.lower() == "kanamori_from_dmft":
-        return ham.kanamori_interaction_d(
-            config.sys.n_bands,
-            config.lattice.interaction.udd,
-            config.lattice.interaction.jdd,
-            config.lattice.interaction.vdd,
-        )
-    elif int_type.lower() == "custom":
+    if int_type and int_type.lower() == "custom":
         if not isinstance(int_input, str):
             raise ValueError("Invalid input for umatrix file.")
         return ham.read_umatrix(int_input)
-    else:
-        raise NotImplementedError(f"Interaction type {int_type} not supported.")
+
+    if int_type and int_type.lower() != "from_dmft":
+        config.logger.warning(f"Interaction type {int_type} not recognized. Falling back to 'from_dmft'.")
+
+    interaction = config.lattice.interaction
+    blocks = [
+        (
+            config.dmft.n_bands_per_ineq[ineq - 1],
+            interaction.udd_per_ineq[ineq - 1],
+            interaction.jdd_per_ineq[ineq - 1],
+            interaction.vdd_per_ineq[ineq - 1],
+        )
+        for ineq in config.dmft.ineq_ordering
+    ]
+    return ham.kanamori_interaction_per_atom(blocks)

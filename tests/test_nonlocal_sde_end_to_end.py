@@ -40,7 +40,7 @@ def setup_srvo3_cubic(monkeypatch):
         c.lattice.k_grid = bz.KGrid(c.lattice.nk, [KnownSymmetries.AUTO])
         c.lattice.symmetries = [KnownSymmetries.AUTO]
         c.lattice.type = "from_wannier90"
-        c.lattice.interaction_type = "kanamori_from_dmft"
+        c.lattice.interaction_type = "from_dmft"
         c.lattice.er_input = f"{f}/wan_hr.dat"
         c.dmft.input_path = f
         c.dmft.symmetrize_orbitals = [1, 2, 3]

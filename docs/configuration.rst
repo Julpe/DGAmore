@@ -44,7 +44,7 @@ The next section describes the Hamiltonian and the lattice symmetries of the sys
      symmetries: "auto"                     # str | list[str]
      type: "from_wannier90"                 # str
      hr_input: "/path/to/file"              # str | list[float]
-     interaction_type: "one_band_from_dmft" # str
+     interaction_type: "from_dmft"          # str
      interaction_input: ""                  # str
      nk: [ 16, 16, 1 ]                      # list[int]
 
@@ -69,12 +69,16 @@ whereas ``from_wannierHK`` expects a file giving the Hamiltonian directly in mom
 nearest, next-nearest and third-nearest neighbor hoppings from ``hr_input``, for example ``[1.0, -0.25, 0.12]``.
 
 Because DGAmore supports multi-orbital calculations with non-local interactions, an interaction type and input must
-be specified as well. With ``one_band_from_dmft`` a single-band calculation is assumed and the local interaction
-strength is read from the DMFT input, while ``kanamori_from_dmft`` takes the interaction values from DMFT and builds
-the Kanamori interaction tensor; in both cases ``interaction_input`` is ignored. Choosing ``custom`` instead lets
-the code read the interaction from the file referenced in ``interaction_input``, which is structured like a
-real-space Hamiltonian file but with four orbital indices instead of two and may also encode non-local
-interactions.
+be specified as well. With ``from_dmft`` the interaction values are read from the DMFT input once per inequivalent
+atom, and every atom gets its own Kanamori block on its own orbitals: the intra-orbital Hubbard :math:`U` on every
+orbital, the inter-orbital density-density :math:`V` and Hund's :math:`J` on the orbital pairs of that atom, which
+a single band does not have, so there the block reduces to the plain Hubbard :math:`U`. Orbitals of different atoms
+are left uncoupled, since what connects them is the non-local :math:`V^{\mathbf{q}}` and not the local tensor. The
+``interaction_input`` field is ignored. Choosing ``custom`` instead
+reads the interaction from the file referenced in ``interaction_input``, which is structured like a real-space
+Hamiltonian file but with four orbital indices instead of two and may also encode non-local interactions.
+``custom`` is the only value that selects the file; anything else, empty or misspelled entries included, falls back
+to ``from_dmft`` with a warning in the log.
 
 The custom interaction file follows the layout of a ``wannier_hr.dat`` file without its leading comment line (no
 comments or empty lines anywhere): the first line gives the number of orbitals, the second the number of lattice
