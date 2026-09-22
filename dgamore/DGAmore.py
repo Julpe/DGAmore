@@ -273,8 +273,8 @@ def run_dga_routine(comm: MPI.Comm) -> None:
                 )
                 obj_full.update_original_shape()
                 if isinstance(obj_full, SelfEnergy):
-                    obj_full._smom0 = np.zeros((config.sys.n_bands,) * 2)
-                    obj_full._smom1 = np.zeros((config.sys.n_bands,) * 2)
+                    obj_full._smom0 = np.zeros((config.sys.n_bands,) * 2, dtype=obj_ineq._smom0.dtype)
+                    obj_full._smom1 = np.zeros((config.sys.n_bands,) * 2, dtype=obj_ineq._smom1.dtype)
             obj_full[0, 0, 0, sl, sl, :] = obj_ineq.mat
             return obj_full
 
