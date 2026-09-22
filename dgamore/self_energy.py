@@ -90,8 +90,8 @@ class SelfEnergy(TwoPoint):
     def fit_smom(self):
         r"""
         Fits the first two high-frequency moments of the (k-averaged) self-energy from the highest stored Matsubara
-        frequencies: the constant Hartree shift :math:`\Sigma_\infty` (real part) and the :math:`1/\imath\nu`
-        coefficient :math:`\Sigma_1` (from the imaginary part). At least four frequencies are used for the fit.
+        frequencies: the constant Hartree shift :math:`\Sigma_\infty` and the :math:`1/\imath\nu` coefficient
+        :math:`\Sigma_1`, see :meth:`_hermitian_moments`. At least four frequencies are used for the fit.
 
         :return: The tuple ``(mom0, mom1)`` of moments, each of shape ``[o1, o2]``.
         """
@@ -104,9 +104,30 @@ class SelfEnergy(TwoPoint):
         iwfit = iv[self.niv - n_freq_fit :][None, None, :]  # * np.eye(self.n_bands)[:, :, None]
         fitdata = mat_half_v[..., self.niv - n_freq_fit :]
 
-        mom0 = np.mean(fitdata.real, axis=-1)
-        mom1 = np.mean(fitdata.imag * iwfit.imag, axis=-1)
-        return mom0, mom1
+        return self._hermitian_moments(fitdata, iwfit)
+
+    @staticmethod
+    def _hermitian_moments(fitdata: np.ndarray, iwfit: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        r"""
+        Averages the two Hermitian tail moments over a fit window of the k-averaged self-energy
+        :math:`\Sigma^{\nu}_{12} = \Sigma_{\infty;12} - \Sigma_{1;12}/\imath\nu`: the Hermitian part
+        :math:`(\Sigma^{\nu} + \Sigma^{\nu\dagger})/2` gives :math:`\Sigma_\infty`, the anti-Hermitian part
+        :math:`-\imath\nu (\Sigma^{\nu} - \Sigma^{\nu\dagger})/2` gives :math:`\Sigma_1`. For an orbitally
+        symmetric self-energy (:math:`\Sigma_{12} = \Sigma_{21}`, e.g. a real Hamiltonian) this is the elementwise
+        real-part / imaginary-part fit, and the moments are returned as real arrays; imaginary parts within 100
+        machine epsilons of the storage precision count as zero.
+
+        :param fitdata: The k-averaged self-energy over the fit window, shape ``[o1, o2, v]``.
+        :param iwfit: The Matsubara frequencies :math:`\imath\nu` of the fit window, shape ``[1, 1, v]``.
+        :return: The tuple ``(mom0, mom1)`` of moments, each of shape ``[o1, o2]``.
+        """
+        hermitian = 0.5 * (fitdata + np.conj(np.swapaxes(fitdata, 0, 1)))
+        anti_hermitian = fitdata - hermitian
+        vn = iwfit.imag
+        # real and imaginary parts are averaged separately so the symmetric case reproduces the real-array sums exactly
+        mom0 = np.mean(hermitian.real, axis=-1) + 1j * np.mean(hermitian.imag, axis=-1)
+        mom1 = np.mean(anti_hermitian.imag * vn, axis=-1) - 1j * np.mean(anti_hermitian.real * vn, axis=-1)
+        return np.real_if_close(mom0), np.real_if_close(mom1)
 
     def create_with_asympt_up_to_core(self) -> "SelfEnergy":
         """
@@ -155,15 +176,18 @@ class SelfEnergy(TwoPoint):
 
     def to_full_niv_range(self):
         r"""
-        Extends the object to the full (signed) fermionic frequency range in place, using
-        :math:`\Sigma(-\nu) = \Sigma(\nu)^*`. A no-op if there is no fermionic axis or the object is already full.
+        Extends the object to the full (signed) fermionic frequency range in place, using the Matsubara Hermiticity
+        :math:`\Sigma^{\mathrm{k}}_{12}(-\nu) = [\Sigma^{\mathrm{k}}_{21}(\nu)]^*` (complex conjugate and orbital
+        transpose). A no-op if there is no fermionic axis or the object is already full.
 
         :return: ``self`` in the full fermionic frequency range.
         """
         if self.num_vn_dimensions == 0 or self.full_niv_range:
             return self
 
-        self.mat = np.concatenate((np.conj(np.flip(self.mat, axis=-1)), self.mat), axis=-1)
+        # the two orbital axes always sit directly in front of the fermionic axis, in every momentum layout
+        negative_half = np.conj(np.flip(np.swapaxes(self.mat, -3, -2), axis=-1))
+        self.mat = np.concatenate((negative_half, self.mat), axis=-1)
         self.update_original_shape()
         self._full_niv_range = True
         return self
@@ -304,9 +328,7 @@ class SelfEnergy(TwoPoint):
         iv = 1j * MFHelper.vn(niv_res, self._beta, return_only_positive=True)
         iwfit = iv[niv_res - n_freq_fit :][None, None, :]
 
-        mom0 = np.mean(fitdata.real, axis=-1)
-        mom1 = np.mean(fitdata.imag * iwfit.imag, axis=-1)
-        return mom0, mom1
+        return self._hermitian_moments(fitdata, iwfit)
 
     def shell_offset_from(self, other: "SelfEnergy") -> np.ndarray:
         """

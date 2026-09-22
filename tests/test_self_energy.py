@@ -69,6 +69,7 @@ def test_fits_smom_algorithm_correctly_with_dummy_data(has_compressed_q_dimensio
     self_energy = _se(mat, nk=nk, has_compressed_q_dimension=has_compressed_q_dimension, full_niv_range=True)
     dummy_smom0 = np.random.rand(2, 2)
     dummy_smom1 = np.random.rand(2, 2)
+    dummy_smom0, dummy_smom1 = dummy_smom0 + dummy_smom0.T, dummy_smom1 + dummy_smom1.T  # moments are Hermitian
     vn = 1j * MFHelper.vn(custom_niv, sys.beta)
     dummy_data = (
         (dummy_smom0[..., None] - 1.0 / vn * dummy_smom1[..., None])[None, None, None, ...]
@@ -757,3 +758,61 @@ def test_asymptotic_self_energy_keeps_beta(monkeypatch):
     se = SelfEnergy(mat_decompressed, nk=nk, beta=2.0)
     appended = se.create_with_asympt_up_to_core()
     assert appended._beta == 2.0
+
+
+@pytest.mark.parametrize("has_compressed_q_dimension", [True, False])
+def test_to_full_niv_range_transposes_the_orbitals_of_a_complex_hopping_model(has_compressed_q_dimension):
+    """to_full_niv_range rebuilds Sigma_12(-v) as conj(Sigma_21(v)) for a Hermitian but not symmetric two-band model."""
+    beta, niv_model, nkx = 10.0, 20, 8
+    kx = 2 * np.pi * np.arange(nkx) / nkx
+    hk = np.zeros((nkx, 2, 2), dtype=complex)
+    hk[:, 0, 0] = -2 * np.cos(kx)
+    hk[:, 1, 1] = -2 * np.cos(kx) + 0.5
+    hk[:, 0, 1] = 0.3 * (1 + 1j) * np.exp(1j * kx)  # complex off-diagonal hopping: Hermitian, not symmetric
+    hk[:, 1, 0] = np.conj(hk[:, 0, 1])
+    iv = 1j * MFHelper.vn(niv_model, beta)
+    dyson = (iv + 0.2)[None, None, None, :] * np.eye(2)[None, :, :, None] - hk[..., None]  # [k, o1, o2, v]
+    g_full = np.moveaxis(np.linalg.inv(np.moveaxis(dyson, -1, 1)), 1, -1)
+    if not has_compressed_q_dimension:
+        g_full = g_full.reshape(nkx, 1, 1, 2, 2, -1)
+
+    half = _se(
+        g_full[..., niv_model:].copy(),
+        nk=(nkx, 1, 1),
+        full_niv_range=False,
+        has_compressed_q_dimension=has_compressed_q_dimension,
+        calc_smom=False,
+        beta=beta,
+    )
+    assert np.allclose(half.to_full_niv_range().mat, g_full, atol=1e-6)  # complex64 storage
+
+
+def _hermitian_tail(mom0: np.ndarray, mom1: np.ndarray, niv_tail: int, beta: float) -> np.ndarray:
+    """Builds the tail Sigma = mom0 - mom1 / (iv) on a local full-range grid, layout [1, 1, 1, o1, o2, v]."""
+    iv = 1j * MFHelper.vn(niv_tail, beta)
+    return (mom0[..., None] - mom1[..., None] / iv)[None, None, None]
+
+
+def test_fit_smom_recovers_hermitian_moments_with_complex_off_diagonals():
+    """fit_smom returns the Hermitian moments of a tail whose off-diagonal moments are complex."""
+    beta = 10.0
+    mom0 = np.array([[1.0, 0.3 + 0.2j], [0.3 - 0.2j, 1.5]])
+    mom1 = np.array([[0.8, 0.1 - 0.15j], [0.1 + 0.15j, 0.6]])
+    se = _se(_hermitian_tail(mom0, mom1, 200, beta), beta=beta)
+    fit0, fit1 = se.fit_smom()
+    assert np.allclose(fit0, mom0, atol=1e-5)  # complex64 storage
+    assert np.allclose(fit1, mom1, atol=1e-5)
+
+
+def test_fit_smom_of_an_orbitally_symmetric_self_energy_equals_the_elementwise_fit():
+    """For Sigma_12 = Sigma_21 the moments equal the elementwise real/imaginary-part fit exactly and stay real."""
+    rng = np.random.default_rng(3)
+    mat = rng.random((16, 2, 2, 2 * niv)) + 1j * rng.random((16, 2, 2, 2 * niv))
+    mat[:, 1, 0] = mat[:, 0, 1]
+    se = _se(mat, nk=nk, has_compressed_q_dimension=True)
+    fitdata = np.mean(se.mat[..., niv:], axis=0)[..., niv - se._n_freq_fit(niv) :]
+    vn = MFHelper.vn(niv, sys.beta, return_only_positive=True)[niv - se._n_freq_fit(niv) :]
+    mom0, mom1 = se.fit_smom()
+    assert mom0.dtype.kind == "f" and mom1.dtype.kind == "f"
+    assert np.array_equal(mom0, np.mean(fitdata.real, axis=-1))
+    assert np.array_equal(mom1, np.mean(fitdata.imag * vn, axis=-1))
