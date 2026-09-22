@@ -120,15 +120,6 @@ class Hamiltonian:
         self._local_interaction = None
         self._nonlocal_interaction = None
 
-    def single_band_interaction(self, u: float) -> "Hamiltonian":
-        r"""
-        Sets the local interaction for a single-band model from a single Hubbard :math:`U`.
-
-        :param u: The Hubbard interaction :math:`U`.
-        :return: ``self`` (for chaining).
-        """
-        return self.interaction_orbital_diagonal(u, 1)
-
     def interaction_orbital_diagonal(self, u: float, n_bands: int = 1) -> "Hamiltonian":
         r"""
         Sets a purely orbital-diagonal local interaction for a multi-band model: the interaction tensor is zero
@@ -161,6 +152,39 @@ class Hamiltonian:
         :return: ``self`` (for chaining).
         """
         return self.kanamori_interaction_dp(nd_bands=n_bands, udd=udd, jdd=jdd, vdd=vdd)
+
+    def kanamori_interaction_per_atom(self, blocks: list[tuple[int, float, float, float]]) -> "Hamiltonian":
+        r"""
+        Adds one Kanamori block per atom along the orbital axis, with no interaction between the blocks. Each block
+        is given as ``(n_bands, u, j, v)`` and occupies the next ``n_bands`` orbitals, so the blocks appear in the
+        order they are listed. A ``v`` of None defaults to :math:`U - 2J` for that block.
+
+        Orbitals of different atoms share no orbital pair, so the inter-orbital :math:`V` and Hund's :math:`J` of
+        one atom never reach another; their coupling is the non-local :math:`V^{\mathbf{q}}`, not the local tensor.
+
+        :param blocks: One ``(n_bands, u, j, v)`` tuple per atom, in orbital order.
+        :return: ``self`` (for chaining).
+        """
+        r_loc = [0, 0, 0]
+        interaction_elements = []
+        offset = 0
+
+        for n_bands, u, j, v in blocks:
+            v = u - 2 * j if v is None else v
+
+            for a, b, c, d in it.product(range(n_bands), repeat=4):
+                bands = [offset + a + 1, offset + b + 1, offset + c + 1, offset + d + 1]
+
+                if a == b == c == d:  # U_{llll}
+                    interaction_elements.append(InteractionElement(r_loc, bands, u))
+                elif a == b and c == d:  # U_{llmm}: inter-orbital density-density
+                    interaction_elements.append(InteractionElement(r_loc, bands, v))
+                elif (a == d and b == c) or (a == c and b == d):  # U_{lmml} Hund's exchange, U_{lmlm} pair hopping
+                    interaction_elements.append(InteractionElement(r_loc, bands, j))
+
+            offset += n_bands
+
+        return self._add_interaction_term(interaction_elements)
 
     def kanamori_interaction_p(self, n_bands: int, upp: float, jpp: float, vpp: float = None) -> "Hamiltonian":
         r"""

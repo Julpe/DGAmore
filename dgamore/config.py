@@ -22,31 +22,34 @@ from dgamore.hamiltonian import Hamiltonian
 
 class InteractionConfig:
     r"""
-    Stores the interaction parameters. Currently only ``udd``, ``vdd``, ``jdd`` are used (local and Kanamori-type
-    interactions); the remaining parameters are reserved for future use.
+    Stores the interaction parameters. Currently only ``udd_per_ineq``, ``vdd_per_ineq`` and ``jdd_per_ineq`` are
+    used (local and Kanamori-type interactions); the remaining parameters are reserved for future use. The three
+    lists carry one entry per inequivalent atom, indexed by ``ineq - 1``.
 
-    :ivar float udd: Intra-orbital Hubbard interaction :math:`U_{\mathrm{dd}}` on the d orbitals.
+    :ivar list udd_per_ineq: Intra-orbital Hubbard interaction :math:`U_{\mathrm{dd}}` on the d orbitals, per
+        inequivalent atom.
     :ivar float udp: Inter-orbital d-p Hubbard interaction.
     :ivar float upp: Intra-orbital Hubbard interaction :math:`U_{\mathrm{pp}}` on the p orbitals.
     :ivar float uppod: Off-diagonal p-p Hubbard interaction.
-    :ivar float jdd: Hund's exchange :math:`J_{\mathrm{dd}}` on the d orbitals.
+    :ivar list jdd_per_ineq: Hund's exchange :math:`J_{\mathrm{dd}}` on the d orbitals, per inequivalent atom.
     :ivar float jdp: Inter-orbital d-p exchange.
     :ivar float jpp: Hund's exchange :math:`J_{\mathrm{pp}}` on the p orbitals.
     :ivar float jppod: Off-diagonal p-p exchange.
-    :ivar float vdd: Inter-orbital interaction :math:`V_{\mathrm{dd}}` on the d orbitals.
+    :ivar list vdd_per_ineq: Inter-orbital interaction :math:`V_{\mathrm{dd}}` on the d orbitals, per
+        inequivalent atom.
     :ivar float vpp: Inter-orbital interaction :math:`V_{\mathrm{pp}}` on the p orbitals.
     """
 
     def __init__(self):
-        self.udd: float = 0.0
+        self.udd_per_ineq: list[float] = []
         self.udp: float = 0.0
         self.upp: float = 0.0
         self.uppod: float = 0.0
-        self.jdd: float = 0.0
+        self.jdd_per_ineq: list[float] = []
         self.jdp: float = 0.0
         self.jpp: float = 0.0
         self.jppod: float = 0.0
-        self.vdd: float = 0.0
+        self.vdd_per_ineq: list[float] = []
         self.vpp: float = 0.0
 
 
@@ -82,7 +85,7 @@ class LatticeConfig:
     :ivar str type: How the kinetic Hamiltonian is provided (e.g. ``"from_wannier90"``).
     :ivar er_input: Path(s) to the hopping input.
     :vartype er_input: str | list
-    :ivar str interaction_type: How the interaction is provided (e.g. ``"one_band_from_dmft"``).
+    :ivar str interaction_type: How the interaction is provided (e.g. ``"from_dmft"``).
     :ivar interaction_input: Path(s) to the interaction input.
     :vartype interaction_input: str | list
     :ivar tuple nk: Number of k-points per spatial direction.
@@ -95,7 +98,7 @@ class LatticeConfig:
         self.symmetries: list[bz.KnownSymmetries] = [bz.KnownSymmetries.AUTO]
         self.type: str = "from_wannier90"
         self.er_input: str | list = "/path/to/file"
-        self.interaction_type: str = "one_band_from_dmft"
+        self.interaction_type: str = "from_dmft"
         self.interaction_input: str | list = ""
         self.nk: tuple[int, int, int] = (16, 16, 1)
 

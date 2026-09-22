@@ -168,22 +168,42 @@ def test_add_interaction_term_raises_for_a_nonlocal_tensor_without_reality_symme
         Hamiltonian()._add_interaction_term(inter)
 
 
-def test_single_band_interaction_sets_correct_u():
-    """single_band_interaction sets the single local Hubbard U."""
-    h = Hamiltonian().single_band_interaction(4.0)
-    assert np.isclose(h._ur_local[0, 0, 0, 0], 4.0)
+@pytest.mark.parametrize("jdd, vdd", [(0.0, 0.0), (1.0, 2.0), (0.75, None), (0.0, None)])
+def test_kanamori_interaction_1_band_is_the_plain_hubbard_u(jdd, vdd):
+    """A single band admits only the aaaa element, so J and V cannot reach the tensor whatever they are."""
+    h = Hamiltonian().kanamori_interaction_d(n_bands=1, udd=5.0, jdd=jdd, vdd=vdd)
+    assert h._ur_local.shape == (1, 1, 1, 1)
+    assert np.allclose(h._ur_local, 5.0)
 
 
-def test_kanamori_interaction_defaults_1_band():
-    """kanamori_interaction_d for a single band sets the local U."""
-    h = Hamiltonian().kanamori_interaction_d(n_bands=1, udd=5.0, jdd=1.0)
-    assert np.isclose(h._ur_local[0, 0, 0, 0], 5.0)
+@pytest.mark.parametrize("n_bands, vdd", [(1, 2.0), (3, 3.5), (3, None)])
+def test_kanamori_interaction_per_atom_with_one_block_equals_the_single_atom_builder(n_bands, vdd):
+    """One block reproduces kanamori_interaction_d exactly, so the two element generators cannot drift apart."""
+    per_atom = Hamiltonian().kanamori_interaction_per_atom([(n_bands, 5.0, 0.75, vdd)])
+    single = Hamiltonian().kanamori_interaction_d(n_bands=n_bands, udd=5.0, jdd=0.75, vdd=vdd)
+    assert np.array_equal(per_atom._ur_local, single._ur_local)
+    assert np.array_equal(per_atom._ur_nonlocal, single._ur_nonlocal)
 
 
-def test_kanamori_interaction_with_vdd_1_band():
-    """kanamori_interaction_d with vdd for a single band sets the local U."""
-    h = Hamiltonian().kanamori_interaction_d(n_bands=1, udd=5.0, jdd=1.0, vdd=2.0)
-    assert np.isclose(h._ur_local[0, 0, 0, 0], 5.0)
+def test_kanamori_interaction_per_atom_keeps_each_atoms_own_parameters():
+    """Each block carries the U, J and V it was given, on its own orbitals."""
+    h = Hamiltonian().kanamori_interaction_per_atom([(1, 4.0, 0.6, 2.8), (2, 9.0, 1.5, 6.0)])
+    u = h._ur_local
+    assert u.shape == (3, 3, 3, 3)
+    assert np.isclose(u[0, 0, 0, 0], 4.0)
+    assert all(np.isclose(u[i, i, i, i], 9.0) for i in (1, 2))
+    assert np.isclose(u[1, 1, 2, 2], 6.0)
+    assert np.isclose(u[1, 2, 2, 1], 1.5)
+
+
+def test_kanamori_interaction_per_atom_couples_no_two_atoms():
+    """Orbitals of different atoms share no V or Hund's J, which is what the single-block builder gets wrong."""
+    h = Hamiltonian().kanamori_interaction_per_atom([(1, 4.0, 0.6, 2.8), (2, 4.0, 0.6, 2.8)])
+    u = h._ur_local
+    assert np.isclose(u[0, 0, 1, 1], 0.0)
+    assert np.isclose(u[0, 1, 1, 0], 0.0)
+    assert np.isclose(u[0, 1, 0, 1], 0.0)
+    assert not np.isclose(Hamiltonian().kanamori_interaction_d(3, 4.0, 0.6, 2.8)._ur_local[0, 0, 1, 1], 0.0)
 
 
 def test_kanamori_interaction_with_vdd_2_band():
@@ -260,8 +280,9 @@ def test_kanamori_p_basic():
 @pytest.mark.parametrize(
     "build",
     [
-        lambda h: h.single_band_interaction(4.0),
         lambda h: h.interaction_orbital_diagonal(4.0, 3),
+        lambda h: h.kanamori_interaction_d(1, udd=4.0, jdd=0.6),
+        lambda h: h.kanamori_interaction_per_atom([(1, 4.0, 0.6, None), (2, 9.0, 1.5, None)]),
         lambda h: h.kanamori_interaction_d(3, udd=4.0, jdd=0.6),
         lambda h: h.kanamori_interaction_p(2, upp=3.0, jpp=0.5, vpp=1.5),
         lambda h: h.kanamori_interaction_dp(
@@ -270,7 +291,16 @@ def test_kanamori_p_basic():
         lambda h: h.read_umatrix(f"{os.path.dirname(os.path.abspath(__file__))}/test_data/local_sde/u_matrix.dat"),
         lambda h: h.read_umatrix(f"{os.path.dirname(os.path.abspath(__file__))}/../docs/u_matrix.dat"),
     ],
-    ids=["single_band", "orbital_diagonal", "kanamori_d", "kanamori_p", "kanamori_dp", "umatrix_file", "docs_example"],
+    ids=[
+        "orbital_diagonal",
+        "kanamori_d_1_band",
+        "kanamori_per_atom",
+        "kanamori_d",
+        "kanamori_p",
+        "kanamori_dp",
+        "umatrix_file",
+        "docs_example",
+    ],
 )
 def test_common_interaction_types_pass_the_symmetry_check(build):
     """Every builder and shipped interaction file satisfies the pair-exchange and reality symmetries without raising."""
