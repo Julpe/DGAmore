@@ -4,8 +4,11 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import base64
 import builtins
 import os
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -56,22 +59,6 @@ def test_translate_kgrid_shifts_flat_indices_modulo_grid_size():
     ix = idx_map // (ny * nz)
     expected = ((ix + 1) % nx) * (ny * nz) + ((iy + 2) % ny) * nz + ((iz + 3) % nz)
     assert np.array_equal(translated, expected)
-
-
-def test_apply_m_to_ev_field_returns_expected_values_for_identity():
-    """apply_m_to_ev_field returns the input field unchanged for the identity."""
-    nk = (2, 2, 2)
-    ev = np.arange(8, dtype=np.float64).reshape(*nk, 1)
-    out = sr._apply_M_to_ev_field(np.eye(3, dtype=np.int64), ev, nk)
-    assert np.array_equal(out, ev)
-
-
-def test_fft_find_matching_q_finds_exact_translation():
-    """fft_find_matching_q finds the exact translation between two fields."""
-    a = np.arange(8, dtype=np.float64).reshape(2, 2, 2, 1)
-    b = np.roll(a, shift=1, axis=0)
-    qs = sr._fft_find_matching_q(a, b, atol=1e-12)
-    assert (1, 0, 0) in qs
 
 
 def test_cluster_eigvals_groups_equal_values_and_singletons():
@@ -391,7 +378,6 @@ def test_discover_symmetries_branching_with_monkeypatched_helpers(monkeypatch):
         mp.setattr(sr, "_enumerate_integer_matrices", MagicMock(return_value=[np.eye(3, dtype=np.int64)]))
         mp.setattr(sr, "_M_preserves_grid", MagicMock(return_value=True))
         mp.setattr(sr, "_apply_M_to_kgrid_indices", MagicMock(return_value=np.array([0, 1], dtype=np.int64)))
-        mp.setattr(sr, "_apply_M_to_ev_field", MagicMock(return_value=np.zeros((2, 1, 1, 1))))
         mp.setattr(sr, "_solve_U_for_op", MagicMock(return_value=np.eye(1)))
         ops, n_found = sr._discover_symmetries(H, atol=1e-12, verbose=False)
 
@@ -424,13 +410,6 @@ def test_apply_m_to_kgrid_indices_with_axis_swap_is_modulo_correct():
                 # After the swap: new (ix', iy', iz') = (iy, ix, iz)
                 expected.append(iy * (ny * nz) + ix * nz + iz)
     assert np.array_equal(out, np.array(expected, dtype=np.int64))
-
-
-def test_fft_find_matching_q_returns_empty_when_fields_do_not_match():
-    """fft_find_matching_q returns empty when the fields do not match."""
-    a = np.zeros((2, 2, 2, 1), dtype=float)
-    b = np.ones((2, 2, 2, 1), dtype=float)
-    assert sr._fft_find_matching_q(a, b, atol=1e-12) == []
 
 
 def test_solve_u_for_op_accepts_global_phase_equivalent_matching():
@@ -587,7 +566,7 @@ def test_group_element_equality_depends_on_canonical_action_and_phase():
 
 
 def test_discover_symmetries_dedups_identical_M_grid_actions(monkeypatch):
-    """When two M's give identical grid actions the second is skipped, so identity mocks yield 4 distinct ops."""
+    """When two M's give identical grid actions the second is skipped, so identity mocks yield 2 distinct ops."""
     H = np.zeros((1, 1, 1, 1, 1), dtype=complex)
 
     with monkeypatch.context() as mp:
@@ -598,14 +577,13 @@ def test_discover_symmetries_dedups_identical_M_grid_actions(monkeypatch):
         )
         mp.setattr(sr, "_M_preserves_grid", MagicMock(return_value=True))
         mp.setattr(sr, "_apply_M_to_kgrid_indices", MagicMock(return_value=np.array([0], dtype=np.int64)))
-        mp.setattr(sr, "_apply_M_to_ev_field", MagicMock(return_value=np.zeros((1, 1, 1, 1))))
         mp.setattr(sr, "_solve_U_for_op", MagicMock(return_value=np.eye(1)))
         ops, n_found = sr._discover_symmetries(H, atol=1e-12, verbose=False)
 
     assert n_found == len(ops)
     # M is enumerated twice but the second copy has the same grid action and is deduped: one unique M times
-    # {sigma=+1,-1} times {conj=False,True} = 4 ops (each (sigma, conj) yields a distinct action_key).
-    assert n_found == 4
+    # {conj=False,True} = 2 ops (each conj yields a distinct action_key).
+    assert n_found == 2
 
 
 def test_apply_auto_orbital_transform_identity_rows_are_left_unchanged():
@@ -939,15 +917,15 @@ def test_get_symmetry_reduction_on_random_non_symmetric_hamiltonian_yields_full_
 
 
 def test_get_symmetry_reduction_handles_zero_hamiltonian():
-    """H == 0 has every possible symmetry; the discovered group will be large but the reconstruction must still work."""
+    """H == 0 has every point-group symmetry; the group will be large but the reconstruction must still work."""
     H = np.zeros((2, 2, 1, 2, 2), dtype=complex)
     result = sr.get_symmetry_reduction(H, atol=1e-10)
 
     H_ibz = H.reshape(-1, 2, 2)[result["irrk_ind"]]
     H_rec = result["expand"](H_ibz)
     assert np.allclose(H_rec, H, atol=1e-12)
-    # Every k collapses to the single representative.
-    assert result["n_ibz"] == 1
+    # Gamma is fixed by every translation-free operation; the three other momenta of the 2x2 grid form one orbit.
+    assert result["n_ibz"] == 2
 
 
 def test_get_symmetry_reduction_handles_diagonal_real_hamiltonian():
@@ -1036,10 +1014,10 @@ def test_get_symmetry_reduction_default_excludes_antiunitary_ops():
 
 
 def test_get_symmetry_reduction_include_antiunitary_admits_conj_ops():
-    """For a real H, H(k)=H(k)* gives anti-unitary ops, so opting in produces at least one conj=True point."""
+    """For a real H, H(k)=H(k)* gives anti-unitary ops, so opting in admits conj=True elements into the group."""
     H = _make_real_cubic_h(4, 4, 4, 1)
     result = sr.get_symmetry_reduction(H, atol=1e-8, include_antiunitary=True)
-    assert int(result["conjs"].sum()) > 0
+    assert any(g.conj for g in result["group"])
 
 
 def test_get_symmetry_reduction_include_antiunitary_shrinks_or_equals_ibz():
@@ -1245,29 +1223,6 @@ def test_fix_gauge_degenerate_returns_none_on_block_svd_linalgerror(monkeypatch)
     assert state["n"] >= 2
 
 
-def test_discover_symmetries_handles_hash_collision_of_grid_actions(monkeypatch):
-    """Two M's with distinct grid actions but a forced identical hash are both kept (confirmed by array compare)."""
-    H = np.zeros((2, 1, 1, 1, 1), dtype=complex)
-    with monkeypatch.context() as mp:
-        mp.setattr(
-            sr,
-            "_enumerate_integer_matrices",
-            MagicMock(return_value=[np.eye(3, dtype=np.int64), np.diag([-1, 1, 1]).astype(np.int64)]),
-        )
-        mp.setattr(sr, "_M_preserves_grid", MagicMock(return_value=True))
-        mp.setattr(
-            sr,
-            "_apply_M_to_kgrid_indices",
-            MagicMock(side_effect=lambda M, nk: np.array([0, 1] if int(M[0, 0]) > 0 else [1, 0], dtype=np.int64)),
-        )
-        mp.setattr(sr, "_apply_M_to_ev_field", MagicMock(return_value=np.zeros((2, 1, 1, 1))))
-        mp.setattr(sr, "_solve_U_for_op", MagicMock(return_value=np.eye(1)))
-        monkeypatch.setattr(builtins, "hash", lambda x: 1234)  # force collision
-        ops, n = sr._discover_symmetries(H, atol=1e-12, verbose=False)
-    assert n == len(ops)
-    assert n >= 1
-
-
 def test_discover_symmetries_handles_zero_pivot_in_U_canonicalization(monkeypatch):
     """An all-near-zero U gives a near-zero pivot, so canonical-bytes skips the phase division (else branch)."""
     H = np.zeros((1, 1, 1, 1, 1), dtype=complex)
@@ -1275,7 +1230,6 @@ def test_discover_symmetries_handles_zero_pivot_in_U_canonicalization(monkeypatc
         mp.setattr(sr, "_enumerate_integer_matrices", MagicMock(return_value=[np.eye(3, dtype=np.int64)]))
         mp.setattr(sr, "_M_preserves_grid", MagicMock(return_value=True))
         mp.setattr(sr, "_apply_M_to_kgrid_indices", MagicMock(return_value=np.array([0], dtype=np.int64)))
-        mp.setattr(sr, "_apply_M_to_ev_field", MagicMock(return_value=np.zeros((1, 1, 1, 1))))
         mp.setattr(sr, "_solve_U_for_op", MagicMock(return_value=np.zeros((1, 1), dtype=complex)))
         ops, n = sr._discover_symmetries(H, atol=1e-12, verbose=False)
     assert n == len(ops)
@@ -1296,7 +1250,6 @@ def test_discover_symmetries_skips_duplicate_action_key(monkeypatch):
             "_apply_M_to_kgrid_indices",
             MagicMock(side_effect=lambda M, nk: np.array([0, 1] if int(M[0, 0]) > 0 else [1, 0], dtype=np.int64)),
         )
-        mp.setattr(sr, "_apply_M_to_ev_field", MagicMock(return_value=np.zeros((2, 1, 1, 1))))
         mp.setattr(sr, "_solve_U_for_op", MagicMock(return_value=np.eye(1)))
         ops, n = sr._discover_symmetries(H, atol=1e-12, verbose=False)
     # With H == 0 every q matches, so both M's enumerate overlapping actions; the
@@ -1519,3 +1472,141 @@ def test_find_coordinate_mirror_orbital_unitaries_reports_nothing_without_coordi
     H = _require_hamiltonian("hk_4band_la3ni2o7_32x32x32.npy", (32, 32, 32, 4, 4))
 
     assert sr.find_coordinate_mirror_orbital_unitaries(H) == {}
+
+
+def _nearest_neighbor_cubic_hamiltonian(n: int = 4) -> np.ndarray:
+    """Nearest-neighbor cubic dispersion on an even grid, which obeys the anti-symmetry e(k + (pi, pi, pi)) = -e(k)."""
+    k = 2 * np.pi * np.arange(n) / n
+    kx, ky, kz = np.meshgrid(k, k, k, indexing="ij")
+    return (-2.0 * (np.cos(kx) + np.cos(ky) + np.cos(kz)))[..., None, None].astype(complex)
+
+
+def test_get_symmetry_reduction_admits_only_translation_free_unitary_symmetries():
+    """Anti-symmetries and reciprocal translations are no symmetries of G or chi, so the group keeps neither of them."""
+    res = sr.get_symmetry_reduction(_nearest_neighbor_cubic_hamiltonian(), atol=1e-8)
+
+    assert all(g.sigma == 1 and not np.any(g.q) for g in res["group"])
+    assert len(res["group"]) == 48
+    assert res["n_ibz"] == 10
+
+
+def test_unfolding_the_free_green_function_is_exact_on_a_nearest_neighbor_lattice():
+    """G0 does not share the anti-symmetry of H, so its unfold from the irreducible zone is exact only without it."""
+    H = _nearest_neighbor_cubic_hamiltonian()
+    res = sr.get_symmetry_reduction(H, atol=1e-8)
+    g0 = 1.0 / (0.3j + 0.2 - H)
+
+    g0_rec = res["expand_tensor"](g0.reshape(-1, 1, 1)[res["irrk_ind"]], kind="kb")
+
+    assert np.allclose(g0_rec, g0, atol=1e-12)
+
+
+def test_unfolding_a_transfer_momentum_object_ignores_reciprocal_translations():
+    """A bubble chi0(q) is covariant only as q -> Mq: a translation cancels between its two propagators."""
+    n = 8
+    k = 2 * np.pi * np.arange(n) / n
+    kx, ky = np.meshgrid(k, k, indexing="ij")
+    e = -2.0 * (np.cos(kx) + np.cos(ky)) - 1.2 * np.cos(kx) * np.cos(ky)
+    H = np.zeros((n, n, 1, 2, 2), dtype=complex)
+    H[..., 0, 0] = e[..., None]
+    H[..., 1, 1] = np.roll(np.roll(e, n // 2, 0), n // 2, 1)[..., None]  # e(k + Q): H(k + Q) = sigma_x H(k) sigma_x
+    H[..., 0, 1] = H[..., 1, 0] = 0.3
+    g = np.linalg.inv(0.5j * np.eye(2) - H)
+    chi0 = np.zeros((n, n, 1, 2, 2, 2, 2), dtype=complex)
+    for qx in range(n):
+        for qy in range(n):
+            g_shifted = np.roll(np.roll(g, qx, 0), qy, 1)  # G(k - q)
+            chi0[qx, qy, 0] = np.einsum("xyzad,xyzcb->abcd", g, g_shifted)
+
+    res = sr.get_symmetry_reduction(H, atol=1e-8)
+    chi0_rec = res["expand_tensor"](chi0.reshape(-1, 2, 2, 2, 2)[res["irrk_ind"]], kind="kbkb", sigma_power=2)
+
+    assert np.allclose(chi0_rec, chi0, atol=1e-10)
+
+
+def test_orbit_collapse_carries_every_representative_by_the_identity():
+    """The value computed at a representative is returned as is, not rotated by one of its little-group elements."""
+    res = sr.get_symmetry_reduction(_cubic_t2g_hamiltonian(nk=4), atol=1e-8)
+
+    us_at_representatives = res["Us"].reshape(-1, 3, 3)[res["irrk_ind"]]
+
+    assert np.allclose(us_at_representatives, np.eye(3), atol=1e-12)
+
+
+def _discovered_carriers_in_a_fresh_process(H: np.ndarray, hash_seed: int) -> np.ndarray:
+    """Runs the discovery in a separate interpreter with the given hash seed and returns its flat per-k unitaries."""
+    code = (
+        "import base64, sys, numpy as np, dgamore.symmetry_reduction as sr; "
+        f"H = np.frombuffer(base64.b64decode(sys.argv[1]), dtype=complex).reshape({H.shape}); "
+        "sys.stdout.write(base64.b64encode(sr.get_symmetry_reduction(H, atol=1e-8)['Us'].tobytes()).decode())"
+    )
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = {**os.environ, "PYTHONHASHSEED": str(hash_seed), "PYTHONPATH": repo_root}
+    h_arg = base64.b64encode(np.ascontiguousarray(H, dtype=complex).tobytes()).decode()
+    proc = subprocess.run([sys.executable, "-c", code, h_arg], capture_output=True, env=env)
+    assert proc.returncode == 0, proc.stderr.decode()
+    return np.frombuffer(base64.b64decode(proc.stdout), dtype=complex)
+
+
+def test_discovered_carriers_do_not_depend_on_the_hash_seed():
+    """Two interpreters with different hash seeds discover bit-identical per-k unitaries, so MPI ranks agree."""
+    H = _cubic_t2g_hamiltonian(nk=4)
+
+    us_1 = _discovered_carriers_in_a_fresh_process(H, hash_seed=1)
+    us_2 = _discovered_carriers_in_a_fresh_process(H, hash_seed=2)
+
+    assert np.array_equal(us_1, us_2)
+
+
+def test_compose_and_inverse_scale_the_translation_by_the_grid_size_ratio():
+    """On a (4, 4, 2) grid the shear k_x -> k_x + k_z carries a one-step z translation two steps along x."""
+    nk = (4, 4, 2)
+    shear = np.array([[1, 0, 1], [0, 1, 0], [0, 0, 1]], dtype=np.int64)
+    ga = sr._GroupElement(shear, np.zeros(3, dtype=np.int64), np.eye(1), +1, False, nk)
+    gb = sr._GroupElement(np.eye(3, dtype=np.int64), np.array([0, 0, 1]), np.eye(1), +1, False, nk)
+    g = sr._GroupElement(shear, np.array([0, 0, 1]), np.eye(1), +1, False, nk)
+
+    def act(element):
+        return sr._g_action_on_kgrid(element, nk)
+
+    assert np.array_equal(act(sr._compose(ga, gb, nk)), act(ga)[act(gb)])
+    assert np.array_equal(act(sr._inverse(g, nk))[act(g)], np.arange(32))
+
+
+def test_point_group_orbits_ignores_anti_symmetries():
+    """A sigma = -1 element is no symmetry of a vertex, so it must not merge real-space stars."""
+    nk = (4, 4, 1)
+    inversion = -np.eye(3, dtype=np.int64)
+    group = {
+        sr._GroupElement.identity(1, nk),
+        sr._GroupElement(inversion, np.zeros(3, dtype=np.int64), np.eye(1), -1, False, nk),
+    }
+
+    rep, _ = sr.point_group_orbits(group, nk)
+
+    assert len(np.unique(rep)) == 16
+
+
+def test_group_element_keeps_small_unitary_entries():
+    """The stored unitary is the validated one; entries below 1e-5 are rounded only inside the hash key."""
+    u = _rot2(1e-6)
+
+    g = sr._GroupElement(np.eye(3, dtype=np.int64), np.zeros(3, dtype=np.int64), u, +1, False, (2, 2, 1))
+
+    assert np.allclose(g.U, u, atol=1e-15)
+
+
+def test_close_group_warns_when_the_size_cap_stops_the_closure():
+    """Stopping at the size cap returns a set that is not closed, which is reported instead of passed on silently."""
+    ops = [
+        {
+            "M": np.eye(3, dtype=np.int64),
+            "q": np.array([1, 0, 0], dtype=np.int64),
+            "U": np.eye(1, dtype=complex),
+            "sigma": 1,
+            "conj": False,
+        }
+    ]
+
+    with pytest.warns(RuntimeWarning):
+        sr._close_group(ops, norb=1, nk=(4, 1, 1), max_size=2)

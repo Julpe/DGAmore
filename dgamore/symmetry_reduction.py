@@ -18,27 +18,31 @@ finite subgroup of GL(3, Z), and its generators have entries in {-1, 0, +1}.
 
 Symmetries searched
 -------------------
-Operations (M, q, U, sigma, conj) such that for every k in the grid,
-    H((M k + q) mod N) = sigma * U @ H(k)^{[*]} @ U^dagger
+Operations (M, U, conj) such that for every k in the grid,
+    H((M k) mod N) = U @ H(k)^{[*]} @ U^dagger
 where:
   * M is a 3x3 integer matrix with entries in {-1, 0, +1} and det = +/- 1.
     Enumerated exhaustively (6960 matrices), filtered to those compatible
     with the grid shape.
-  * q is any integer translation vector in [0, N_1) x [0, N_2) x [0, N_3).
-    For each M, valid q's are found via FFT-based cross-correlation of the
-    eigenvalue field (fast: O(N^3 log N) per M).
   * U is an arbitrary unitary in orbital space, found by simultaneous
     diagonalization with per-eigenspace gauge fixing. NOT enumerated:
     works for any number of orbitals and any U (not just signed perms).
-  * sigma in {+1, -1} covers anti-symmetries (chiral / particle-hole).
-  * conj covers anti-unitary symmetries (time-reversal-like).
+  * conj covers anti-unitary symmetries (time-reversal-like), kept only on
+    request.
+
+Reciprocal translations (k -> M k + q) and anti-symmetries
+(H(M k) = -U H(k) U^dagger) are symmetries of H alone: a translation cancels
+between the two propagators of a transfer-momentum object and an
+anti-symmetry relates G or chi only together with a particle-hole and
+Matsubara-frequency flip, so neither is searched. The group algebra
+(_GroupElement, _compose, _inverse) still carries q and sigma for generality.
 
 Algorithm
 ---------
 1. Enumerate {-1,0,+1}-matrix candidates M (grid-compatible).
-2. For each M and each (sigma, conj), use FFT cross-correlation on the
-   eigenvalue field to find all q for which the eigenvalue pre-screen holds.
-3. For each surviving (M, q, sigma, conj), solve for U.
+2. Keep the M whose grid action reproduces the sorted eigenvalues of H at
+   a few generic k-points (cheap necessary condition), then on the whole grid.
+3. For each surviving M and conj in {False, True}, solve for U.
 4. Close the discovered operations under composition.
 5. Orbit-collapse the k-grid using the closed group; canonical representative
    = smallest flat index in each orbit.
@@ -55,9 +59,9 @@ matrices and will not be detected. Re-grid H onto the lattice basis first.
 """
 
 import numpy as np
-import scipy as sp
 import itertools
 import string
+import warnings
 from functools import lru_cache
 
 # ============================================================================
@@ -178,49 +182,6 @@ def _translate_kgrid(idx_map, q, nk):
     iy = (iy + qy) % ny
     iz = (iz + qz) % nz
     return ix * (ny * nz) + iy * nz + iz
-
-
-def _apply_M_to_ev_field(M, ev, nk, idx_map=None):
-    """
-    Pulls back an eigenvalue field by the action of ``M``, returning ``A[k] = ev[M k mod N]``. Used for the
-    eigenvalue pre-screen in symmetry discovery. Reuses a precomputed flat-index map when available so the pullback
-    is a single fancy-index gather instead of rebuilding the M-action.
-
-    :param M: The 3x3 integer matrix acting on k-indices.
-    :param ev: The eigenvalue field of shape ``(nx, ny, nz, n_orb)``.
-    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
-    :param idx_map: Optional precomputed flat-index map from :func:`_apply_M_to_kgrid_indices` for ``M``.
-    :return: The transformed eigenvalue field, same shape as ``ev``.
-    """
-    if idx_map is None:
-        idx_map = _apply_M_to_kgrid_indices(M, nk)
-    return ev.reshape(-1, ev.shape[-1])[idx_map].reshape(ev.shape)
-
-
-# ============================================================================
-# FFT-based fast q-detection (eigenvalue pre-screen)
-
-
-def _fft_find_matching_q(A, B, atol):
-    r"""
-    Finds all integer translations ``q`` such that ``A[k] = B[k + q]`` for all ``k``, via a 3D FFT cross-correlation of
-    the (real) eigenvalue fields, i.e. minimizing :math:`D(\mathbf{q}) = \sum_{\mathbf{k},e} (A -
-    B(\cdot+\mathbf{q}))^2`.
-
-    :param A: First real field of shape ``(Nx, Ny, Nz, n_orb_evals)``.
-    :param B: Second real field of the same shape.
-    :param atol: Absolute tolerance for accepting a translation.
-    :return: A list of ``q`` index tuples for which the mismatch is below tolerance.
-    """
-    A2 = (A * A).sum()
-    B2 = (B * B).sum()
-    FA = sp.fft.fftn(A, axes=(0, 1, 2))
-    FB = sp.fft.fftn(B, axes=(0, 1, 2))
-    cross = sp.fft.ifftn(np.conj(FA) * FB, axes=(0, 1, 2), overwrite_x=True).real.sum(axis=-1)
-    D = A2 + B2 - 2.0 * cross
-    thresh = max(atol * (A2 + B2 + 1.0), atol * 100)
-    qs = np.argwhere(D < thresh)
-    return [tuple(int(x) for x in q) for q in qs]
 
 
 # ============================================================================
@@ -494,11 +455,27 @@ def _fix_gauge_degenerate(V, W, clusters, Hk_eff, Hg, atol):
 # Symmetry discovery
 
 
+def _canon_U_bytes(U):
+    """
+    Produces a canonical (global-phase-fixed, rounded) byte representation of a unitary for deduplication.
+
+    :param U: The unitary matrix to canonicalize.
+    :return: The canonical byte string identifying ``U`` up to a global phase.
+    """
+    flat = U.ravel()
+    mags = np.abs(flat)
+    i_pivot = np.where(mags > mags.max() - 1e-4)[0][0]
+    Uc = U / (flat[i_pivot] / mags[i_pivot]) if mags[i_pivot] > 1e-12 else U.copy()
+    Uc[np.abs(Uc) < 1e-5] = 0
+    return (np.round(Uc.real, 4) + 1j * np.round(Uc.imag, 4)).tobytes()
+
+
 def _discover_symmetries(H, atol, verbose=False):
     """
-    Discovers all symmetry operations ``(M, q, U, sigma, conj)`` of the Hamiltonian ``H``, deduplicated by their
-    action (grid index map + sigma + conj + U up to phase). Uses the integer-matrix enumeration, the FFT eigenvalue
-    pre-screen for translations, and the U-solver for the orbital part.
+    Discovers the translation-free unitary and anti-unitary symmetries ``(M, U, conj)`` of the Hamiltonian ``H``,
+    i.e. every ``H(M k) = U H(k)^{[*]} U^dagger``, deduplicated by their action (grid index map + conj + U up to a
+    phase). Every grid-compatible integer matrix first has to reproduce the sorted eigenvalues of ``H`` at a few
+    generic k-points (a cheap necessary condition) before the U-solver runs on the whole grid.
 
     :param H: The Hamiltonian field of shape ``(nx, ny, nz, norb, norb)``.
     :param atol: Absolute tolerance for symmetry validation.
@@ -507,161 +484,33 @@ def _discover_symmetries(H, atol, verbose=False):
     """
     nx, ny, nz, norb, _ = H.shape
     nk = (nx, ny, nz)
-
-    M_all = _enumerate_integer_matrices()
-    M_candidates = [M for M in M_all if _M_preserves_grid(M, nk)]
-
-    # For N >= 3 on every axis, distinct integer M's (entries in {-1, 0, 1}) give distinct grid actions (since
-    # -1 mod N != +1), so no dedup is needed and the grid index map is built lazily only for the few M's that
-    # survive the symmetry prune. On small grids (some N <= 2) the actions can collapse, so dedup by the full action.
-    if all(N >= 3 for N in nk):
-        M_unique = [(M, None) for M in M_candidates]
-    else:
-        seen_hashes: dict = {}
-        M_unique = []
-        for M in M_candidates:
-            idx_map = _apply_M_to_kgrid_indices(M, nk)
-            h = hash(idx_map.tobytes())  # cheap key; a collision is confirmed against the stored representative
-            existing = seen_hashes.get(h)
-            if existing is None:
-                seen_hashes[h] = (M, idx_map)
-                M_unique.append((M, idx_map))
-            elif not np.array_equal(existing[1], idx_map):
-                seen_hashes[h] = (M, idx_map)  # genuine 64-bit hash collision: keep both distinct actions
-                M_unique.append((M, idx_map))
-    if verbose:
-        print(f"  Integer matrices: {len(M_candidates)} grid-compatible -> {len(M_unique)} unique grid actions")
+    M_candidates = [M for M in _enumerate_integer_matrices() if _M_preserves_grid(M, nk)]
 
     ev = np.linalg.eigvalsh(H)
-    ev_neg = -ev[..., ::-1]
-    H_flat = H.reshape(-1, norb, norb)
     ev_flat = ev.reshape(-1, norb)
-
-    # Cache the reference FFTs (one for sigma=+1, one for sigma=-1) and their magnitudes for the prune.
-    FB_plus = sp.fft.fftn(ev, axes=(0, 1, 2))
-    FB_minus = sp.fft.fftn(ev_neg, axes=(0, 1, 2))
-    B_plus_sq = (ev * ev).sum()
-    B_minus_sq = (ev_neg * ev_neg).sum()
-    FB_plus_flat = FB_plus.reshape(-1, norb)
-    absFB_plus_flat = np.abs(FB_plus_flat)
-    absFB_minus_flat = np.abs(FB_minus).reshape(-1, norb)
-    # A real symmetry has |F[ev_M]| == |F[ev]| EXACTLY (a translate only changes the Fourier phase), matching to the
-    # eigenvalue noise floor (~1e-13*max), so this loose bound prunes non-symmetries without ever dropping a real one.
-    mag_atol = 1e-6 * float(absFB_plus_flat.max()) if absFB_plus_flat.size else 0.0
-    # Cheap O(K) signature pre-filter: the K most distinctive |FB| R-points. A real symmetry keeps |FB| invariant
-    # everywhere and hence at these points, so most non-symmetries are rejected here without the full-grid gather.
-    sig_k = min(8, absFB_plus_flat.shape[0])
-    sig_R = np.argsort(-absFB_plus_flat.sum(axis=1))[:sig_k]
-    sig_coords = _grid_index_stack(nk).reshape(-1, 3)[sig_R]
-    sig_ref_plus = absFB_plus_flat[sig_R]
-    sig_ref_minus = absFB_minus_flat[sig_R]
-
-    def _fft_q_scan_cached(FA, A2, FB, B_sq, atol):
-        """
-        FFT translation scan against a precomputed reference FFT (faster variant of :func:`_fft_find_matching_q`).
-        Takes the pulled-back field's forward FFT and squared norm precomputed, since they are identical for the
-        ``sigma = +/-1`` reference scans of the same field.
-
-        :param FA: The forward FFT of the pulled-back eigenvalue field to match.
-        :param A2: The squared norm of the pulled-back field.
-        :param FB: The precomputed FFT of the reference eigenvalue field.
-        :param B_sq: The precomputed squared norm of the reference field.
-        :param atol: Absolute tolerance for accepting a translation.
-        :return: A list of matching ``q`` index tuples.
-        """
-        cross = sp.fft.ifftn(np.conj(FA) * FB, axes=(0, 1, 2), overwrite_x=True).real.sum(axis=-1)
-        D = A2 + B_sq - 2.0 * cross
-        thresh = max(atol * (A2 + B_sq + 1.0), atol * 100)
-        return [tuple(int(x) for x in q) for q in np.argwhere(D < thresh)]
+    H_flat = H.reshape(-1, norb, norb)
+    probe = np.random.default_rng(0).choice(ev_flat.shape[0], size=min(8, ev_flat.shape[0]), replace=False)
+    probe_coords = _grid_index_stack(nk).reshape(-1, 3)[probe]
 
     ops = []
     seen_actions = set()
-
-    def _canon_U_bytes(U):
-        """
-        Produces a canonical (global-phase-fixed, rounded) byte representation of a unitary for deduplication.
-
-        :param U: The unitary matrix to canonicalize.
-        :return: The canonical byte string identifying ``U`` up to a global phase.
-        """
-        flat = U.ravel()
-        mags = np.abs(flat)
-        candidates_idx = np.where(mags > mags.max() - 1e-4)[0]
-        i_pivot = candidates_idx[0]
-        if mags[i_pivot] > 1e-12:
-            phase = flat[i_pivot] / mags[i_pivot]
-            Uc = U / phase
-        else:
-            Uc = U.copy()
-        Uc[np.abs(Uc) < 1e-5] = 0
-        return (np.round(Uc.real, 4) + 1j * np.round(Uc.imag, 4)).tobytes()
-
-    for M, idx_map in M_unique:
-        # F[ev_M] equals F[ev] permuted by M^-T (an integer grid automorphism, since det M = +/-1), so when M^-T also
-        # preserves the grid the forward FFT is a pure index gather of the precomputed FB_plus (no FFT); otherwise
-        # fall back to the direct FFT. |F[ev_M]| is then a necessary-condition prune for a translation match either
-        # way, skipping the (expensive) correlation for the vast majority of M's that are not symmetries.
-        M_invT = np.rint(np.linalg.inv(M)).astype(np.int64).T
-        if _M_preserves_grid(M_invT, nk):
-            # cheap signature: reject unless |FB| is invariant under M^-T at the K distinctive points (necessary)
-            sig_mapped = _apply_M_to_points(M_invT, sig_coords, nk)
-            plus_ok = np.allclose(absFB_plus_flat[sig_mapped], sig_ref_plus, rtol=0.0, atol=mag_atol)
-            minus_ok = np.allclose(absFB_minus_flat[sig_mapped], sig_ref_minus, rtol=0.0, atol=mag_atol)
-            if not (plus_ok or minus_ok):
+    for M in M_candidates:
+        if not np.allclose(ev_flat[_apply_M_to_points(M, probe_coords, nk)], ev_flat[probe], atol=10 * atol):
+            continue
+        idx_map = _apply_M_to_kgrid_indices(M, nk)
+        Hg = H_flat[idx_map].reshape(H.shape)
+        ev_g = ev_flat[idx_map].reshape(ev.shape)  # eigvalsh(Hg) = ev reindexed by the grid action
+        for conj in (False, True):
+            U = _solve_U_for_op(Hg, H.conj() if conj else H, atol, ev_k=ev, ev_g=ev_g)
+            if U is None:
                 continue
-            r_map = _apply_M_to_kgrid_indices(M_invT, nk)  # full frequency map, only for signature survivors
-            FA = None  # the full complex FA is built lazily, only when a sigma survives
-        else:
-            if idx_map is None:
-                idx_map = _apply_M_to_kgrid_indices(M, nk)
-            FA = sp.fft.fftn(_apply_M_to_ev_field(M, ev, nk, idx_map), axes=(0, 1, 2))
-            abs_FA = np.abs(FA).reshape(-1, norb)
-            plus_ok = np.allclose(abs_FA, absFB_plus_flat, rtol=0.0, atol=mag_atol)
-            minus_ok = np.allclose(abs_FA, absFB_minus_flat, rtol=0.0, atol=mag_atol)
-            r_map = None
-
-        for sigma, FB, B_sq, sig_ok in (
-            (+1, FB_plus, B_plus_sq, plus_ok),
-            (-1, FB_minus, B_minus_sq, minus_ok),
-        ):
-            if not sig_ok:
+            action_key = (idx_map.tobytes(), conj, _canon_U_bytes(U))
+            if action_key in seen_actions:
                 continue
-            if FA is None:
-                FA = FB_plus_flat[r_map].reshape(FB_plus.shape)
-            qs = _fft_q_scan_cached(FA, B_plus_sq, FB, B_sq, atol)
-            if not qs:
-                continue
-            ev_k = ev if sigma > 0 else ev_neg  # eigvalsh(sigma * H[.conj]) is +/- ev, never recomputed in the solver
-            for q in qs:
-                if idx_map is None:
-                    idx_map = _apply_M_to_kgrid_indices(M, nk)
-                idx_q = _translate_kgrid(idx_map, q, nk)
-                idx_q_key = idx_q.tobytes()
-                Hg = None
-                ev_g = None
-                for conj in (False, True):
-                    # Quick dedup: if this (idx_q, sigma, conj) already has an op, one U is enough (determined up to the
-                    # group's commutant - redundant for the IBZ), but we keep distinct U's as different group elts.
-                    if Hg is None:
-                        Hg = H_flat[idx_q].reshape(nx, ny, nz, norb, norb)
-                        ev_g = ev_flat[idx_q].reshape(nx, ny, nz, norb)  # eigvalsh(Hg) = ev reindexed by the action
-                    Hk_eff = sigma * (H.conj() if conj else H)
-                    U = _solve_U_for_op(Hg, Hk_eff, atol, ev_k=ev_k, ev_g=ev_g)
-                    if U is None:
-                        continue
-                    action_key = (idx_q_key, sigma, conj, _canon_U_bytes(U))
-                    if action_key in seen_actions:
-                        continue
-                    seen_actions.add(action_key)
-                    ops.append(
-                        {
-                            "M": M.copy(),
-                            "q": np.array(q, dtype=np.int64),
-                            "U": U,
-                            "sigma": sigma,
-                            "conj": conj,
-                        }
-                    )
+            seen_actions.add(action_key)
+            ops.append({"M": M.copy(), "q": np.zeros(3, dtype=np.int64), "U": U, "sigma": 1, "conj": conj})
+    if verbose:
+        print(f"  Integer matrices: {len(M_candidates)} grid-compatible; validated operations: {len(ops)}")
     return ops, len(ops)
 
 
@@ -736,14 +585,12 @@ class _GroupElement:
         if abs(flat[idx_pivot]) > 1e-12:
             phase = flat[idx_pivot] / abs(flat[idx_pivot])
             U = U / phase
-        U_clean = U.copy()
-        U_clean[np.abs(U_clean) < 1e-5] = 0
-        self.U = U_clean
+        self.U = U
         self.sigma = int(sigma)
         self.conj = bool(conj)
-        # Key: the GRID ACTION, sigma, conj, and the canonicalized U. Using the grid action (not raw M, q) merges
-        # operations with different (M, q) but identical effect on the discrete grid.
-        Ur = np.round(self.U.real, 4) + 1j * np.round(self.U.imag, 4)
+        # Key: the GRID ACTION, sigma, conj, and U rounded to 4 decimals (+0 maps -0.0 to 0.0). Using the grid action
+        # (not raw M, q) merges operations with different (M, q) but identical effect on the discrete grid.
+        Ur = np.round(self.U, 4) + (0.0 + 0.0j)
         grid_key = _grid_action_bytes(self.M, self.q, self.nk)
         self._key = (grid_key, self.sigma, self.conj, Ur.tobytes())
 
@@ -784,7 +631,7 @@ def _compose(ga, gb, nk):
     """
     Ns = np.array(nk, dtype=np.int64)
     M = ga.M @ gb.M
-    q = (ga.M @ gb.q + ga.q) % Ns
+    q = ((ga.M * (Ns[:, None] // Ns[None, :])) @ gb.q + ga.q) % Ns  # M[i, j] acts on the grid with N_i / N_j
     sigma = ga.sigma * gb.sigma
     conj = ga.conj ^ gb.conj
     Ub = gb.U if not ga.conj else gb.U.conj()
@@ -803,7 +650,7 @@ def _inverse(g, nk):
     Ns = np.array(nk, dtype=np.int64)
     M_inv = np.linalg.inv(g.M.astype(float))
     M_inv = np.round(M_inv).astype(np.int64)
-    q_inv = (-M_inv @ g.q) % Ns
+    q_inv = (-(M_inv * (Ns[:, None] // Ns[None, :])) @ g.q) % Ns
     U_inv = g.U.conj().T if not g.conj else g.U.T
     return _GroupElement(M_inv, q_inv, U_inv, g.sigma, g.conj, nk)
 
@@ -816,12 +663,20 @@ def _close_group(ops_raw, norb, nk, max_size=10000):
     :param ops_raw: The list of discovered operation dicts.
     :param norb: Number of orbitals.
     :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
-    :param max_size: Maximum allowed group size before bailing out.
+    :param max_size: Maximum allowed group size before bailing out with a ``RuntimeWarning`` (the set is then not
+        closed).
     :return: The closed set of :class:`_GroupElement`.
     """
     group = {_GroupElement.identity(norb, nk)}
     for o in ops_raw:
         group.add(_GroupElement(o["M"], o["q"], o["U"], o["sigma"], o["conj"], nk))
+
+    def done():
+        if len(group) >= max_size:
+            message = f"Symmetry group closure stopped at {len(group)} elements, the set is not closed."
+            warnings.warn(message, RuntimeWarning)
+        return group
+
     changed = True
     while changed and len(group) < max_size:
         changed = False
@@ -833,12 +688,25 @@ def _close_group(ops_raw, norb, nk, max_size=10000):
                     group.add(p)
                     changed = True
                     if len(group) >= max_size:
-                        return group
-    return group
+                        return done()
+    return done()
 
 
 # ============================================================================
 # Orbit collapse and reconstruction
+
+
+def _ordered(group, nk):
+    """
+    Lists a group deterministically: the identity first, the rest sorted by their canonical keys. Set iteration order
+    depends on the process's hash seed, so an argmin over this list picks the same carrier in every process.
+
+    :param group: The group elements (iterable of :class:`_GroupElement`, containing the identity).
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+    :return: The elements as a list, identity first.
+    """
+    identity = _GroupElement.identity(next(iter(group)).U.shape[0], nk)
+    return [identity] + sorted((g for g in group if g != identity), key=lambda g: g._key)
 
 
 def _g_action_on_kgrid(g, nk):
@@ -855,8 +723,9 @@ def _g_action_on_kgrid(g, nk):
 
 def point_group_orbits(group, nk: tuple) -> tuple[np.ndarray, np.ndarray]:
     r"""
-    Collapses the grid into the orbits of the point-like part of a closed symmetry group: the unitary elements whose
-    action on the axes with more than one point is a signed permutation without translation, i.e. the elements that
+    Collapses the grid into the orbits of the point-like part of a closed symmetry group: the unitary, sign-free
+    (``sigma = +1``) elements whose action on the axes with more than one point is a signed permutation without
+    translation, i.e. the elements that
     act on the real-space grid exactly as on the momentum grid. Returns, per flat grid index, the smallest flat index
     of its orbit and the orbital unitary of the element carrying that representative onto the index, so that
     :math:`T(\mathbf{k}) = U_{\mathbf{k}} T(\mathbf{k}_{\mathrm{rep}}) U^\dagger_{\mathbf{k}}` for a two-index tensor
@@ -871,13 +740,11 @@ def point_group_orbits(group, nk: tuple) -> tuple[np.ndarray, np.ndarray]:
     def point_like(g) -> bool:
         m = g.M[np.ix_(active, active)]
         signed_permutation = np.array_equal(m.T @ m, np.eye(len(active), dtype=np.int64))
-        return not g.conj and signed_permutation and all(int(g.q[axis]) % nk[axis] == 0 for axis in active)
+        translation_free = all(int(g.q[axis]) % nk[axis] == 0 for axis in active)
+        return not g.conj and g.sigma == 1 and signed_permutation and translation_free
 
-    elements = [g for g in group if point_like(g)]
+    elements = _ordered([g for g in group if point_like(g)], nk)
     idx_maps = np.stack([_g_action_on_kgrid(g, nk) for g in elements])
-    # the identity first, so a representative is carried onto itself by the identity rather than by a stabilizer
-    first = np.argsort([not np.array_equal(m, np.arange(len(m))) for m in idx_maps], kind="stable")
-    elements, idx_maps = [elements[j] for j in first], idx_maps[first]
     carriers = [_inverse(g, nk).U for g in elements]
     us = np.asarray(carriers)[idx_maps.argmin(axis=0)]
     return idx_maps.min(axis=0), us
@@ -896,7 +763,7 @@ def _orbit_collapse(H, group):
     nx, ny, nz, norb, _ = H.shape
     nk = (nx, ny, nz)
     nktot = nx * ny * nz
-    g_list = list(group)
+    g_list = _ordered(group, nk)
     idx_maps = np.stack([_g_action_on_kgrid(g, nk) for g in g_list], axis=0)
     orbit_min = idx_maps.min(axis=0)
     g_to_rep = np.argmin(idx_maps, axis=0)
@@ -921,7 +788,9 @@ def get_symmetry_reduction(H, atol=1e-8, verbose=False, include_antiunitary=Fals
         :math:`H(\mathbf{k}) = H(\mathbf{k})^*`) are discarded after discovery. They are valid symmetries of H, but for
         frequency-dependent objects they additionally require a Matsubara-frequency flip :math:`\imath\omega \to
         -\imath\omega` that the FBZ-mapping path does not perform; keep the default unless reducing a strictly static
-        quantity (such as H itself or a band structure).
+        quantity (such as H itself or a band structure). Anti-symmetries (``sigma = -1``) and operations with a
+        reciprocal translation (``q != 0``) are discarded in any case: neither is a symmetry of the correlation
+        functions the zone is used for.
     :return: A dict with keys ``'group'`` (the discovered :class:`_GroupElement` list), ``'irrk_ind'`` (flat IBZ
         representative indices), ``'fbz2irrk'`` (per-k representative field), ``'expand'`` (callable mapping IBZ
         Hamiltonian values to the full BZ), ``'expand_tensor'`` (callable for arbitrary-rank tensors with per-axis
@@ -1136,8 +1005,8 @@ def apply_auto_orbital_transform(
         M_{1234}(\mathbf{k}) &= \sigma_{\mathbf{k}}^2\, U_{1a} [M_{abcd}(\mathbf{k}_{\mathrm{rep}})]^{[*\mathrm{conj}_k]}
                                 U^\dagger_{b2} U_{3c} U^\dagger_{d4}
 
-    Since :math:`\sigma_{\mathbf{k}} = \pm 1`, :math:`\sigma_{\mathbf{k}}^2 = 1`; the 4-index case effectively has no
-    sign factor, which is the correct physics for vertex quantities under particle-hole-like antisymmetries.
+    Since :math:`\sigma_{\mathbf{k}} = \pm 1`, :math:`\sigma_{\mathbf{k}}^2 = 1`, so the 4-index case carries no sign
+    factor (the group a grid discovers has :math:`\sigma_{\mathbf{k}} = +1` throughout in any case).
 
     :param mat: Input tensor of shape ``(k_local, nb, [nb, nb,] nb, ...)``. The leading axis may be the full FBZ or a
         contiguous slice of it; ``us``, ``sigmas`` and ``conjs`` must be sliced consistently.

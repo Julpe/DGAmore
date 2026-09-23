@@ -1091,7 +1091,7 @@ def test_wedge_window_points_shrink_only_under_point_like_operations():
 
 
 def test_wedge_orbits_partition_the_grid_by_star():
-    """Every grid index appears once, grouped by star, and the auto grid's translation members split the stars."""
+    """Every grid index appears once, grouped by star; on the auto grid the stars are its irreducible zone."""
     grid = bz.KGrid((4, 4, 1), symmetries=[bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV])
     points, offsets, order, us = es._wedge_orbits(grid)
     assert sorted(order.tolist()) == list(range(grid.nk_tot)) and offsets[-1] == grid.nk_tot and us is None
@@ -1100,7 +1100,7 @@ def test_wedge_orbits_partition_the_grid_by_star():
         assert set(inv[order[offsets[r] : offsets[r + 1]]]) == {r} and inv[points[r]] == r
     auto = _rotating_auto_grid((4, 4, 1))
     points, offsets, order, us = es._wedge_orbits(auto)
-    assert auto.nk_irr < len(points) < auto.nk_tot and us.shape == (auto.nk_tot, 2, 2)
+    assert auto.nk_irr == len(points) < auto.nk_tot and us.shape == (auto.nk_tot, 2, 2)
     assert all(np.allclose(us[point], np.eye(2)) for point in points)
 
 
