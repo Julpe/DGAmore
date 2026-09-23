@@ -41,6 +41,26 @@ def uniquify_path(path: str = None):
     return path
 
 
+def create_output_folders() -> None:
+    """
+    Creates the run's output folder and, where their content is produced, the plots and Eliashberg subfolders. The
+    plots folder is needed by the general plots and by the spectrum plot of the analytic continuation alike.
+
+    :return: None.
+    """
+    spectrum_plot = config.ana_cont.plot_spectrum and (
+        config.ana_cont.do_spectrum_dga or config.ana_cont.do_spectrum_dmft
+    )
+    wanted = {
+        config.output.output_path: True,
+        config.output.plotting_path: config.output.do_plotting or spectrum_plot,
+        config.output.eliashberg_path: config.eliashberg.perform_eliashberg,
+    }
+    for path, needed in wanted.items():
+        if needed and not os.path.exists(path):
+            os.makedirs(path)
+
+
 def load_from_dmft_file_and_update_config() -> (
     tuple[list[GreensFunction], list[SelfEnergy], list[LocalFourPoint], list[LocalFourPoint]]
 ):
@@ -107,12 +127,7 @@ def load_from_dmft_file_and_update_config() -> (
     config.output.plotting_path = os.path.join(config.output.output_path, config.output.plotting_subfolder_name)
     config.output.eliashberg_path = os.path.join(config.output.output_path, config.eliashberg.subfolder_name)
 
-    if not os.path.exists(config.output.output_path):
-        os.makedirs(config.output.output_path)
-    if not os.path.exists(config.output.plotting_path) and config.output.do_plotting:
-        os.makedirs(config.output.plotting_path)
-    if not os.path.exists(config.output.eliashberg_path) and config.eliashberg.perform_eliashberg:
-        os.makedirs(config.output.eliashberg_path)
+    create_output_folders()
 
     for i in range(len(g2_dens_per_ineq)):
         g2_dens_per_ineq[i] = g2_dens_per_ineq[i].cut_niw_and_niv(config.box.niw_core, config.box.niv_core)

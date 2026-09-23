@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from dgamore import config
-from dgamore.dga_io import set_hamiltonian
+from dgamore.dga_io import create_output_folders, set_hamiltonian
 from dgamore.hamiltonian import Hamiltonian
 
 TEST_DATA = f"{os.path.dirname(os.path.abspath(__file__))}/test_data"
@@ -99,3 +99,33 @@ def test_unrecognized_interaction_types_fall_back_to_from_dmft(int_type):
     u_loc = set_hamiltonian(*KINETIC, int_type, "").get_local_u()
     assert np.array_equal(u_loc.mat, Hamiltonian().kanamori_interaction_d(2, 8.0, 0.0, 0.0).get_local_u().mat)
     assert config.logger.warning.called
+
+
+def _recorded_folder_creations(monkeypatch, do_plotting: bool, do_spectrum: bool, plot_spectrum: bool) -> list:
+    """Runs the output-folder setup with no folder present and returns the paths it asked to create."""
+    created = []
+    monkeypatch.setattr(os.path, "exists", lambda path: False)
+    monkeypatch.setattr(os, "makedirs", lambda path: created.append(path))
+    config.output.output_path = "/run"
+    config.output.plotting_path = "/run/Plots"
+    config.output.eliashberg_path = "/run/Eliashberg"
+    config.output.do_plotting = do_plotting
+    config.ana_cont.do_spectrum_dga = do_spectrum
+    config.ana_cont.plot_spectrum = plot_spectrum
+    config.eliashberg.perform_eliashberg = False
+    create_output_folders()
+    return created
+
+
+def test_create_output_folders_makes_the_plots_folder_for_a_spectrum_plot_without_general_plotting(monkeypatch):
+    """A requested spectrum plot needs the plots folder even when the general plotting switch is off."""
+    created = _recorded_folder_creations(monkeypatch, do_plotting=False, do_spectrum=True, plot_spectrum=True)
+
+    assert created == ["/run", "/run/Plots"]
+
+
+def test_create_output_folders_skips_the_plots_folder_when_nothing_is_plotted(monkeypatch):
+    """Without general plotting and without a spectrum plot only the run folder is created."""
+    created = _recorded_folder_creations(monkeypatch, do_plotting=False, do_spectrum=True, plot_spectrum=False)
+
+    assert created == ["/run"]

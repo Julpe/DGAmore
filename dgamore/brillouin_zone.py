@@ -469,8 +469,9 @@ class KGrid:
         :param include_antiunitary: If False (default), anti-unitary symmetries (``conj=True``, i.e.
             :math:`H(\mathbf{k}) = H(\mathbf{k})^*`-style time-reversal) are dropped after discovery. They are valid
             symmetries of H but, for frequency-dependent quantities, additionally require a Matsubara-frequency flip
-            that ``_map_to_full_bz`` does not perform; keeping ``False`` makes the IBZ-to-FBZ expansion safe for any
-            object with the same lattice symmetry as H, at the cost of a possibly larger IBZ.
+            that ``_map_to_full_bz`` does not perform. Anti-symmetries (``sigma = -1``) and operations with a
+            reciprocal translation are dropped in any case, so with the default the IBZ-to-FBZ expansion is safe for
+            any object with the same lattice symmetry as H, at the cost of a possibly larger IBZ.
         :return: None.
         :raises RuntimeError: If the grid was not constructed in auto mode.
         :raises ValueError: If ``hk``'s shape does not match the grid or is not ``(nx, ny, nz, nb, nb)``.

@@ -11,6 +11,7 @@ import pytest
 
 import dgamore.brillouin_zone as bz
 from dgamore.brillouin_zone import KPath, KnownKPoints, Labels
+from dgamore.hamiltonian import Hamiltonian
 
 
 def test_applies_inversion_symmetry_along_x_axis():
@@ -730,12 +731,12 @@ def test_specify_auto_symmetries_default_drops_antiunitary_ops():
 
 
 def test_specify_auto_symmetries_with_include_antiunitary_admits_conj_ops():
-    """include_antiunitary=True gives a larger group; for a real H some FBZ points carry conj=True."""
+    """include_antiunitary=True gives a larger group; for a real H it contains conj=True elements."""
     nx, ny, nz, nb = 4, 4, 4, 1
     H = _make_small_real_cubic_h(nx, ny, nz, nb)
     grid = bz.KGrid(nk=(nx, ny, nz), symmetries=[bz.KnownSymmetries.AUTO])
     grid.specify_auto_symmetries(H, include_antiunitary=True)
-    assert int(grid._auto_conjs.sum()) > 0
+    assert any(g.conj for g in grid._auto_group)
 
 
 def test_specify_auto_symmetries_with_include_antiunitary_yields_smaller_or_equal_ibz():
@@ -805,16 +806,29 @@ def test_plain_symmetry_kgrid_three_dimensional_cubic_unchanged():
     assert grid.irrk_count.sum() == 64
 
 
-def test_specify_auto_symmetries_finds_at_least_explicit_cubic_symmetries_for_cubic_h():
-    """For a real cubic H the auto IBZ is no larger than the explicit three_dimensional_cubic IBZ."""
+def test_specify_auto_symmetries_matches_the_explicit_cubic_zone_for_a_nearest_neighbor_cubic_h():
+    """For a real nearest-neighbor cubic H the auto IBZ is exactly the explicit three_dimensional_cubic IBZ."""
     H = _make_small_real_cubic_h(4, 4, 4, 1)
     g_auto = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
     g_auto.specify_auto_symmetries(H)
     g_explicit = bz.KGrid(nk=(4, 4, 4), symmetries=bz.three_dimensional_cubic_symmetries())
-    assert g_auto.nk_irr <= g_explicit.nk_irr
+    assert g_auto.nk_irr == g_explicit.nk_irr
     # auto refines the cubic orbits: fbz2irrk_auto must be constant on each explicit-group orbit
     fbz_auto = g_auto.fbz2irrk.ravel()
     fbz_explicit = g_explicit.fbz2irrk.ravel()
     for explicit_rep in np.unique(fbz_explicit):
         members = np.where(fbz_explicit == explicit_rep)[0]
         assert len(np.unique(fbz_auto[members])) == 1
+
+
+def test_specify_auto_symmetries_keeps_the_square_zone_for_nearest_neighbor_hopping_only():
+    """t_tp_tpp with tp = tpp = 0 obeys e(k + (pi, pi)) = -e(k); the anti-symmetry must not shrink the zone below D4."""
+    nk = (8, 8, 1)
+    grid = bz.KGrid(nk=nk, symmetries=[bz.KnownSymmetries.AUTO])
+    ek = Hamiltonian().kinetic_one_band_2d_t_tp_tpp(1.0, 0.0, 0.0).get_ek(grid)
+
+    grid.specify_auto_symmetries(ek)
+
+    explicit = bz.KGrid(nk=nk, symmetries=bz.two_dimensional_square_symmetries())
+    assert grid.nk_irr == explicit.nk_irr == 15
+    assert np.array_equal(grid.fbz2irrk, explicit.fbz2irrk)
