@@ -413,6 +413,7 @@ class KGrid:
         self._auto_sigmas = None  # shape (nx, ny, nz), float (+/-1)
         self._auto_conjs = None  # shape (nx, ny, nz), bool
         self._auto_group = None  # the closed group of discovered operations
+        self._auto_groups: dict = {}  # cached k-point groups of the orbital transformation, see auto_orbital_groups
 
         self.nk = nk
         self.set_k_axes()
@@ -513,6 +514,28 @@ class KGrid:
 
         # fbz2sym is kept as built by the trivial set_fbz2irrk path on the auto sentinel; it is not consumed by
         # _map_to_full_bz in auto mode and remains for backwards compatibility only.
+
+    def auto_orbital_groups(self, dtype, num_orbital_dimensions: int) -> list[np.ndarray]:
+        """
+        Returns the full-BZ k-point groups that share one auto-discovered orbital transformation (see
+        :func:`dgamore.symmetry_reduction.auto_transform_groups`) for rotations held in ``dtype``, with the sign
+        raised to the power the transformation of ``num_orbital_dimensions`` orbital axes applies. The groups are
+        computed once per dtype and orbital-axis count and recomputed when the transformation arrays are replaced.
+
+        :param dtype: Element type of the tensors the transformation is applied to.
+        :param num_orbital_dimensions: Number of transformed orbital axes (2 or 4).
+        :return: The k-point index arrays of the groups.
+        """
+        from dgamore.symmetry_reduction import auto_transform_groups
+
+        arrays = (self._auto_us, self._auto_sigmas, self._auto_conjs)
+        key = (np.dtype(dtype), num_orbital_dimensions)
+        cached = self._auto_groups.get(key)
+        if cached is None or any(a is not b for a, b in zip(cached[0], arrays)):
+            us = self._auto_us.reshape(self.nk_tot, *self._auto_us.shape[3:]).astype(dtype, copy=False)
+            sigmas = self._auto_sigmas.reshape(-1) ** (num_orbital_dimensions // 2)
+            cached = self._auto_groups[key] = (arrays, auto_transform_groups(us, sigmas, self._auto_conjs.reshape(-1)))
+        return cached[1]
 
     @property
     def is_auto(self) -> bool:

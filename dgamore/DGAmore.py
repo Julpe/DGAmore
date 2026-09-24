@@ -420,7 +420,8 @@ def run_dga_routine(comm: MPI.Comm) -> None:
     del sigma_dmft_full, sigma_loc_full
     logger.info("Non-local ladder-DGA routine finished.")
 
-    giwk_dga = GreensFunction.get_g_full(sigma_dga, config.sys.mu, ek, config.sys.beta)
+    # only rank 0 reads the DGA self-energy and Green's function after the loop (files, plots, MaxEnt, pp bubble)
+    giwk_dga = GreensFunction.get_g_full(sigma_dga, config.sys.mu, ek, config.sys.beta) if comm.rank == 0 else None
 
     if config.ana_cont.do_spectrum_dga:
         spectrum = max_ent.perform_maxent_giwk(giwk_dga, "DGA", comm)
@@ -449,7 +450,6 @@ def run_dga_routine(comm: MPI.Comm) -> None:
                 nk=config.lattice.nk,
                 beta=config.sys.beta,
             ).cut_niv(config.box.niv_core)
-        g_latt = comm.bcast(g_latt, root=0)
         spectrum = max_ent.perform_maxent_giwk(g_latt, "DMFT", comm)
 
         if config.ana_cont.plot_spectrum and comm.rank == 0:
@@ -517,9 +517,10 @@ def run_dga_routine(comm: MPI.Comm) -> None:
 
     if config.eliashberg.perform_eliashberg:
         logger.info("Starting with Eliashberg equation.")
-        # sigma_dga is already saved to disk and never consumed by the Eliashberg step - drop the replicated
-        # full-grid copy on every rank before the memory-heavy vertex construction
-        sigma_dga.free()
+        # sigma_dga is already saved to disk and never consumed by the Eliashberg step - drop rank 0's copy before
+        # the memory-heavy vertex construction
+        if comm.rank == 0:
+            sigma_dga.free()
         results = eliashberg_solver.solve(giwk_dga, g_dmft_full, u_loc, v_nonloc, comm, chunk_budgets)
 
         def gap_stem(channel, parity):
@@ -581,11 +582,11 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     The budget is a **node total**: on a node with ``r`` ranks the memory held by all of them at a branch's peak is
     ``r * (baseline + distributed) + single`` (every rank holds the branch's persistent baseline; a *distributed*
     transient is held by every rank at once, a *single-rank* transient by one rank while the others idle), minus
-    ``(r - 1) * giwk_shareable`` for the branch's node-shared ``giwk_full`` window, and this must not exceed
+    ``(r - 1) * giwk_shareable`` for the branch's node-shared windows, and this must not exceed
     ``NODE_MEMORY_FRACTION`` times the node budget - ``psutil.virtual_memory().available``, capped by the cgroup
     memory limit when the scheduler sets one (see :func:`dgamore.mpi_utils.cgroup_memory_limit`). Each
-    node's rank count, available memory and job memory total are collected with a single ``allgather`` of
-    ``(hostname, available_bytes, total_bytes)``; a branch's path is judged to "fit" only if it fits on **every**
+    node's rank count and available memory are collected with a single ``allgather`` of
+    ``(hostname, available_bytes)``; a branch's path is judged to "fit" only if it fits on **every**
     node (the flags are process-wide, so the tightest node governs, and a single-rank transient may land on any
     node). The
     Eliashberg solver's single-rank peak is doubled on a single-node multi-rank job because the singlet and triplet
@@ -594,13 +595,9 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
 
     The three chunked builds get the memory their residents leave below the node budget: for every chunked branch
     :func:`dgamore.memory_estimator.max_chunk_budget` searches the largest per-rank chunk budget whose modeled node
-    total stays inside every node's budget line (identical on every rank, as the estimate is). The
-    auxiliary-susceptibility and pairing-vertex builds fill the line of the available memory (their results do not
-    depend on the chunking); the self-energy passes stop at their residents plus
-    :data:`~dgamore.memory_estimator.SDE_HEADROOM_SHARE` of the headroom below the job memory total, so their chunk
-    schedule - and with it their floating-point reduction order - stays reproducible across reruns, and fall back
-    to the floor budget when the memory actually available does not hold that. The fit checks then model exactly
-    the budgets the builds receive.
+    total stays inside every node's line of available memory (identical on every rank, as the estimate is). The
+    results of all three builds do not depend on their chunking. The fit checks then model exactly the budgets the
+    builds receive.
 
     :param comm: The MPI communicator (used to group ranks by node).
     :return: The per-rank chunk byte budgets of the chunked builds (:class:`~dgamore.memory_estimator.ChunkBudgets`).
@@ -616,12 +613,11 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         node_available = min(node_available, cgroup_limit)
     hostname = socket.gethostname()
     nodes: dict[str, list] = {}
-    for host, avail, total in comm.allgather((hostname, node_available, mpi_utils.job_memory_total())):
+    for host, avail in comm.allgather((hostname, node_available)):
         if host not in nodes:
-            nodes[host] = [0, avail, total]
+            nodes[host] = [0, avail]
         nodes[host][0] += 1
         nodes[host][1] = min(nodes[host][1], avail)
-        nodes[host][2] = min(nodes[host][2], total)
 
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
     # Must mirror the giwk_full window the SDE section starts from in nonlocal_sde.calculate_self_energy_q.
@@ -641,11 +637,19 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         with_eliashberg=config.eliashberg.perform_eliashberg,
         save_pairing_vertex=config.eliashberg.save_pairing_vertex,
         n_eig=config.eliashberg.n_eig,
+        mixing_pairs=(
+            min(config.self_consistency.mixing_history_length + 1, config.self_consistency.max_iter)
+            if config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson")
+            else 0
+        ),
+        niv_interp=(
+            config.self_energy_interpolation.niv_target if config.self_energy_interpolation.do_interpolation else 0
+        ),
     )
 
     def node_total(bp: memory_estimator.BranchPeak, distributed: float, single: float, n_ranks: int) -> float:
         """Memory held on a node with ``n_ranks`` ranks at a branch's peak (see :func:`autodetect_memory_settings`).
-        The branch's shareable ``giwk_full`` is counted once per node instead of once per rank."""
+        The branch's node-shared windows are counted once per node instead of once per rank."""
         total = n_ranks * (bp.baseline + distributed) + single
         total -= (n_ranks - 1) * bp.giwk_shareable
         return total
@@ -653,7 +657,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     def fits_everywhere(bp: memory_estimator.BranchPeak, distributed: float, single: float) -> bool:
         """Whether a transient (per-rank ``distributed`` + one-off ``single``) fits the node budget on every node."""
         return all(
-            node_total(bp, distributed, single, r) <= avail * NODE_MEMORY_FRACTION for r, avail, _ in nodes.values()
+            node_total(bp, distributed, single, r) <= avail * NODE_MEMORY_FRACTION for r, avail in nodes.values()
         )
 
     zero_budgets = memory_estimator.ChunkBudgets(0, 0, 0)
@@ -663,43 +667,26 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         bp = estimate(chunk_budgets=dataclasses.replace(zero_budgets, **{key: budget}))[key]
         return node_total(bp, bp.off_distributed, bp.off_single, r)
 
-    def sized_budget(key: str, from_total: bool, share: float = 1.0) -> int:
-        """Largest per-rank chunk budget of the chunked branch ``key`` that keeps every node inside its budget line:
-        the available memory, or (``from_total``) the residents plus ``share`` of the headroom below the job memory
-        total, for a chunk schedule that is reproducible across reruns."""
+    def sized_budget(key: str) -> int:
+        """Largest per-rank chunk budget of the chunked branch ``key`` that keeps every node inside its line of
+        available memory."""
         if key not in estimate(chunk_budgets=zero_budgets):
             return memory_estimator.SLICE_CHUNK_BYTES
-        lines = {}
-        for host, (r, avail, total) in nodes.items():
-            residents = branch_total(key, 0, r)
-            total_line = residents + share * (total * NODE_MEMORY_FRACTION - residents)
-            lines[host] = total_line if from_total else avail * NODE_MEMORY_FRACTION
         return memory_estimator.max_chunk_budget(
-            lambda budget: all(branch_total(key, budget, r) <= lines[host] for host, (r, *_) in nodes.items())
+            lambda budget: all(
+                branch_total(key, budget, r) <= avail * NODE_MEMORY_FRACTION for r, avail in nodes.values()
+            )
         )
 
     budgets = memory_estimator.ChunkBudgets(
-        chiq_aux=sized_budget("chiq_aux", from_total=False),
-        sde=sized_budget("sde", from_total=True, share=memory_estimator.SDE_HEADROOM_SHARE),
-        fq=sized_budget("fq", from_total=False),
+        chiq_aux=sized_budget("chiq_aux"), sde=sized_budget("sde"), fq=sized_budget("fq")
     )
     peaks = estimate(chunk_budgets=budgets)
-    # The self-energy budget is sized from the job memory total; when the memory actually available does not hold
-    # it, the passes fall back to the floor budget instead of failing the run over the chunk size.
-    if "sde" in peaks and budgets.sde > memory_estimator.SLICE_CHUNK_BYTES:
-        bp_sde = peaks["sde"]
-        if not fits_everywhere(bp_sde, bp_sde.off_distributed, bp_sde.off_single):
-            logger.warning(
-                f"The self-energy chunk budget of {budgets.sde / 1024**3:.3f} GB per rank does not fit the available "
-                f"memory; falling back to the {memory_estimator.SLICE_CHUNK_BYTES / 1024**3:.3f} GB floor."
-            )
-            budgets = dataclasses.replace(budgets, sde=memory_estimator.SLICE_CHUNK_BYTES)
-            peaks = estimate(chunk_budgets=budgets)
 
     def team_need(n_ranks: int) -> float:
         """Node peak of the team solve's leanest round (one channel's sectors per node), as its planner models it."""
         n_parities = 2 if config.eliashberg.resolve_frequency_parity else 1
-        return n_ranks * memory_estimator.RANK_BASELINE_BYTES + memory_estimator.lanczos_team_bytes(
+        return n_ranks * peaks["lanczos"].baseline + memory_estimator.lanczos_team_bytes(
             config.sys.n_bands,
             config.lattice.k_grid.nk_tot,
             config.lattice.k_grid.nk_irr,
@@ -718,12 +705,12 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         return "whole block" if budget >= memory_estimator.MAX_CHUNK_BUDGET_BYTES else f"{budget / 1024**3:.3f} GB"
 
     logger.info(
-        f"Chunk budgets per rank: auxiliary susceptibility {budget_label(budgets.chiq_aux)}, self-energy passes "
+        f"Chunk budgets per rank: auxiliary susceptibility {budget_label(budgets.chiq_aux)}, self-energy contraction "
         f"{budget_label(budgets.sde)}, pairing vertex {budget_label(budgets.fq)}."
     )
 
-    # The Schwinger-Dyson contraction always runs the two-pass FFT path (the q-loop variant is unused - it peaked
-    # HIGHER); its single path is still checked so an oversized box fails fast, not mid-run.
+    # The Schwinger-Dyson contraction always runs the column-distributed real-space path (the q-loop variant is
+    # unused - it peaked HIGHER); its single path is still checked so an oversized box fails fast, not mid-run.
     if "sde" in peaks:
         bp_sde = peaks["sde"]
         if not fits_everywhere(bp_sde, bp_sde.off_distributed, bp_sde.off_single):
@@ -751,6 +738,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         ("chi0q", "Bare bubble"),
         ("chiq_aux", "Auxiliary susceptibility"),
         ("sigma_loop", "self-consistency self-energy step"),
+        ("sigma_interp", "self-energy interpolation"),
         ("fq", "Pairing-vertex construction"),
         ("lanczos", "Eliashberg solver"),
     )
@@ -760,7 +748,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         bp = peaks[key]
         fits_in_memory = fits_everywhere(bp, bp.off_distributed, bp.off_single)
         if key == "lanczos" and comm.size > 1:
-            fits_in_memory = all(team_need(r) <= avail * NODE_MEMORY_FRACTION for r, avail, _ in nodes.values())
+            fits_in_memory = all(team_need(r) <= avail * NODE_MEMORY_FRACTION for r, avail in nodes.values())
         fits_grid = key == "lanczos" and fits_everywhere(bp, bp.on_distributed, bp.on_single)
         if not fits_in_memory and not fits_grid:
             worst = max(node_total(bp, bp.off_distributed, bp.off_single, r) for r, *_ in nodes.values())

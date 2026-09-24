@@ -2034,7 +2034,7 @@ def _solve_sectors_in_teams(
     node_comm: MPI.Comm,
     gamma_sing_pp: FourPoint,
     gamma_trip_pp: FourPoint,
-    giwk_dga: GreensFunction,
+    giwk_dga: GreensFunction | None,
     niv_pp: int,
     rounds: tuple[tuple[LanczosTeam, ...], ...],
 ) -> dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]]:
@@ -2566,7 +2566,7 @@ def _solve_sectors_in_memory(
 
 
 def solve(
-    giwk_dga: GreensFunction,
+    giwk_dga: GreensFunction | None,
     g_dmft: GreensFunction,
     u_loc: LocalInteraction,
     v_nonloc: Interaction,
@@ -2581,7 +2581,8 @@ def solve(
     vertex window per channel and node when a node holds such a window (see :func:`plan_lanczos_teams`, decided
     from the available node memory), and on the block-distributed solver grid otherwise.
 
-    :param giwk_dga: The converged momentum-dependent DGA :class:`GreensFunction`.
+    :param giwk_dga: The converged momentum-dependent DGA :class:`GreensFunction` on rank 0 (the pp-bubble build
+        there is its only reader); ``None`` on every other rank.
     :param g_dmft: The local (DMFT) :class:`GreensFunction` (used for the local diagrams).
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
@@ -2664,9 +2665,6 @@ def solve(
                 f"{'all sectors at once' if len(rounds) == 1 else 'one channel at a time'}; one vertex window per "
                 f"channel and hosting node (niv_pp = {niv_pp}, node budget {node_budget / 1024**3:.3f} GB)."
             )
-    # giwk_dga is consumed only by the pp-bubble build on bubble_rank, so every other rank drops its copy
-    if comm.rank != bubble_rank:
-        giwk_dga.free()
 
     chunk_bytes = (
         memory_estimator.dynamic_chunk_budget(mpi_utils.job_memory_total(), node_comm.size if node_comm else 1)

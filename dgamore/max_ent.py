@@ -64,14 +64,14 @@ def orbital_to_band_basis(hk: np.ndarray, data: np.ndarray) -> np.ndarray:
     return data
 
 
-def perform_maxent_giwk(giwk: GreensFunction, name: str, comm: MPI.Comm):
+def perform_maxent_giwk(giwk: GreensFunction | None, name: str, comm: MPI.Comm):
     r"""
     Analytically continues the momentum-dependent Green's function to the real axis via maximum entropy, per
     band and per irreducible-BZ k-point, and assembles the spectral function over the full BZ on rank 0. The
     k-points are distributed across MPI ranks; failed continuations are set to zero. The continuation problem
     (kernel, its SVD and the preblur convolution) is set up once per rank and reused for every k-point and band.
 
-    :param giwk: The momentum-dependent :class:`GreensFunction` to continue.
+    :param giwk: The momentum-dependent :class:`GreensFunction` to continue, read on rank 0 only (``None`` elsewhere).
     :param name: Label of the continued quantity (e.g. ``"DGA"``), used in the log messages and, lowercased, in the
         output file name ``spectral_function_<name>.npy``.
     :param comm: The MPI communicator.

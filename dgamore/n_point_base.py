@@ -806,17 +806,19 @@ class IAmNonLocal(IHaveMat, ABC):
 
         return copy.compress_q_dimension() if compress else copy
 
-    def map_to_full_bz(self, k_grid: "KGrid", nq: tuple = None):
+    def map_to_full_bz(self, k_grid: "KGrid", nq: tuple = None, conjugate: bool = False):
         """
         Maps to full BZ using k_grid's inverse map and precomputed orbital rotation tensors.
 
         :param k_grid: The momentum grid carrying the irreducible-to-full-BZ map and per-k orbital rotations.
         :param nq: Optional override for the number of momenta; if None the object's own ``nq`` is used.
+        :param conjugate: Whether the object holds the complex conjugate of the quantity the grid's orbital rotations
+            were discovered for (see :meth:`_map_to_full_bz`).
         :return: ``self`` expanded to the full BZ (four orbital dimensions transformed).
         """
-        return self._map_to_full_bz(k_grid, 4, nq)
+        return self._map_to_full_bz(k_grid, 4, nq, conjugate)
 
-    def _map_to_full_bz(self, k_grid: "KGrid", num_orbital_dimensions: int, nq: tuple = None):
+    def _map_to_full_bz(self, k_grid: "KGrid", num_orbital_dimensions: int, nq: tuple = None, conjugate: bool = False):
         r"""
         Maps the object from the irreducible to the full Brillouin zone.
 
@@ -839,6 +841,9 @@ class IAmNonLocal(IHaveMat, ABC):
         :param k_grid: The momentum grid carrying the irreducible-to-full-BZ map and per-k orbital rotations.
         :param num_orbital_dimensions: Number of orbital axes to transform; must be 2 or 4.
         :param nq: Optional override for the number of momenta; if None the object's own ``nq`` is used.
+        :param conjugate: If True, the object holds the complex conjugate of the quantity the rotations were
+            discovered for (e.g. a time-reversed kernel), so the rotation runs with the conjugate unitaries
+            :math:`U^*`; this equals conjugating the mapped un-conjugated object.
         :return: ``self`` expanded to the full BZ.
         :raises ValueError: If the object does not have a compressed momentum dimension.
         """
@@ -854,33 +859,39 @@ class IAmNonLocal(IHaveMat, ABC):
         flat_inv = k_grid.irrk_inv.ravel()
         out_shape = (np.prod(self.nq), *self.current_shape[1:])
         expanded = np.empty(out_shape, dtype=self.mat.dtype)
-        np.take(self.mat, flat_inv, axis=0, out=expanded)
+        # mode="clip" writes straight into out (the default "raise" buffers a second output-sized array); the
+        # indices of irrk_inv are valid by construction, so clipping never acts
+        np.take(self.mat, flat_inv, axis=0, out=expanded, mode="clip")
         self.mat = expanded
 
         # Apply per-k orbital transformation if auto-mode data is present.
         if k_grid.is_auto:
             from dgamore import symmetry_reduction
 
+            us = k_grid._auto_us.reshape(np.prod(k_grid.nk), *k_grid._auto_us.shape[3:])
             self.mat = symmetry_reduction.apply_auto_orbital_transform(
                 self.mat,
-                us=k_grid._auto_us.reshape(np.prod(k_grid.nk), *k_grid._auto_us.shape[3:]),
+                us=us.conj() if conjugate else us,
                 sigmas=k_grid._auto_sigmas.reshape(-1),
                 conjs=k_grid._auto_conjs.reshape(-1),
                 num_orbital_dimensions=num_orbital_dimensions,
+                groups=k_grid.auto_orbital_groups(self.mat.dtype, num_orbital_dimensions),
             )
 
         self.update_original_shape()
         return self
 
-    def fft(self, copy: bool = True):
+    def fft(self, copy: bool = True, axes: tuple[int, int, int] = (0, 1, 2)):
         """
         Performs a discrete forward Fourier transform over the momentum dimension and returns a copy if specified.
 
         :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
+        :param axes: Order in which the three momentum axes are transformed; ``(2, 1, 0)`` transforms z, then y, then
+            x. Every order gives the same transform up to rounding.
         :return: The Fourier-transformed object, in the same momentum-compression state as the input.
         """
         if copy:
-            return self.copy().fft(copy=False)
+            return self.copy().fft(copy=False, axes=axes)
 
         compress = False
         if self.has_compressed_q_dimension:
@@ -888,7 +899,7 @@ class IAmNonLocal(IHaveMat, ABC):
             self.decompress_q_dimension()
         # scipy.fft + overwrite_x transforms the complex64 array in place (no extra buffer). Do NOT switch to
         # numpy.fft.fftn: it computes in double precision internally and peaks at ~5x the array size.
-        self.mat = sp.fft.fftn(self.mat, axes=(0, 1, 2), overwrite_x=True)
+        self.mat = sp.fft.fftn(self.mat, axes=axes, overwrite_x=True)
         return self.compress_q_dimension() if compress else self
 
     def ifft(self, copy: bool = True):
