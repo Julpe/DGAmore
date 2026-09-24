@@ -1018,6 +1018,42 @@ def test_resumed_run_shares_the_starting_iterate_per_node_before_the_first_propo
     assert before == []
 
 
+def test_warm_start_holds_the_dmft_filling_and_resolves_mu(monkeypatch, tmp_path):
+    """A resumed run holds the DMFT lattice filling, not its start's filling at the predecessor's mu, and re-solves
+    the start's mu for it before the first proposal."""
+    run, calls, logger = _setup_self_energy_loop(
+        monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0
+    )
+    config.sys.mu_dmft = 0.5
+    start = SelfEnergy(
+        np.full((1, 1, 1, 16), 0.5 + 0.2j, dtype=np.complex64), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0
+    )
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3))
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [0.7])  # the predecessor's mu
+
+    def g_full(siw, mu, ek, beta):
+        n = 0.85 if np.isclose(siw.mat.reshape(-1)[0], 1.0 + 0.1j) and mu == 0.5 else 0.8621
+        fill = (n, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1)))
+        return SimpleNamespace(get_fill_nonlocal=lambda: fill, save=lambda *a, **k: None, free=lambda: None)
+
+    monkeypatch.setattr(nonlocal_sde, "GreensFunction", SimpleNamespace(get_g_full=g_full))
+    solves = []
+    monkeypatch.setattr(nonlocal_sde, "update_mu", lambda mu0, n, *a, **k: solves.append((mu0, n)) or 0.42)
+    fake, proposal_mus = nonlocal_sde.calculate_sigma_proposal, []
+
+    def spy(sigma_in, mu, *args, **kwargs):
+        proposal_mus.append(mu)
+        return fake(sigma_in, mu, *args, **kwargs)
+
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", spy)
+    run()
+    assert solves[0] == (0.7, 0.85)  # the start's mu re-solved for the DMFT lattice filling
+    assert proposal_mus[0] == 0.42 and config.sys.n == 0.85
+    assert all(n == 0.85 for _, n in solves)  # every later mu update holds the same filling
+    infos = [str(c.args[0]) for c in logger.info.call_args_list]
+    assert "Filling of the updated Green's function: 1.000000 (target 0.850000)." in infos  # the stub reports 1.0
+
+
 def test_loop_concatenates_the_previous_iterate_on_rank0_only(monkeypatch, tmp_path):
     """Only rank 0 rebuilds the previous iterate on the DMFT tail each iteration; the other ranks never copy it."""
     seen = _run_loop_on_two_node_ranks(monkeypatch, tmp_path, "concatenate_self_energies", SelfEnergy)

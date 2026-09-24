@@ -989,6 +989,8 @@ def _init_mu_history(starting_iter: int) -> list[float]:
     is synced to it: otherwise ``config.sys.mu`` would stay at the DMFT value while ``giwk_full`` is built with the
     previous run's :math:`\mu`, and any quantity computed from the global (e.g. the lattice filling in
     :meth:`GreensFunction.get_fill_nonlocal`, which now reads ``self._mu``) would use an inconsistent chemical potential.
+    That value is only the starting guess: :func:`calculate_self_energy_q` re-solves it so the starting self-energy has
+    the DMFT lattice filling.
 
     :param starting_iter: The iteration the previous calculation stopped at (0 for a fresh run).
     :return: The single-element chemical-potential history list.
@@ -1593,19 +1595,42 @@ def calculate_self_energy_q(
             sigma_dmft_full, config.sys.mu_dmft, config.lattice.hamiltonian.get_ek(), config.sys.beta
         )
         giwk_full_dmft.save(output_dir=config.output.output_path, name="g_latt_dmft")
+        n_dmft = giwk_full_dmft.get_fill_nonlocal()[0]
         giwk_full_dmft.free()
 
         sigma_old = sigma_old.concatenate_self_energies(sigma_dmft_full)
 
+        if starting_iter > 0:
+            # the loop holds the filling of the DMFT lattice Green's function the local vertex belongs to; a warm
+            # start's own filling (its self-energy at the predecessor's mu) drifts along a chain of rungs, so its mu
+            # is re-solved for the DMFT filling on the loop's frequency box
+            sigma_cut = sigma_old.cut_niv(niv_cut).compress_q_dimension()
+            mu_previous = mu_history[-1]
+            mu_history[-1] = update_mu(
+                mu_previous,
+                n_dmft,
+                config.lattice.hamiltonian.get_ek(),
+                sigma_cut.mat,
+                config.sys.beta,
+                sigma_cut.fit_smom()[0],
+                logger=logger,
+            )
+            logger.info(
+                f"Warm start holds the DMFT lattice filling {n_dmft:.6f}: mu re-solved from {mu_previous} to "
+                f"{mu_history[-1]}."
+            )
+
         giwk_full = GreensFunction.get_g_full(
             sigma_old, mu_history[-1], config.lattice.hamiltonian.get_ek(), config.sys.beta
         )
-        config.sys.n, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
+        n_start, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
         giwk_full.free()
+        config.sys.n = n_dmft if starting_iter > 0 else n_start
 
-    config.sys.n, config.sys.occ, config.sys.occ_k = comm.bcast(
-        (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
+    config.sys.n, config.sys.occ, config.sys.occ_k, mu_history[-1] = comm.bcast(
+        (config.sys.n, config.sys.occ, config.sys.occ_k, mu_history[-1]), root=0
     )
+    config.sys.mu = mu_history[-1]
 
     sigma_old = sigma_old.cut_niv(niv_cut)
     sigma_dmft = sigma_dmft.cut_niv(niv_cut)
@@ -1696,9 +1721,10 @@ def calculate_self_energy_q(
 
         # new occupation matrix and energies from the new Green's function (outside the asympt region it is the
         # DMFT lattice Green's function); k-distributed, so no rank builds the whole DMFT-box Green's function
-        _, config.sys.occ, config.sys.occ_k, ekin, epot = _update_occ_and_energies_distributed(
+        n_current, config.sys.occ, config.sys.occ_k, ekin, epot = _update_occ_and_energies_distributed(
             sigma_new, sigma_dmft_full, mpi_dist_fullbz, config.sys.mu
-        )  # n should not change
+        )
+        logger.info(f"Filling of the updated Green's function: {n_current:.6f} (target {config.sys.n:.6f}).")
         logger.info(f"Kinetic energy: {ekin:.4f} [t or eV].")
         logger.info(f"Potential energy: {epot:.4f} [t or eV].")
         logger.info(f"Total energy: {(ekin + epot):.4f} [t or eV].")
