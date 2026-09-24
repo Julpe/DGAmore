@@ -281,8 +281,10 @@ At the start of the cycle, the predecessor's result becomes the rung's starting 
   onto it, exactly by striding when the new grid is a sub-lattice of the old one and by band-limited Fourier
   interpolation otherwise, so the grid may be refined along the ladder. Beyond the core box, the rung's own DMFT
   self-energy supplies the tail, as in any cold run.
-* The chemical potential starts at the last entry of the predecessor's ``mu_history.npy`` and gets re-adjusted to
-  the filling from the first iteration on.
+* The chemical potential starts at the last entry of the predecessor's ``mu_history.npy`` and is re-solved before
+  the first iteration, so that the starting self-energy has the filling of the rung's DMFT lattice Green's function.
+  Every later iteration holds that same filling. The predecessor's own filling at its chemical potential is never
+  the target: it drifts along a chain of rungs.
 * The iteration count carries on. A predecessor that ended at iteration :math:`N` hands over to iteration
   :math:`N + 1`, the rung performs up to ``max_iter`` further iterations on top, and its per-iteration files keep
   that numbering.
