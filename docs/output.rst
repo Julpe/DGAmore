@@ -290,7 +290,7 @@ separate momentum axes.
      - Non-local Green's function built from the converged self-energy
      - ``[nkx, nky, nkz, no, no, 2 niv]``
    * - ``g_latt_dmft.npy``
-     - Lattice Green's function built from the DMFT self-energy
+     - Lattice Green's function built from the DMFT self-energy (written when ``do_spectrum_dmft`` is enabled)
      - ``[nkx, nky, nkz, no, no, 2 niv]``
    * - ``sigma_dga_iteration_<i>.npy``
      - Self-energy after self-consistency iteration ``i`` (also read back when a run is resumed)

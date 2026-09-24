@@ -6,6 +6,7 @@
 
 import os
 import sys
+import tracemalloc
 import types
 from unittest.mock import MagicMock
 
@@ -538,6 +539,16 @@ def test_performs_fft_correctly_on_compressed_matrix():
     expected = sp.fft.fftn(decompressed_mat, axes=(0, 1, 2)).reshape(64)
     assert np.allclose(result.mat, expected, atol=1e-6)
     assert result.has_compressed_q_dimension is True
+
+
+def test_fft_axis_order_z_y_x_equals_sequential_one_dimensional_transforms(c128_storage):
+    """fft(axes=(2, 1, 0)) equals one-dimensional transforms along z, then y, then x, bit for bit."""
+    rng = np.random.default_rng(3)
+    mat = rng.standard_normal((4, 3, 5, 2)) + 1j * rng.standard_normal((4, 3, 5, 2))
+    obj = IAmNonLocal(mat.reshape(60, 2).copy(), (4, 3, 5), has_compressed_q_dimension=True)
+    expected = sp.fft.fft(sp.fft.fft(sp.fft.fft(mat, axis=2), axis=1), axis=0).reshape(60, 2)
+    result = obj.fft(copy=False, axes=(2, 1, 0))
+    assert np.array_equal(result.mat, expected) and result.has_compressed_q_dimension
 
 
 def test_retains_original_shape_after_fft():
@@ -1373,6 +1384,56 @@ def test_map_to_full_bz_plain_symmetry_kgrid_does_not_call_orbital_transform(c12
     monkeypatch.setattr(sr, "apply_auto_orbital_transform", spy)
     obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     assert spy.call_count == 0
+
+
+@pytest.mark.parametrize("antiunitary", [False, True])
+def test_map_to_full_bz_of_a_conjugated_object_with_conjugate_rotation_is_the_conjugated_mapping(
+    c128_storage, antiunitary
+):
+    """Mapping conj(X) with conjugate unitaries equals conj of mapping X bit for bit, anti-unitary members included."""
+    grid, _ = _build_auto_kgrid(nx=4, ny=4, nz=2, nb=2)
+    rng = np.random.default_rng(4)
+    grid._auto_us = np.array(
+        [np.linalg.qr(rng.standard_normal((2, 2)) + 1j * rng.standard_normal((2, 2)))[0] for _ in range(32)]
+    ).reshape(4, 4, 2, 2, 2)
+    grid._auto_conjs = (rng.random((4, 4, 2)) < 0.5) if antiunitary else np.zeros((4, 4, 2), dtype=bool)
+    shape = (grid.nk_irr, 2, 2, 2, 2, 3)
+    x = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    plain = IAmNonLocal(x.copy(), (4, 4, 2), has_compressed_q_dimension=True)._map_to_full_bz(grid, 4)
+    conj = IAmNonLocal(np.conj(x), (4, 4, 2), has_compressed_q_dimension=True)._map_to_full_bz(grid, 4, conjugate=True)
+    assert np.array_equal(conj.mat, np.conj(plain.mat))
+
+
+def test_auto_orbital_groups_are_cached_per_dtype_and_recomputed_for_replaced_rotations():
+    """KGrid.auto_orbital_groups computes the groups once per dtype and again after the rotations are replaced."""
+    grid, _ = _build_auto_kgrid(nx=4, ny=4, nz=2, nb=2)
+    first = grid.auto_orbital_groups(np.complex128, 4)
+    us = grid._auto_us.reshape(grid.nk_tot, 2, 2)
+    expected = sr.auto_transform_groups(us, grid._auto_sigmas.reshape(-1), grid._auto_conjs.reshape(-1))
+    assert (
+        grid.auto_orbital_groups(np.complex128, 4) is first and grid.auto_orbital_groups(np.complex64, 4) is not first
+    )
+    assert [g.tolist() for g in first] == [g.tolist() for g in expected]
+    grid._auto_us = np.broadcast_to(np.eye(2, dtype=complex), grid._auto_us.shape).copy()
+    replaced = grid.auto_orbital_groups(np.complex128, 4)
+    identity = sr.auto_transform_groups(
+        grid._auto_us.reshape(-1, 2, 2), grid._auto_sigmas.reshape(-1), grid._auto_conjs.reshape(-1)
+    )
+    assert replaced is not first and [g.tolist() for g in replaced] == [g.tolist() for g in identity]
+
+
+def test_map_to_full_bz_writes_the_expansion_without_an_output_sized_buffer(c128_storage):
+    """The irreducible-to-full expansion holds one full-BZ array at its peak, not two."""
+    grid = bz.KGrid(nk=(8, 8, 4), symmetries=bz.two_dimensional_square_symmetries())
+    obj = IAmNonLocal(
+        np.ones((grid.nk_irr, 2, 2, 2, 2, 8), dtype=np.complex128), (8, 8, 4), has_compressed_q_dimension=True
+    )
+    full_bytes = grid.nk_tot * 2**4 * 8 * 16
+    tracemalloc.start()
+    obj._map_to_full_bz(grid, 4)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak < 1.2 * full_bytes
 
 
 def test_map_to_full_bz_raises_for_invalid_num_orbital_dimensions(c128_storage):

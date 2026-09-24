@@ -148,6 +148,31 @@ def test_raises_error_for_not_having_two_vn_dimensions():
         obj.symmetrize_v_vp()
 
 
+def test_orbital_pairs_without_vertex_are_the_inter_atom_pairs_of_an_atom_by_atom_vertex():
+    """An atom-by-atom vertex and interaction leave the inter-atom pairs free; an inter-atom U entry binds one."""
+    atom = np.array([0, 0, 1, 1])
+    same = (atom[:, None, None, None] == atom[None, :, None, None]) & (
+        atom[:, None, None, None] == atom[None, None, :, None]
+    )
+    per_atom = same & (atom[:, None, None, None] == atom[None, None, None, :])
+    mat = np.zeros((4, 4, 4, 4, 3, 4, 4), dtype=complex)
+    mat[per_atom] = np.random.default_rng(3).standard_normal((int(per_atom.sum()), 3, 4, 4))
+    gamma = LocalFourPoint(mat, SpinChannel.DENS, 1, 2, True, True)
+    u = np.where(per_atom, 1.0, 0.0).astype(complex)
+    assert gamma.orbital_pairs_without_vertex(LocalInteraction(u, SpinChannel.DENS)).tolist() == [
+        2,
+        3,
+        6,
+        7,
+        8,
+        9,
+        12,
+        13,
+    ]
+    u[0, 2, 2, 0] = 0.5
+    assert gamma.orbital_pairs_without_vertex(LocalInteraction(u, SpinChannel.DENS)).tolist() == [3, 6, 7, 8, 9, 12, 13]
+
+
 def test_sums_over_orbitals_correctly_1():
     """sum_over_orbitals contracts the orbital indices correctly (variant 1)."""
     mat = np.random.rand(2, 2, 2, 2, 5, 3)

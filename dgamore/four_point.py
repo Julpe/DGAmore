@@ -13,9 +13,11 @@ mirrors the thesis (Chapters 3 & 4).
 """
 
 import gc
+import warnings
 
 import numpy as np
 import scipy as sp
+from scipy.linalg import LinAlgWarning
 
 from dgamore.brillouin_zone import KGrid
 from dgamore.interaction import Interaction, LocalInteraction
@@ -381,16 +383,18 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         self.mat = np.einsum(permutation, self.mat, optimize=True)
         return self
 
-    def map_to_full_bz(self, grid: KGrid, nq: tuple = None):
+    def map_to_full_bz(self, grid: KGrid, nq: tuple = None, conjugate: bool = False):
         """
         Unfolds the object from the irreducible BZ to the full BZ using the grid's symmetry index map (see
         :meth:`IAmNonLocal._map_to_full_bz`), with four orbital dimensions.
 
         :param grid: The :class:`KGrid` providing the irreducible-to-full BZ index mapping.
         :param nq: Optional number of momenta per direction for the unfolded grid; defaults to the object's ``nq``.
+        :param conjugate: Whether the object holds the complex conjugate of the quantity the grid's orbital rotations
+            were discovered for; the rotation then runs with the conjugate unitaries.
         :return: ``self`` defined on the full BZ.
         """
-        return self._map_to_full_bz(grid, 4, nq)
+        return self._map_to_full_bz(grid, 4, nq, conjugate)
 
     def add(self, other, copy: bool = True) -> "FourPoint":
         """
@@ -841,17 +845,60 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         self.update_original_shape()
         return self
 
-    def invert_and_sum_over_last_vn_v2(self, beta: float):
+    def contract_first_pair_with_local_vertex(self, f_loc: LocalFourPoint, niv_out: int) -> "FourPoint":
+        r"""
+        Contracts the first orbital pair and the fermionic frequency of this one-fermion bubble with the first
+        orbital pair and the first fermionic frequency of a local two-fermion vertex,
+
+        .. math:: T^{\mathrm{q}\nu'}_{1234} = \sum_{ab\nu} F^{\omega\nu\nu'}_{ab21}\,\chi^{\mathrm{q}\nu}_{0;ab34},
+
+        as one matrix product per momentum, ``[w, (34), (ab nu)] @ [w, (ab nu), (21 nu')]``, and keeps only the
+        window ``|nu'| < niv_out`` of the vertex's second frequency. The vertex operand is a view when the vertex
+        array is stored in the axis order ``(4, 0, 1, 5, 2, 3, 6)``, i.e. ``[w, o1, o2, nu, o3, o4, nu']``, and a
+        single copy otherwise; the per-momentum product never materializes the vertex again.
+
+        :param f_loc: The local two-fermion vertex ``[o1, o2, o3, o4, w, nu, nu']`` (half niw range) whose stored
+            first frequency is summed.
+        :param niv_out: Number of positive fermionic frequencies kept of the vertex's second frequency.
+        :return: The contraction as a new one-fermion :class:`FourPoint` (half niw range, compressed momentum axis,
+            channel ``NONE``).
+        """
+        nq, nb, n_w = self.current_shape[0], self.n_bands, self.mat.shape[-2]
+        window = f_loc.vn_slice(f_loc.niv_second, niv_out)
+        f_pair = f_loc.mat.transpose(4, 0, 1, 5, 2, 3, 6).reshape(n_w, nb * nb * f_loc.mat.shape[-2], -1)
+        out = np.empty((nq, nb, nb, nb, nb, n_w, 2 * niv_out), dtype=self.mat.dtype)
+        for q in range(nq):
+            bubble = self.mat[q].transpose(4, 2, 3, 0, 1, 5).reshape(n_w, nb * nb, -1)
+            out[q] = (bubble @ f_pair).reshape(n_w, nb, nb, nb, nb, -1).transpose(4, 3, 1, 2, 0, 5)[..., window]
+        return FourPoint(
+            out, SpinChannel.NONE, self.nq, 1, 1, self.full_niw_range, True, has_compressed_q_dimension=True
+        )
+
+    def invert_and_sum_over_last_vn_v2(self, beta: float, inactive_pairs: np.ndarray | None = None):
         r"""
         Computes the sum over the auxiliary susceptibility with a very small memory footprint. Rather than inverting
-        the full compound matrix, each momentum and bosonic
-        frequency slice is LU-factorized in place (``scipy.linalg.lu_factor`` with ``overwrite_a``) and only the
-        :math:`o^2` right-hand sides that select the last-fermionic-frequency sum grouped by :math:`(o_4, o_3)` are
-        back-substituted. The single compound slice held live per iteration keeps the peak footprint far below the
-        full inverse, which matters most for a large number of orbital degrees of freedom, where the compound-index
-        matrix becomes very large. Is up to numerical precision the same as :meth:`invert_and_sum_over_last_vn`.
+        the full compound matrix, each momentum and bosonic frequency slice is copied once (strided) into a reused
+        Fortran-order buffer, factorized in place and only the :math:`o^2` right-hand sides that select the
+        last-fermionic-frequency sum grouped by :math:`(o_4, o_3)` are back-substituted. The single compound slice
+        held live per iteration keeps the peak footprint far below the full inverse, which matters most for a large
+        number of orbital degrees of freedom, where the compound-index matrix becomes very large.
+
+        A slice whose compound matrix is complex-symmetric, :math:`M_{1234}^{\nu\nu'} = M_{4321}^{\nu'\nu}` (the
+        time-reversal property the :math:`\nu\nu'`-symmetrized vertex and a real dispersion give the Bethe-Salpeter
+        matrix), is factorized with the complex-symmetric Bunch-Kaufman routine (``?sytrf``/``?sytrs``, half the
+        flops of an LU); the decision is taken per slice from its own data, so it does not depend on the chunking.
+        Any other slice takes the LU (``scipy.linalg.lu_factor``/``lu_solve``). Both agree with
+        :meth:`invert_and_sum_over_last_vn` up to numerical precision.
+
+        Orbital pairs without vertex (``inactive_pairs``, see :meth:`LocalFourPoint.orbital_pairs_without_vertex`)
+        label compound rows and columns that couple only at equal :math:`\nu`, through the inverse bubble. They are
+        eliminated one fermionic frequency at a time: the matrix over the other pairs, :math:`S = M_{aa} - M_{ai}
+        M_{ii}^{-1} M_{ia}` with the correction on its frequency diagonal, is assembled and factorized as above, and
+        the eliminated pairs follow by back-substitution. With half of the pairs eliminated the factorization costs an
+        eighth. With no pair, or every pair, eliminated the full slice is solved as before.
 
         :param beta: Inverse temperature :math:`\beta`.
+        :param inactive_pairs: Flat indices ``x * n_bands + y`` of the orbital pairs without vertex, or None.
         :return: ``self`` with the last fermionic axis summed out (``num_vn_dimensions`` reduced to 1).
         """
         o = self.n_bands
@@ -862,25 +909,81 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         w_dim = self.original_shape[5] if self.has_compressed_q_dimension else self.original_shape[7]
 
         new_arr = np.empty(self.original_shape[:-1], dtype=self.mat.dtype)
+        sytrf, sytrs, sytrf_lwork = sp.linalg.get_lapack_funcs(("sytrf", "sytrs", "sytrf_lwork"), dtype=new_arr.dtype)
+        symmetry_tol = 4 * np.finfo(new_arr.dtype).eps
 
-        idx = np.arange(compound_size)
+        def factorize_and_solve(buf: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+            """Solves ``buf @ x = rhs`` in place of the Fortran-order ``buf``: Bunch-Kaufman if symmetric, else LU."""
+            # a slice counts as complex-symmetric when max|M - M^T| is within 4 machine epsilons of max|M|; both
+            # maxima come from 256-wide tiles (upper tile against its mirror), so no slice-sized temporary is made
+            cols = [slice(a, a + 256) for a in range(0, buf.shape[0], 256)]
+            bound = symmetry_tol * np.max([np.abs(buf[:, c]).max() for c in cols])
+            if all(np.abs(buf[r, c] - buf[c, r].T).max() <= bound for t, r in enumerate(cols) for c in cols[t:]):
+                lwork = int(sytrf_lwork(buf.shape[0], lower=1)[0].real)
+                ldu, ipiv, info = sytrf(buf, lower=1, lwork=lwork, overwrite_a=1)
+                if info > 0:
+                    warnings.warn(f"Diagonal number {info} is exactly zero. Singular matrix.", LinAlgWarning)
+                return sytrs(ldu, ipiv, rhs, lower=1)[0]
+            lu_and_piv = sp.linalg.lu_factor(buf, overwrite_a=True, check_finite=False)
+            return sp.linalg.lu_solve(lu_and_piv, rhs, check_finite=False)
 
-        # decode flat compound column index (o4,o3,v') -> the (o4,o3) group it contributes its v' sum to
-        idx_o4 = idx // (o * vn)
-        idx_o3 = (idx // vn) % o
+        inactive = np.asarray([] if inactive_pairs is None else inactive_pairs, dtype=int)
+        if not 0 < inactive.size < o * o:
+            idx = np.arange(compound_size)
 
-        rhs = np.zeros((compound_size, o * o), dtype=self.mat.dtype)
-        rhs[idx, idx_o4 * o + idx_o3] = 1.0
+            # decode flat compound column index (o4,o3,v') -> the (o4,o3) group it contributes its v' sum to
+            idx_o4 = idx // (o * vn)
+            idx_o3 = (idx // vn) % o
+
+            rhs = np.zeros((compound_size, o * o), dtype=self.mat.dtype)
+            rhs[idx, idx_o4 * o + idx_o3] = 1.0
+
+            # one Fortran-order buffer, reused for every slice; fview addresses it as [(o1,o2,v), (o4,o3,v')] in the
+            # block's own index order, so each slice is filled by a single strided copy
+            fbuf = np.empty((compound_size, compound_size), dtype=self.mat.dtype, order="F")
+            fview = fbuf.T.reshape(o, o, vn, o, o, vn).transpose(3, 4, 5, 0, 1, 2)
+
+            def solve_slice(src: np.ndarray) -> np.ndarray:
+                """Solves one slice ``src`` ``[o1, o2, o3, o4, v, v']`` as a whole."""
+                np.copyto(fview, src.transpose(0, 1, 4, 3, 2, 5))
+                return factorize_and_solve(fbuf, rhs)
+
+        else:
+            active = np.setdiff1d(np.arange(o * o), inactive)
+            ax, ay = np.divmod(active, o)
+            ix, iy = np.divmod(inactive, o)
+            n_act, n_ina, v = active.size, inactive.size, np.arange(vn)
+            sbuf = np.empty((n_act * vn, n_act * vn), dtype=self.mat.dtype, order="F")
+            # sview addresses sbuf as [a, v, a', v'] over the active pairs, the way fview addresses the whole slice
+            sview = sbuf.T.reshape(n_act, vn, n_act, vn).transpose(2, 3, 0, 1)
+            rhs_act = np.zeros((n_act, vn, o * o), dtype=self.mat.dtype)
+            rhs_act[np.arange(n_act), :, active] = 1.0
+            rhs_ina = np.zeros((vn, n_ina, o * o), dtype=self.mat.dtype)
+            rhs_ina[:, np.arange(n_ina), inactive] = 1.0
+
+            def solve_slice(src: np.ndarray) -> np.ndarray:
+                """Solves one slice ``src`` ``[o1, o2, o3, o4, v, v']`` by eliminating the inactive pairs per v."""
+                for r, (x, y) in enumerate(zip(ax, ay)):
+                    for c, (xx, yy) in enumerate(zip(ax, ay)):
+                        sview[r, :, c, :] = src[x, y, yy, xx]
+                diag = np.diagonal(src, axis1=4, axis2=5)  # [o1, o2, o3, o4, v]: the equal-frequency couplings
+                d_ii = diag[ix[:, None], iy[:, None], iy, ix].transpose(2, 0, 1)
+                d_ia = diag[ix[:, None], iy[:, None], ay, ax].transpose(2, 0, 1)
+                d_ai = diag[ax[:, None], ay[:, None], iy, ix].transpose(2, 0, 1)
+                y_a = np.linalg.solve(d_ii, d_ia)
+                y_r = np.linalg.solve(d_ii, rhs_ina)
+                sview[:, v, :, v] -= d_ai @ y_a
+                rhs = (rhs_act - (d_ai @ y_r).transpose(1, 0, 2)).reshape(n_act * vn, o * o)
+                x_act = factorize_and_solve(sbuf, rhs).reshape(n_act, vn, o * o)
+                solution = np.empty((o * o, vn, o * o), dtype=self.mat.dtype)
+                solution[active] = x_act
+                solution[inactive] = (y_r - y_a @ x_act.transpose(1, 0, 2)).transpose(1, 0, 2)
+                return solution.reshape(compound_size, o * o)
 
         for i in range(self.current_shape[0]):
             block = self.mat[i]
             for w in range(w_dim):
-                # compound rows (o1,o2,v), cols (o4,o3,v'); factor in place so no batched Fortran copy is made
-                compound = np.asfortranarray(
-                    block[:, :, :, :, w].transpose(0, 1, 4, 3, 2, 5).reshape(compound_size, compound_size)
-                )
-                lu_and_piv = sp.linalg.lu_factor(compound, overwrite_a=True, check_finite=False)
-                solution = sp.linalg.lu_solve(lu_and_piv, rhs, check_finite=False)
+                solution = solve_slice(block[:, :, :, :, w])
                 new_arr[i][:, :, :, :, w, :] = solution.reshape((o, o, vn, o, o)).transpose(0, 1, 4, 3, 2)
 
         new_arr /= beta  # in-place scale: new_arr is freshly allocated and unaliased, so no full-size temporary

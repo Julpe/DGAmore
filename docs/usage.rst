@@ -111,7 +111,7 @@ folder, whose name encodes run-specific parameters such as the momentum-grid siz
 Memory is managed automatically: every heavy step runs a single chunk-bounded or distributed algorithm, and before
 the heavy part of a run begins, DGAmore verifies from the memory available on every node together with an analytic
 estimate of each step's peak (as a node total over all ranks placed there) that the run fits, and sizes the chunks
-of the auxiliary-susceptibility build, the self-energy passes and the pairing-vertex build from the memory that
+of the auxiliary-susceptibility build, the self-energy contraction and the pairing-vertex build from the memory that
 estimate leaves free on the tightest node - the runtime choices left are the Eliashberg solver's automatic
 fallback from its in-memory solve to the block-distributed grid and whether a node holds every vertex window of
 its sectors at once or one channel at a time.

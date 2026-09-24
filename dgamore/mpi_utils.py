@@ -14,17 +14,15 @@ Multiprocessing (MPI) utilities for the non-local step - a single module coverin
   irreducible Brillouin zone) into per-rank contiguous slices and wraps the collective/point-to-point communication
   (scatter, gather, all-gather, all-reduce, broadcast, object send/recv); each rank owns a private HDF5 file for
   spilling intermediate results without write conflicts;
-* higher-level **data-movement routines** built on top: mapping objects between the irreducible-BZ and full-BZ rank
-  distributions (a simple gather/scatter version and a fully distributed peer-to-peer version that never assembles
-  the full object on one rank), a node-aware frequency distribution, and a distributed 3D FFT over the BZ via pencil
-  redistributions.
+* higher-level **data-movement routines** built on top: the per-node shared-memory windows, the ring transpose that
+  turns a row-distributed array into a column-distributed one (the kernel columns of the self-energy contraction),
+  and the ordered point-to-point delivery of numbered blocks.
 
 ``MAX_MPI_BYTES`` is the single source of the 2 GB limit; the chunking helpers take it as an explicit ``limit``
 argument (read at call time by the callers), so monkeypatching ``mpi_utils.MAX_MPI_BYTES`` in tests still forces the
 chunked path.
 """
 
-import functools
 import gc
 import os
 import pickle
@@ -34,12 +32,7 @@ import h5py
 import mpi4py.MPI as MPI
 import psutil
 import numpy as np
-import scipy.fft as fft
 
-import dgamore.config as config
-from dgamore import symmetry_reduction
-from dgamore.brillouin_zone import KGrid
-from dgamore.four_point import FourPoint
 from dgamore.n_point_base import DTYPE
 
 # Canonical 2 GB MPI per-message limit. The chunking helpers below take it as an explicit ``limit`` argument so the
@@ -391,7 +384,14 @@ class MpiDistributor:
     has its own instance of an MPI distributor and hdf5-file to avoid write conflicts.
     """
 
-    def __init__(self, ntasks: int = 1, comm: MPI.Comm = None, name: str = "", output_path: str = None):
+    def __init__(
+        self,
+        ntasks: int = 1,
+        comm: MPI.Comm = None,
+        name: str = "",
+        output_path: str = None,
+        sizes: np.ndarray | None = None,
+    ):
         """
         Distributes the tasks across the communicator and opens this rank's HDF5 spill file.
 
@@ -399,6 +399,8 @@ class MpiDistributor:
         :param comm: The MPI communicator across which the tasks are distributed.
         :param name: Prefix for this rank's HDF5 spill file.
         :param output_path: Directory the per-rank HDF5 spill file is created in; if None, no spill file is opened.
+        :param sizes: Optional per-rank task counts (contiguous runs in rank order, summing to ``ntasks``) replacing
+            the default as-even-as-possible split.
         """
         self._comm = comm
         self._ntasks = ntasks
@@ -408,7 +410,7 @@ class MpiDistributor:
         self._my_size = None
         self._slices = None
 
-        self._distribute_tasks()
+        self._distribute_tasks(sizes)
 
         if output_path is not None:
             # creates rank file if it does not exist
@@ -847,19 +849,25 @@ class MpiDistributor:
             comm = MPI.COMM_WORLD
         return MpiDistributor(ntasks=ntasks, comm=comm, name=name, output_path=output_path)
 
-    def _distribute_tasks(self):
+    def _distribute_tasks(self, sizes: np.ndarray | None = None):
         """
         Computes the per-rank chunk sizes and slices, distributing the tasks as evenly as possible (excess tasks go to
-        the highest ranks), and records this rank's own size and slice.
+        the highest ranks) unless explicit sizes are given, and records this rank's own size and slice.
 
+        :param sizes: Optional per-rank task counts summing to ``ntasks``.
         :return: None.
+        :raises ValueError: If ``sizes`` does not hold one count per rank summing to ``ntasks``.
         """
-        n_per_rank = self.ntasks // self.mpi_size
-        n_excess = self.ntasks - n_per_rank * self.mpi_size
-        self._sizes = n_per_rank * np.ones(self.mpi_size, int)
-
-        if n_excess:
-            self._sizes[-n_excess:] += 1
+        if sizes is not None:
+            if len(sizes) != self.mpi_size or int(np.sum(sizes)) != self.ntasks:
+                raise ValueError("The explicit task counts must hold one entry per rank and sum to ntasks.")
+            self._sizes = np.asarray(sizes, dtype=int)
+        else:
+            n_per_rank = self.ntasks // self.mpi_size
+            n_excess = self.ntasks - n_per_rank * self.mpi_size
+            self._sizes = n_per_rank * np.ones(self.mpi_size, int)
+            if n_excess:
+                self._sizes[-n_excess:] += 1
 
         slice_ends = self._sizes.cumsum()
         self._slices = list(map(slice, slice_ends - self._sizes, slice_ends))
@@ -868,7 +876,73 @@ class MpiDistributor:
 
 
 # ====================================================================================================================
-# Higher-level data-movement routines (irreducible-BZ <-> full-BZ remap, distributed FFT).
+# Higher-level data-movement routines (column transpose, ordered block exchange).
+def transpose_columns(
+    local: np.ndarray, mpi_dist: MpiDistributor, cols_of: list[np.ndarray], base_tag: int = 0
+) -> np.ndarray:
+    r"""
+    Transposes a row-distributed array into a column-distributed one. ``local`` holds this rank's rows
+    ``[rows_rank, ..., n_a, n_b]`` of an array whose rows are split over the ranks as in ``mpi_dist`` and whose
+    columns are the index pairs into its last two axes; ``cols_of[r]`` lists the columns of rank ``r`` as two index
+    rows ``[2, n_cols]`` (into the second-to-last and the last axis). Every rank receives all rows of its own
+    columns, ``[n_rows, ..., n_cols]`` in the order of ``cols_of[rank]``. The rows travel in a ring, one rank
+    distance per step (the step's single send copy is freed before the next step), straight into the result, so no
+    staging buffer is held.
+
+    :param local: This rank's rows of the array; only read.
+    :param mpi_dist: MPI distributor of the rows (its communicator and per-rank row slices).
+    :param cols_of: The column index rows of every rank (identical on every rank).
+    :param base_tag: Base MPI tag; successive chunks use ``base_tag + chunk_index``.
+    :return: All rows of this rank's columns.
+    """
+    comm, rank, size = mpi_dist.comm, mpi_dist.my_rank, mpi_dist.mpi_size
+    slices = mpi_dist.slices
+    mine = cols_of[rank]
+    out = np.empty((mpi_dist.ntasks, *local.shape[1:-2], len(mine[0])), dtype=local.dtype)
+    out[slices[rank]] = local[..., mine[0], mine[1]]
+    for step in range(1, size):
+        dst, src = (rank + step) % size, (rank - step) % size
+        reqs, send = [], None
+        if local.shape[0] and len(cols_of[dst][0]):
+            send = np.ascontiguousarray(local[..., cols_of[dst][0], cols_of[dst][1]])
+            reqs += _isend_rows(comm, send, dst, base_tag=base_tag, limit=MAX_MPI_BYTES)
+        if slices[src].stop > slices[src].start and len(mine[0]):
+            reqs += _irecv_rows_into(comm, out[slices[src]], src, base_tag=base_tag, limit=MAX_MPI_BYTES)
+        MPI.Request.Waitall(reqs)
+        del send
+    return out
+
+
+def exchange_blocks(
+    comm, sends: list[tuple[int, np.ndarray]], sources: list[int], shape: tuple, dtype, base_tag: int = 0
+) -> list[np.ndarray]:
+    r"""
+    Delivers numbered array blocks point to point: every send ``(destination, array)`` and every receive (one per
+    entry of ``sources``, each into a fresh array of ``shape`` and ``dtype``) is posted at once and all complete in a
+    single ``Waitall``. Blocks between one pair of ranks travel on the same tags, so they match in posting order (MPI
+    non-overtaking): both sides must list them in the same order. A single-rank communicator exchanges nothing.
+
+    :param comm: The MPI communicator.
+    :param sends: The outgoing blocks as ``(destination, C-contiguous array)`` pairs, in delivery order; the arrays
+        stay alive until the exchange completes.
+    :param sources: The source rank of every incoming block, in delivery order.
+    :param shape: Shape of every incoming block.
+    :param dtype: Element type of every incoming block.
+    :param base_tag: Base MPI tag; successive chunks use ``base_tag + chunk_index``.
+    :return: The received blocks, in the order of ``sources``.
+    """
+    if comm.size == 1:
+        return []
+    received = [np.empty(shape, dtype=dtype) for _ in sources]
+    reqs = []
+    for dst, block in sends:
+        reqs += _isend_rows(comm, block, dst, base_tag=base_tag, limit=MAX_MPI_BYTES)
+    for src, buf in zip(sources, received):
+        reqs += _irecv_rows_into(comm, buf, src, base_tag=base_tag, limit=MAX_MPI_BYTES)
+    MPI.Request.Waitall(reqs)
+    return received
+
+
 def _send_in_chunks(comm, arr, dest, base_tag=0):
     """
     Sends a numpy array to a destination rank in below-2 GB chunks along axis 0 (no handshake). Thin wrapper around
@@ -897,384 +971,3 @@ def _recv_in_chunks(comm, shape, dtype, source, base_tag=0):
     :return: The received array.
     """
     return recv_rows_alloc(comm, shape, dtype, source, base_tag=base_tag, limit=MAX_MPI_BYTES)
-
-
-def map_irrbz_fullbz(obj, mpi_dist_irrk, mpi_dist_fullbz):
-    """
-    Maps an object from the irreducible-BZ rank distribution to the full-BZ distribution the simple way: gather to
-    rank 0, unfold to the full BZ there, then scatter back. Requires rank 0 to hold the full-BZ object transiently.
-
-    :param obj: The object distributed over the irreducible BZ (must support :meth:`map_to_full_bz`).
-    :param mpi_dist_irrk: MPI distributor over the irreducible BZ (source layout).
-    :param mpi_dist_fullbz: MPI distributor over the full BZ (target layout).
-    :return: The object distributed over the full BZ.
-    """
-    obj.mat = mpi_dist_irrk.gather(obj.mat)
-    if mpi_dist_irrk.comm.rank == 0:
-        obj = obj.map_to_full_bz(config.lattice.k_grid)
-    obj.mat = mpi_dist_fullbz.scatter(obj.mat)
-    return obj
-
-
-def exchange_and_map_irrbz_fullbz(
-    obj: FourPoint, mpi_dist_irrk: MpiDistributor, mpi_dist_fullbz: MpiDistributor
-) -> FourPoint:
-    """
-    Maps an object from the irreducible BZ distribution to the full BZ distribution without
-    ever assembling the full object on any single rank.
-
-    Each rank holds a slice of the object over the irreducible BZ (shape [q_irr_rank, ...]).
-    This routine redistributes the data peer-to-peer so that each rank ends up with a slice
-    over the full BZ (shape [q_full_rank, ...]), with symmetry-equivalent points correctly
-    replicated according to the ``irrk_inv`` mapping.
-
-    If ``config.lattice.k_grid`` is in auto-discovered symmetry mode (its
-    ``specify_auto_symmetries`` has been called), the per-k orbital transformation
-    ``(sigma_k, U_k, conj_k)`` is also applied locally on each rank, using only the
-    transformation arrays sliced to that rank's FBZ range. No global gather is needed.
-
-    This is a distributed replacement for the pattern (see also :func:`map_irrbz_fullbz`)::
-
-        obj.mat = mpi_dist_irrk.gather(obj.mat)
-        if comm.rank == 0:
-            obj = obj.map_to_full_bz(q_grid)
-        obj.mat = mpi_dist_fullbz.scatter(obj.mat)
-
-    which would require rank 0 to hold the entire full-BZ object in memory.
-
-    :param obj: The :class:`FourPoint` distributed over the irreducible BZ.
-    :param mpi_dist_irrk: MPI distributor over the irreducible BZ (source layout).
-    :param mpi_dist_fullbz: MPI distributor over the full BZ (target layout).
-    :return: The :class:`FourPoint` distributed over the full BZ (compressed q dimension).
-    """
-    comm = mpi_dist_irrk.comm
-    rank = comm.rank
-    size = comm.size
-
-    q_grid = config.lattice.k_grid
-
-    # 1. Global mapping setup
-    # irrk_inv[fbz_idx] = irrbz_idx
-    irrk_inv_flat = q_grid.irrk_inv.ravel()
-
-    # These are the global FBZ indices this specific rank is responsible for
-    my_fbz_range = np.arange(mpi_dist_fullbz.my_slice.start, mpi_dist_fullbz.my_slice.stop)
-    # These are the corresponding global IRBZ indices needed
-    needed_irrk_indices = irrk_inv_flat[my_fbz_range]
-
-    # 2. Identify Sources
-    # Find which rank owns each needed IRBZ index
-    irr_rank_starts = np.array([s.start for s in mpi_dist_irrk.slices])
-    # owner_ranks[i] is the rank that has the data for my_fbz_range[i]
-    owner_ranks = np.searchsorted(irr_rank_starts, needed_irrk_indices, side="right") - 1
-
-    # 3. Request/Send Index Information: tell each rank exactly which of its LOCAL indices we need,
-    # asking for each unique index only once.
-
-    indices_to_send = [[] for _ in range(size)]
-    # Mapping to help us rebuild the full_mat after receiving unique matrices
-    # key: source_rank, value: (unique_local_indices, map_to_my_fbz_slice)
-    receiving_info = {}
-
-    for src in range(size):
-        mask = owner_ranks == src
-        if not np.any(mask):
-            continue
-
-        global_indices = needed_irrk_indices[mask]
-        local_indices = global_indices - irr_rank_starts[src]
-
-        # Uniqueify so we don't transfer the same matrix multiple times
-        unique_local, inv_map = np.unique(local_indices, return_inverse=True)
-        indices_to_send[src] = unique_local.astype(int)
-
-        # Store how to put these unique received matrices back into our full_mat
-        receiving_info[src] = {
-            "full_mat_locations": np.where(mask)[0],
-            "unique_map": inv_map,
-            "count": unique_local.size,
-        }
-
-    # 4. Exchange Counts and Indices
-    send_counts = np.array([len(indices_to_send[r]) for r in range(size)], dtype=int)
-    recv_counts = np.empty(size, dtype=int)
-    comm.Alltoall(send_counts, recv_counts)
-
-    reqs = []
-    remote_indices_needed_from_me = [np.empty(recv_counts[r], dtype=int) for r in range(size)]
-
-    for r in range(size):
-        if r == rank:
-            continue
-        if send_counts[r] > 0:
-            reqs.append(comm.Isend(indices_to_send[r], dest=r, tag=11))
-        if recv_counts[r] > 0:
-            reqs.append(comm.Irecv(remote_indices_needed_from_me[r], source=r, tag=11))
-    MPI.Request.Waitall(reqs)
-
-    # 5. Data Exchange
-    # Prepare buffers
-    rest_shape = obj.mat.shape[1:]
-    dtype = obj.mat.dtype
-    full_mat = np.empty((mpi_dist_fullbz.my_size,) + rest_shape, dtype=dtype)
-
-    data_reqs = []
-    send_buffers = []  # Keep alive for Isend
-
-    # Handle Self-Copy first (Avoids MPI latency for local data)
-    if rank in receiving_info:
-        info = receiving_info[rank]
-        local_data = obj.mat[indices_to_send[rank]]
-        full_mat[info["full_mat_locations"]] = local_data[info["unique_map"]]
-
-    # Prepare Receives
-    receive_buffers = {}
-    for src, info in receiving_info.items():
-        if src == rank:
-            continue
-        buf = np.empty((info["count"],) + rest_shape, dtype=dtype)
-        receive_buffers[src] = buf
-        # Chunk the receive under the 2 GB limit (the matching send chunks identically: same row count and shape).
-        data_reqs += _irecv_rows_into(comm, buf, source=src, base_tag=12, limit=MAX_MPI_BYTES)
-
-    # Prepare Sends
-    for dest in range(size):
-        if dest == rank or recv_counts[dest] == 0:
-            continue
-        # Extract the matrices the remote rank requested from my local IRBZ slice
-        data_to_send = np.ascontiguousarray(obj.mat[remote_indices_needed_from_me[dest]])
-        send_buffers.append(data_to_send)
-        data_reqs += _isend_rows(comm, data_to_send, dest=dest, base_tag=12, limit=MAX_MPI_BYTES)
-
-    MPI.Request.Waitall(data_reqs)
-
-    # 6. Reconstruct full_mat from received unique buffers
-    for src, buf in receive_buffers.items():
-        info = receiving_info[src]
-        # Duplicate the unique received matrices into their (multiple) FBZ target rows
-        full_mat[info["full_mat_locations"]] = buf[info["unique_map"]]
-
-    # 6b. Apply the per-k orbital transformation locally if q_grid is in auto mode. Each rank only needs the FBZ
-    # slice of (Us, sigmas, conjs) for its own my_fbz_range - no gather, no scatter.
-    if q_grid.is_auto and mpi_dist_fullbz.my_size > 0:
-        # FourPoint always has 4 orbital indices contracted with the symmetry.
-        num_orb_dims = 4
-        nb_full = q_grid._auto_us.shape[-1]
-        us_flat = q_grid._auto_us.reshape(-1, nb_full, nb_full)
-        sigmas_flat = q_grid._auto_sigmas.reshape(-1)
-        conjs_flat = q_grid._auto_conjs.reshape(-1)
-
-        us_local = us_flat[my_fbz_range]
-        sigmas_local = sigmas_flat[my_fbz_range]
-        conjs_local = conjs_flat[my_fbz_range]
-
-        full_mat = symmetry_reduction.apply_auto_orbital_transform(
-            full_mat,
-            us=us_local,
-            sigmas=sigmas_local,
-            conjs=conjs_local,
-            num_orbital_dimensions=num_orb_dims,
-        )
-
-    # 7. Finalize Object
-    return FourPoint(
-        full_mat,
-        obj.channel,
-        obj.nq,
-        obj.num_wn_dimensions,
-        obj.num_vn_dimensions,
-        obj.full_niw_range,
-        obj.full_niv_range,
-        True,
-        obj.frequency_notation,
-    )
-
-
-@functools.lru_cache(maxsize=None)
-def get_pencil_indices(rank: int, size: int, nq: tuple[int, int, int], layout: str) -> np.ndarray:
-    """
-    Calculates which global flattened q-indices (0 to ``n_tot - 1``) a rank owns under a given decomposition layout.
-    The ``"flat"`` layout matches :meth:`MpiDistributor._distribute_tasks` (excess on the last ranks); the pencil
-    layouts assign whole lines along one axis so a subsequent 1D FFT along that axis is rank-local.
-
-    The result is cached (it is a pure function of the arguments, and :func:`_redistribute_p2p` looks it up twice per
-    rank pair on every redistribution), so callers must treat the returned array as read-only.
-
-    :param rank: The rank whose indices to compute.
-    :param size: Total number of ranks.
-    :param nq: Number of momenta per spatial direction ``(nx, ny, nz)``.
-    :param layout: One of ``"flat"``, ``"z_pencil"``, ``"y_pencil"``, ``"x_pencil"``.
-    :return: The global flattened q-indices owned by ``rank``; a cached array, do not modify it.
-    :raises ValueError: If ``layout`` is not one of the supported layouts.
-    """
-    nx, ny, nz = nq
-    n_tot = nx * ny * nz
-
-    if layout == "flat":
-        # Same convention as MpiDistributor._distribute_tasks: excess on the LAST ranks.
-        n_per, rem = divmod(n_tot, size)
-        sizes = np.full(size, n_per, dtype=int)
-        if rem:
-            sizes[-rem:] += 1
-        start = int(sizes[:rank].sum())
-        count = int(sizes[rank])
-        return np.arange(start, start + count)
-    elif layout == "z_pencil":
-        # A Z-pencil owns all nz points for a specific (x, y) coordinate.
-        # Total number of such pencils is nx * ny.
-        n_pencils = nx * ny
-        n_per, rem = divmod(n_pencils, size)
-        start_p = rank * n_per + min(rank, rem)
-        count_p = n_per + (1 if rank < rem else 0)
-
-        # In a flattened array [x,y,z], a Z-pencil is a contiguous block of length nz.
-        # The global start index of pencil 'p' is p * nz.
-        indices = []
-        for p in range(start_p, start_p + count_p):
-            indices.append(np.arange(p * nz, (p + 1) * nz))
-        return np.concatenate(indices) if indices else np.array([], dtype=int)
-    elif layout == "y_pencil":
-        # A Y-pencil owns all ny points for a specific (x, z) coordinate.
-        # Total number of such pencils is nx * nz.
-        n_pencils = nx * nz
-        n_per, rem = divmod(n_pencils, size)
-        start_p = rank * n_per + min(rank, rem)
-        count_p = n_per + (1 if rank < rem else 0)
-
-        indices = []
-        for p in range(start_p, start_p + count_p):
-            # Decompose pencil index p into x and z
-            ix = p // nz
-            iz = p % nz
-            # A Y-pencil starts at (ix, 0, iz) and jumps by nz for ny steps.
-            # Global index q = ix*(ny*nz) + iy*nz + iz
-            start_q = ix * (ny * nz) + iz
-            indices.append(start_q + np.arange(ny) * nz)
-        return np.concatenate(indices) if indices else np.array([], dtype=int)
-    elif layout == "x_pencil":
-        # An X-pencil owns all nx points for a specific (y, z) coordinate.
-        # Total number of such pencils is ny * nz.
-        n_pencils = ny * nz
-        n_per, rem = divmod(n_pencils, size)
-        start_p = rank * n_per + min(rank, rem)
-        count_p = n_per + (1 if rank < rem else 0)
-
-        indices = []
-        for p in range(start_p, start_p + count_p):
-            # p represents the (y, z) coordinate
-            iy = p // nz
-            iz = p % nz
-            # An X-pencil starts at (0, iy, iz) and jumps by (ny*nz) for nx steps.
-            # Global index q = ix*(ny*nz) + iy*nz + iz
-            start_q = iy * nz + iz
-            indices.append(start_q + np.arange(nx) * (ny * nz))
-        return np.concatenate(indices) if indices else np.array([], dtype=int)
-    else:
-        raise ValueError(f"Unknown layout: {layout}")
-
-
-def _redistribute_p2p(mat, nq, comm, source_layout, target_layout):
-    """
-    Peer-to-peer redistributes the rows of ``mat`` (indexed by flattened q) from one pencil/flat layout to another,
-    exchanging only the rows each rank pair shares (in below-2 GB byte chunks). Every pair's transfer is posted
-    non-blocking at once and completed by a single ``Waitall``: a one-round-per-pair schedule would serialize
-    ``size`` blocking rounds per redistribution, which dominates the FFT step at high rank counts. The staging stays
-    bounded because each source row belongs to exactly one target (and vice versa), so all send copies together hold
-    at most one local slab and all receive stagings at most one target slab.
-
-    :param mat: The local array slice, with the q-index on axis 0.
-    :param nq: Number of momenta per spatial direction ``(nx, ny, nz)``.
-    :param comm: The MPI communicator.
-    :param source_layout: The current layout of ``mat`` (see :func:`get_pencil_indices`).
-    :param target_layout: The desired layout of the result.
-    :return: The local array slice in the target layout.
-    """
-    size = comm.Get_size()
-    rank = comm.Get_rank()
-
-    src_indices = get_pencil_indices(rank, size, nq, source_layout)
-    tgt_indices = get_pencil_indices(rank, size, nq, target_layout)
-
-    res_mat = np.empty((len(tgt_indices),) + mat.shape[1:], dtype=mat.dtype)
-    src_map = {g_idx: l_idx for l_idx, g_idx in enumerate(src_indices)}
-    tgt_map = {g_idx: l_idx for l_idx, g_idx in enumerate(tgt_indices)}
-
-    # Self-overlap: rows this rank both owns (source layout) and needs (target layout). Copy locally instead
-    # of round-tripping the data through MPI to itself.
-    common = np.intersect1d(src_indices, tgt_indices, assume_unique=True)
-    if len(common) > 0:
-        res_mat[[tgt_map[g] for g in common]] = mat[[src_map[g] for g in common]]
-
-    # every rank pair's transfer is posted at once and completed by the single Waitall below (see the docstring)
-    reqs = []
-    send_bufs = []  # keep alive until Waitall
-    recv_stagings = []
-
-    for shift in range(1, size):
-        target_rank = (rank + shift) % size
-        source_rank = (rank - shift) % size
-
-        remote_tgt_indices = get_pencil_indices(target_rank, size, nq, target_layout)
-        to_send_g = np.intersect1d(src_indices, remote_tgt_indices, assume_unique=True)
-
-        remote_src_indices = get_pencil_indices(source_rank, size, nq, source_layout)
-        to_recv_g = np.intersect1d(tgt_indices, remote_src_indices, assume_unique=True)
-
-        if len(to_send_g) > 0:
-            send_l = [src_map[g] for g in to_send_g]
-            send_buf = np.ascontiguousarray(mat[send_l])
-            send_bufs.append(send_buf)
-            send_view = send_buf.view(np.byte).reshape(-1)
-            for i in range(0, send_view.nbytes, MAX_MPI_BYTES):
-                reqs.append(comm.Isend(send_view[i : i + MAX_MPI_BYTES], dest=target_rank, tag=shift))
-
-        if len(to_recv_g) > 0:
-            recv_staging = np.empty((len(to_recv_g),) + mat.shape[1:], dtype=mat.dtype)
-            recv_stagings.append((recv_staging, [tgt_map[g] for g in to_recv_g]))
-            recv_view = recv_staging.view(np.byte).reshape(-1)
-            for i in range(0, recv_view.nbytes, MAX_MPI_BYTES):
-                reqs.append(comm.Irecv(recv_view[i : i + MAX_MPI_BYTES], source=source_rank, tag=shift))
-
-    MPI.Request.Waitall(reqs)
-
-    for recv_staging, recv_l in recv_stagings:
-        res_mat[recv_l] = recv_staging
-
-    return res_mat
-
-
-def execute_distributed_fft(obj: FourPoint, comm: MPI.Comm) -> FourPoint:
-    """
-    Main routine: Call this for objects that are local to a rank but in the respective full BZ slice. E.g., after
-    a call to :func:`exchange_and_map_irrbz_fullbz`.
-    This routine performs a distributed 3D FFT by redistributing the data into pencil decompositions for
-    each dimension, performing local FFTs, and then redistributing back to the original layout.
-    The final result is that ``obj.mat`` is transformed in place to the Fourier space representation
-    corresponding to the full BZ.
-    Attention: modifies the object in place!
-
-    :param obj: The :class:`FourPoint` distributed over the full BZ (``flat`` layout), transformed in place.
-    :param comm: The MPI communicator.
-    :return: The same :class:`FourPoint`, now holding the BZ Fourier transform (back in the ``flat`` layout).
-    """
-    nq = obj.nq
-
-    # The 3D BZ FFT factorizes into independent, commuting 1D FFTs along z, y and x. A singleton axis (n == 1, e.g.
-    # nz == 1 on a 2D/layered lattice) has an identity 1D FFT, so its pencil stage is skipped entirely - one fewer
-    # distributed redistribution per skipped axis; the remaining axes give the identical result.
-    active_stages = [(n, layout) for n, layout in zip(nq[::-1], ("z_pencil", "y_pencil", "x_pencil")) if n > 1]
-    if not active_stages:
-        return obj  # a single momentum on every axis: the BZ FFT is the identity
-
-    current_layout = "flat"
-    for n, layout in active_stages:
-        # Move to this axis's pencil layout (whole lines rank-local), FFT along it, keep the pencil shape.
-        obj.mat = _redistribute_p2p(obj.mat, nq, comm, current_layout, layout)
-        pencil_shape = obj.mat.shape
-        obj.mat = obj.mat.reshape(-1, n, *pencil_shape[1:])
-        obj.mat = fft.fftn(obj.mat, axes=(1,), overwrite_x=True)
-        obj.mat = obj.mat.reshape(pencil_shape)
-        current_layout = layout
-
-    obj.mat = _redistribute_p2p(obj.mat, nq, comm, current_layout, "flat")
-    return obj

@@ -4,13 +4,18 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import tracemalloc
 from copy import deepcopy
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+import scipy as sp
 
+import dgamore.n_point_base as npb
 from dgamore.four_point import FourPoint
 from dgamore.interaction import LocalInteraction, Interaction
+from dgamore.local_four_point import LocalFourPoint
 from dgamore.n_point_base import SpinChannel, FrequencyNotation, IAmNonLocal
 
 
@@ -892,6 +897,175 @@ def test_invert_and_sum_and_invert_preserve_complex64(small_fourpoint_compressed
     assert deepcopy(fp).invert_and_sum_over_last_vn(2.0).mat.dtype == np.complex64
     assert deepcopy(fp).invert_and_sum_over_last_vn_v2(2.0).mat.dtype == np.complex64
     assert deepcopy(fp).invert().mat.dtype == np.complex64
+
+
+def _lu_invert_and_sum_reference(fp: FourPoint, beta: float) -> np.ndarray:
+    """Per-slice LU solve with a reshape copy and a Fortran copy per slice, the sum over the last frequency."""
+    fp = deepcopy(fp).to_half_niw_range().compress_q_dimension()
+    o, vn = fp.n_bands, 2 * fp.niv
+    n = o * o * vn
+    idx = np.arange(n)
+    rhs = np.zeros((n, o * o), dtype=fp.mat.dtype)
+    rhs[idx, (idx // (o * vn)) * o + (idx // vn) % o] = 1.0
+    out = np.empty(fp.original_shape[:-1], dtype=fp.mat.dtype)
+    for i in range(fp.current_shape[0]):
+        for w in range(fp.original_shape[5]):
+            compound = np.asfortranarray(fp.mat[i][:, :, :, :, w].transpose(0, 1, 4, 3, 2, 5).reshape(n, n))
+            lu_and_piv = sp.linalg.lu_factor(compound, overwrite_a=True, check_finite=False)
+            solution = sp.linalg.lu_solve(lu_and_piv, rhs, check_finite=False)
+            out[i][:, :, :, :, w, :] = solution.reshape((o, o, vn, o, o)).transpose(0, 1, 4, 3, 2)
+    return out / beta
+
+
+def _random_compound_fourpoint(rng, o: int, symmetric: bool, niv: int = 3, nq_tot: int = 3, niw: int = 2) -> FourPoint:
+    """A well-conditioned random two-fermion FourPoint, optionally complex-symmetric in the compound layout."""
+    vn = 2 * niv
+    shape = (nq_tot, o, o, o, o, 2 * niw + 1, vn, vn)
+    mat = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    if symmetric:
+        for q in range(nq_tot):
+            for w in range(2 * niw + 1):
+                c = mat[q, :, :, :, :, w].transpose(0, 1, 4, 3, 2, 5).reshape(o * o * vn, o * o * vn)
+                c = (c + c.T) / 2
+                mat[q, :, :, :, :, w] = c.reshape(o, o, vn, o, o, vn).transpose(0, 1, 4, 3, 2, 5)
+    eye = 10.0 * np.eye(vn)
+    for a in range(o):
+        for b in range(o):
+            mat[:, a, b, b, a] += eye
+    return FourPoint(mat, nq=(nq_tot, 1, 1), num_vn_dimensions=2, has_compressed_q_dimension=True, full_niw_range=True)
+
+
+@pytest.mark.parametrize("o", [1, 2, 3])
+def test_invert_and_sum_v2_asymmetric_slices_take_the_lu_bit_for_bit(rng, o):
+    """A slice without the compound transpose symmetry is LU-solved exactly like the two-copy per-slice loop."""
+    fp = _random_compound_fourpoint(rng, o, symmetric=False)
+    assert np.array_equal(deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0).mat, _lu_invert_and_sum_reference(fp, 8.0))
+
+
+@pytest.mark.parametrize("o", [1, 2, 3])
+def test_invert_and_sum_v2_symmetric_slices_use_the_symmetric_factorization(rng, o, monkeypatch):
+    """A complex-symmetric compound slice is factorized without any LU call and agrees with the full inverse."""
+    fp = _random_compound_fourpoint(rng, o, symmetric=True)
+    monkeypatch.setattr(sp.linalg, "lu_factor", MagicMock(side_effect=AssertionError("LU must not run")))
+    out = deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0)
+    monkeypatch.undo()
+    ref = deepcopy(fp).invert_and_sum_over_last_vn(8.0)
+    assert out.mat.dtype == np.complex64 and out.current_shape == ref.current_shape
+    assert np.allclose(out.mat, ref.mat, atol=1e-4)
+
+
+@pytest.mark.parametrize("o", [1, 2, 3])
+def test_contract_first_pair_with_local_vertex_matches_the_einsum(rng, o):
+    """The per-momentum matmul equals the explicit contraction over the first pair and the stored first frequency."""
+    nq, nw, niv_full, niv_core = 3, 2, 4, 2
+    f_shape, b_shape = (o, o, o, o, nw, 2 * niv_full, 2 * niv_full), (nq, o, o, o, o, nw, 2 * niv_full)
+    f_mat = (rng.standard_normal(f_shape) + 1j * rng.standard_normal(f_shape)).astype(np.complex64)
+    b_mat = (rng.standard_normal(b_shape) + 1j * rng.standard_normal(b_shape)).astype(np.complex64)
+    f_loc = LocalFourPoint(f_mat, SpinChannel.MAGN, 1, 2, False, True)
+    bubble = FourPoint(b_mat, SpinChannel.NONE, (nq, 1, 1), 1, 1, False, True, has_compressed_q_dimension=True)
+    axes = (4, 0, 1, 5, 2, 3, 6)
+    stored = np.ascontiguousarray(f_mat.transpose(axes)).transpose(np.argsort(axes))
+    f_view = LocalFourPoint(stored, SpinChannel.MAGN, 1, 2, False, True)
+
+    out = bubble.contract_first_pair_with_local_vertex(f_loc, niv_core)
+    out_view = bubble.contract_first_pair_with_local_vertex(f_view, niv_core)
+
+    window = slice(niv_full - niv_core, niv_full + niv_core)
+    ref = np.einsum("efgiwvp,qefdcwv->qigdcwp", f_mat, b_mat, optimize=True)[..., window]
+    assert out.mat.shape == (nq, o, o, o, o, nw, 2 * niv_core) and out.mat.dtype == np.complex64
+    assert out.num_vn_dimensions == 1 and not out.full_niw_range and out.has_compressed_q_dimension
+    assert np.allclose(out.mat, ref, atol=1e-5)
+    assert np.array_equal(out_view.mat, out.mat)
+
+
+def test_invert_and_sum_v2_symmetry_decision_is_taken_per_slice(rng, monkeypatch):
+    """Mixed input: symmetric slices skip the LU and asymmetric ones use it, each judged from its own data."""
+    fp = _random_compound_fourpoint(rng, 2, symmetric=True)
+    fp.mat[1, 0, 1, 0, 1, 2, 0, 1] += 1.0  # break the symmetry of one (q, w) slice only
+    lu_calls = []
+    real_lu_factor = sp.linalg.lu_factor
+    monkeypatch.setattr(sp.linalg, "lu_factor", lambda *a, **k: lu_calls.append(1) or real_lu_factor(*a, **k))
+    out = deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0)
+    assert len(lu_calls) == 1
+    assert np.allclose(out.mat, deepcopy(fp).invert_and_sum_over_last_vn(8.0).mat, atol=1e-4)
+
+
+def test_invert_and_sum_v2_symmetry_test_pairs_mirrored_ragged_tiles(rng, monkeypatch):
+    """Across ragged 256-wide tiles one broken cross-tile pair sends exactly its own slice to the LU."""
+    fp = _random_compound_fourpoint(rng, 2, symmetric=True, niv=40)
+    fp.mat[1, 1, 1, 0, 0, 2, 70, 5] += 1.0  # compound row 310 (second tile) against column 5 (first tile)
+    lu_calls = []
+    real_lu_factor = sp.linalg.lu_factor
+    monkeypatch.setattr(sp.linalg, "lu_factor", lambda *a, **k: lu_calls.append(1) or real_lu_factor(*a, **k))
+    deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0)
+    assert len(lu_calls) == 1
+
+
+def test_invert_and_sum_v2_symmetry_test_holds_no_slice_sized_temporary(rng):
+    """The per-slice symmetry test adds tile-sized temporaries only, so the call peaks near one compound slice."""
+    fp = _random_compound_fourpoint(rng, 2, symmetric=True, niv=128, nq_tot=1, niw=0).to_half_niw_range()
+    slice_bytes = (2 * 2 * 256) ** 2 * np.dtype(np.complex64).itemsize
+    tracemalloc.start()
+    fp.invert_and_sum_over_last_vn_v2(8.0)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert peak < 1.3 * slice_bytes
+
+
+def _two_atom_compound_fourpoint(rng, symmetric: bool) -> tuple[FourPoint, np.ndarray]:
+    """Two atoms of two orbitals: v-dense couplings only between intra-atom pairs, equal-v couplings between all."""
+    o, nq_tot, niw, vn = 4, 2, 1, 6
+    atom = np.array([0, 0, 1, 1])
+    intra = atom[:, None] == atom[None, :]
+    shape = (nq_tot, o, o, o, o, 2 * niw + 1, vn, vn)
+    mat = np.zeros(shape, dtype=complex)
+    vertex = intra[:, :, None, None] & intra[None, None, :, :]
+    mat[:, vertex] = rng.standard_normal((nq_tot, int(vertex.sum()), 2 * niw + 1, vn, vn))
+    v = np.arange(vn)
+    mat[..., v, v] += rng.standard_normal(shape[:-1]) + 1j * rng.standard_normal(shape[:-1])
+    for a in range(o):
+        for b in range(o):
+            mat[:, a, b, b, a, :, v, v] += 10.0
+    if symmetric:
+        n = o * o * vn
+        for q in range(nq_tot):
+            for w in range(2 * niw + 1):
+                c = mat[q, :, :, :, :, w].transpose(0, 1, 4, 3, 2, 5).reshape(n, n)
+                mat[q, :, :, :, :, w] = ((c + c.T) / 2).reshape(o, o, vn, o, o, vn).transpose(0, 1, 4, 3, 2, 5)
+    fp = FourPoint(mat, nq=(nq_tot, 1, 1), num_vn_dimensions=2, has_compressed_q_dimension=True, full_niw_range=True)
+    return fp, np.flatnonzero(~intra.ravel())
+
+
+@pytest.mark.parametrize("symmetric", [False, True])
+@pytest.mark.parametrize("dtype, atol", [(np.complex64, 1e-5), (np.complex128, 1e-12)])
+def test_invert_and_sum_v2_eliminating_the_pairs_without_vertex_matches_the_full_solve(
+    rng, monkeypatch, symmetric, dtype, atol
+):
+    """Eliminating the inter-atom pairs frequency by frequency reproduces the full slice solve up to rounding."""
+    monkeypatch.setattr(npb, "DTYPE", dtype)
+    fp, inactive = _two_atom_compound_fourpoint(rng, symmetric)
+    full = deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0)
+    schur = deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0, inactive)
+    assert schur.mat.dtype == dtype and schur.current_shape == full.current_shape
+    assert np.allclose(schur.mat, full.mat, atol=atol)
+
+
+def test_invert_and_sum_v2_elimination_factorizes_only_the_pairs_with_vertex(rng, monkeypatch):
+    """With half of the pairs eliminated every factorized matrix spans the other half of the compound space."""
+    fp, inactive = _two_atom_compound_fourpoint(rng, symmetric=False)
+    sizes = []
+    real_lu_factor = sp.linalg.lu_factor
+    monkeypatch.setattr(sp.linalg, "lu_factor", lambda a, **k: sizes.append(a.shape) or real_lu_factor(a, **k))
+    deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0, inactive)
+    assert sizes and set(sizes) == {(8 * 6, 8 * 6)}
+
+
+def test_invert_and_sum_v2_with_no_or_every_pair_inactive_takes_the_full_solve(rng):
+    """An empty or a complete inactive set leaves the whole-slice solve in place, bit for bit."""
+    fp = _random_compound_fourpoint(rng, 2, symmetric=False)
+    full = deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0).mat
+    assert np.array_equal(deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0, np.array([], dtype=int)).mat, full)
+    assert np.array_equal(deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0, np.arange(4)).mat, full)
 
 
 def _compound_product_reference_q(mat1: np.ndarray, mat2: np.ndarray, notation: FrequencyNotation) -> np.ndarray:

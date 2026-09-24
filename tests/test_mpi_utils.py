@@ -12,13 +12,8 @@ import numpy as np
 import pytest
 
 import dgamore.config as config
-import dgamore.symmetry_reduction as symmetry_reduction
 import dgamore.mpi_utils as mu
 from dgamore.mpi_utils import MpiDistributor
-import dgamore.brillouin_zone as bz
-from dgamore.brillouin_zone import KGrid
-from dgamore.four_point import FourPoint
-from dgamore.n_point_base import SpinChannel
 
 from tests.conftest import run_parallel, FAKE_MPI as MPI, FAKE_SOCKET
 
@@ -101,171 +96,6 @@ def test_send_recv_in_chunks_1d():
     assert np.allclose(res[1], arr)
 
 
-# A real (2x2x1) square-lattice grid reduces 4 full-BZ q-points to 3 irreducible (inverse map [0, 1, 1, 2], point 1
-# duplicated, so IBZ->FBZ is non-trivial). Sizes and the reference expansion are derived from the grid, not hardcoded.
-Q_NK = (2, 2, 1)
-Q_SYMS = bz.two_dimensional_square_symmetries()
-IRR_INV = KGrid(Q_NK, Q_SYMS).irrk_inv.ravel()
-N_IRR = int(IRR_INV.max()) + 1
-N_FULL = int(IRR_INV.size)
-G_IRR = (np.arange(N_IRR * 2 * 2).reshape(N_IRR, 2, 2) + 1j).astype(np.complex128)
-FULL_MAPPED = G_IRR[IRR_INV]  # shape (N_FULL, 2, 2)
-
-
-def _q_grid():
-    return KGrid(Q_NK, Q_SYMS)
-
-
-def test_map_irrbz_fullbz():
-    """map_irrbz_fullbz expands the distributed IBZ object to the full BZ."""
-
-    def fn(comm, rank):
-        config.lattice.k_grid = _q_grid()
-        d_irr = MpiDistributor(ntasks=N_IRR, comm=comm)
-        d_full = MpiDistributor(ntasks=N_FULL, comm=comm)
-        obj = FourPoint(G_IRR[d_irr.my_slice].copy(), nq=Q_NK, has_compressed_q_dimension=True)
-        out = mu.map_irrbz_fullbz(obj, d_irr, d_full)
-        return out.mat
-
-    _, res = run_parallel(3, fn)
-    rebuilt = np.concatenate(res, axis=0)
-    assert np.allclose(rebuilt, FULL_MAPPED)
-
-
-def test_exchange_and_map_matches_reference():
-    """exchange_and_map_irrbz_fullbz reproduces the reference full-BZ expansion."""
-
-    def fn(comm, rank):
-        config.lattice.k_grid = _q_grid()
-        d_irr = MpiDistributor(ntasks=N_IRR, comm=comm)
-        d_full = MpiDistributor(ntasks=N_FULL, comm=comm)
-        obj = FourPoint(
-            G_IRR[d_irr.my_slice].copy(), channel=SpinChannel.DENS, nq=Q_NK, has_compressed_q_dimension=True
-        )
-        out = mu.exchange_and_map_irrbz_fullbz(obj, d_irr, d_full)
-        return None if out is None else out.mat
-
-    _, res = run_parallel(3, fn)
-    rebuilt = np.concatenate([r for r in res if r is not None], axis=0)
-    assert np.allclose(rebuilt, FULL_MAPPED)
-
-
-def test_exchange_and_map_single_rank():
-    """exchange_and_map_irrbz_fullbz works on a single rank and propagates metadata."""
-    config.lattice.k_grid = _q_grid()
-    comm = MPI.Comm(1)
-    d_irr = MpiDistributor(ntasks=N_IRR, comm=comm)
-    d_full = MpiDistributor(ntasks=N_FULL, comm=comm)
-    obj = FourPoint(G_IRR.copy(), channel=SpinChannel.MAGN, nq=Q_NK, has_compressed_q_dimension=True)
-    out = mu.exchange_and_map_irrbz_fullbz(obj, d_irr, d_full)
-    assert np.allclose(out.mat, FULL_MAPPED)
-    # metadata propagated to the new FourPoint
-    assert out.channel == SpinChannel.MAGN
-    assert out.nq == Q_NK
-
-
-def test_exchange_and_map_auto_orbital_transform(monkeypatch):
-    """exchange_and_map_irrbz_fullbz applies the auto orbital transform per rank slice; the slices sum to the BZ."""
-    calls = []
-
-    def _recording_transform(full_mat, us, sigmas, conjs, num_orbital_dimensions):
-        calls.append(
-            {
-                "n_us": None if us is None else len(us),
-                "num_orbital_dimensions": num_orbital_dimensions,
-            }
-        )
-        return full_mat
-
-    monkeypatch.setattr(symmetry_reduction, "apply_auto_orbital_transform", _recording_transform)
-
-    nb = 2
-    auto_us = (np.arange(N_FULL * nb * nb).reshape(N_FULL, nb, nb) + 0.0).astype(np.complex128)
-    auto_sigmas = np.arange(N_FULL)
-    auto_conjs = np.zeros(N_FULL, dtype=bool)
-
-    def _auto_grid():
-        # force a real KGrid into auto mode with controlled transform data (no specify_auto_symmetries needed)
-        g = _q_grid()
-        g._auto_mode = True
-        g._auto_us = auto_us
-        g._auto_sigmas = auto_sigmas
-        g._auto_conjs = auto_conjs
-        return g
-
-    def fn(comm, rank):
-        config.lattice.k_grid = _auto_grid()
-        d_irr = MpiDistributor(ntasks=N_IRR, comm=comm)
-        d_full = MpiDistributor(ntasks=N_FULL, comm=comm)
-        obj = FourPoint(G_IRR[d_irr.my_slice].copy(), nq=Q_NK, has_compressed_q_dimension=True)
-        out = mu.exchange_and_map_irrbz_fullbz(obj, d_irr, d_full)
-        return out.mat, d_full.my_size
-
-    _, res = run_parallel(3, fn)
-    rebuilt = np.concatenate([m for m, _ in res], axis=0)
-    assert np.allclose(rebuilt, FULL_MAPPED)
-    applied_sizes = [c["n_us"] for c in calls]
-    expected_sizes = [sz for _, sz in res if sz > 0]
-    assert sorted(applied_sizes) == sorted(expected_sizes)
-    assert sum(applied_sizes) == N_FULL
-    assert all(c["num_orbital_dimensions"] == 4 for c in calls)
-
-
-def test_exchange_and_map_data_exchange_is_chunked(monkeypatch):
-    """exchange_and_map_irrbz_fullbz chunks the peer-to-peer data exchange under the 2 GB limit."""
-    nk = (4, 4, 1)
-    syms = bz.two_dimensional_square_symmetries()
-    inv = KGrid(nk, syms).irrk_inv.ravel()
-    n_irr = int(inv.max()) + 1
-    n_full = inv.size
-    g_irr = (np.arange(n_irr * 2 * 2).reshape(n_irr, 2, 2) + 1j).astype(np.complex128)
-    full_mapped = g_irr[inv]
-
-    counter = {"n": 0}
-    orig_isend = MPI.Comm.Isend
-
-    def counting_isend(self, buf, dest, tag=0):
-        counter["n"] += 1
-        return orig_isend(self, buf, dest, tag)
-
-    monkeypatch.setattr(MPI.Comm, "Isend", counting_isend)
-
-    def run(limit):
-        counter["n"] = 0
-        monkeypatch.setattr(mu, "MAX_MPI_BYTES", limit)
-
-        def fn(comm, rank):
-            config.lattice.k_grid = KGrid(nk, syms)
-            d_irr = MpiDistributor(ntasks=n_irr, comm=comm)
-            d_full = MpiDistributor(ntasks=n_full, comm=comm)
-            obj = FourPoint(g_irr[d_irr.my_slice].copy(), nq=nk, has_compressed_q_dimension=True)
-            out = mu.exchange_and_map_irrbz_fullbz(obj, d_irr, d_full)
-            return None if out is None else out.mat
-
-        _, res = run_parallel(2, fn)
-        rebuilt = np.concatenate([r for r in res if r is not None], axis=0)
-        return counter["n"], rebuilt
-
-    n_huge, rebuilt_huge = run(2**31 - 1)
-    # one (2,2) complex row is 64 B > 16, so the tiny limit forces one row per chunk and more Isend calls
-    n_tiny, rebuilt_tiny = run(16)
-    assert np.allclose(rebuilt_huge, full_mapped)
-    assert np.allclose(rebuilt_tiny, full_mapped)
-    assert n_tiny > n_huge
-
-
-@pytest.mark.parametrize("layout", ["flat", "z_pencil", "y_pencil", "x_pencil"])
-@pytest.mark.parametrize("size", [1, 2, 3, 4])
-def test_get_pencil_indices_partition(layout, size):
-    """get_pencil_indices partitions every global index exactly once across layouts and sizes."""
-    nq = (2, 3, 2)
-    n_tot = nq[0] * nq[1] * nq[2]
-    parts = [mu.get_pencil_indices(r, size, nq, layout) for r in range(size)]
-    allidx = np.concatenate(parts) if any(len(p) for p in parts) else np.array([], dtype=int)
-    # Every global index is owned exactly once.
-    assert np.array_equal(np.sort(allidx), np.arange(n_tot))
-
-
 def test_cgroup_memory_limit_walks_v2_ancestors_to_the_smallest_set_limit(tmp_path):
     """The v2 reader skips a "max" leaf and returns the smallest configured ancestor memory.max."""
     (tmp_path / "proc_cgroup").write_text("0::/a/b\n")
@@ -299,147 +129,6 @@ def test_job_memory_total_caps_the_hardware_total_by_the_cgroup_limit(monkeypatc
     assert mu.job_memory_total() == 1000
 
 
-def test_get_pencil_indices_is_cached():
-    """Repeated get_pencil_indices calls with the same arguments are served from the cache with equal content."""
-    first = mu.get_pencil_indices(1, 3, (4, 4, 2), "y_pencil")
-    again = mu.get_pencil_indices(1, 3, (4, 4, 2), "y_pencil")
-    assert np.array_equal(first, again)
-    assert mu.get_pencil_indices.cache_info().hits > 0
-
-
-def test_get_pencil_indices_flat_matches_distributor():
-    """get_pencil_indices flat layout matches the MpiDistributor slicing convention."""
-    nq = (2, 2, 2)
-    size = 3
-    for r in range(size):
-        idx = mu.get_pencil_indices(r, size, nq, "flat")
-        d = MpiDistributor(ntasks=8, comm=MPI.Comm(size))
-        # same excess-on-last convention
-        sl = d.slices[r]
-        assert np.array_equal(idx, np.arange(sl.start, sl.stop))
-
-
-def test_get_pencil_indices_invalid_layout():
-    """get_pencil_indices raises for an unknown layout."""
-    with pytest.raises(ValueError):
-        mu.get_pencil_indices(0, 1, (2, 2, 2), "bogus")
-
-
-def test_get_pencil_indices_empty_partition():
-    """get_pencil_indices returns an empty partition when ranks exceed pencils."""
-    # More ranks than pencils -> some ranks own nothing.
-    nq = (1, 1, 2)  # only 2 z-pencils? n_pencils for z = nx*ny = 1
-    idx = mu.get_pencil_indices(3, 4, nq, "z_pencil")
-    assert idx.size == 0
-
-
-def test_redistribute_flat_to_zpencil():
-    """_redistribute_p2p moves data from a flat to a z-pencil layout."""
-    nq = (2, 3, 2)
-    n_tot = nq[0] * nq[1] * nq[2]
-    G = (np.arange(n_tot * 2).reshape(n_tot, 2) + 1j).astype(np.complex128)
-
-    def fn(comm, rank):
-        src = mu.get_pencil_indices(rank, comm.size, nq, "flat")
-        out = mu._redistribute_p2p(G[src].copy(), nq, comm, "flat", "z_pencil")
-        return rank, out
-
-    _, res = run_parallel(3, fn)
-    for rank, out in res:
-        expected = G[mu.get_pencil_indices(rank, 3, nq, "z_pencil")]
-        assert np.allclose(out, expected)
-
-
-def test_redistribute_self_shift_skips_mpi(monkeypatch):
-    """_redistribute_p2p copies the self-overlap locally instead of round-tripping it through MPI."""
-    nq = (2, 2, 2)
-    n_tot = 8
-    G = (np.arange(n_tot * 2).reshape(n_tot, 2) + 1j).astype(np.complex128)
-    counter = {"n": 0}
-    for name in ("Isend", "Irecv"):
-        orig = getattr(MPI.Comm, name)
-
-        def wrap(self, *a, _o=orig, **k):
-            counter["n"] += 1
-            return _o(self, *a, **k)
-
-        monkeypatch.setattr(MPI.Comm, name, wrap)
-
-    comm = MPI.Comm(1)
-    src = mu.get_pencil_indices(0, 1, nq, "flat")
-    out = mu._redistribute_p2p(G[src].copy(), nq, comm, "flat", "z_pencil")
-    expected = G[mu.get_pencil_indices(0, 1, nq, "z_pencil")]
-    assert np.allclose(out, expected)
-    assert counter["n"] == 0  # the single rank's only shift is the self-shift -> no MPI traffic
-
-
-@pytest.mark.parametrize("nq", [(2, 3, 2), (3, 4, 1), (1, 4, 2), (1, 1, 1)])
-def test_execute_distributed_fft_matches_reference(nq):
-    """execute_distributed_fft matches a direct 3D FFT for 3D, 2D (nz=1), leading- and all-singleton grids."""
-    n_tot = int(np.prod(nq))
-    rng = np.random.default_rng(5)
-    G = (rng.standard_normal((n_tot, 2, 3)) + 1j * rng.standard_normal((n_tot, 2, 3))).astype(np.complex64)
-
-    def fn(comm, rank):
-        obj = SimpleNamespace(nq=nq, mat=G[mu.get_pencil_indices(rank, comm.size, nq, "flat")].copy())
-        return rank, mu.execute_distributed_fft(obj, comm).mat
-
-    _, res = run_parallel(3, fn)
-    assembled = np.concatenate([out for _, out in sorted(res, key=lambda pair: pair[0])], axis=0)
-    ref = np.fft.fftn(G.reshape(*nq, 2, 3), axes=(0, 1, 2)).reshape(n_tot, 2, 3)
-    assert np.allclose(assembled, ref, atol=1e-4)
-
-
-def test_redistribute_roundtrip_multichunk(monkeypatch):
-    """_redistribute_p2p round-trips flat->z-pencil->flat across multiple chunks."""
-    nq = (2, 2, 2)
-    n_tot = 8
-    G = (np.arange(n_tot * 3).reshape(n_tot, 3) + 2j).astype(np.complex128)
-    monkeypatch.setattr(mu, "MAX_MPI_BYTES", 16)
-
-    def fn(comm, rank):
-        src = mu.get_pencil_indices(rank, comm.size, nq, "flat")
-        z = mu._redistribute_p2p(G[src].copy(), nq, comm, "flat", "z_pencil")
-        back = mu._redistribute_p2p(z, nq, comm, "z_pencil", "flat")
-        return rank, back
-
-    _, res = run_parallel(2, fn)
-    for rank, back in res:
-        expected = G[mu.get_pencil_indices(rank, 2, nq, "flat")]
-        assert np.allclose(back, expected)
-
-
-def _run_dist_fft(size, G, nq):
-    """Run the distributed FFT across `size` ranks and reconstruct the global flat-layout result."""
-
-    def fn(comm, rank):
-        flat = mu.get_pencil_indices(rank, comm.size, nq, "flat")
-        obj = FourPoint(G[flat].copy(), nq=nq)
-        out = mu.execute_distributed_fft(obj, comm)
-        return rank, flat, out.mat
-
-    _, res = run_parallel(size, fn)
-    rebuilt = np.empty_like(G)
-    for rank, flat, mat in res:
-        rebuilt[flat] = mat
-    return rebuilt
-
-
-def test_execute_distributed_fft_matches_numpy():
-    """execute_distributed_fft matches numpy.fft.fftn for 1-3 ranks."""
-    nq = (2, 3, 2)
-    nx, ny, nz = nq
-    n_tot = nx * ny * nz
-    rng = np.random.default_rng(0)
-    G = (rng.standard_normal((n_tot, 2)) + 1j * rng.standard_normal((n_tot, 2))).astype(np.complex128)
-
-    expected = np.fft.fftn(G.reshape(nx, ny, nz, 2), axes=(0, 1, 2)).reshape(n_tot, 2)
-
-    for size in (1, 2, 3):
-        rebuilt = _run_dist_fft(size, G.copy(), nq)
-        assert np.allclose(rebuilt, expected), f"mismatch for size={size}"
-
-
 def test_distribute_tasks_with_excess():
     """MpiDistributor places the task excess on the last rank."""
     d = MpiDistributor(ntasks=7, comm=MPI.Comm(3))
@@ -452,6 +141,63 @@ def test_distribute_tasks_even_no_excess():
     """MpiDistributor splits tasks evenly when there is no excess."""
     d = MpiDistributor(ntasks=6, comm=MPI.Comm(3))
     assert list(d.sizes) == [2, 2, 2]
+
+
+def test_distributor_takes_explicit_task_counts_and_gathers_them_in_rank_order():
+    """Explicit per-rank task counts replace the even split, and gather assembles the uneven slices in rank order."""
+    rows = np.arange(7 * 3, dtype=float).reshape(7, 3)
+    sizes = [0, 5, 2]
+    bounds = np.concatenate([[0], np.cumsum(sizes)])
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=7, comm=comm, sizes=sizes)
+        return list(d.sizes), d.gather(rows[bounds[rank] : bounds[rank + 1]].copy())
+
+    _, res = run_parallel(3, fn)
+    assert all(r[0] == sizes for r in res)
+    assert np.array_equal(res[0][1], rows) and res[1][1] is None
+    with pytest.raises(ValueError):
+        MpiDistributor(ntasks=7, comm=MPI.Comm(3), sizes=[3, 3, 3])
+
+
+@pytest.mark.parametrize("size", [1, 3, 4])
+@pytest.mark.parametrize("limit", [None, 64])
+def test_transpose_columns_delivers_all_rows_of_each_ranks_columns(size, limit, monkeypatch):
+    """Every rank receives all rows of its columns, in its column order, also through the chunked message path."""
+    if limit is not None:
+        monkeypatch.setattr(mu, "MAX_MPI_BYTES", limit)
+    rng = np.random.default_rng(size)
+    full = rng.standard_normal((7, 2, 3, 4)) + 1j * rng.standard_normal((7, 2, 3, 4))
+    pairs = [(a, b) for a in range(3) for b in range(4)]
+    order = rng.permutation(len(pairs))
+    split = np.array_split(order, size)
+    cols_of = [
+        (np.array([pairs[i][0] for i in part], dtype=int), np.array([pairs[i][1] for i in part], dtype=int))
+        for part in split
+    ]
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=7, comm=comm)
+        return mu.transpose_columns(full[d.my_slice].copy(), d, cols_of, base_tag=5)
+
+    _, res = run_parallel(size, fn)
+    for rank, out in enumerate(res):
+        assert np.array_equal(out, full[..., cols_of[rank][0], cols_of[rank][1]])
+
+
+def test_exchange_blocks_matches_blocks_between_one_pair_in_posting_order():
+    """Several blocks from one source arrive in the order both sides list them; one rank exchanges nothing."""
+    blocks = [np.full((3, 2), float(i)) for i in range(4)]
+
+    def fn(comm, rank):
+        if rank == 0:
+            return mu.exchange_blocks(comm, [], [1, 1, 2], (3, 2), float, base_tag=7)
+        sends = [(0, blocks[0]), (0, blocks[1])] if rank == 1 else [(0, blocks[2])]
+        return mu.exchange_blocks(comm, sends, [], (3, 2), float, base_tag=7)
+
+    _, res = run_parallel(3, fn)
+    assert [b[0, 0] for b in res[0]] == [0.0, 1.0, 2.0] and res[1] == [] and res[2] == []
+    assert mu.exchange_blocks(MPI.Comm(1), [], [], (3, 2), float) == []
 
 
 def test_distribute_tasks_fewer_than_ranks():

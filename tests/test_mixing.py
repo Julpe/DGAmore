@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+import dgamore.n_point_base as n_point_base
 from dgamore.self_energy import SelfEnergy
 from dgamore.nonlocal_sde import apply_mixing_strategy
 
@@ -510,3 +511,66 @@ def test_history_cap_zero_still_records_the_pair():
 
     assert len(history) == 4
     assert np.allclose(history[-1][0], 1.0, atol=1e-6)
+
+
+def _anderson_step(pairs: list[tuple[np.ndarray, np.ndarray]], alpha: float) -> np.ndarray:
+    """Returns the Anderson core update of the plain column-stacked formulation, flattened."""
+    xs, fs = [x.reshape(-1) for x, _ in pairs], [f.reshape(-1) for _, f in pairs]
+    m, n = len(pairs) - 1, xs[-1].size
+    f_curr = fs[-1] - xs[-1]
+    f_vec = np.concatenate([f_curr.real, f_curr.imag])
+    norm_f = np.linalg.norm(f_vec)
+    diffs = [xs[-1 - i] - xs[-2 - i] for i in range(m)]
+    dx = np.column_stack([np.concatenate([d.real, d.imag]) for d in diffs])
+    diffs = [(fs[-1 - i] - xs[-1 - i]) - (fs[-2 - i] - xs[-2 - i]) for i in range(m)]
+    df = np.column_stack([np.concatenate([d.real, d.imag]) for d in diffs])
+    u, s, vh = np.linalg.svd(df, full_matrices=False)
+    cutoff = 1e-5 * s[0]
+    mask = s > cutoff
+    coeffs = vh[mask].T @ (s[mask] / (s[mask] ** 2 + cutoff**2) * (u[:, mask].T @ f_vec))
+    x_anderson = np.concatenate([xs[-1].real, xs[-1].imag]) + f_vec - (dx + df) @ coeffs
+    candidate = (1 - alpha) * xs[-1] + alpha * (x_anderson[:n] + 1j * x_anderson[n:])
+    update = candidate - xs[-1]
+    norm_u = np.linalg.norm(update)
+    return xs[-1] + update * (3.0 * norm_f / norm_u) if norm_f > 0 and norm_u > 3.0 * norm_f else candidate
+
+
+def _pulay_step(pairs: list[tuple[np.ndarray, np.ndarray]], alpha: float) -> np.ndarray:
+    """Returns the Pulay core update of the plain formulation with a stored R matrix, flattened."""
+    xs, fs = [x.flatten() for x, _ in pairs], [f.flatten() for _, f in pairs]
+    m, n = len(pairs) - 1, xs[-1].size
+    r, f = np.zeros((2 * n, m)), np.zeros((2 * n, m))
+    for i in range(m):
+        r[:n, i], r[n:, i] = (xs[-1 - i] - xs[-2 - i]).real, (xs[-1 - i] - xs[-2 - i]).imag
+        f[:n, i], f[n:, i] = (fs[-1 - i] - fs[-2 - i]).real, (fs[-1 - i] - fs[-2 - i]).imag
+        f[:, i] -= r[:, i]
+    f_i = np.concatenate([(fs[-1] - xs[-1]).real, (fs[-1] - xs[-1]).imag]).astype(np.float64)
+    norm_f = np.linalg.norm(f_i)
+    u, s, vh = np.linalg.svd(f, full_matrices=False)
+    mask = s > 1e-5 * s[0]
+    update = alpha * f_i - (r + alpha * f) @ (vh[mask].T @ ((u[:, mask].T @ f_i) / s[mask]))
+    norm_u = np.linalg.norm(update)
+    if norm_f > 0 and norm_u > 10.0 * norm_f:
+        update *= 10.0 * norm_f / norm_u
+    return xs[-1] + (update[:n] + 1j * update[n:])
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+@pytest.mark.parametrize("strategy, step", [("anderson", _anderson_step), ("pulay", _pulay_step)])
+def test_accelerated_mixing_reproduces_the_plain_least_squares_formulas_bit_for_bit(monkeypatch, dtype, strategy, step):
+    """Anderson and Pulay equal their plain column-stacked formulation bit for bit in both storage precisions."""
+    monkeypatch.setattr(n_point_base, "DTYPE", dtype)
+    rng = np.random.default_rng(7)
+    nk, niv = (3, 3, 2), 8
+    shape = (*nk, 2, 2)
+
+    def random(n_freq):
+        return (rng.standard_normal((*shape, n_freq)) + 1j * rng.standard_normal((*shape, n_freq))).astype(dtype)
+
+    history = [(random(2 * NIV_CORE), random(2 * NIV_CORE)) for _ in range(3)]
+    sigma_new = SelfEnergy(random(2 * niv), nk, calc_smom=False, beta=BETA)
+    sigma_old = SelfEnergy(random(2 * niv), nk, calc_smom=False, beta=BETA)
+    with patch_config(strategy=strategy, mixing=0.3, n_hist=3):
+        result = apply_mixing_strategy(sigma_new, sigma_old, None, history)
+    expected = step(history, 0.3).astype(dtype)
+    assert np.array_equal(result.mat[..., niv - NIV_CORE : niv + NIV_CORE].reshape(-1), expected)

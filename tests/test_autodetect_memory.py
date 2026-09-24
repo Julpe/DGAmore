@@ -12,8 +12,6 @@ import dgamore.DGAmore as dgamore_main
 from dgamore.memory_estimator import (
     MAX_CHUNK_BUDGET_BYTES,
     RANK_BASELINE_BYTES,
-    SDE_CHUNK_FACTOR,
-    SDE_HEADROOM_SHARE,
     SLICE_CHUNK_BYTES,
     BranchPeak,
     ChunkBudgets,
@@ -41,10 +39,6 @@ def fake_system(monkeypatch):
     config.logger = MagicMock()
 
     monkeypatch.setattr(dgamore_main.MPI, "Get_processor_name", lambda: "node0", raising=False)
-    # the job memory total follows whatever available memory a test installs, unless a test overrides it
-    monkeypatch.setattr(
-        dgamore_main.mpi_utils, "job_memory_total", lambda: dgamore_main.psutil.virtual_memory().available
-    )
 
     def _set_available(num_bytes):
         monkeypatch.setattr(
@@ -100,15 +94,15 @@ def _linear_chunk_branches(**kw):
 
 
 def test_chunk_budgets_are_the_largest_that_keep_each_branch_inside_its_line(fake_system, monkeypatch):
-    """aux-chi and fq fill the available line; sde stops at its share of the headroom below the job memory total."""
+    """All three chunked builds fill the line of the available memory (their results do not depend on the chunking)."""
     avail = 3 * 1024**3
     fake_system(avail)
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", _linear_chunk_branches)
     budgets = dgamore_main.autodetect_memory_settings(_mock_comm())
-    line = avail * dgamore_main.NODE_MEMORY_FRACTION  # the fixture's job memory total equals its available memory
+    line = avail * dgamore_main.NODE_MEMORY_FRACTION
     assert line / 3 - 2**20 <= budgets.chiq_aux <= line / 3
     assert line / 3 - 2**20 <= budgets.fq <= line / 3
-    assert SDE_HEADROOM_SHARE * line / 3 - 2**20 <= budgets.sde <= SDE_HEADROOM_SHARE * line / 3
+    assert line / 3 - 2**20 <= budgets.sde <= line / 3
 
 
 def test_chunk_budgets_take_the_minimum_over_the_nodes(fake_system, monkeypatch):
@@ -116,7 +110,7 @@ def test_chunk_budgets_take_the_minimum_over_the_nodes(fake_system, monkeypatch)
     fake_system(1)
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", _linear_chunk_branches)
     big, small = 8 * 1024**3, 2 * 1024**3
-    two_nodes = lambda obj: [("node0", big, big), ("node1", small, small)]
+    two_nodes = lambda obj: [("node0", big), ("node1", small)]
     budgets = dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=two_nodes))
     tight = small * dgamore_main.NODE_MEMORY_FRACTION / 3
     assert tight - 2**20 <= budgets.chiq_aux <= tight
@@ -136,19 +130,6 @@ def test_chunk_budgets_floor_when_only_the_floor_fits(fake_system, monkeypatch):
     fake_system(int((resident + 3 * SLICE_CHUNK_BYTES - 2**20) / dgamore_main.NODE_MEMORY_FRACTION))
     with pytest.raises(MemoryError, match="Auxiliary susceptibility"):
         dgamore_main.autodetect_memory_settings(_mock_comm())
-
-
-def test_sde_chunk_budget_falls_back_to_the_floor_when_the_available_memory_does_not_hold_it(fake_system, monkeypatch):
-    """A total-sized sde budget that overflows the available memory is replaced by the floor, with a warning."""
-    fake_system(2 * 1024**3)
-    monkeypatch.setattr(dgamore_main.mpi_utils, "job_memory_total", lambda: 100 * 1024**3)
-
-    def sde_only(**kw):
-        return {"sde": _mock_branch(off_distributed=SDE_CHUNK_FACTOR * kw["chunk_budgets"].sde)}
-
-    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", sde_only)
-    assert dgamore_main.autodetect_memory_settings(_mock_comm()).sde == SLICE_CHUNK_BYTES
-    assert config.logger.warning.call_count == 1
 
 
 def test_heaviest_branch_overflow_raises_while_lighter_branches_fit(fake_system):
@@ -208,6 +189,44 @@ def test_autodetect_forwards_eliashberg_flags(fake_system, monkeypatch):
     dgamore_main.autodetect_memory_settings(_mock_comm())
     assert captured["save_pairing_vertex"] is True
     assert captured["n_eig"] == 3
+
+
+def test_autodetect_forwards_the_mixing_pairs_the_loop_reaches(fake_system, monkeypatch):
+    """The driver models min(history + 1, max_iter) mixing pairs for Pulay or Anderson and none for linear mixing."""
+    fake_system(64 * 1024**3)
+    captured = []
+    real = dgamore_main.memory_estimator.estimate_peaks
+
+    def spy(**kwargs):
+        captured.append(kwargs["mixing_pairs"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", spy)
+    config.self_consistency.mixing_history_length = 3
+    for strategy, max_iter, pairs in (("anderson", 50, 4), ("Pulay", 2, 2), ("linear", 50, 0)):
+        config.self_consistency.mixing_strategy, config.self_consistency.max_iter = strategy, max_iter
+        captured.clear()
+        dgamore_main.autodetect_memory_settings(_mock_comm())
+        assert set(captured) == {pairs}
+
+
+def test_autodetect_forwards_the_interpolation_target_box_only_when_interpolating(fake_system, monkeypatch):
+    """The driver models the final re-gridding at niv_target when the run interpolates and not at all otherwise."""
+    fake_system(64 * 1024**3)
+    captured = []
+    real = dgamore_main.memory_estimator.estimate_peaks
+
+    def spy(**kwargs):
+        captured.append(kwargs["niv_interp"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", spy)
+    config.self_energy_interpolation.niv_target = 17
+    for interpolate, niv_interp in ((True, 17), (False, 0)):
+        config.self_energy_interpolation.do_interpolation = interpolate
+        captured.clear()
+        dgamore_main.autodetect_memory_settings(_mock_comm())
+        assert set(captured) == {niv_interp}
 
 
 def test_shared_giwk_credits_the_bubble_branch_node_total(fake_system, monkeypatch):
@@ -350,7 +369,7 @@ def test_lanczos_multi_rank_gate_uses_the_team_formula_per_node(fake_system, mon
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: grid_rescues)
     dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=lambda obj: [obj, obj]))
 
-    two_nodes = lambda obj: [("node0", obj[1], obj[2]), ("node1", obj[1], obj[2])]
+    two_nodes = lambda obj: [("node0", obj[1]), ("node1", obj[1])]
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: both_too_big)
     dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=two_nodes))
 

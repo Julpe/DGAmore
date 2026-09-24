@@ -586,6 +586,25 @@ def test_discover_symmetries_dedups_identical_M_grid_actions(monkeypatch):
     assert n_found == 2
 
 
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+def test_auto_transform_groups_match_the_rounded_bytes_signature_in_first_member_order(dtype):
+    """Groups equal a per-k dict over the rounded U bytes, sigma and conj (signed zeros apart), also for conj(U)."""
+    rng = np.random.default_rng(7)
+    base = [np.linalg.qr(rng.standard_normal((2, 2)) + 1j * rng.standard_normal((2, 2)))[0] for _ in range(3)]
+    us = np.array([base[i % 3] for i in range(40)], dtype=np.complex128)
+    us[5], us[7], us[8], us[9] = us[2] + 4e-7, np.eye(2), np.eye(2), np.eye(2)
+    us[8][0, 1], us[9][0, 1] = -1e-9, 1e-9
+    us = us.astype(dtype)
+    sigmas, conjs = rng.choice([1.0, -1.0], 40), rng.random(40) < 0.4
+    reference = {}
+    for ik in range(40):
+        key = (us[ik].real.round(6).tobytes() + us[ik].imag.round(6).tobytes(), float(sigmas[ik]), bool(conjs[ik]))
+        reference.setdefault(key, []).append(ik)
+    groups = sr.auto_transform_groups(us, sigmas, conjs)
+    assert [g.tolist() for g in groups] == list(reference.values())
+    assert [g.tolist() for g in sr.auto_transform_groups(us.conj(), sigmas, conjs)] == list(reference.values())
+
+
 def test_apply_auto_orbital_transform_identity_rows_are_left_unchanged():
     """apply_auto_orbital_transform leaves identity rows unchanged."""
     mat = np.arange(2 * 2 * 2, dtype=np.complex128).reshape(2, 2, 2)

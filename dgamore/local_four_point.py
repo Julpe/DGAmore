@@ -806,6 +806,23 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         self.mat[..., diag, diag] += other.mat if factor == 1.0 else factor * other.mat
         return self
 
+    def orbital_pairs_without_vertex(self, u_r: LocalInteraction) -> np.ndarray:
+        r"""
+        Returns the orbital pairs that carry no entry of :math:`\Gamma_{r} - U_{r}`, as flat indices
+        ``x * n_bands + y``: such a pair occupies no entry of this vertex or of ``u_r``, neither as the first pair
+        ``(o1, o2) = (x, y)`` nor as the reversed second pair ``(o4, o3) = (x, y)``. In the Bethe-Salpeter compound
+        matrix the rows and columns it labels then carry only the frequency-diagonal inverse bubble; these are the
+        inter-atom pairs of a cell whose local vertex and interaction are built atom by atom. Any non-zero entry
+        counts, and the vertex is scanned one orbital component at a time, so no vertex-sized temporary is made.
+
+        :param u_r: The channel-projected local interaction :math:`U_{r}`.
+        :return: The sorted flat indices of the pairs without vertex.
+        """
+        o = self.n_bands
+        in_vertex = [np.count_nonzero(self.mat[idx]) > 0 for idx in np.ndindex(o, o, o, o)]
+        occupied = np.array(in_vertex).reshape(o, o, o, o) | (u_r.mat != 0)
+        return np.flatnonzero(~occupied.any(axis=(2, 3)) & ~occupied.any(axis=(0, 1)).T)
+
     def permute_orbitals(self, permutation: str = "abcd->abcd", copy: bool = True) -> "LocalFourPoint":
         """
         Permutes the four orbital axes according to an einsum-style string. Summing over orbitals is not allowed

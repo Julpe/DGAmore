@@ -4,6 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import contextlib
 import os
 import threading
 from types import SimpleNamespace
@@ -255,6 +256,63 @@ def test_ornstein_zernike_fit_logs_no_warning_when_all_converge(monkeypatch):
     logger.warning.assert_not_called()
 
 
+def test_ornstein_zernike_fit_fits_the_static_slice_of_the_unfolded_susceptibility(monkeypatch, tmp_path):
+    """Selecting the static slice before the unfold hands curve_fit the same data as unfolding every slice first."""
+    config.sys.n_bands = 2
+    config.output.output_path = str(tmp_path)
+    config.lattice.k_grid = bz.KGrid((4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    rng = np.random.default_rng(5)
+    shape = (config.lattice.k_grid.nk_irr, 2, 2, 2, 2, 3)
+    chi = FourPoint(
+        (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64),
+        SpinChannel.MAGN,
+        (4, 4, 1),
+        1,
+        0,
+        full_niw_range=False,
+        has_compressed_q_dimension=True,
+    )
+    fitted = []
+    monkeypatch.setattr(
+        nonlocal_sde.opt, "curve_fit", lambda f, x, y, p0: fitted.append(y.copy()) or (np.array([1.0, 2.0]), None)
+    )
+
+    perform_ornstein_zernike_fit(chi)
+
+    ref = chi.copy().map_to_full_bz(config.lattice.k_grid).to_half_niw_range().take_first_wn().mat.real
+    expected = [ref[..., idx[0], idx[1], idx[2], idx[3]].flatten() for idx in np.ndindex((2, 2, 2, 2))]
+    assert len(fitted) == 16
+    assert all(np.array_equal(f, e) for f, e in zip(fitted, expected))
+
+
+def test_rpa_susceptibility_dresses_the_frequency_summed_bubble_with_the_channel_interaction(monkeypatch):
+    """For one band the saved RPA susceptibility is chi0 / (1 + (U_r + V_r) chi0) of the frequency-summed bubble."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    saved = {}
+    monkeypatch.setattr(FourPoint, "save", lambda self, name, output_dir: saved.__setitem__(name, self.mat.copy()))
+    rng = np.random.default_rng(12)
+    nq, nw = 3, 2
+    chi0 = FourPoint(
+        (0.2 + rng.random((nq, 1, 1, 1, 1, nw)) + 0.1j * rng.standard_normal((nq, 1, 1, 1, 1, nw))),
+        SpinChannel.NONE,
+        (nq, 1, 1),
+        1,
+        0,
+        False,
+        True,
+        True,
+    )
+    u_loc = LocalInteraction(np.full((1, 1, 1, 1), 1.3), SpinChannel.NONE)
+    v_nonloc = Interaction(0.2 * rng.standard_normal((nq, 1, 1, 1, 1)), SpinChannel.NONE, (nq, 1, 1), True)
+    dist = mpi_utils.MpiDistributor(ntasks=nq, comm=create_comm_mock())
+    nonlocal_sde.calculate_and_save_chi_q_r_rpa(chi0, u_loc, v_nonloc, dist)
+    for channel in (SpinChannel.DENS, SpinChannel.MAGN):
+        u = u_loc.as_channel(channel).mat.ravel()[0] + v_nonloc.as_channel(channel).mat.reshape(nq, 1)
+        expected = chi0.mat.reshape(nq, nw) / (1.0 + u * chi0.mat.reshape(nq, nw))
+        assert np.allclose(saved[f"chi_rpa_q_{channel.value}"].reshape(nq, nw), expected, atol=1e-6)
+
+
 def _tiny_sigma_and_ek(nb=1, niv=4):
     """Builds a minimal single-k self-energy and dispersion for the Dyson build."""
     sigma = SelfEnergy(np.zeros((1, 1, 1, nb, nb, 2 * niv), dtype=np.complex64), calc_smom=False, beta=10.0)
@@ -272,6 +330,15 @@ def test_build_giwk_full_shared_single_rank_matches_direct_dyson():
     assert win is None
     assert np.array_equal(giwk.mat, GreensFunction.get_g_full(sigma, 0.3, ek, 10.0).mat)
     _release_shared_giwk(win, node_comm)  # must not raise on the single-rank / mock path
+
+
+def test_build_giwk_full_keeps_no_self_energy_so_its_copies_never_duplicate_sigma():
+    """The proposal's Green's function holds the dispersion but no self-energy, so a frequency cut copies no Sigma."""
+    sigma, ek = _tiny_sigma_and_ek(niv=8)
+    giwk, win, node_comm = _build_giwk_full(create_comm_mock(), sigma, 0.3, ek, 10.0)
+    cut = giwk.cut_niv(4)
+    assert giwk._sigma is None and cut._sigma is None and np.array_equal(cut._ek, ek)
+    _release_shared_giwk(win, node_comm)
 
 
 def test_release_shared_giwk_without_sharing_is_noop():
@@ -573,30 +640,6 @@ def test_effective_epsilon_is_relaxed_while_lambda_correction_is_active():
     assert np.allclose(nonlocal_sde._effective_epsilon(), 1e-5, atol=1e-18)
 
 
-def test_build_rspace_giwk_pencil_node_sharing_matches_private_build():
-    """_build_rspace_giwk_pencil routes the R-space G through the node-shared window builder, matching private."""
-    nk, o, niw, niv = (4, 4, 1), 2, 3, 4
-    config.lattice.nk = nk
-    config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
-    config.box.niw_core = niw
-    config.box.niv_core = niv
-    config.sys.n_bands = o
-    config.sys.beta = 12.5
-    config.logger = MagicMock()
-
-    rng = np.random.default_rng(9)
-    g_shape = (*nk, o, o, 2 * (niv + niw + 2))
-    g_mat = (rng.standard_normal(g_shape) + 1j * rng.standard_normal(g_shape)).astype(np.complex64)
-    giwk = GreensFunction(g_mat, calc_filling=False, nk=nk, beta=config.sys.beta)
-    mpi_dist = MagicMock()
-    mpi_dist.comm = create_comm_mock()
-
-    node_comm = MagicMock(**{"Get_rank.return_value": 0, "Get_size.return_value": 1})
-    g_r_plain = nonlocal_sde._build_rspace_giwk_pencil(giwk, mpi_dist)
-    g_r_shared = nonlocal_sde._build_rspace_giwk_pencil(giwk, mpi_dist, node_comm=node_comm)
-    assert np.array_equal(g_r_shared, g_r_plain)
-
-
 def test_load_node_shared_local_vertex_private_path_applies_transform(monkeypatch):
     """Without a node communicator the helper loads privately, applies the transform and returns win=None."""
     rng = np.random.default_rng(81)
@@ -642,6 +685,30 @@ def test_load_node_shared_local_vertex_loads_once_per_node(monkeypatch):
     _, res = run_parallel(2, fn, hostnames=["n0", "n0"])
     assert len(load_calls) == 1  # one read per node, not per rank
     assert np.array_equal(res[0], mat) and np.array_equal(res[1], mat)
+
+
+def test_load_node_shared_local_vertex_exposes_the_requested_storage_order_as_a_view(monkeypatch):
+    """With an axis order the private copy and the node window store that order and expose the logical layout."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    rng = np.random.default_rng(83)
+    mat = (rng.standard_normal((2, 2, 2, 2, 3, 4, 4)) + 1j * rng.standard_normal((2, 2, 2, 2, 3, 4, 4))).astype(
+        np.complex64
+    )
+    monkeypatch.setattr(np, "load", lambda *a, **k: mat.copy())
+    axes = (4, 0, 1, 5, 2, 3, 6)
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        out, win = nonlocal_sde._load_node_shared_local_vertex(node_comm, "unused.npy", SpinChannel.DENS, axes=axes)
+        res = (out.mat.copy(), out.mat.transpose(axes).flags["C_CONTIGUOUS"])
+        out.mat = None
+        nonlocal_sde._free_shared_window(win, node_comm)
+        return res
+
+    private, _ = nonlocal_sde._load_node_shared_local_vertex(None, "unused.npy", SpinChannel.DENS, axes=axes)
+    assert np.array_equal(private.mat, mat) and private.mat.transpose(axes).flags["C_CONTIGUOUS"]
+    _, res = run_parallel(2, fn, hostnames=["n0", "n0"])
+    assert all(np.array_equal(r[0], mat) and r[1] for r in res)
 
 
 @pytest.fixture
@@ -931,7 +998,8 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
 
     def fake_proposal(sigma_in, *args, annealer=None, **kwargs):
         calls.append(len(calls) + 1)
-        return proposal_step(sigma_in, len(calls), annealer)
+        proposal = proposal_step(sigma_in, len(calls), annealer)
+        return proposal if args[-2].rank == 0 else None  # like the real map: comm precedes current_iter
 
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", fake_proposal)
 
@@ -967,6 +1035,24 @@ def _run_loop_on_two_node_ranks(monkeypatch, tmp_path, spied_name, spied_owner):
     return seen
 
 
+def test_loop_returns_sigma_on_rank0_only_after_interpolating_the_final_sigma_on_every_rank(monkeypatch, tmp_path):
+    """Only rank 0 gets the loop's result back, and the interpolation still reads the final sigma on every rank."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
+    config.self_energy_interpolation.do_interpolation = True
+    seen = []
+
+    def interpolate(sigma, beta_target, niv_target, comm):
+        seen.append(sigma.mat.copy())
+        return sigma.copy() if comm.rank == 0 else None
+
+    monkeypatch.setattr(nonlocal_sde, "interpolate_sigma", interpolate)
+    _, res = run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
+    assert isinstance(res[0], SelfEnergy) and res[1] is None
+    assert len(seen) == 2 and all(np.array_equal(m.reshape(-1), res[0].mat.reshape(-1)) for m in seen)
+
+
 def test_loop_forwards_the_chunk_budgets_to_every_proposal(monkeypatch, tmp_path):
     """The chunk budgets handed to the loop reach every proposal evaluation; None is forwarded as None."""
     run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
@@ -988,16 +1074,17 @@ def test_resumed_run_shares_the_starting_iterate_per_node_before_the_first_propo
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
     run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
-    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [config.sys.mu])  # no history file
-    original, before, loads = nonlocal_sde._share_sigma_per_node, [], []
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [config.sys.mu])
+    original, before, loads, broadcasts = nonlocal_sde._share_sigma_per_node, [], [], []
 
-    def spy(sigma, node_comm, roots_comm):
-        win = original(sigma, node_comm, roots_comm)
+    def spy(sigma, comm, node_comm, roots_comm):
+        shared, win = original(sigma, comm, node_comm, roots_comm)
         if not calls:  # before the first proposal: the starting iterate, not the loop's mixed one
-            before.append((threading.current_thread().name, complex(sigma.mat.reshape(-1)[0])))
-        return win
+            before.append((threading.current_thread().name, complex(shared.mat.reshape(-1)[0])))
+        return shared, win
 
     monkeypatch.setattr(nonlocal_sde, "_share_sigma_per_node", spy)
+    monkeypatch.setattr(mpi_utils.MpiDistributor, "bcast_npoint", lambda self, obj, root=0: broadcasts.append(obj))
 
     mat = np.full((1, 1, 1, 16), 0.5 + 0.2j, dtype=np.complex64)
 
@@ -1007,13 +1094,14 @@ def test_resumed_run_shares_the_starting_iterate_per_node_before_the_first_propo
 
     monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", loaded)
     run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
-    assert loads == ["rank0"]  # only rank 0 reads the file
+    assert loads == ["rank0"]
     value = complex(np.complex64(0.5 + 0.2j))
-    assert sorted(before) == [("rank0", value), ("rank1", value)]  # both ranks see rank 0's values
+    assert sorted(before) == [("rank0", value), ("rank1", value)]
+    assert broadcasts == []
 
     before.clear()
     calls.clear()
-    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (default, 0))  # a fresh run
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (default, 0))
     run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
     assert before == []
 
@@ -1251,6 +1339,22 @@ def test_create_auxiliary_chi_r_q_sum_is_bit_invariant_under_the_chunk_budget(mo
     assert np.array_equal(nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc).mat, whole.mat)
 
 
+def test_create_auxiliary_chi_r_q_sum_eliminates_the_pairs_without_vertex_of_a_two_atom_cell(monkeypatch):
+    """For two atoms built atom by atom the free pairs are logged and eliminated; the sum matches the full inversion."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(np.random.default_rng(33), o=4, nqi=2, nw=2, niv=2)
+    atom = np.array([0, 0, 1, 1])
+    same = atom[:, None, None, None] == atom[None, :, None, None]
+    per_atom = same & (same.transpose(0, 2, 1, 3)) & (same.transpose(0, 2, 3, 1))
+    gamma.mat[~per_atom] = 0.0
+    u_loc.mat[~per_atom] = 0.0
+    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    ref = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc).sum_over_vn(config.sys.beta)
+    assert "8 of 16 orbital pairs" in config.logger.info.call_args.args[0]
+    assert np.allclose(out.mat, ref.mat, atol=1e-5)
+    assert np.array_equal(nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, 1).mat, out.mat)
+
+
 def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(monkeypatch):
     """The k-distributed occupation/energy evaluation matches the single-rank full-box reference with its offset."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
@@ -1367,126 +1471,173 @@ def test_update_occ_and_energies_distributed_pins_the_occupation_dtype_across_ra
         )
 
 
-def test_share_sigma_per_node_gives_each_node_one_shared_buffer_with_rank0_values(monkeypatch):
-    """_share_sigma_per_node leaves every rank viewing its node's single shared buffer holding rank 0's array."""
+def test_share_sigma_per_node_hands_rank0_sigma_with_its_metadata_to_every_rank_once_per_node(monkeypatch):
+    """Rank 0's Sigma reaches every rank, metadata included, as a view of its node's single shared buffer."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
-    mixed = (np.arange(2 * 2 * 6).reshape(2, 2, 6) + 1j).astype(np.complex64)
+    mixed = (np.arange(2 * 2 * 12).reshape(2, 2, 1, 1, 1, 12) + 1j).astype(np.complex64)
 
     def fn(comm, rank):
-        sigma = SimpleNamespace(mat=mixed.copy() if rank == 0 else np.zeros_like(mixed))
+        sigma = SelfEnergy(mixed.copy(), (2, 2, 1), calc_smom=False, beta=10.0) if rank == 0 else None
         node_comm = comm.Split_type(0)
         roots_comm = comm.Split(0 if node_comm.rank == 0 else 1)
-        win = nonlocal_sde._share_sigma_per_node(sigma, node_comm, roots_comm)
-        return sigma.mat.copy(), sigma.mat.__array_interface__["data"][0], win is not None
+        shared, win = nonlocal_sde._share_sigma_per_node(sigma, comm, node_comm, roots_comm)
+        meta = (shared.has_compressed_q_dimension, shared.nq, shared.niv, shared._beta)
+        return shared.mat.copy(), shared.mat.__array_interface__["data"][0], win is not None, meta
 
     _, res = run_parallel(4, fn, hostnames=["n0", "n0", "n1", "n1"])
-    pointers = {r[1] for r in res}
-    assert all(np.array_equal(r[0], mixed) for r in res)
-    assert len(pointers) == 2 and all(r[2] for r in res)
+    assert all(np.array_equal(r[0], mixed.reshape(4, 1, 1, 12)) for r in res)
+    assert len({r[1] for r in res}) == 2 and all(r[2] for r in res)
+    assert all(r[3] == (True, (2, 2, 1), 6, 10.0) for r in res)
 
 
-@pytest.mark.parametrize("negative_w", [False, True])
-def test_fft_sde_pass_is_invariant_under_the_w_chunk_size(negative_w, monkeypatch):
-    """A one-byte chunk budget reproduces the all-w-at-once result of the chunked FFT self-energy pass."""
+def test_assemble_occupation_from_momentum_slices_matches_the_full_grid_filling(monkeypatch):
+    """The slice-wise filling of a momentum-local sigma assembles to the full-grid filling bit for bit."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
-    nk, o, niw, niv, beta = (4, 4, 1), 2, 3, 4, 12.5
-    rng = np.random.default_rng(21)
-    niv_g = niv + niw
-    g_shape = (*nk, o, o, 2 * niv_g)
-    g_mat = (rng.standard_normal(g_shape) + 1j * rng.standard_normal(g_shape)).astype(np.complex64)
-    n_irr = bz.KGrid(nk, bz.two_dimensional_square_symmetries()).nk_irr
-    k_shape = (n_irr, o, o, o, o, niw + 1, 2 * niv)
-    kernel_mat = (rng.standard_normal(k_shape) + 1j * rng.standard_normal(k_shape)).astype(np.complex64)
+    nk, o, niv, beta, mu = (4, 2, 1), 2, 6, 9.0, 0.4
+    nk_tot = int(np.prod(nk))
+    rng = np.random.default_rng(17)
+    config.sys.beta, config.sys.n_bands = beta, o
+    config.lattice.nk = nk
+    config.lattice.k_grid = SimpleNamespace(nk_tot=nk_tot, nk=nk)
+    ek = rng.standard_normal((*nk, o, o))
+    ek = ek + ek.swapaxes(-1, -2)
+    sigma = SelfEnergy((rng.standard_normal((1, 1, 1, o, o, 2 * niv)) * 0.1 + 0.3j).astype(np.complex64), beta=beta)
+    n_ref, occ_ref, occ_k_ref = GreensFunction.get_g_full(sigma, mu, ek, beta).get_fill_nonlocal()
 
     def fn(comm, rank):
-        config.lattice.nk = nk
-        config.lattice.k_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
-        config.box.niw_core, config.box.niv_core = niw, niv
-        config.sys.n_bands, config.sys.beta = o, beta
-        config.logger = MagicMock()
-        d_irr = mpi_utils.MpiDistributor(ntasks=n_irr, comm=comm)
-        d_full = mpi_utils.MpiDistributor(ntasks=int(np.prod(nk)), comm=comm)
-        giwk = GreensFunction(g_mat.copy(), calc_filling=False, nk=nk, beta=beta)
-        g_r_local = nonlocal_sde._build_rspace_giwk_pencil(giwk, d_irr)
-        pairs = [(i, -i) for i in range(1, niw + 1)] if negative_w else [(i, i) for i in range(niw + 1)]
-        results = []
-        for chunk_bytes in (2**62, 1):
-            kernel = FourPoint(
-                kernel_mat[d_irr.my_slice].copy(),
-                SpinChannel.NONE,
-                nk,
-                1,
-                1,
-                full_niw_range=False,
-                has_compressed_q_dimension=True,
-            )
-            sigma = nonlocal_sde._run_fft_sde_pass(
-                kernel, d_irr, d_full, g_r_local, niv_g, pairs, negative_w, chunk_bytes
-            )
-            results.append(sigma.mat.copy())
-        return results
+        d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
+        n_my = d_full.my_size
+        ek_my = ek.reshape(-1, o, o)[d_full.my_slice].reshape(n_my, 1, 1, o, o)
+        occ_k_my = GreensFunction.get_g_full(sigma, mu, ek_my, beta).get_fill_nonlocal()[2]
+        return nonlocal_sde._assemble_occupation(occ_k_my, d_full)
 
     _, res = run_parallel(3, fn)
-    for whole, chunked in res:
-        assert np.allclose(chunked, whole, atol=1e-5)
+    for n_el, occ, occ_k in res:
+        assert n_el == n_ref and np.array_equal(occ, occ_ref) and np.array_equal(occ_k, occ_k_ref)
 
 
-@pytest.mark.parametrize(
-    "chunk_bytes, expected",
-    [
-        (  # one w per chunk: the positive pass logs its halfway and last chunk, the negative pass only its last
-            1,
+def _column_sde_setup(auto: bool, nk=(4, 4, 2), o=2, niw=3, niv=2, seed=41):
+    """Configures a small grid (optionally in auto mode with random complex unitaries) and returns kernel and G."""
+    rng = np.random.default_rng(seed)
+    grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    if auto:  # a real grid in auto mode with complex unitaries and anti-unitary members
+        grid._auto_mode = True
+        grid._auto_us = np.array(
             [
-                "Self-energy FFT pass (positive w): 2 of 4 bosonic chunks done.",
-                "Self-energy FFT pass (positive w): 4 of 4 bosonic chunks done.",
-                "Self-energy FFT pass (negative w): 3 of 3 bosonic chunks done.",
-            ],
-        ),
-        (  # a single chunk per pass: halfway and last chunk coincide, one line per pass
-            2**62,
-            [
-                "Self-energy FFT pass (positive w): 1 of 1 bosonic chunks done.",
-                "Self-energy FFT pass (negative w): 1 of 1 bosonic chunks done.",
-            ],
-        ),
-    ],
-)
-def test_fft_sde_pass_logs_progress_at_the_halfway_and_last_chunk(chunk_bytes, expected, monkeypatch):
-    """The positive pass logs its halfway and last chunk, the negative pass only its last one; one chunk logs once."""
-    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
-    nk, o, niw, niv, beta = (4, 4, 1), 1, 3, 2, 12.5
-    rng = np.random.default_rng(5)
-    niv_g = niv + niw
-    g_mat = (rng.standard_normal((*nk, o, o, 2 * niv_g)) + 0j).astype(np.complex64)
-    n_irr = bz.KGrid(nk, bz.two_dimensional_square_symmetries()).nk_irr
-    kernel_mat = (rng.standard_normal((n_irr, o, o, o, o, niw + 1, 2 * niv)) + 0j).astype(np.complex64)
+                np.linalg.qr(rng.standard_normal((o, o)) + 1j * rng.standard_normal((o, o)))[0]
+                for _ in range(grid.nk_tot)
+            ]
+        ).reshape(*nk, o, o)
+        grid._auto_sigmas = np.ones(nk)
+        grid._auto_conjs = rng.random(nk) < 0.3
+    config.lattice.nk, config.lattice.k_grid = nk, grid
+    config.box.niw_core, config.box.niv_core = niw, niv
+    config.sys.n_bands, config.sys.beta = o, 12.5
     config.logger = MagicMock()
+    k_shape = (grid.nk_irr, o, o, o, o, niw + 1, 2 * niv)
+    kernel = (rng.standard_normal(k_shape) + 1j * rng.standard_normal(k_shape)).astype(np.complex64)
+    g_shape = (*nk, o, o, 2 * (niv + niw))
+    g_mat = (rng.standard_normal(g_shape) + 1j * rng.standard_normal(g_shape)).astype(np.complex64)
+    return kernel, GreensFunction(g_mat, calc_filling=False, nk=nk, beta=config.sys.beta)
+
+
+def _run_column_sde_parallel(size, kernel, giwk, chunk_bytes=None, hostnames=None):
+    """Runs the column-distributed contraction on fake ranks and returns rank 0's real-space result."""
 
     def fn(comm, rank):
-        config.lattice.nk = nk
-        config.lattice.k_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
-        config.box.niw_core, config.box.niv_core = niw, niv
-        config.sys.n_bands, config.sys.beta = o, beta
-        d_irr = mpi_utils.MpiDistributor(ntasks=n_irr, comm=comm)
-        d_full = mpi_utils.MpiDistributor(ntasks=int(np.prod(nk)), comm=comm)
-        g_r_local = nonlocal_sde._build_rspace_giwk_pencil(
-            GreensFunction(g_mat.copy(), calc_filling=False, nk=nk, beta=beta), d_irr
-        )
-        for negative_w in (False, True):
-            pairs = [(i, -i) for i in range(1, niw + 1)] if negative_w else [(i, i) for i in range(niw + 1)]
-            kernel = FourPoint(
-                kernel_mat[d_irr.my_slice].copy(),
-                SpinChannel.NONE,
-                nk,
-                1,
-                1,
-                full_niw_range=False,
-                has_compressed_q_dimension=True,
-            )
-            nonlocal_sde._run_fft_sde_pass(kernel, d_irr, d_full, g_r_local, niv_g, pairs, negative_w, chunk_bytes)
+        d_irr = mpi_utils.MpiDistributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        g_r, win = nonlocal_sde._build_rspace_giwk_window(giwk, node_comm)
+        kern = FourPoint(kernel[d_irr.my_slice].copy(), SpinChannel.NONE, config.lattice.nk, 1, 1, False, True, True)
+        sigma = nonlocal_sde._run_column_sde(kern, d_irr, g_r, giwk.niv, chunk_bytes)
+        g_r = None
+        nonlocal_sde._free_shared_window(win, node_comm)
+        return None if sigma is None else sigma.mat.copy()
 
-    run_parallel(1, fn)
-    assert [call.args[0] for call in config.logger.info.call_args_list] == expected
+    _, res = run_parallel(size, fn, hostnames=hostnames)
+    assert all(r is None for r in res[1:])
+    return res[0]
+
+
+@pytest.mark.parametrize("auto", [False, True])
+@pytest.mark.parametrize("size", [1, 3])
+def test_column_sde_matches_the_qloop_reference(auto, size, monkeypatch):
+    """The column-distributed contraction reproduces the q-loop sum over the kernel mapped to the full BZ."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _column_sde_setup(auto)
+    k_grid = config.lattice.k_grid
+    full_kernel = FourPoint(kernel.copy(), SpinChannel.NONE, config.lattice.nk, 1, 1, False, True, True)
+    ref = nonlocal_sde.calculate_sigma_from_kernel(full_kernel.map_to_full_bz(k_grid), giwk, k_grid.get_q_list())
+
+    mat = _run_column_sde_parallel(size, kernel, giwk, hostnames=["n0"] * size)
+    sigma = SelfEnergy(mat, config.lattice.nk, False, True, calc_smom=False, beta=config.sys.beta)
+    assert np.allclose(sigma.ifft().to_full_niv_range().mat, ref.mat, atol=1e-5)
+
+
+@pytest.mark.parametrize("auto", [False, True])
+def test_column_sde_is_bit_invariant_under_the_round_budget_and_the_contraction_chunk(auto, monkeypatch):
+    """Single-task rounds, one-row contraction chunks and the whole block give the same bits; rank counts agree."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _column_sde_setup(auto)
+    whole = _run_column_sde_parallel(3, kernel, giwk, chunk_bytes=2**40, hostnames=["n0", "n0", "n1"])
+    rounds = _run_column_sde_parallel(3, kernel, giwk, chunk_bytes=1)
+    monkeypatch.setattr(memory_estimator, "SDE_CONTRACTION_CHUNK_BYTES", 1)
+    rows = _run_column_sde_parallel(3, kernel, giwk, chunk_bytes=2**40)
+    assert np.array_equal(rounds, whole) and np.array_equal(rows, whole)
+    for size in (1, 2, 4):  # the rank count moves the fold's partial-sum boundaries, a rounding-level change
+        assert np.allclose(_run_column_sde_parallel(size, kernel, giwk), whole, atol=1e-5)
+
+
+def test_column_sde_single_rank_mock_path_equals_the_fake_mpi_run(monkeypatch):
+    """The single-rank mock communicator (no messages, private window) gives the fake one-rank result exactly."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _column_sde_setup(True)
+    comm = create_comm_mock()
+    d_irr = mpi_utils.MpiDistributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
+    g_r, win = nonlocal_sde._build_rspace_giwk_window(giwk, comm)
+    kern = FourPoint(kernel.copy(), SpinChannel.NONE, config.lattice.nk, 1, 1, False, True, True)
+    sigma = nonlocal_sde._run_column_sde(kern, d_irr, g_r, giwk.niv)
+    assert win is None
+    assert np.array_equal(sigma.mat, _run_column_sde_parallel(1, kernel, giwk))
+
+
+@pytest.mark.parametrize("size", [5, 7])
+def test_column_sde_with_more_ranks_than_tasks_matches_one_rank(size, monkeypatch):
+    """Ranks without tasks or irreducible momenta join every exchange and leave the result at the one-rank value."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _column_sde_setup(True, niw=1, niv=1)
+    one = _run_column_sde_parallel(1, kernel, giwk)
+    assert np.allclose(_run_column_sde_parallel(size, kernel, giwk), one, atol=1e-5)
+
+
+def test_build_rspace_giwk_window_is_the_frequency_first_transform_in_one_buffer_per_node(monkeypatch):
+    """Every rank of a node maps one shared buffer holding the momentum FFT of G in frequency-first layout."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    _, giwk = _column_sde_setup(False)
+    nb, n_r = config.sys.n_bands, config.lattice.k_grid.nk_tot
+    expected = np.moveaxis(giwk.fft().mat.reshape(n_r, nb, nb, -1), -1, 0)
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        g_r, win = nonlocal_sde._build_rspace_giwk_window(giwk, node_comm)
+        res = (g_r.copy(), g_r.__array_interface__["data"][0], g_r.flags["C_CONTIGUOUS"])
+        g_r = None
+        nonlocal_sde._free_shared_window(win, node_comm)
+        return res
+
+    _, res = run_parallel(2, fn, hostnames=["n0", "n0"])
+    assert all(np.array_equal(r[0], expected) and r[2] for r in res)
+    assert res[0][1] == res[1][1]
+
+
+@pytest.mark.parametrize("chunk_bytes, n_lines", [(1, 2), (2**40, 1)])
+def test_column_sde_logs_progress_at_the_halfway_and_the_last_round(chunk_bytes, n_lines, monkeypatch):
+    """Single-task rounds log the halfway and the last round, a single round logs once."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _column_sde_setup(False)
+    _run_column_sde_parallel(1, kernel, giwk, chunk_bytes=chunk_bytes)
+    lines = [c.args[0] for c in config.logger.info.call_args_list if "column rounds" in c.args[0]]
+    assert len(lines) == n_lines and lines[-1].split(":")[1].split()[0] == lines[-1].split()[-4]
 
 
 def test_sde_chunk_budget_is_the_job_wide_minimum(monkeypatch):
@@ -1501,8 +1652,9 @@ def test_sde_chunk_budget_is_the_job_wide_minimum(monkeypatch):
     assert budgets == [memory_estimator.SLICE_CHUNK_BYTES] * 3
 
 
-def test_interpolate_sigma_unfolds_distributed_pole_fits_to_the_full_bz(monkeypatch):
-    """interpolate_sigma fits the flagged irreducible momenta across ranks and unfolds everything to the full BZ."""
+@pytest.mark.parametrize("size", [2, 5])
+def test_interpolate_sigma_unfolds_distributed_pole_fits_to_the_full_bz(monkeypatch, size):
+    """interpolate_sigma fits the flagged irreducible momenta across ranks and unfolds them to the full BZ on rank 0."""
     config.logger = MagicMock()
     beta, x, hartree, niv = 10.0, -0.3, 1.5, 200
     config.lattice.nk = (4, 4, 1)
@@ -1513,11 +1665,13 @@ def test_interpolate_sigma_unfolds_distributed_pole_fits_to_the_full_bz(monkeypa
     vn = MFHelper.vn(niv, beta)
     sigma = SelfEnergy(hartree + weight / (1j * vn - x), nk=(4, 4, 1), has_compressed_q_dimension=False, beta=beta)
     patch_mini_pole_with_exact_single_pole_fit(monkeypatch, x)
+    monkeypatch.setattr(contextlib, "redirect_stdout", lambda target: contextlib.nullcontext())
 
     def fn(comm, rank):
-        return nonlocal_sde.interpolate_sigma(sigma, beta_target=2.0 * beta, niv_target=niv, comm=comm).mat
+        out = nonlocal_sde.interpolate_sigma(sigma.copy(), beta_target=2.0 * beta, niv_target=niv, comm=comm)
+        return None if out is None else out.mat
 
-    _, results = run_parallel(2, fn)
+    _, results = run_parallel(size, fn)
     single = nonlocal_sde.interpolate_sigma(sigma, 2.0 * beta, niv, create_comm_mock()).mat
 
     target_vn = MFHelper.vn(niv, 2.0 * beta)
@@ -1526,7 +1680,7 @@ def test_interpolate_sigma_unfolds_distributed_pole_fits_to_the_full_bz(monkeypa
     expected_inner = hartree + weight / (1j * target_vn[inner] - x)
     plain = sigma.interpolate(2.0 * beta, niv).mat
     assert 0 < flagged.sum() < flagged.size
-    assert np.array_equal(results[0], results[1])
+    assert all(r is None for r in results[1:])
     assert np.array_equal(results[0], single)
     assert np.allclose(results[0][flagged][..., inner], expected_inner[flagged], atol=1e-5)
     assert np.allclose(results[0][~flagged][..., inner], plain[~flagged][..., inner])

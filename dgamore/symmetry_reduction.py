@@ -982,12 +982,39 @@ def find_coordinate_mirror_orbital_unitaries(H, atol=1e-8) -> dict:
     return mirrors
 
 
+def auto_transform_groups(us: np.ndarray, sigmas: np.ndarray, conjs: np.ndarray) -> list[np.ndarray]:
+    r"""
+    Returns the k-point groups that share one orbital-transformation signature ``(U_k, sigma_k, conj_k)``: ``U_k``
+    compared bit for bit after rounding its real and imaginary parts to six decimals, ``sigma_k`` by value. Each group
+    lists its k-points in ascending order and the groups come in the order of their first k-point, so the first
+    k-point of a group is the one whose ``U_k`` the group is transformed with. The conjugate unitaries ``U_k^*`` give
+    the same groups.
+
+    :param us: Per-k unitary matrices of shape ``(k_local, nb, nb)``.
+    :param sigmas: Per-k signs of shape ``(k_local,)``.
+    :param conjs: Per-k anti-unitary flags of shape ``(k_local,)``.
+    :return: The k-point index arrays of the groups.
+    """
+    k_local = us.shape[0]
+    rounded = [np.ascontiguousarray(part.round(6)).reshape(k_local, -1) for part in (us.real, us.imag)]
+    _, sigma_codes = np.unique(np.asarray(sigmas, dtype=float), return_inverse=True)
+    keys = np.column_stack(
+        [part.view(f"u{part.itemsize}").astype(np.uint64) for part in rounded]
+        + [sigma_codes.reshape(-1).astype(np.uint64), np.asarray(conjs).reshape(-1).astype(np.uint64)]
+    )
+    _, first, labels = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+    labels = labels.reshape(-1)
+    members = np.split(np.argsort(labels, kind="stable"), np.cumsum(np.bincount(labels, minlength=first.size))[:-1])
+    return [members[g] for g in np.argsort(first)]
+
+
 def apply_auto_orbital_transform(
     mat: np.ndarray,
     us: np.ndarray,
     sigmas: np.ndarray,
     conjs: np.ndarray,
     num_orbital_dimensions: int,
+    groups: list[np.ndarray] | None = None,
 ) -> np.ndarray:
     r"""
     Applies the auto-discovered per-k orbital transformation ``(sigma_k, U_k, conj_k)`` to a tensor whose leading
@@ -1015,6 +1042,8 @@ def apply_auto_orbital_transform(
     :param conjs: Per-k anti-unitary flags of shape ``(k_local,)``, dtype bool.
     :param num_orbital_dimensions: 2 (single-particle, e.g. H, G) or 4 (two-particle vertex); determines both the
         einsum pattern and the effective power of ``sigma_k``.
+    :param groups: The k-point groups of :func:`auto_transform_groups` for ``us`` in the dtype of ``mat`` (e.g. the
+        cached :meth:`dgamore.brillouin_zone.KGrid.auto_orbital_groups`); computed here when None.
     :return: The transformed tensor with the same shape as ``mat`` (the same backing array, with identity rows left
         untouched).
     """
@@ -1045,26 +1074,16 @@ def apply_auto_orbital_transform(
 
     # Group local k-points by their (U, sigma, conj) signature so each equivalence
     # class can be transformed in one batched einsum.
-    groups: dict = {}
-    for ik in range(k_local):
-        key = (
-            us[ik].real.round(6).tobytes() + us[ik].imag.round(6).tobytes(),
-            float(effective_sigmas[ik]),
-            bool(conjs[ik]),
-        )
-        groups.setdefault(key, []).append(ik)
-
     path_2 = path_4 = None
-    for indices in groups.values():
-        u_ref = us[indices[0]]
-        sigma = float(effective_sigmas[indices[0]])
-        conj = bool(conjs[indices[0]])
+    for idx in auto_transform_groups(us, effective_sigmas, conjs) if groups is None else groups:
+        u_ref = us[idx[0]]
+        sigma = float(effective_sigmas[idx[0]])
+        conj = bool(conjs[idx[0]])
 
         # Identity-like rows: skip entirely.
         if sigma == 1.0 and not conj and np.allclose(u_ref, identity):
             continue
 
-        idx = np.array(indices)
         block = mat[idx]
 
         if conj:

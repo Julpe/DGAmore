@@ -21,12 +21,10 @@ driver's node-memory fraction (``NODE_MEMORY_FRACTION`` in :mod:`dgamore.DGAmore
 The chunk budgets of the three chunked builds are sized from this estimate: the driver hands
 :func:`max_chunk_budget` the fit check of a branch and receives the largest budget that check accepts, and
 :func:`estimate_peaks` models each branch at the budget it was handed (:class:`ChunkBudgets`), so the fit check and
-the builds agree. The auxiliary-susceptibility and pairing-vertex builds are bit-invariant under their chunking and
-fill the headroom below the currently available memory; the FFT self-energy passes reassociate their bosonic sum
-at the chunk boundaries and therefore take :data:`SDE_HEADROOM_SHARE` of the headroom below the job memory total
-instead, which keeps their chunk schedule reproducible across reruns. The per-chunk transients of the two
-bit-invariant builds are modeled from their actual temporaries (assembled window, sliced local vertex, per-slice
-copies).
+the builds agree. All three builds are bit-invariant under their chunking (the self-energy contraction associates
+its bosonic sum in fixed blocks of :data:`SDE_W_BLOCK` frequencies folded in rank order, whatever its budget) and fill
+the headroom below the currently available memory. Their per-chunk transients are modeled from their actual
+temporaries (assembled window, sliced local vertex, per-slice copies, transposed kernel columns).
 
 Each branch carries its **own** persistent per-rank ``baseline`` (the full-grid two-point objects resident at that
 branch's peak) and the portion of it (``giwk_shareable``) that the node-shared giwk window deduplicates
@@ -52,9 +50,17 @@ RANK_BASELINE_BYTES: int = 2**28
 # fq: single-block BSE assembly + eagerly rebound matmuls (f = gchi0_q_inv @ f, then f @ gchi0_q_inv), ~2 blocks live.
 FQ_MATMUL_FACTOR: int = 2
 
-# FFT SDE per-chunk transient: the exchanged full-BZ bosonic window plus the peer-to-peer exchange's in-flight
-# send and receive staging copies of it.
-SDE_CHUNK_FACTOR: int = 3
+# Consecutive bosonic frequencies one task of the column-distributed self-energy contraction sums; the bosonic sum is
+# associated in these fixed blocks, so the chunk budget never changes the result (the rank count moves the fold).
+SDE_W_BLOCK: int = 4
+
+# Full-BZ kernel columns alive at once in the self-energy contraction: the unfolded column plus the orbital rotation's
+# group copies on auto-symmetry grids or the in-place FFT's line buffers (measured up to 1.73 columns at four bands).
+SDE_COLUMN_FACTOR: float = 1.75
+
+# Bytes of kernel rows one call of the self-energy contraction reads; numpy reorders its operand into a copy of this
+# size, so the contraction runs over the real-space rows in pieces of it (per-row results do not depend on it).
+SDE_CONTRACTION_CHUNK_BYTES: int = 32 * 1024**2
 
 # scipy.fft.ifftn(overwrite_x=True) transforms the c64 full-grid bubble in place, so no ifftn transient is allocated
 # beyond the multiply buffer (numpy.fft would allocate ~2x: returned array + work arrays). Per-iw peak = multiply buffer.
@@ -94,10 +100,6 @@ MAX_SLICE_CHUNK_BYTES: int = 2**32
 # A budget at or above this value walks a build in a single chunk per rank block (upper bound of the budget search).
 MAX_CHUNK_BUDGET_BYTES: int = 2**40
 
-# Share of the total-memory headroom the self-energy passes' chunks may take; the rest stays free for the gap between
-# the job memory total the sizing reads and the available memory the fit check reads, and for un-modeled memory.
-SDE_HEADROOM_SHARE: float = 0.85
-
 
 @dataclass(frozen=True)
 class ChunkBudgets:
@@ -108,8 +110,8 @@ class ChunkBudgets:
 
     :ivar chiq_aux: Budget of the auxiliary-susceptibility sum
         (:func:`dgamore.nonlocal_sde.create_auxiliary_chi_r_q_sum`).
-    :ivar sde: Budget of one exchanged full-BZ bosonic window of the FFT self-energy passes
-        (:func:`dgamore.nonlocal_sde._run_fft_sde_pass`).
+    :ivar sde: Budget of one round of transposed irreducible kernel columns of the self-energy contraction
+        (:func:`dgamore.nonlocal_sde._run_column_sde`).
     :ivar fq: Budget of the pairing-vertex build (:func:`dgamore.eliashberg_solver._build_pairing_vertex_pp`).
     """
 
@@ -227,6 +229,57 @@ def lanczos_solver_bytes(
     return scale * per_sector, scale * grid_share
 
 
+def column_sde_schedule(niw: int, niv: int, n_ranks: int) -> tuple[list, np.ndarray, np.ndarray]:
+    r"""
+    Returns the task layout of the column-distributed self-energy contraction
+    (:func:`dgamore.nonlocal_sde._run_column_sde`). Task ``t = v * n_blocks + b`` sums the bosonic block ``b`` of the
+    fermionic frequency index ``v``; the blocks are the runs of :data:`SDE_W_BLOCK` consecutive frequencies
+    :math:`\omega = 0, \ldots, n_\omega` followed by the runs of the negative frequencies :math:`\omega = -1, \ldots,
+    -n_\omega`, in the order the bosonic sum is associated. The tasks are split into contiguous runs over the ranks, as
+    equal as possible, and the owner of ``v``, the rank that reduces its blocks, is the rank holding its first block.
+    The layout depends on the box and the rank count only, so every rank derives the same one.
+
+    :param niw: Number of positive bosonic frequencies.
+    :param niv: Number of positive fermionic frequencies.
+    :param n_ranks: Number of MPI ranks.
+    :return: The tuple ``(blocks, bounds, owner)``: the blocks as ``(negative, bosonic frequencies)`` pairs in summation
+        order, the task bounds of the ranks (rank ``r`` holds tasks ``bounds[r]`` to ``bounds[r + 1] - 1``) and the
+        owner rank of every ``v``.
+    """
+    w = SDE_W_BLOCK
+    blocks = [(False, tuple(range(b, min(niw + 1, b + w)))) for b in range(0, niw + 1, w)]
+    blocks += [(True, tuple(range(b, min(niw + 1, b + w)))) for b in range(1, niw + 1, w)]
+    n_tasks = niv * len(blocks)
+    bounds = np.arange(n_ranks + 1) * n_tasks // n_ranks
+    owner = np.searchsorted(bounds, np.arange(niv) * len(blocks), side="right") - 1
+    return blocks, bounds, owner
+
+
+def column_sde_slabs(niw: int, niv: int, n_ranks: int) -> int:
+    r"""
+    Returns the largest number of real-space self-energy slabs ``[nk_tot, nb, nb]`` one rank holds in the
+    column-distributed self-energy contraction (see :func:`column_sde_schedule`): the reduced result of every owned
+    frequency, the running sum of the one frequency another rank owns (only the first frequency of a rank's run can
+    have begun on another rank), the receive buffers for the other ranks' sums of its owned frequencies, and the partial
+    and contraction buffers of the task in flight.
+
+    :param niw: Number of positive bosonic frequencies.
+    :param niv: Number of positive fermionic frequencies.
+    :param n_ranks: Number of MPI ranks.
+    :return: The slab count of the busiest rank.
+    """
+    blocks, bounds, owner = column_sde_schedule(niw, niv, n_ranks)
+    n_b = len(blocks)
+    slabs = np.bincount(owner, minlength=n_ranks)
+    for rank in np.flatnonzero(np.diff(bounds) > 0):
+        slabs[rank] += 2  # the partial and contraction buffers of the task in flight
+        first_v = bounds[rank] // n_b
+        if owner[first_v] != rank:
+            slabs[rank] += 1  # the running sum handed to the owner
+            slabs[owner[first_v]] += 1  # the owner's receive buffer for it
+    return int(np.max(slabs))
+
+
 def team_build_columns(nk_tot: int, n_bands: int, npp: int) -> int:
     r"""
     Returns the number of vertex columns one node rank expands, transforms and writes at a time while the team solve
@@ -312,8 +365,9 @@ class BranchPeak:
     instead of once per rank (subtracting ``(r - 1) * giwk_shareable`` from the node total).
 
     :ivar baseline: Per-rank persistent bytes (full-grid two-point objects) live at this branch's peak.
-    :ivar giwk_shareable: The ``giwk_full`` portion of ``baseline`` that the node-shared window deduplicates to one
-        copy per node (0 for the Eliashberg branches, whose ``giwk_dga`` is a private per-rank object).
+    :ivar giwk_shareable: The portion of ``baseline`` held in per-node shared-memory windows (the Green's functions,
+        the local vertex and the loop self-energy), deduplicated to one copy per node (0 for the Eliashberg branches,
+        whose ``giwk_dga`` is a private object).
     :ivar off_distributed: Per-rank transient bytes held by every rank in the fast (flag-off) path.
     :ivar off_single: Transient bytes held by a single rank in the fast (flag-off) path.
     :ivar on_distributed: Per-rank transient bytes held by every rank in the lean (flag-on) path.
@@ -423,6 +477,8 @@ def estimate_peaks(
     with_eliashberg: bool,
     save_pairing_vertex: bool = False,
     n_eig: int = 1,
+    mixing_pairs: int = 0,
+    niv_interp: int = 0,
     overhead: float = OVERHEAD_FACTOR,
     chunk_budgets: ChunkBudgets = ChunkBudgets(),
 ) -> dict[str, BranchPeak]:
@@ -439,16 +495,22 @@ def estimate_peaks(
 
     The per-branch baselines track the actual giwk window of ``nonlocal_sde.calculate_self_energy_q``: the bubble
     (``chi0q``) runs on the ``niv_cut`` window, after which giwk is cut (and re-shared) to the
-    ``niv_core + niw_core`` window for the kernel/SDE section (``chiq_aux``, ``sde``); ``sigma_old`` is cut to the
-    core box before the kernel section. The ``sde`` baseline additionally holds the R-space Green's-function copy,
-    which is node-shared like giwk itself when the shared window is active (its ``giwk_shareable`` covers both). The
-    Eliashberg branches run after the self-consistency loop with ``sigma_dga`` freed on every rank and ``giwk_dga``
-    surviving on the bubble-building rank only, so their baseline is the per-rank footprint alone
-    (``giwk_shareable = 0``); the
-    surviving copy is counted in their single-rank slots. The ``sigma_loop`` branch is the loop's replicated
-    self-energy step after the SDE (proposal tail and mixing point, every window already released): the per-rank
-    private proposal and, on rank 0 only, the previous iterate's rebuild and the linear-mixing transients; it
-    carries no array baseline either.
+    ``niv_core + niw_core`` window for the kernel/SDE section (``chiq_aux``, ``sde``). The loop's self-energy stays
+    node-shared at the ``niv_cut`` window through the whole proposal, and rank 0 holds the accelerated-mixing history
+    (``mixing_pairs`` core-box (iterate, proposal) pairs) in the single-rank slots of all three branches. The ``sde``
+    baseline additionally holds the R-space Green's-function copy, which is node-shared like giwk itself when the
+    shared window is active (its ``giwk_shareable`` covers the node-shared arrays). The Eliashberg branches run after
+    the self-consistency loop with ``sigma_dga`` freed and ``giwk_dga`` on rank 0 only, so their baseline is the
+    per-rank footprint alone (``giwk_shareable = 0``); the surviving copy is counted in their single-rank slots. The
+    ``sigma_loop`` branch is the loop's self-energy step after the SDE, which runs on rank 0 alone: the history plus
+    the largest of the mixing point (the proposal and the rebuilt previous iterate with the three linear-mixing
+    copies, or the accelerated least-squares solve) and the chemical-potential update (the previous iterate and the
+    node's new window next to two complex128 Green's-function arrays), which dominate the proposal tail and the
+    hand-over; the other node roots hold at most their received array and window then, which the single-rank slot
+    covers on every node. The ``sigma_interp`` branch, present when ``niv_interp`` is set, is the final re-gridding:
+    rank 0 interpolates the irreducible self-energy and unfolds the result next to the node-shared window, every rank
+    re-grids at most its share of the momenta it fits with a pole. Every branch's baseline includes the per-rank
+    :data:`RANK_BASELINE_BYTES` and the full-grid non-local interaction every rank keeps for the whole run.
 
     :param n_bands: Number of bands :math:`B`.
     :param nk_tot: Total number of momentum points (full BZ).
@@ -467,12 +529,17 @@ def estimate_peaks(
         (``config.eliashberg.save_pairing_vertex``); a single-rank peak of the ``lanczos`` branch.
     :param n_eig: Number of requested eigenpairs (``config.eliashberg.n_eig``); sets the ARPACK Lanczos basis size
         ``ncv`` of :func:`lanczos_ncv` held per solving rank.
+    :param mixing_pairs: Number of (iterate, proposal) pairs rank 0's accelerated-mixing history reaches, i.e.
+        ``min(mixing_history_length + 1, max_iter)`` for Pulay or Anderson mixing and 0 for linear mixing; the
+        least-squares solve is modeled over ``mixing_pairs - 1`` secant columns.
+    :param niv_interp: Number of positive fermionic frequencies of the final self-energy interpolation's target grid
+        (``config.self_energy_interpolation.niv_target``), or 0 when the run does not interpolate (no
+        ``"sigma_interp"`` branch).
     :param overhead: Global multiplicative factor accounting for un-modeled transient arrays.
     :param chunk_budgets: Chunk byte budgets of the three chunked builds (see :class:`ChunkBudgets` and
         :func:`max_chunk_budget`); each modeled chunk is clamped to at least one slice of its build (a ``(q, w)``
-        compound slice, or one full-BZ bosonic row of the self-energy kernel) and at most the build's rank block. A
-        zero budget yields that branch's residents plus a single slice's transient. Every branch's baseline
-        includes the per-rank :data:`RANK_BASELINE_BYTES`.
+        compound slice, or one task's irreducible kernel columns of the self-energy contraction) and at most the
+        build's rank block. A zero budget yields that branch's residents plus a single slice's transient.
     :return: A dict mapping each branch key to its :class:`BranchPeak`.
     """
     nb = n_bands
@@ -483,19 +550,23 @@ def estimate_peaks(
     niv_sde = niv_core + niw_core  # giwk window through the kernel/SDE section (post-bubble cut/re-share)
 
     qi = _ceil_div(nk_irr, n_ranks)  # per-rank irreducible-BZ q-count
-    qt = _ceil_div(nk_tot, n_ranks)  # per-rank full-BZ q-count
 
     scale = DTYPE_BYTES * overhead
 
-    # Persistent per-rank baselines: giwk_full + sigma_old at niv_cut (bubble), cut to niv_core+niw_core / core box for
-    # the kernel section; sde adds a node-shared giwk.fft() copy; Eliashberg frees sigma_dga, keeps one giwk_dga.
-    giwk_bubble = scale * _giwk_rspace(nk_tot, nb, 2 * niv_cut)
+    # Persistent per-rank baselines: giwk_full (niv_cut for the bubble, niv_core+niw_core for the kernel section) next
+    # to the node-shared loop Sigma at niv_cut; sde adds a node-shared giwk.fft() copy; Eliashberg keeps one giwk_dga.
+    sigma_core = _giwk_rspace(nk_tot, nb, vc)
+    sigma_full = _giwk_rspace(nk_tot, nb, 2 * niv_cut)
+    giwk_bubble = scale * sigma_full
     giwk_sde = scale * _giwk_rspace(nk_tot, nb, 2 * niv_sde)
-    baseline_bubble = giwk_bubble + scale * _giwk_rspace(nk_tot, nb, 2 * niv_cut)  # + sigma_old at niv_cut
-    baseline_kernel_section = giwk_sde + scale * _giwk_rspace(nk_tot, nb, vc)  # + sigma_old at the core box
+    sigma_shared = scale * sigma_full
+    baseline_bubble = giwk_bubble + sigma_shared
+    baseline_kernel_section = giwk_sde + sigma_shared
     baseline_sde = baseline_kernel_section + giwk_sde  # + the (node-shareable) R-space Green's-function copy
-    giwk_dga_single = scale * _giwk_rspace(nk_tot, nb, 2 * niv_cut)  # the single surviving giwk_dga copy
-    rank_base = overhead * RANK_BASELINE_BYTES  # interpreter, libraries and buffers of every rank, in every baseline
+    giwk_dga_single = scale * sigma_full  # the single surviving giwk_dga copy
+    # interpreter, libraries and buffers of every rank plus the driver's full-grid non-local interaction
+    rank_base = overhead * RANK_BASELINE_BYTES + scale * nk_tot * nb**4
+    mixing_history = scale * 2 * mixing_pairs * sigma_core  # rank 0's (iterate, proposal) pairs
 
     peaks: dict[str, BranchPeak] = {}
 
@@ -504,7 +575,7 @@ def estimate_peaks(
     gf_window_bubble = 2 * (niv_full + niw_core)
     if n_ranks == 1:
         chi0q_baseline = baseline_bubble
-        chi0q_shareable = giwk_bubble
+        chi0q_shareable = giwk_bubble + sigma_shared
         chi0q_off_distributed = 0.0
         chi0q_off_single = scale * (
             _bubble_block(nk_irr, nb, wp, vf)
@@ -515,16 +586,16 @@ def estimate_peaks(
     else:
         g_r_windows = scale * 2 * _giwk_rspace(nk_tot, nb, gf_window_bubble)  # node-shared like giwk itself
         chi0q_baseline = baseline_bubble + g_r_windows
-        chi0q_shareable = giwk_bubble + g_r_windows
+        chi0q_shareable = giwk_bubble + sigma_shared + g_r_windows
         chi0q_off_distributed = scale * 1.5 * _bubble_block(qi, nb, wp, vf)
         chi0q_off_single = 0.0
     peaks["chi0q"] = BranchPeak(
         baseline=chi0q_baseline + rank_base,
         giwk_shareable=chi0q_shareable,
         off_distributed=chi0q_off_distributed,
-        off_single=chi0q_off_single,
+        off_single=chi0q_off_single + mixing_history,
         on_distributed=chi0q_off_distributed,
-        on_single=chi0q_off_single,
+        on_single=chi0q_off_single + mixing_history,
     )
 
     # Chunked sum (verify-only): three resident one-fermion blocks (accumulated sum, kernel accumulator, inverse
@@ -541,25 +612,30 @@ def estimate_peaks(
     local_vertex_shared = scale * max(_two_fermion_block(1, nb, wp, vf, vc), _two_fermion_block(1, nb, wp, vc))
     peaks["chiq_aux"] = BranchPeak(
         baseline=baseline_kernel_section + local_vertex_shared + rank_base,
-        giwk_shareable=giwk_sde + local_vertex_shared,
+        giwk_shareable=giwk_sde + sigma_shared + local_vertex_shared,
         off_distributed=chiq_aux_distributed,
-        off_single=0.0,
+        off_single=mixing_history,
         on_distributed=chiq_aux_distributed,
-        on_single=0.0,
+        on_single=mixing_history,
     )
 
-    # Two-pass FFT contraction in bounded w-chunks: the retained irr-BZ kernel + the exchange transients of one chunk
-    # at the driver-sized budget, clamped to [one full-BZ bosonic row, the full-BZ kernel block].
-    sde_row = DTYPE_BYTES * _bubble_block(qt, nb, 1, vc)
-    sde_block = DTYPE_BYTES * _bubble_block(qt, nb, wp, vc)
-    sde_chunk = min(max(chunk_budgets.sde, sde_row), sde_block)
-    sde_distributed = scale * _bubble_block(qi, nb, wp, vc) + overhead * SDE_CHUNK_FACTOR * sde_chunk
+    # Column-distributed contraction: the irr kernel, one round of irr columns (whole tasks) with the ring's send
+    # copy, the full-BZ column work with the contraction's operand chunk, and the busiest rank's real-space slabs.
+    _, sde_bounds, _ = column_sde_schedule(niw_core, niv_core, n_ranks)
+    sde_task = DTYPE_BYTES * _bubble_block(nk_irr, nb, 1, SDE_W_BLOCK)
+    sde_round = min(max(1, chunk_budgets.sde // sde_task), int(np.max(np.diff(sde_bounds)))) * sde_task
+    sde_column = DTYPE_BYTES * _bubble_block(nk_tot, nb, 1, 1)
+    sde_columns = SDE_COLUMN_FACTOR * sde_column + min(SDE_CONTRACTION_CHUNK_BYTES, sde_column)
+    sde_slabs = column_sde_slabs(niw_core, niv_core, n_ranks) * DTYPE_BYTES * _giwk_rspace(nk_tot, nb, 1)
+    sde_distributed = scale * _bubble_block(qi, nb, wp, vc) + overhead * (
+        sde_round * (1 + qi / nk_irr) + sde_columns + sde_slabs
+    )
     # rank-0 single: the sigma finalize buffers, or the occupation/energy step's DMFT-box sigma + giwk pair
     # (its concatenation and Dyson-build transients are broadcast-assigned and v-chunked, so only the pair counts)
-    sde_single = scale * max(2 * _giwk_rspace(nk_tot, nb, vc), 2 * _giwk_rspace(nk_tot, nb, 2 * niv_dmft))
+    sde_single = scale * max(2 * sigma_core, 2 * _giwk_rspace(nk_tot, nb, 2 * niv_dmft)) + mixing_history
     peaks["sde"] = BranchPeak(
         baseline=baseline_sde + rank_base,
-        giwk_shareable=2 * giwk_sde,
+        giwk_shareable=2 * giwk_sde + sigma_shared,
         off_distributed=sde_distributed,
         off_single=sde_single,
         on_distributed=sde_distributed,
@@ -595,20 +671,47 @@ def estimate_peaks(
             on_single=pairing_gather + giwk_dga_single,
         )
 
-    # Replicated loop self-energy step (flag-less, verify-only): per rank the private proposal through its Hartree/Fock
-    # chain (three core copies) or its tail concatenation; rank 0 adds the previous iterate's rebuild + 3 mix copies.
-    sigma_core = _giwk_rspace(nk_tot, nb, vc)
-    sigma_full = _giwk_rspace(nk_tot, nb, 2 * niv_cut)
-    sigma_loop_distributed = scale * max(3 * sigma_core, sigma_core + sigma_full)
-    sigma_loop_single = scale * (sigma_core + 4 * sigma_full)
+    # Rank-0 loop step (verify-only): the history + two niv_cut Sigmas with 3 linear-mix copies, the accelerated solve
+    # (measured: 9 m + 10 complex64 core copies bound Anderson and Pulay in both precisions) or update_mu's G arrays.
+    solve_width = mixing_pairs - 1
+    mixing_solve = overhead * 8 * sigma_core * (9 * solve_width + 10) if solve_width > 0 else 0.0
+    sigma_loop_single = (
+        mixing_history
+        + scale * 2 * sigma_full
+        + max(scale * 3 * sigma_full, mixing_solve, overhead * 16 * 2 * sigma_full)
+    )
     peaks["sigma_loop"] = BranchPeak(
         baseline=rank_base,
         giwk_shareable=0.0,
-        off_distributed=sigma_loop_distributed,
+        off_distributed=0.0,
         off_single=sigma_loop_single,
-        on_distributed=sigma_loop_distributed,
+        on_distributed=0.0,
         on_single=sigma_loop_single,
     )
+
+    if niv_interp:
+        # Final re-gridding (verify-only): rank 0 interpolates the irreducible Sigma (measured: 10 source + 4 target
+        # complex128 copies of PCHIP data), then unfolds it; every rank re-grids at most its share for the pole fits.
+        irr_source = _giwk_rspace(nk_irr, nb, 2 * niv_cut)
+        irr_target = _giwk_rspace(nk_irr, nb, 2 * niv_interp)
+        share_source, share_target = _giwk_rspace(qi, nb, 2 * niv_cut), _giwk_rspace(qi, nb, 2 * niv_interp)
+        interp_distributed = scale * share_source + overhead * 16 * (10 * share_source + 4 * share_target)
+        interp_single = (
+            mixing_history
+            + scale * (sigma_full + irr_source)
+            + max(
+                overhead * 16 * (10 * irr_source + 4 * irr_target),
+                scale * (irr_target + _giwk_rspace(nk_tot, nb, 2 * niv_interp)),
+            )
+        )
+        peaks["sigma_interp"] = BranchPeak(
+            baseline=rank_base,
+            giwk_shareable=0.0,
+            off_distributed=interp_distributed,
+            off_single=interp_single,
+            on_distributed=interp_distributed,
+            on_single=interp_single,
+        )
 
     # Rank-0-serial local SDE (flag-less, verify-only): both channels' outputs (gamma + chi at the core box, full
     # vertex at niv_full) + the two halved inputs + the dominant chi-tilde shell transient at niv_full.

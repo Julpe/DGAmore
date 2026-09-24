@@ -238,6 +238,16 @@ def test_subtracts_self_energy_and_numpy_array_correctly():
     assert np.allclose(result.mat, self_energy.mat - array)
 
 
+def test_interpolate_on_a_subset_of_momenta_gives_exactly_the_rows_of_the_full_interpolation():
+    """Every momentum is re-gridded on its own, so interpolating a subset of rows reproduces those rows bit for bit."""
+    rng = np.random.default_rng(21)
+    mat = (rng.standard_normal((9, 2, 2, 16)) + 1j * rng.standard_normal((9, 2, 2, 16))).astype(np.complex64)
+    full = SelfEnergy(mat, (3, 3, 1), has_compressed_q_dimension=True, calc_smom=False, beta=8.0)
+    rows = np.array([1, 4, 8])
+    subset = SelfEnergy(mat[rows], (3, 3, 1), has_compressed_q_dimension=True, calc_smom=False, beta=8.0)
+    assert np.array_equal(subset.interpolate(11.0, 12).mat, full.interpolate(11.0, 12).mat[rows])
+
+
 def test_interpolate_returns_same_values_when_beta_and_grid_are_unchanged():
     """interpolate returns the same values when beta and grid are unchanged."""
     beta = 1.0
