@@ -51,6 +51,9 @@ from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE, deferred_collection
 from dgamore.symmetry_reduction import find_coordinate_mirror_orbital_unitaries, point_group_orbits
 
+EVEN_SECTOR_DEGENERACY = 1e-2  # relative agreement of the leading singlet-even and triplet-even eigenvalues above
+# which even_sectors_degenerate reports them as coinciding
+
 
 def delete_files(filepath: str, *args) -> None:
     """
@@ -696,6 +699,24 @@ def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
 
 
 # --- Physical-gap symmetry sectors (frequency parity + forced momentum/orbital parity) ---
+def even_sectors_degenerate(results: dict) -> bool:
+    """
+    Returns whether the leading singlet-even and triplet-even eigenvalues agree to the relative tolerance
+    ``EVEN_SECTOR_DEGENERACY``. The two sectors belong to different channels and have no reason to coincide on a
+    physical state; a coincidence to many digits has marked an unphysical fixed point of the self-consistency.
+    False when either sector was not solved (no frequency-parity resolution, or no converged eigenvalue).
+
+    :param results: The solver output ``{(channel, parity): (lambdas, gaps)}``.
+    :return: Whether the two leading even eigenvalues coincide.
+    """
+    leading = []
+    for channel in (SpinChannel.SING, SpinChannel.TRIP):
+        if (channel, "even") not in results or len(results[(channel, "even")][0]) == 0:
+            return False
+        leading.append(float(np.max(np.asarray(results[(channel, "even")][0]).real)))
+    return abs(leading[0] - leading[1]) <= EVEN_SECTOR_DEGENERACY * max(abs(leading[0]), abs(leading[1]))
+
+
 def _frequency_parity_sectors(resolve_frequency_parity: bool) -> list[tuple[str, int | None]]:
     r"""
     Returns the list of gap sectors to solve, each a ``(label, eps_T)`` pair where ``eps_T`` is the requested

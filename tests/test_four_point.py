@@ -1060,6 +1060,41 @@ def test_invert_and_sum_v2_elimination_factorizes_only_the_pairs_with_vertex(rng
     assert sizes and set(sizes) == {(8 * 6, 8 * 6)}
 
 
+def _dense_solve_reference(fp: FourPoint, rhs: np.ndarray) -> np.ndarray:
+    """Dense solve of every half-range compound slice for the one-fermion right-hand sides ``rhs``."""
+    half = deepcopy(fp).to_half_niw_range().compress_q_dimension()
+    o, vn = half.n_bands, 2 * half.niv
+    n = o * o * vn
+    out = np.empty_like(rhs)
+    for i in range(half.current_shape[0]):
+        for w in range(half.current_shape[-3]):
+            compound = half.mat[i][:, :, :, :, w].transpose(0, 1, 4, 3, 2, 5).reshape(n, n)
+            b = rhs[i][:, :, :, :, w].transpose(0, 1, 4, 3, 2).reshape(n, o * o)
+            out[i][:, :, :, :, w] = np.linalg.solve(compound, b).reshape(o, o, vn, o, o).transpose(0, 1, 4, 3, 2)
+    return out
+
+
+@pytest.mark.parametrize("eliminated", [False, True])
+def test_invert_and_sum_v2_solves_a_given_right_hand_side(rng, monkeypatch, eliminated):
+    """With rhs the per-slice solve returns the compound solution for those right-hand sides, without 1/beta."""
+    monkeypatch.setattr(npb, "DTYPE", np.complex128)
+    if eliminated:
+        fp, inactive = _two_atom_compound_fourpoint(rng, symmetric=False)
+    else:
+        fp, inactive = _random_compound_fourpoint(rng, 2, symmetric=False), None
+    half = deepcopy(fp).to_half_niw_range()
+    shape = half.current_shape[:-1]
+    rhs = FourPoint(
+        rng.standard_normal(shape) + 1j * rng.standard_normal(shape),
+        nq=half.nq,
+        num_vn_dimensions=1,
+        has_compressed_q_dimension=True,
+        full_niw_range=False,
+    )
+    solved = deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0, inactive, rhs=rhs)
+    assert np.allclose(solved.mat, _dense_solve_reference(fp, rhs.mat), atol=1e-10)
+
+
 def test_invert_and_sum_v2_with_no_or_every_pair_inactive_takes_the_full_solve(rng):
     """An empty or a complete inactive set leaves the whole-slice solve in place, bit for bit."""
     fp = _random_compound_fourpoint(rng, 2, symmetric=False)

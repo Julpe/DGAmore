@@ -130,15 +130,22 @@ the previous one - taken over the full momentum grid, all orbital combinations a
 frequencies of the core box (reported in the log every iteration). The chemical potential must also settle,
 changing by less than a small temperature-dependent threshold between iterations.
 
-The ``mixing`` parameter is a floating-point number between zero and one that sets the weight of the new
-self-energy in the update. The accompanying ``mixing_strategy`` selects between ``linear``, ``pulay`` and
-``anderson`` mixing; the latter two build a secant model from the last ``mixing_history_length`` pairs of an
-iterate and the un-mixed self-energy the Schwinger-Dyson map produced from it, collected in memory as the run
-iterates, and mix linearly for the first ``mixing_history_length`` iterations while those pairs accumulate. The
-``previous_sc_path`` field points to the folder of an earlier, possibly unconverged, self-consistency run: the
-code then resumes from its last iteration and chemical potential and continues converging; the accelerated
-schemes rebuild their history during the resumed run's first iterations, since the saved per-iteration files hold
-only the already-mixed self-energies. Enabling ``use_interpolated_sigma`` makes the cycle start from the
+The ``mixing`` parameter is a floating-point number between zero and one that sets the weight of the new self-energy
+in the update. With ``use_jacobian_stabilization`` on (see the :ref:`stabilization section <stabilization>`) it
+remains the ceiling of every damped step on the directions the tracker does not certify and of the accelerated
+steps, while a certified direction takes a step of its own that is capped at one rather than at ``mixing``, so a
+certified flat direction may step further than the configured value. The accompanying ``mixing_strategy`` selects
+between ``linear``, ``pulay`` and ``anderson`` mixing; the latter two build a secant model from the last
+``mixing_history_length`` pairs of an iterate and the un-mixed self-energy the Schwinger-Dyson map produced from it,
+collected in memory as the run iterates, and mix linearly for the first ``mixing_history_length`` iterations while
+those pairs accumulate. The ``previous_sc_path`` field points to
+the folder (``LDGA_...``) of an earlier, possibly unconverged, self-consistency run: the code then resumes from the
+last iteration found in its ``Sigma_Iterates`` subfolder (or in the run folder itself for older runs) and from its
+chemical potential, and continues converging. With ``use_jacobian_stabilization`` on, every iteration also writes
+the un-mixed proposal (``sigma_dga_proposal_iteration_<i>.npy``) next to the mixed self-energy. The resumed run
+rebuilds the accelerated-mixing history from scratch, mixing linearly for the first ``mixing_history_length``
+iterations: the previous run's pairs sample a different map, and seeding a secant model with them lets the fit cancel
+the new residual and stall at the old solution. Enabling ``use_interpolated_sigma`` makes the cycle start from the
 interpolated self-energy of the previous run, with the interpolation itself configured in the
 :ref:`self-energy interpolation section <self-energy-interpolation>`.
 
@@ -156,6 +163,8 @@ work, what they have in common and when to reach for which is discussed on the :
      use_lambda_correction: False      # bool
      use_chi_phys_restriction: False   # bool
      use_lambda_annealing: False       # bool
+     use_jacobian_stabilization: False # bool
+     use_exact_jacobian: False         # bool
 
 Setting ``use_lambda_correction`` to ``True`` applies the lambda correction to the physical susceptibilities
 in every iteration of the cycle. The correction is dispatched by the band count (and the choice is logged):
@@ -168,6 +177,11 @@ below purely to stabilize convergence (it always corrects both channels). In bot
 the *uncorrected* self-consistent solution to the full ``epsilon``, so the corrected susceptibilities never enter
 the final result. It is independent of the one-shot ``perform_lambda_correction`` of the
 :ref:`lambda correction section <lambda-correction>`, which takes precedence when both are enabled.
+
+The per-iteration single-band search differs from the one-shot one in two points: it brackets the root inside the
+branch of the sum rule that is anchored at the static divergence bound and closed at the next pole above it, and it
+warm-starts from the previous iteration's :math:`\lambda`. The one-shot correction is unchanged by this. The reason
+is described on the :doc:`cooldown` page.
 
 The multi-band scheme mimics the scalar correction without being derived from it: instead of one scalar per channel
 it calibrates a full :math:`n_{\mathrm{o}}^2 \times n_{\mathrm{o}}^2` real-symmetric mass matrix
@@ -183,17 +197,21 @@ correctly once the star is summed explicitly. For a single band the matrix colla
 reduces to the ordinary lambda correction.
 
 The option ``use_chi_phys_restriction`` regularizes the physical
-susceptibilities: per momentum and bosonic frequency, the eigenvalues of the Hermitian part of the inverse
-susceptibility are floored at a small positive value (a negative eigenvalue of the inverse marks a crossed pole of
-the Bethe-Salpeter equation), while healthy eigenpairs - including legitimately negative off-diagonal matrix
-elements - pass through unchanged.
-This stabilizes cycles that would otherwise converge onto an unphysical branch, but the floored blocks are a
+susceptibilities with the two bounds a bosonic susceptibility obeys, per momentum: at the static frequency the
+eigenvalues of the Hermitian part of the inverse susceptibility are floored (a negative eigenvalue of the inverse
+marks a crossed pole of the Bethe-Salpeter equation), at half the smallest one of the healthy static blocks of that
+channel, so a crossed mode is pinned at twice the largest healthy static susceptibility; and at every finite
+frequency the eigenvalues of the Hermitian and of the skew-Hermitian part of the susceptibility are clipped into
+[-c, c], with c the largest static eigenvalue at that momentum (a larger value marks a pole at that frequency, e.g.
+the first-frequency density pole the static bound cannot see). Blocks within both bounds, including legitimately
+negative off-diagonal matrix elements and the small negative values of the frequency-box truncation, pass through bit
+for bit. This stabilizes cycles that would otherwise converge onto an unphysical branch, but the floored blocks are a
 regularization rather than physics, so once the self-energy converges with this option enabled and iterations
 remain, the option is switched off automatically and the cycle continues until convergence is reached again or
 ``max_iter`` is hit. The restricted phase only serves as a scaffold for the unrestricted one, so it is converged to
 a relaxed threshold of ten times ``epsilon``; at the release the mixing history is reset (the accelerated schemes
 must not extrapolate across the discontinuity) and the unrestricted phase then converges to the full ``epsilon``.
-The log reports the number of floored eigenvalues per iteration - releasing is only promising once that count has
+The log reports the number of restricted eigenvalues per iteration - releasing is only promising once that count has
 decayed to zero - and the minimum static eigenvalue of every channel's susceptibility, which certifies whether the
 final state is physical. Combining ``use_chi_phys_restriction`` with the lambda correction is not recommended (the lambda
 correction would calibrate its sum rule on eigenvalue-floored susceptibilities); if both are enabled, the lambda
@@ -214,6 +232,70 @@ verdict that no stable physical fixed point was found. It is mutually exclusive 
 susceptibility-reshaping options - the lambda correction and ``use_chi_phys_restriction`` (the sum rule must not be
 calibrated on mass-shifted susceptibilities, and the two scaffolds would fight); if combined, a lambda correction
 or ``use_chi_phys_restriction`` takes precedence and the annealing scaffold is disabled with a warning.
+
+Setting ``use_jacobian_stabilization`` to ``True`` turns on :mod:`dgamore.jacobian_stabilization`: the cycle tracks the
+leading eigenvalues of the Jacobian of the self-energy map from its own (iterate, proposal) history at no extra proposal
+evaluation (a secant Rayleigh-Ritz estimate, refreshed every iteration), and stabilizes the physical fixed point by
+flipping the sign of the damping on the certified unstable eigendirections - the modified iteration of arXiv:2606.04936,
+Eqs. 25-26, built on Phys. Rev. Lett. doi:10.1103/zjy7-4jqd - reflecting the proposal residual on the unstable subspace
+before the configured mixing (linear, Pulay or Anderson) acts on it, and overwriting the certified directions of a
+damped step afterwards with the step their own eigenvalues allow. The cycle also lowers the mixing parameter to the
+largest value the measured spectrum allows (arXiv:2606.04936 Eq. 13, whose safety factor ``c`` in ``(0, 1)`` widens the
+basin as it shrinks and is taken at the vertex of the stability parabola, arXiv:2609.11405 App. F), never above
+``self_consistency.mixing``, on every damped step (linear mixing, and the warm-up and fallbacks of the accelerated
+schemes); an accelerated step keeps its configured parameter, because a whole-spectrum bound describes the damped Picard
+iteration and not the damping of a quasi-Newton step. That scalar governs only the directions the estimate does not
+certify: each certified direction of a damped step is damped instead by the amount its own eigenvalue allows (Eq. 27 of
+arXiv:2606.04936 and Eq. 21 of arXiv:2609.11405, capped at one rather than at ``mixing``, and taken with the reversed
+sign where the direction is flipped), so a stiff certified mode is damped hard while a flat one advances its whole
+residual in a single step, whatever the damping did to it. The per-direction damping gave no speed-up for the parquet
+iteration of the earlier paper and looked less stable there than uniform damping, while the later one finds it helps
+TRILEX and SBE and that uniform mixing is more stable for MBE, which it attributes to MBE being affected by vertex
+divergences the way the parquet iteration is; ladder DGA iterates the self-energy alone but sits close to those
+divergences on the beta ladder, so its benefit here is a hypothesis for the ladder to confirm rather than a settled
+result. An accelerated Pulay or Anderson step keeps the step it computed on the reflected map, since its secant model of
+the certified span is built from the same secants that certified it. A certified unstable direction whose flip is not
+yet acted on, below the persistence streak of three consecutive certifications or with its reflection refused, is no
+part of that map and keeps the mixing's step, and a certified direction whose negative real part lies inside its
+undecidable band, whose sign is not resolved, takes the damping of the damped step in the map. Where two certified
+directions of opposite sign lie too close for any bounded map to reverse one and fix the other, no per-direction damping
+is built at all and the log says so. The per-direction damping is rebuilt on every iteration that certifies a direction,
+with or without a flip, and otherwise stays in force: it ends when the residual grows on three consecutive iterations,
+which releases it and holds it off for three further informative iterations (an iteration frozen below the noise floor
+does not count) before the estimate may install it again, when the calm release of the reflection beside it drops it
+until the next certifying iteration, or when a scaffold pauses the flips. The certified span is taken out of the damped
+step along the oblique spectral projector onto it, so a direction the estimate does not certify keeps exactly the step
+the mixing gave it; where the certified and the uncertified subspace are too close to separate that way, the orthogonal
+projector is used instead and the log records it. The estimate needs three recorded pairs, so the first steps of a cold
+run are taken at the configured ``mixing`` with nothing measured yet; a run started from a predecessor with the flag on
+carries that predecessor's spectrum in (``jacobian.npz`` in its run folder) and starts with its flips and with the
+damping bound that spectrum allows (the damping the predecessor ended with is a record and is not read back), see the
+:ref:`cooldown procedure <cooldown-jacobian>`. A direction is also flipped ahead of its crossing, when three
+consecutive estimates extrapolate its real part across the boundary beyond their error bar or when its eigenvalue has
+just passed through a pole, and a carried direction when its values at the two preceding rungs extrapolate across it
+in :math:`\beta`; both predictions are module constants of :mod:`dgamore.jacobian_stabilization`, not YAML options.
+The tracker follows at most six directions (the secant window it
+estimates from), so it addresses an instability carried by a few unstable modes; a post-divergence instability whose
+unstable directions form a band growing with the grid size (arXiv:2606.04936, appendix D.1) is beyond its reach. It
+composes with the three susceptibility-reshaping scaffolds above: monitoring runs throughout, flips are paused while a
+scaffold is active (the scaffolded map is not the physical map) and resume after its release. It is not compatible with
+the one-shot ``perform_lambda_correction`` of the :ref:`lambda correction section <lambda-correction>` (a single
+iteration has no history): if both are enabled, ``use_jacobian_stabilization`` is disabled automatically with a warning.
+A run whose certified spectrum holds no unstable direction never flips, but it does not proceed as it would with the
+flag off: from the first iteration that certifies a direction, every certified direction takes the step its own
+eigenvalue allows on each damped step, and a certified overshoot mode lowers the damping of those steps, so the
+iterates differ from the flag-off run from that iteration on. Beyond the Rayleigh-Ritz estimate per iteration on
+rank 0, what the flag buys is a run whose start sits near a direction the map has already turned unstable, typically
+after a large step in temperature or interaction.
+
+Setting ``use_exact_jacobian`` to ``True`` as well (see :mod:`dgamore.sigma_jacobian`) evaluates the exact Jacobian
+of the loop's self-energy map, the chemical-potential and occupation updates included, once the run reaches the pure
+fixed point: ARPACK computes its six eigenpairs with the largest real part and the six with the largest modulus, which
+replace the tracker's certified spectrum in ``jacobian.npz`` for the next run of a ladder. The loop's own iterations are
+unchanged. The evaluation costs up to about 300 Jacobian-vector products of one to two proposals each and is exact for
+:math:`V = 0` (the :math:`V^{\mathbf{q}}` Hartree-Fock offset of the self-energy's shell is held). It is disabled with a
+warning without ``use_jacobian_stabilization`` or when its memory estimate does not fit the job; a run that stops at
+``max_iter`` or in a scaffolded phase skips it.
 
 .. _lambda-correction:
 

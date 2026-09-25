@@ -30,10 +30,19 @@ stabilization:
   # then disabled so the run converges the uncorrected solution). Dispatched by the band count: single-band input uses the scalar correction (honoring lambda_correction.type
   # below), multi-band input the multi-orbital matrix correction (always both channels). Mutually exclusive with use_chi_phys_restriction and use_lambda_annealing;
   # the one-shot perform_lambda_correction below takes precedence when both are enabled.
-  use_chi_phys_restriction: False # If True, the physical susceptibilities are restricted to positive-semidefinite compound blocks (eigenvalue floor on the inverse) during the self-consistency cycle.
+  use_chi_phys_restriction: False # If True, the physical susceptibilities are restricted to the bounds of a bosonic susceptibility during the self-consistency cycle (releasing scaffold):
+  # static compound blocks positive-semidefinite (a crossed mode pinned at twice the largest healthy static value), finite-frequency blocks clipped to the static maximum per momentum.
   use_lambda_annealing: False # If True, protects the cycle with the lambda-annealing scaffold: a bosonic mass (measured automatically from the susceptibility
   # spectrum) is added to 1/chi per channel, held constant per convergence phase and halved between phases until it is exactly zero - the final result is always
   # pure self-consistency. Multi-orbital-safe, like the matrix lambda correction (with which it must not be combined).
+  use_jacobian_stabilization: False # If True, tracks the leading Jacobian eigenvalues of the self-energy map from the cycle's own (iterate, proposal) history
+  # (no extra proposal evaluation) and flips the sign of the damping on the certified unstable eigendirections; it also lowers the mixing parameter to what the
+  # measured spectrum allows (never above self_consistency.mixing) on every damped step, where each certified
+  # direction takes instead the step its own eigenvalue allows; an accelerated step keeps the configured parameter. Composes with the three scaffolds above; disabled if perform_lambda_correction is on.
+  # A run started from a previous one with the flag on carries that run's certified spectrum in (its
+  # jacobian.npz).
+  use_exact_jacobian: False # If True (with use_jacobian_stabilization), a converged run writes the exact Jacobian's leading eigenpairs to jacobian.npz
+  # instead of the secant estimate: up to about 300 Jacobian-vector products of one to two proposals each; skipped if its memory estimate does not fit.
 
 lambda_correction:
   perform_lambda_correction: False # If True, the code will perform a one-shot DGA with lambda correction: max_iter is overridden to 1 and mixing to 1.0. Dispatched by the
@@ -87,5 +96,3 @@ ana_cont:
   # for the plot of the spectral function. The format is a list of lists, where each sub-list contains the 3d k-point in
   # fractional coordinates in the primitive (not conventional!) k-space basis, and the label for the plot.
   energy_window: [ -2, 3 ] # Energy window for the plot of the spectral function in eV.
-
-  # shared-memory windows (computed only by the node's first rank)

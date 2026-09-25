@@ -2937,3 +2937,21 @@ def test_pairing_vertex_gather_scatter_round_trip_preserves_rank_shares(setup, m
         assert np.array_equal(restored, own)
 
     conftest.run_parallel(2, worker)
+
+
+def test_even_sectors_degenerate_flags_equal_leading_even_eigenvalues():
+    """Equal leading singlet-even and triplet-even eigenvalues are flagged, distinct or unprojected sectors are not."""
+
+    def results(singlet: float, triplet: float) -> dict:
+        """Solver output with the two even sectors and one odd sector."""
+        return {
+            (SpinChannel.SING, "even"): (np.array([singlet, 0.1]), []),
+            (SpinChannel.SING, "odd"): (np.array([1.12]), []),
+            (SpinChannel.TRIP, "even"): (np.array([triplet]), []),
+        }
+
+    assert es.even_sectors_degenerate(results(0.617, 0.6170001))
+    assert es.even_sectors_degenerate(results(0.436512, 0.435412))
+    assert not es.even_sectors_degenerate(results(0.21, 0.011))
+    unprojected = {(SpinChannel.SING, "none"): (np.array([0.5]), []), (SpinChannel.TRIP, "none"): (np.array([0.5]), [])}
+    assert not es.even_sectors_degenerate(unprojected)

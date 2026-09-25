@@ -43,8 +43,9 @@ def uniquify_path(path: str = None):
 
 def create_output_folders() -> None:
     """
-    Creates the run's output folder and, where their content is produced, the plots and Eliashberg subfolders. The
-    plots folder is needed by the general plots and by the spectrum plot of the analytic continuation alike.
+    Creates the run's output folder, its per-iteration self-energy subfolder and, where their content is produced,
+    the plots and Eliashberg subfolders. The plots folder is needed by the general plots and by the spectrum plot of
+    the analytic continuation alike.
 
     :return: None.
     """
@@ -53,6 +54,7 @@ def create_output_folders() -> None:
     )
     wanted = {
         config.output.output_path: True,
+        config.output.sigma_iterates_path: True,
         config.output.plotting_path: config.output.do_plotting or spectrum_plot,
         config.output.eliashberg_path: config.eliashberg.perform_eliashberg,
     }
@@ -126,6 +128,9 @@ def load_from_dmft_file_and_update_config() -> (
     config.output.output_path = uniquify_path(os.path.join(config.output.output_path, output_format))
     config.output.plotting_path = os.path.join(config.output.output_path, config.output.plotting_subfolder_name)
     config.output.eliashberg_path = os.path.join(config.output.output_path, config.eliashberg.subfolder_name)
+    config.output.sigma_iterates_path = os.path.join(
+        config.output.output_path, config.self_consistency.sigma_iterates_subfolder_name
+    )
 
     create_output_folders()
 

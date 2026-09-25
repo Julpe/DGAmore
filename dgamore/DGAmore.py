@@ -532,6 +532,12 @@ def run_dga_routine(comm: MPI.Comm) -> None:
             return name if parity == "none" else f"{name} {parity}"
 
         if comm.rank == 0:
+            if eliashberg_solver.even_sectors_degenerate(results):
+                logger.warning(
+                    "The leading singlet-even and triplet-even Eliashberg eigenvalues coincide (relative "
+                    f"{eliashberg_solver.EVEN_SECTOR_DEGENERACY:g}). Two channels have no reason to agree on a "
+                    "physical state; such a coincidence has marked an unphysical fixed point of the self-consistency."
+                )
             with open(os.path.join(config.output.eliashberg_path, "eigenvalues.txt"), "w") as eig_file:
                 for (channel, parity), (lambdas, _gaps) in results.items():
                     eig_file.write(
@@ -576,7 +582,8 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     each heavy step's peak, that the run fits: the FFT bubble, the chunked auxiliary-susceptibility sum, the
     Schwinger-Dyson contraction, the local Schwinger-Dyson pass, the pairing-vertex construction and the Eliashberg
     solver (which alone has two variants, in-memory versus its block-distributed grid fallback), and sizes the
-    chunk budgets of the three chunked builds from the same estimate.
+    chunk budgets of the three chunked builds from the same estimate. The optional converged-point exact Jacobian
+    (``stabilization.use_exact_jacobian``) is disabled with a warning instead of raising when it does not fit.
     Must be called only after the irreducible BZ is known (i.e. after auto-symmetry discovery), as the estimate depends on ``k_grid.nk_irr``.
 
     The budget is a **node total**: on a node with ``r`` ranks the memory held by all of them at a branch's peak is
@@ -646,6 +653,9 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         niv_interp=(
             config.self_energy_interpolation.niv_target if config.self_energy_interpolation.do_interpolation else 0
         ),
+        with_jacobian_tracker=config.stabilization.use_jacobian_stabilization,
+        mixing_history_length=config.self_consistency.mixing_history_length,
+        with_exact_jacobian=config.stabilization.use_exact_jacobian,
     )
 
     def node_total(bp: memory_estimator.BranchPeak, distributed: float, single: float, n_ranks: int) -> float:
@@ -733,6 +743,19 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
                 f"The local Schwinger-Dyson step needs {worst / 1024**3:.3f} GB on rank 0's node, which exceeds "
                 f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory. Use a smaller frequency box or fewer bands."
             )
+    # The exact Jacobian is optional: a job it does not fit runs without it and keeps the tracker's estimate.
+    if "exact_jacobian" in peaks:
+        bp_exact = peaks["exact_jacobian"]
+        if not fits_everywhere(bp_exact, bp_exact.off_distributed, bp_exact.off_single):
+            worst = max(
+                node_total(bp_exact, bp_exact.off_distributed, bp_exact.off_single, r) for r, *_ in nodes.values()
+            )
+            config.stabilization.use_exact_jacobian = False
+            logger.warning(
+                f"The exact Jacobian needs {worst / 1024**3:.3f} GB on a node, which exceeds "
+                f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory; it is disabled and jacobian.npz keeps "
+                "the tracker's estimate."
+            )
     # Single-path branches: the bubble always runs the FFT evaluation, the pairing vertex the chunked slice build,
     # and the solver falls back from in-memory (a multi-rank job: the team solve's own node formula) to the grid.
     verify_only = (
@@ -768,7 +791,10 @@ def _resolve_option_exclusivity() -> None:
     ``use_chi_phys_restriction`` and the lambda-annealing scaffold - all modify the physical susceptibility and cannot run
     together (a sum-rule calibration must not see a floored or mass-shifted chi, and the two scaffolds would fight).
     Precedence: lambda correction > use_chi_phys_restriction > lambda annealing. Conflicting options are disabled
-    with a warning.
+    with a warning. Separately, ``use_jacobian_stabilization`` cannot run with the one-shot
+    ``perform_lambda_correction`` (a single iteration has no history) and is disabled with a warning if both are
+    enabled, and ``use_exact_jacobian`` needs ``use_jacobian_stabilization`` (the exact spectrum is written through
+    the tracker) and is disabled with a warning without it.
 
     :return: None.
     """
@@ -788,6 +814,15 @@ def _resolve_option_exclusivity() -> None:
                 f"'{name}' was enabled together with {kept} - these are mutually exclusive. Keeping {kept} and "
                 f"disabling '{name}'."
             )
+
+    if config.lambda_correction.perform_lambda_correction and config.stabilization.use_jacobian_stabilization:
+        disable_option("use_jacobian_stabilization", "the one-shot lambda correction")
+
+    if config.stabilization.use_exact_jacobian and not config.stabilization.use_jacobian_stabilization:
+        config.stabilization.use_exact_jacobian = False
+        config.logger.warning(
+            "'use_exact_jacobian' needs 'use_jacobian_stabilization', which is off; the exact Jacobian is disabled."
+        )
 
     if config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction:
         disable_option("use_chi_phys_restriction", "the lambda correction")
