@@ -360,9 +360,6 @@ iteration, and they are deleted once the vertex has been built.
    * - ``vrg_q_<channel>_rank_<r>.npy``
      - Three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{\mathrm{r}}`
      - ``[nq_rank, no, no, no, no, niw_core + 1, 2 niv_core]``
-   * - ``vrg_q_<channel>_right_rank_<r>.npy``
-     - The corresponding right (left-summed) three-leg vertex
-     - ``[nq_rank, no, no, no, no, niw_core + 1, 2 niv_core]``
    * - ``chi_phys_q_<channel>_rank_<r>.npy``
      - Physical susceptibility of that rank's momenta
      - ``[nq_rank, no, no, no, no, niw_core + 1]``

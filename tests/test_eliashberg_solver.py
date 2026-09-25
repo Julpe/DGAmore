@@ -15,6 +15,7 @@ import pytest
 
 import dgamore.config as config
 import dgamore.mpi_utils as mu
+import dgamore.n_point_base as n_point_base
 from dgamore import eliashberg_solver as es
 from dgamore import nonlocal_sde
 from dgamore.dga_logger import DgaLogger
@@ -2544,8 +2545,8 @@ def setup(tmp_path, monkeypatch):
     yield tmp_path
 
 
-def _toy_arrays(no, rng):
-    """Builds a reversal-symmetric bubble, a v/v'-symmetric local vertex and a symmetric interaction."""
+def _toy_arrays(no, rng, symmetric_bubble=True):
+    """Builds a (reversal-symmetric) bubble, a v/v'-symmetric local vertex and a symmetric interaction."""
     beta = config.sys.beta
     chi0_mat = np.zeros((N_Q, no, no, no, no, N_W, 2 * NIV), complex)
     for iq in range(N_Q):
@@ -2553,9 +2554,9 @@ def _toy_arrays(no, rng):
             for iv in range(2 * NIV):
                 a = rng.standard_normal((no, no)) + 1j * rng.standard_normal((no, no))
                 b = rng.standard_normal((no, no)) + 1j * rng.standard_normal((no, no))
-                chi0_mat[iq, ..., iw, iv] = -beta * (
-                    np.einsum("il,kj->ijkl", a, b) + np.einsum("il,kj->ijkl", a.T, b.T)
-                )
+                chi0_mat[iq, ..., iw, iv] = -beta * np.einsum("il,kj->ijkl", a, b)
+                if symmetric_bubble:
+                    chi0_mat[iq, ..., iw, iv] -= beta * np.einsum("il,kj->ijkl", a.T, b.T)
 
     gamma_mat = 0.3 * (
         rng.standard_normal((no, no, no, no, N_W, 2 * NIV, 2 * NIV))
@@ -2584,9 +2585,28 @@ def _write_intermediates(chi0_mat, gamma_mat, u_mat, no):
     return gamma_r, u_loc, v_nonloc, dist
 
 
+@pytest.mark.parametrize("symmetric_bubble", [True, False])
+@pytest.mark.parametrize("no", [1, 2, 3])
+def test_slice_constructor_matches_streaming_route_in_double_precision(setup, monkeypatch, no, symmetric_bubble):
+    """The band solve of the slice constructor and the full inverse of the streaming route agree in complex128."""
+    monkeypatch.setattr(n_point_base, "DTYPE", np.complex128)
+    config.sys.n_bands = no
+    niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
+    chi0_mat, gamma_mat, u_mat = _toy_arrays(no, np.random.default_rng(0), symmetric_bubble)
+
+    gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
+    reference = es.create_pairing_vertex_streaming_fq(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+
+    gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
+    result = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+
+    assert result.mat.dtype == np.complex128
+    assert np.allclose(result.mat, reference.mat, atol=1e-11 * np.max(np.abs(reference.mat)))
+
+
 @pytest.mark.parametrize("no", [1, 2, 3])
 def test_slice_constructor_matches_streaming_route(setup, no):
-    """The slice-direct constructor and the streaming save_fq route produce the same pp pairing vertex."""
+    """In complex64 the native band solve matches the double-precision streaming route to its rounding."""
     config.sys.n_bands = no
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
     chi0_mat, gamma_mat, u_mat = _toy_arrays(no, np.random.default_rng(0))
@@ -2598,7 +2618,7 @@ def test_slice_constructor_matches_streaming_route(setup, no):
     result = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
 
     assert result.mat.shape == reference.mat.shape
-    assert np.allclose(result.mat, reference.mat, atol=1e-5 * np.max(np.abs(reference.mat)))
+    assert np.allclose(result.mat, reference.mat, atol=1e-4 * np.max(np.abs(reference.mat)))
 
 
 def test_slice_constructor_is_bit_invariant_under_the_chunk_budget(setup, monkeypatch):
@@ -2863,7 +2883,7 @@ def test_streaming_fq_multi_rank_writes_disjoint_slabs_matching_single_rank(setu
 
     # split the regenerated single-rank intermediates into per-rank q-shares (the q axis leads in every file)
     gamma_r, u_loc, v_nonloc, _ = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    for name in ("gchi0_q_inv", "vrg_q_dens", "vrg_q_dens_right", "chi_phys_q_dens"):
+    for name in ("gchi0_q_inv", "vrg_q_dens", "chi_phys_q_dens"):
         whole = np.load(f"{config.output.output_path}/{name}_rank_0.npy")
         np.save(f"{config.output.output_path}/{name}_rank_1.npy", whole[1:])
         np.save(f"{config.output.output_path}/{name}_rank_0.npy", whole[:1])
@@ -2900,7 +2920,7 @@ def test_pairing_vertex_gather_scatter_round_trip_preserves_rank_shares(setup, m
     reference = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, deepcopy(gamma_r), niv_pp, dist)
 
     gamma_r, u_loc, v_nonloc, _ = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    for name in ("gchi0_q_inv", "vrg_q_dens", "vrg_q_dens_right", "chi_phys_q_dens"):
+    for name in ("gchi0_q_inv", "vrg_q_dens", "chi_phys_q_dens"):
         whole = np.load(f"{config.output.output_path}/{name}_rank_0.npy")
         np.save(f"{config.output.output_path}/{name}_rank_1.npy", whole[1:])
         np.save(f"{config.output.output_path}/{name}_rank_0.npy", whole[:1])

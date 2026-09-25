@@ -173,40 +173,60 @@ def _build_ladder_vertex_chunk(
     gamma_r: LocalFourPoint,
     gchi0_q_inv: FourPoint,
     vrg_q_r_left: FourPoint,
-    vrg_q_r_right: FourPoint,
     chi_phys_q_r: FourPoint,
     u_loc: LocalInteraction,
     u_r: Interaction,
     w_start: int,
     w_stop: int,
+    niv_pp: int | None,
+    inactive_pairs: np.ndarray | None = None,
 ) -> FourPoint:
     r"""
-    Builds the full ladder vertex :math:`F^{\mathrm{q}}_{r}` for one momentum and the bosonic window
-    ``[w_start, w_stop)``, i.e. the amputated auxiliary susceptibility plus the separable interaction part, on the
-    restricted inputs.
+    Builds the full ladder vertex :math:`F^{\mathrm{q}}_{r}` for the momenta of the inputs and the bosonic window
+    ``[w_start, w_stop)``, i.e. the amputated auxiliary susceptibility plus the separable interaction part. The
+    right-sided three-leg vertex :math:`\tilde\gamma^{\mathrm{q}\nu'}_{r;1234} = \beta \sum_{ab}\sum_{\nu}
+    \chi^{*;\mathrm{q}\nu\nu'}_{r;12ab} (\chi^{\mathrm{q}\nu'}_{0;ba34})^{-1}` of the separable part sums the
+    auxiliary susceptibility over its first frequency, which the build takes from the same inversion (exact also where
+    the Bethe-Salpeter matrix is not complex-symmetric).
+
+    With ``niv_pp`` given, only what the :math:`\omega' = 0` pp band reads is built: the auxiliary susceptibility on
+    the anti-diagonal :math:`\nu + \nu' = \omega` of the pp box (see :meth:`FourPoint.invert_on_anti_diagonal`),
+    and the whole chain on the pp box, so the result is exact on that anti-diagonal only. With ``niv_pp`` None the
+    whole core box is inverted and every entry is exact (the streamed full vertex).
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
-    :param gchi0_q_inv: The single-q inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}`.
-    :param vrg_q_r_left: The single-q three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}`.
-    :param vrg_q_r_right: The single-q "right-side" three-leg vertex :math:`\tilde\gamma^{\mathrm{q}\nu}_{r}`.
-    :param chi_phys_q_r: The single-q physical susceptibility :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}`.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` of the momenta.
+    :param vrg_q_r_left: The three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}` of the momenta.
+    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}` of the momenta.
     :param u_loc: The bare local interaction :math:`U`.
     :param u_r: The channel-projected total interaction :math:`\mathcal{U}^{\mathbf{q}}_{r}`.
     :param w_start: First bosonic index of the window.
     :param w_stop: One past the last bosonic index of the window.
+    :param niv_pp: Number of positive fermionic frequencies of the pp box, or None for the whole core box.
+    :param inactive_pairs: Orbital pairs without vertex (see :meth:`LocalFourPoint.orbital_pairs_without_vertex`).
     :return: The ladder vertex over that window as a :class:`FourPoint` (half niw range, two fermionic dimensions).
     """
+    beta = config.sys.beta
     gchi0_w = gchi0_q_inv.take_wn_slice(w_start, w_stop)
-    gamma_w = gamma_r.take_wn_slice(w_start, w_stop)
+    matrix = nonlocal_sde.create_inverse_auxiliary_chi_r_q(
+        gamma_r.take_wn_slice(w_start, w_stop), gchi0_w, u_loc.as_channel(gamma_r.channel)
+    )
+    vrg_left_w = vrg_q_r_left.take_wn_slice(w_start, w_stop)
+    if niv_pp is None:
+        chi_aux = matrix.invert(False)
+        chi_aux_first_sum = chi_aux.sum_over_vn(beta, axis=(-2,))
+    else:
+        chi_aux, chi_aux_first_sum = matrix.invert_on_anti_diagonal(niv_pp, w_start, beta, inactive_pairs)
+        matrix.free()
+        gchi0_w = gchi0_w.cut_niv(niv_pp)
+        vrg_left_w = vrg_left_w.cut_niv(niv_pp)
 
     # eager rebinding releases chi* right after the first matmul; the bubble term enters on the diagonal in place
-    f_chunk = nonlocal_sde.create_auxiliary_chi_r_q(gamma_w, gchi0_w, u_loc)
-    f_chunk = gchi0_w @ f_chunk
+    f_chunk = gchi0_w @ chi_aux
     f_chunk = f_chunk @ gchi0_w
-    f_chunk = f_chunk.scale(-config.sys.beta**2).add_on_vn_diagonal(gchi0_w, factor=config.sys.beta**2)
+    f_chunk = f_chunk.scale(-(beta**2)).add_on_vn_diagonal(gchi0_w, factor=beta**2)
 
-    vrg_left_w = vrg_q_r_left.take_wn_slice(w_start, w_stop)
-    vrg_right_w = vrg_q_r_right.take_wn_slice(w_start, w_stop)
+    vrg_right_w = (chi_aux_first_sum @ gchi0_w).scale(beta)
     chi_phys_w = chi_phys_q_r.take_wn_slice(w_start, w_stop)
     return f_chunk.add((vrg_left_w @ u_r - vrg_left_w @ (u_r @ chi_phys_w @ u_r)) * vrg_right_w, copy=False)
 
@@ -273,9 +293,6 @@ def _build_pairing_vertex_pp(
     vrg_q_r_left = FourPoint.load(
         os.path.join(path, f"vrg_q_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=1
     )
-    vrg_q_r_right = FourPoint.load(
-        os.path.join(path, f"vrg_q_{channel.value}_right_rank_{rank}.npy"), channel=channel, num_vn_dimensions=1
-    )
     chi_phys_q_r = FourPoint.load(
         os.path.join(path, f"chi_phys_q_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=0
     )
@@ -288,6 +305,8 @@ def _build_pairing_vertex_pp(
     niw_build = niw_stored if chunk_writer is not None else int(np.max(omega))
 
     n_bands = config.sys.n_bands
+    # orbital pairs without vertex are eliminated from every slice, as in the kernel step's auxiliary susceptibility
+    inactive = gamma_r.orbital_pairs_without_vertex(u_loc.as_channel(channel))
     f_pp_mat = np.zeros((len(my_irr_q_list),) + (n_bands,) * 4 + (2 * niv_pp,) * 2, dtype=gamma_r.mat.dtype)
 
     # one byte budget bounds the transient: as many whole-box momenta as fit (small problems degenerate to the
@@ -302,7 +321,6 @@ def _build_pairing_vertex_pp(
             q_stop = min(q_start + q_group, len(my_irr_q_list))
             gchi0_grp = gchi0_q_inv.take_q_index_slice(q_start, q_stop)
             vrg_left_grp = vrg_q_r_left.take_q_index_slice(q_start, q_stop)
-            vrg_right_grp = vrg_q_r_right.take_q_index_slice(q_start, q_stop)
             chi_phys_grp = chi_phys_q_r.take_q_index_slice(q_start, q_stop)
             v_nonloc_grp = v_nonloc.take_q_index_slice(q_start, q_stop)
             u_r = u_loc.as_channel(channel) + v_nonloc_grp.as_channel(channel)
@@ -312,12 +330,13 @@ def _build_pairing_vertex_pp(
                     gamma_r,
                     gchi0_grp,
                     vrg_left_grp,
-                    vrg_right_grp,
                     chi_phys_grp,
                     u_loc,
                     u_r,
                     w_start,
                     min(w_start + w_chunk, niw_build + 1),
+                    None if chunk_writer is not None else niv_pp,
+                    inactive,
                 )
                 if chunk_writer is not None:
                     chunk_writer(q_start, w_start, f_chunk.mat)
@@ -326,18 +345,15 @@ def _build_pairing_vertex_pp(
 
             gchi0_grp.free()
             vrg_left_grp.free()
-            vrg_right_grp.free()
             chi_phys_grp.free()
 
     gchi0_q_inv.free()
     vrg_q_r_left.free()
-    vrg_q_r_right.free()
     chi_phys_q_r.free()
 
     delete_files(
         path,
         f"vrg_q_{channel.value}_rank_{rank}.npy",
-        f"vrg_q_{channel.value}_right_rank_{rank}.npy",
         f"chi_phys_q_{channel.value}_rank_{rank}.npy",
     )
 
@@ -2497,10 +2513,12 @@ def dispatch_full_vertex_calculation(
     and :math:`F^{(2);\mathrm{q}\nu\nu'}_{r;1234} = \sum_{abcdgh}\gamma^{\mathrm{q}\nu}_{r;12ab}\Big(\mathbb{1}_{bacd} -
     \sum_{ef}\mathcal{U}^{\mathbf{q}}_{r;baef}\chi^{\mathrm{q}}_{r;fecd}\Big)\mathcal{U}^{\mathbf{q}}_{r;dcgh}\tilde\gamma^{\mathrm{q}\nu'}_{r;hg34}`,
     where :math:`\tilde\gamma^{\mathrm{q}\nu}_{r;1234}=\beta \sum_{ab}\sum_{\nu'} \chi^{*;\mathrm{q}\nu'\nu}_{r;12ab}
-    (\chi^{\mathrm{q}\nu}_{0;ba34})^{-1}
-    =\beta \sum_{ab}\sum_{\nu'} \chi^{*;\mathrm{q}\nu\nu'}_{r;ab21} (\chi^{\mathrm{q}\nu}_{0;ab34})^{-1}`, i.e. the sum
-    over the first frequency argument equals the sum over the last one only up to the orbital reversal dictated by
-    time-reversal symmetry, see :meth:`~dgamore.nonlocal_sde.create_vrg_r_q_right`. No explicit factors of :math:`\beta`
+    (\chi^{\mathrm{q}\nu}_{0;ba34})^{-1}` sums over the FIRST frequency argument. It equals the orbital-reversed sum
+    over the last one, :math:`\beta \sum_{ab}\sum_{\nu'} \chi^{*;\mathrm{q}\nu\nu'}_{r;ab21}
+    (\chi^{\mathrm{q}\nu}_{0;ab34})^{-1}`, only where the Bethe-Salpeter matrix is complex-symmetric, i.e. where
+    :math:`G^{\mathrm{k}} = (G^{\mathrm{k}})^{T}`; complex hoppings or a lattice without inversion break that symmetry
+    of the lattice bubble, so the build takes the first-frequency sum from its own inversion (see
+    :func:`_build_ladder_vertex_chunk`). No explicit factors of :math:`\beta`
     appear in :math:`F^{(2)}` because they are absorbed into the stored objects: :math:`\chi^{\mathrm{q}}_{r}` is the
     (:math:`U`-dressed, shell- (and sometimes :math:`\lambda`-corrected)) physical susceptibility normalized as
     :math:`\frac{1}{\beta^2}\sum_{\nu\nu'}\chi^{\mathrm{q}\nu\nu'}_{r}`, and the three-leg vertices carry the net

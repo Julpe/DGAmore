@@ -222,29 +222,6 @@ def create_vrg_r_q(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint) -> FourP
     return (gchi0_q_inv @ gchi_aux_q_r_sum).scale(config.sys.beta)
 
 
-def create_vrg_r_q_right(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint) -> FourPoint:
-    r"""
-    Returns the momentum-dependent right-sided three-leg vertex, i.e. the counterpart of :meth:`create_vrg_r_q` (Eq.
-    (3.63) in my master's thesis) with the summed frequency argument of :math:`\chi^{*}` and the position of
-    :math:`(\chi_0)^{-1}` swapped. It thus reads :math:`\tilde{\gamma}^{\mathrm{q}\nu}_{r;1234} = \beta \sum_{ab}
-    \sum_{\nu'} \chi^{*;\mathrm{q}\nu'\nu}_{r;12ab} (\chi^{\mathrm{q}\nu}_{0;ba34})^{-1}`. Notice that the sum runs over
-    the *first* frequency argument, whereas only the sum over the last frequency is available (see
-    :meth:`FourPoint.invert_and_sum_over_last_vn`). The two are related by the time-reversal symmetry
-    :math:`\chi^{*;\mathrm{q}\nu\nu'}_{r;1234} = \chi^{*;\mathrm{q}\nu'\nu}_{r;4321}` (enforced on the DMFT two-particle
-    Green's function via :meth:`LocalFourPoint.symmetrize_v_vp` and inherited by all vertices built from it), which
-    carries an orbital reversal along with the frequency swap: :math:`\sum_{\nu'} \chi^{*;\mathrm{q}\nu'\nu}_{r;12ab} =
-    \sum_{\nu'} \chi^{*;\mathrm{q}\nu\nu'}_{r;ba21}`. Hence the last-frequency sum enters with the orbital permutation
-    ``"abcd->dcba"`` applied.
-
-    :param gchi_aux_q_r_sum: The frequency-summed auxiliary susceptibility
-        :math:`\sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r}`.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
-    :return: The right-sided three-leg vertex :math:`\tilde{\gamma}^{\mathrm{q}\nu}_{r}` (``vrg_right``) as a
-        :class:`FourPoint`.
-    """
-    return (gchi_aux_q_r_sum.permute_orbitals("abcd->dcba") @ gchi0_q_inv).scale(config.sys.beta)
-
-
 def create_generalized_chi_q_with_shell_correction(
     chi_phys_q_r: FourPoint,
     gchi0_q_full_sum: FourPoint,
@@ -570,14 +547,6 @@ def calculate_sigma_kernel_r_q(
         scale=2 * config.box.niv_core,
     )
     logger.info(f"Non-Local auxiliary susceptibility ({gchi_aux_q_r_sum.channel.value}) calculated.")
-
-    if config.eliashberg.perform_eliashberg:
-        vrg_q_r_right = create_vrg_r_q_right(gchi_aux_q_r_sum, gchi0_q_inv)
-        vrg_q_r_right.save(
-            name=f"vrg_q_{vrg_q_r_right.channel.value}_right_rank_{mpi_dist_irrq.comm.rank}",
-            output_dir=config.output.eliashberg_path,
-        )
-        vrg_q_r_right.free()
 
     vrg_q_r = create_vrg_r_q(gchi_aux_q_r_sum, gchi0_q_inv)
 
