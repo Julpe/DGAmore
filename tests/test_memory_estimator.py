@@ -572,3 +572,51 @@ def test_dynamic_chunk_budget_scales_floors_and_caps():
     assert floor < mid < cap
     assert dynamic_chunk_budget(total_bytes=4000 * 2**30, node_ranks=2) == cap
     assert dynamic_chunk_budget(total_bytes=600 * 2**30, node_ranks=48) == 2 * mid
+
+
+def test_jacobian_tracker_residents_join_the_history_and_its_transient_the_mixing_step():
+    """The tracker's history triples, three resident Ritz sets and four tall arrays live on rank 0 through the whole
+    loop, so they join every single-rank slot the mixing history reaches; its secant transient runs in the mixing
+    step, after the mixing temporaries are freed, so it enters the sigma_loop maximum and nothing else."""
+    from dgamore.jacobian_stabilization import TRACKER_PAIRS
+    from dgamore.memory_estimator import _giwk_rspace, jacobian_tracker_bytes
+
+    kw = dict(overhead=1.0, mixing_pairs=4, niv_interp=2 * BASE["niv_core"])
+    off = _peaks(**kw)
+    on = _peaks(**kw, with_jacobian_tracker=True, mixing_history_length=3)
+    core = BASE["nk_tot"] * BASE["n_bands"] ** 2 * (2 * BASE["niv_core"])
+    history = (3 * (TRACKER_PAIRS + 1) - 2 * 4) * DTYPE_BYTES * core
+    resident = (
+        (3 * np.dtype(np.complex128).itemsize + 4 * np.dtype(np.float64).itemsize) * 2 * core * (TRACKER_PAIRS - 1)
+    )
+    transient = 9 * np.dtype(np.float64).itemsize * 2 * core * (TRACKER_PAIRS - 1)
+    assert jacobian_tracker_bytes(BASE["nk_tot"], BASE["n_bands"], 2 * BASE["niv_core"]) == (resident, transient)
+    for key in ("chi0q", "chiq_aux", "sde", "sigma_interp"):
+        assert on[key].off_single == pytest.approx(off[key].off_single + history + resident), key
+        assert on[key].on_single == pytest.approx(off[key].on_single + history + resident), key
+        assert on[key].off_distributed == pytest.approx(off[key].off_distributed), key
+    sigma_full = DTYPE_BYTES * _giwk_rspace(BASE["nk_tot"], BASE["n_bands"], 2 * BASE["niv_cut"])
+    off_history = 2 * 4 * DTYPE_BYTES * core
+    off_step = off["sigma_loop"].off_single - off_history - 2 * sigma_full
+    expected = off_history + history + resident + 2 * sigma_full + max(off_step, transient)
+    assert on["sigma_loop"].off_single == pytest.approx(expected)
+
+
+def test_exact_jacobian_branch_is_present_only_with_the_flag_and_leaves_the_other_branches_alone():
+    """The converged-point Jacobian adds its own branch, only when it is enabled, and changes no other branch."""
+    off, on = _peaks(), _peaks(with_exact_jacobian=True)
+    assert "exact_jacobian" not in off and set(on) == set(off) | {"exact_jacobian"}
+    assert all(on[key] == off[key] for key in off)
+
+
+def test_exact_jacobian_branch_grows_with_the_box_and_holds_the_eigenvectors_on_rank_0():
+    """The branch grows with the momentum grid and the core box; rank 0 holds the Arnoldi basis and the eigenvectors."""
+    from dgamore.memory_estimator import EXACT_JACOBIAN_MODES
+
+    small = _peaks(with_exact_jacobian=True)["exact_jacobian"]
+    for bigger in (dict(nk_tot=2 * BASE["nk_tot"], nk_irr=2 * BASE["nk_irr"]), dict(niv_core=BASE["niv_core"] + 5)):
+        big = _peaks(with_exact_jacobian=True, **bigger)["exact_jacobian"]
+        assert _off_node_total(big, 4) > _off_node_total(small, 4), bigger
+    window = BASE["nk_tot"] * BASE["n_bands"] ** 2 * 2 * BASE["niv_core"]
+    eigenvectors = np.dtype(np.complex128).itemsize * 2 * window * 4 * EXACT_JACOBIAN_MODES
+    assert small.off_single > eigenvectors and small.giwk_shareable < small.baseline

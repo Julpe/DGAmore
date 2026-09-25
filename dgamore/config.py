@@ -121,6 +121,8 @@ class SelfConsistencyConfig:
     :ivar int mixing_history_length: Number of past iterations used by the accelerated mixing schemes.
     :ivar str previous_sc_path: Path to a previous self-consistency run to resume from (empty to start fresh).
     :ivar bool use_interpolated_sigma: Whether to resume from the interpolated rather than the raw self-energy.
+    :ivar str sigma_iterates_subfolder_name: Subfolder name (under the output path) for the per-iteration
+        self-energies the loop writes; the resolved directory is :attr:`OutputConfig.sigma_iterates_path`.
     """
 
     def __init__(self):
@@ -131,13 +133,14 @@ class SelfConsistencyConfig:
         self.mixing_history_length: int = 3
         self.previous_sc_path: str = ""
         self.use_interpolated_sigma: bool = False
+        self.sigma_iterates_subfolder_name: str = "Sigma_Iterates"
 
 
 class StabilizationConfig:
     r"""
     Stores the convergence-stabilization options of the self-consistency loop. The susceptibility-reshaping options
     (the per-iteration lambda correction, ``use_chi_phys_restriction`` and ``use_lambda_annealing``) are mutually
-    exclusive.
+    exclusive; the Jacobian tracking of ``use_jacobian_stabilization`` composes with any of them.
 
     :ivar bool use_lambda_correction: Whether the self-consistency loop applies the Moriya lambda correction to the
         physical susceptibility in every iteration, dispatched by the band count: single-band input uses the scalar
@@ -146,21 +149,49 @@ class StabilizationConfig:
         channels). Wired as a releasing scaffold: the loop converges at ten times epsilon with the correction on,
         disables it and converges the pure map to full epsilon. Independent of the one-shot
         ``lambda_correction.perform_lambda_correction``, which takes precedence when both are enabled.
-    :ivar bool use_chi_phys_restriction: Whether to restrict the physical susceptibility to positive-semidefinite
-        compound blocks (eigenvalues of the inverse susceptibility floored at a small positive value, see
-        :func:`~dgamore.nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues`).
+    :ivar bool use_chi_phys_restriction: Whether to restrict the physical susceptibility to the bounds of a bosonic
+        susceptibility, as a releasing scaffold: the static compound blocks positive-semidefinite (a crossed mode
+        pinned at twice the channel's largest healthy static value) and every finite-frequency block within the
+        static maximum (see :func:`~dgamore.nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues`).
     :ivar bool use_lambda_annealing: Whether to protect the self-consistency with the lambda-annealing scaffold:
         a single shared bosonic mass :math:`\lambda` (measured from the worst channel's static susceptibility
         gap, never user-chosen) is added to the inverse physical susceptibility of every channel, damped toward its
         target and annealed to exactly zero between converged phases - the final result is always pure self-consistency (the schedule and
         state live in :class:`~dgamore.lambda_ops.LambdaAnnealer`, owned by the loop). Multi-orbital-safe,
         unlike the sum-rule lambda correction.
+    :ivar bool use_jacobian_stabilization: Whether the self-consistency loop tracks the leading eigenvalues of the
+        Jacobian of the self-energy map from the iteration's own history - the genuine (iterate, proposal) pairs
+        the mixing records - at no extra proposal evaluation (a secant Rayleigh-Ritz estimate, refreshed every
+        iteration, see :class:`~dgamore.jacobian_stabilization.JacobianTracker`), and stabilizes the physical
+        fixed point by flipping the sign of the damping on the certified unstable eigendirections (the modified
+        iteration of arXiv:2606.04936, Eqs. 25-26, built on Phys. Rev. Lett. doi:10.1103/zjy7-4jqd): the proposal
+        residual is reflected on the unstable subspace before the configured mixing (linear, Pulay or Anderson)
+        acts on it, and every certified direction of a damped step takes the step its own eigenvalue allows
+        (arXiv:2606.04936 Eq. 27), with the sign reversed where it is flipped. The loop also lowers the mixing
+        parameter to the largest value the measured spectrum allows (arXiv:2606.04936 Eq. 13, with the constant
+        ``c = 0.5`` at the vertex of the stability parabola), never above ``self_consistency.mixing``, on every
+        damped Picard step (linear mixing, the warm-up and fallbacks of the accelerated schemes); an accelerated
+        step keeps the configured parameter. Compatible with the
+        three susceptibility-reshaping scaffolds: monitoring runs throughout, flips are paused
+        while a scaffold is active (the scaffolded map is not the physical map) and resume after its release. Not
+        compatible with the one-shot ``lambda_correction.perform_lambda_correction`` (a single iteration has no
+        history): disabled with a warning in that case. A run started from a previous one with the flag on carries
+        that run's certified spectrum in (its ``jacobian.npz``) and installs the reflector and the
+        per-direction damping of the modes it can flip; the predecessor's own damping is a record and is not read
+        back, so one transient early in a ladder cannot pin every later run to the value it forced.
+    :ivar bool use_exact_jacobian: Whether a run with ``use_jacobian_stabilization`` that reaches the pure fixed point
+        writes the leading eigenpairs of the exact Jacobian of the self-energy map there (see
+        :mod:`~dgamore.sigma_jacobian`) to ``jacobian.npz`` in place of the secant estimate: up to about 300
+        Jacobian-vector products of one to two proposals each, exact for :math:`V = 0`. Disabled with a warning
+        without ``use_jacobian_stabilization`` or when its memory estimate does not fit the job.
     """
 
     def __init__(self):
         self.use_lambda_correction: bool = False
         self.use_chi_phys_restriction: bool = False
         self.use_lambda_annealing: bool = False
+        self.use_jacobian_stabilization: bool = False
+        self.use_exact_jacobian: bool = False
 
 
 class EliashbergConfig:
@@ -291,6 +322,8 @@ class OutputConfig:
     :ivar str plotting_path: Directory where plots are written.
     :ivar str plotting_subfolder_name: Subfolder name (under ``plotting_path``) for the plots.
     :ivar str eliashberg_path: Directory where Eliashberg results are written.
+    :ivar str sigma_iterates_path: Directory where the per-iteration self-energies of the self-consistency loop are
+        written, the subfolder :attr:`SelfConsistencyConfig.sigma_iterates_subfolder_name` of ``output_path``.
     """
 
     def __init__(self):
@@ -299,6 +332,7 @@ class OutputConfig:
         self.plotting_path: str = "./Plots/"
         self.plotting_subfolder_name: str = "Plots"
         self.eliashberg_path: str = "./Eliashberg/"
+        self.sigma_iterates_path: str = "./Sigma_Iterates/"
 
 
 class AnaContConfig:

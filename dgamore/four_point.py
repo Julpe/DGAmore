@@ -888,7 +888,9 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             out, SpinChannel.NONE, self.nq, 1, 1, self.full_niw_range, True, has_compressed_q_dimension=True
         )
 
-    def invert_and_sum_over_last_vn_v2(self, beta: float, inactive_pairs: np.ndarray | None = None):
+    def invert_and_sum_over_last_vn_v2(
+        self, beta: float, inactive_pairs: np.ndarray | None = None, rhs: "FourPoint | None" = None
+    ):
         r"""
         Computes the sum over the auxiliary susceptibility with a very small memory footprint. Rather than inverting
         the full compound matrix, each momentum and bosonic frequency slice is copied once (strided) into a reused
@@ -911,9 +913,16 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         the eliminated pairs follow by back-substitution. With half of the pairs eliminated the factorization costs an
         eighth. With no pair, or every pair, eliminated the full slice is solved as before.
 
+        With ``rhs`` the same factorization solves the compound system for those right-hand sides instead of the
+        :math:`\nu'`-sum selector, :math:`x = M^{-1} b` per slice, and the result is that solution without the
+        :math:`1/\beta` of the sum.
+
         :param beta: Inverse temperature :math:`\beta`.
         :param inactive_pairs: Flat indices ``x * n_bands + y`` of the orbital pairs without vertex, or None.
-        :return: ``self`` with the last fermionic axis summed out (``num_vn_dimensions`` reduced to 1).
+        :param rhs: Right-hand sides in the layout of the result, ``[q, o1, o2, o3, o4, w, v]`` (compressed
+            momenta, the bosonic range of the result), or None for the sum over the last fermionic frequency.
+        :return: ``self`` with the last fermionic axis summed out (``num_vn_dimensions`` reduced to 1), or holding
+            the solution for ``rhs`` in the same layout.
         """
         o = self.n_bands
         vn = 2 * self.niv
@@ -936,6 +945,15 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             lu_and_piv = sp.linalg.lu_factor(buf, overwrite_a=True, check_finite=False)
             return sp.linalg.lu_solve(lu_and_piv, rhs, check_finite=False)
 
+        rhs_mat = None if rhs is None else rhs.to_half_niw_range().compress_q_dimension().mat
+
+        def slice_rhs(i: int, w: int) -> np.ndarray | None:
+            """The right-hand sides of slice ``(i, w)`` as the matrix ``[(o1, o2, v), (o4, o3)]``, or None."""
+            if rhs_mat is None:
+                return None
+            b = rhs_mat[i][:, :, :, :, w, :].transpose(0, 1, 4, 3, 2).reshape(compound_size, o * o)
+            return b.astype(self.mat.dtype, copy=False)
+
         inactive = np.asarray([] if inactive_pairs is None else inactive_pairs, dtype=int)
         if not 0 < inactive.size < o * o:
             idx = np.arange(compound_size)
@@ -944,18 +962,18 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             idx_o4 = idx // (o * vn)
             idx_o3 = (idx // vn) % o
 
-            rhs = np.zeros((compound_size, o * o), dtype=self.mat.dtype)
-            rhs[idx, idx_o4 * o + idx_o3] = 1.0
+            selector = np.zeros((compound_size, o * o), dtype=self.mat.dtype)
+            selector[idx, idx_o4 * o + idx_o3] = 1.0
 
             # one Fortran-order buffer, reused for every slice; fview addresses it as [(o1,o2,v), (o4,o3,v')] in the
             # block's own index order, so each slice is filled by a single strided copy
             fbuf = np.empty((compound_size, compound_size), dtype=self.mat.dtype, order="F")
             fview = fbuf.T.reshape(o, o, vn, o, o, vn).transpose(3, 4, 5, 0, 1, 2)
 
-            def solve_slice(src: np.ndarray) -> np.ndarray:
-                """Solves one slice ``src`` ``[o1, o2, o3, o4, v, v']`` as a whole."""
+            def solve_slice(src: np.ndarray, b: np.ndarray | None) -> np.ndarray:
+                """Solves one slice ``src`` ``[o1, o2, o3, o4, v, v']`` as a whole, for ``b`` or the selector."""
                 np.copyto(fview, src.transpose(0, 1, 4, 3, 2, 5))
-                return factorize_and_solve(fbuf, rhs)
+                return factorize_and_solve(fbuf, selector if b is None else b)
 
         else:
             active = np.setdiff1d(np.arange(o * o), inactive)
@@ -970,8 +988,9 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             rhs_ina = np.zeros((vn, n_ina, o * o), dtype=self.mat.dtype)
             rhs_ina[:, np.arange(n_ina), inactive] = 1.0
 
-            def solve_slice(src: np.ndarray) -> np.ndarray:
-                """Solves one slice ``src`` ``[o1, o2, o3, o4, v, v']`` by eliminating the inactive pairs per v."""
+            def solve_slice(src: np.ndarray, b: np.ndarray | None) -> np.ndarray:
+                """Solves one slice ``src`` ``[o1, o2, o3, o4, v, v']`` by eliminating the inactive pairs per v, for
+                ``b`` or the selector."""
                 for r, (x, y) in enumerate(zip(ax, ay)):
                     for c, (xx, yy) in enumerate(zip(ax, ay)):
                         sview[r, :, c, :] = src[x, y, yy, xx]
@@ -979,11 +998,16 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
                 d_ii = diag[ix[:, None], iy[:, None], iy, ix].transpose(2, 0, 1)
                 d_ia = diag[ix[:, None], iy[:, None], ay, ax].transpose(2, 0, 1)
                 d_ai = diag[ax[:, None], ay[:, None], iy, ix].transpose(2, 0, 1)
+                if b is None:
+                    b_act, b_ina = rhs_act, rhs_ina
+                else:
+                    rows = b.reshape(o * o, vn, o * o)
+                    b_act, b_ina = rows[active], rows[inactive].transpose(1, 0, 2)
                 y_a = np.linalg.solve(d_ii, d_ia)
-                y_r = np.linalg.solve(d_ii, rhs_ina)
+                y_r = np.linalg.solve(d_ii, b_ina)
                 sview[:, v, :, v] -= d_ai @ y_a
-                rhs = (rhs_act - (d_ai @ y_r).transpose(1, 0, 2)).reshape(n_act * vn, o * o)
-                x_act = factorize_and_solve(sbuf, rhs).reshape(n_act, vn, o * o)
+                b_schur = (b_act - (d_ai @ y_r).transpose(1, 0, 2)).reshape(n_act * vn, o * o)
+                x_act = factorize_and_solve(sbuf, b_schur).reshape(n_act, vn, o * o)
                 solution = np.empty((o * o, vn, o * o), dtype=self.mat.dtype)
                 solution[active] = x_act
                 solution[inactive] = (y_r - y_a @ x_act.transpose(1, 0, 2)).transpose(1, 0, 2)
@@ -992,10 +1016,11 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         for i in range(self.current_shape[0]):
             block = self.mat[i]
             for w in range(w_dim):
-                solution = solve_slice(block[:, :, :, :, w])
+                solution = solve_slice(block[:, :, :, :, w], slice_rhs(i, w))
                 new_arr[i][:, :, :, :, w, :] = solution.reshape((o, o, vn, o, o)).transpose(0, 1, 4, 3, 2)
 
-        new_arr /= beta  # in-place scale: new_arr is freshly allocated and unaliased, so no full-size temporary
+        if rhs_mat is None:
+            new_arr /= beta  # in-place scale: new_arr is freshly allocated and unaliased, so no full-size temporary
         self.mat = new_arr
         self._num_vn_dimensions = 1
         self.update_original_shape()
