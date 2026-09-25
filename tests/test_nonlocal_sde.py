@@ -501,14 +501,13 @@ def test_calculate_kernel_r_q_matches_rewired_reference():
         assert np.allclose(out.mat, ref_mat, atol=1e-10)
 
 
-def test_vrg_right_is_first_frequency_summed_three_leg_vertex():
-    """The right three-leg vertex equals its first-frequency-summed definition via the dcba permute of chi*."""
+def test_vrg_is_the_inverse_bubble_applied_to_the_last_frequency_sum_of_chi_aux():
+    """The three-leg vertex equals the inverse bubble contracted with the last-frequency sum of chi*."""
     o, nqi, nw, n2, beta = 2, 3, 3, 4, 12.5
     config.sys.beta = beta
     rng = np.random.default_rng(11)
     shape = (nqi, o, o, o, o, nw, n2, n2)
     chi_star = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
-    chi_star = 0.5 * (chi_star + np.transpose(chi_star, (0, 4, 3, 2, 1, 5, 7, 6)))
     chi0_inv = rng.standard_normal(shape[:-1]) + 1j * rng.standard_normal(shape[:-1])
 
     sum_last = FourPoint(chi_star.sum(axis=-1) / beta, SpinChannel.DENS, (nqi, 1, 1), 1, 1, False, True, True)
@@ -517,10 +516,6 @@ def test_vrg_right_is_first_frequency_summed_three_leg_vertex():
     vrg_left = nonlocal_sde.create_vrg_r_q(sum_last.copy(), chi0_inv_fp)
     ref_left = np.einsum("qabefwv,qfecdwv->qabcdwv", chi0_inv, chi_star.sum(axis=-1), optimize=True)
     assert np.allclose(vrg_left.mat, ref_left, atol=1e-10)
-
-    vrg_right = nonlocal_sde.create_vrg_r_q_right(sum_last, chi0_inv_fp)
-    ref_right = np.einsum("qabefwv,qfecdwv->qabcdwv", chi_star.sum(axis=-2), chi0_inv, optimize=True)
-    assert np.allclose(vrg_right.mat, ref_right, atol=1e-10)
 
 
 def test_unused_qloop_sigma_variants_agree():

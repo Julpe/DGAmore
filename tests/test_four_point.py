@@ -1068,6 +1068,60 @@ def test_invert_and_sum_v2_with_no_or_every_pair_inactive_takes_the_full_solve(r
     assert np.array_equal(deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0, np.arange(4)).mat, full)
 
 
+def _band_and_first_sum_reference(fp: FourPoint, niv_band: int, beta: float) -> tuple[np.ndarray, np.ndarray]:
+    """The full inverse of every half-range slice, kept on the anti-diagonal of the box, and its first-frequency sum."""
+    half = deepcopy(fp).to_half_niw_range()
+    o, vn, nb2 = half.n_bands, 2 * half.niv, 2 * niv_band
+    off = half.niv - niv_band
+    n_q, n_w = half.current_shape[0], half.current_shape[-3]
+    band = np.zeros((n_q, o, o, o, o, n_w, nb2, nb2), dtype=complex)
+    first = np.zeros((n_q, o, o, o, o, n_w, nb2), dtype=complex)
+    for q in range(n_q):
+        for w in range(n_w):
+            c = half.mat[q, :, :, :, :, w].transpose(0, 1, 4, 3, 2, 5).reshape(o * o * vn, o * o * vn)
+            x = np.linalg.inv(c.astype(np.complex128)).reshape(o, o, vn, o, o, vn).transpose(0, 1, 4, 3, 2, 5)
+            p2 = np.arange(w, nb2)
+            band[q, :, :, :, :, w][..., nb2 - 1 + w - p2, p2] = x[..., off + nb2 - 1 + w - p2, off + p2]
+            first[q, :, :, :, :, w] = x.sum(axis=-2)[..., off : off + nb2] / beta
+    return band, first
+
+
+@pytest.mark.parametrize("symmetric", [True, False])
+@pytest.mark.parametrize("o", [1, 2, 3])
+def test_invert_on_anti_diagonal_matches_the_full_inverse_on_the_band(rng, monkeypatch, o, symmetric):
+    """The band of the inverse and its first-frequency sum equal those of the full inverse, zero off the band."""
+    monkeypatch.setattr(npb, "DTYPE", np.complex128)
+    fp = _random_compound_fourpoint(rng, o, symmetric, niv=4, nq_tot=2, niw=3)
+    band, first = deepcopy(fp).invert_on_anti_diagonal(2, 0, 8.0)
+    ref_band, ref_first = _band_and_first_sum_reference(fp, 2, 8.0)
+    assert band.mat.shape == ref_band.shape and first.mat.shape == ref_first.shape
+    assert np.allclose(band.mat, ref_band, atol=1e-12) and np.allclose(first.mat, ref_first, atol=1e-12)
+
+
+@pytest.mark.parametrize("symmetric", [False, True])
+@pytest.mark.parametrize("dtype, atol", [(np.complex64, 1e-5), (np.complex128, 1e-12)])
+def test_invert_on_anti_diagonal_eliminating_the_pairs_without_vertex_matches_the_full_inverse(
+    rng, monkeypatch, symmetric, dtype, atol
+):
+    """Eliminating the inter-atom pairs reproduces the band and the first-frequency sum of the full inverse."""
+    monkeypatch.setattr(npb, "DTYPE", dtype)
+    fp, inactive = _two_atom_compound_fourpoint(rng, symmetric)
+    band, first = deepcopy(fp).invert_on_anti_diagonal(2, 0, 8.0, inactive)
+    ref_band, ref_first = _band_and_first_sum_reference(fp, 2, 8.0)
+    assert np.allclose(band.mat, ref_band, atol=atol) and np.allclose(first.mat, ref_first, atol=atol)
+
+
+def test_invert_on_anti_diagonal_takes_no_lu_on_symmetric_and_half_size_ones_on_other_slices(rng, monkeypatch):
+    """Symmetric slices need no LU at all; the others factorize only the two halves of the Schur reduction."""
+    sizes = []
+    real_lu = sp.linalg.lu_factor
+    monkeypatch.setattr(sp.linalg, "lu_factor", lambda a, **kw: sizes.append(a.shape[0]) or real_lu(a, **kw))
+    deepcopy(_random_compound_fourpoint(rng, 2, symmetric=True, niv=4)).invert_on_anti_diagonal(2, 1, 8.0)
+    assert sizes == []
+    deepcopy(_random_compound_fourpoint(rng, 2, symmetric=False, niv=4)).invert_on_anti_diagonal(2, 1, 8.0)
+    assert sizes and max(sizes) == 2 * 2 * 4
+
+
 def _compound_product_reference_q(mat1: np.ndarray, mat2: np.ndarray, notation: FrequencyNotation) -> np.ndarray:
     """Per-momentum compound-space matrix product of two full-index tensors in the given frequency notation."""
     nq_tot, o, n2 = mat1.shape[0], mat1.shape[1], mat1.shape[-1]

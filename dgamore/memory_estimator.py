@@ -47,9 +47,6 @@ OVERHEAD_FACTOR: float = 1.0
 # ~170 MB per rank measured on a single-band run; counted in every branch's baseline.
 RANK_BASELINE_BYTES: int = 2**28
 
-# fq: single-block BSE assembly + eagerly rebound matmuls (f = gchi0_q_inv @ f, then f @ gchi0_q_inv), ~2 blocks live.
-FQ_MATMUL_FACTOR: int = 2
-
 # Consecutive bosonic frequencies one task of the column-distributed self-energy contraction sums; the bosonic sum is
 # associated in these fixed blocks, so the chunk budget never changes the result (the rank count moves the fold).
 SDE_W_BLOCK: int = 4
@@ -435,18 +432,21 @@ def _chiq_aux_transient(chunk: int, per_q_box: int, one_slice: int, vc: int) -> 
     return chunk + min(chunk, per_q_box) + one_slice + chunk // vc
 
 
-def _fq_transient(chunk: int, per_q_box: int, pp_ratio: float) -> int:
+def _fq_transient(chunk: int, one_slice: int, streaming: bool) -> int:
     """
-    Returns the per-rank transient bytes of one chunk of the pairing-vertex build: the larger of the matmul phase
-    (the assembled ladder window and its eagerly rebound copy, ``FQ_MATMUL_FACTOR`` windows) and the write phase
-    (the window plus its two pp-box cuts), together with the sliced local vertex (at most one momentum's box).
+    Returns the per-rank transient bytes of one chunk of the pairing-vertex build, as measured by RSS: the band build
+    holds the sliced local vertex and the assembled Bethe-Salpeter window with its pp-box chain (1.6 windows) plus one
+    slice's solve buffers (2 slices); the streamed full vertex inverts the whole window with numpy, which computes a
+    complex64 window in complex128 (6.2 windows plus 4.2 slices; a complex128 window needs about 3.7 and 1.4).
 
     :param chunk: Bytes of the assembled two-fermion window.
-    :param per_q_box: Bytes of one momentum's full two-fermion box.
-    :param pp_ratio: Size of the pp box relative to the core box, ``(2 niv_pp / 2 niv_core)^2``.
+    :param one_slice: Bytes of one ``(q, w)`` compound slice.
+    :param streaming: Whether the full ladder vertex is streamed to disk (``save_fq``).
     :return: The transient bytes.
     """
-    return max(FQ_MATMUL_FACTOR * chunk, chunk + int(2 * pp_ratio * chunk)) + min(chunk, per_q_box)
+    if streaming:
+        return int(6.2 * chunk + 4.2 * one_slice)
+    return int(1.6 * chunk + 2 * one_slice)
 
 
 def _giwk_rspace(nk_tot: int, nb: int, nv: int) -> int:
@@ -476,6 +476,7 @@ def estimate_peaks(
     n_ranks: int,
     with_eliashberg: bool,
     save_pairing_vertex: bool = False,
+    save_fq: bool = False,
     n_eig: int = 1,
     mixing_pairs: int = 0,
     niv_interp: int = 0,
@@ -527,6 +528,8 @@ def estimate_peaks(
     :param with_eliashberg: Whether the Eliashberg step runs (adds the ``"fq"`` and ``"lanczos"`` branches).
     :param save_pairing_vertex: Whether both pp pairing vertices are gathered on one rank for saving
         (``config.eliashberg.save_pairing_vertex``); a single-rank peak of the ``lanczos`` branch.
+    :param save_fq: Whether the full ladder vertex is streamed to disk (``config.eliashberg.save_fq``), which
+        inverts every whole Bethe-Salpeter slice instead of its pp band.
     :param n_eig: Number of requested eigenpairs (``config.eliashberg.n_eig``); sets the ARPACK Lanczos basis size
         ``ncv`` of :func:`lanczos_ncv` held per solving rank.
     :param mixing_pairs: Number of (iterate, proposal) pairs rank 0's accelerated-mixing history reaches, i.e.
@@ -643,12 +646,12 @@ def estimate_peaks(
     )
 
     if with_eliashberg:
-        # Slice-direct pairing-vertex build: pp accumulator + three loaded one-fermion inputs + the chunk transient
-        # (matmul pair, sliced local vertex, pp cuts) at the driver-sized budget, slice/block clamped.
+        # Slice-direct pairing-vertex build: pp accumulator + the two loaded one-fermion inputs + the measured chunk
+        # transient of the band build (or of the streamed full vertex) at the driver-sized budget, slice/block clamped.
         fq_chunk = min(max(chunk_budgets.fq, one_slice), rank_block)
         fq_distributed = scale * (
-            _two_fermion_block(qi, nb, 1, vpp) + 3 * _bubble_block(qi, nb, wp, vc)
-        ) + overhead * _fq_transient(fq_chunk, per_q_box, (vpp / vc) ** 2)
+            _two_fermion_block(qi, nb, 1, vpp) + 2 * _bubble_block(qi, nb, wp, vc)
+        ) + overhead * _fq_transient(fq_chunk, one_slice, save_fq)
         peaks["fq"] = BranchPeak(
             baseline=rank_base,
             giwk_shareable=0.0,

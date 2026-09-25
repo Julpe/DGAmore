@@ -10,7 +10,6 @@ from dgamore.memory_estimator import (
     ARPACK_EXTRA_VECTORS,
     CHI0Q_IFFTN_TRANSIENT_FACTOR,
     DTYPE_BYTES,
-    FQ_MATMUL_FACTOR,
     LANCZOS_VERTEX_FACTOR,
     MAX_CHUNK_BUDGET_BYTES,
     MAX_SLICE_CHUNK_BYTES,
@@ -245,11 +244,10 @@ def _chiq_aux_transient(chunk):
     return chunk + min(chunk, per_q_box) + one_slice + chunk // (2 * TINY["niv_core"])
 
 
-def _fq_transient(chunk):
-    """The modeled pairing-vertex chunk transient: max(matmul pair, window + two pp cuts) + sliced local vertex."""
-    _, per_q_box, _ = _tiny_chunk_sizes()
-    pp_ratio = (2 * TINY["niv_pp"] / (2 * TINY["niv_core"])) ** 2
-    return max(FQ_MATMUL_FACTOR * chunk, chunk + int(2 * pp_ratio * chunk)) + min(chunk, per_q_box)
+def _fq_transient(chunk, streaming=False):
+    """The pairing-vertex chunk transient is 1.6 windows + 2 slices (band), 6.2 windows + 4.2 slices (streamed)."""
+    _, _, one_slice = _tiny_chunk_sizes()
+    return int(6.2 * chunk + 4.2 * one_slice) if streaming else int(1.6 * chunk + 2 * one_slice)
 
 
 def test_chiq_aux_block_is_the_resident_one_fermion_blocks_plus_the_chunk_transient():
@@ -296,12 +294,24 @@ def test_fq_chunk_term_follows_the_passed_budget_up_to_the_rank_block():
     qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
     block, _, _ = _tiny_chunk_sizes()
     params = {**TINY, "with_eliashberg": True}
-    residents = SCALE * (qi * nb**4 * vpp * vpp + 3 * qi * nb**4 * wp * vc)
+    residents = SCALE * (qi * nb**4 * vpp * vpp + 2 * qi * nb**4 * wp * vc)
     for budget in (block // 4, block // 2, block):
         bp = estimate_peaks(**params, chunk_budgets=ChunkBudgets(fq=budget))["fq"]
         assert bp.off_distributed == pytest.approx(residents + OVERHEAD_FACTOR * _fq_transient(budget))
     capped = estimate_peaks(**params, chunk_budgets=ChunkBudgets(fq=10 * block))["fq"]
     assert capped.off_distributed == pytest.approx(residents + OVERHEAD_FACTOR * _fq_transient(block))
+
+
+def test_streamed_full_vertex_models_the_whole_slice_inverse():
+    """With save_fq the pairing-vertex chunk carries the transient of numpy's whole-slice inverse, not the band's."""
+    nb, wp, vc, vpp = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"], 2 * TINY["niv_pp"]
+    qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
+    block, _, _ = _tiny_chunk_sizes()
+    residents = SCALE * (qi * nb**4 * vpp * vpp + 2 * qi * nb**4 * wp * vc)
+    params = {**TINY, "with_eliashberg": True, "chunk_budgets": ChunkBudgets(fq=block)}
+    band, streamed = (estimate_peaks(**params, save_fq=flag)["fq"].off_distributed for flag in (False, True))
+    assert streamed == pytest.approx(residents + OVERHEAD_FACTOR * _fq_transient(block, streaming=True))
+    assert streamed > band
 
 
 def test_chiq_aux_chunk_term_never_drops_below_one_compound_slice():

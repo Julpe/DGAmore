@@ -94,10 +94,10 @@ def test_eliashberg_equation_with_local_part(setup, save_fq):
     for (_channel, _parity), (lambdas, gaps) in results.items():
         assert len(gaps) == config.eliashberg.n_eig and len(lambdas) == config.eliashberg.n_eig
     # sing/even reproduces the unprojected leading singlet and trip/odd the unprojected leading triplet
-    assert np.allclose(results[(SpinChannel.SING, "even")][0], [15.80255, 15.55585, 14.68491, 14.28071], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.SING, "odd")][0], [4.37008, 4.37007, 3.33718, 3.33718], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.TRIP, "even")][0], [2.84907, 2.84906, 2.40087, 2.40087], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.TRIP, "odd")][0], [7.33033, 7.26272, 6.64910, 6.20756], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.SING, "even")][0], [1.00111, 0.98595, 0.48783, 0.45501], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.SING, "odd")][0], [0.51245, 0.51245, 0.47951, 0.47951], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.TRIP, "even")][0], [0.03748, 0.03626, 0.03626, 0.02470], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.TRIP, "odd")][0], [1.55254, 1.53935, 0.58601, 0.58248], atol=1e-2)
     _assert_gap_sector_parity(results)
 
 
@@ -254,7 +254,7 @@ def test_eliashberg_grid_solver_matches_reference(setup, monkeypatch):
 
     results = eliashberg_solver.solve(g_dga, g_dmft, u_loc, v_nonloc, comm_mock)
 
-    assert np.allclose(results[(SpinChannel.SING, "even")][0], [15.80255, 15.55585, 14.68491, 14.28071], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.SING, "odd")][0], [4.37008, 4.37007, 3.33718, 3.33718], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.TRIP, "even")][0], [2.84907, 2.84906, 2.40087, 2.40087], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.TRIP, "odd")][0], [7.33033, 7.26272, 6.64910, 6.20756], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.SING, "even")][0], [1.00111, 0.98595, 0.48783, 0.45501], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.SING, "odd")][0], [0.51245, 0.51245, 0.47951, 0.47951], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.TRIP, "even")][0], [0.03748, 0.03626, 0.03626, 0.02470], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.TRIP, "odd")][0], [1.55254, 1.53935, 0.58601, 0.58248], atol=1e-2)

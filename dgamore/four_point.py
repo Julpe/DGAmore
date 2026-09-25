@@ -25,6 +25,20 @@ from dgamore.local_four_point import LocalFourPoint
 from dgamore.n_point_base import IAmNonLocal, SpinChannel, FrequencyNotation, DTYPE
 
 
+def _is_complex_symmetric(buf: np.ndarray) -> bool:
+    """
+    Tells whether a square compound slice is complex-symmetric, i.e. ``max|M - M^T|`` lies within 4 machine epsilons
+    of its dtype times ``max|M|``. Both maxima come from 256-wide tiles (each upper tile against its mirror), so no
+    slice-sized temporary is made, and the test stops at the first failing tile.
+
+    :param buf: The square slice.
+    :return: Whether the slice counts as complex-symmetric.
+    """
+    cols = [slice(a, a + 256) for a in range(0, buf.shape[0], 256)]
+    bound = 4 * np.finfo(buf.dtype).eps * np.max([np.abs(buf[:, c]).max() for c in cols])
+    return all(np.abs(buf[r, c] - buf[c, r].T).max() <= bound for t, r in enumerate(cols) for c in cols[t:])
+
+
 class FourPoint(IAmNonLocal, LocalFourPoint):
     """
     A non-local four-point object in a given channel, carrying one momentum dimension, four orbital dimensions and
@@ -910,15 +924,10 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
         new_arr = np.empty(self.original_shape[:-1], dtype=self.mat.dtype)
         sytrf, sytrs, sytrf_lwork = sp.linalg.get_lapack_funcs(("sytrf", "sytrs", "sytrf_lwork"), dtype=new_arr.dtype)
-        symmetry_tol = 4 * np.finfo(new_arr.dtype).eps
 
         def factorize_and_solve(buf: np.ndarray, rhs: np.ndarray) -> np.ndarray:
             """Solves ``buf @ x = rhs`` in place of the Fortran-order ``buf``: Bunch-Kaufman if symmetric, else LU."""
-            # a slice counts as complex-symmetric when max|M - M^T| is within 4 machine epsilons of max|M|; both
-            # maxima come from 256-wide tiles (upper tile against its mirror), so no slice-sized temporary is made
-            cols = [slice(a, a + 256) for a in range(0, buf.shape[0], 256)]
-            bound = symmetry_tol * np.max([np.abs(buf[:, c]).max() for c in cols])
-            if all(np.abs(buf[r, c] - buf[c, r].T).max() <= bound for t, r in enumerate(cols) for c in cols[t:]):
+            if _is_complex_symmetric(buf):
                 lwork = int(sytrf_lwork(buf.shape[0], lower=1)[0].real)
                 ldu, ipiv, info = sytrf(buf, lower=1, lwork=lwork, overwrite_a=1)
                 if info > 0:
@@ -991,6 +1000,161 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         self._num_vn_dimensions = 1
         self.update_original_shape()
         return self
+
+    def invert_on_anti_diagonal(
+        self, niv_band: int, w_start: int, beta: float, inactive_pairs: np.ndarray | None = None
+    ) -> tuple["FourPoint", "FourPoint"]:
+        r"""
+        Inverts the compound matrix :math:`M` per momentum and bosonic frequency, but returns the inverse
+        :math:`X = M^{-1}` only on the anti-diagonal :math:`\nu + \nu' = \omega` of the centered box of ``niv_band``
+        positive fermionic frequencies (zero everywhere else), together with the sum over its FIRST fermionic
+        frequency on that box,
+
+        .. math:: R^{\omega\nu}_{12ab} = \frac{1}{\beta} \sum_{\nu'} X^{\omega\nu'\nu}_{12ab},
+
+        where :math:`\nu'` runs over the whole box of the object. :math:`R` comes from a solve with :math:`M^{T}`, so
+        it is exact also where :math:`M` is not complex-symmetric (the lattice bubble is symmetric only where
+        :math:`G^{\mathrm{k}} = (G^{\mathrm{k}})^{T}`, which complex hoppings or a lattice without inversion
+        break); on a complex-symmetric slice it equals the orbital-reversed sum over the last frequency.
+
+        Per slice the compound matrix is copied once into a reused Fortran-order buffer in the storage precision. A
+        complex-symmetric slice, :math:`M_{1234}^{\nu\nu'} = M_{4321}^{\nu'\nu}` within 4 machine epsilons, is solved
+        with ``?sysv`` (Bunch-Kaufman with a level-3 solve) for only the band columns on one side of the
+        anti-diagonal; the other side follows from :math:`X = X^{T}`. Any other slice is reduced to the box by the
+        Schur complement :math:`S = M_{PP} - M_{PQ} M_{QQ}^{-1} M_{QP}`, with :math:`P` the box and :math:`Q` the
+        remaining frequencies, and :math:`(M^{-1})_{PP} = S^{-1}` is solved with an LU for the band columns. Orbital
+        pairs without vertex (``inactive_pairs``, see :meth:`LocalFourPoint.orbital_pairs_without_vertex`) couple only
+        at equal :math:`\nu`: they are eliminated one fermionic frequency at a time as in
+        :meth:`invert_and_sum_over_last_vn_v2`, the band of the reduced matrix is solved as above, and the blocks of
+        the eliminated pairs follow from the equal-frequency couplings.
+
+        :param niv_band: Number of positive fermionic frequencies of the centered box the band lives on.
+        :param w_start: Bosonic index of the object's first frequency (the object holds ``w >= 0``).
+        :param beta: Inverse temperature :math:`\beta`.
+        :param inactive_pairs: Flat indices ``x * n_bands + y`` of the orbital pairs without vertex, or None.
+        :return: The tuple ``(band, first_sum)``: :math:`X` on the anti-diagonal of the box as a two-fermion
+            :class:`FourPoint` and :math:`R` on the box as a one-fermion :class:`FourPoint` (half niw range,
+            compressed momenta).
+        """
+        o, vn, nb2 = self.n_bands, 2 * self.niv, 2 * niv_band
+        off = self.niv - niv_band
+        inner = np.arange(off, off + nb2)
+        outer = np.setdiff1d(np.arange(vn), inner)
+
+        self.to_half_niw_range().compress_q_dimension()
+        n_q, w_dim = self.current_shape[0], self.current_shape[-3]
+        dtype = self.mat.dtype
+        band = np.zeros((n_q, o, o, o, o, w_dim, nb2, nb2), dtype=dtype)
+        first_sum = np.empty((n_q, o, o, o, o, w_dim, nb2), dtype=dtype)
+
+        inactive = np.asarray([] if inactive_pairs is None else inactive_pairs, dtype=int)
+        eliminate = 0 < inactive.size < o * o
+        pairs = np.setdiff1d(np.arange(o * o), inactive) if eliminate else np.arange(o * o)
+        n_p = pairs.size
+        size = n_p * vn
+        buf = np.empty((size, size), dtype=dtype, order="F")
+        # sums over the first frequency per orbital pair, in the positions (pair, v) of the system
+        selector = np.zeros((n_p, vn, o * o), dtype=dtype)
+        selector[np.arange(n_p), :, pairs] = 1.0
+        i_p = (np.arange(n_p)[:, None] * vn + inner).reshape(-1)
+        i_q = (np.arange(n_p)[:, None] * vn + outer).reshape(-1)
+        sysv, sysv_lwork = sp.linalg.get_lapack_funcs(("sysv", "sysv_lwork"), dtype=dtype)
+        lwork = int(sysv_lwork(size, lower=1)[0].real)
+
+        if eliminate:
+            ax, ay = np.divmod(pairs, o)
+            ix, iy = np.divmod(inactive, o)
+            v = np.arange(vn)
+            ina_sum = np.zeros((vn, inactive.size, o * o), dtype=dtype)
+            ina_sum[:, np.arange(inactive.size), inactive] = 1.0
+            # bview addresses buf as [a, v, a', v'] over the active pairs
+            bview = buf.T.reshape(n_p, vn, n_p, vn).transpose(2, 3, 0, 1)
+        else:
+            # bview addresses buf as [(o1, o2, v), (o4, o3, v')] in the slice's own index order
+            bview = buf.T.reshape(o, o, vn, o, o, vn).transpose(3, 4, 5, 0, 1, 2)
+
+        def solve_band(w_abs: int, rhs_sum: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            """Returns the band blocks of ``buf^-1`` and ``buf^-T @ rhs_sum`` on the box; ``buf`` is overwritten."""
+            v2 = np.arange(off + w_abs, off + nb2)
+            v1 = vn - 1 + w_abs - v2
+            if _is_complex_symmetric(buf):
+                keep = v2 >= v1
+                cols = (np.arange(n_p)[None, :] * vn + v2[keep][:, None]).reshape(-1)
+                rhs = np.zeros((size, cols.size + o * o), dtype=dtype, order="F")
+                rhs[cols, np.arange(cols.size)] = 1.0
+                rhs[:, cols.size :] = rhs_sum.reshape(size, o * o)
+                _, _, x, info = sysv(buf, rhs, lwork=lwork, lower=1, overwrite_a=1, overwrite_b=1)
+                if info > 0:
+                    warnings.warn(f"Diagonal number {info} is exactly zero. Singular matrix.", LinAlgWarning)
+                n_keep = int(keep.sum())
+                half = x[:, : cols.size].reshape(n_p, vn, n_keep, n_p)[:, v1[keep], np.arange(n_keep)]
+                blocks = np.empty((v2.size, n_p, n_p), dtype=dtype)
+                blocks[keep] = half.transpose(1, 0, 2)
+                # the other side of the anti-diagonal follows from X = X^T: the mirror of (v1, v2) is row v1 - v2[0]
+                blocks[~keep] = blocks[v1[~keep] - v2[0]].transpose(0, 2, 1)
+                return blocks, v1, v2, x[:, cols.size :].reshape(n_p, vn, o * o)[:, inner]
+            lu_qq = sp.linalg.lu_factor(np.asfortranarray(buf[np.ix_(i_q, i_q)]), overwrite_a=True, check_finite=False)
+            w_qp = sp.linalg.lu_solve(lu_qq, buf[np.ix_(i_q, i_p)], check_finite=False)
+            del lu_qq
+            schur = np.asfortranarray(buf[np.ix_(i_p, i_p)] - buf[np.ix_(i_p, i_q)] @ w_qp)
+            lu_s = sp.linalg.lu_factor(schur, overwrite_a=True, check_finite=False)
+            cols = (np.arange(n_p)[None, :] * nb2 + (v2 - off)[:, None]).reshape(-1)
+            rhs = np.zeros((n_p * nb2, cols.size), dtype=dtype, order="F")
+            rhs[cols, np.arange(cols.size)] = 1.0
+            x = sp.linalg.lu_solve(lu_s, rhs, check_finite=False).reshape(n_p, nb2, v2.size, n_p)
+            blocks = x[:, v1 - off, np.arange(v2.size)].transpose(1, 0, 2)
+            # (M^-T rhs)_P = S^-T (rhs_P - W^T rhs_Q) with W = M_QQ^-1 M_QP
+            rhs_t = rhs_sum.reshape(size, o * o)
+            rhs_t = rhs_t[i_p] - w_qp.T @ rhs_t[i_q]
+            y_box = sp.linalg.lu_solve(lu_s, rhs_t, trans=1, check_finite=False).reshape(n_p, nb2, o * o)
+            return blocks, v1, v2, y_box
+
+        for i in range(n_q):
+            for w in range(w_dim):
+                src = self.mat[i, :, :, :, :, w]  # [o1, o2, o3, o4, v, v']
+                if not eliminate:
+                    np.copyto(bview, src.transpose(0, 1, 4, 3, 2, 5))
+                    blocks, v1, v2, y_box = solve_band(w_start + w, selector)
+                else:
+                    for r, (x, y) in enumerate(zip(ax, ay)):
+                        for c, (xx, yy) in enumerate(zip(ax, ay)):
+                            bview[r, :, c, :] = src[x, y, yy, xx]
+                    diag = np.diagonal(src, axis1=4, axis2=5)  # [o1, o2, o3, o4, v]: the equal-frequency couplings
+                    d_ii = diag[ix[:, None], iy[:, None], iy, ix].transpose(2, 0, 1)
+                    d_ia = diag[ix[:, None], iy[:, None], ay, ax].transpose(2, 0, 1)
+                    d_ai = diag[ax[:, None], ay[:, None], iy, ix].transpose(2, 0, 1)
+                    h_ia = np.linalg.solve(d_ii, d_ia)  # M_ii^-1 M_ia per v
+                    bview[:, v, :, v] -= d_ai @ h_ia
+                    # the first-frequency sums solve with M^T, whose blocks are M_aa^T, M_ia^T, M_ai^T and M_ii^T
+                    d_ii_t = d_ii.transpose(0, 2, 1)
+                    y_ina = np.linalg.solve(d_ii_t, ina_sum)
+                    rhs_sum = selector - (d_ia.transpose(0, 2, 1) @ y_ina).transpose(1, 0, 2)
+                    blocks_a, v1, v2, y_act = solve_band(w_start + w, rhs_sum)
+                    g_t = np.linalg.solve(d_ii_t, d_ai.transpose(0, 2, 1))  # (M_ai M_ii^-1)^T per v
+                    g_ai = g_t.transpose(0, 2, 1)
+                    j = np.arange(v2.size)[:, None, None]
+                    blocks = np.empty((v2.size, o * o, o * o), dtype=dtype)
+                    blocks[j, pairs[:, None], pairs] = blocks_a
+                    blocks[j, pairs[:, None], inactive] = -blocks_a @ g_ai[v2]
+                    blocks[j, inactive[:, None], pairs] = -h_ia[v1] @ blocks_a
+                    x_ii = h_ia[v1] @ blocks_a @ g_ai[v2]
+                    same = v1 == v2
+                    x_ii[same] += np.linalg.inv(d_ii[v1[same]])
+                    blocks[j, inactive[:, None], inactive] = x_ii
+                    y_box = np.empty((o * o, nb2, o * o), dtype=dtype)
+                    y_box[pairs] = y_act
+                    y_box[inactive] = (y_ina[inner] - g_t[inner] @ y_act.transpose(1, 0, 2)).transpose(1, 0, 2)
+                # blocks [j, (o1 o2), (o4 o3)] -> band[o1, o2, o3, o4, v1_j - off, v2_j - off]
+                band[i, :, :, :, :, w][..., v1 - off, v2 - off] = blocks.reshape(-1, o, o, o, o).transpose(
+                    1, 2, 4, 3, 0
+                )
+                # y_box [(b a), v, (1 2)] -> first_sum[1, 2, a, b, v]
+                first_sum[i, :, :, :, :, w] = y_box.reshape(o, o, nb2, o, o).transpose(3, 4, 1, 0, 2)
+
+        first_sum /= beta
+        meta = (self.channel, self.nq, 1)
+        band_obj = FourPoint(band, *meta, 2, False, True, True, self.frequency_notation)
+        return band_obj, FourPoint(first_sum, *meta, 1, False, True, True, self.frequency_notation)
 
     @staticmethod
     def load(

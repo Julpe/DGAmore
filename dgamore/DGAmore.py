@@ -636,6 +636,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         n_ranks=comm.size,
         with_eliashberg=config.eliashberg.perform_eliashberg,
         save_pairing_vertex=config.eliashberg.save_pairing_vertex,
+        save_fq=config.eliashberg.save_fq,
         n_eig=config.eliashberg.n_eig,
         mixing_pairs=(
             min(config.self_consistency.mixing_history_length + 1, config.self_consistency.max_iter)
