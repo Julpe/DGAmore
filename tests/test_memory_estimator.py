@@ -515,6 +515,13 @@ def test_lanczos_team_bytes_on_the_wedge_holds_irreducible_windows(monkeypatch):
     assert full - wedge == 2 * memory_estimator.DTYPE_BYTES * (vertex - irr)
 
 
+def test_lanczos_team_bytes_counts_the_residual_block_of_the_block_iteration():
+    """A block of three starting vectors adds two gap vectors to every sector's Krylov basis."""
+    plain = memory_estimator.lanczos_team_bytes(2, 64, 10, 3, 4, 1, 2, 3)
+    block = memory_estimator.lanczos_team_bytes(2, 64, 10, 3, 4, 1, 2, 3, block=3)
+    assert block - plain == memory_estimator.DTYPE_BYTES * 2 * 2 * memory_estimator._giwk_rspace(64, 2, 6)
+
+
 def test_lanczos_team_bytes_counts_windows_source_build_blocks_bubble_and_sectors(monkeypatch):
     """The team-solve node peak is the windows, the irr source beside the build blocks, the bubble and the sectors."""
     monkeypatch.setattr(memory_estimator, "TEAM_BUILD_CHUNK_BYTES", 1000 * memory_estimator.DTYPE_BYTES)

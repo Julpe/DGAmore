@@ -178,6 +178,10 @@ class EliashbergConfig:
         eigenvalue clusters and rotate each cluster to the basis adapted to the point-group mirrors, which act on the
         orbital indices as well as on the momenta (see
         :func:`~dgamore.eliashberg_solver.symmetrize_degenerate_gaps`).
+    :ivar bool resolve_degenerate_multiplets: Whether sectors whose point group forces degenerate multiplets are solved
+        with the block Krylov-Schur iteration, which finds every partner of a multiplet at the cost of more operator
+        applications (see :func:`~dgamore.eliashberg_solver.block_size`); otherwise every sector uses the
+        single-vector solve.
     :ivar bool resolve_frequency_parity: Whether to project each channel's gap onto its physical frequency-even and
         frequency-odd sectors (the paired momentum-orbital parity is fixed by the Pauli constraint) and return both,
         with files named ``gap_<channel>_<parity>_<i>``. When disabled, the overall leading eigenpairs are returned
@@ -193,6 +197,7 @@ class EliashbergConfig:
         self.epsilon: float = 1e-6
         self.symmetry: str = "random"
         self.symmetrize_degenerate_gaps: bool = True
+        self.resolve_degenerate_multiplets: bool = False
         self.resolve_frequency_parity: bool = True
         self.subfolder_name: str = "Eliashberg"
 

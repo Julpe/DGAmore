@@ -1629,3 +1629,19 @@ def test_close_group_warns_when_the_size_cap_stops_the_closure():
 
     with pytest.warns(RuntimeWarning):
         sr._close_group(ops, norb=1, nk=(4, 1, 1), max_size=2)
+
+
+@pytest.mark.parametrize(
+    "matrices, nk, expected",
+    [
+        ([np.diag([-1, 1, 1]), np.diag([1, -1, 1]), np.eye(3, dtype=int)[[1, 0, 2]]], (8, 8, 1), (2, 1, 2)),
+        ([np.diag([-1, 1, 1]), np.diag([1, -1, 1]), np.diag([1, 1, -1])], (8, 6, 4), (1, 1, 1)),
+        ([np.diag([-1, 1, 1]), np.eye(3, dtype=int)[[1, 0, 2]], np.eye(3, dtype=int)[[0, 2, 1]]], (6, 6, 6), (3, 3, 3)),
+        ([], (4, 4, 1), (1, 1, 1)),
+    ],
+)
+def test_forced_multiplicity_reads_the_irreducible_dimensions_of_the_group(matrices, nk, expected):
+    """D4, D2h and Oh force multiplets of 2, 1 and 3, the square lattice's doublets living in the odd parity only."""
+    ops = [{"M": m, "q": np.zeros(3, dtype=int), "U": np.eye(1), "sigma": 1, "conj": False} for m in matrices]
+    group = sr._close_group(ops, 1, nk)
+    assert tuple(sr.forced_multiplicity(group, nk, parity) for parity in (None, 1, -1)) == expected

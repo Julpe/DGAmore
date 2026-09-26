@@ -1157,9 +1157,9 @@ def _power_loop_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
     return np.array([lam] * k), np.repeat(vec[:, None], k, axis=1)
 
 
-def _power_loop_team_arnoldi(apply_block, seed, n_eig, ncv, tol, maxiter, comm):
+def _power_loop_team_arnoldi(apply_block, seed, n_eig, ncv, tol, maxiter, comm, n_block=1):
     """Deterministic stand-in for the team Krylov-Schur: the same short power iteration on distributed blocks."""
-    vec = seed.reshape(-1).astype(np.complex64)
+    vec = seed.reshape(n_block, -1)[0].astype(np.complex64)
     for _ in range(6):
         vec = apply_block(vec).reshape(-1)
         vec /= np.sqrt(comm.allreduce(float(np.vdot(vec, vec).real)))
@@ -1246,6 +1246,67 @@ def test_team_arnoldi_returns_the_converged_subset_at_the_restart_limit():
     assert 0 < len(lambdas) < n_eig and blocks.shape == (len(lambdas), n)
     for lam, vec in zip(lambdas, blocks):
         assert np.linalg.norm(h @ vec - lam * vec) <= 1e-1 * abs(lam)
+
+
+def _doublet_problem(m):
+    """Two exact copies of a non-normal operator with a real spectrum, and two seeds, the first confined to one copy."""
+    rng = np.random.default_rng(7)
+    first = np.concatenate([rng.standard_normal(m), np.zeros(m)])
+    return np.kron(np.eye(2), _test_matrix(m, 6, False)), np.stack([first, rng.standard_normal(2 * m)]) + 0j
+
+
+@pytest.mark.parametrize("size", [1, 3])
+def test_team_arnoldi_block_finds_both_partners_of_every_doublet(size):
+    """A seed confined to one copy reaches one partner per doublet, while two seeds give the block iteration both."""
+    m, n_eig = 30, 4
+    h, seeds = _doublet_problem(m)
+    expected = np.sort(np.linalg.eigvals(h).real)[::-1][:n_eig]
+
+    def fn(comm, rank):
+        bounds = np.linspace(0, 2 * m, comm.Get_size() + 1).astype(int)
+        s0, s1 = int(bounds[rank]), int(bounds[rank + 1])
+        apply_block = lambda block: (h @ np.concatenate(comm.allgather(block)))[s0:s1]
+        plain = es._team_arnoldi(apply_block, seeds[0, s0:s1], n_eig, 12, 1e-10, 300, comm)[0]
+        lambdas, ritz, basis, _, _ = es._team_arnoldi(apply_block, seeds[:, s0:s1], n_eig, 12, 1e-10, 300, comm, 2)
+        return plain, lambdas, np.concatenate(comm.allgather(ritz.T @ basis), axis=1)
+
+    _, res = run_parallel(size, fn)
+    for plain, lambdas, vectors in res:
+        assert not np.allclose(plain, expected, atol=1e-7) and np.allclose(lambdas, expected, atol=1e-7)
+        for lam, vec in zip(lambdas, vectors):
+            assert np.linalg.norm(h @ vec - lam * vec) <= 1e-6 * abs(lam)
+
+
+@pytest.mark.parametrize(
+    "symmetries, nk, expected",
+    [
+        (bz.two_dimensional_square_symmetries(), (8, 8, 1), (2, 1, 2)),
+        (bz.quasi_two_dimensional_square_symmetries(), (8, 8, 4), (2, 2, 2)),
+        (bz.three_dimensional_cubic_symmetries(), (6, 6, 6), (3, 3, 3)),
+        (bz.two_dimensional_nematic_symmetries(), (8, 8, 1), (1, 1, 1)),
+        ([], (8, 8, 1), (1, 1, 1)),
+    ],
+)
+def test_block_size_is_the_largest_multiplicity_the_grid_symmetry_forces(symmetries, nk, expected):
+    """The block size is the largest irreducible dimension of the grid's group, per inversion parity when asked."""
+    config.eliashberg.resolve_degenerate_multiplets = True
+    grid = bz.KGrid(nk, symmetries)
+    assert tuple(es.block_size(grid, parity) for parity in (None, 1, -1)) == expected
+
+
+def test_block_size_is_one_while_resolve_degenerate_multiplets_is_off():
+    """Without the flag every sector keeps the single-vector solve, whatever the grid's symmetry."""
+    assert es.block_size(bz.KGrid((6, 6, 6), bz.three_dimensional_cubic_symmetries()), -1) == 1
+
+
+def test_block_size_reads_the_discovered_group_on_an_auto_grid():
+    """On an auto grid of the square lattice the discovered group forces doublets in the momentum-odd sectors only."""
+    from dgamore.hamiltonian import Hamiltonian
+
+    config.eliashberg.resolve_degenerate_multiplets = True
+    grid = bz.KGrid((8, 8, 1), [bz.KnownSymmetries.AUTO])
+    grid.specify_auto_symmetries(Hamiltonian().kinetic_one_band_2d_t_tp_tpp(1.0, -0.25, 0.12).get_ek(grid))
+    assert (es.block_size(grid), es.block_size(grid, 1), es.block_size(grid, -1)) == (2, 1, 2)
 
 
 @pytest.mark.parametrize(
@@ -2472,6 +2533,35 @@ def test_gap_orbital_mirrors_returns_nothing_when_the_hamiltonian_is_unavailable
     assert _gap_orbital_mirrors(3) == {}
 
 
+def test_solve_pairing_sectors_runs_the_block_iteration_where_the_symmetry_forces_multiplets(monkeypatch):
+    """A sector with a forced block size is solved by the block iteration, which returns both partners of a doublet."""
+    m, n_eig = 30, 4
+    h, seeds = _doublet_problem(m)
+    gap_shape = (2 * m, 1, 1, 1, 1, 1)
+    monkeypatch.setattr(es, "block_size", lambda k_grid, parity=None: 2)
+    config.eliashberg.n_eig = n_eig
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetrize_degenerate_gaps = False
+    config.eliashberg.resolve_frequency_parity = None
+    config.logger = MagicMock()
+
+    res = es._solve_pairing_sectors(
+        mv=lambda gap, eps_t, eps_po: h @ gap,
+        gap_shape=gap_shape,
+        sign=1,
+        channel=SpinChannel.SING,
+        nq=gap_shape[:3],
+        executor=None,
+        ranks=(0, 0),
+        base_seed=seeds[0],
+        dtype=np.complex128,
+    )
+    ((lambdas, gaps),) = res.values()
+    assert np.allclose(lambdas, np.sort(np.linalg.eigvals(h).real)[::-1][:n_eig], atol=1e-7)
+    for lam, gap in zip(lambdas, gaps):
+        assert np.linalg.norm(h @ gap.mat.reshape(-1) - lam * gap.mat.reshape(-1)) <= 1e-5
+
+
 def test_solve_pairing_sectors_passes_the_orbital_mirrors_into_the_symmetrization(monkeypatch):
     """The solver hands the discovered mirrors to symmetrize_degenerate_gaps instead of leaving it momentum-only."""
     import dgamore.eliashberg_solver as es
@@ -2860,6 +2950,44 @@ def test_grid_solver_multi_rank_matches_in_memory_solver(monkeypatch, size, niv_
             assert res is None
             continue
         assert set(res) == set(reference)
+        for parity in reference:
+            assert np.allclose(res[parity][0], reference[parity][0], atol=1e-5)
+
+
+@pytest.mark.parametrize("size", [2, 3])
+def test_grid_solver_runs_the_block_iteration_in_lockstep_where_the_symmetry_forces_multiplets(monkeypatch, size):
+    """With a forced block size every grid rank runs the block iteration instead of ARPACK and matches in memory."""
+    from copy import deepcopy
+
+    monkeypatch.setattr(es, "MPI", conftest.FAKE_MPI)
+    monkeypatch.setattr(es, "block_size", lambda k_grid, parity=None: 2)
+    nq, o, niv_pp = (4, 2, 1), 1, 2
+    _grid_test_config(nq, niv_pp)
+    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 5)
+    np.random.seed(0)
+    reference = solve_eliashberg_lanczos(deepcopy(gamma), deepcopy(chi0), (0,))
+    monkeypatch.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", MagicMock(side_effect=AssertionError))
+    bounds = np.linspace(0, int(np.prod(nq)), size + 1).astype(int)
+
+    def worker(comm, rank):
+        _grid_test_config(nq, niv_pp)
+        local = FourPoint(
+            gamma.mat[bounds[rank] : bounds[rank + 1]].copy(),
+            SpinChannel.SING,
+            nq,
+            0,
+            2,
+            False,
+            True,
+            True,
+            FrequencyNotation.PP,
+        )
+        np.random.seed(0)
+        return es.solve_eliashberg_lanczos_grid(local, deepcopy(chi0) if rank == 0 else None, comm, 0)
+
+    _, results = conftest.run_parallel(size, worker)
+    rows, cols = es.solver_grid_shape(size, 2 * niv_pp)
+    for res in results[: rows * cols]:
         for parity in reference:
             assert np.allclose(res[parity][0], reference[parity][0], atol=1e-5)
 

@@ -750,6 +750,41 @@ def point_group_orbits(group, nk: tuple) -> tuple[np.ndarray, np.ndarray]:
     return idx_maps.min(axis=0), us
 
 
+def forced_multiplicity(group, nk: tuple, parity: int | None = None) -> int:
+    r"""
+    Returns the largest dimension of the irreducible representations of a closed symmetry group, i.e. the largest
+    eigenvalue multiplicity the group forces on any operator commuting with it. With ``parity`` only the
+    representations in which the momentum inversion :math:`\mathbf{k} \to -\mathbf{k}` acts as ``parity`` count, when
+    the group contains the inversion. The dimensions are read off the regular representation: a random symmetric
+    matrix averaged over the left action of the group has one eigenvalue per irreducible representation and copy,
+    each as often as the representation's dimension.
+
+    :param group: The closed symmetry group (iterable of :class:`_GroupElement`, containing the identity).
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+    :param parity: The inversion eigenvalue (+1 or -1) the representations must carry, or ``None`` for all of them.
+    :return: The largest forced multiplicity (1 for an abelian group).
+    """
+    elements = _ordered(group, nk)
+    index = {g._key: i for i, g in enumerate(elements)}
+    left = np.zeros((len(elements),) * 3)
+    for a, ga in enumerate(elements):
+        for b, gb in enumerate(elements):
+            left[a, index[_compose(ga, gb, nk)._key], b] = 1.0
+    x = np.random.default_rng(0).standard_normal(left.shape[1:])
+    averaged = np.einsum("aij,jk,alk->il", left, x + x.T, left)
+    inversion_key = (_grid_action_bytes(-np.eye(3, dtype=np.int64), np.zeros(3, dtype=np.int64), nk),)
+    inversion = index.get(inversion_key + elements[0]._key[1:])
+    if parity is not None and inversion is not None:
+        values, vectors = np.linalg.eigh(left[inversion])
+        vectors = vectors[:, np.isclose(values, parity)]
+        averaged = vectors.T @ averaged @ vectors
+    values = np.linalg.eigvalsh(averaged)
+    if values.size == 0:
+        return 1
+    breaks = np.flatnonzero(np.diff(values) > 1e-8 * max(np.abs(values).max(), 1.0)) + 1
+    return int(np.diff(np.concatenate(([0], breaks, [values.size]))).max())
+
+
 def _orbit_collapse(H, group):
     """
     Collapses the k-grid into symmetry orbits under the closed group, choosing the smallest flat index as each

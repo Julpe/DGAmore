@@ -62,6 +62,7 @@ eliashberg:
   epsilon: 1e-6 # Convergence criterion for the eigenvalues and eigenvectors
   symmetry: "random" # Symmetry of the gap function that will be used as a starting point for the ARNOLDI Lanczos. Available: p-wave-x, p-wave-y, d-wave, random
   symmetrize_degenerate_gaps: True # If True, gap functions within (near-)degenerate eigenvalue clusters are orthogonalized (Loewdin) and rotated to the mirror-adapted basis, using the full point-group mirrors (momentum reflection plus the orbital transformation solved for from H(k)); multiplets the coordinate mirrors cannot split keep the Loewdin basis.
+  resolve_degenerate_multiplets: False # If True, sectors in which the lattice symmetry forces degenerate multiplets (p-wave doublets of a square lattice, triplets of a cubic one) are solved with a block Krylov-Schur iteration that finds every partner, at the cost of more operator applications; otherwise a partner can occasionally be missing.
   resolve_frequency_parity: True # If True, project each channel's gap onto its physical frequency-even and frequency-odd sectors (paired momentum-orbital parity fixed by Pauli) and return both; if False, return the overall leading eigenpairs unprojected.
   subfolder_name: "Eliashberg" # name for the subfolder where certain outputs are generated
 

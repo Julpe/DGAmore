@@ -697,6 +697,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
             n_parities,
             n_ranks,
             eliashberg_solver.wedge_window_points(config.lattice.k_grid),
+            eliashberg_solver.block_size(config.lattice.k_grid),
         )
 
     logger.info(f"Auto memory detection (node-total budget): {len(nodes)} node(s).")

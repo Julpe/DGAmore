@@ -300,6 +300,7 @@ def lanczos_team_bytes(
     n_sectors: int,
     n_node_ranks: int,
     nk_window: int | None = None,
+    block: int = 1,
     overhead: float = OVERHEAD_FACTOR,
 ) -> float:
     r"""
@@ -309,7 +310,7 @@ def lanczos_team_bytes(
     windows, the node-shared irreducible-BZ source of the last window next to either the node root's private
     gathered copy of it or the column blocks the node's ranks expand at once (one block of
     :func:`team_build_columns` full-BZ columns per rank, counted twice for the expansion temporary, at most twice
-    the full-BZ vertex), the node-shared pp bubble, and per sector the Krylov basis (``ncv`` gap vectors,
+    the full-BZ vertex), the node-shared pp bubble, and per sector the Krylov basis (``ncv + block - 1`` gap vectors,
     split over the team), the scratch windows of the team matvec, the lead's assembled eigenvectors with their one
     reordering or symmetrization copy (``2 n_eig``) and the block-sized temporaries. Read by the team planner to
     decide whether a node may hold both channels at once, one at a time, or none.
@@ -323,12 +324,13 @@ def lanczos_team_bytes(
     :param n_sectors: Number of sectors solved on the node while those vertices are resident.
     :param n_node_ranks: Number of MPI ranks on the node (each expands one column block at a time).
     :param nk_window: Number of momentum points each resident window holds; ``None`` means the full BZ.
+    :param block: Number of starting vectors of the eigensolver's block iteration (1 for the plain one).
     :param overhead: Safety factor multiplied onto the raw byte counts.
     :return: The node-peak bytes.
     """
     vpp = 2 * niv_pp
     ncv = lanczos_ncv(n_eig)
-    per_sector = (ncv + TEAM_SCRATCH_VECTORS + 2 * n_eig + TEAM_MATVEC_TRANSIENT_VECTORS) * _giwk_rspace(
+    per_sector = (ncv + block - 1 + TEAM_SCRATCH_VECTORS + 2 * n_eig + TEAM_MATVEC_TRANSIENT_VECTORS) * _giwk_rspace(
         nk_tot, n_bands, vpp
     )
     vertex_full = _two_fermion_block(nk_tot, n_bands, 1, vpp)

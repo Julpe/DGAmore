@@ -272,6 +272,9 @@ class ConfigParser:
         conf.symmetrize_degenerate_gaps = self._try_parse(
             section, "symmetrize_degenerate_gaps", conf.symmetrize_degenerate_gaps
         )
+        conf.resolve_degenerate_multiplets = self._try_parse(
+            section, "resolve_degenerate_multiplets", conf.resolve_degenerate_multiplets
+        )
         conf.resolve_frequency_parity = self._try_parse(
             section, "resolve_frequency_parity", conf.resolve_frequency_parity
         )

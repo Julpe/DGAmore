@@ -30,7 +30,7 @@ from threadpoolctl import ThreadpoolController, threadpool_limits
 
 import dgamore.config as config
 from dgamore import nonlocal_sde, mpi_utils
-from dgamore.brillouin_zone import KGrid
+from dgamore.brillouin_zone import KGrid, KnownSymmetries
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.four_point import FourPoint
 from dgamore.gap_function import GapFunction
@@ -49,7 +49,13 @@ from dgamore.memory_estimator import (
 )
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE, deferred_collection
-from dgamore.symmetry_reduction import find_coordinate_mirror_orbital_unitaries, point_group_orbits
+from dgamore.symmetry_reduction import (
+    _M_preserves_grid,
+    _close_group,
+    find_coordinate_mirror_orbital_unitaries,
+    forced_multiplicity,
+    point_group_orbits,
+)
 
 
 def delete_files(filepath: str, *args) -> None:
@@ -799,6 +805,28 @@ def _sector_seed(base_seed: np.ndarray, gap_shape: tuple, eps_t: int | None, eps
     return fallback if np.linalg.norm(fallback) > 0 else base_seed
 
 
+def _sector_seeds(
+    base_seed: np.ndarray, gap_shape: tuple, eps_t: int | None, eps_po: int | None, n_seeds: int
+) -> np.ndarray:
+    r"""
+    Returns the ``n_seeds`` starting vectors of one sector along a leading axis: the seed of :func:`_sector_seed`
+    followed by random vectors of a fixed-seed generator projected onto the sector, identical on every rank.
+
+    :param base_seed: The flattened initial gap seed.
+    :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
+    :param eps_t: The requested T-parity, or ``None`` for the raw kernel.
+    :param eps_po: The forced combined ``P.O`` parity.
+    :param n_seeds: Number of starting vectors.
+    :return: The seeds, shape ``[n_seeds, n]``.
+    """
+    rng = np.random.default_rng(1)
+    seeds = [_sector_seed(base_seed, gap_shape, eps_t, eps_po)]
+    for _ in range(n_seeds - 1):
+        extra = (rng.standard_normal(base_seed.size) + 1j * rng.standard_normal(base_seed.size)).astype(base_seed.dtype)
+        seeds.append(extra if eps_t is None else _project_gap_to_sector(extra, gap_shape, eps_t, eps_po))
+    return np.stack(seeds)
+
+
 def _finish_sector(
     lambdas: np.ndarray,
     gaps: np.ndarray,
@@ -844,7 +872,8 @@ def _team_arnoldi(
     ncv: int,
     tol: float,
     maxiter: int,
-    team_comm: MPI.Comm,
+    team_comm: MPI.Comm | None,
+    n_block: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, float]:
     r"""
     Krylov-Schur (restarted Arnoldi) iteration for the eigenpairs of largest real part of an operator whose vectors
@@ -864,31 +893,43 @@ def _team_arnoldi(
     converged or after ``maxiter`` restarts, returning the converged pairs in either case; the eigenvalues are
     returned as real parts, the way scipy's ``eigsh`` reports a complex operator's spectrum.
 
+    With ``n_block > 1`` it is the block (band) variant: the basis starts from ``n_block`` orthonormalized seeds, the
+    image of basis vector :math:`j` is orthogonalized against the first :math:`j + n_\mathrm{block}` vectors and
+    becomes vector :math:`j + n_\mathrm{block}`, and the last ``n_block`` vectors form the residual block whose
+    coupling to the Ritz vectors gives the residual estimates and carries over the restart. Every eigenspace of
+    dimension up to ``n_block`` is then reached in exact arithmetic, where a single start vector reaches one direction
+    of each; ``n_block = 1`` is the plain iteration.
+
     :param apply_block: The operator, ``block -> block`` on this rank's slice.
-    :param seed_block: This rank's block of the starting vector.
+    :param seed_block: This rank's block of the starting vector, or of the ``n_block`` starting vectors along a
+        leading axis.
     :param n_eig: Number of wanted eigenpairs.
     :param ncv: Size of the Krylov basis (``n_eig < ncv``).
     :param tol: Relative residual tolerance of a Ritz pair.
     :param maxiter: Maximum number of restarts.
-    :param team_comm: The team communicator.
+    :param team_comm: The team communicator, or ``None`` for a single process holding the whole vectors.
+    :param n_block: Number of starting vectors, the largest eigenvalue multiplicity resolved in exact arithmetic.
     :return: ``(lambdas, ritz, basis, n_matvec, matvec_seconds)``: the converged eigenvalues in descending order,
         their Ritz coefficients as columns (this rank's block of eigenvector ``i`` is ``ritz[:, i] @ basis``, of unit
         norm up to rounding), this rank's blocks of the basis vectors as rows, the number of operator applications
         and the time spent in them.
     """
     dtype = seed_block.dtype
-    basis = np.empty((ncv, seed_block.size), dtype=dtype)
-    rayleigh = np.zeros((ncv, ncv), dtype=np.complex128)
+    seeds = seed_block.reshape(n_block, -1)
+    basis = np.empty((ncv + n_block - 1, seeds.shape[1]), dtype=dtype)
+    rayleigh = np.zeros((ncv + n_block, ncv), dtype=np.complex128)
     n_matvec, matvec_seconds = 0, 0.0
+
+    reduce = (lambda x: x) if team_comm is None else team_comm.allreduce
 
     def dots(vectors: np.ndarray, w: np.ndarray) -> np.ndarray:
         # conjugating the one vector instead of the basis slice spares a basis-sized copy per call (bit-identical)
-        return team_comm.allreduce((vectors @ w.conj()).conj())
+        return reduce((vectors @ w.conj()).conj())
 
     def norm(w: np.ndarray) -> float:
-        return float(np.sqrt(team_comm.allreduce(float(np.vdot(w, w).real))))
+        return float(np.sqrt(reduce(float(np.vdot(w, w).real))))
 
-    rng = np.random.default_rng(team_comm.Get_rank())
+    rng = np.random.default_rng(0 if team_comm is None else team_comm.Get_rank())
 
     def fresh_direction(n_basis: int) -> np.ndarray:
         # a random unit vector orthogonalized twice against the basis (all ranks draw their block together)
@@ -897,7 +938,12 @@ def _team_arnoldi(
             w = w - dots(basis[:n_basis], w) @ basis[:n_basis]
         return w / norm(w)
 
-    basis[0] = seed_block.reshape(-1) / norm(seed_block.reshape(-1))
+    basis[0] = seeds[0] / norm(seeds[0])
+    for i in range(1, n_block):
+        w = seeds[i] - dots(basis[:i], seeds[i]) @ basis[:i]
+        w = w - dots(basis[:i], w) @ basis[:i]
+        basis[i] = w / norm(w)
+    del seed_block, seeds
     j, restarts = 0, 0
     while True:
         start = time.perf_counter()
@@ -905,41 +951,47 @@ def _team_arnoldi(
         matvec_seconds += time.perf_counter() - start
         n_matvec += 1
         w_norm = norm(w)
-        h = dots(basis[: j + 1], w)
-        w = w - h @ basis[: j + 1]
+        top = j + n_block
+        h = dots(basis[:top], w)
+        w = w - h @ basis[:top]
         beta, spent = norm(w), False
         if beta < REORTHOGONALIZE_BELOW * w_norm:
-            correction = dots(basis[: j + 1], w)
-            w = w - correction @ basis[: j + 1]
+            correction = dots(basis[:top], w)
+            w = w - correction @ basis[:top]
             h += correction
             beta, previous = norm(w), beta
             spent = beta < REORTHOGONALIZE_BELOW * previous
-        rayleigh[: j + 1, j] = h
+        rayleigh[:top, j] = h
+        rayleigh[top, j] = beta
         if j + 1 < ncv:
-            rayleigh[j + 1, j] = beta
-            basis[j + 1] = fresh_direction(j + 1) if spent else w / beta
+            basis[top] = fresh_direction(top) if spent else w / beta
             j += 1
             continue
         # the basis is full: Ritz pairs of the Rayleigh quotient, largest real part first
-        theta, ritz = np.linalg.eig(rayleigh)
+        theta, ritz = np.linalg.eig(rayleigh[:ncv])
         order = np.argsort(-theta.real)
         theta, ritz = theta[order], ritz[:, order]
-        converged = beta * np.abs(ritz[-1]) <= tol * np.abs(theta)
+        residual = beta * np.abs(ritz[-1]) if n_block == 1 else np.linalg.norm(rayleigh[ncv:] @ ritz, axis=0)
+        converged = residual <= tol * np.abs(theta)
         if converged[:n_eig].all() or restarts >= maxiter:
             chosen = [i for i in range(n_eig) if converged[i]]
-            return theta[chosen].real, ritz[:, chosen], basis, n_matvec, matvec_seconds
+            return theta[chosen].real, ritz[:, chosen], basis[:ncv], n_matvec, matvec_seconds
         # Krylov-Schur restart: the wanted Ritz values and half of the rest lead the reordered Schur form
         threshold = theta.real[n_eig + (ncv - n_eig) // 2 - 1]
-        schur, vectors, n_leading = sp.linalg.schur(rayleigh, output="complex", sort=lambda z: z.real >= threshold)
-        kept = min(n_leading, ncv - 1)
+        schur, vectors, n_leading = sp.linalg.schur(
+            rayleigh[:ncv], output="complex", sort=lambda z: z.real >= threshold
+        )
+        kept = min(n_leading, ncv - n_block)
         # compacted in column chunks, so the transient stays a fraction of the basis
         chunk = max(1, basis.shape[1] // 8)
         for c0 in range(0, basis.shape[1], chunk):
-            basis[:kept, c0 : c0 + chunk] = vectors[:, :kept].T @ basis[:, c0 : c0 + chunk]
-        basis[kept] = w / beta
+            basis[:kept, c0 : c0 + chunk] = vectors[:, :kept].T @ basis[:ncv, c0 : c0 + chunk]
+        basis[kept : kept + n_block - 1] = basis[ncv:]
+        basis[kept + n_block - 1] = w / beta
+        coupling = beta * vectors[-1, :kept] if n_block == 1 else rayleigh[ncv:] @ vectors[:, :kept]
         rayleigh[...] = 0.0
         rayleigh[:kept, :kept] = schur[:kept, :kept]
-        rayleigh[kept, :kept] = beta * vectors[-1, :kept]
+        rayleigh[kept : kept + n_block, :kept] = coupling
         j = kept
         restarts += 1
 
@@ -1750,6 +1802,43 @@ def _wedge_orbits(k_grid: KGrid) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
     return reps, offsets, order, us
 
 
+_SYMMETRY_MATRICES = {
+    KnownSymmetries.X_INV: np.diag([-1, 1, 1]),
+    KnownSymmetries.Y_INV: np.diag([1, -1, 1]),
+    KnownSymmetries.Z_INV: np.diag([1, 1, -1]),
+    KnownSymmetries.X_Y_SYM: np.eye(3, dtype=np.int64)[[1, 0, 2]],
+    KnownSymmetries.X_Z_SYM: np.eye(3, dtype=np.int64)[[2, 1, 0]],
+    KnownSymmetries.Y_Z_SYM: np.eye(3, dtype=np.int64)[[0, 2, 1]],
+    KnownSymmetries.X_Y_INV: np.diag([-1, -1, 1]),
+}
+
+
+def block_size(k_grid: KGrid, parity: int | None = None) -> int:
+    r"""
+    Returns the number of starting vectors the Eliashberg eigensolver takes with ``resolve_degenerate_multiplets``, so
+    that every eigenvalue multiplicity the grid's symmetry forces is found in exact arithmetic (see :func:`~dgamore.symmetry_reduction.forced_multiplicity`):
+    the discovered group on an auto-symmetry grid, the group generated by the listed operations otherwise. A
+    single-vector Krylov method reaches one direction of each eigenspace, so the partners of a forced multiplet only
+    enter through rounding and can be missing from the converged eigenpairs.
+
+    :param k_grid: The momentum grid.
+    :param parity: The momentum-inversion parity of the sector (one band), or ``None`` for every representation.
+    :return: The block size, 1 when the group forces no multiplet or ``resolve_degenerate_multiplets`` is off.
+    """
+    if not config.eliashberg.resolve_degenerate_multiplets:
+        return 1
+    nk = tuple(k_grid.nk)
+    if k_grid.is_auto:
+        return forced_multiplicity(k_grid._auto_group, nk, parity)
+    matrices = [_SYMMETRY_MATRICES.get(sym) for sym in k_grid.symmetries or []]
+    ops = [
+        {"M": m, "q": np.zeros(3, dtype=np.int64), "U": np.eye(1), "sigma": 1, "conj": False}
+        for m in matrices
+        if m is not None and _M_preserves_grid(m, nk)
+    ]
+    return forced_multiplicity(_close_group(ops, 1, nk), nk, parity)
+
+
 def wedge_window_points(k_grid: KGrid) -> int:
     r"""
     Returns the number of real-space points a channel's vertex window holds in the team solve: the star
@@ -2019,6 +2108,7 @@ def plan_lanczos_teams(
                     len(node_sectors),
                     len(node_ranks[node]),
                     wedge_window_points(config.lattice.k_grid),
+                    block_size(config.lattice.k_grid),
                 )
                 if need > node_available[node] * NODE_MEMORY_FRACTION:
                     return False
@@ -2231,10 +2321,13 @@ def _solve_team_sectors(
         logger.info(f"Starting Lanczos method for {label}.", allowed_ranks=ranks)
         if channel != seeded_channel:
             base_seed, seeded_channel = get_initial_gap_function(gap_shape, channel).flatten(), channel
-        seed = _sector_seed(base_seed, gap_shape, eps_t, eps_po).reshape(gap_shape)[..., v0:v1]
+        n_block = block_size(config.lattice.k_grid, eps_po if gap_shape[3] == 1 else None)
+        seeds = _sector_seeds(base_seed, gap_shape, eps_t, eps_po, n_block)
+        seed = np.ascontiguousarray(seeds.reshape((n_block,) + tuple(gap_shape))[..., v0:v1])
+        del seeds
         start = time.perf_counter()
         lambdas, ritz, basis, n_matvec, matvec_seconds = _team_arnoldi(
-            lambda block: apply_block(channel, eps_t, eps_po, block), seed, n_eig, ncv, tol, 10000, team_comm
+            lambda block: apply_block(channel, eps_t, eps_po, block), seed, n_eig, ncv, tol, 10000, team_comm, n_block
         )
         logger.info(
             f"Lanczos for {label}: {n_matvec} matvecs, {matvec_seconds:.1f} s in the matvec "
@@ -2328,28 +2421,50 @@ def _solve_pairing_sectors(
                 return result
 
             mat = sp.sparse.linalg.LinearOperator(shape=(shape_flat, shape_flat), matvec=counted_matvec, dtype=dtype)
+            n_block = block_size(config.lattice.k_grid, eps_po if gap_shape[3] == 1 else None)
             eigsh_start = time.perf_counter()
             # BLAS is pinned to one thread for the solve (threadpool_limits resizes the live pool; an environment
             # change would be ignored) so the momentum-batch threads never nest BLAS threads underneath.
             with threadpool_limits(limits=1 if executor is not None else None):
-                try:
-                    lambdas, gaps = sp.sparse.linalg.eigsh(
-                        mat,
-                        k=n_eig,
-                        tol=config.eliashberg.epsilon,
-                        v0=_sector_seed(base_seed, gap_shape, eps_t, eps_po),
-                        ncv=min(lanczos_ncv(n_eig), shape_flat),
-                        which="LA",
-                        maxiter=10000,
+                if n_block > 1:
+                    # forced multiplets need the block iteration, run on the full vectors of this rank
+                    lambdas, ritz, basis, _, _ = _team_arnoldi(
+                        counted_matvec,
+                        _sector_seeds(base_seed, gap_shape, eps_t, eps_po, n_block),
+                        n_eig,
+                        min(lanczos_ncv(n_eig), shape_flat),
+                        config.eliashberg.epsilon,
+                        10000,
+                        None,
+                        n_block,
                     )
-                except sp.sparse.linalg.ArpackNoConvergence as exc:
-                    # the converged subset is kept; the delivery sizes the gap transfer off what came back
-                    lambdas, gaps = exc.eigenvalues.real, exc.eigenvectors
-                    logger.warning(
-                        f"Lanczos for {label} did not converge within the iteration limit; keeping the "
-                        f"{len(lambdas)} of {n_eig} converged eigenpair(s).",
-                        allowed_ranks=ranks,
-                    )
+                    gaps = (ritz.T @ basis).T
+                    del basis
+                    if len(lambdas) < n_eig:
+                        logger.warning(
+                            f"Lanczos for {label} did not converge within the restart limit; keeping the "
+                            f"{len(lambdas)} of {n_eig} converged eigenpair(s).",
+                            allowed_ranks=ranks,
+                        )
+                else:
+                    try:
+                        lambdas, gaps = sp.sparse.linalg.eigsh(
+                            mat,
+                            k=n_eig,
+                            tol=config.eliashberg.epsilon,
+                            v0=_sector_seed(base_seed, gap_shape, eps_t, eps_po),
+                            ncv=min(lanczos_ncv(n_eig), shape_flat),
+                            which="LA",
+                            maxiter=10000,
+                        )
+                    except sp.sparse.linalg.ArpackNoConvergence as exc:
+                        # the converged subset is kept; the delivery sizes the gap transfer off what came back
+                        lambdas, gaps = exc.eigenvalues.real, exc.eigenvectors
+                        logger.warning(
+                            f"Lanczos for {label} did not converge within the iteration limit; keeping the "
+                            f"{len(lambdas)} of {n_eig} converged eigenpair(s).",
+                            allowed_ranks=ranks,
+                        )
             logger.info(
                 f"Lanczos for {label}: {n_matvec} matvecs, {matvec_seconds:.1f} s in the matvec "
                 f"({1e3 * matvec_seconds / max(n_matvec, 1):.0f} ms each), {time.perf_counter() - eigsh_start:.1f} s "

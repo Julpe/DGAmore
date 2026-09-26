@@ -19,9 +19,9 @@ The first section governs the frequency box sizes used throughout the calculatio
 .. code-block:: yaml
 
    box_sizes:
-     niw_core: -1   # int
-     niv_core: -1   # int
-     niv_shell: 0   # int
+     niw_core: -1 # int
+     niv_core: -1 # int
+     niv_shell: 0 # int
 
 The "core" region defines the frequency box on which the Bethe-Salpeter and Schwinger-Dyson equations are solved
 explicitly, while the "shell" region sets the size of the asymptotic tails used for the vertex reconstruction
@@ -41,12 +41,12 @@ The next section describes the Hamiltonian and the lattice symmetries of the sys
 .. code-block:: yaml
 
    lattice:
-     symmetries: "auto"                     # str | list[str]
-     type: "from_wannier90"                 # str
-     hr_input: "/path/to/file"              # str | list[float]
-     interaction_type: "from_dmft"          # str
-     interaction_input: ""                  # str
-     nk: [ 16, 16, 1 ]                      # list[int]
+     symmetries: "auto"            # str | list[str]
+     type: "from_wannier90"        # str
+     hr_input: "/path/to/file"     # str | list[float]
+     interaction_type: "from_dmft" # str
+     interaction_input: ""         # str
+     nk: [ 16, 16, 1 ]             # list[int]
 
 The ``symmetries`` field controls how the irreducible Brillouin zone is built. Entering ``auto`` enables the
 automatic symmetry discovery, which probes a large number of combined momentum and orbital transformations,
@@ -153,9 +153,9 @@ work, what they have in common and when to reach for which is discussed on the :
 .. code-block:: yaml
 
    stabilization:
-     use_lambda_correction: False      # bool
-     use_chi_phys_restriction: False   # bool
-     use_lambda_annealing: False       # bool
+     use_lambda_correction: False    # bool
+     use_chi_phys_restriction: False # bool
+     use_lambda_annealing: False     # bool
 
 Setting ``use_lambda_correction`` to ``True`` applies the lambda correction to the physical susceptibilities
 in every iteration of the cycle. The correction is dispatched by the band count (and the choice is logged):
@@ -288,15 +288,16 @@ Superconducting properties are obtained by solving the linearized Eliashberg equ
 .. code-block:: yaml
 
    eliashberg:
-     perform_eliashberg: False    # bool
-     save_pairing_vertex: False   # bool
-     save_fq: False               # bool
-     n_eig: 4                     # int
-     epsilon: 1e-6                # float
-     symmetry: "random"           # str
-     symmetrize_degenerate_gaps: True # bool
-     resolve_frequency_parity: True # bool
-     subfolder_name: "Eliashberg" # str
+     perform_eliashberg: False            # bool
+     save_pairing_vertex: False           # bool
+     save_fq: False                       # bool
+     n_eig: 4                             # int
+     epsilon: 1e-6                        # float
+     symmetry: "random"                   # str
+     symmetrize_degenerate_gaps: True     # bool
+     resolve_degenerate_multiplets: False # bool
+     resolve_frequency_parity: True       # bool
+     subfolder_name: "Eliashberg"         # str
 
 The equation is solved only when ``perform_eliashberg`` is ``True``. Enabling ``save_pairing_vertex`` or ``save_fq``
 writes the pairing vertex or the full ladder vertex on the irreducible Brillouin zone to the output folder. With
@@ -309,8 +310,14 @@ The equation is solved with a Lanczos algorithm based on the ARPACK routines, re
 eigenvalues and the corresponding gap functions to an accuracy of ``epsilon``. The ``symmetry`` field sets the
 starting vector of the iteration: entering ``"d-wave"``, for example, begins from a gap function with d-wave
 symmetry, but ``"random"`` is sufficient most of the time. The random start is drawn from a fixed seed, so a run
-reproduces the same gap functions when repeated. The pairing vertex always includes the local reducible pp
-diagrams. With ``symmetrize_degenerate_gaps`` enabled (the
+reproduces the same gap functions when repeated. A single start vector reaches only one direction of an exactly
+degenerate eigenvalue, so the partners of a multiplet the lattice symmetry forces (the :math:`p`-wave doublets of a
+square lattice, the triplets of a cubic one) can be missing from the result, most likely when the eigenvalues below
+them lie close together. With ``resolve_degenerate_multiplets`` enabled, sectors in which the symmetry group of the
+k-grid forces such multiplets are solved with a block Krylov-Schur iteration started from as many vectors as the
+largest multiplet, which finds every partner but needs more operator applications (about 1.4-2 times as many on a
+square lattice, up to several times on a cubic one); every other sector keeps the single-vector solve. The pairing vertex always
+includes the local reducible pp diagrams. With ``symmetrize_degenerate_gaps`` enabled (the
 default), gap functions belonging to (near-)degenerate eigenvalues are orthogonalized with a Loewdin scheme and
 rotated to their mirror-adapted partners: single-axis (:math:`p_x`/:math:`p_y`/:math:`p_z`-like) and two-axis
 (:math:`d_{xy}`/:math:`d_{xz}`/:math:`d_{yz}`-like) modes are ordered by the mirrors they are odd under. The mirrors
