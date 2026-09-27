@@ -85,7 +85,6 @@ def load_from_dmft_file_and_update_config() -> (
 
     config.sys.mu = dmft_interface.get_mu()
     config.sys.mu_dmft = config.sys.mu
-    config.sys.n = dmft_interface.get_totdens()
 
     sigma_per_ineq, g_per_ineq, g2_dens_per_ineq, g2_magn_per_ineq = [], [], [], []
     for ineq in range(1, config.dmft.n_ineq + 1):

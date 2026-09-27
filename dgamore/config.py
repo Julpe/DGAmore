@@ -252,7 +252,8 @@ class SystemConfig:
     :ivar float beta: Inverse temperature :math:`\beta`.
     :ivar float mu: Chemical potential :math:`\mu` (updated during self-consistency).
     :ivar float mu_dmft: Chemical potential of the DMFT input.
-    :ivar float n: Total filling :math:`n`.
+    :ivar float n: Target total filling :math:`n`, set to the filling of the DMFT lattice Green's function at the
+        start of the self-consistency.
     :ivar int n_bands: Number of bands.
     :ivar numpy.ndarray occ: Local (k-averaged) occupation matrix.
     :ivar numpy.ndarray occ_k: Full (k-resolved) occupation matrix.

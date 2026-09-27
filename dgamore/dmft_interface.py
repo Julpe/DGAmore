@@ -59,15 +59,6 @@ class DMFTInterface(ABC):
         """
         raise NotImplementedError()
 
-    def get_totdens(self) -> float:
-        """
-        Returns the total electron density from the DMFT calculation.
-
-        :return: The total electron density from the DMFT calculation.
-        :raises NotImplementedError: In the abstract base class.
-        """
-        raise NotImplementedError()
-
     def get_occ(self, ineq: int = 1) -> np.ndarray:
         """
         Returns the orbital-resolved occupation from the DMFT calculation.
@@ -193,15 +184,6 @@ class W2dynInterface(DMFTInterface):
         :return: The number of interacting d-orbitals.
         """
         return self._from_ineq_config("nd", ineq=ineq)
-
-    def get_totdens(self, dmft_iter: str = "dmft-last") -> float:
-        """
-        Reads the total electron density from the w2dynamics config.
-
-        :param dmft_iter: The DMFT iteration to read from.
-        :return: The total electron density.
-        """
-        return self.file_1p[".config"].attrs["general.totdens"]
 
     def get_occ(self, ineq: int = 1, dmft_iter: str = "dmft-last") -> np.ndarray:
         """
