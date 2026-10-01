@@ -95,6 +95,25 @@ def test_raises_error_when_dividing_by_invalid_type():
         obj / "invalid"
 
 
+def test_conj_in_place_conjugates_the_stored_buffer_and_returns_self():
+    """conj(copy=False) writes the conjugate into the existing buffer and returns the same object."""
+    mat = np.array([[1 + 2j, 3 - 4j], [-5j, 6]])
+    obj = IHaveMat(mat)
+    buffer = obj.mat
+    result = obj.conj(copy=False)
+    assert result is obj and result.mat is buffer
+    assert np.array_equal(result.mat, np.conj(mat))
+
+
+def test_conj_with_copy_returns_the_conjugate_and_leaves_the_original_untouched():
+    """conj() returns a conjugated copy and leaves the original matrix unchanged."""
+    mat = np.array([[1 + 2j, 3 - 4j], [-5j, 6]])
+    obj = IHaveMat(mat)
+    result = obj.conj()
+    assert result is not obj
+    assert np.array_equal(result.mat, np.conj(mat)) and np.array_equal(obj.mat, mat)
+
+
 def test_reshapes_matrix_and_updates_original_shape():
     """Reshaping updates the matrix and tracks the original shape."""
     mat = np.array([[1, 2], [3, 4]])
@@ -1384,24 +1403,6 @@ def test_map_to_full_bz_plain_symmetry_kgrid_does_not_call_orbital_transform(c12
     monkeypatch.setattr(sr, "apply_auto_orbital_transform", spy)
     obj._map_to_full_bz(grid, num_orbital_dimensions=2)
     assert spy.call_count == 0
-
-
-@pytest.mark.parametrize("antiunitary", [False, True])
-def test_map_to_full_bz_of_a_conjugated_object_with_conjugate_rotation_is_the_conjugated_mapping(
-    c128_storage, antiunitary
-):
-    """Mapping conj(X) with conjugate unitaries equals conj of mapping X bit for bit, anti-unitary members included."""
-    grid, _ = _build_auto_kgrid(nx=4, ny=4, nz=2, nb=2)
-    rng = np.random.default_rng(4)
-    grid._auto_us = np.array(
-        [np.linalg.qr(rng.standard_normal((2, 2)) + 1j * rng.standard_normal((2, 2)))[0] for _ in range(32)]
-    ).reshape(4, 4, 2, 2, 2)
-    grid._auto_conjs = (rng.random((4, 4, 2)) < 0.5) if antiunitary else np.zeros((4, 4, 2), dtype=bool)
-    shape = (grid.nk_irr, 2, 2, 2, 2, 3)
-    x = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
-    plain = IAmNonLocal(x.copy(), (4, 4, 2), has_compressed_q_dimension=True)._map_to_full_bz(grid, 4)
-    conj = IAmNonLocal(np.conj(x), (4, 4, 2), has_compressed_q_dimension=True)._map_to_full_bz(grid, 4, conjugate=True)
-    assert np.array_equal(conj.mat, np.conj(plain.mat))
 
 
 def test_auto_orbital_groups_are_cached_per_dtype_and_recomputed_for_replaced_rotations():

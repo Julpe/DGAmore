@@ -242,9 +242,10 @@ def _write_pp_band(out: np.ndarray, f_chunk: FourPoint, niv_pp: int, omega: np.n
     Writes the :math:`\omega' = 0` pp band of one ladder-vertex window into the pp accumulator of its momenta.
 
     Each bosonic frequency contributes the anti-diagonal :math:`\omega = \nu - \nu'` (see :func:`_pp_w0_band`), and
-    the negative bosonic half is obtained from the positive one through the complex-conjugation symmetry that
-    :meth:`~dgamore.local_n_point.LocalNPoint.to_negative_niw_range` implements. The orbital permutation, the
-    fermionic flip and the overall minus are the ones of :func:`_transform_vertex_frequencies_w0`.
+    the negative bosonic half is obtained from the positive one at the same momentum through the Hermiticity of the
+    vertex, :math:`F^{(\mathbf{q},-\omega)\nu\nu'}_{1234} = (F^{(\mathbf{q},\omega)(-\nu')(-\nu)}_{4321})^*` (a plain
+    conjugation would need :math:`-\mathbf{q}`). The orbital permutation, the fermionic flip and the overall minus
+    are the ones of :func:`_transform_vertex_frequencies_w0`.
 
     :param out: The pp accumulator of this momentum group, shape ``[nq_group, no, no, no, no, 2 niv_pp, 2 niv_pp]``.
     :param f_chunk: The ladder vertex over a bosonic window, in ph notation and half niw range.
@@ -256,7 +257,13 @@ def _write_pp_band(out: np.ndarray, f_chunk: FourPoint, niv_pp: int, omega: np.n
     # cut to the pp box first so the negative-half copy is pp-sized, not core-sized (the cut is centered, so the
     # fermionic flips inside to_negative_niw_range commute with it); positive then mutates the cut copy in place
     cut = f_chunk.cut_niv(niv_pp)
-    negative = cut.to_negative_niw_range().permute_orbitals("abcd->adcb", copy=False).flip_frequency_axis(-1, False)
+    # Hermitian partner F^{-w}_{1234}(v, v') = conj(F^{w}_{4321}(-v', -v)), then the 1432 slot map: orbitals 2341
+    negative = (
+        cut.to_negative_niw_range()
+        .swap_fermionic_frequency_axes(copy=False)
+        .permute_orbitals("bcda->abcd", copy=False)
+        .flip_frequency_axis(-1, False)
+    )
     positive = cut.permute_orbitals("abcd->adcb", copy=False).flip_frequency_axis(-1, False)
 
     for index in range(positive.current_shape[-3]):

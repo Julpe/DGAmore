@@ -33,6 +33,10 @@ class SelfEnergy(TwoPoint):
     Matsubara frequencies.
     """
 
+    # Upper bound (in bytes) on the transient of symmetrize_time_reversal: the gathered partners and their average of
+    # one fermionic chunk, so a full-BZ self-energy is never duplicated.
+    _TR_CHUNK_BYTES = 256 * 1024**2
+
     def __init__(
         self,
         mat: np.ndarray,
@@ -288,6 +292,38 @@ class SelfEnergy(TwoPoint):
         return SelfEnergy(
             result_mat, self.nq, self.full_niv_range, self.has_compressed_q_dimension, False, beta=self._beta
         )
+
+    def symmetrize_time_reversal(self) -> float:
+        r"""
+        Enforces the time-reversal relation of real hoppings, :math:`\Sigma^{(\mathbf{k},\nu)}_{12} =
+        \Sigma^{(-\mathbf{k},\nu)}_{21}`, in place by averaging every momentum with its time-reversed partner,
+
+        .. math:: \Sigma^{(\mathbf{k},\nu)}_{12} \to \tfrac{1}{2}\left(\Sigma^{(\mathbf{k},\nu)}_{12}
+            + \Sigma^{(-\mathbf{k},\nu)}_{21}\right).
+
+        The average keeps the Matsubara Hermiticity and the causality of the input. It runs over chunks of the
+        fermionic axis whose transient (the gathered partners and their average) stays below ``_TR_CHUNK_BYTES``.
+
+        :return: The largest change of an element, i.e. half the largest time-reversal asymmetry of the input.
+        :raises ValueError: If the momentum axis is not compressed.
+        """
+        if not self.has_compressed_q_dimension:
+            raise ValueError("The time-reversal average needs a compressed momentum axis.")
+        grid = np.array(self.nq)
+        k = np.array(np.unravel_index(np.arange(grid.prod()), self.nq))
+        minus = np.ravel_multi_index(tuple(-k % grid[:, None]), self.nq)
+
+        mat = self.mat
+        width = max(1, int(self._TR_CHUNK_BYTES // (2 * mat[..., :1].nbytes)))
+        removed = 0.0
+        for start in range(0, mat.shape[-1], width):
+            block = mat[..., start : start + width]
+            average = block[minus].swapaxes(1, 2)
+            average += block
+            average *= 0.5
+            removed = max(removed, float(np.abs(average - block).max()))
+            block[...] = average
+        return removed
 
     def fit_smom_concatenated(
         self, other: "SelfEnergy", shell_offset: np.ndarray | None = None

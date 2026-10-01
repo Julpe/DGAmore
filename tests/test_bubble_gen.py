@@ -147,22 +147,41 @@ def test_create_generalized_chi0_q_pp_w0_matches_reference():
 
     gm = g.cut_niv(niv_pp).compress_q_dimension().mat
     nkt, n = gm.shape[0], 2 * niv_pp
+    minus_k = [np.ravel_multi_index(tuple(-np.array(np.unravel_index(k, nk)) % nk), nk) for k in range(nkt)]
     ref = np.zeros((nkt, nb, nb, nb, nb, n), dtype=np.complex128)
     for k in range(nkt):
         for a in range(nb):
             for b in range(nb):
                 for c in range(nb):
                     for d in range(nb):
-                        # G_14^{kv} * conj(G_32^{kv})   (transpose_orbitals -> g[c,b], conjugated)
-                        ref[k, a, b, c, d, :] = gm[k, a, d, :] * np.conj(gm[k, c, b, :])
+                        # G_14^{k,v} * G_23^{-k,-v}
+                        ref[k, a, b, c, d, :] = gm[k, a, d, :] * gm[minus_k[k], b, c, ::-1]
 
     assert res.mat.shape == ref.shape
     assert res.frequency_notation == FrequencyNotation.PP
     assert np.allclose(res.mat, ref, atol=1e-4)
 
 
+def test_momentum_pp_bubble_transforms_like_a_four_point_object_under_a_unit_cell_relabeling():
+    """Relabeling one orbital's cell (G -> D G D^+, D(-k) = D(k)^*) rephases the pp bubble by D_1 D_2^* D_3 D_4^*."""
+    nk, nb, niv_pp = (4, 1, 1), 2, 3
+    q_grid = bz.KGrid(nk, symmetries=[])
+    g = _make_momentum_g(nk, nb, niv_pp, seed=12)
+    d = np.ones((*nk, nb), dtype=np.complex128)
+    d[..., 1] = np.exp(2j * np.pi * np.arange(nk[0]) / nk[0])[:, None, None]
+    mat = d[..., :, None, None] * g.mat * d[..., None, :, None].conj()
+    shifted = GreensFunction(mat, has_compressed_q_dimension=False, nk=nk)
+    bubble, bubble_shifted = (
+        BubbleGenerator.create_generalized_chi0_q_pp_w0(x, niv_pp, q_grid).decompress_q_dimension().mat
+        for x in (g, shifted)
+    )
+    dc = d.conj()
+    phase = d[..., :, None, None, None] * dc[..., None, :, None, None] * d[..., None, None, :, None]
+    assert np.allclose(bubble_shifted, (phase * dc[..., None, None, None, :])[..., None] * bubble, atol=1e-5)
+
+
 def test_create_generalized_chi0_q_pp_w0_does_not_mutate_input():
-    """create_generalized_chi0_q_pp_w0 conjugates only a private copy and leaves its input untouched."""
+    """create_generalized_chi0_q_pp_w0 flips only a private copy and leaves its input untouched."""
     nk, nb, niv_pp = (2, 2, 1), 2, 2
     g = _make_momentum_g(nk, nb, niv_pp + 1, seed=7)
     g_before = g.mat.copy()

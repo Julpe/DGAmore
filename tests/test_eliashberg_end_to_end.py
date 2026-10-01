@@ -213,6 +213,8 @@ def test_eliashberg_gap_functions_carry_sector_parity_and_match_reference(setup)
     config.output.eliashberg_path = folder
     config.eliashberg.n_eig = 4
     config.eliashberg.resolve_frequency_parity = True
+    # at the default 1e-6 the admixture of the nearest gap (~1e-3) depends on the BLAS platform
+    config.eliashberg.epsilon = 1e-10
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)

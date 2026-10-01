@@ -324,8 +324,8 @@ class BubbleGenerator:
     def create_generalized_chi0_q_pp_w0(giwk: GreensFunction, niv_pp: int, q_grid: KGrid) -> FourPoint:
         r"""
         Returns the momentum-dependent particle-particle bare bubble at :math:`\omega = 0`,
-        :math:`\chi^{\mathrm{k}}_{0;1234} = G^{\mathrm{k}}_{14}\, G^{-\mathrm{k}}_{23}` with :math:`G^{-\mathrm{k}}_{23}
-        = (G^{\mathrm{k}}_{32})^{*}`.
+        :math:`\chi^{\mathrm{k}}_{0;1234} = G^{\mathrm{k}}_{14}\, G^{-\mathrm{k}}_{23}`, the partner propagator read at
+        the flipped momentum and fermionic frequency, :math:`-\mathrm{k} = (-\mathbf{k}, -\nu)`.
         Note that no factor of :math:`-\beta` is included here.
 
         :param giwk: The momentum-dependent :class:`GreensFunction`.
@@ -334,10 +334,9 @@ class BubbleGenerator:
         :return: The momentum-dependent pp bubble as a :class:`FourPoint` (no bosonic axis, pp notation, compressed q).
         """
         g = giwk.cut_niv(niv_pp).compress_q_dimension()
-        # transpose_orbitals() returns a fresh private copy, so conjugate it in place to reuse its buffer.
-        g_t = g.transpose_orbitals()
-        np.conj(g_t.mat, out=g_t.mat)
-        gchi0_q_pp_w0 = g.mat[:, :, None, None, :, :] * g_t.mat[:, None, :, :, None, :]
+        # G_23 at (-k, -v); the same-momentum conj(G_32(k, v)) equals it only if G(-k) = G(k)
+        g_minus = g.flip_momentum_axis(copy=True)
+        gchi0_q_pp_w0 = g.mat[:, :, None, None, :, :] * g_minus.mat[:, None, :, :, None, ::-1]
 
         return FourPoint(
             gchi0_q_pp_w0, SpinChannel.NONE, q_grid.nk, 0, 1, True, True, True, FrequencyNotation.PP

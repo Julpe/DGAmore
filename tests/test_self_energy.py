@@ -826,3 +826,44 @@ def test_fit_smom_of_an_orbitally_symmetric_self_energy_equals_the_elementwise_f
     assert mom0.dtype.kind == "f" and mom1.dtype.kind == "f"
     assert np.array_equal(mom0, np.mean(fitdata.real, axis=-1))
     assert np.array_equal(mom1, np.mean(fitdata.imag * vn, axis=-1))
+
+
+def _time_reversed(mat: np.ndarray, grid: tuple) -> np.ndarray:
+    """Returns Sigma(-k)^T of a compressed [k, o1, o2, v] array, built from per-axis momentum flips."""
+    flipped = np.roll(np.flip(mat.reshape(*grid, *mat.shape[1:]), axis=(0, 1, 2)), 1, axis=(0, 1, 2))
+    return np.swapaxes(flipped, 3, 4).reshape(mat.shape)
+
+
+def test_symmetrize_time_reversal_averages_every_momentum_with_its_transposed_partner():
+    """symmetrize_time_reversal sets Sigma(k) to (Sigma(k) + Sigma(-k)^T) / 2 and returns the removed asymmetry."""
+    rng = np.random.default_rng(5)
+    grid = (4, 3, 2)
+    se = _se(
+        rng.standard_normal((24, 3, 3, 4)) + 1j * rng.standard_normal((24, 3, 3, 4)),
+        nk=grid,
+        has_compressed_q_dimension=True,
+    )
+    old = se.mat.copy()
+    expected = 0.5 * (old + _time_reversed(old, grid))
+    removed = se.symmetrize_time_reversal()
+    assert np.allclose(se.mat, expected, atol=1e-6)
+    assert np.allclose(se.mat, _time_reversed(se.mat, grid), atol=1e-6)
+    assert np.isclose(removed, np.abs(expected - old).max(), atol=1e-6)
+
+
+def test_symmetrize_time_reversal_is_bit_invariant_under_the_chunk_size(monkeypatch):
+    """The frequency-chunked averaging reproduces the single-pass result bit for bit."""
+    rng = np.random.default_rng(6)
+    mat = rng.standard_normal((16, 2, 2, 10)) + 1j * rng.standard_normal((16, 2, 2, 10))
+    single = _se(mat.copy(), nk=(4, 4, 1), has_compressed_q_dimension=True)
+    single.symmetrize_time_reversal()
+    monkeypatch.setattr(SelfEnergy, "_TR_CHUNK_BYTES", 1)
+    chunked = _se(mat.copy(), nk=(4, 4, 1), has_compressed_q_dimension=True)
+    chunked.symmetrize_time_reversal()
+    assert np.array_equal(chunked.mat, single.mat)
+
+
+def test_symmetrize_time_reversal_rejects_an_uncompressed_momentum_axis():
+    """symmetrize_time_reversal needs the compressed momentum axis."""
+    with pytest.raises(ValueError):
+        _se(mat_decompressed.copy(), nk=nk, has_compressed_q_dimension=False).symmetrize_time_reversal()

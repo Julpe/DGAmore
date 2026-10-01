@@ -196,6 +196,47 @@ def test_energies_use_injected_state_not_config(monkeypatch):
     assert np.isfinite(g.get_epot())
 
 
+def _make_complex_hopping_ek(nk: tuple) -> np.ndarray:
+    """Builds a two-site dispersion whose inter-site hopping ``0.3 + 0.7 e^{ik_x}`` is complex, with H(-k) = H(k)^*."""
+    kx = 2 * np.pi * np.arange(nk[0]) / nk[0]
+    ek = np.zeros((*nk, 2, 2), dtype=np.complex128)
+    ek[..., 0, 0] = -2 * np.cos(kx)[:, None, None]
+    ek[..., 1, 1] = 0.5
+    ek[..., 0, 1] = (0.3 + 0.7 * np.exp(1j * kx))[:, None, None]
+    ek[..., 1, 0] = np.conj(ek[..., 0, 1])
+    return ek
+
+
+def test_get_fill_nonlocal_is_the_fermi_dirac_density_of_a_complex_hopping_dispersion():
+    """Without a self-energy the k-resolved occupation is f(beta (H(k) - mu)) of the complex H(k), for any box."""
+    nk, niv, beta, mu = (4, 1, 1), 8, 5.0, 0.2
+    ek = _make_complex_hopping_ek(nk)
+    sig = SelfEnergy(np.zeros((int(np.prod(nk)), 2, 2, 2 * niv)), nk=nk, has_compressed_q_dimension=True, beta=beta)
+    _, _, occ_k = GreensFunction.get_g_full(sig, mu, ek, beta).get_fill_nonlocal()
+    eps, vecs = np.linalg.eigh(beta * (ek - mu * np.eye(2)))
+    exact = (vecs / (1 + np.exp(eps))[..., None, :]) @ np.conj(np.swapaxes(vecs, -1, -2))
+    assert np.allclose(occ_k, exact, atol=1e-5)
+
+
+def test_get_fill_nonlocal_keeps_the_real_arithmetic_for_a_real_dispersion():
+    """A real dispersion is occupied with the real-part arithmetic f(Re h) + Re(G - G_model), bit for bit."""
+    from dgamore.greens_function import _fermi_dirac_density
+
+    nk, nb, niv, beta, mu = (2, 2, 1), 2, 6, 5.0, 0.3
+    rng = np.random.default_rng(3)
+    ek = rng.standard_normal((*nk, nb, nb))
+    ek = 0.5 * (ek + ek.swapaxes(-1, -2)) + 0j
+    shape = (int(np.prod(nk)), nb, nb, 2 * niv)
+    sig_mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    sig = SelfEnergy(sig_mat, nk=nk, has_compressed_q_dimension=True, beta=beta)
+    g = GreensFunction.get_g_full(sig, mu, ek, beta)
+    _, _, occ_k = g.get_fill_nonlocal()
+    box = np.sum(g._get_gfull_mat().real - g._get_g_model_k_mat().real, axis=-1) / beta
+    ref = _fermi_dirac_density(ek.real + sig.smom[0][None, None, None] - mu * np.eye(nb), beta) + box
+    ref.real[np.abs(ref) < 1e-12] = 0.0
+    assert np.array_equal(occ_k, ref)
+
+
 def test_fermi_dirac_density_matches_diagonal_matmul_reference():
     """_fermi_dirac_density (column-scaling) equals the explicit V diag(f) V^-1 construction, bit-for-bit."""
     from dgamore.greens_function import _fermi_dirac_density
