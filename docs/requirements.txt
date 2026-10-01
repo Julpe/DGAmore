@@ -14,6 +14,6 @@ pandas~=2.2
 matplotlib~=3.10
 multimethod~=2.0
 ruamel.yaml~=0.19
-threadpoolctl~=3.6
+threadpoolctl~=3.7
 mini_pole==0.7
 kneed==0.8.6
