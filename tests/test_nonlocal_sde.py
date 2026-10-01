@@ -1554,15 +1554,47 @@ def _run_column_sde_parallel(size, kernel, giwk, chunk_bytes=None, hostnames=Non
     return res[0]
 
 
+def _time_reversed_qloop_sigma(kernel, giwk):
+    """Hand-rolled q-loop sigma over the full-BZ kernel, its w < 0 half read at -q by time reversal (conj, v -> -v)."""
+    k_grid, nk = config.lattice.k_grid, config.lattice.nk
+    niw, niv, o = config.box.niw_core, config.box.niv_core, config.sys.n_bands
+    full = FourPoint(kernel.copy(), SpinChannel.NONE, nk, 1, 1, False, True, True).map_to_full_bz(k_grid).mat
+    q_list = k_grid.get_q_list()
+    minus_q = np.ravel_multi_index(tuple((-q_list % np.array(nk)).T), nk)
+    kernel_w = np.concatenate((np.conj(full[minus_q][..., 1:, ::-1])[..., ::-1, :], full), axis=-2)
+    mat = np.zeros((*nk, o, o, niv), dtype=np.complex128)
+    for iq, q in enumerate(q_list):
+        g_shift = np.roll(giwk.mat, tuple(q), axis=(0, 1, 2))
+        for iw, w in enumerate(MFHelper.wn(niw)):
+            g = g_shift[..., giwk.niv - w : giwk.niv + niv - w]
+            mat += np.einsum("aijdv,xyzadv->xyzijv", kernel_w[iq, ..., iw, niv:], g)
+    mat *= -0.5 / config.sys.beta / k_grid.nk_tot
+    return SelfEnergy(mat, nk, False, beta=config.sys.beta).compress_q_dimension().to_full_niv_range()
+
+
+def test_has_time_reversal_accepts_real_hoppings_and_rejects_a_complex_one():
+    """Real hoppings obey eps(-k) = eps(k)^T up to hopping-file noise; a complex on-site hopping breaks it."""
+    kx = 2 * np.pi * np.arange(4) / 4
+    ek = np.zeros((4, 1, 1, 2, 2), dtype=np.complex128)
+    ek[..., 0, 0] = -2 * np.cos(kx)[:, None, None]
+    ek[..., 0, 1] = (0.3 + 0.7 * np.exp(1j * kx))[:, None, None]
+    ek[..., 1, 0] = np.conj(ek[..., 0, 1])
+    assert nonlocal_sde._has_time_reversal(ek)
+    ek[..., 0, 1] += 1e-6j
+    ek[..., 1, 0] -= 1e-6j
+    assert nonlocal_sde._has_time_reversal(ek)
+    ek[..., 0, 1] += 0.2j
+    ek[..., 1, 0] -= 0.2j
+    assert not nonlocal_sde._has_time_reversal(ek)
+
+
 @pytest.mark.parametrize("auto", [False, True])
 @pytest.mark.parametrize("size", [1, 3])
 def test_column_sde_matches_the_qloop_reference(auto, size, monkeypatch):
-    """The column-distributed contraction reproduces the q-loop sum over the kernel mapped to the full BZ."""
+    """The column-distributed contraction reproduces the q-loop sum, its w < 0 half read at -q by time reversal."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     kernel, giwk = _column_sde_setup(auto)
-    k_grid = config.lattice.k_grid
-    full_kernel = FourPoint(kernel.copy(), SpinChannel.NONE, config.lattice.nk, 1, 1, False, True, True)
-    ref = nonlocal_sde.calculate_sigma_from_kernel(full_kernel.map_to_full_bz(k_grid), giwk, k_grid.get_q_list())
+    ref = _time_reversed_qloop_sigma(kernel, giwk)
 
     mat = _run_column_sde_parallel(size, kernel, giwk, hostnames=["n0"] * size)
     sigma = SelfEnergy(mat, config.lattice.nk, False, True, calc_smom=False, beta=config.sys.beta)

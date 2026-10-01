@@ -742,16 +742,17 @@ def _run_column_sde(
 
     for :math:`\nu \geq 0` as a real-space product (convolution theorem), distributing the kernel's frequency columns
     over the ranks instead of its momenta. A column is one bosonic frequency :math:`\omega` of one fermionic frequency
-    :math:`\nu`; a negative :math:`\omega` is read from the stored positive one by time reversal,
-    :math:`K^{-\omega,\nu} = (K^{\omega,-\nu})^*`. The tasks - runs of
+    :math:`\nu`; a negative :math:`\omega` is read from the stored positive one by time reversal, which for real
+    hoppings is a plain conjugation in real space, :math:`K^{-\omega,\nu}(\mathbf{R}) = (K^{\omega,-\nu}(\mathbf{R}))^*`
+    (in momentum space it maps :math:`\mathbf{q} \to -\mathbf{q}`). The tasks - runs of
     :data:`~dgamore.memory_estimator.SDE_W_BLOCK` consecutive columns of one :math:`\nu` - are laid out by
     :func:`~dgamore.memory_estimator.column_sde_schedule`, and every rank:
 
     1. receives the irreducible-BZ rows of its tasks' columns in rounds of at most ``chunk_bytes``
        (:func:`~dgamore.mpi_utils.transpose_columns`),
-    2. expands each column to the full BZ with :meth:`FourPoint.map_to_full_bz` (a time-reversed column with the
-       conjugate orbital rotation), Fourier transforms it over the momentum axes in the order z, y, x and contracts
-       it with the frequency slab of ``g_r`` at :math:`\nu - \omega` in bounded real-space row chunks,
+    2. expands each column to the full BZ with :meth:`FourPoint.map_to_full_bz`, Fourier transforms it over the
+       momentum axes in the order z, y, x (a time-reversed column is conjugated afterwards) and contracts it with the
+       frequency slab of ``g_r`` at :math:`\nu - \omega` in bounded real-space row chunks,
     3. folds its tasks' partial sums of each :math:`\nu` in block order; the owner of :math:`\nu` (the rank holding
        its first block) folds the other ranks' sums in rank order, and rank 0 gathers the result.
 
@@ -817,9 +818,10 @@ def _run_column_sde(
                 for w in ws:
                     col = FourPoint(block[..., c : c + 1], SpinChannel.NONE, config.lattice.nk, 1, 0, False, True, True)
                     c += 1
+                    col = col.map_to_full_bz(k_grid).fft(copy=False, axes=(2, 1, 0))
+                    # time reversal of real hoppings conjugates at fixed R: K^{-w,v}(R) = conj(K^{w,-v}(R))
                     if negative:
-                        col = col.to_negative_niw_range()
-                    col = col.map_to_full_bz(k_grid, conjugate=negative).fft(copy=False, axes=(2, 1, 0))
+                        col = col.conj(copy=False)
                     g_slab = g_r[giwk_niv + (w if negative else -w) + v]
                     k_mat = col.mat[..., 0]
                     for r0 in range(0, n_r, rows):
@@ -1214,6 +1216,19 @@ def _assemble_occupation(
     return 2.0 * np.trace(occ).real, occ, occ_k
 
 
+def _has_time_reversal(ek: np.ndarray) -> bool:
+    r"""
+    Returns whether the dispersion obeys the time reversal of real hoppings,
+    :math:`\varepsilon_{12}(-\mathbf{k}) = \varepsilon_{21}(\mathbf{k})`, to 1e-4 of its largest element: above the
+    six-digit precision of wannier90 hopping files, below any physical complex hopping.
+
+    :param ek: The band dispersion ``[kx, ky, kz, o1, o2]``.
+    :return: Whether the relation holds.
+    """
+    flipped = np.roll(np.flip(ek, axis=(0, 1, 2)), 1, axis=(0, 1, 2))
+    return bool(np.allclose(flipped, np.swapaxes(ek, -1, -2), rtol=0.0, atol=1e-4 * np.abs(ek).max()))
+
+
 def calculate_sigma_proposal(
     sigma_in: SelfEnergy,
     mu: float,
@@ -1234,7 +1249,12 @@ def calculate_sigma_proposal(
     :math:`\mu`: Hartree/Fock, the Dyson Green's function, the bubble, the double-counting, density and magnetic
     kernels, and the FFT Schwinger-Dyson contraction, finished with the noise-removal term and the DMFT tail. The
     tail carries the momentum-dependent part of the Hartree-Fock term, i.e. the contribution of
-    :math:`V^{\mathbf{q}}`, which the impurity self-energy does not contain.
+    :math:`V^{\mathbf{q}}`, which the impurity self-energy does not contain. For several orbitals on a lattice with
+    real hoppings the proposal is finally averaged with its time-reversed partner (see
+    :meth:`~dgamore.self_energy.SelfEnergy.symmetrize_time_reversal`): the Schwinger-Dyson equation is one-sided,
+    with the three-leg vertex on the first external orbital and the interaction on the second, time reversal maps it
+    onto the mirrored form, and the average is the two-sided equation. One band needs no average, its one-sided
+    equation already obeys time reversal.
 
     Single source of truth for the proposal map: it is called once per self-consistency iteration by
     :func:`calculate_self_energy_q`. The local irreducible vertex is frozen, so every
@@ -1408,6 +1428,12 @@ def calculate_sigma_proposal(
     # calculated in this code and add the smooth dmft self-energy
     sigma_prop += delta_sigma
     sigma_prop = sigma_prop.concatenate_self_energies(sigma_dmft, shell_offset=hf_v)
+    # the one-sided SDE breaks Sigma(-k) = Sigma(k)^T for several orbitals; the average is the two-sided SDE
+    if sigma_prop.n_bands > 1 and _has_time_reversal(config.lattice.hamiltonian.get_ek()):
+        removed = sigma_prop.symmetrize_time_reversal()
+        logger.info(f"Time-reversal average of the self-energy proposal: largest change {removed:.3e}.")
+    elif sigma_prop.n_bands > 1:
+        logger.info("The dispersion breaks time reversal (complex hoppings); the self-energy proposal is not averaged.")
     return sigma_prop
 
 

@@ -2733,6 +2733,24 @@ def test_slice_constructor_is_bit_invariant_under_the_chunk_budget(setup, monkey
     assert np.array_equal(one_chunk.mat, per_w.mat)
 
 
+def test_pp_band_reads_the_negative_bosonic_half_by_hermiticity():
+    """The w < 0 pp band is -conj(F^{|w|}_{2341}(v', -v)), the same-momentum Hermitian partner of the ladder vertex."""
+    no, niv_pp, nq = 2, 2, 3
+    n2 = 2 * niv_pp
+    shape = (nq,) + (no,) * 4 + (n2, n2, n2)
+    rng = np.random.default_rng(8)
+    f = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    _, omega = es._pp_w0_band(niv_pp, n2 - 1)
+    out = np.zeros((nq,) + (no,) * 4 + (n2, n2), dtype=np.complex128)
+    es._write_pp_band(out, FourPoint(f.copy(), SpinChannel.DENS, (nq, 1, 1), 1, 2, False, True, True), niv_pp, omega, 0)
+    f_1432, f_2341 = np.einsum("qadcbwxy->qabcdwxy", f), np.einsum("qbcdawxy->qabcdwxy", f)
+    ref = np.empty_like(out)
+    for i, j in np.ndindex(n2, n2):
+        w = omega[i, j]
+        ref[..., i, j] = -f_1432[..., w, i, n2 - 1 - j] if w >= 0 else -np.conj(f_2341[..., -w, j, n2 - 1 - i])
+    assert np.allclose(out, ref, atol=1e-5)
+
+
 def test_streaming_fq_file_has_gather_layout_and_matches_pp_band(setup):
     """The streamed f_irrq file carries the historical layout and the w' = 0 band map at a spot-checked entry."""
     no = 2

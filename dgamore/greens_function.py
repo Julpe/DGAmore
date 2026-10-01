@@ -358,8 +358,11 @@ class GreensFunction(TwoPoint):
 
         mu_bands: np.ndarray = self._mu * np.eye(self.n_bands)[None, None, None, ...]
 
-        rho_k = _fermi_dirac_density(self._ek.real + smom0 - mu_bands, self._beta)
-        occ_k = rho_k + np.sum(mat.real - g_model.real, axis=-1) / self._beta
+        # a complex (Hermitian) dispersion keeps its imaginary part; a real one keeps the real-part arithmetic
+        ek = np.real_if_close(self._ek)
+        rho_k = _fermi_dirac_density(ek + smom0 - mu_bands, self._beta)
+        box = mat - g_model if np.iscomplexobj(ek) else mat.real - g_model.real
+        occ_k = rho_k + np.sum(box, axis=-1) / self._beta
         occ_k.real[np.abs(occ_k) < 1e-12] = 0.0
 
         occ_mean = np.mean(occ_k, axis=(0, 1, 2))

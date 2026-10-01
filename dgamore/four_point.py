@@ -397,18 +397,16 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         self.mat = np.einsum(permutation, self.mat, optimize=True)
         return self
 
-    def map_to_full_bz(self, grid: KGrid, nq: tuple = None, conjugate: bool = False):
+    def map_to_full_bz(self, k_grid: KGrid, nq: tuple = None):
         """
         Unfolds the object from the irreducible BZ to the full BZ using the grid's symmetry index map (see
         :meth:`IAmNonLocal._map_to_full_bz`), with four orbital dimensions.
 
-        :param grid: The :class:`KGrid` providing the irreducible-to-full BZ index mapping.
+        :param k_grid: The :class:`KGrid` providing the irreducible-to-full BZ index mapping.
         :param nq: Optional number of momenta per direction for the unfolded grid; defaults to the object's ``nq``.
-        :param conjugate: Whether the object holds the complex conjugate of the quantity the grid's orbital rotations
-            were discovered for; the rotation then runs with the conjugate unitaries.
         :return: ``self`` defined on the full BZ.
         """
-        return self._map_to_full_bz(grid, 4, nq, conjugate)
+        return self._map_to_full_bz(k_grid, 4, nq)
 
     def add(self, other, copy: bool = True) -> "FourPoint":
         """

@@ -255,6 +255,19 @@ class IHaveMat(ABC):
         self.mat *= factor
         return self
 
+    def conj(self, copy: bool = True):
+        """
+        Complex-conjugates the matrix. The in-place branch (``copy=False``) writes the conjugate into the existing
+        buffer and allocates nothing.
+
+        :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
+        :return: The conjugated object (``self`` when ``copy=False``).
+        """
+        if copy:
+            return self.copy().conj(copy=False)
+        np.conj(self.mat, out=self.mat)
+        return self
+
     def __getitem__(self, item):
         """
         Indexing shortcut: ``obj[item]`` is equivalent to ``obj.mat[item]``.
@@ -806,19 +819,17 @@ class IAmNonLocal(IHaveMat, ABC):
 
         return copy.compress_q_dimension() if compress else copy
 
-    def map_to_full_bz(self, k_grid: "KGrid", nq: tuple = None, conjugate: bool = False):
+    def map_to_full_bz(self, k_grid: "KGrid", nq: tuple = None):
         """
         Maps to full BZ using k_grid's inverse map and precomputed orbital rotation tensors.
 
         :param k_grid: The momentum grid carrying the irreducible-to-full-BZ map and per-k orbital rotations.
         :param nq: Optional override for the number of momenta; if None the object's own ``nq`` is used.
-        :param conjugate: Whether the object holds the complex conjugate of the quantity the grid's orbital rotations
-            were discovered for (see :meth:`_map_to_full_bz`).
         :return: ``self`` expanded to the full BZ (four orbital dimensions transformed).
         """
-        return self._map_to_full_bz(k_grid, 4, nq, conjugate)
+        return self._map_to_full_bz(k_grid, 4, nq)
 
-    def _map_to_full_bz(self, k_grid: "KGrid", num_orbital_dimensions: int, nq: tuple = None, conjugate: bool = False):
+    def _map_to_full_bz(self, k_grid: "KGrid", num_orbital_dimensions: int, nq: tuple = None):
         r"""
         Maps the object from the irreducible to the full Brillouin zone.
 
@@ -841,9 +852,6 @@ class IAmNonLocal(IHaveMat, ABC):
         :param k_grid: The momentum grid carrying the irreducible-to-full-BZ map and per-k orbital rotations.
         :param num_orbital_dimensions: Number of orbital axes to transform; must be 2 or 4.
         :param nq: Optional override for the number of momenta; if None the object's own ``nq`` is used.
-        :param conjugate: If True, the object holds the complex conjugate of the quantity the rotations were
-            discovered for (e.g. a time-reversed kernel), so the rotation runs with the conjugate unitaries
-            :math:`U^*`; this equals conjugating the mapped un-conjugated object.
         :return: ``self`` expanded to the full BZ.
         :raises ValueError: If the object does not have a compressed momentum dimension.
         """
@@ -871,7 +879,7 @@ class IAmNonLocal(IHaveMat, ABC):
             us = k_grid._auto_us.reshape(np.prod(k_grid.nk), *k_grid._auto_us.shape[3:])
             self.mat = symmetry_reduction.apply_auto_orbital_transform(
                 self.mat,
-                us=us.conj() if conjugate else us,
+                us=us,
                 sigmas=k_grid._auto_sigmas.reshape(-1),
                 conjs=k_grid._auto_conjs.reshape(-1),
                 num_orbital_dimensions=num_orbital_dimensions,
