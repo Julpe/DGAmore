@@ -9,7 +9,7 @@ pytest~=9.1
 setuptools~=84.0
 ruamel.yaml~=0.19
 psutil~=7.2
-threadpoolctl~=3.6
+threadpoolctl~=3.7
 # Exact pins: research codes whose updates are not tracked by DGAmore.
 mini_pole==0.7
 kneed==0.8.6
