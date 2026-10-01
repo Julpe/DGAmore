@@ -1060,6 +1060,51 @@ def test_invert_and_sum_v2_elimination_factorizes_only_the_pairs_with_vertex(rng
     assert sizes and set(sizes) == {(8 * 6, 8 * 6)}
 
 
+def _dense_solve_reference(fp: FourPoint, rhs: np.ndarray) -> np.ndarray:
+    """Dense solve of every half-range compound slice for the one-fermion right-hand sides ``rhs``."""
+    half = deepcopy(fp).to_half_niw_range().compress_q_dimension()
+    o, vn = half.n_bands, 2 * half.niv
+    n = o * o * vn
+    out = np.empty_like(rhs)
+    for i in range(half.current_shape[0]):
+        for w in range(half.current_shape[-3]):
+            compound = half.mat[i][:, :, :, :, w].transpose(0, 1, 4, 3, 2, 5).reshape(n, n)
+            b = rhs[i][:, :, :, :, w].transpose(0, 1, 4, 3, 2).reshape(n, o * o)
+            out[i][:, :, :, :, w] = np.linalg.solve(compound, b).reshape(o, o, vn, o, o).transpose(0, 1, 4, 3, 2)
+    return out
+
+
+def _one_fermion_rhs(fp: FourPoint, rng) -> FourPoint:
+    """A random right-hand side in the layout of the one-fermion result of ``fp``'s half-range slices."""
+    half = deepcopy(fp).to_half_niw_range()
+    shape = half.current_shape[:-1]
+    return FourPoint(
+        rng.standard_normal(shape) + 1j * rng.standard_normal(shape),
+        nq=half.nq,
+        num_vn_dimensions=1,
+        has_compressed_q_dimension=True,
+        full_niw_range=False,
+    )
+
+
+@pytest.mark.parametrize("eliminated", [False, True])
+def test_invert_and_sum_v2_solves_every_right_hand_side_of_a_list(rng, monkeypatch, eliminated):
+    """With a list of rhs the per-slice solve returns each compound solution, without 1/beta, one factorization each."""
+    monkeypatch.setattr(npb, "DTYPE", np.complex128)
+    if eliminated:
+        fp, inactive = _two_atom_compound_fourpoint(rng, symmetric=False)
+    else:
+        fp, inactive = _random_compound_fourpoint(rng, 2, symmetric=False), None
+    rhs = [_one_fermion_rhs(fp, rng) for _ in range(3)]
+    factor = MagicMock(side_effect=sp.linalg.lu_factor)
+    monkeypatch.setattr(sp.linalg, "lu_factor", factor)
+    solved = deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0, inactive, rhs=rhs)
+    half = deepcopy(fp).to_half_niw_range()
+    assert len(solved) == 3 and factor.call_count == half.current_shape[0] * half.current_shape[-3]
+    for out, b in zip(solved, rhs):
+        assert out.num_vn_dimensions == 1 and np.allclose(out.mat, _dense_solve_reference(fp, b.mat), atol=1e-10)
+
+
 def test_invert_and_sum_v2_with_no_or_every_pair_inactive_takes_the_full_solve(rng):
     """An empty or a complete inactive set leaves the whole-slice solve in place, bit for bit."""
     fp = _random_compound_fourpoint(rng, 2, symmetric=False)

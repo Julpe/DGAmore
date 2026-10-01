@@ -203,12 +203,13 @@ def test_giwk_shareable_is_every_array_of_each_sde_section_baseline():
 
 
 def test_mixing_history_sits_in_the_rank0_slot_of_every_proposal_branch():
-    """Each of rank 0's mixing pairs adds two core-box Sigma copies to the single slot of every proposal branch."""
+    """Each mixing pair adds two core-box Sigma copies to every proposal branch's single slot, none after the loop."""
     pairs = 2 * BASE["nk_tot"] * BASE["n_bands"] ** 2 * 2 * BASE["niv_core"]
-    linear, anderson = _peaks(), _peaks(mixing_pairs=4)
+    linear, anderson = _peaks(niv_interp=40), _peaks(mixing_pairs=4, niv_interp=40)
     for key in ("chi0q", "chiq_aux", "sde"):
         assert anderson[key].off_single - linear[key].off_single == pytest.approx(SCALE * 4 * pairs)
         assert anderson[key].off_distributed == linear[key].off_distributed
+    assert anderson["sigma_interp"].off_single == linear["sigma_interp"].off_single
 
 
 def test_eliashberg_branches_are_not_giwk_shareable():
@@ -579,3 +580,102 @@ def test_dynamic_chunk_budget_scales_floors_and_caps():
     assert floor < mid < cap
     assert dynamic_chunk_budget(total_bytes=4000 * 2**30, node_ranks=2) == cap
     assert dynamic_chunk_budget(total_bytes=600 * 2**30, node_ranks=48) == 2 * mid
+
+
+def test_jacobian_tracker_residents_join_the_history_and_its_transient_the_mixing_step():
+    """The tracker's residents join every single-rank slot, its pair and secant transient only the sigma_loop slot."""
+    from dgamore.jacobian_stabilization import TRACKER_PAIRS
+    from dgamore.memory_estimator import _giwk_rspace, jacobian_tracker_bytes
+
+    kw = dict(overhead=1.0, niv_interp=2 * BASE["niv_core"])
+    core = DTYPE_BYTES * BASE["nk_tot"] * BASE["n_bands"] ** 2 * (2 * BASE["niv_core"])
+    sector = BASE["nk_irr"] * BASE["n_bands"] ** 2 * (2 * BASE["niv_core"])
+    ritz = 3 * np.dtype(np.complex128).itemsize * (TRACKER_PAIRS - 1)
+    resident = (2 * TRACKER_PAIRS * 8 + ritz + 4 * 8 * (TRACKER_PAIRS - 1)) * sector
+    transient = 9 * np.dtype(np.float64).itemsize * sector * (TRACKER_PAIRS - 1)
+    assert jacobian_tracker_bytes(BASE["nk_irr"], BASE["n_bands"], 2 * BASE["niv_core"]) == (resident, transient)
+    sigma_full = DTYPE_BYTES * _giwk_rspace(BASE["nk_tot"], BASE["n_bands"], 2 * BASE["niv_cut"])
+    for pairs, step in ((0, 3), (4, 1)):
+        off = _peaks(**kw, mixing_pairs=pairs)
+        on = _peaks(**kw, mixing_pairs=pairs, with_jacobian_tracker=True)
+        for key in ("chi0q", "chiq_aux", "sde", "sigma_interp"):
+            assert on[key].off_single == pytest.approx(off[key].off_single + resident), key
+            assert on[key].on_single == pytest.approx(off[key].on_single + resident), key
+            assert on[key].off_distributed == pytest.approx(off[key].off_distributed), key
+        history = 2 * pairs * core
+        off_step = off["sigma_loop"].off_single - history - 2 * sigma_full
+        expected = history + resident + step * core + 2 * sigma_full + max(off_step, transient)
+        assert on["sigma_loop"].off_single == pytest.approx(expected)
+
+
+def test_exact_jacobian_branch_is_present_only_with_the_flag_and_leaves_the_other_branches_alone():
+    """The converged-point Jacobian adds its own branch, only when it is enabled, and changes no other branch."""
+    off, on = _peaks(), _peaks(with_exact_jacobian=True)
+    assert "exact_jacobian" not in off and set(on) == set(off) | {"exact_jacobian"}
+    assert all(on[key] == off[key] for key in off)
+
+
+def test_exact_jacobian_branch_grows_with_its_block_width_and_leaves_the_other_branches_alone():
+    """A wider block of exact products raises the exact branch's per-rank peak and no other branch."""
+    from dgamore.memory_estimator import ChunkBudgets
+
+    narrow = _peaks(with_exact_jacobian=True, chunk_budgets=ChunkBudgets(exact_block=1))
+    wide = _peaks(with_exact_jacobian=True, chunk_budgets=ChunkBudgets(exact_block=4))
+    assert wide["exact_jacobian"].off_distributed > narrow["exact_jacobian"].off_distributed
+    assert all(wide[key] == narrow[key] for key in narrow if key != "exact_jacobian")
+
+
+def test_exact_jacobian_branch_counts_its_node_windows_and_rank_0s_check_exactly():
+    """Node: loop Sigma, G, dG, G_R, three vertices, the block, bubble windows; rank 0: proposal, pair, Arnoldi."""
+    from dgamore.memory_estimator import EXACT_CHECK_BASIS, EXACT_JACOBIAN_MODES, EXACT_JACOBIAN_NCV
+
+    bp = _peaks(with_exact_jacobian=True, overhead=1.0)["exact_jacobian"]
+    nk, niv, niw, nivf, cut = BASE["nk_tot"], BASE["niv_core"], BASE["niw_core"], BASE["niv_full"], BASE["niv_cut"]
+    sigma_full, sigma_core, sector = nk * 2 * cut, nk * 2 * niv, 2 * BASE["nk_irr"] * niv
+    vertices = (niw + 1) * 2 * nivf * 2 * niv + 2 * (niw + 1) * (2 * niv) ** 2
+    windows = DTYPE_BYTES * (3 * sigma_full + nk * 2 * (niv + niw) + vertices) + 8 * EXACT_CHECK_BASIS * sector
+    bubble_windows = DTYPE_BYTES * 2 * nk * 2 * (nivf + niw)
+    assert bp.giwk_shareable == pytest.approx(windows + bubble_windows)
+    assert bp.baseline == pytest.approx(windows + bubble_windows + _rank_base(BASE))
+    arpack = (8 * (EXACT_JACOBIAN_NCV + 1) + 16 * 4 * EXACT_JACOBIAN_MODES) * sector
+    check = 8 * 13 * EXACT_CHECK_BASIS * sector
+    assert bp.off_single == pytest.approx(DTYPE_BYTES * (sigma_full + 6 * sigma_core) + max(arpack, check))
+
+
+def test_exact_jacobian_branch_holds_one_local_vertex_when_they_load_per_phase():
+    """Vertices loaded per phase leave the larger one on the node instead of all three, and change nothing else."""
+    from dgamore.memory_estimator import ChunkBudgets
+
+    held = _peaks(with_exact_jacobian=True)["exact_jacobian"]
+    per_phase = _peaks(with_exact_jacobian=True, chunk_budgets=ChunkBudgets(exact_vertices_per_phase=True))
+    per_phase = per_phase["exact_jacobian"]
+    wp, vc, vf = BASE["niw_core"] + 1, 2 * BASE["niv_core"], 2 * BASE["niv_full"]
+    f_dc, gamma = wp * vf * vc, wp * vc * vc
+    assert f_dc > gamma and held.giwk_shareable - per_phase.giwk_shareable == pytest.approx(DTYPE_BYTES * 2 * gamma)
+    assert held.baseline - per_phase.baseline == pytest.approx(held.giwk_shareable - per_phase.giwk_shareable)
+    assert (per_phase.off_distributed, per_phase.off_single) == (held.off_distributed, held.off_single)
+
+
+def test_exact_jacobian_branch_is_sized_by_its_own_budget_and_not_the_loops():
+    """The exact products' transients follow ChunkBudgets.exact, not the loop's chiq_aux and sde budgets."""
+    from dgamore.memory_estimator import ChunkBudgets
+
+    def exact(**budgets):
+        return _peaks(with_exact_jacobian=True, chunk_budgets=ChunkBudgets(**budgets))["exact_jacobian"].off_distributed
+
+    small = exact(exact=0)
+    assert exact(exact=MAX_CHUNK_BUDGET_BYTES) > small
+    assert exact(exact=0, chiq_aux=MAX_CHUNK_BUDGET_BYTES, sde=MAX_CHUNK_BUDGET_BYTES) == small
+
+
+def test_exact_jacobian_branch_grows_with_the_box_and_holds_the_eigenvectors_on_rank_0():
+    """The branch grows with the momentum grid and the core box; rank 0 holds the Arnoldi basis and the eigenvectors."""
+    from dgamore.memory_estimator import EXACT_CHECK_BASIS
+
+    small = _peaks(with_exact_jacobian=True)["exact_jacobian"]
+    for bigger in (dict(nk_tot=2 * BASE["nk_tot"], nk_irr=2 * BASE["nk_irr"]), dict(niv_core=BASE["niv_core"] + 5)):
+        big = _peaks(with_exact_jacobian=True, **bigger)["exact_jacobian"]
+        assert _off_node_total(big, 4) > _off_node_total(small, 4), bigger
+    sector = 2 * BASE["nk_irr"] * BASE["n_bands"] ** 2 * BASE["niv_core"]
+    arnoldi = np.dtype(np.float64).itemsize * 13 * EXACT_CHECK_BASIS * sector
+    assert small.off_single > arnoldi and small.giwk_shareable < small.baseline

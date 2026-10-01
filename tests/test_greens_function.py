@@ -221,6 +221,7 @@ def test_get_fill_nonlocal_is_the_fermi_dirac_density_of_a_complex_hopping_dispe
 def test_get_fill_nonlocal_keeps_the_real_arithmetic_for_a_real_dispersion():
     """A real dispersion is occupied with the real-part arithmetic f(Re h) + Re(G - G_model), bit for bit."""
     from dgamore.greens_function import _fermi_dirac_density
+    from dgamore.matsubara_frequencies import MFHelper
 
     nk, nb, niv, beta, mu = (2, 2, 1), 2, 6, 5.0, 0.3
     rng = np.random.default_rng(3)
@@ -229,10 +230,18 @@ def test_get_fill_nonlocal_keeps_the_real_arithmetic_for_a_real_dispersion():
     shape = (int(np.prod(nk)), nb, nb, 2 * niv)
     sig_mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
     sig = SelfEnergy(sig_mat, nk=nk, has_compressed_q_dimension=True, beta=beta)
-    g = GreensFunction.get_g_full(sig, mu, ek, beta)
-    _, _, occ_k = g.get_fill_nonlocal()
-    box = np.sum(g._get_gfull_mat().real - g._get_g_model_k_mat().real, axis=-1) / beta
-    ref = _fermi_dirac_density(ek.real + sig.smom[0][None, None, None] - mu * np.eye(nb), beta) + box
+    _, _, occ_k = GreensFunction.get_g_full(sig, mu, ek, beta).get_fill_nonlocal()
+
+    # the box sums of get_fill_nonlocal_from_sigma in one chunk, the model one in the eigenbasis of eps_k + Sigma_inf
+    eye, iv, smom0 = np.eye(nb), 1j * MFHelper.vn(niv, beta), sig.smom[0]
+    ek_rows = ek.reshape(-1, nb, nb)
+    dyson = (iv[None, None, :] * eye[..., None])[None] + ((mu * eye)[None, :, :, None] - ek_rows[..., None])
+    dyson -= sig.decompress_q_dimension().mat.reshape(shape)
+    box = np.sum(GreensFunction._invert_last_orbital_block(dyson).real, axis=-1)
+    lam, u = np.linalg.eig(ek_rows + smom0)
+    model = (1.0 / (iv[None, None, :] + mu - lam[..., None])).sum(axis=-1)
+    box -= ((u * model[:, None, :]) @ np.linalg.inv(u)).real
+    ref = _fermi_dirac_density(ek.real + smom0 - mu * eye, beta) + box.reshape(*nk, nb, nb) / beta
     ref.real[np.abs(ref) < 1e-12] = 0.0
     assert np.array_equal(occ_k, ref)
 
@@ -389,3 +398,134 @@ def test_model_epot_chunked_matches_unchunked_reference(monkeypatch):
 
     monkeypatch.setattr(gf_module, "_MODEL_EPOT_CHUNK_ELEMENTS", 50)
     assert np.allclose(g._model_epot(smom0, smom1, 37, beta), ref, atol=1e-10)
+
+
+def _dense_inputs(nk=(4, 4, 1), nbands=2, niv=256, beta=10.0, mu=0.3, seed=0):
+    """Random hermitian dispersion and a decaying self-energy on a k-grid large enough to make memory peaks visible."""
+    rng = np.random.default_rng(seed)
+    nk_tot = int(np.prod(nk))
+    ek = rng.standard_normal((*nk, nbands, nbands))
+    ek = ek + ek.swapaxes(-1, -2)
+    iv = 1j * (2 * np.arange(-niv, niv) + 1) * np.pi / beta
+    tail = 0.5 / iv
+    sig_mat = 0.1 * rng.standard_normal((nk_tot, nbands, nbands, 2 * niv)) + 0.2 + tail[None, None, None, :]
+    sig = SelfEnergy(sig_mat.astype(np.complex128), nk=nk, has_compressed_q_dimension=True, beta=beta)
+    return nk, ek, sig, beta, mu
+
+
+def _reference_fill_nonlocal(sig, mu, ek, beta):
+    """Brute-force k-resolved occupation: full [k, o, o, v] G and model G, summed over the whole frequency box."""
+    from dgamore.greens_function import _fermi_dirac_density
+    from dgamore.matsubara_frequencies import MFHelper
+
+    nb, niv = sig.n_bands, sig.niv
+    iv = 1j * MFHelper.vn(niv, beta)
+    eye = np.eye(nb)
+    iv_bands = (iv[None, None, :] * eye[..., None])[None, None, None]
+    mu_bands = (mu * eye)[None, None, None, :, :, None]
+    smom0 = sig.smom[0]
+    sig_mat = sig.copy().decompress_q_dimension().mat
+    g = np.linalg.inv(np.moveaxis(iv_bands + mu_bands - ek[..., None] - sig_mat, -1, -3))
+    g_model = np.linalg.inv(
+        np.moveaxis(iv_bands + mu_bands - ek[..., None] - smom0[None, None, None, :, :, None], -1, -3)
+    )
+    g, g_model = np.moveaxis(g, -3, -1), np.moveaxis(g_model, -3, -1)
+    rho_k = _fermi_dirac_density(ek.real + smom0[None, None, None] - mu * eye[None, None, None], beta)
+    occ_k = rho_k + np.sum(g.real - g_model.real, axis=-1) / beta
+    occ = np.mean(occ_k, axis=(0, 1, 2))
+    return 2.0 * np.trace(occ).real, occ, occ_k
+
+
+def _peak_allocation(fn):
+    """Peak bytes allocated (as seen by tracemalloc) while running ``fn``; returns (result, peak)."""
+    import tracemalloc
+
+    tracemalloc.start()
+    tracemalloc.reset_peak()
+    try:
+        result = fn()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return result, peak
+
+
+def test_get_fill_nonlocal_matches_brute_force_reference():
+    """The (chunked) k-resolved filling equals the single-pass full-box reference."""
+    nk, ek, sig, beta, mu = _dense_inputs()
+    n_ref, occ_ref, occ_k_ref = _reference_fill_nonlocal(sig, mu, ek, beta)
+
+    n, occ, occ_k = GreensFunction.get_g_full(sig, mu, ek, beta).get_fill_nonlocal()
+
+    assert np.isclose(n, n_ref, rtol=0, atol=1e-12)
+    assert np.allclose(occ, occ_ref, rtol=0, atol=1e-12)
+    assert np.allclose(occ_k, occ_k_ref, rtol=0, atol=1e-12)
+
+
+def test_get_fill_nonlocal_stays_within_a_momentum_chunk(monkeypatch):
+    """get_fill_nonlocal builds no full-box [k, o, o, v] Dyson or model array: the chunked peak stays below one."""
+    from dgamore import greens_function
+
+    nk, ek, sig, beta, mu = _dense_inputs()
+    g = GreensFunction.get_g_full(sig, mu, ek, beta)
+    full_box_bytes = g.nq_tot * g.n_bands**2 * 2 * g.niv * 16
+    monkeypatch.setattr(greens_function, "_MODEL_EPOT_CHUNK_ELEMENTS", g.nq_tot * g.n_bands**2 * (2 * g.niv // 16))
+
+    _, peak = _peak_allocation(g.get_fill_nonlocal)
+
+    assert peak < 0.5 * full_box_bytes, f"peak {peak} B vs full box {full_box_bytes} B"
+
+
+def test_get_fill_nonlocal_from_sigma_matches_full_greens_function(monkeypatch):
+    """The sigma-only entry point reports what building G^k first reports, without ever holding G^k."""
+    from dgamore import greens_function
+
+    nk, ek, sig, beta, mu = _dense_inputs()
+    g = GreensFunction.get_g_full(sig, mu, ek, beta)
+    n_ref, occ_ref, occ_k_ref = g.get_fill_nonlocal()
+    full_box_bytes = g.nq_tot * g.n_bands**2 * 2 * g.niv * 16
+    monkeypatch.setattr(greens_function, "_MODEL_EPOT_CHUNK_ELEMENTS", g.nq_tot * g.n_bands**2 * (2 * g.niv // 16))
+
+    (n, occ, occ_k), peak = _peak_allocation(lambda: GreensFunction.get_fill_nonlocal_from_sigma(sig, mu, ek, beta))
+
+    # the two calls differ only in chunking (summation order), i.e. at rounding level
+    assert np.isclose(n, n_ref, rtol=0, atol=1e-13)
+    assert np.allclose(occ, occ_ref, rtol=0, atol=1e-13)
+    assert np.allclose(occ_k, occ_k_ref, rtol=0, atol=1e-13)
+    assert peak < 0.5 * full_box_bytes, f"peak {peak} B vs full box {full_box_bytes} B"
+
+
+def test_get_fill_nonlocal_local_sigma_broadcasts_over_k():
+    """A momentum-local self-energy ([1, 1, 1, o, o, v]) yields the same k-resolved occupation as its tiled copy."""
+    nk, ek, sig, beta, mu = _dense_inputs()
+    local_mat = sig.mat[:1]
+    sig_local = SelfEnergy(local_mat.copy(), nk=(1, 1, 1), has_compressed_q_dimension=True, beta=beta)
+    tiled = np.broadcast_to(local_mat, (int(np.prod(nk)), *local_mat.shape[1:])).copy()
+    sig_tiled = SelfEnergy(tiled, nk=nk, has_compressed_q_dimension=True, beta=beta)
+
+    n_loc, occ_loc, occ_k_loc = GreensFunction.get_fill_nonlocal_from_sigma(sig_local, mu, ek, beta)
+    n_til, occ_til, occ_k_til = GreensFunction.get_fill_nonlocal_from_sigma(sig_tiled, mu, ek, beta)
+
+    assert occ_k_loc.shape == (*nk, sig.n_bands, sig.n_bands)
+    assert np.allclose(occ_k_loc, occ_k_til, rtol=0, atol=1e-13)
+    assert np.isclose(n_loc, n_til, rtol=0, atol=1e-13)
+
+
+def test_get_fill_nonlocal_from_sigma_is_chunk_schedule_independent(monkeypatch):
+    """occ_k is bit-identical across chunk budgets, and a momentum slice reports the full grid's rows."""
+    from dgamore import greens_function
+
+    nk, ek, sig, beta, mu = _dense_inputs(nk=(4, 2, 1), nbands=2, niv=8)
+    nb, nk_tot = sig.n_bands, int(np.prod(nk))
+    sig_local = SelfEnergy(sig.mat[:1].copy(), nk=(1, 1, 1), has_compressed_q_dimension=True, beta=beta)
+    ek_flat = ek.reshape(nk_tot, 1, 1, nb, nb)
+    monkeypatch.setattr(greens_function, "_MODEL_EPOT_CHUNK_ELEMENTS", 3 * nb**2 * 2 * sig.niv)
+
+    occ_k = GreensFunction.get_fill_nonlocal_from_sigma(sig_local, mu, ek, beta)[2]
+    occ_k_slice = GreensFunction.get_fill_nonlocal_from_sigma(sig_local, mu, ek_flat[2:7], beta)[2]
+    monkeypatch.setattr(greens_function, "_MODEL_EPOT_CHUNK_ELEMENTS", 2**24)
+    occ_k_one_chunk = GreensFunction.get_fill_nonlocal_from_sigma(sig_local, mu, ek, beta)[2]
+
+    # the budget splits the eight momenta into three chunks and the five-momentum slice into two
+    assert np.array_equal(occ_k_slice.reshape(5, nb, nb), occ_k.reshape(nk_tot, nb, nb)[2:7])
+    assert np.array_equal(occ_k, occ_k_one_chunk)
