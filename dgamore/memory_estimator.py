@@ -37,6 +37,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from dgamore.jacobian_stabilization import TRACKER_PAIRS
+
 from dgamore.n_point_base import DTYPE
 
 # Bytes per stored element (from the global DTYPE, so it tracks a switch to e.g. complex128).
@@ -73,6 +75,15 @@ ARPACK_EXTRA_VECTORS: int = 3
 # Smallest Lanczos basis handed to the eigensolver (scipy's own floor is 20): ncv = max(2 n_eig + 1, this floor).
 LANCZOS_NCV_FLOOR: int = 12
 
+# Eigenpairs the converged-point exact Jacobian asks ARPACK for per target (largest real part, largest modulus) and
+# its Arnoldi basis size (>= 2 * EXACT_JACOBIAN_MODES + 1; wide, so clustered stable modes converge within the cap)
+EXACT_JACOBIAN_MODES: int = 6
+EXACT_JACOBIAN_NCV: int = 40
+# Basis vectors, i.e. products, of one in-loop exact check (sigma_jacobian.certify_subspace)
+EXACT_CHECK_BASIS: int = 10
+# Widest block of exact-Jacobian products sharing one Bethe-Salpeter factorization pass (ExactJacobian.matvec_block)
+EXACT_JACOBIAN_BLOCK: int = 4
+
 # Gap-sized scratch windows of one team matvec (the gap, its dressed transform, the direct and the crossed term).
 TEAM_SCRATCH_VECTORS: int = 4
 
@@ -102,19 +113,29 @@ MAX_CHUNK_BUDGET_BYTES: int = 2**40
 class ChunkBudgets:
     """
     Per-rank chunk byte budgets of the three chunked builds, sized by the driver from the estimate (see
-    :func:`max_chunk_budget`) and consumed both by :func:`estimate_peaks` and by the builds themselves.
-    Every field defaults to the :data:`SLICE_CHUNK_BYTES` floor.
+    :func:`max_chunk_budget`) and consumed both by :func:`estimate_peaks` and by the builds themselves, and the
+    block width of the exact Jacobian's products, sized by the driver the same way. Every byte budget defaults to the
+    :data:`SLICE_CHUNK_BYTES` floor, the block width to one column.
 
     :ivar chiq_aux: Budget of the auxiliary-susceptibility sum
         (:func:`dgamore.nonlocal_sde.create_auxiliary_chi_r_q_sum`).
     :ivar sde: Budget of one round of transposed irreducible kernel columns of the self-energy contraction
         (:func:`dgamore.nonlocal_sde._run_column_sde`).
     :ivar fq: Budget of the pairing-vertex build (:func:`dgamore.eliashberg_solver._build_pairing_vertex_pp`).
+    :ivar exact: Budget of both chunked builds inside the exact Jacobian's products, its Bethe-Salpeter solves and its
+        self-energy contraction (:class:`dgamore.sigma_jacobian.ExactJacobian`).
+    :ivar exact_block: Columns one block product of the exact Jacobian takes at once
+        (:meth:`dgamore.sigma_jacobian.ExactJacobian.matvec_block`), at most :data:`EXACT_JACOBIAN_BLOCK`.
+    :ivar exact_vertices_per_phase: Whether the exact Jacobian loads each local vertex for the phase that reads it
+        instead of holding all three between products (set by the driver when they do not fit together).
     """
 
     chiq_aux: int = SLICE_CHUNK_BYTES
     sde: int = SLICE_CHUNK_BYTES
     fq: int = SLICE_CHUNK_BYTES
+    exact: int = SLICE_CHUNK_BYTES
+    exact_block: int = 1
+    exact_vertices_per_phase: bool = False
 
 
 def dynamic_chunk_budget(total_bytes: float, node_ranks: int) -> int:
@@ -464,6 +485,41 @@ def _giwk_rspace(nk_tot: int, nb: int, nv: int) -> int:
     return nk_tot * nb**2 * nv
 
 
+def jacobian_tracker_bytes(nk_irr: int, nb: int, nv: int) -> tuple[int, int]:
+    """
+    Bytes the rank-0 Jacobian tracker holds, split into what stays resident through the whole loop and the transient of
+    one update. The tracker keeps every vector on the weighted symmetry sector of the core window
+    (:func:`~dgamore.sigma_jacobian.tracker_sector_maps`), ``n_real = nk_irr * nb^2 * nv`` real entries: the irreducible
+    momenta and the positive half of the ``nv`` core frequencies. Resident, between updates: the recorded window of
+    ``TRACKER_PAIRS`` (iterate, raw proposal) float64 pairs, the complex Ritz vectors of up to three sets
+    (``TRACKER_PAIRS - 1`` columns each: the snapshot kept for the spectrum file, a newer uncertified estimate, and the
+    predecessor's columns a carried run keeps until its spectrum is saved, which also serve as its carried set while
+    that is installed or pending) and the four tall float64 arrays of the reflector's basis and dual rows and the map's
+    span and dual rows (each ``[n_real, k]`` or its transpose with ``k <= TRACKER_PAIRS - 1``). Transient, in the update
+    before the mixing step: the secant step's nine ``[n_real, TRACKER_PAIRS - 1]`` float64 arrays (the two increment
+    stacks, the tall QR factor together with the copies its factorization and the triangular solve make, the kept basis
+    and its image, and the complex Ritz vectors built from them, a real-to-complex promotion of the basis included;
+    measured 6.4 of them). The reflector and the map are rebuilt after that step, while the old four tall arrays are
+    still alive, but below its peak. A window is read at its irreducible momenta only; the reflection and the
+    per-direction step unfold one correction to the whole core window, a transient of about two core windows in the
+    storage precision (measured 2.1 to 2.3) that the copies of the ``niv_cut`` window counted for the mixing step cover.
+
+    :param nk_irr: Number of irreducible momentum points.
+    :param nb: Number of bands.
+    :param nv: Number of fermionic frequencies of the core window (single axis length).
+    :return: The tuple ``(resident, transient)`` in bytes.
+    """
+    n_real = nk_irr * nb**2 * nv
+    window = 2 * TRACKER_PAIRS * np.dtype(np.float64).itemsize * n_real
+    # three resident Ritz sets: the snapshot kept for the spectrum file, a newer uncertified estimate and the
+    # predecessor's re-gridded columns a carried run keeps until its own spectrum is saved
+    ritz_vectors = 3 * np.dtype(np.complex128).itemsize * n_real * (TRACKER_PAIRS - 1)
+    # the reflector's basis and dual rows and the map's span and dual rows, kept between updates
+    tall = 4 * np.dtype(np.float64).itemsize * n_real * (TRACKER_PAIRS - 1)
+    transient = 9 * np.dtype(np.float64).itemsize * n_real * (TRACKER_PAIRS - 1)
+    return window + ritz_vectors + tall, transient
+
+
 def estimate_peaks(
     *,
     n_bands: int,
@@ -482,6 +538,8 @@ def estimate_peaks(
     n_eig: int = 1,
     mixing_pairs: int = 0,
     niv_interp: int = 0,
+    with_jacobian_tracker: bool = False,
+    with_exact_jacobian: bool = False,
     overhead: float = OVERHEAD_FACTOR,
     chunk_budgets: ChunkBudgets = ChunkBudgets(),
 ) -> dict[str, BranchPeak]:
@@ -492,9 +550,10 @@ def estimate_peaks(
 
     The returned dict maps a branch key to a :class:`BranchPeak`. Every branch is single-path with identical off
     and on slots, except ``"lanczos"``, which carries the in-memory solve in its off slots and the block-distributed
-    grid fallback in its on slots. ``"fq"`` and ``"lanczos"`` are present only when ``with_eliashberg`` is True. For a node with ``r`` ranks the memory at a branch's peak is
-    ``r * (baseline + distributed) + single``, minus ``(r - 1) * giwk_shareable`` when the node-shared giwk window is
-    active (the driver assembles this; see :func:`dgamore.DGAmore.autodetect_memory_settings`).
+    grid fallback in its on slots. ``"fq"`` and ``"lanczos"`` are present only when ``with_eliashberg`` is True,
+    ``"exact_jacobian"`` only when ``with_exact_jacobian`` is. For a node with ``r`` ranks the memory at a branch's
+    peak is ``r * (baseline + distributed) + single``, minus ``(r - 1) * giwk_shareable`` when the node-shared giwk
+    window is active (the driver assembles this; see :func:`dgamore.DGAmore.autodetect_memory_settings`).
 
     The per-branch baselines track the actual giwk window of ``nonlocal_sde.calculate_self_energy_q``: the bubble
     (``chi0q``) runs on the ``niv_cut`` window, after which giwk is cut (and re-shared) to the
@@ -540,6 +599,17 @@ def estimate_peaks(
     :param niv_interp: Number of positive fermionic frequencies of the final self-energy interpolation's target grid
         (``config.self_energy_interpolation.niv_target``), or 0 when the run does not interpolate (no
         ``"sigma_interp"`` branch).
+    :param with_jacobian_tracker: Whether the Jacobian tracker runs
+        (``config.stabilization.use_jacobian_stabilization``). Its residents (:func:`jacobian_tracker_bytes`) join
+        every single-rank slot, the iteration's core-window pair and reflected proposal the ``sigma_loop`` slot, and
+        its secant transient enters the ``sigma_loop`` maximum, since the update runs before the mixing step
+        allocates its temporaries.
+    :param with_exact_jacobian: Whether the converged-point exact Jacobian is evaluated
+        (``config.stabilization.use_exact_jacobian``), which adds the ``"exact_jacobian"`` branch: the node-shared
+        windows :class:`~dgamore.sigma_jacobian.ExactJacobian` holds, four resident core one-fermion blocks per rank
+        and the largest phase of one product (bubble response, Bethe-Salpeter solve, contraction), and on rank 0 the
+        larger of the two solvers on the symmetry sector (ARPACK's basis with the eigenvectors, or the block Arnoldi
+        of an in-loop exact check).
     :param overhead: Global multiplicative factor accounting for un-modeled transient arrays.
     :param chunk_budgets: Chunk byte budgets of the three chunked builds (see :class:`ChunkBudgets` and
         :func:`max_chunk_budget`); each modeled chunk is clamped to at least one slice of its build (a ``(q, w)``
@@ -571,7 +641,12 @@ def estimate_peaks(
     giwk_dga_single = scale * sigma_full  # the single surviving giwk_dga copy
     # interpreter, libraries and buffers of every rank plus the driver's full-grid non-local interaction
     rank_base = overhead * RANK_BASELINE_BYTES + scale * nk_tot * nb**4
-    mixing_history = scale * 2 * mixing_pairs * sigma_core  # rank 0's (iterate, proposal) pairs
+    # rank 0's accelerated-mixing history of core-box (iterate, proposal) pairs and the Jacobian tracker's residents,
+    # both alive through every loop branch; the history is freed after the loop
+    tracker_resident, tracker_transient = jacobian_tracker_bytes(nk_irr, nb, vc) if with_jacobian_tracker else (0, 0)
+    mixing_history = scale * 2 * mixing_pairs * sigma_core + overhead * tracker_resident
+    # the tracker's pair of this iteration and its reflected proposal, beside the history the pair joins
+    tracker_step = scale * (1 if mixing_pairs else 3) * sigma_core if with_jacobian_tracker else 0.0
 
     peaks: dict[str, BranchPeak] = {}
 
@@ -677,13 +752,14 @@ def estimate_peaks(
         )
 
     # Rank-0 loop step (verify-only): the history + two niv_cut Sigmas with 3 linear-mix copies, the accelerated solve
-    # (measured: 9 m + 10 complex64 core copies bound Anderson and Pulay in both precisions) or update_mu's G arrays.
+    # (measured 9 m + 10 complex64 core copies), the Jacobian tracker's secant step or update_mu's G arrays.
     solve_width = mixing_pairs - 1
     mixing_solve = overhead * 8 * sigma_core * (9 * solve_width + 10) if solve_width > 0 else 0.0
     sigma_loop_single = (
         mixing_history
+        + tracker_step
         + scale * 2 * sigma_full
-        + max(scale * 3 * sigma_full, mixing_solve, overhead * 16 * 2 * sigma_full)
+        + max(scale * 3 * sigma_full, mixing_solve, overhead * 16 * 2 * sigma_full, overhead * tracker_transient)
     )
     peaks["sigma_loop"] = BranchPeak(
         baseline=rank_base,
@@ -694,6 +770,53 @@ def estimate_peaks(
         on_single=sigma_loop_single,
     )
 
+    if with_exact_jacobian:
+        # Converged-point exact Jacobian (verify-only, see sigma_jacobian.ExactJacobian); the transients of one product
+        # follow the phases of its matvec, the bubble on the path the chi0q branch models for this rank count.
+        core_block, full_block = _bubble_block(qi, nb, wp, vc), _bubble_block(qi, nb, wp, vf)
+        f_dc_vertex, gamma_vertex = _two_fermion_block(1, nb, wp, vf, vc), _two_fermion_block(1, nb, wp, vc)
+        # the three local vertices together, or the larger one alone when each is loaded for its phase
+        per_phase = chunk_budgets.exact_vertices_per_phase
+        vertices = scale * (max(f_dc_vertex, gamma_vertex) if per_phase else f_dc_vertex + 2 * gamma_vertex)
+        n_sector = 2 * _giwk_rspace(nk_irr, nb, niv_core)
+        # a node root holds the block of sector vectors, never wider than a check's basis
+        block_vectors = np.dtype(np.float64).itemsize * EXACT_CHECK_BASIS * n_sector
+        windows = sigma_shared + 2 * giwk_bubble + giwk_sde + vertices + overhead * block_vectors
+        bubble_windows = scale * 2 * _giwk_rspace(nk_tot, nb, gf_window_bubble) if n_ranks > 1 else 0.0
+        shared_extra = max(bubble_windows, 2 * giwk_sde)
+        # per column the dc and core bubble responses, and one momentum group's right-hand sides, solutions and kernel
+        # terms at a time (measured 2.35 / 2.87 core blocks above the phase's entry at 1 / 2 columns, six groups)
+        m = max(1, chunk_budgets.exact_block)
+        aux_chunk = min(max(chunk_budgets.exact, one_slice), rank_block)
+        sde_round_exact = min(max(1, chunk_budgets.exact // sde_task), int(np.max(np.diff(sde_bounds)))) * sde_task
+        group_slice = min(scale * core_block, overhead * max(aux_chunk, per_q_box) / vc)
+        bubble_phase = scale * (full_block + 2 * (m - 1) * core_block) + chi0q_off_distributed
+        kernel_phase = (
+            scale * 2 * m * core_block
+            + (8 + 3 * m) * group_slice
+            + overhead * _chiq_aux_transient(aux_chunk, per_q_box, one_slice, vc)
+        )
+        sde_phase = scale * m * core_block + overhead * (sde_round_exact * (1 + qi / nk_irr) + sde_columns + sde_slabs)
+        exact_distributed = scale * 4 * core_block + max(bubble_phase, kernel_phase, sde_phase)
+        # rank 0's solver on the sector: ARPACK's basis with both targets' eigenvectors (measured 33 complex128
+        # columns at ncv 20), or the in-loop check's block Arnoldi (measured 12.4 float64 vectors per basis vector)
+        arpack = (
+            np.dtype(np.float64).itemsize * (EXACT_JACOBIAN_NCV + 1)
+            + np.dtype(np.complex128).itemsize * 4 * EXACT_JACOBIAN_MODES
+        ) * n_sector
+        check = np.dtype(np.float64).itemsize * 13 * EXACT_CHECK_BASIS * n_sector
+        eigen = overhead * max(arpack, check)
+        # an in-loop check also meets rank 0's private proposal and this iteration's pair, not yet recorded
+        exact_single = mixing_history + chi0q_off_single + scale * (sigma_full + 6 * sigma_core) + eigen
+        peaks["exact_jacobian"] = BranchPeak(
+            baseline=windows + shared_extra + rank_base,
+            giwk_shareable=windows + shared_extra,
+            off_distributed=exact_distributed,
+            off_single=exact_single,
+            on_distributed=exact_distributed,
+            on_single=exact_single,
+        )
+
     if niv_interp:
         # Final re-gridding (verify-only): rank 0 interpolates the irreducible Sigma (measured: 10 source + 4 target
         # complex128 copies of PCHIP data), then unfolds it; every rank re-grids at most its share for the pole fits.
@@ -702,7 +825,7 @@ def estimate_peaks(
         share_source, share_target = _giwk_rspace(qi, nb, 2 * niv_cut), _giwk_rspace(qi, nb, 2 * niv_interp)
         interp_distributed = scale * share_source + overhead * 16 * (10 * share_source + 4 * share_target)
         interp_single = (
-            mixing_history
+            overhead * tracker_resident
             + scale * (sigma_full + irr_source)
             + max(
                 overhead * 16 * (10 * irr_source + 4 * irr_target),

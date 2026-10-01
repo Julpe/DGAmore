@@ -105,6 +105,56 @@ def test_chunk_budgets_are_the_largest_that_keep_each_branch_inside_its_line(fak
     assert line / 3 - 2**20 <= budgets.sde <= line / 3
 
 
+@pytest.mark.parametrize("width_cost, width", [(1 / 8, 4), (1 / 3, 2), (1.0, None)])
+def test_exact_products_get_the_widest_block_that_fits_and_their_own_budget(
+    fake_system, monkeypatch, width_cost, width
+):
+    """The exact products take the widest fitting block at the floor and the budget left, apart from the loop's."""
+    avail = 3 * 1024**3
+    line = avail * dgamore_main.NODE_MEMORY_FRACTION
+
+    def peaks(**kw):
+        budgets = kw["chunk_budgets"]
+        branches = _linear_chunk_branches(**kw)
+        cost = width_cost * line * budgets.exact_block
+        branches["exact_jacobian"] = _mock_branch(off_distributed=3 * budgets.exact + cost)
+        return branches
+
+    fake_system(avail)
+    monkeypatch.setattr(config.stabilization, "use_exact_jacobian", True)
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", peaks)
+    budgets = dgamore_main.autodetect_memory_settings(_mock_comm())
+    assert config.stabilization.use_exact_jacobian is (width is not None)
+    if width is not None:
+        left = (line - width_cost * line * width) / 3
+        assert budgets.exact_block == width and left - 2**20 <= budgets.exact <= left < budgets.chiq_aux
+
+
+@pytest.mark.parametrize("vertices, width, per_phase", [(0.1, 4, False), (0.6, 1, False), (0.7, 4, True)])
+def test_exact_products_hold_their_vertices_when_they_fit_and_load_them_per_phase_else(
+    fake_system, monkeypatch, vertices, width, per_phase
+):
+    """The driver keeps the three local vertices of the exact products when they fit and loads them per phase else."""
+    avail = 3 * 1024**3
+    line = avail * dgamore_main.NODE_MEMORY_FRACTION
+
+    def peaks(**kw):
+        budgets = kw["chunk_budgets"]
+        branches = _linear_chunk_branches(**kw)
+        held = 0.0 if budgets.exact_vertices_per_phase else vertices * line
+        branches["exact_jacobian"] = _mock_branch(
+            off_distributed=3 * budgets.exact + 0.1 * line * budgets.exact_block + held
+        )
+        return branches
+
+    fake_system(avail)
+    monkeypatch.setattr(config.stabilization, "use_exact_jacobian", True)
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", peaks)
+    budgets = dgamore_main.autodetect_memory_settings(_mock_comm())
+    assert config.stabilization.use_exact_jacobian and budgets.exact_vertices_per_phase is per_phase
+    assert budgets.exact_block == width
+
+
 def test_chunk_budgets_take_the_minimum_over_the_nodes(fake_system, monkeypatch):
     """With nodes of different memory the tightest node's headroom sizes every chunk budget."""
     fake_system(1)
