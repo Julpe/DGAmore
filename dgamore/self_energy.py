@@ -14,6 +14,7 @@ obtained by fitting the highest available Matsubara frequencies.
 import contextlib
 import io
 import itertools as it
+import warnings
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator, interp1d
@@ -538,7 +539,10 @@ class SelfEnergy(TwoPoint):
         accepted = np.ones(len(k_indices), dtype=bool)
         for k, o1, o2 in it.product(range(len(k_indices)), range(self.n_bands), range(self.n_bands)):
             try:
-                with contextlib.redirect_stdout(io.StringIO()):  # MiniPole prints its tolerance diagnostics
+                # MiniPole prints its tolerance diagnostics and its quadratures warn of roundoff; the checks below
+                # screen the fit instead
+                with warnings.catch_warnings(), contextlib.redirect_stdout(io.StringIO()):
+                    warnings.simplefilter("ignore")
                     fit = MiniPole(mat[k, o1, o2, self.niv :] - sinf[k, o1, o2], vn_pos, n0=0, err=1e-6, err_type="rel")
             except Exception:
                 accepted[k] = False

@@ -4,11 +4,13 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import warnings
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+from scipy.integrate import IntegrationWarning
 
 from dgamore import config
 from dgamore.matsubara_frequencies import MFHelper
@@ -379,6 +381,30 @@ def test_pole_extrapolate_removes_the_static_part_per_momentum(monkeypatch):
     expected = hartree[:, None, None, None] + (weight[..., None] / (1j * target_vn[inner] - x))[None]
     assert np.array_equal(accepted, [True, True])
     assert np.allclose(values, expected, atol=1e-6)
+
+
+def test_pole_extrapolate_silences_the_warnings_of_the_mini_pole_fit(monkeypatch):
+    """pole_extrapolate keeps MiniPole's quadrature warnings out of the output; its own checks screen the fit."""
+    beta, x, niv = 10.0, -0.3, 200
+    vn = MFHelper.vn(niv, beta)
+    mat = (1.5 + 1.0 / (1j * vn - x))[None, None, None, None, None]
+    self_energy = _se(mat, nk=(1, 1, 1), has_compressed_q_dimension=False, beta=beta)
+    patch_mini_pole_with_exact_single_pole_fit(monkeypatch, x)
+    exact_fit = self_energy_module.MiniPole.side_effect
+
+    def warning_fit(*args, **kwargs):
+        warnings.warn("The occurrence of roundoff error is detected", IntegrationWarning)
+        return exact_fit(*args, **kwargs)
+
+    self_energy_module.MiniPole.side_effect = warning_fit
+    reference = self_energy.interpolate(2.0 * beta, niv)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _, accepted = self_energy.pole_extrapolate(2.0 * beta, niv, np.array([0]), reference)
+
+    assert caught == []
+    assert np.array_equal(accepted, [True])
 
 
 def test_pole_extrapolate_rejects_upper_half_plane_poles_failed_fits_and_implausible_values(monkeypatch):
