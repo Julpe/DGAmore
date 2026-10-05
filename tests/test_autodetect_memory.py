@@ -383,10 +383,11 @@ def test_dgamore_excludes_osc_ucx_before_mpi_init():
 
 def test_local_step_overflow_raises_before_the_flag_loop(fake_system, monkeypatch):
     """A budget below the flag-less local single peak raises MemoryError naming the local Schwinger-Dyson step."""
+    monkeypatch.setattr(config.box, "niv_core", 40)
     monkeypatch.setattr(config.box, "niv_full", 100)
-    params = {**FIXTURE_PARAMS, "niv_full": 100, "niv_cut": 50}  # niv_cut = min(10 + 100 + 10, niv_dmft=50)
-    peaks = estimate_peaks(**params, n_ranks=1, with_eliashberg=False)
-    # array totals without the per-rank footprint every branch carries alike
+    params = {**FIXTURE_PARAMS, "niv_core": 40, "niv_full": 100, "niv_cut": 50}  # niv_cut = min(10 + 100 + 10, 50)
+    peaks = estimate_peaks(**params, n_ranks=1, with_eliashberg=False, chunk_budgets=ChunkBudgets(0, 0, 0))
+    # array totals at the chunk floors without the per-rank footprint every branch carries alike
     totals = {k: bp.baseline - RANK_BASELINE_BYTES + bp.off_distributed + bp.off_single for k, bp in peaks.items()}
     local = totals.pop("local")
     assert max(totals.values()) < 0.9 * local

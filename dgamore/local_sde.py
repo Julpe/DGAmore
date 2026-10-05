@@ -30,13 +30,15 @@ def create_generalized_chi(g2: LocalFourPoint, g_dmft: GreensFunction) -> LocalF
     Returns the generalized susceptibility, see also Eq. (3.41) in my master's thesis,
     :math:`\chi_{r;1234}^{\omega\nu\nu'} = \beta (G_{r;1234}^{(2);\omega\nu\nu'} - 2 \delta_{r,\mathrm{dens}}
     \delta_{\omega 0} G_{12}^{\nu} G_{34}^{\nu'})`. The disconnected term is subtracted only in the density
-    (ph) channel at :math:`\omega = 0`.
+    (ph) channel at :math:`\omega = 0`. The susceptibility is built in the array of ``g2``, which is consumed.
 
-    :param g2: Two-particle (DMFT) Green's function :math:`G^{(2)}_{r}` as a :class:`LocalFourPoint`.
+    :param g2: Two-particle (DMFT) Green's function :math:`G^{(2)}_{r}` as a :class:`LocalFourPoint`; it is
+        overwritten.
     :param g_dmft: The local (DMFT) :class:`GreensFunction`.
-    :return: The generalized susceptibility :math:`\chi_{r}` as a :class:`LocalFourPoint` (half niw range).
+    :return: The generalized susceptibility :math:`\chi_{r}` as a :class:`LocalFourPoint` (half niw range), i.e.
+        ``g2`` itself.
     """
-    chi = config.sys.beta * g2.to_half_niw_range()
+    chi = g2.to_half_niw_range().scale(config.sys.beta)
 
     if g2.channel == SpinChannel.DENS and g2.frequency_notation == FrequencyNotation.PH:
         g_loc_slice_mat = g_dmft.mat[0, 0, 0][..., g_dmft.niv - config.box.niv_core : g_dmft.niv + config.box.niv_core]
@@ -322,7 +324,8 @@ def create_vertex_functions(
     explicit asymptotics as proposed by Motoharu Kitatani et al. 2022 J. Phys. Mater. 5 034005;
     DOI 10.1088/2515-7639/ac7e6d for the local irreducible vertex.
 
-    :param g2_r: The two-particle (DMFT) Green's function :math:`G^{(2)}_{r}` for this channel.
+    :param g2_r: The two-particle (DMFT) Green's function :math:`G^{(2)}_{r}` for this channel; consumed, it becomes
+        the returned :math:`\chi_{r}`.
     :param gchi0: The bare bubble :math:`\chi_0` over the full frequency box.
     :param gchi0_inv_core: The inverse bare bubble :math:`\chi_0^{-1}` over the core box (diagonal in :math:`\nu`).
     :param g_dmft: The local (DMFT) :class:`GreensFunction`.
@@ -342,9 +345,6 @@ def create_vertex_functions(
         f"{" with asymptotic correction" if config.box.niv_shell > 0 else ""} calculated."
     )
 
-    f_r = create_full_vertex_from_gamma(gamma_r, gchi0, u_loc)
-    logger.info(f"Local full vertex F^wvv' ({f_r.channel.value}) calculated.")
-
     gchi_r_aux = create_auxiliary_chi(gamma_r, gchi0_inv_core, u_loc)
     logger.info(f"Local auxiliary susceptibility chi^*wvv' ({gchi_r_aux.channel.value}) calculated.")
 
@@ -359,6 +359,10 @@ def create_vertex_functions(
         f"Updated local susceptibility chi^w ({gchi_r_aux_sum.channel.value})"
         f"{" with asymptotic correction" if config.box.niv_shell > 0 else ""}."
     )
+
+    # last: the full vertex is the largest output, so the auxiliary susceptibility is gone before it is allocated
+    f_r = create_full_vertex_from_gamma(gamma_r, gchi0, u_loc)
+    logger.info(f"Local full vertex F^wvv' ({f_r.channel.value}) calculated.")
 
     return gamma_r, gchi_r_aux_sum, vrg_r, f_r, gchi_r
 
@@ -381,20 +385,25 @@ def get_local_hartree_fock(u_loc: LocalInteraction, occ: np.ndarray) -> np.ndarr
     return u_loc.as_channel(SpinChannel.DENS).times("abcd,dc->ab", occ)
 
 
-def double_counting_vertex(f_dens_full: LocalFourPoint, f_magn_full: LocalFourPoint) -> LocalFourPoint:
+def double_counting_vertex(
+    f_dens_full: LocalFourPoint, f_magn_full: LocalFourPoint, copy: bool = True
+) -> LocalFourPoint:
     r"""
     Returns the local vertex the double-counting kernel of the non-local Schwinger-Dyson equation subtracts with the
     exchange attachment: the local part of the transversal ladder term, :math:`\tfrac12(F_{\mathrm{d}} +
     3F_{\mathrm{m}})`, carrying the magnetic metadata (so the kernel wiring stays that of the magnetic vertex) and
-    built from a single scaled copy of the magnetic vertex. Together with the density form of the local
-    Schwinger-Dyson equation its local content cancels term by term on any finite frequency box and for any band
-    count. Both inputs are expected on the same (asymmetric) frequency box and are left untouched.
+    built from a single scaled copy of the magnetic vertex, or in the magnetic vertex itself. Together with the
+    density form of the local Schwinger-Dyson equation its local content cancels term by term on any finite frequency
+    box and for any band count. Both inputs are expected on the same (asymmetric) frequency box; the density vertex is
+    left untouched.
 
     :param f_dens_full: The local density full vertex :math:`F_{\mathrm{d}}`.
     :param f_magn_full: The local magnetic full vertex :math:`F_{\mathrm{m}}`.
+    :param copy: If True, build the result in a copy of ``f_magn_full``; if False, overwrite and return
+        ``f_magn_full``.
     :return: The vertex to store as ``f_dc_loc``.
     """
-    return f_magn_full.scale(3.0, copy=True).add(f_dens_full, copy=False).scale(0.5)
+    return f_magn_full.scale(3.0, copy=copy).add(f_dens_full, copy=False).scale(0.5)
 
 
 def get_loc_self_energy_vrg(
@@ -437,8 +446,8 @@ def perform_local_schwinger_dyson(
     asymptotics as proposed by Motoharu Kitatani et al. 2022 J. Phys. Mater. 5 034005; DOI 10.1088/2515-7639/ac7e6d.
 
     :param g_dmft: The local (DMFT) :class:`GreensFunction`.
-    :param g2_dens: The two-particle (DMFT) Green's function in the density channel.
-    :param g2_magn: The two-particle (DMFT) Green's function in the magnetic channel.
+    :param g2_dens: The two-particle (DMFT) Green's function in the density channel; consumed, it becomes ``gchi_d``.
+    :param g2_magn: The two-particle (DMFT) Green's function in the magnetic channel; consumed, it becomes ``gchi_m``.
     :param u_loc: The bare local interaction :math:`U`.
     :return: The tuple ``(gamma_d, gamma_m, gchi_d_sum, gchi_m_sum, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m,
         sigma_loc)`` of local vertex functions and the local self-energy.

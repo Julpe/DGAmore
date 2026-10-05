@@ -84,10 +84,6 @@ TEAM_MATVEC_TRANSIENT_VECTORS: int = 5
 # channel's full-BZ vertex window from the node-shared irreducible source.
 TEAM_BUILD_CHUNK_BYTES: int = 64 * 1024**2
 
-# Local SDE dominant transient: the chi-tilde shell chain at niv_full (extended inverted bubble carrying the +U, its
-# dense compound inversion output, LAPACK workspace) - ~3 niv_full two-fermion blocks beyond the persistent outputs.
-LOCAL_SHELL_INVERT_FACTOR: int = 3
-
 
 # Floor and cap of the per-chunk byte budget of the chunked builds (auxiliary susceptibility and pairing vertex):
 # the floor keeps per-chunk Python and dispatch overhead negligible, the cap bounds the transient on fat nodes.
@@ -482,6 +478,7 @@ def estimate_peaks(
     n_eig: int = 1,
     mixing_pairs: int = 0,
     niv_interp: int = 0,
+    symmetrize_orbitals: bool = False,
     overhead: float = OVERHEAD_FACTOR,
     chunk_budgets: ChunkBudgets = ChunkBudgets(),
 ) -> dict[str, BranchPeak]:
@@ -512,8 +509,12 @@ def estimate_peaks(
     hand-over; the other node roots hold at most their received array and window then, which the single-rank slot
     covers on every node. The ``sigma_interp`` branch, present when ``niv_interp`` is set, is the final re-gridding:
     rank 0 interpolates the irreducible self-energy and unfolds the result next to the node-shared window, every rank
-    re-grids at most its share of the momenta it fits with a pole. Every branch's baseline includes the per-rank
-    :data:`RANK_BASELINE_BYTES` and the full-grid non-local interaction every rank keeps for the whole run.
+    re-grids at most its share of the momenta it fits with a pole. The ``local`` branch is rank 0's local
+    Schwinger-Dyson step, the larger of the second channel's inversions (three core blocks next to the first channel's
+    outputs and its own generalized susceptibility) and its full vertex (next to both channels' irreducible vertices
+    and generalized susceptibilities and the first full vertex), plus the orbital symmetrization's copy of one full
+    vertex with ``symmetrize_orbitals``. Every branch's baseline includes the per-rank :data:`RANK_BASELINE_BYTES` and
+    the full-grid non-local interaction every rank keeps for the whole run.
 
     :param n_bands: Number of bands :math:`B`.
     :param nk_tot: Total number of momentum points (full BZ).
@@ -540,6 +541,8 @@ def estimate_peaks(
     :param niv_interp: Number of positive fermionic frequencies of the final self-energy interpolation's target grid
         (``config.self_energy_interpolation.niv_target``), or 0 when the run does not interpolate (no
         ``"sigma_interp"`` branch).
+    :param symmetrize_orbitals: Whether the local vertices are symmetrized over orbitals
+        (``config.dmft.symmetrize_orbitals`` is not empty), which copies one full vertex at a time.
     :param overhead: Global multiplicative factor accounting for un-modeled transient arrays.
     :param chunk_budgets: Chunk byte budgets of the three chunked builds (see :class:`ChunkBudgets` and
         :func:`max_chunk_budget`); each modeled chunk is clamped to at least one slice of its build (a ``(q, w)``
@@ -718,11 +721,11 @@ def estimate_peaks(
             on_single=interp_single,
         )
 
-    # Rank-0-serial local SDE (flag-less, verify-only): both channels' outputs (gamma + chi at the core box, full
-    # vertex at niv_full) + the two halved inputs + the dominant chi-tilde shell transient at niv_full.
+    # Rank-0-serial local SDE (verify-only): the first channel's gamma, gchi and F (niv_full x niv_core) next to the
+    # second's gchi plus three core blocks of its inversions, or next to its gamma, gchi and F (measured)
     l_core = _two_fermion_block(1, nb, wp, vc)
-    l_full = _two_fermion_block(1, nb, wp, vf)
-    local_single = scale * (2 * (2 * l_core + l_full) + 2 * l_core + LOCAL_SHELL_INVERT_FACTOR * l_full)
+    f_full = _two_fermion_block(1, nb, wp, vf, vc)
+    local_single = scale * max(4 * l_core + (3 if symmetrize_orbitals else 2) * f_full, 6 * l_core + f_full)
     peaks["local"] = BranchPeak(
         baseline=rank_base,
         giwk_shareable=0.0,

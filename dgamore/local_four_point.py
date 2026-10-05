@@ -374,7 +374,10 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         :math:`\nu`, so it is inverted per :math:`(\omega, \nu)` orbital block and **keeps one fermionic
         dimension** (the inverse of a block-diagonal matrix is block-diagonal); the former route diagonally
         extended it and dense-inverted the whole compound matrix - :math:`(2 n_{\nu})^2` more flops and a full
-        two-fermion block for the same information.
+        two-fermion block for the same information. Otherwise the compound matrix is inverted one bosonic slice at a
+        time into its own array, so no stacked inverse and its workspace are allocated next to it. With
+        ``copy=False`` that array is the object's own one whenever the compound layout is a view of it (a read-only
+        array is copied first), so an object sharing it sees the inverse, as for every in-place transformation.
 
         :param copy: If True, operate on and return a deep copy; if False, mutate and return ``self`` in place.
         :return: The inverted :class:`LocalFourPoint` in the half niw range.
@@ -395,7 +398,11 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
             return self
 
         self.to_compound_indices()
-        self.mat = np.linalg.inv(self.mat)
+        if not self.mat.flags.writeable:  # the compound layout is a view of a read-only array (window, mmap)
+            self.mat = self.mat.copy()
+        # per slice in place: a stacked np.linalg.inv peaks at about four times its input
+        for iw in range(self.current_shape[0]):
+            self.mat[iw] = np.linalg.inv(self.mat[iw])
         return self.to_full_indices()
 
     def get_core_from_shell_inversion(self, coupling: "LocalInteraction", niv_core: int = -1) -> "LocalFourPoint":

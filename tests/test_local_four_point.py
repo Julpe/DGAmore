@@ -4,6 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import tracemalloc
 from unittest.mock import MagicMock, create_autospec
 
 import pytest
@@ -1488,6 +1489,48 @@ def test_invert_one_vn_keeps_single_fermionic_dimension_and_matches_dense_refere
     assert out.mat.shape == obj.mat.shape
     assert np.allclose(out.mat, ref.mat, atol=1e-4)
     assert np.allclose(out.invert().mat, obj.mat, atol=1e-4)
+
+
+@pytest.mark.parametrize("frequency_notation", [FrequencyNotation.PH, FrequencyNotation.PP])
+def test_invert_two_vn_matches_the_stacked_compound_inverse_bit_for_bit(frequency_notation):
+    """The two-fermion invert equals the stacked compound inverse bit for bit, values and memory layout alike."""
+    rng = np.random.default_rng(31)
+    shape = (2, 2, 2, 2, 5, 6, 6)
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    obj = LocalFourPoint(mat, SpinChannel.DENS, 1, 2, False, True, frequency_notation)
+    ref = obj.copy().to_compound_indices()
+    ref.mat = np.linalg.inv(ref.mat)
+    ref.to_full_indices()
+    out = obj.invert()
+    assert np.array_equal(out.mat, ref.mat) and out.mat.strides == ref.mat.strides
+
+
+def test_invert_two_vn_allocates_no_stacked_inverse_next_to_its_input():
+    """The in-place two-fermion invert allocates the compound copy and one slice's workspace, not a stacked inverse."""
+    rng = np.random.default_rng(32)
+    shape = (2, 2, 2, 2, 21, 8, 8)
+    mat = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    obj = LocalFourPoint(mat, SpinChannel.DENS, 1, 2, False, True)
+    tracemalloc.start()
+    obj.invert(copy=False)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak < 2.0 * mat.nbytes
+
+
+def test_invert_two_vn_in_place_inverts_a_read_only_array_into_a_private_copy():
+    """invert(copy=False) on a read-only compound-layout view matches the stacked inverse and leaves the view intact."""
+    rng = np.random.default_rng(33)
+    shape = (2, 2, 2, 2, 5, 6, 6)
+    obj = LocalFourPoint(rng.standard_normal(shape) + 1j * rng.standard_normal(shape), SpinChannel.DENS, 1, 2, False)
+    obj = obj.invert()
+    ref = obj.copy().to_compound_indices()
+    ref.mat = np.linalg.inv(ref.mat)
+    ref.to_full_indices()
+    frozen, source = obj.mat, obj.mat.copy()
+    frozen.flags.writeable = False
+    out = obj.invert(copy=False)
+    assert np.array_equal(out.mat, ref.mat) and np.array_equal(frozen, source)
 
 
 def _shell_inversion_inputs(o, niw, niv_full, full_niw, singular_coupling, seed=4):
