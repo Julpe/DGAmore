@@ -159,23 +159,7 @@ def run_dga_routine(comm: MPI.Comm) -> None:
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
 
     if comm.rank == 0:
-        (
-            g2_dens_full,
-            g2_magn_full,
-            gamma_d_full,
-            gamma_m_full,
-            chi_d_full,
-            chi_m_full,
-            vrg_d_full,
-            vrg_m_full,
-            f_d_full,
-            f_m_full,
-            gchi_d_full,
-            gchi_m_full,
-            sigma_loc_full,
-            sigma_dmft_full,
-            g_dmft_full,
-        ) = (None,) * 15
+        sigma_loc_full, sigma_dmft_full, g_dmft_full = (None,) * 3
         offsets = []
         offset = 0
 
@@ -188,6 +172,83 @@ def run_dga_routine(comm: MPI.Comm) -> None:
             if ineq not in first_block:
                 first_block[ineq] = k
 
+        def write_to_full_4pt_quantity(obj_full, obj_ineq: LocalFourPoint, sl: slice):
+            """
+            Writes a single inequivalent atom's four-point quantity into the orbital-diagonal block of the assembled
+            full multi-band quantity (allocating the full object on the first call; an atom spanning every orbital
+            is the full object itself).
+
+            :param obj_full: The full multi-band object, or None to allocate it from ``obj_ineq``.
+            :param obj_ineq: The per-atom :class:`LocalFourPoint` to insert.
+            :param sl: The orbital slice (block) of this atom in the full object.
+            :return: The full object with this atom's block filled in.
+            """
+            if obj_full is None:
+                if obj_ineq.n_bands == config.sys.n_bands:
+                    return obj_ineq
+                obj_full = obj_ineq._clone_without_mat()
+                obj_full.mat = np.zeros(
+                    (config.sys.n_bands,) * 4 + obj_ineq.current_shape[4:], dtype=obj_ineq.mat.dtype
+                )
+                obj_full.update_original_shape()
+            obj_full[sl, sl, sl, sl] = obj_ineq.mat
+            return obj_full
+
+        def save_full_4pt_quantity(obj_per_ineq: list, name: str) -> LocalFourPoint:
+            """
+            Assembles a four-point quantity from its per-atom objects in the order of the atoms in the unit cell and
+            saves it.
+
+            :param obj_per_ineq: The per-atom :class:`LocalFourPoint` objects, one per inequivalent atom.
+            :param name: File name (without extension) in the output folder.
+            :return: The assembled full multi-band object.
+            """
+            obj_full = None
+            for idx, ineq in enumerate(config.dmft.ineq_ordering):
+                sl = slice(offsets[idx], offsets[idx] + config.dmft.n_bands_per_ineq[ineq - 1])
+                obj_full = write_to_full_4pt_quantity(obj_full, obj_per_ineq[ineq - 1], sl)
+            obj_full.save(name=name, output_dir=config.output.output_path)
+            return obj_full
+
+        # g2 is only written out, so it is saved (and plotted) before the local step builds the susceptibilities
+        # in its arrays
+        for g2_per_ineq, channel in [(g2_dens_per_ineq, "dens"), (g2_magn_per_ineq, "magn")]:
+            for g2 in g2_per_ineq:
+                g2.to_half_niw_range()
+            g2_full = save_full_4pt_quantity(g2_per_ineq, f"g2_{channel}_loc")
+            if config.output.do_plotting:
+                for omega in [0, -10, 10] if config.box.niw_core > 10 else [0]:
+                    plotting.plot_nu_nup(
+                        g2_full, omega=omega, name=f"G2_{channel}", output_dir=config.output.plotting_path
+                    )
+            del g2_full
+        del g2, g2_per_ineq
+        if config.output.do_plotting:
+            logger.info(f"Plotted g2 (dens) and g2 (magn).")
+
+        per_ineq = [[] for _ in range(11)]
+        for ineq in range(1, config.dmft.n_ineq + 1):
+            k = first_block[ineq]
+            n_start = offsets[k]
+            n_end = n_start + config.dmft.n_bands_per_ineq[ineq - 1]
+
+            config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[ineq - 1]
+
+            u_loc_ineq = LocalInteraction(u_loc.mat[n_start:n_end, n_start:n_end, n_start:n_end, n_start:n_end].copy())
+
+            logger.info(f"Starting local Schwinger-Dyson equation (SDE) for atom {ineq}.")
+
+            outputs = local_sde.perform_local_schwinger_dyson(
+                g_dmft_per_ineq[ineq - 1], g2_dens_per_ineq[ineq - 1], g2_magn_per_ineq[ineq - 1], u_loc_ineq
+            )
+            for obj_per_ineq, obj in zip(per_ineq, outputs, strict=True):
+                obj_per_ineq.append(obj)
+            del outputs, obj
+
+            logger.info(f"Local Schwinger-Dyson equation (SDE) for atom {ineq} done.")
+
+        # the g2 arrays now hold the generalized susceptibilities
+        del g2_dens_per_ineq, g2_magn_per_ineq
         (
             gamma_d_per_ineq,
             gamma_m_per_ineq,
@@ -200,59 +261,7 @@ def run_dga_routine(comm: MPI.Comm) -> None:
             gchi_d_per_ineq,
             gchi_m_per_ineq,
             sigma_loc_per_ineq,
-        ) = ([], [], [], [], [], [], [], [], [], [], [])
-        for ineq in range(1, config.dmft.n_ineq + 1):
-            k = first_block[ineq]
-            n_start = offsets[k]
-            n_end = n_start + config.dmft.n_bands_per_ineq[ineq - 1]
-
-            config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[ineq - 1]
-
-            u_loc_ineq = LocalInteraction(u_loc.mat[n_start:n_end, n_start:n_end, n_start:n_end, n_start:n_end].copy())
-
-            logger.info(f"Starting local Schwinger-Dyson equation (SDE) for atom {ineq}.")
-
-            if comm.rank == 0:
-                gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc = (
-                    local_sde.perform_local_schwinger_dyson(
-                        g_dmft_per_ineq[ineq - 1], g2_dens_per_ineq[ineq - 1], g2_magn_per_ineq[ineq - 1], u_loc_ineq
-                    )
-                )
-            else:
-                gamma_d, gamma_m, chi_d, chi_m, vrg_d, vrg_m, f_d, f_m, gchi_d, gchi_m, sigma_loc = (None,) * 11
-
-            gamma_d_per_ineq.append(gamma_d)
-            gamma_m_per_ineq.append(gamma_m)
-            chi_d_per_ineq.append(chi_d)
-            chi_m_per_ineq.append(chi_m)
-            vrg_d_per_ineq.append(vrg_d)
-            vrg_m_per_ineq.append(vrg_m)
-            f_d_per_ineq.append(f_d)
-            f_m_per_ineq.append(f_m)
-            gchi_d_per_ineq.append(gchi_d)
-            gchi_m_per_ineq.append(gchi_m)
-            sigma_loc_per_ineq.append(sigma_loc)
-
-            logger.info(f"Local Schwinger-Dyson equation (SDE) for atom {ineq} done.")
-
-        def write_to_full_4pt_quantity(obj_full, obj_ineq: LocalFourPoint, sl: slice):
-            """
-            Writes a single inequivalent atom's four-point quantity into the orbital-diagonal block of the assembled
-            full multi-band quantity (allocating the full object on the first call).
-
-            :param obj_full: The full multi-band object, or None to allocate it from ``obj_ineq``.
-            :param obj_ineq: The per-atom :class:`LocalFourPoint` to insert.
-            :param sl: The orbital slice (block) of this atom in the full object.
-            :return: The full object with this atom's block filled in.
-            """
-            if obj_full is None:
-                obj_full = obj_ineq.copy()
-                obj_full.mat = np.zeros(
-                    (config.sys.n_bands,) * 4 + obj_ineq.current_shape[4:], dtype=obj_ineq.mat.dtype
-                )
-                obj_full.update_original_shape()
-            obj_full[sl, sl, sl, sl] = obj_ineq.mat
-            return obj_full
+        ) = per_ineq
 
         def write_to_full_2pt_quantity(obj_full, obj_ineq: SelfEnergy | GreensFunction, sl: slice):
             """
@@ -300,18 +309,6 @@ def run_dga_routine(comm: MPI.Comm) -> None:
             n_end = n_start + config.dmft.n_bands_per_ineq[ineq - 1]
             s = slice(n_start, n_end)
 
-            g2_dens_full = write_to_full_4pt_quantity(g2_dens_full, g2_dens_per_ineq[ineq - 1], s)
-            g2_magn_full = write_to_full_4pt_quantity(g2_magn_full, g2_magn_per_ineq[ineq - 1], s)
-            gamma_d_full = write_to_full_4pt_quantity(gamma_d_full, gamma_d_per_ineq[ineq - 1], s)
-            gamma_m_full = write_to_full_4pt_quantity(gamma_m_full, gamma_m_per_ineq[ineq - 1], s)
-            chi_d_full = write_to_full_4pt_quantity(chi_d_full, chi_d_per_ineq[ineq - 1], s)
-            chi_m_full = write_to_full_4pt_quantity(chi_m_full, chi_m_per_ineq[ineq - 1], s)
-            vrg_d_full = write_to_full_4pt_quantity(vrg_d_full, vrg_d_per_ineq[ineq - 1], s)
-            vrg_m_full = write_to_full_4pt_quantity(vrg_m_full, vrg_m_per_ineq[ineq - 1], s)
-            f_d_full = write_to_full_4pt_quantity(f_d_full, f_d_per_ineq[ineq - 1], s)
-            f_m_full = write_to_full_4pt_quantity(f_m_full, f_m_per_ineq[ineq - 1], s)
-            gchi_d_full = write_to_full_4pt_quantity(gchi_d_full, gchi_d_per_ineq[ineq - 1], s)
-            gchi_m_full = write_to_full_4pt_quantity(gchi_m_full, gchi_m_per_ineq[ineq - 1], s)
             sigma_dmft_full = write_to_full_2pt_quantity(sigma_dmft_full, sigma_dmft_per_ineq[ineq - 1], s)
             g_dmft_full = write_to_full_2pt_quantity(g_dmft_full, g_dmft_per_ineq[ineq - 1], s)
             sigma_loc_full = write_to_full_2pt_quantity(sigma_loc_full, sigma_loc_per_ineq[ineq - 1], s)
@@ -320,53 +317,58 @@ def run_dga_routine(comm: MPI.Comm) -> None:
             sigma_dmft_full = write_smom(sigma_dmft_full, sigma_dmft_per_ineq[ineq - 1], s)
 
     if comm.rank == 0:
-        # saved unconditionally (like every sibling local quantity): the scalar and matrix lambda corrections
-        # load chi_*_loc.npy under different flags, so it must exist whenever either consumer may run
-        chi_d_full.save(name="chi_dens_loc", output_dir=config.output.output_path)
-        chi_m_full.save(name="chi_magn_loc", output_dir=config.output.output_path)
-        del chi_d, chi_m
+        # one quantity at a time is assembled, saved (and plotted) and dropped with its per-atom objects: the later
+        # steps read the files, so no local vertex stays on rank 0. chi_*_loc.npy is read by both lambda corrections.
+        for obj_per_ineq, name in [
+            (chi_d_per_ineq, "chi_dens_loc"),
+            (chi_m_per_ineq, "chi_magn_loc"),
+            (vrg_d_per_ineq, "vrg_dens_loc"),
+            (vrg_m_per_ineq, "vrg_magn_loc"),
+        ]:
+            save_full_4pt_quantity(obj_per_ineq, name)
+            obj_per_ineq.clear()
 
-        g2_dens_full.save(name="g2_dens_loc", output_dir=config.output.output_path)
-        g2_magn_full.save(name="g2_magn_loc", output_dir=config.output.output_path)
-        del g2_dens_per_ineq, g2_magn_per_ineq
+        for gchi_per_ineq, channel in [(gchi_d_per_ineq, "dens"), (gchi_m_per_ineq, "magn")]:
+            gchi_full = save_full_4pt_quantity(gchi_per_ineq, f"gchi_{channel}_loc")
+            gchi_per_ineq.clear()
+            if config.output.do_plotting:
+                plotting.plot_nu_nup(gchi_full, omega=0, name=f"Gchi_{channel}", output_dir=config.output.plotting_path)
+            del gchi_full
+        if config.output.do_plotting:
+            logger.info(f"Local generalized susceptibilities dens & magn plotted.")
 
-        gamma_d_full.save(name="gamma_dens_loc", output_dir=config.output.output_path)
-        gamma_m_full.save(name="gamma_magn_loc", output_dir=config.output.output_path)
+        for gamma_per_ineq, channel in [(gamma_d_per_ineq, "dens"), (gamma_m_per_ineq, "magn")]:
+            gamma_full = save_full_4pt_quantity(gamma_per_ineq, f"gamma_{channel}_loc")
+            gamma_per_ineq.clear()
+            if config.output.do_plotting:
+                gamma_plot = gamma_full.cut_niv(min(config.box.niv_core, 2 * int(config.sys.beta)))
+                for omega in [0, 10, -10]:
+                    plotting.plot_nu_nup(
+                        gamma_plot, omega=omega, name=f"Gamma_{channel}", output_dir=config.output.plotting_path
+                    )
+                logger.info(f"Plotted gamma ({channel}).")
+                del gamma_plot
+            del gamma_full
 
-        vrg_d_full.save(name="vrg_dens_loc", output_dir=config.output.output_path)
-        vrg_m_full.save(name="vrg_magn_loc", output_dir=config.output.output_path)
-        del vrg_d_full, vrg_m_full
-
-        gchi_d_full.save(name="gchi_dens_loc", output_dir=config.output.output_path)
-        gchi_m_full.save(name="gchi_magn_loc", output_dir=config.output.output_path)
         # only the double-counting kernel needs one fermionic index on the full box (the summed nu' is read off the
         # stored first axis via the compound symmetry); channel files stay square (Eliashberg: niv_pp <= niv_core // 2)
-        local_sde.double_counting_vertex(f_d_full, f_m_full).save(name="f_dc_loc", output_dir=config.output.output_path)
-        f_d_full.cut_niv(config.box.niv_core, copy=False).save(name="f_dens_loc", output_dir=config.output.output_path)
-        f_m_full.cut_niv(config.box.niv_core, copy=False).save(name="f_magn_loc", output_dir=config.output.output_path)
-        del f_d_full, f_m_full
+        f_d_core_per_ineq, f_m_core_per_ineq = [], []
+        for f_d, f_m in zip(f_d_per_ineq, f_m_per_ineq):
+            f_d_core_per_ineq.append(f_d.cut_niv(config.box.niv_core))
+            f_m_core_per_ineq.append(f_m.cut_niv(config.box.niv_core))
+            local_sde.double_counting_vertex(f_d, f_m, copy=False)
+        del f_d, f_m
+        f_d_per_ineq.clear()
+        for obj_per_ineq, name in [
+            (f_m_per_ineq, "f_dc_loc"),
+            (f_d_core_per_ineq, "f_dens_loc"),
+            (f_m_core_per_ineq, "f_magn_loc"),
+        ]:
+            save_full_4pt_quantity(obj_per_ineq, name)
+            obj_per_ineq.clear()
         logger.info("Saved all relevant quantities as numpy files.")
 
     if config.output.do_plotting and comm.rank == 0:
-        plotting.plot_nu_nup(gchi_d_full, omega=0, name=f"Gchi_dens", output_dir=config.output.plotting_path)
-        plotting.plot_nu_nup(gchi_m_full, omega=0, name=f"Gchi_magn", output_dir=config.output.plotting_path)
-        logger.info(f"Local generalized susceptibilities dens & magn plotted.")
-        del gchi_m_full, gchi_d_full
-
-        gamma_dens_plot = gamma_d_full.cut_niv(min(config.box.niv_core, 2 * int(config.sys.beta)))
-        plotting.plot_nu_nup(gamma_dens_plot, omega=0, name="Gamma_dens", output_dir=config.output.plotting_path)
-        plotting.plot_nu_nup(gamma_dens_plot, omega=10, name="Gamma_dens", output_dir=config.output.plotting_path)
-        plotting.plot_nu_nup(gamma_dens_plot, omega=-10, name="Gamma_dens", output_dir=config.output.plotting_path)
-        logger.info("Plotted gamma (dens).")
-        del gamma_dens_plot, gamma_d_full
-
-        gamma_magn_plot = gamma_m_full.cut_niv(min(config.box.niv_core, 2 * int(config.sys.beta)))
-        plotting.plot_nu_nup(gamma_magn_plot, omega=0, name="Gamma_magn", output_dir=config.output.plotting_path)
-        plotting.plot_nu_nup(gamma_magn_plot, omega=10, name="Gamma_magn", output_dir=config.output.plotting_path)
-        plotting.plot_nu_nup(gamma_magn_plot, omega=-10, name="Gamma_magn", output_dir=config.output.plotting_path)
-        logger.info("Plotted gamma (magn).")
-        del gamma_magn_plot, gamma_m_full
-
         sigma_list = []
         sigma_names = []
         for i, j in it.product(range(config.sys.n_bands), repeat=2):
@@ -397,13 +399,6 @@ def run_dga_routine(comm: MPI.Comm) -> None:
         sigma_dmft_full.save(name="sigma_dmft", output_dir=config.output.output_path)
         g_dmft_full.save(name="g_dmft", output_dir=config.output.output_path)
         sigma_loc_full.save(name="siw_dga_local", output_dir=config.output.output_path)
-
-    if config.output.do_plotting and comm.rank == 0:
-        for g2, name in [(g2_dens_full, f"G2_dens"), (g2_magn_full, f"G2_magn")]:
-            for omega in ([0, -10, 10] if config.box.niw_core > 10 else [0]):
-                plotting.plot_nu_nup(g2, omega=omega, name=name, output_dir=config.output.plotting_path)
-        logger.info(f"Plotted g2 (dens) and g2 (magn).")
-        del g2_dens_full, g2_magn_full
 
     if comm.rank != 0:
         sigma_loc_full, sigma_dmft_full, g_dmft_full = (None,) * 3
@@ -646,6 +641,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         niv_interp=(
             config.self_energy_interpolation.niv_target if config.self_energy_interpolation.do_interpolation else 0
         ),
+        symmetrize_orbitals=bool(config.dmft.symmetrize_orbitals),
     )
 
     def node_total(bp: memory_estimator.BranchPeak, distributed: float, single: float, n_ranks: int) -> float:

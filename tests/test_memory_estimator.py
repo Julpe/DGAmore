@@ -556,18 +556,18 @@ def test_save_pairing_vertex_enters_the_single_rank_gather_peak():
     assert with_save.on_single > without.on_single  # the gather is a single-rank peak of the grid variant too
 
 
-def test_local_step_is_flagless_single_rank_and_band_heavy():
-    """The local branch is verify-only, rank-independent and nb^4-heavy (both channels + the shell transient)."""
-    from dgamore.memory_estimator import LOCAL_SHELL_INVERT_FACTOR
-
-    bp = _peaks()["local"]
+@pytest.mark.parametrize("niv_full, symmetrize", [(40, False), (40, True), (30, False)])
+def test_local_step_is_flagless_single_rank_and_band_heavy(niv_full, symmetrize):
+    """The local branch is verify-only, rank-independent and nb^4-heavy: the larger of the inversion and F phases."""
+    bp = _peaks(niv_full=niv_full, symmetrize_orbitals=symmetrize)["local"]
     assert bp.baseline == pytest.approx(_rank_base(BASE)) and bp.giwk_shareable == 0.0 and bp.off_distributed == 0.0
     assert bp.off_single == bp.on_single > 0.0
-    assert _peaks(n_ranks=16)["local"].off_single == pytest.approx(bp.off_single)
-    assert _peaks(n_bands=2)["local"].off_single == pytest.approx(16 * bp.off_single)
-    wp, vc, vf = BASE["niw_core"] + 1, 2 * BASE["niv_core"], 2 * BASE["niv_full"]
-    l_core, l_full = wp * vc * vc, wp * vf * vf
-    expected = SCALE * (2 * (2 * l_core + l_full) + 2 * l_core + LOCAL_SHELL_INVERT_FACTOR * l_full)
+    assert _peaks(n_ranks=16, niv_full=niv_full, symmetrize_orbitals=symmetrize)["local"].off_single == bp.off_single
+    two_bands = _peaks(n_bands=2, niv_full=niv_full, symmetrize_orbitals=symmetrize)["local"].off_single
+    assert two_bands == pytest.approx(16 * bp.off_single)
+    wp, vc, vf = BASE["niw_core"] + 1, 2 * BASE["niv_core"], 2 * niv_full
+    l_core, f_full = wp * vc * vc, wp * vf * vc
+    expected = SCALE * max(4 * l_core + (3 if symmetrize else 2) * f_full, 6 * l_core + f_full)
     assert bp.off_single == pytest.approx(expected)
 
 

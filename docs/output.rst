@@ -213,7 +213,8 @@ Green's function, the pairing channel for the gap:
 Local quantities
 ----------------
 
-These files are written to ``output_path`` by rank 0 after the local Schwinger-Dyson step. The four-point
+These files are written to ``output_path`` by rank 0 around the local Schwinger-Dyson step (``g2_*_loc`` before it,
+since the step builds the generalized susceptibilities in the two-particle arrays, the others after it). The four-point
 quantities among them carry no momentum axis at all. The two-point ones do: the DMFT Green's function and the two
 self-energies descend from :class:`~dgamore.two_point.TwoPoint`, so they are momentum-dependent objects evaluated on
 a single momentum point and keep three leading axes of length one.

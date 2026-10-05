@@ -322,6 +322,43 @@ def test_local_self_energy_is_the_density_form_with_the_direct_attachment(o):
     assert np.allclose(sigma.mat[0, 0, 0], ref, atol=1e-4)
 
 
+def test_generalized_chi_is_built_in_the_two_particle_array():
+    """chi = beta (G2 - 2 G G at w = 0, density only) is returned in the half-range array of the consumed G2."""
+    from dgamore.greens_function import GreensFunction
+    from dgamore.local_four_point import LocalFourPoint
+
+    config.sys.beta, config.box.niv_core = 4.0, 3
+    rng = np.random.default_rng(8)
+    shape = (2, 2, 2, 2, 5, 6, 6)
+    g2_mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    g_mat = rng.standard_normal((1, 1, 1, 2, 2, 10)) + 1j * rng.standard_normal((1, 1, 1, 2, 2, 10))
+    g2 = LocalFourPoint(g2_mat, SpinChannel.DENS, 1, 2, True, True)
+    expected = config.sys.beta * g2.mat[..., 2:, :, :]
+    g_core = g_mat[0, 0, 0, ..., 2:8].astype(np.complex64)
+    expected[..., 0, :, :] -= (
+        2.0 * config.sys.beta * g_core[:, :, None, None, :, None] * g_core[None, None, :, :, None, :]
+    )
+
+    chi = local_sde.create_generalized_chi(g2, GreensFunction(g_mat))
+    assert chi is g2 and not chi.full_niw_range
+    assert np.allclose(chi.mat, expected, atol=1e-5)
+
+
+def test_double_counting_vertex_in_place_overwrites_the_magnetic_vertex():
+    """copy=False builds the double-counting vertex bit for bit in the magnetic vertex itself."""
+    from dgamore.local_four_point import LocalFourPoint
+
+    rng = np.random.default_rng(6)
+    shape = (2, 2, 2, 2, 3, 8, 6)
+    f_d = LocalFourPoint(rng.standard_normal(shape).astype(np.complex64), SpinChannel.DENS, 1, 2, False, True)
+    f_m = LocalFourPoint(rng.standard_normal(shape).astype(np.complex64), SpinChannel.MAGN, 1, 2, False, True)
+    f_d_mat = f_d.mat.copy()
+
+    ref = local_sde.double_counting_vertex(f_d, f_m)
+    assert local_sde.double_counting_vertex(f_d, f_m, copy=False) is f_m
+    assert np.array_equal(f_m.mat, ref.mat) and np.array_equal(f_d.mat, f_d_mat)
+
+
 def test_double_counting_vertex_is_the_transversal_local_part():
     """f_dc = 1/2 (F_d + 3 F_m) with the magnetic metadata, built from a copy: both inputs stay untouched."""
     from dgamore.local_four_point import LocalFourPoint
