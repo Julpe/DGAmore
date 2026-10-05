@@ -1073,8 +1073,9 @@ def test_resumed_run_shares_the_starting_iterate_per_node_before_the_first_propo
     original, before, loads, broadcasts = nonlocal_sde._share_sigma_per_node, [], [], []
 
     def spy(sigma, comm, node_comm, roots_comm):
+        first = not calls  # read before the collective share: a rank past it may already run the first proposal
         shared, win = original(sigma, comm, node_comm, roots_comm)
-        if not calls:  # before the first proposal: the starting iterate, not the loop's mixed one
+        if first:
             before.append((threading.current_thread().name, complex(shared.mat.reshape(-1)[0])))
         return shared, win
 
