@@ -22,6 +22,9 @@ from dgamore.matsubara_frequencies import MFHelper
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel, FrequencyNotation
 
+# bytes of one sub-chunk round's full-grid buffer in the distributed bubble: about one rank's L3 share
+ROUND_BUFFER_BYTES = 4 * 1024**2
+
 
 class BubbleGenerator:
     """
@@ -132,7 +135,9 @@ class BubbleGenerator:
         the R-space Green's function and its momentum-flipped, orbital-transposed partner from per-node shared-memory
         windows - and the per-column irreducible-BZ results are ring-exchanged onto the irr-BZ q-distribution
         (the same total bytes the former rank-0 scatter moved). The columns are processed in sub-chunks sized so
-        that a node's combined full-grid buffers stay well below the former rank-0 footprint; the exchange is
+        that a node's combined full-grid buffers stay well below the former rank-0 footprint and a sub-chunk's buffer
+        stays within ``ROUND_BUFFER_BYTES`` (its column-wise fill is a strided write, so a larger buffer would stream
+        every cache line through memory once per column; a column above the budget runs alone); the exchange is
         pipelined per sub-chunk on a globally derived schedule, so no rank ever holds more than its final irr-BZ
         slice plus one sub-chunk in flight.
 
@@ -175,6 +180,7 @@ class BubbleGenerator:
         col_bounds = np.linspace(0, total_cols, size + 1).astype(int)
         ncols_max = int(np.max(np.diff(col_bounds)))
         sub_cols = max(1, ncols_max * nk_irr // (6 * nk_tot), min(ncols_max, vpos // max(1, size)))
+        sub_cols = max(1, min(sub_cols, ROUND_BUFFER_BYTES // (nk_tot * nb**4 * g_r_mat.itemsize)))
         n_rounds = -(-ncols_max // sub_cols) if ncols_max else 0
 
         my_q_slice = mpi_dist_irrk.slices[rank]

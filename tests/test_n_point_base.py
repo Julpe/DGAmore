@@ -18,6 +18,7 @@ from scipy.signal import resample
 import dgamore.n_point_base as npb
 import dgamore.symmetry_reduction as sr
 from dgamore import brillouin_zone as bz
+from dgamore.hamiltonian import Hamiltonian
 from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.n_point_base import IHaveChannel, IHaveMat, IAmNonLocal, SpinChannel, FrequencyNotation, DTYPE
 
@@ -1435,6 +1436,91 @@ def test_map_to_full_bz_writes_the_expansion_without_an_output_sized_buffer(c128
     _, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     assert peak < 1.2 * full_bytes
+
+
+_SRVO3_HR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_data", "srvo3_end2end", "wan_hr.dat")
+
+
+@pytest.fixture(scope="module")
+def srvo3_monomial_grid():
+    """The SrVO3 auto grid at 4^3 discovered from wan_hr.dat, its rotations snapped to the exact signed permutations."""
+    grid = bz.KGrid(nk=(4, 4, 4), symmetries=[bz.KnownSymmetries.AUTO])
+    grid.specify_auto_symmetries(Hamiltonian().read_hr_w2k(_SRVO3_HR).get_ek(grid))
+    grid._auto_us = np.round(grid._auto_us.real) + 1j * np.round(grid._auto_us.imag)
+    return grid
+
+
+def _random_auto_grid(nb, nk=(4, 4, 2), monomial=True, seed=5):
+    """An auto grid with random signs and per-k rotations: signed permutations times powers of i, or dense unitaries."""
+    rng = np.random.default_rng(seed)
+    grid = bz.KGrid(nk=nk, symmetries=bz.two_dimensional_square_symmetries())
+    shape = (grid.nk_tot, nb, nb)
+    if monomial:
+        us = (
+            np.eye(nb)[np.argsort(rng.random(shape[:2]), axis=1)]
+            * np.array([1, 1j, -1, -1j])[rng.integers(0, 4, shape)]
+        )
+    else:
+        us = np.linalg.qr(rng.standard_normal(shape) + 1j * rng.standard_normal(shape))[0]
+    grid._auto_mode = True
+    grid._auto_us = us.reshape(*nk, nb, nb)
+    grid._auto_sigmas = rng.choice([-1.0, 1.0], nk)
+    grid._auto_conjs = np.zeros(nk, dtype=bool)
+    return grid
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+@pytest.mark.parametrize("trailing", [(), (1,), (4,), (3, 4), (5, 4)])
+@pytest.mark.parametrize("num_orbital_dimensions", [2, 4])
+@pytest.mark.parametrize("kind", ["srvo3", "one_band", "two_band"])
+def test_map_to_full_bz_monomial_gather_equals_the_einsum_unfold(
+    kind, num_orbital_dimensions, trailing, dtype, srvo3_monomial_grid, monkeypatch
+):
+    """The monomial gather gives the einsum unfold's values in both momentum layouts for any trailing extent."""
+    grid = srvo3_monomial_grid if kind == "srvo3" else _random_auto_grid(1 if kind == "one_band" else 2)
+    monkeypatch.setattr(npb, "DTYPE", dtype)
+    shape = (grid.nk_irr, *(grid._auto_us.shape[-1],) * num_orbital_dimensions, *trailing)
+    payload = _rng_payload(shape).astype(dtype)
+    # exact zeros, whose sign the two paths may set differently (IEEE equality ignores it)
+    payload[np.random.default_rng(1).random(shape) < 0.2] = 0
+    assert grid.auto_monomial_map(dtype, num_orbital_dimensions) is not None
+    fast = IAmNonLocal(payload.copy(), grid.nk, True)._map_to_full_bz(grid, num_orbital_dimensions)
+    with monkeypatch.context() as mp:
+        mp.setattr(bz.KGrid, "auto_monomial_map", MagicMock(return_value=None))
+        slow = IAmNonLocal(payload.copy(), grid.nk, True)._map_to_full_bz(grid, num_orbital_dimensions)
+    assert fast.mat.dtype == dtype and np.array_equal(fast.mat, slow.mat)
+    assert np.array_equal(fast.decompress_q_dimension().mat, slow.decompress_q_dimension().mat)
+
+
+@pytest.mark.parametrize("kind", ["plain", "dense", "monomial"])
+def test_map_to_full_bz_writes_into_the_given_buffer(kind, c128_storage):
+    """With out= every path expands into the given buffer and gives the values of a fresh expansion."""
+    if kind == "plain":
+        grid = bz.KGrid(nk=(4, 4, 2), symmetries=bz.two_dimensional_square_symmetries())
+    else:
+        grid = _random_auto_grid(2, monomial=kind == "monomial")
+    payload = _rng_payload((grid.nk_irr, 2, 2, 2, 2, 3))
+    expected = IAmNonLocal(payload.copy(), grid.nk, True)._map_to_full_bz(grid, 4).mat
+    out = np.full(expected.shape, np.nan, dtype=expected.dtype)
+    obj = IAmNonLocal(payload.copy(), grid.nk, True)._map_to_full_bz(grid, 4, out=out)
+    assert np.shares_memory(obj.mat, out) and np.array_equal(obj.mat, expected)
+
+
+def test_map_to_full_bz_monomial_gather_holds_no_output_sized_temporary(c128_storage):
+    """The monomial gather peaks at its output alone, and at a small fraction of it when writing into a buffer."""
+    grid = _random_auto_grid(2, nk=(8, 8, 4))
+    payload = _rng_payload((grid.nk_irr, 2, 2, 2, 2, 64))
+    full_bytes = grid.nk_tot * 2**4 * 64 * 16
+    out = np.empty((grid.nk_tot, 2, 2, 2, 2, 64), dtype=np.complex128)
+    grid.auto_monomial_map(np.complex128, 4)
+    peaks = []
+    for buffer in (None, out):
+        obj = IAmNonLocal(payload.copy(), grid.nk, True)
+        tracemalloc.start()
+        obj._map_to_full_bz(grid, 4, out=buffer)
+        peaks.append(tracemalloc.get_traced_memory()[1])
+        tracemalloc.stop()
+    assert peaks[0] < 1.1 * full_bytes and peaks[1] < 0.1 * full_bytes
 
 
 def test_map_to_full_bz_raises_for_invalid_num_orbital_dimensions(c128_storage):

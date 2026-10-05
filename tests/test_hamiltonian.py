@@ -392,6 +392,57 @@ def test_convham_2_orbs():
     assert np.allclose(out, 1.0)
 
 
+def _per_pair_phase_dispersion(h: Hamiltonian, k_mesh: np.ndarray) -> np.ndarray:
+    """Evaluates the dispersion with one exponential per orbital pair and lattice vector, the bit reference."""
+    result = np.zeros((*h._er.shape[1:], k_mesh.shape[1]), dtype=np.complex128)
+    for r in range(h._er.shape[0]):
+        phase = np.exp(1j * np.tensordot(h._er_r_grid[r], k_mesh, axes=([2], [0])))
+        phase /= float(h._er_r_weights[r, 0])
+        result += phase * h._er[r, ..., None]
+    return np.transpose(result, axes=(2, 0, 1))
+
+
+def _hr_hamiltonian(hr_file: str) -> Hamiltonian:
+    """Reads a hopping file from the test data with the wien2k hr reader."""
+    return Hamiltonian().read_hr_w2k(f"{os.path.dirname(os.path.abspath(__file__))}/test_data/{hr_file}")
+
+
+def _two_band_builder_hamiltonian() -> Hamiltonian:
+    """Builds a two-band hopping with inter-orbital terms through the hopping builder (one vector for all pairs)."""
+    hops = [([1, 0, 0], [1, 1], -1.0), ([0, 1, 0], [2, 2], -0.5), ([1, 1, 0], [1, 2], 0.2), ([0, 0, 1], [2, 1], 0.1)]
+    hops += [([-x, -y, -z], orbs[::-1], t) for (x, y, z), orbs, t in hops]
+    return Hamiltonian()._add_kinetic_term([HoppingElement(r, orbs, t) for r, orbs, t in hops])
+
+
+@pytest.mark.parametrize("n_bands", [1, 2, 3])
+def test_convham_2_orbs_evaluates_one_phase_per_lattice_vector_bit_identical_to_per_pair_phases(n_bands, monkeypatch):
+    """With one lattice vector for every orbital pair, each exponential covers all pairs and e(k) keeps its bits."""
+    h = {
+        1: lambda: _hr_hamiltonian("hamiltonian/wannier_hr_oneband.dat"),
+        2: _two_band_builder_hamiltonian,
+        3: lambda: _hr_hamiltonian("srvo3_end2end/wan_hr.dat"),
+    }[n_bands]()
+    k_mesh = KGrid(nk=(8, 6, 5), symmetries=[]).kmesh.reshape(3, -1)
+    shapes, exp = [], np.exp
+    with monkeypatch.context() as mp:
+        mp.setattr(np, "exp", lambda x: shapes.append(x.shape) or exp(x))
+        ek = h._convham_2_orbs(k_mesh)
+    assert h._er.shape[-1] == n_bands and np.array_equal(ek, _per_pair_phase_dispersion(h, k_mesh))
+    assert shapes == [(1, 1, k_mesh.shape[1])] * h._er.shape[0]
+
+
+def test_convham_2_orbs_keeps_per_pair_phases_when_the_lattice_vectors_differ(monkeypatch):
+    """A file whose orbital pairs carry different lattice vectors keeps one exponential per pair and its bits."""
+    h = _hr_hamiltonian("hamiltonian/wannier_hr_twoband.dat")
+    k_mesh = KGrid(nk=(8, 6, 1), symmetries=[]).kmesh.reshape(3, -1)
+    shapes, exp = [], np.exp
+    with monkeypatch.context() as mp:
+        mp.setattr(np, "exp", lambda x: shapes.append(x.shape) or exp(x))
+        ek = h._convham_2_orbs(k_mesh)
+    assert np.array_equal(ek, _per_pair_phase_dispersion(h, k_mesh))
+    assert shapes == [(2, 2, k_mesh.shape[1])] * h._er.shape[0]
+
+
 def test_convham_4_orbs():
     """_convham_4_orbs Fourier-transforms a 4-orbital real-space interaction to k-space."""
     h = Hamiltonian()

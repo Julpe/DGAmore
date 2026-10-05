@@ -4,6 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import itertools
 import tracemalloc
 from copy import deepcopy
 from unittest.mock import MagicMock
@@ -12,11 +13,15 @@ import numpy as np
 import pytest
 import scipy as sp
 
+import dgamore.config as config
+import dgamore.four_point as four_point
 import dgamore.n_point_base as npb
-from dgamore.four_point import FourPoint
+from dgamore import brillouin_zone as bz
+from dgamore import nonlocal_sde
+from dgamore.four_point import FourPoint, _is_complex_symmetric
 from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.local_four_point import LocalFourPoint
-from dgamore.n_point_base import SpinChannel, FrequencyNotation, IAmNonLocal
+from dgamore.n_point_base import SpinChannel, FrequencyNotation, IAmNonLocal, deferred_collection
 
 
 @pytest.fixture
@@ -1060,12 +1065,231 @@ def test_invert_and_sum_v2_elimination_factorizes_only_the_pairs_with_vertex(rng
     assert sizes and set(sizes) == {(8 * 6, 8 * 6)}
 
 
+def _dense_solve_reference(fp: FourPoint, rhs: np.ndarray) -> np.ndarray:
+    """Dense solve of every half-range compound slice for the one-fermion right-hand sides ``rhs``."""
+    half = deepcopy(fp).to_half_niw_range().compress_q_dimension()
+    o, vn = half.n_bands, 2 * half.niv
+    n = o * o * vn
+    out = np.empty_like(rhs)
+    for i in range(half.current_shape[0]):
+        for w in range(half.current_shape[-3]):
+            compound = half.mat[i][:, :, :, :, w].transpose(0, 1, 4, 3, 2, 5).reshape(n, n)
+            b = rhs[i][:, :, :, :, w].transpose(0, 1, 4, 3, 2).reshape(n, o * o)
+            out[i][:, :, :, :, w] = np.linalg.solve(compound, b).reshape(o, o, vn, o, o).transpose(0, 1, 4, 3, 2)
+    return out
+
+
+def _one_fermion_rhs(fp: FourPoint, rng) -> FourPoint:
+    """A random right-hand side in the layout of the one-fermion result of ``fp``'s half-range slices."""
+    half = deepcopy(fp).to_half_niw_range()
+    shape = half.current_shape[:-1]
+    return FourPoint(
+        rng.standard_normal(shape) + 1j * rng.standard_normal(shape),
+        nq=half.nq,
+        num_vn_dimensions=1,
+        has_compressed_q_dimension=True,
+        full_niw_range=False,
+    )
+
+
+@pytest.mark.parametrize("eliminated", [False, True])
+def test_invert_and_sum_v2_solves_every_right_hand_side_of_a_list(rng, monkeypatch, eliminated):
+    """With a list of rhs the per-slice solve returns each compound solution, without 1/beta, one factorization each."""
+    monkeypatch.setattr(npb, "DTYPE", np.complex128)
+    if eliminated:
+        fp, inactive = _two_atom_compound_fourpoint(rng, symmetric=False)
+    else:
+        fp, inactive = _random_compound_fourpoint(rng, 2, symmetric=False), None
+    rhs = [_one_fermion_rhs(fp, rng) for _ in range(3)]
+    factor = MagicMock(side_effect=sp.linalg.lu_factor)
+    monkeypatch.setattr(sp.linalg, "lu_factor", factor)
+    solved = deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0, inactive, rhs=rhs)
+    half = deepcopy(fp).to_half_niw_range()
+    assert len(solved) == 3 and factor.call_count == half.current_shape[0] * half.current_shape[-3]
+    for out, b in zip(solved, rhs):
+        assert out.num_vn_dimensions == 1 and np.allclose(out.mat, _dense_solve_reference(fp, b.mat), atol=1e-10)
+
+
 def test_invert_and_sum_v2_with_no_or_every_pair_inactive_takes_the_full_solve(rng):
     """An empty or a complete inactive set leaves the whole-slice solve in place, bit for bit."""
     fp = _random_compound_fourpoint(rng, 2, symmetric=False)
     full = deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0).mat
     assert np.array_equal(deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0, np.array([], dtype=int)).mat, full)
     assert np.array_equal(deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0, np.arange(4)).mat, full)
+
+
+def _kernel_inputs(rng, o, niv=3, nq=3, nw=3, full=False, two_atoms=False, broken=True):
+    """(kernel, frequency-diagonal part, shift, inactive pairs) whose slices are symmetric except at odd q + w
+    (o = 1: w = 1)."""
+    vn, nw_gamma = 2 * niv, 2 * nw - 1 if full else nw
+    g_shape, c_shape = (o,) * 4 + (nw_gamma, vn, vn), (nq,) + (o,) * 4 + (nw, vn)
+    gamma = rng.standard_normal(g_shape) + 1j * rng.standard_normal(g_shape)
+    gamma = 0.5 * (gamma + gamma.transpose(3, 2, 1, 0, 4, 6, 5))
+    chi0_inv = rng.standard_normal(c_shape) + 1j * rng.standard_normal(c_shape)
+    chi0_inv = 0.5 * (chi0_inv + chi0_inv.transpose(0, 4, 3, 2, 1, 5, 6))
+    for a in range(o):
+        for b in range(o):
+            chi0_inv[:, a, b, b, a] += 30.0
+    u = rng.standard_normal((o,) * 4)
+    u = sum(u.transpose(p) for p in itertools.permutations(range(4))) / 24
+    if two_atoms:
+        atom = np.arange(o) // 2
+        same = atom[:, None, None, None] == atom[None, :, None, None]
+        per_atom = same & same.transpose(0, 2, 1, 3) & same.transpose(0, 2, 3, 1)
+        gamma[~per_atom], u[~per_atom] = 0.0, 0.0
+    if broken and o > 1:
+        chi0_inv[:, 0, 1, 0, 0][(np.arange(nq)[:, None] + np.arange(nw)) % 2 == 1] += 0.37
+    elif broken:
+        gamma[0, 0, 0, 0, nw_gamma - nw + 1, 0, 1] += 0.5
+    gamma_r = LocalFourPoint(gamma, SpinChannel.DENS, 1, 2, full, True)
+    u_r = LocalInteraction(u, SpinChannel.DENS)
+    chi0 = FourPoint(chi0_inv, SpinChannel.NONE, (nq, 1, 1), 1, 1, False, True, True)
+    return gamma_r, chi0, u_r, gamma_r.orbital_pairs_without_vertex(u_r)
+
+
+def _spy_factorizations(monkeypatch) -> list[bool]:
+    """Records the symmetry decision of every factorized slice, in call order."""
+    flags, real = [], four_point._factorize_and_solve
+    monkeypatch.setattr(
+        four_point, "_factorize_and_solve", lambda buf, rhs, sym: flags.append(bool(sym)) or real(buf, rhs, sym)
+    )
+    return flags
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+@pytest.mark.parametrize("o, two_atoms", [(1, False), (2, False), (3, False), (4, True)])
+@pytest.mark.parametrize("full", [False, True])
+def test_invert_with_local_kernel_and_sum_is_the_assembled_v2_solve_bit_for_bit(
+    rng, monkeypatch, dtype, o, two_atoms, full
+):
+    """Each slice built from the per-w buffer solves to exactly the bits of the assembled matrix summed by v2."""
+    monkeypatch.setattr(npb, "DTYPE", dtype)
+    beta = config.sys.beta = np.float64(8.0)  # a NumPy float, as the DMFT file gives it: no operand may be promoted
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, o, full=full, two_atoms=two_atoms)
+    ref = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r).invert_and_sum_over_last_vn_v2(beta, inactive)
+    flags = _spy_factorizations(monkeypatch)
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / beta**2, beta, inactive)
+    assert set(flags) == {True, False} and (inactive.size > 0) == two_atoms
+    assert out.mat.dtype == dtype and out.channel == gamma.channel and not out.full_niw_range
+    assert out.num_vn_dimensions == 1 and np.array_equal(out.mat, ref.mat)
+
+
+_SYMMETRY_CASES = (
+    [("none", None, 0)]
+    + [("eps", "off", k) for k in (1, 3, 4, 5, 8)]
+    + [("eps", "diag", k) for k in (2, 4, 6)]
+    + [(value, where, 0) for value in ("nan", "inf") for where in ("off", "diag")]
+    + [("inf", "pair", 0)]
+)
+
+
+@pytest.mark.filterwarnings("ignore:invalid value encountered:RuntimeWarning")
+@pytest.mark.parametrize("o, niv", [(1, 3), (1, 129), (2, 33)])
+def test_invert_with_local_kernel_and_sum_decides_symmetry_like_the_whole_slice_test(rng, monkeypatch, o, niv):
+    """Per slice the split maxima give _is_complex_symmetric's decision on the assembled slice, NaN and inf included."""
+    config.sys.beta, n, decisions = 8.0, o * o * 2 * niv, set()
+    flags = _spy_factorizations(monkeypatch)
+    with deferred_collection():
+        for kind, where, size in _SYMMETRY_CASES:
+            gamma, chi0, u_r, _ = _kernel_inputs(rng, o, niv=niv, nq=2, nw=2, broken=False)
+            scale = np.finfo(np.complex64).eps * np.abs(chi0.mat).max()
+            value = {"eps": size * scale, "nan": np.nan, "inf": np.inf}.get(kind, 0.0)
+            # off: v != v' at w = 0, every q; diag: v = v' at q = 1, w = 1 (off-pair at o = 2, only max|M| at o = 1)
+            if where in ("off", "pair"):
+                gamma.mat[0, 0, 0, 0, 0, 0, 1] += value * config.sys.beta**2 if kind == "eps" else value
+            if where == "pair":
+                gamma.mat[0, 0, 0, 0, 0, 1, 0] = value
+            if where == "diag":
+                chi0.mat[1, 0, o - 1, 0, 0, 1, 0] += value
+            assembled = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r)
+            slices = assembled.mat.transpose(0, 5, 1, 2, 6, 4, 3, 7).reshape(2, 2, n, n)
+            expected = [_is_complex_symmetric(np.asfortranarray(slices[q, w])) for w in range(2) for q in range(2)]
+            ref = assembled.invert_and_sum_over_last_vn_v2(8.0)
+            flags.clear()
+            out = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / 8.0**2, 8.0)
+            assert flags == expected, (kind, where, size)
+            assert np.array_equal(out.mat, ref.mat, equal_nan=True), (kind, where, size)
+            decisions.update(expected)
+    assert decisions == {True, False}
+
+
+def _nan_above_diagonal(buf: np.ndarray) -> np.ndarray:
+    """Writes NaN into the strict upper triangle of a square buffer in place and returns it."""
+    buf[np.triu_indices(buf.shape[0], 1)] = np.nan
+    return buf
+
+
+@pytest.mark.parametrize("o, two_atoms, niv", [(2, False, 33), (4, True, 17)])
+def test_invert_with_local_kernel_and_sum_symmetric_slices_need_only_the_lower_triangle(
+    rng, monkeypatch, o, two_atoms, niv
+):
+    """NaN written above the diagonal of every symmetric slice's buffer leaves the result bit-identical."""
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, o, niv=niv, two_atoms=two_atoms)
+    ref = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / 8.0**2, 8.0, inactive)
+    real = four_point._factorize_and_solve
+
+    def poisoned(buf, rhs, symmetric):
+        return real(_nan_above_diagonal(buf) if symmetric else buf, rhs, symmetric)
+
+    monkeypatch.setattr(four_point, "_factorize_and_solve", poisoned)
+    assert np.array_equal(
+        chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / 8.0**2, 8.0, inactive).mat, ref.mat
+    )
+
+
+@pytest.mark.parametrize("o, two_atoms", [(1, False), (2, False), (3, False), (4, True)])
+def test_invert_with_local_kernel_and_rhs_gives_the_assembled_v2_solutions_bit_for_bit(rng, monkeypatch, o, two_atoms):
+    """With a list of rhs each slice solves every member against one factorization, with v2's bits on the assembly."""
+    beta = config.sys.beta = np.float64(8.0)
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, o, two_atoms=two_atoms)
+    shape = chi0.current_shape
+    rhs = [
+        FourPoint(
+            rng.standard_normal(shape) + 1j * rng.standard_normal(shape),
+            nq=chi0.nq,
+            num_vn_dimensions=1,
+            has_compressed_q_dimension=True,
+            full_niw_range=False,
+        )
+        for _ in range(2)
+    ]
+    assembled = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r)
+    ref = assembled.invert_and_sum_over_last_vn_v2(beta, inactive, rhs=[b.copy() for b in rhs])
+    flags = _spy_factorizations(monkeypatch)
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / beta**2, beta, inactive, rhs=rhs)
+    assert len(out) == 2 and len(flags) == shape[0] * shape[-2] and set(flags) == {True, False}
+    assert all(s.channel == gamma.channel and np.array_equal(s.mat, r.mat) for s, r in zip(out, ref))
+
+
+def test_invert_with_local_kernel_and_sum_without_momenta_solves_nothing(rng, monkeypatch):
+    """A rank without momenta factorizes no slice and returns the empty one-fermion sum."""
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, _ = _kernel_inputs(rng, 2, nq=0)
+    flags = _spy_factorizations(monkeypatch)
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / 8.0**2, 8.0)
+    assert flags == [] and out.mat.shape == (0, 2, 2, 2, 2, 3, 6)
+
+
+def test_invert_with_local_kernel_and_sum_keeps_the_memory_layout_of_the_inverse_bubble(rng):
+    """The sum keeps the inverse bubble's memory layout (FourPoint.invert's), on which later sums' bits depend."""
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, _ = _kernel_inputs(rng, 2)
+    chi0 = chi0.invert()
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / 8.0**2, 8.0)
+    assert not chi0.mat.flags.c_contiguous and out.mat.strides == chi0.mat.strides
+
+
+def test_invert_with_local_kernel_and_sum_holds_two_compound_slices_beyond_its_output(rng):
+    """Beyond its output the call holds the per-w buffer and the factorized copy, about two compound slices."""
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, _ = _kernel_inputs(rng, 2, niv=128, nq=1, nw=1)
+    slice_bytes = (2 * 2 * 256) ** 2 * np.dtype(np.complex64).itemsize
+    tracemalloc.start()
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / 8.0**2, 8.0)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert 2 * slice_bytes < peak - out.mat.nbytes < 2.5 * slice_bytes
 
 
 def _band_and_first_sum_reference(fp: FourPoint, niv_band: int, beta: float) -> tuple[np.ndarray, np.ndarray]:
@@ -1120,6 +1344,76 @@ def test_invert_on_anti_diagonal_takes_no_lu_on_symmetric_and_half_size_ones_on_
     assert sizes == []
     deepcopy(_random_compound_fourpoint(rng, 2, symmetric=False, niv=4)).invert_on_anti_diagonal(2, 1, 8.0)
     assert sizes and max(sizes) == 2 * 2 * 4
+
+
+def _assembled_window(gamma: LocalFourPoint, chi0: FourPoint, u_r: LocalInteraction, w_start: int) -> FourPoint:
+    """The matrix of chi0's bosonic window [w_start, ...) assembled by the kernel step's builder."""
+    half = gamma.copy().to_half_niw_range() if gamma.full_niw_range else gamma
+    return nonlocal_sde.create_inverse_auxiliary_chi_r_q(half.take_wn_slice(w_start, half.current_shape[-3]), chi0, u_r)
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+@pytest.mark.parametrize("o, two_atoms", [(1, False), (2, False), (3, False), (4, True)])
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize("w_start", [0, 1])
+def test_invert_with_local_kernel_on_anti_diagonal_is_the_assembled_band_solve_bit_for_bit(
+    rng, monkeypatch, dtype, o, two_atoms, full, w_start
+):
+    """Each slice built from the per-w buffer gives invert_on_anti_diagonal's bits and decisions on the assembly."""
+    monkeypatch.setattr(npb, "DTYPE", dtype)
+    beta = config.sys.beta = np.float64(8.0)  # a NumPy float, as the DMFT file gives it: no operand may be promoted
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, o, niv=4, nw=4, full=full, two_atoms=two_atoms)
+    chi0 = chi0.take_wn_slice(w_start, 4)
+    lu_calls = MagicMock(side_effect=sp.linalg.lu_factor)
+    monkeypatch.setattr(sp.linalg, "lu_factor", lu_calls)
+    ref_band, ref_first = _assembled_window(gamma, chi0, u_r, w_start).invert_on_anti_diagonal(
+        2, w_start, beta, inactive
+    )
+    ref_calls = lu_calls.call_count
+    lu_calls.reset_mock()
+    band, first = chi0.invert_with_local_kernel_on_anti_diagonal(gamma, u_r, 1.0 / beta**2, beta, 2, w_start, inactive)
+    assert lu_calls.call_count == ref_calls and 0 < ref_calls < 2 * chi0.current_shape[0] * chi0.current_shape[-2]
+    assert (
+        band.mat.dtype == dtype and band.channel == first.channel == gamma.channel and (inactive.size > 0) == two_atoms
+    )
+    assert np.array_equal(band.mat, ref_band.mat) and np.array_equal(first.mat, ref_first.mat)
+
+
+@pytest.mark.parametrize("o, two_atoms, niv", [(2, False, 33), (4, True, 17)])
+def test_invert_with_local_kernel_on_anti_diagonal_symmetric_slices_need_only_the_lower_triangle(
+    rng, monkeypatch, o, two_atoms, niv
+):
+    """NaN written above the diagonal of every buffer handed to ?sysv leaves the band and its sum bit-identical."""
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, o, niv=niv, nw=2, two_atoms=two_atoms)
+    ref = chi0.invert_with_local_kernel_on_anti_diagonal(gamma, u_r, 1.0 / 8.0**2, 8.0, niv // 2, 0, inactive)
+    real = sp.linalg.get_lapack_funcs
+
+    def poisoned_sysv(names, dtype):
+        sysv, lwork = real(names, dtype=dtype)
+        return lambda a, *args, **kw: sysv(_nan_above_diagonal(a), *args, **kw), lwork
+
+    monkeypatch.setattr(sp.linalg, "get_lapack_funcs", poisoned_sysv)
+    out = chi0.invert_with_local_kernel_on_anti_diagonal(gamma, u_r, 1.0 / 8.0**2, 8.0, niv // 2, 0, inactive)
+    assert all(np.array_equal(a.mat, b.mat) for a, b in zip(out, ref))
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+@pytest.mark.parametrize("o", [1, 2, 3])
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize("w_start", [0, 1])
+def test_invert_with_local_kernel_is_the_assembled_whole_box_inverse_bit_for_bit(
+    rng, monkeypatch, dtype, o, full, w_start
+):
+    """Each slice built from the per-w buffer and inverted alone gives FourPoint.invert's bits and layout."""
+    monkeypatch.setattr(npb, "DTYPE", dtype)
+    beta = config.sys.beta = np.float64(8.0)
+    gamma, chi0, u_r, _ = _kernel_inputs(rng, o, niv=4, nw=4, full=full)
+    chi0 = chi0.take_wn_slice(w_start, 4)
+    ref = _assembled_window(gamma, chi0, u_r, w_start).invert(False)
+    out = chi0.invert_with_local_kernel(gamma, u_r, 1.0 / beta**2, w_start)
+    assert out.channel == gamma.channel and out.num_vn_dimensions == 2 and not out.full_niw_range
+    assert out.mat.strides == ref.mat.strides and np.array_equal(out.mat, ref.mat)
 
 
 def _compound_product_reference_q(mat1: np.ndarray, mat2: np.ndarray, notation: FrequencyNotation) -> np.ndarray:
@@ -1209,3 +1503,13 @@ def test_pow_pp_squares_in_pp_compound_space_without_explicit_identity():
     ref = _compound_product_reference_q(mat64, mat64, FrequencyNotation.PP)
     assert result.frequency_notation == FrequencyNotation.PP
     assert np.allclose(result.mat[:, :, :, :, :, 0], ref, atol=1e-4)
+
+
+def test_map_to_full_bz_unfolds_into_the_given_buffer(rng):
+    """map_to_full_bz forwards out=, so the unfolded vertex lives in the caller's buffer."""
+    grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    shape = (grid.nk_irr, 2, 2, 2, 2, 3)
+    mat = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    out = np.empty((grid.nk_tot, *shape[1:]), dtype=np.complex64)
+    unfolded = FourPoint(mat, SpinChannel.NONE, grid.nk, 1, 0, False, True, True).map_to_full_bz(grid, out=out)
+    assert np.shares_memory(unfolded.mat, out) and np.array_equal(out, mat[grid.irrk_inv.ravel()])

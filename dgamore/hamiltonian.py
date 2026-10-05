@@ -768,7 +768,9 @@ class Hamiltonian:
     def _convham_2_orbs(self, k_mesh: np.ndarray) -> np.ndarray:
         r"""
         Fourier-transforms the real-space hopping to the band dispersion :math:`\varepsilon_{12}(\mathbf{k})`, looping
-        over lattice vectors to keep the memory footprint low.
+        over lattice vectors to keep the memory footprint low. When the phase argument
+        :math:`\mathbf{k} \cdot \mathbf{R}` of a lattice vector is the same for every orbital pair (wien2k hr files, the
+        hopping builders), its exponential is evaluated once and broadcast over the orbital pairs.
 
         :param k_mesh: The k-points as an array of shape ``[3, nk]``.
         :return: The band dispersion of shape ``[nk, o1, o2]``.
@@ -780,7 +782,10 @@ class Hamiltonian:
         result = np.zeros((n_orbs, n_orbs, nk), dtype=np.complex128)
 
         for r in range(n_rp):
-            phase = np.exp(1j * np.tensordot(self._er_r_grid[r], k_mesh, axes=([2], [0])))
+            arg = np.tensordot(self._er_r_grid[r], k_mesh, axes=([2], [0]))
+            if (arg == arg[:1, :1]).all():
+                arg = arg[:1, :1]
+            phase = np.exp(1j * arg)
             phase /= float(self._er_r_weights[r, 0])
             result += phase * self._er[r, ..., None]
 

@@ -5,6 +5,7 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
+import tracemalloc
 from contextlib import nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
@@ -17,7 +18,7 @@ import dgamore.config as config
 import dgamore.mpi_utils as mu
 import dgamore.n_point_base as n_point_base
 from dgamore import eliashberg_solver as es
-from dgamore import nonlocal_sde
+from dgamore import memory_estimator, nonlocal_sde
 from dgamore.dga_logger import DgaLogger
 from dgamore.interaction import Interaction, LocalInteraction
 from dgamore import brillouin_zone as bz
@@ -2721,7 +2722,7 @@ def test_slice_constructor_is_bit_invariant_under_the_chunk_budget(setup, monkey
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
     one_chunk = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
 
-    one_wn = no**4 * (2 * NIV) ** 2 * np.dtype(es.DTYPE).itemsize
+    one_wn = no**4 * (2 * niv_pp) ** 2 * np.dtype(es.DTYPE).itemsize
     for budget in (1, 2 * one_wn, N_W * one_wn, 2 * N_W * one_wn):
         gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
         chunked = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist, chunk_bytes=budget)
@@ -2731,6 +2732,100 @@ def test_slice_constructor_is_bit_invariant_under_the_chunk_budget(setup, monkey
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
     per_w = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
     assert np.array_equal(one_chunk.mat, per_w.mat)
+
+
+def _assembled_band(chi0, gamma_r, u_r, scale, beta, niv_band, w_start, inactive_pairs=None):
+    """The band solve of the Bethe-Salpeter window the kernel step's builder assembles (stands in for
+    invert_with_local_kernel_on_anti_diagonal)."""
+    gamma_w = gamma_r.take_wn_slice(w_start, w_start + chi0.current_shape[-2])
+    matrix = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma_w, chi0, u_r)
+    return matrix.invert_on_anti_diagonal(niv_band, w_start, beta, inactive_pairs)
+
+
+def _assembled_inverse(chi0, gamma_r, u_r, scale, w_start=0):
+    """FourPoint.invert of the Bethe-Salpeter window the kernel step's builder assembles (stands in for
+    invert_with_local_kernel)."""
+    gamma_w = gamma_r.take_wn_slice(w_start, w_start + chi0.current_shape[-2])
+    return nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma_w, chi0, u_r).invert(False)
+
+
+@pytest.mark.parametrize("save_fq", [False, True])
+@pytest.mark.parametrize("symmetric_bubble", [True, False])
+@pytest.mark.parametrize("no", [1, 3])
+def test_pairing_vertex_build_gives_the_bits_of_the_assembled_bethe_salpeter_window(
+    setup, monkeypatch, save_fq, symmetric_bubble, no
+):
+    """Building the slices one at a time gives the pairing vertex and the streamed vertex of the assembled window."""
+    config.sys.n_bands, config.sys.beta = no, np.float64(7.3)  # a NumPy-float beta, as the DMFT file gives it
+    config.eliashberg.save_fq = save_fq
+    niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
+    chi0_mat, gamma_mat, u_mat = _toy_arrays(no, np.random.default_rng(4), symmetric_bubble)
+    build = es.create_pairing_vertex_streaming_fq if save_fq else es.create_pairing_vertex_slice_q_r
+    file_path = f"{config.output.output_path}/f_irrq_dens.npy"
+
+    gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
+    per_slice = build(u_loc, v_nonloc, gamma_r, niv_pp, dist).mat
+    streamed = np.load(file_path) if save_fq else None
+
+    monkeypatch.setattr(FourPoint, "invert_with_local_kernel_on_anti_diagonal", _assembled_band)
+    monkeypatch.setattr(FourPoint, "invert_with_local_kernel", _assembled_inverse)
+    gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
+    assembled = build(u_loc, v_nonloc, gamma_r, niv_pp, dist).mat
+
+    assert per_slice.dtype == np.complex64 and np.array_equal(per_slice, assembled)
+    assert not save_fq or np.array_equal(streamed, np.load(file_path))
+
+
+def _write_random_intermediates(no: int, niv: int, niw: int, nq: int):
+    """Writes random rank-0 pairing-vertex intermediates of the given box and returns (gamma_r, u_loc, v_nonloc)."""
+    config.sys.n_bands, config.box.niv_core, config.box.niw_core = no, niv, niw
+    config.lattice.k_grid = bz.KGrid((nq, 1, 1), symmetries=[])
+    rng, vn, wp = np.random.default_rng(3), 2 * niv, niw + 1
+    gamma = rng.standard_normal((no,) * 4 + (wp, vn, vn)) + 1j * rng.standard_normal((no,) * 4 + (wp, vn, vn))
+    chi0_inv = rng.standard_normal((nq,) + (no,) * 4 + (wp, vn)) + 1j * rng.standard_normal(
+        (nq,) + (no,) * 4 + (wp, vn)
+    )
+    for a, b in np.ndindex(no, no):
+        chi0_inv[:, a, b, b, a] += 30.0
+    path = config.output.eliashberg_path
+    np.save(f"{path}/gchi0_q_inv_rank_0.npy", chi0_inv.astype(np.complex64))
+    np.save(f"{path}/vrg_q_dens_rank_0.npy", (0.01 * chi0_inv + 1.0).astype(np.complex64))
+    np.save(f"{path}/chi_phys_q_dens_rank_0.npy", (0.01 * chi0_inv[..., 0]).astype(np.complex64))
+    u_loc = LocalInteraction(rng.standard_normal((no,) * 4))
+    v_nonloc = Interaction(np.zeros((nq,) + (no,) * 4), SpinChannel.NONE, (nq, 1, 1), True)
+    return LocalFourPoint(gamma, SpinChannel.DENS, 1, 2, False, True), u_loc, v_nonloc
+
+
+@pytest.mark.parametrize("save_fq, no, niv, niw", [(False, 3, 12, 12), (False, 2, 20, 6), (True, 3, 12, 12)])
+@pytest.mark.parametrize("budget", [1, memory_estimator.MAX_CHUNK_BUDGET_BYTES])
+def test_fq_estimate_bounds_the_traced_peak_of_the_pairing_vertex_build(setup, save_fq, no, niv, niw, budget):
+    """The modeled fq branch covers the traced peak of the build at one-frequency chunks and at whole momenta."""
+    config.eliashberg.save_fq = save_fq
+    gamma_r, u_loc, v_nonloc = _write_random_intermediates(no, niv, niw, nq=2)
+    niv_pp = min(niw // 2, niv // 2)
+    build = es.create_pairing_vertex_streaming_fq if save_fq else es.create_pairing_vertex_slice_q_r
+    tracemalloc.start()
+    try:
+        build(u_loc, v_nonloc, gamma_r, niv_pp, _make_single_rank_distributor(), chunk_bytes=budget)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    modeled = memory_estimator.estimate_peaks(
+        n_bands=no,
+        nk_tot=2,
+        nk_irr=2,
+        niw_core=niw,
+        niv_core=niv,
+        niv_full=niv,
+        niv_cut=niv + niw,
+        niv_dmft=niv + niw,
+        niv_pp=niv_pp,
+        n_ranks=1,
+        with_eliashberg=True,
+        save_fq=save_fq,
+        chunk_budgets=memory_estimator.ChunkBudgets(fq=budget),
+    )["fq"].off_distributed
+    assert 0.7 * modeled < peak <= modeled
 
 
 def test_pp_band_reads_the_negative_bosonic_half_by_hermiticity():

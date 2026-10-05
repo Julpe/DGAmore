@@ -18,6 +18,7 @@ import functools
 import itertools as it
 import logging
 import os
+import pickle
 import socket
 import sys
 import traceback
@@ -95,23 +96,17 @@ def run_dga_routine(comm: MPI.Comm) -> None:
         g_dmft_per_ineq, sigma_dmft_per_ineq, g2_dens_per_ineq, g2_magn_per_ineq = (
             dga_io.load_from_dmft_file_and_update_config()
         )
+        # rank 0 alone evaluates e(k) (cached in the Hamiltonian) and the auto symmetries; the broadcast below ships
+        # them to every rank
+        ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
+        if is_auto_symmetries(config.lattice.k_grid.symmetries):
+            config.lattice.k_grid.specify_auto_symmetries(ek)
     else:
         g_dmft_per_ineq, sigma_dmft_per_ineq, g2_dens_per_ineq, g2_magn_per_ineq = None, None, None, None
 
-    (
-        config.dmft,
-        config.lattice,
-        config.box,
-        config.output,
-        config.sys,
-        config.self_consistency,
-        config.stabilization,
-        config.eliashberg,
-        config.lambda_correction,
-        config.self_energy_interpolation,
-        config.ana_cont,
-    ) = comm.bcast(
-        (
+    if comm.size > 1:
+        # pickled and broadcast in sub-2 GB pieces: e(k) and the symmetry maps outgrow one message on large grids
+        payload = (
             config.dmft,
             config.lattice,
             config.box,
@@ -123,9 +118,24 @@ def run_dga_routine(comm: MPI.Comm) -> None:
             config.lambda_correction,
             config.self_energy_interpolation,
             config.ana_cont,
-        ),
-        root=0,
-    )
+        )
+        blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL) if comm.rank == 0 else b""
+        blob = mpi_utils.bcast_rows(comm, np.frombuffer(blob, np.uint8), 0)
+        if comm.rank != 0:
+            (
+                config.dmft,
+                config.lattice,
+                config.box,
+                config.output,
+                config.sys,
+                config.self_consistency,
+                config.stabilization,
+                config.eliashberg,
+                config.lambda_correction,
+                config.self_energy_interpolation,
+                config.ana_cont,
+            ) = pickle.loads(blob)
+        del payload, blob
 
     setup_lambda_correction_settings()
 
@@ -147,7 +157,6 @@ def run_dga_routine(comm: MPI.Comm) -> None:
     ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
 
     if is_auto_symmetries(config.lattice.k_grid.symmetries):
-        config.lattice.k_grid.specify_auto_symmetries(ek)
         logger.info(
             f"Automatically determined symmetries for the k-grid. The irreducible BZ has "
             f"{config.lattice.k_grid.nk_irr}/{config.lattice.k_grid.nk_tot} elements."
@@ -568,10 +577,11 @@ def run_dga_routine(comm: MPI.Comm) -> None:
 def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     """
     Verifies from the host memory available on every node the job runs on, together with an analytic estimate of
-    each heavy step's peak, that the run fits: the FFT bubble, the chunked auxiliary-susceptibility sum, the
-    Schwinger-Dyson contraction, the local Schwinger-Dyson pass, the pairing-vertex construction and the Eliashberg
+    each heavy step's peak, that the run fits: the FFT bubble, the per-slice auxiliary-susceptibility sum, the
+    Schwinger-Dyson contraction, the local Schwinger-Dyson pass, the self-consistency mixing step and
+    chemical-potential update, the final self-energy interpolation, the pairing-vertex construction and the Eliashberg
     solver (which alone has two variants, in-memory versus its block-distributed grid fallback), and sizes the
-    chunk budgets of the three chunked builds from the same estimate.
+    chunk budgets of the two chunked builds from the same estimate.
     Must be called only after the irreducible BZ is known (i.e. after auto-symmetry discovery), as the estimate depends on ``k_grid.nk_irr``.
 
     The budget is a **node total**: on a node with ``r`` ranks the memory held by all of them at a branch's peak is
@@ -588,10 +598,10 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     solves then run concurrently on the same node. A :class:`MemoryError` is raised only if the
     path that would actually run does not fit.
 
-    The three chunked builds get the memory their residents leave below the node budget: for every chunked branch
+    The two chunked builds get the memory their residents leave below the node budget: for every chunked branch
     :func:`dgamore.memory_estimator.max_chunk_budget` searches the largest per-rank chunk budget whose modeled node
     total stays inside every node's line of available memory (identical on every rank, as the estimate is). The
-    results of all three builds do not depend on their chunking. The fit checks then model exactly the budgets the
+    results of both builds do not depend on their chunking. The fit checks then model exactly the budgets the
     builds receive.
 
     :param comm: The MPI communicator (used to group ranks by node).
@@ -657,7 +667,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
             node_total(bp, distributed, single, r) <= avail * NODE_MEMORY_FRACTION for r, avail in nodes.values()
         )
 
-    zero_budgets = memory_estimator.ChunkBudgets(0, 0, 0)
+    zero_budgets = memory_estimator.ChunkBudgets(0, 0)
 
     def branch_total(key: str, budget: int, r: int) -> float:
         """Node total of the chunked branch ``key`` on an ``r``-rank node at the chunk ``budget``."""
@@ -675,9 +685,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
             )
         )
 
-    budgets = memory_estimator.ChunkBudgets(
-        chiq_aux=sized_budget("chiq_aux"), sde=sized_budget("sde"), fq=sized_budget("fq")
-    )
+    budgets = memory_estimator.ChunkBudgets(sde=sized_budget("sde"), fq=sized_budget("fq"))
     peaks = estimate(chunk_budgets=budgets)
 
     def team_need(n_ranks: int) -> float:
@@ -703,8 +711,8 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         return "whole block" if budget >= memory_estimator.MAX_CHUNK_BUDGET_BYTES else f"{budget / 1024**3:.3f} GB"
 
     logger.info(
-        f"Chunk budgets per rank: auxiliary susceptibility {budget_label(budgets.chiq_aux)}, self-energy contraction "
-        f"{budget_label(budgets.sde)}, pairing vertex {budget_label(budgets.fq)}."
+        f"Chunk budgets per rank: self-energy contraction {budget_label(budgets.sde)}, pairing vertex "
+        f"{budget_label(budgets.fq)}."
     )
 
     # The Schwinger-Dyson contraction always runs the column-distributed real-space path (the q-loop variant is
@@ -736,6 +744,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         ("chi0q", "Bare bubble"),
         ("chiq_aux", "Auxiliary susceptibility"),
         ("sigma_loop", "self-consistency self-energy step"),
+        ("mu_update", "chemical-potential update"),
         ("sigma_interp", "self-energy interpolation"),
         ("fq", "Pairing-vertex construction"),
         ("lanczos", "Eliashberg solver"),

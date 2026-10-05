@@ -605,6 +605,21 @@ def test_auto_transform_groups_match_the_rounded_bytes_signature_in_first_member
     assert [g.tolist() for g in sr.auto_transform_groups(us.conj(), sigmas, conjs)] == list(reference.values())
 
 
+@pytest.mark.parametrize(
+    "sigma, conj, shift, expected",
+    [
+        (1.0, False, 0.0, True),
+        (1.0, False, 1e-9, True),
+        (-1.0, False, 0.0, False),
+        (1.0, True, 0.0, False),
+        (1.0, False, 1e-3, False),
+    ],
+)
+def test_leaves_unchanged_holds_only_for_a_unitary_identity_with_unit_sign(sigma, conj, shift, expected):
+    """leaves_unchanged is True only for sigma 1, no conjugation and U the identity up to np.allclose."""
+    assert sr.leaves_unchanged(np.eye(3, dtype=np.complex64) + shift, sigma, conj) == expected
+
+
 def test_apply_auto_orbital_transform_identity_rows_are_left_unchanged():
     """apply_auto_orbital_transform leaves identity rows unchanged."""
     mat = np.arange(2 * 2 * 2, dtype=np.complex128).reshape(2, 2, 2)

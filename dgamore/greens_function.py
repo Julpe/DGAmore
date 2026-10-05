@@ -16,6 +16,7 @@ import numpy as np
 from scipy import optimize as opt
 
 from dgamore.matsubara_frequencies import MFHelper
+from dgamore.mpi_utils import MpiDistributor
 from dgamore.self_energy import SelfEnergy
 from dgamore.two_point import TwoPoint
 
@@ -48,7 +49,14 @@ def _fermi_dirac_density(h: np.ndarray, beta: float) -> np.ndarray:
     return (eigenvecs * rho_diag[..., None, :]) @ np.linalg.inv(eigenvecs)
 
 
-def get_total_fill(mu: float, ek: np.ndarray, sigma_mat: np.ndarray, beta: float, smom0: np.ndarray) -> float:
+def get_total_fill(
+    mu: float,
+    ek: np.ndarray,
+    sigma_mat: np.ndarray,
+    beta: float,
+    smom0: np.ndarray,
+    mpi_dist: MpiDistributor | None = None,
+) -> float:
     r"""
     Returns the total filling for a given :math:`\mu`, self-energy and kinetic Hamiltonian. A local model Green's
     function built from the self-energy moment is subtracted to accelerate the Matsubara sum convergence. This is
@@ -56,11 +64,17 @@ def get_total_fill(mu: float, ek: np.ndarray, sigma_mat: np.ndarray, beta: float
     :meth:`GreensFunction.get_fill_nonlocal` is the k-resolved counterpart that additionally returns the
     occupation matrices. Both share the Fermi-Dirac density matrix via :func:`_fermi_dirac_density`.
 
+    With ``mpi_dist`` every rank builds and inverts the Dyson matrix of its own momenta only, and the momentum sum
+    continues from rank to rank in momentum order (:meth:`MpiDistributor.ordered_sum`); rank 0's filling is broadcast,
+    so every rank returns the filling of the whole grid, bit-identical to the single-process evaluation.
+
     :param mu: Chemical potential :math:`\mu`.
-    :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`, shape ``[kx, ky, kz, o1, o2]``.
-    :param sigma_mat: Self-energy array, shape ``[k, o1, o2, v]``.
+    :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})` on the whole grid, shape ``[kx, ky, kz, o1, o2]``.
+    :param sigma_mat: Self-energy array, shape ``[k, o1, o2, v]``; with ``mpi_dist`` only this rank's momenta.
     :param beta: Inverse temperature :math:`\beta`.
     :param smom0: Zeroth moment :math:`\Sigma_\infty` of the self-energy, shape ``[o1, o2]``.
+    :param mpi_dist: MPI distributor over the full-BZ momenta (see :class:`MpiDistributor`), or ``None`` for the
+        whole grid on this process.
     :return: The total filling (electron number) :math:`n`.
     """
     n_bands = sigma_mat.shape[-2]
@@ -74,17 +88,26 @@ def get_total_fill(mu: float, ek: np.ndarray, sigma_mat: np.ndarray, beta: float
     g_model_mat = GreensFunction._invert_last_orbital_block(mat)
 
     ek = ek.reshape(np.prod(ek.shape[:3]), n_bands, n_bands)  # sigma will always enter with shape (k,o1,o2,v)
-    mat = iv_bands[None, ...] + mu_bands[None, ..., None] - ek[..., None] - sigma_mat
-    g_full_mat = GreensFunction._invert_last_orbital_block(mat)
-    g_loc_mat = np.mean(g_full_mat, axis=0)
+    if mpi_dist is not None:
+        ek = ek[mpi_dist.my_slice]
+    mat = iv_bands[None, ...] + mu_bands[None, ..., None] - ek[..., None]
+    g_full_mat = GreensFunction._invert_last_orbital_block(np.subtract(mat, sigma_mat, out=mat))
+    g_loc_mat = np.mean(g_full_mat, axis=0) if mpi_dist is None else mpi_dist.ordered_sum(g_full_mat) / mpi_dist.ntasks
 
     rho_loc = _fermi_dirac_density(hloc.real + smom0 - mu_bands, beta)
     occ = rho_loc + np.sum(g_loc_mat.real - g_model_mat.real, axis=-1) / beta
-    return 2.0 * np.trace(occ).real
+    fill = 2.0 * np.trace(occ).real
+    return fill if mpi_dist is None else mpi_dist.bcast(fill, root=0)
 
 
 def root_fun(
-    mu: float, target_filling: float, ek: np.ndarray, sigma_mat: np.ndarray, beta: float, smom0: np.ndarray
+    mu: float,
+    target_filling: float,
+    ek: np.ndarray,
+    sigma_mat: np.ndarray,
+    beta: float,
+    smom0: np.ndarray,
+    mpi_dist: MpiDistributor | None = None,
 ) -> float:
     r"""
     Residual function used to find a new chemical potential :math:`\mu` via Newton's method: the difference between
@@ -93,12 +116,14 @@ def root_fun(
     :param mu: Chemical potential :math:`\mu`.
     :param target_filling: Desired total filling.
     :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
-    :param sigma_mat: Self-energy array, shape ``[k, o1, o2, v]``.
+    :param sigma_mat: Self-energy array, shape ``[k, o1, o2, v]``; with ``mpi_dist`` only this rank's momenta.
     :param beta: Inverse temperature :math:`\beta`.
     :param smom0: Zeroth moment :math:`\Sigma_\infty` of the self-energy.
+    :param mpi_dist: MPI distributor over the full-BZ momenta (see :class:`MpiDistributor`), or ``None`` for the
+        whole grid on this process.
     :return: The signed filling residual ``filling(mu) - target_filling``.
     """
-    return get_total_fill(mu, ek, sigma_mat, beta, smom0) - target_filling
+    return get_total_fill(mu, ek, sigma_mat, beta, smom0, mpi_dist) - target_filling
 
 
 # Largest filling residual accepted from a "converged" Newton result; genuine roots sit orders of magnitude below
@@ -115,7 +140,8 @@ def _find_mu_bracket(
     closest to ``mu0``, which keeps a self-consistency trajectory in its current basin.
 
     :param mu0: Center of the search interval.
-    :param args: The :func:`root_fun` arguments after ``mu`` (target filling, dispersion, self-energy, beta, moment).
+    :param args: The :func:`root_fun` arguments after ``mu`` (target filling, dispersion, self-energy, beta, moment,
+        distributor).
     :param initial_width: Half-width of the first interval.
     :param max_width: Half-width beyond which the search gives up.
     :return: A bracketing interval ``(lo, hi)``, or ``None`` if no sign change was found.
@@ -138,6 +164,7 @@ def update_mu(
     smom0: np.ndarray,
     logger=None,
     tol: float = 1e-6,
+    mpi_dist: MpiDistributor | None = None,
 ) -> float:
     r"""
     Updates the chemical potential to match the target filling by using Newton's method to find the optimal
@@ -145,20 +172,26 @@ def update_mu(
     away from an actual root, the root nearest the starting value is found instead with a bracketed Brent search
     (see :func:`_find_mu_bracket`). The starting value is returned unchanged only if no bracket exists.
 
+    With ``mpi_dist`` every rank of its communicator must call this with its own momenta: each filling evaluation
+    is distributed (see :func:`get_total_fill`) and returns the same value on every rank, so all ranks run the
+    same search in lockstep and return the same :math:`\mu`, bit-identical to the single-process search.
+
     :param mu0: Initial guess for the chemical potential.
     :param target_filling: Desired total filling.
     :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
-    :param sigma_mat: Self-energy array, shape ``[k, o1, o2, v]``.
+    :param sigma_mat: Self-energy array, shape ``[k, o1, o2, v]``; with ``mpi_dist`` only this rank's momenta.
     :param beta: Inverse temperature :math:`\beta`.
-    :param smom0: Zeroth moment :math:`\Sigma_\infty` of the self-energy.
+    :param smom0: Zeroth moment :math:`\Sigma_\infty` of the self-energy (the same on every rank).
     :param logger: Optional logger; if given, the bracketed fallback is logged at info level and a fully failed
         root search at warning level.
     :param tol: Root search tolerance for the chemical potential.
+    :param mpi_dist: MPI distributor over the full-BZ momenta (see :class:`MpiDistributor`), or ``None`` for the
+        whole grid on this process.
     :return: The updated (real) chemical potential, or ``mu0`` if no root was found.
     :raises ValueError: If the converged chemical potential has a non-negligible imaginary part.
     """
     mu = mu0
-    args = (target_filling, ek, sigma_mat, beta, smom0)
+    args = (target_filling, ek, sigma_mat, beta, smom0, mpi_dist)
     try:
         mu = opt.newton(root_fun, mu, args=args, tol=tol)
         # the secant step criterion can also "converge" inside a flat filling region far from any root, so the

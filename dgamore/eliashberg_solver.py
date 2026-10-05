@@ -193,14 +193,19 @@ def _build_ladder_vertex_chunk(
     right-sided three-leg vertex :math:`\tilde\gamma^{\mathrm{q}\nu'}_{r;1234} = \beta \sum_{ab}\sum_{\nu}
     \chi^{*;\mathrm{q}\nu\nu'}_{r;12ab} (\chi^{\mathrm{q}\nu'}_{0;ba34})^{-1}` of the separable part sums the
     auxiliary susceptibility over its first frequency, which the build takes from the same inversion (exact also where
-    the Bethe-Salpeter matrix is not complex-symmetric).
+    the Bethe-Salpeter matrix is not complex-symmetric). The Bethe-Salpeter matrix is built one compound slice at a
+    time from the local vertex and the inverse bubble, never as a whole window.
 
     With ``niv_pp`` given, only what the :math:`\omega' = 0` pp band reads is built: the auxiliary susceptibility on
-    the anti-diagonal :math:`\nu + \nu' = \omega` of the pp box (see :meth:`FourPoint.invert_on_anti_diagonal`),
-    and the whole chain on the pp box, so the result is exact on that anti-diagonal only. With ``niv_pp`` None the
-    whole core box is inverted and every entry is exact (the streamed full vertex).
+    the anti-diagonal :math:`\nu + \nu' = \omega` of the pp box (see
+    :meth:`FourPoint.invert_with_local_kernel_on_anti_diagonal`, with the inverse bubble as the frequency-diagonal
+    part, the kernel :math:`\Gamma_{r}`, the shift :math:`U_{r}` and the scale :math:`1/\beta^2`), and the whole
+    chain on the pp box, so the result is exact on that anti-diagonal only. With ``niv_pp`` None the whole core box
+    is inverted (see :meth:`FourPoint.invert_with_local_kernel`) and every entry is exact (the streamed full
+    vertex).
 
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel, from :math:`\omega = 0` on
+        (half bosonic range) or on the full range.
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` of the momenta.
     :param vrg_q_r_left: The three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}` of the momenta.
     :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}` of the momenta.
@@ -213,22 +218,22 @@ def _build_ladder_vertex_chunk(
     :return: The ladder vertex over that window as a :class:`FourPoint` (half niw range, two fermionic dimensions).
     """
     beta = config.sys.beta
+    u_r_loc = u_loc.as_channel(gamma_r.channel)
     gchi0_w = gchi0_q_inv.take_wn_slice(w_start, w_stop)
-    matrix = nonlocal_sde.create_inverse_auxiliary_chi_r_q(
-        gamma_r.take_wn_slice(w_start, w_stop), gchi0_w, u_loc.as_channel(gamma_r.channel)
-    )
     vrg_left_w = vrg_q_r_left.take_wn_slice(w_start, w_stop)
     if niv_pp is None:
-        chi_aux = matrix.invert(False)
+        chi_aux = gchi0_w.invert_with_local_kernel(gamma_r, u_r_loc, 1.0 / beta**2, w_start)
         chi_aux_first_sum = chi_aux.sum_over_vn(beta, axis=(-2,))
     else:
-        chi_aux, chi_aux_first_sum = matrix.invert_on_anti_diagonal(niv_pp, w_start, beta, inactive_pairs)
-        matrix.free()
+        chi_aux, chi_aux_first_sum = gchi0_w.invert_with_local_kernel_on_anti_diagonal(
+            gamma_r, u_r_loc, 1.0 / beta**2, beta, niv_pp, w_start, inactive_pairs
+        )
         gchi0_w = gchi0_w.cut_niv(niv_pp)
         vrg_left_w = vrg_left_w.cut_niv(niv_pp)
 
-    # eager rebinding releases chi* right after the first matmul; the bubble term enters on the diagonal in place
+    # chi* is released right after the first matmul and its product by rebinding; the bubble term enters in place
     f_chunk = gchi0_w @ chi_aux
+    del chi_aux
     f_chunk = f_chunk @ gchi0_w
     f_chunk = f_chunk.scale(-(beta**2)).add_on_vn_diagonal(gchi0_w, factor=beta**2)
 
@@ -322,10 +327,11 @@ def _build_pairing_vertex_pp(
     inactive = gamma_r.orbital_pairs_without_vertex(u_loc.as_channel(channel))
     f_pp_mat = np.zeros((len(my_irr_q_list),) + (n_bands,) * 4 + (2 * niv_pp,) * 2, dtype=gamma_r.mat.dtype)
 
-    # one byte budget bounds the transient: as many whole-box momenta as fit (small problems degenerate to the
-    # single batched build), and where even one momentum's box exceeds it, that momentum's bosonic axis is chunked
+    # the budget bounds a chunk's two-fermion window on the box its chain runs on (pp box for the band, core box for a
+    # streamed full vertex): as many whole momenta as fit, else one momentum's bosonic axis is chunked
     budget = SLICE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
-    one_wn_bytes = n_bands**4 * (2 * config.box.niv_core) ** 2 * np.dtype(DTYPE).itemsize
+    niv_window = config.box.niv_core if chunk_writer is not None else niv_pp
+    one_wn_bytes = n_bands**4 * (2 * niv_window) ** 2 * np.dtype(DTYPE).itemsize
     w_chunk = _wn_chunk_size(one_wn_bytes, budget)
     q_group = max(1, int(budget // max(one_wn_bytes * (niw_build + 1), 1)))
 

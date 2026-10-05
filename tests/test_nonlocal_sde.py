@@ -7,8 +7,9 @@
 import contextlib
 import os
 import threading
+import tracemalloc
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import numpy as np
 import pytest
@@ -384,12 +385,12 @@ def test_cut_and_reshare_giwk_shared_single_rank_matches_plain_cut():
     assert np.array_equal(cut.mat, GreensFunction.get_g_full(sigma, 0.3, ek, 10.0).cut_niv(4).mat)
 
 
-def _bse_assembly_inputs(rng, o=2, nqi=3, nw=3, niv=2, beta=12.5):
+def _bse_assembly_inputs(rng, o=2, nqi=3, nw=3, niv=2, beta=12.5, channel=SpinChannel.DENS):
     """Builds (gamma [full niw], gchi0_q_inv [half niw, 1 vn], u_loc, v_nonloc) for the BSE-matrix assembly tests."""
     config.sys.beta = beta
     gamma_shape = (o, o, o, o, 2 * nw - 1, 2 * niv, 2 * niv)
     gamma_mat = rng.standard_normal(gamma_shape) + 1j * rng.standard_normal(gamma_shape)
-    gamma = LocalFourPoint(gamma_mat, SpinChannel.DENS, 1, 2, True, True)
+    gamma = LocalFourPoint(gamma_mat, channel, 1, 2, True, True)
     chi0_shape = (nqi, o, o, o, o, nw, 2 * niv)
     chi0_mat = rng.standard_normal(chi0_shape) + 1j * rng.standard_normal(chi0_shape)
     gchi0_q_inv = FourPoint(chi0_mat, SpinChannel.NONE, (nqi, 1, 1), 1, 1, False, True, True)
@@ -999,7 +1000,6 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", fake_proposal)
 
     mat = np.full((1, 1, 1, 16), 1.0 + 0.1j, dtype=np.complex64)
-    sigma_dmft = SelfEnergy(mat, (1, 1, 1), has_compressed_q_dimension=True, beta=10.0)
 
     v_nonloc = MagicMock()
     v_nonloc.copy.return_value = v_nonloc
@@ -1007,6 +1007,9 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
 
     def run(comm=None, **kwargs):
         comm = create_comm_mock() if comm is None else comm
+        # one DMFT sigma per fake rank, as every MPI rank holds its own: the transformations park their source's mat
+        # at None while they clone it (_clone_without_mat), so ranks sharing one object race on it
+        sigma_dmft = SelfEnergy(mat.copy(), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0)
         return nonlocal_sde.calculate_self_energy_q(comm, None, v_nonloc, sigma_dmft, sigma_dmft.copy(), **kwargs)
 
     return run, calls, logger
@@ -1058,7 +1061,7 @@ def test_loop_forwards_the_chunk_budgets_to_every_proposal(monkeypatch, tmp_path
         return fake(*args, **kwargs)
 
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", spy)
-    budgets = memory_estimator.ChunkBudgets(12345, 678, 9)
+    budgets = memory_estimator.ChunkBudgets(678, 9)
     run(chunk_budgets=budgets)
     run()
     assert seen == [budgets, budgets, None, None]
@@ -1136,6 +1139,38 @@ def test_warm_start_holds_the_dmft_filling_and_resolves_mu(monkeypatch, tmp_path
     assert all(n == 0.85 for _, n in solves)  # every later mu update holds the same filling
     infos = [str(c.args[0]) for c in logger.info.call_args_list]
     assert "Filling of the updated Green's function: 1.000000 (target 0.850000)." in infos  # the stub reports 1.0
+
+
+def test_warm_start_and_loop_solve_mu_on_every_rank_with_its_momenta(monkeypatch, tmp_path):
+    """Both mu searches run on every rank on its own rows of the start and of the mixed iterate with one moment."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0)
+    config.lattice.k_grid = bz.KGrid((3, 1, 1), symmetries=[])
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((3, 1, 1, 1, 1)))
+    mat = (np.arange(3.0)[:, None, None, None] + 0.1j + np.zeros((3, 1, 1, 16))).astype(np.complex64)
+    start = SelfEnergy(mat, (3, 1, 1), has_compressed_q_dimension=True, beta=10.0)
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3))
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [0.7])
+    mixing, mixed, seen = nonlocal_sde.apply_mixing_strategy, [], []
+
+    def mix(*args):
+        out = mixing(*args)
+        mixed.append(out.mat.reshape(3, 1, 1, -1).copy())
+        return out
+
+    def solve(mu0, n, ek, sigma_mat, beta, smom0, logger=None, mpi_dist=None):
+        seen.append((threading.current_thread().name, mpi_dist, sigma_mat.copy(), smom0))
+        return 0.42
+
+    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", mix)
+    monkeypatch.setattr(nonlocal_sde, "update_mu", solve)
+    run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
+    calls = sorted(seen, key=lambda c: c[0])  # per rank: the warm-start search, then the loop's
+    assert [(c[0], c[1].ntasks) for c in calls] == [("rank0", 3)] * 2 + [("rank1", 3)] * 2 and len(mixed) == 1
+    assert calls[0][1].my_slice.stop == calls[2][1].my_slice.start > 0
+    assert all(np.array_equal(c[2], (start.mat, mixed[0])[i % 2][c[1].my_slice]) for i, c in enumerate(calls))
+    assert all(np.array_equal(c[3], calls[i % 2][3]) for i, c in enumerate(calls))
 
 
 def test_loop_concatenates_the_previous_iterate_on_rank0_only(monkeypatch, tmp_path):
@@ -1321,18 +1356,19 @@ def test_create_auxiliary_chi_r_q_sum_matches_full_inversion_reference():
     assert out.channel == gamma.channel and not out.full_niw_range and out.num_vn_dimensions == 1
 
 
-def test_create_auxiliary_chi_r_q_sum_is_bit_invariant_under_the_chunk_budget(monkeypatch):
-    """Single slices, w-chunks, q-groups and the whole box give the same bits, so the budget may follow free memory."""
-    rng = np.random.default_rng(32)
-    o, nqi, nw, niv = 2, 4, 3, 2
-    gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(rng, o=o, nqi=nqi, nw=nw, niv=niv)
-    whole = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, 2**62)
-    one_wn = (2 * niv) ** 2 * o**4 * gamma.mat.itemsize
-    for budget in (1, 2 * one_wn, nw * one_wn, 2 * nw * one_wn):  # single slice, w-chunk, one q, q-group of two
-        chunked = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, budget)
-        assert np.array_equal(chunked.mat, whole.mat)
-    monkeypatch.setattr(nonlocal_sde, "SLICE_CHUNK_BYTES", 1)
-    assert np.array_equal(nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc).mat, whole.mat)
+@pytest.mark.parametrize("o", [1, 2, 3])
+@pytest.mark.parametrize("channel", [SpinChannel.DENS, SpinChannel.MAGN])
+def test_create_auxiliary_chi_r_q_sum_is_the_assembled_per_slice_solve_bit_for_bit(o, channel):
+    """The sum equals the assembled BSE matrix summed slice by slice with v2, bit for bit, for full and half gamma."""
+    gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(np.random.default_rng(32), o=o, channel=channel)
+    u_r = u_loc.as_channel(channel)
+    ref = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r).invert_and_sum_over_last_vn_v2(
+        config.sys.beta
+    )
+    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    half = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma.copy().to_half_niw_range(), gchi0_q_inv, u_loc, 1)
+    assert out.channel == channel and not out.full_niw_range and out.num_vn_dimensions == 1
+    assert np.array_equal(out.mat, ref.mat) and np.array_equal(half.mat, ref.mat)
 
 
 def test_create_auxiliary_chi_r_q_sum_eliminates_the_pairs_without_vertex_of_a_two_atom_cell(monkeypatch):
@@ -1346,9 +1382,66 @@ def test_create_auxiliary_chi_r_q_sum_eliminates_the_pairs_without_vertex_of_a_t
     u_loc.mat[~per_atom] = 0.0
     out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
     ref = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc).sum_over_vn(config.sys.beta)
+    u_r = u_loc.as_channel(gamma.channel)
+    assembled = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
+    inactive = gamma.orbital_pairs_without_vertex(u_r)
     assert "8 of 16 orbital pairs" in config.logger.info.call_args.args[0]
     assert np.allclose(out.mat, ref.mat, atol=1e-5)
-    assert np.array_equal(nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, 1).mat, out.mat)
+    assert np.array_equal(assembled.invert_and_sum_over_last_vn_v2(config.sys.beta, inactive).mat, out.mat)
+
+
+def test_create_auxiliary_chi_r_q_sum_with_rhs_solves_the_bethe_salpeter_system(monkeypatch):
+    """With a list of rhs every slice solves the Bethe-Salpeter system for each, chi* applied to that rhs."""
+    monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
+    rng = np.random.default_rng(34)
+    gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(rng, o=2, nqi=3, nw=2, niv=2)
+    shape = gchi0_q_inv.current_shape
+    mats = [rng.standard_normal(shape) + 1j * rng.standard_normal(shape) for _ in range(2)]
+    rhs = [FourPoint(mat, SpinChannel.NONE, gchi0_q_inv.nq, 1, 1, False, True, True) for mat in mats]
+    chi_star = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc).to_half_niw_range().mat
+    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=rhs)
+    assert len(out) == 2
+    for solved, b in zip(out, rhs):
+        assert np.allclose(solved.mat, np.einsum("qijabwvp,qbaklwp->qijklwv", chi_star, b.mat), atol=1e-10)
+
+
+def test_create_auxiliary_chi_r_q_sum_takes_the_given_pairs_without_vertex_instead_of_scanning(monkeypatch):
+    """Pairs without vertex handed in skip the vertex scan and its log line and give the scanning call's bits."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(np.random.default_rng(33), o=4, nqi=2, nw=2, niv=2)
+    atom = np.array([0, 0, 1, 1])
+    same = atom[:, None, None, None] == atom[None, :, None, None]
+    per_atom = same & (same.transpose(0, 2, 1, 3)) & (same.transpose(0, 2, 3, 1))
+    gamma.mat[~per_atom] = 0.0
+    u_loc.mat[~per_atom] = 0.0
+    scanned = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    inactive = gamma.copy().to_half_niw_range().orbital_pairs_without_vertex(u_loc.as_channel(gamma.channel))
+    config.logger.reset_mock()
+    scan = create_autospec(
+        LocalFourPoint.orbital_pairs_without_vertex, wraps=LocalFourPoint.orbital_pairs_without_vertex
+    )
+    monkeypatch.setattr(LocalFourPoint, "orbital_pairs_without_vertex", scan)
+    given = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, inactive=inactive)
+    assert inactive.size == 8 and scan.call_count == 0 and not config.logger.info.called
+    assert np.array_equal(given.mat, scanned.mat)
+
+
+@pytest.mark.parametrize("o, niv, nw", [(3, 60, 1), (6, 20, 2)])
+def test_chiq_aux_transient_bounds_the_traced_peak_of_the_build(o, niv, nw):
+    """The modeled transient covers the traced peak above the summed output, the next w's scan at six bands included."""
+    config.sys.beta, vn, n = 9.0, 2 * niv, o * o * 2 * niv
+    rng = np.random.default_rng(5)
+    gamma = LocalFourPoint(rng.standard_normal((o,) * 4 + (nw, vn, vn)) + 0j, SpinChannel.DENS, 1, 2, False, True)
+    chi0_inv = rng.standard_normal((1,) + (o,) * 4 + (nw, vn)) + 30.0
+    gchi0_q_inv = FourPoint(chi0_inv, SpinChannel.NONE, (1, 1, 1), 1, 1, False, True, True)
+    u_loc = LocalInteraction(np.ones((o,) * 4), SpinChannel.NONE)
+    nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    tracemalloc.start()
+    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    modeled = memory_estimator._chiq_aux_transient(n, o)
+    assert 2 * n**2 * memory_estimator.DTYPE_BYTES < peak - out.mat.nbytes <= modeled
 
 
 def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(monkeypatch):
@@ -1375,9 +1468,13 @@ def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(mon
     _, occ_ref, occ_k_ref = giwk_ref.get_fill_nonlocal()
     ekin_ref, epot_ref = giwk_ref.get_ekin(), giwk_ref.get_epot()
 
+    # one pair of sigmas per fake rank, as every MPI rank holds its own: the update compresses the DMFT sigma in place
+    # (flag check, then reshape), so ranks sharing one object race on it
+    sigmas = [(sigma_new.copy(), sigma_dmft_full.copy()) for _ in range(2)]
+
     def fn(comm, rank):
         d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
-        return nonlocal_sde._update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, d_full, mu)
+        return nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
 
     _, res = run_parallel(2, fn)
     # occupations reproduce the full-box reference bit-for-bit; only the energy scalars regroup their k-sums
@@ -1411,9 +1508,13 @@ def test_update_occ_and_energies_distributed_carries_the_shell_offset_of_the_mix
     _, occ_ref, occ_k_ref = giwk_ref.get_fill_nonlocal()
     ekin_ref, epot_ref = giwk_ref.get_ekin(), giwk_ref.get_epot()
 
+    # one pair of sigmas per fake rank, as every MPI rank holds its own: the update compresses the DMFT sigma in place
+    # (flag check, then reshape), so ranks sharing one object race on it
+    sigmas = [(sigma_new.copy(), sigma_dmft_full.copy()) for _ in range(2)]
+
     def fn(comm, rank):
         d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
-        return nonlocal_sde._update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, d_full, mu)
+        return nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
 
     _, res = run_parallel(2, fn)
     for _, occ, occ_k, ekin, epot in res:
@@ -1453,9 +1554,13 @@ def test_update_occ_and_energies_distributed_pins_the_occupation_dtype_across_ra
         g.get_epot.return_value = 2.0
         return g
 
+    # one pair of sigmas per fake rank, as every MPI rank holds its own: the update compresses the DMFT sigma in place
+    # (flag check, then reshape), so ranks sharing one object race on it
+    sigmas = [(sigma_new.copy(), sigma_dmft_full.copy()) for _ in range(2)]
+
     def fn(comm, rank):
         d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
-        return nonlocal_sde._update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, d_full, mu)
+        return nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
 
     with monkeypatch.context() as mp:
         mp.setattr(nonlocal_sde.GreensFunction, "get_g_full", fake_get_g_full)
@@ -1614,6 +1719,35 @@ def test_column_sde_is_bit_invariant_under_the_round_budget_and_the_contraction_
     assert np.array_equal(rounds, whole) and np.array_equal(rows, whole)
     for size in (1, 2, 4):  # the rank count moves the fold's partial-sum boundaries, a rounding-level change
         assert np.allclose(_run_column_sde_parallel(size, kernel, giwk), whole, atol=1e-5)
+
+
+@pytest.mark.parametrize("size", [1, 3])
+def test_column_sde_with_monomial_rotations_keeps_the_bits_of_the_einsum_unfold(size, monkeypatch):
+    """Signed permutations times powers of i take the gather unfold, which leaves every bit of the result unchanged."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _column_sde_setup(True)
+    grid, rng = config.lattice.k_grid, np.random.default_rng(7)
+    shape = (grid.nk_tot, 2, 2)
+    us = np.eye(2)[np.argsort(rng.random(shape[:2]), axis=1)] * np.array([1, 1j, -1, -1j])[rng.integers(0, 4, shape)]
+    grid._auto_us, grid._auto_conjs = us.reshape(grid._auto_us.shape), np.zeros_like(grid._auto_conjs)
+    assert grid.auto_monomial_map(np.complex64, 4) is not None
+    gathered = _run_column_sde_parallel(size, kernel, giwk)
+    with monkeypatch.context() as mp:
+        mp.setattr(bz.KGrid, "auto_monomial_map", MagicMock(return_value=None))
+        einsum = _run_column_sde_parallel(size, kernel, giwk)
+    assert np.array_equal(gathered, einsum)
+
+
+def test_column_sde_unfolds_every_column_of_a_rank_into_one_buffer(monkeypatch):
+    """Each rank allocates one full-BZ column and unfolds every column of its tasks into it."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _column_sde_setup(True)
+    spy = create_autospec(FourPoint.map_to_full_bz, side_effect=FourPoint.map_to_full_bz)
+    monkeypatch.setattr(FourPoint, "map_to_full_bz", spy)
+    _run_column_sde_parallel(1, kernel, giwk)
+    buffers = [c.kwargs["out"] for c in spy.call_args_list]
+    assert len(buffers) == config.box.niv_core * (2 * config.box.niw_core + 1)
+    assert all(b is buffers[0] for b in buffers)
 
 
 def test_column_sde_single_rank_mock_path_equals_the_fake_mpi_run(monkeypatch):

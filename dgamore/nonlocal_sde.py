@@ -147,65 +147,70 @@ def create_auxiliary_chi_r_q(gamma_r: LocalFourPoint, gchi0_q_inv: FourPoint, u_
     return create_inverse_auxiliary_chi_r_q(gamma_r, gchi0_q_inv, u_r).invert(False)
 
 
+def _inactive_orbital_pairs(gamma_half: LocalFourPoint, u_r: LocalInteraction) -> np.ndarray:
+    r"""
+    Returns the orbital pairs without vertex of a channel (see
+    :meth:`~dgamore.local_four_point.LocalFourPoint.orbital_pairs_without_vertex`) and logs their count when some,
+    but not all, pairs are inactive.
+
+    :param gamma_half: The local irreducible vertex :math:`\Gamma_{r}` on the half bosonic range.
+    :param u_r: The channel-projected local interaction :math:`U_{r}`.
+    :return: The sorted flat indices of the pairs without vertex.
+    """
+    inactive = gamma_half.orbital_pairs_without_vertex(u_r)
+    if 0 < inactive.size < gamma_half.n_bands**2:
+        config.logger.info(
+            f"Auxiliary susceptibility ({gamma_half.channel.value}): {inactive.size} of {gamma_half.n_bands**2} "
+            f"orbital pairs carry no vertex and are eliminated frequency by frequency."
+        )
+    return inactive
+
+
 def create_auxiliary_chi_r_q_sum(
     gamma_r: LocalFourPoint,
     gchi0_q_inv: FourPoint,
     u_loc: LocalInteraction,
     chunk_bytes: int | None = None,
-) -> FourPoint:
+    rhs: list[FourPoint] | None = None,
+    inactive: np.ndarray | None = None,
+) -> FourPoint | list[FourPoint]:
     r"""
     Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis,
 
     .. math:: \sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r;1234} = \sum_{\nu'}((\chi^{\mathrm{q}\nu}_{0;1234})^{-1} + (\Gamma^{\omega\nu\nu'}_{r;1234}-U_{r;1234})/\beta^2)^{-1},
 
-    walking the rank-local momenta and their bosonic axis in byte-bounded chunks: each chunk assembles its window of
-    the Bethe-Salpeter matrix (see :func:`create_inverse_auxiliary_chi_r_q`) and back-substitutes only the
-    :math:`\nu'`-summed columns through the per-slice factorization of
-    :meth:`~dgamore.four_point.FourPoint.invert_and_sum_over_last_vn_v2`, so the transient never exceeds a few
-    chunk budgets regardless of the box size while small problems degenerate into a single batched evaluation. The
-    orbital pairs without vertex (see :meth:`~dgamore.local_four_point.LocalFourPoint.orbital_pairs_without_vertex`),
-    found once per channel, are eliminated frequency by frequency inside every slice.
+    solved slice by slice by
+    :meth:`~dgamore.four_point.FourPoint.invert_with_local_kernel_and_sum_over_last_vn` on the inverse bubble as the
+    frequency-diagonal part, with the kernel :math:`\Gamma_{r}`, the shift :math:`U_{r}` and the scale
+    :math:`1/\beta^2`: every rank-local momentum and bosonic frequency assembles its Bethe-Salpeter slice from a
+    momentum-independent buffer per bosonic frequency and back-substitutes only the :math:`\nu'`-summed columns, so
+    the transient is two compound slices regardless of the box size. The orbital pairs without vertex (see
+    :meth:`~dgamore.local_four_point.LocalFourPoint.orbital_pairs_without_vertex`), found once per call unless the
+    caller passes them, are eliminated frequency by frequency inside every slice.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` (full or half bosonic range).
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
     :param u_loc: The bare local interaction :math:`U`.
-    :param chunk_bytes: Chunk byte budget of the build; defaults to the :data:`SLICE_CHUNK_BYTES` floor (the
-        pipeline passes the budget the driver sizes from the memory estimate, see
-        :func:`~dgamore.memory_estimator.max_chunk_budget`). Every budget yields the same bits.
+    :param chunk_bytes: Not read: the build holds two compound slices at any budget.
+    :param rhs: Right-hand sides in the layout of the result (half niw range, one fermionic dimension), one object
+        per system; every slice then solves the Bethe-Salpeter system for all of them against its one factorization
+        instead of summing its inverse (see
+        :meth:`~dgamore.four_point.FourPoint.invert_with_local_kernel_and_sum_over_last_vn`), and the result is the
+        list of solutions. None sums, as the ladder does.
+    :param inactive: The orbital pairs without vertex of ``gamma_r`` (see
+        :meth:`~dgamore.local_four_point.LocalFourPoint.orbital_pairs_without_vertex`) when the caller holds them;
+        ``None`` finds them here and logs their count.
     :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` as a
-        :class:`FourPoint` (half niw range, one fermionic dimension).
+        :class:`FourPoint` (half niw range, one fermionic dimension), or the solutions for ``rhs`` as a list.
     """
     u_r = u_loc.as_channel(gamma_r.channel)
     gamma_half = gamma_r.copy().to_half_niw_range() if gamma_r.full_niw_range else gamma_r
-    inactive = gamma_half.orbital_pairs_without_vertex(u_r)
-    if 0 < inactive.size < gamma_half.n_bands**2:
-        config.logger.info(
-            f"Auxiliary susceptibility ({gamma_r.channel.value}): {inactive.size} of {gamma_half.n_bands**2} orbital "
-            f"pairs carry no vertex and are eliminated frequency by frequency."
-        )
-
-    budget = SLICE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
-    n_q, n_w = gchi0_q_inv.current_shape[0], gchi0_q_inv.current_shape[-2]
-    one_wn_bytes = gamma_half.current_shape[-1] ** 2 * gamma_half.n_bands**4 * np.dtype(gamma_half.mat.dtype).itemsize
-    w_chunk = max(1, int(budget // one_wn_bytes))
-    q_group = max(1, int(budget // max(one_wn_bytes * n_w, 1)))
-
-    chi_r_q_sum_mat = np.empty_like(gchi0_q_inv.mat)
-    # deferred_collection batches the gc pass of the per-chunk temporaries into one collection at the end
-    # (a full gc walk per released slice dominates the wall time of the chunk loop otherwise).
-    with deferred_collection():
-        for q_start in range(0, n_q, q_group):
-            q_stop = min(n_q, q_start + q_group)
-            gchi0_q = gchi0_q_inv.take_q_index_slice(q_start, q_stop)
-            for w_start in range(0, n_w, w_chunk):
-                w_stop = min(n_w, w_start + w_chunk)
-                chunk = create_inverse_auxiliary_chi_r_q(
-                    gamma_half.take_wn_slice(w_start, w_stop), gchi0_q.take_wn_slice(w_start, w_stop), u_r
-                )
-                chi_r_q_sum_mat[q_start:q_stop, ..., w_start:w_stop, :] = chunk.invert_and_sum_over_last_vn_v2(
-                    config.sys.beta, inactive
-                ).mat
-    return FourPoint(chi_r_q_sum_mat, gamma_r.channel, config.lattice.nk, 1, 1, False, has_compressed_q_dimension=True)
+    if inactive is None:
+        inactive = _inactive_orbital_pairs(gamma_half, u_r)
+    beta = config.sys.beta
+    return gchi0_q_inv.invert_with_local_kernel_and_sum_over_last_vn(
+        gamma_half, u_r, 1.0 / beta**2, beta, inactive, rhs
+    )
 
 
 def create_vrg_r_q(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint) -> FourPoint:
@@ -513,7 +518,6 @@ def calculate_sigma_kernel_r_q(
     v_nonloc: Interaction,
     mpi_dist_irrq: MpiDistributor,
     annealer: "LambdaAnnealer | None" = None,
-    chunk_bytes: int | None = None,
 ) -> FourPoint:
     r"""
     Returns the kernel for the self-energy calculation in a specific spin channel. Calculates the auxiliary
@@ -530,12 +534,11 @@ def calculate_sigma_kernel_r_q(
     :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param annealer: The active :class:`LambdaAnnealer` (its boson mass is applied to the physical susceptibility),
         or ``None`` when annealing is off.
-    :param chunk_bytes: Chunk byte budget of the auxiliary-susceptibility build (``None`` uses the floor).
     :return: The self-energy kernel for this channel as a :class:`FourPoint`.
     """
     logger = config.logger
 
-    gchi_aux_q_r_sum = create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc, chunk_bytes)
+    gchi_aux_q_r_sum = create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc)
 
     mpi_dist_irrq.barrier()
 
@@ -750,9 +753,10 @@ def _run_column_sde(
 
     1. receives the irreducible-BZ rows of its tasks' columns in rounds of at most ``chunk_bytes``
        (:func:`~dgamore.mpi_utils.transpose_columns`),
-    2. expands each column to the full BZ with :meth:`FourPoint.map_to_full_bz`, Fourier transforms it over the
-       momentum axes in the order z, y, x (a time-reversed column is conjugated afterwards) and contracts it with the
-       frequency slab of ``g_r`` at :math:`\nu - \omega` in bounded real-space row chunks,
+    2. expands each column to the full BZ with :meth:`FourPoint.map_to_full_bz` into one buffer reused for every
+       column, Fourier transforms it in place over the momentum axes in the order z, y, x (a time-reversed column is
+       conjugated afterwards) and contracts it with the frequency slab of ``g_r`` at :math:`\nu - \omega` in bounded
+       real-space row chunks,
     3. folds its tasks' partial sums of each :math:`\nu` in block order; the owner of :math:`\nu` (the rank holding
        its first block) folds the other ranks' sums in rank order, and rank 0 gathers the result.
 
@@ -800,6 +804,7 @@ def _run_column_sde(
     sums = {}
     partial = np.empty((n_r, nb, nb), dtype=dtype)
     acc = np.empty_like(partial)
+    column = np.empty((n_r, nb, nb, nb, nb, 1), dtype=dtype)  # every column is unfolded into this one buffer
     report_at = {-(-n_rounds // 2), n_rounds}
     # deferred_collection batches the gc pass of the per-column object releases into one collection at the end
     with deferred_collection():
@@ -818,7 +823,7 @@ def _run_column_sde(
                 for w in ws:
                     col = FourPoint(block[..., c : c + 1], SpinChannel.NONE, config.lattice.nk, 1, 0, False, True, True)
                     c += 1
-                    col = col.map_to_full_bz(k_grid).fft(copy=False, axes=(2, 1, 0))
+                    col = col.map_to_full_bz(k_grid, out=column).fft(copy=False, axes=(2, 1, 0))
                     # time reversal of real hoppings conjugates at fixed R: K^{-w,v}(R) = conj(K^{w,-v}(R))
                     if negative:
                         col = col.conj(copy=False)
@@ -1275,9 +1280,8 @@ def calculate_sigma_proposal(
     :param current_iter: The current iteration number (the RPA susceptibility is saved only on iteration 1).
     :param annealer: The active :class:`LambdaAnnealer` threaded into the kernel step, or ``None`` when annealing
         is off.
-    :param chunk_budgets: Chunk byte budgets of the auxiliary-susceptibility build and the self-energy
-        contraction (sized by the driver from the memory estimate); ``None`` gives both the job-wide fair-share
-        budget of :func:`_sde_chunk_budget`.
+    :param chunk_budgets: Chunk byte budgets, of which the self-energy contraction reads its own (sized by the driver
+        from the memory estimate); ``None`` gives it the job-wide fair-share budget of :func:`_sde_chunk_budget`.
     :return: The raw full-BZ proposal :class:`SelfEnergy` (DMFT tail attached) on rank 0; ``None`` on every other rank,
         since only rank 0 mixes it.
     """
@@ -1340,7 +1344,6 @@ def calculate_sigma_proposal(
         gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
 
     chunk_bytes = _sde_chunk_budget(comm, shared_node_comm) if chunk_budgets is None else chunk_budgets.sde
-    aux_chunk_bytes = chunk_bytes if chunk_budgets is None else chunk_budgets.chiq_aux
 
     gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
         shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
@@ -1355,7 +1358,6 @@ def calculate_sigma_proposal(
             v_nonloc,
             mpi_dist_irrk,
             annealer,
-            aux_chunk_bytes,
         ),
         copy=False,
     )
@@ -1379,7 +1381,6 @@ def calculate_sigma_proposal(
             v_nonloc,
             mpi_dist_irrk,
             annealer,
-            aux_chunk_bytes,
         ).scale(3.0),
         copy=False,
     )
@@ -1546,9 +1547,8 @@ def calculate_self_energy_q(
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param sigma_dmft: The DMFT self-energy (used as the starting point and for the shell/tail correction).
     :param sigma_local: The locally recomputed self-energy (used for smoothing out the DGA :class:`SelfEnergy`).
-    :param chunk_budgets: Chunk byte budgets of the auxiliary-susceptibility build and the self-energy
-        contraction (sized by the driver from the memory estimate); ``None`` gives both the job-wide fair-share
-        budget of :func:`_sde_chunk_budget`.
+    :param chunk_budgets: Chunk byte budgets, of which the self-energy contraction reads its own (sized by the driver
+        from the memory estimate); ``None`` gives it the job-wide fair-share budget of :func:`_sde_chunk_budget`.
     :return: The converged (or last-iteration) momentum-dependent DGA :class:`SelfEnergy` on rank 0; ``None`` on every
         other rank.
     """
@@ -1619,15 +1619,18 @@ def calculate_self_energy_q(
         )
         config.sys.n, config.sys.occ, config.sys.occ_k = _assemble_occupation(occ_k_my, mpi_dist_fullbz)
     else:
+        # a warm start's own filling drifts along a chain of rungs, so mu is re-solved for the DMFT lattice filling on
+        # the loop's frequency box, every rank on its momenta of rank 0's starting iterate
+        sigma_cut = sigma_old.cut_niv(niv_cut).compress_q_dimension() if comm.rank == 0 else None
+        n_dmft, smom0 = comm.bcast((n_dmft, sigma_cut.fit_smom()[0]) if comm.rank == 0 else None, root=0)
+        sigma_my = mpi_dist_fullbz.scatter(sigma_cut.mat if comm.rank == 0 else None)
+        del sigma_cut
+        mu_previous = mu_history[-1]
+        mu_history[-1] = update_mu(
+            mu_previous, n_dmft, ek, sigma_my, config.sys.beta, smom0, logger=logger, mpi_dist=mpi_dist_fullbz
+        )
+        del sigma_my
         if comm.rank == 0:
-            # the loop holds the filling of the DMFT lattice Green's function the local vertex belongs to; a warm
-            # start's own filling (its self-energy at the predecessor's mu) drifts along a chain of rungs, so its mu
-            # is re-solved for the DMFT filling on the loop's frequency box
-            sigma_cut = sigma_old.cut_niv(niv_cut).compress_q_dimension()
-            mu_previous = mu_history[-1]
-            mu_history[-1] = update_mu(
-                mu_previous, n_dmft, ek, sigma_cut.mat, config.sys.beta, sigma_cut.fit_smom()[0], logger=logger
-            )
             logger.info(
                 f"Warm start holds the DMFT lattice filling {n_dmft:.6f}: mu re-solved from {mu_previous} to "
                 f"{mu_history[-1]}."
@@ -1636,8 +1639,8 @@ def calculate_self_energy_q(
             _, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
             giwk_full.free()
             config.sys.n = n_dmft
-        config.sys.n, config.sys.occ, config.sys.occ_k, mu_history[-1] = comm.bcast(
-            (config.sys.n, config.sys.occ, config.sys.occ_k, mu_history[-1]), root=0
+        config.sys.n, config.sys.occ, config.sys.occ_k = comm.bcast(
+            (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
         )
         config.sys.mu = mu_history[-1]
 
@@ -1708,19 +1711,18 @@ def calculate_self_energy_q(
             _relative_sigma_residual(sigma_new, sigma_old.compress_q_dimension()) if comm.rank == 0 else None
         )
 
+        # every rank solves mu on its momenta of the shared sigma; the moment is fitted on rank 0 alone
         old_mu = mu_history[-1]
-        if comm.rank == 0:
-            config.sys.mu = update_mu(
-                old_mu,
-                config.sys.n,
-                config.lattice.hamiltonian.get_ek(),
-                sigma_new.mat,
-                config.sys.beta,
-                sigma_new.fit_smom()[0],
-                logger=logger,
-            )
-
-        config.sys.mu = comm.bcast(config.sys.mu)
+        config.sys.mu = update_mu(
+            old_mu,
+            config.sys.n,
+            config.lattice.hamiltonian.get_ek(),
+            sigma_new.mat[mpi_dist_fullbz.my_slice],
+            config.sys.beta,
+            comm.bcast(sigma_new.fit_smom()[0] if comm.rank == 0 else None, root=0),
+            logger=logger,
+            mpi_dist=mpi_dist_fullbz,
+        )
         mu_history.append(config.sys.mu)
         logger.info(f"Updated mu from {old_mu} to {config.sys.mu}.")
 
