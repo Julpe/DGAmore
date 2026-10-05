@@ -4,6 +4,7 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import gc
 import logging
 import os
 from unittest.mock import MagicMock
@@ -40,6 +41,12 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip_slow)
+
+
+def pytest_collection_finish(session):
+    """Freezes the collected session so the gc.collect() of every IHaveMat.free() walks only what the tests create."""
+    gc.collect()
+    gc.freeze()
 
 
 @pytest.fixture(autouse=True)
