@@ -244,14 +244,60 @@ def test_fft_bubble_distributed_matches_single_rank(monkeypatch):
     q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
     ref = _fft_bubble_reference(g, niw, niv, q_grid, beta)
 
+    # one Green's function per fake rank, as every MPI rank holds its own: cut_niv parks its source's mat at None
+    # while it clones it (_clone_without_mat), so ranks sharing one object race on it
+    g_ranks = [g.copy() for _ in range(3)]
+
     def fn(comm, rank):
         dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
-        return BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, beta).mat
+        return BubbleGenerator.create_generalized_chi0_q_fft(dist, g_ranks[rank], niw, niv, q_grid, beta).mat
 
     _, res = run_parallel(3, fn)
     assembled = np.concatenate(res, axis=0)
     assert assembled.shape == ref.mat.shape
     assert np.allclose(assembled, ref.mat, atol=1e-5)
+
+
+@pytest.mark.parametrize("one_column_budget", [False, True])
+@pytest.mark.parametrize(
+    "nb, ranks, hostnames, compressed", [(1, 2, None, False), (2, 3, ["n0", "n0", "n1"], True), (3, 2, None, False)]
+)
+def test_fft_bubble_distributed_round_buffer_budget_keeps_the_rank0_path_bits(
+    nb, ranks, hostnames, compressed, one_column_budget, monkeypatch
+):
+    """A round transforms several columns within the byte budget, one column above it, and keeps the rank-0 bits."""
+    import scipy as sp
+
+    import dgamore.bubble_gen as bubble_gen
+    import dgamore.mpi_utils as mpi_utils
+    from dgamore.mpi_utils import MpiDistributor
+    from tests.conftest import FAKE_MPI, run_parallel
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, niv, niw, beta = (4, 4, 1), 4, 3, 2.5
+    if one_column_budget:
+        monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", int(np.prod(nk)) * nb**4 * 8)
+    g = _make_momentum_g(nk, nb, niv + niw + 2, seed=20 + nb)
+    g = g.compress_q_dimension() if compressed else g
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    ref = _fft_bubble_reference(g, niw, niv, q_grid, beta)
+    shapes, ifftn = [], sp.fft.ifftn
+    monkeypatch.setattr(sp.fft, "ifftn", lambda x, **kwargs: shapes.append(x.shape) or ifftn(x, **kwargs))
+
+    # one Green's function per fake rank, as every MPI rank holds its own: cut_niv parks its source's mat at None
+    # while it clones it (_clone_without_mat), so ranks sharing one object race on it
+    g_ranks = [g.copy() for _ in range(ranks)]
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED) if hostnames else None
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+        return BubbleGenerator.create_generalized_chi0_q_fft(
+            dist, g_ranks[rank], niw, niv, q_grid, beta, node_comm=node_comm
+        ).mat
+
+    _, res = run_parallel(ranks, fn, hostnames=hostnames)
+    assert np.array_equal(np.concatenate(res, axis=0), ref.mat)
+    assert (max(s[-1] for s in shapes) == 1) == one_column_budget and sum(s[-1] for s in shapes) == (niw + 1) * 2 * niv
 
 
 def test_fft_bubble_distributed_with_node_shared_greens_function(monkeypatch):
@@ -266,10 +312,16 @@ def test_fft_bubble_distributed_with_node_shared_greens_function(monkeypatch):
     q_grid = bz.KGrid(nk, symmetries=[])
     ref = _fft_bubble_reference(g, niw, niv, q_grid, beta)
 
+    # one Green's function per fake rank, as every MPI rank holds its own: cut_niv parks its source's mat at None
+    # while it clones it (_clone_without_mat), so ranks sharing one object race on it
+    g_ranks = [g.copy() for _ in range(4)]
+
     def fn(comm, rank):
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
         dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
-        return BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, beta, node_comm=node_comm).mat
+        return BubbleGenerator.create_generalized_chi0_q_fft(
+            dist, g_ranks[rank], niw, niv, q_grid, beta, node_comm=node_comm
+        ).mat
 
     _, res = run_parallel(4, fn, hostnames=["n0", "n0", "n1", "n1"])
     assembled = np.concatenate(res, axis=0)
@@ -288,9 +340,13 @@ def test_fft_bubble_distributed_with_fewer_columns_than_ranks(monkeypatch):
     q_grid = bz.KGrid(nk, symmetries=[])
     ref = _fft_bubble_reference(g, niw, niv, q_grid, beta)
 
+    # one Green's function per fake rank, as every MPI rank holds its own: cut_niv parks its source's mat at None
+    # while it clones it (_clone_without_mat), so ranks sharing one object race on it
+    g_ranks = [g.copy() for _ in range(5)]
+
     def fn(comm, rank):
         dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
-        return BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, beta).mat
+        return BubbleGenerator.create_generalized_chi0_q_fft(dist, g_ranks[rank], niw, niv, q_grid, beta).mat
 
     _, res = run_parallel(5, fn)
     assembled = np.concatenate(res, axis=0)

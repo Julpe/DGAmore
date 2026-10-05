@@ -80,22 +80,23 @@ def test_constants():
 
 
 def test_keys_without_eliashberg():
-    """Without Eliashberg the estimator reports the chi0q, chiq_aux, sde, sigma_loop and local branches."""
-    assert set(_peaks(with_eliashberg=False)) == {"chi0q", "chiq_aux", "sde", "sigma_loop", "local"}
+    """Without Eliashberg the estimator reports the chi0q, chiq_aux, sde, sigma_loop, mu_update and local branches."""
+    assert set(_peaks(with_eliashberg=False)) == {"chi0q", "chiq_aux", "sde", "sigma_loop", "mu_update", "local"}
 
 
 def test_keys_with_eliashberg():
     """With Eliashberg the estimator adds the fq and lanczos branches."""
-    assert set(_peaks(with_eliashberg=True)) == {"chi0q", "chiq_aux", "sde", "sigma_loop", "fq", "lanczos", "local"}
+    branches = {"chi0q", "chiq_aux", "sde", "sigma_loop", "mu_update", "fq", "lanczos", "local"}
+    assert set(_peaks(with_eliashberg=True)) == branches
 
 
 def test_every_branch_has_positive_baseline_and_off_transient():
-    """SDE-section branches carry a positive baseline, Eliashberg branches none, and every branch has a fast"""
+    """The SDE-section branches and fq carry a baseline beyond the rank footprint, the others none; all a transient."""
     peaks = _peaks(with_eliashberg=True)
     for key, bp in peaks.items():
         assert isinstance(bp, BranchPeak)
         base = _rank_base(BASE)  # every rank's footprint and full-grid interaction sit in every baseline
-        assert bp.baseline > base if key in ("chi0q", "chiq_aux", "sde") else bp.baseline == base
+        assert bp.baseline > base if key in ("chi0q", "chiq_aux", "sde", "fq") else bp.baseline == base
         assert bp.off_distributed + bp.off_single > 0
 
 
@@ -211,13 +212,14 @@ def test_mixing_history_sits_in_the_rank0_slot_of_every_proposal_branch():
         assert anderson[key].off_distributed == linear[key].off_distributed
 
 
-def test_eliashberg_branches_are_not_giwk_shareable():
-    """The fq/lanczos branches carry no baseline (sigma_dga freed, giwk_dga on the bubble rank), nothing node-shared."""
+def test_eliashberg_branches_share_only_the_local_vertex_of_the_pairing_vertex_build():
+    """Only fq's local vertex is node-shared in the Eliashberg branches (sigma_dga freed, giwk_dga on rank 0)."""
     peaks = _peaks(with_eliashberg=True)
     giwk_dga = SCALE * BASE["nk_tot"] * BASE["n_bands"] ** 2 * 2 * BASE["niv_cut"]
-    for key in ("fq", "lanczos"):
-        assert peaks[key].giwk_shareable == 0.0
-        assert peaks[key].baseline == pytest.approx(_rank_base(BASE))
+    local_vertex = SCALE * BASE["n_bands"] ** 4 * (BASE["niw_core"] + 1) * (2 * BASE["niv_core"]) ** 2
+    for key, shared in (("fq", local_vertex), ("lanczos", 0.0)):
+        assert peaks[key].giwk_shareable == pytest.approx(shared)
+        assert peaks[key].baseline == pytest.approx(_rank_base(BASE) + shared)
         assert peaks[key].off_single >= giwk_dga
         assert peaks[key].on_single >= giwk_dga
 
@@ -231,97 +233,61 @@ def test_bubble_baseline_depends_on_niv_cut_not_niv_full():
     assert _peaks(niv_cut=80)["chi0q"].baseline != pytest.approx(_peaks(niv_cut=800)["chi0q"].baseline)
 
 
-def _tiny_chunk_sizes():
-    """(rank block, one momentum's box, one (q, w) compound slice) of the TINY two-fermion objects, in bytes."""
+def _chiq_aux_transient():
+    """The modeled aux-chi transient: two compound slices, 128 + 4 n_bands^2 of their columns and two 256^2 tiles."""
+    nb = TINY["n_bands"]
+    n = nb**2 * 2 * TINY["niv_core"]
+    return DTYPE_BYTES * (2 * n * n + (128 + 4 * nb**2) * n + 2 * 256**2)
+
+
+def _fq_branch(budget, streaming=False):
+    """The TINY fq branch: accumulator, loaded and group-copied bubbles, 3 windows + 6 one-fermion + 4 (9) slices."""
+    nb, wp, vc, vpp = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"], 2 * TINY["niv_pp"]
+    qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
+    nv, nw = (vc, wp) if streaming else (vpp, vpp)
+    window_slice = DTYPE_BYTES * nb**4 * nv * nv
+    chunk = min(max(budget, window_slice), qi * nw * window_slice)
+    group = max(1, chunk // (nw * window_slice))
+    residents = SCALE * (qi * nb**4 * vpp * vpp + 2 * (qi + group) * nb**4 * wp * vc)
+    slices = (9 if streaming else 4) * DTYPE_BYTES * nb**4 * vc * vc
+    return residents + OVERHEAD_FACTOR * (3 * chunk + 6 * (chunk * vc // nv**2) + slices), window_slice, qi * nw
+
+
+def test_chiq_aux_block_is_the_resident_one_fermion_blocks_plus_two_compound_slices():
+    """The chiq_aux transient is three one-fermion blocks (sum, kernel, inverse bubble) plus the per-slice buffers."""
     nb, wp, vc = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"]
     qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
-    return DTYPE_BYTES * qi * nb**4 * wp * vc * vc, DTYPE_BYTES * nb**4 * wp * vc * vc, DTYPE_BYTES * nb**4 * vc * vc
-
-
-def _chiq_aux_transient(chunk):
-    """The modeled aux-chi chunk transient: window + sliced local vertex + LU slice copy + summed output."""
-    _, per_q_box, one_slice = _tiny_chunk_sizes()
-    return chunk + min(chunk, per_q_box) + one_slice + chunk // (2 * TINY["niv_core"])
-
-
-def _fq_transient(chunk, streaming=False):
-    """The pairing-vertex chunk transient is 1.6 windows + 2 slices (band), 6.2 windows + 4.2 slices (streamed)."""
-    _, _, one_slice = _tiny_chunk_sizes()
-    return int(6.2 * chunk + 4.2 * one_slice) if streaming else int(1.6 * chunk + 2 * one_slice)
-
-
-def test_chiq_aux_block_is_the_resident_one_fermion_blocks_plus_the_chunk_transient():
-    """The chiq_aux transient holds three one-fermion blocks (sum, kernel, inverse bubble) plus the chunk transient."""
-    nb, wp, vc = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"]
-    qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
-    block, _, _ = _tiny_chunk_sizes()
-    assert block < SLICE_CHUNK_BYTES  # the floor budget already walks the tiny block in one chunk
-    expected = SCALE * 3 * qi * nb**4 * wp * vc + OVERHEAD_FACTOR * _chiq_aux_transient(block)
+    expected = SCALE * 3 * qi * nb**4 * wp * vc + OVERHEAD_FACTOR * _chiq_aux_transient()
     bp = estimate_peaks(**TINY)["chiq_aux"]
     assert bp.off_distributed == pytest.approx(expected)
     assert bp.on_distributed == bp.off_distributed
 
 
-def test_chiq_aux_chunk_term_follows_the_passed_budget_up_to_the_rank_block():
-    """A larger aux-chi chunk budget raises only the chiq_aux transient, by the modeled per-chunk temporaries."""
-    block, _, _ = _tiny_chunk_sizes()
-    at = {b: estimate_peaks(**TINY, chunk_budgets=ChunkBudgets(chiq_aux=b)) for b in (block // 4, block // 2, block)}
-    quarter, half, whole = (at[b]["chiq_aux"].off_distributed for b in (block // 4, block // 2, block))
-    assert half - quarter == pytest.approx(
-        OVERHEAD_FACTOR * (_chiq_aux_transient(block // 2) - _chiq_aux_transient(block // 4))
-    )
-    assert whole - half == pytest.approx(
-        OVERHEAD_FACTOR * (_chiq_aux_transient(block) - _chiq_aux_transient(block // 2))
-    )
-    capped = estimate_peaks(**TINY, chunk_budgets=ChunkBudgets(chiq_aux=10 * block))["chiq_aux"]
-    assert capped.off_distributed == pytest.approx(whole)
-    for key in ("chi0q", "sde", "sigma_loop", "local"):
-        assert at[block // 4][key] == at[block][key]
-
-
-def test_chiq_aux_transient_counts_the_sliced_local_vertex_at_most_once_per_momentum_box():
-    """Above one momentum's box the sliced local vertex stops growing with the chunk (q-groups share one window)."""
-    block, per_q_box, one_slice = _tiny_chunk_sizes()
-    assert per_q_box < block
-    below, above = _chiq_aux_transient(per_q_box // 2), _chiq_aux_transient(2 * per_q_box)
-    assert below == pytest.approx(2 * (per_q_box // 2) + one_slice + (per_q_box // 2) // (2 * TINY["niv_core"]))
-    assert above == pytest.approx(3 * per_q_box + one_slice + (2 * per_q_box) // (2 * TINY["niv_core"]))
+def test_chiq_aux_transient_takes_no_chunk_budget():
+    """No budget moves the chiq_aux branch: the per-slice build holds the same two slices at any setting."""
+    floor = estimate_peaks(**TINY)["chiq_aux"]
+    for budgets in (ChunkBudgets(0, 0), ChunkBudgets(2**30, 2**30), ChunkBudgets(MAX_CHUNK_BUDGET_BYTES)):
+        assert estimate_peaks(**TINY, chunk_budgets=budgets)["chiq_aux"] == floor
 
 
 def test_fq_chunk_term_follows_the_passed_budget_up_to_the_rank_block():
-    """The pairing-vertex transient follows its modeled per-chunk temporaries, capped at the rank block."""
-    nb, wp, vc, vpp = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"], 2 * TINY["niv_pp"]
-    qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
-    block, _, _ = _tiny_chunk_sizes()
+    """The pairing-vertex transient follows its pp-box window chunk and momentum group, capped at the rank block."""
     params = {**TINY, "with_eliashberg": True}
-    residents = SCALE * (qi * nb**4 * vpp * vpp + 2 * qi * nb**4 * wp * vc)
-    for budget in (block // 4, block // 2, block):
+    _, window_slice, block_slices = _fq_branch(0)
+    for budget in (0, 3 * window_slice, block_slices * window_slice // 2, block_slices * window_slice):
         bp = estimate_peaks(**params, chunk_budgets=ChunkBudgets(fq=budget))["fq"]
-        assert bp.off_distributed == pytest.approx(residents + OVERHEAD_FACTOR * _fq_transient(budget))
-    capped = estimate_peaks(**params, chunk_budgets=ChunkBudgets(fq=10 * block))["fq"]
-    assert capped.off_distributed == pytest.approx(residents + OVERHEAD_FACTOR * _fq_transient(block))
+        assert bp.off_distributed == pytest.approx(_fq_branch(budget)[0])
+    capped = estimate_peaks(**params, chunk_budgets=ChunkBudgets(fq=MAX_CHUNK_BUDGET_BYTES))["fq"]
+    assert capped.off_distributed == pytest.approx(_fq_branch(block_slices * window_slice)[0])
 
 
 def test_streamed_full_vertex_models_the_whole_slice_inverse():
-    """With save_fq the pairing-vertex chunk carries the transient of numpy's whole-slice inverse, not the band's."""
-    nb, wp, vc, vpp = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"], 2 * TINY["niv_pp"]
-    qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
-    block, _, _ = _tiny_chunk_sizes()
-    residents = SCALE * (qi * nb**4 * vpp * vpp + 2 * qi * nb**4 * wp * vc)
-    params = {**TINY, "with_eliashberg": True, "chunk_budgets": ChunkBudgets(fq=block)}
-    band, streamed = (estimate_peaks(**params, save_fq=flag)["fq"].off_distributed for flag in (False, True))
-    assert streamed == pytest.approx(residents + OVERHEAD_FACTOR * _fq_transient(block, streaming=True))
-    assert streamed > band
-
-
-def test_chiq_aux_chunk_term_never_drops_below_one_compound_slice():
-    """The build walks at least one (q, w) slice per chunk, so a zero budget still models one slice's transient."""
-    nb, wp, vc = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"]
-    qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
-    _, _, one_slice = _tiny_chunk_sizes()
-    residents = SCALE * 3 * qi * nb**4 * wp * vc
-    bp = estimate_peaks(**TINY, chunk_budgets=ChunkBudgets(chiq_aux=0))["chiq_aux"]
-    assert bp.off_distributed == pytest.approx(residents + OVERHEAD_FACTOR * _chiq_aux_transient(one_slice))
+    """With save_fq the chunk is a core-box window and carries numpy's whole-slice inverse, beyond the band's."""
+    _, window_slice, block_slices = _fq_branch(0, streaming=True)
+    for budget in (0, block_slices * window_slice):
+        params = {**TINY, "with_eliashberg": True, "chunk_budgets": ChunkBudgets(fq=budget)}
+        band, streamed = (estimate_peaks(**params, save_fq=flag)["fq"].off_distributed for flag in (False, True))
+        assert streamed == pytest.approx(_fq_branch(budget, streaming=True)[0]) and streamed > band
 
 
 def test_max_chunk_budget_bisects_to_the_largest_fitting_budget():
@@ -333,7 +299,7 @@ def test_max_chunk_budget_bisects_to_the_largest_fitting_budget():
     assert max_chunk_budget(lambda budget: False) == SLICE_CHUNK_BYTES
     assert max_chunk_budget(lambda budget: budget <= SLICE_CHUNK_BYTES) == SLICE_CHUNK_BYTES
     assert max_chunk_budget(lambda budget: budget <= 2**31, upper=2**30) == 2**30
-    assert ChunkBudgets() == ChunkBudgets(SLICE_CHUNK_BYTES, SLICE_CHUNK_BYTES, SLICE_CHUNK_BYTES)
+    assert ChunkBudgets() == ChunkBudgets(SLICE_CHUNK_BYTES, SLICE_CHUNK_BYTES)
     assert RANK_BASELINE_BYTES > 0
 
 
@@ -349,7 +315,7 @@ def test_chi0q_fast_single_counts_buffer_ifftn_transient_and_g_copies():
 
 
 def test_chi0q_fast_distributed_is_bounded_by_the_result_slice():
-    """The multi-rank chi0q fast peak is the per-rank irr result slice plus the bounded sub-chunk group."""
+    """The multi-rank chi0q fast peak is 1.5 times the per-rank irr result slice."""
     nb, wp, vf = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_full"]
     qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
     expected = SCALE * 1.5 * qi * nb**4 * wp * vf
@@ -416,11 +382,11 @@ def test_sde_single_covers_the_rank0_occupation_step():
 
 
 def test_sigma_loop_is_rank0_only_with_the_linear_mix_copies_or_the_accelerated_solve():
-    """sigma_loop is rank 0's step alone: two niv_cut Sigmas plus the linear mix, update_mu or the accelerated solve."""
+    """sigma_loop is rank 0's step alone: two niv_cut Sigmas plus the linear mix or the accelerated solve."""
     nk, nb = TINY["nk_tot"], TINY["n_bands"]
     core = nk * nb**2 * 2 * TINY["niv_core"]
     full = nk * nb**2 * 2 * TINY["niv_cut"]
-    linear = SCALE * 2 * full + max(SCALE * 3 * full, 16 * 2 * full)
+    linear = SCALE * 2 * full + SCALE * 3 * full
     bp = estimate_peaks(**TINY)["sigma_loop"]
     assert bp.baseline == pytest.approx(_rank_base(TINY)) and bp.giwk_shareable == 0.0
     assert bp.off_distributed == 0.0 and bp.off_single == pytest.approx(linear)
@@ -429,6 +395,19 @@ def test_sigma_loop_is_rank0_only_with_the_linear_mix_copies_or_the_accelerated_
     assert solve == pytest.approx(SCALE * (8 * core + 2 * full) + 8 * core * (9 * 3 + 10))
     one_pair = estimate_peaks(**TINY, mixing_pairs=1)["sigma_loop"].off_single
     assert one_pair == pytest.approx(SCALE * 2 * core + linear)
+
+
+def test_mu_update_holds_two_complex128_green_function_slices_per_rank_next_to_rank0_sigmas():
+    """mu_update: every rank two complex128 G arrays on its momentum share, rank 0 two niv_cut Sigmas and history."""
+    nk, nb, ranks = TINY["nk_tot"], TINY["n_bands"], TINY["n_ranks"]
+    per_k = nb**2 * 2 * TINY["niv_cut"]
+    bp = estimate_peaks(**TINY)["mu_update"]
+    assert bp.baseline == pytest.approx(_rank_base(TINY)) and bp.giwk_shareable == 0.0
+    assert bp.off_distributed == pytest.approx(16 * 2 * -(-nk // ranks) * per_k)
+    assert bp.off_single == pytest.approx(SCALE * 2 * nk * per_k)
+    assert (bp.on_distributed, bp.on_single) == (bp.off_distributed, bp.off_single)
+    history = estimate_peaks(**TINY, mixing_pairs=4)["mu_update"].off_single - bp.off_single
+    assert history == pytest.approx(SCALE * 8 * nk * nb**2 * 2 * TINY["niv_core"])
 
 
 def test_sigma_interp_branch_models_rank0_interpolating_the_irreducible_sigma():

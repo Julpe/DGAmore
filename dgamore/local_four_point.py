@@ -817,10 +817,11 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         r"""
         Returns the orbital pairs that carry no entry of :math:`\Gamma_{r} - U_{r}`, as flat indices
         ``x * n_bands + y``: such a pair occupies no entry of this vertex or of ``u_r``, neither as the first pair
-        ``(o1, o2) = (x, y)`` nor as the reversed second pair ``(o4, o3) = (x, y)``. In the Bethe-Salpeter compound
-        matrix the rows and columns it labels then carry only the frequency-diagonal inverse bubble; these are the
-        inter-atom pairs of a cell whose local vertex and interaction are built atom by atom. Any non-zero entry
-        counts, and the vertex is scanned one orbital component at a time, so no vertex-sized temporary is made.
+        ``(o1, o2) = (x, y)`` nor as the reversed second pair ``(o4, o3) = (x, y)``. In a compound matrix that adds
+        this vertex minus ``u_r`` to a frequency-diagonal part, the rows and columns it labels then carry only that
+        part; these are the inter-atom pairs of a cell whose local vertex and interaction are built atom by atom. Any
+        non-zero entry counts, and the vertex is scanned one orbital component at a time, so no vertex-sized temporary
+        is made.
 
         :param u_r: The channel-projected local interaction :math:`U_{r}`.
         :return: The sorted flat indices of the pairs without vertex.

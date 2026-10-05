@@ -15,7 +15,7 @@ import dgamore.config as config
 import dgamore.mpi_utils as mu
 from dgamore.mpi_utils import MpiDistributor
 
-from tests.conftest import run_parallel, FAKE_MPI as MPI, FAKE_SOCKET
+from tests.conftest import create_comm_mock, run_parallel, FAKE_MPI as MPI, FAKE_SOCKET
 
 # The shared conftest autouse-fixture no-ops os.remove (so the suite never deletes real files). Capture the genuine
 # os.remove here at import time, so the rank-file lifecycle test can opt back into real deletion without disturbing it.
@@ -700,6 +700,29 @@ def test_allreduce_empty_leading_axis():
     _, res = run_parallel(3, fn)
     for r in res:
         assert r.shape == (0, 2)
+
+
+@pytest.mark.parametrize("size, ntasks", [(2, 11), (3, 11), (7, 11), (7, 4)])
+def test_ordered_sum_is_bit_identical_to_the_whole_array_reduction(size, ntasks):
+    """ordered_sum equals numpy's leading-axis reduction of the whole array bit for bit on every rank."""
+    rng = np.random.default_rng(ntasks)
+    full = rng.standard_normal((ntasks, 3, 3, 8)) + 1j * rng.standard_normal((ntasks, 3, 3, 8))
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=ntasks, comm=comm)
+        return d.ordered_sum(full[d.my_slice].copy())
+
+    _, res = run_parallel(size, fn)
+    assert all(np.array_equal(r, np.add.reduce(full, axis=0)) for r in res)
+
+
+def test_ordered_sum_single_rank_reduces_without_messages():
+    """ordered_sum on the single-rank mock communicator reduces locally and never sends, receives or broadcasts."""
+    comm = create_comm_mock()
+    rows = np.random.default_rng(5).standard_normal((5, 2, 2, 4)) + 0j
+    out = MpiDistributor(ntasks=5, comm=comm).ordered_sum(rows.copy())
+    assert np.array_equal(out, np.add.reduce(rows, axis=0))
+    assert comm.send.call_count == comm.recv.call_count == comm.bcast.call_count == 0
 
 
 def test_create_distributor_with_comm():

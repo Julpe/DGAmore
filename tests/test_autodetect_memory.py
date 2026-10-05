@@ -84,23 +84,22 @@ def test_large_memory_passes_verification(fake_system):
     """A large memory budget on a tiny problem passes every verification; the chunked builds get whole blocks."""
     fake_system(64 * 1024**3)
     whole, floor = MAX_CHUNK_BUDGET_BYTES, SLICE_CHUNK_BYTES
-    assert dgamore_main.autodetect_memory_settings(_mock_comm()) == ChunkBudgets(whole, whole, floor)  # no fq
+    assert dgamore_main.autodetect_memory_settings(_mock_comm()) == ChunkBudgets(whole, floor)  # no fq
 
 
 def _linear_chunk_branches(**kw):
     """Synthetic chunked branches whose per-rank transient is three times their chunk budget."""
     budgets = kw["chunk_budgets"]
-    return {key: _mock_branch(off_distributed=3 * getattr(budgets, key)) for key in ("chiq_aux", "sde", "fq")}
+    return {key: _mock_branch(off_distributed=3 * getattr(budgets, key)) for key in ("sde", "fq")}
 
 
 def test_chunk_budgets_are_the_largest_that_keep_each_branch_inside_its_line(fake_system, monkeypatch):
-    """All three chunked builds fill the line of the available memory (their results do not depend on the chunking)."""
+    """Both chunked builds fill the line of the available memory (their results do not depend on the chunking)."""
     avail = 3 * 1024**3
     fake_system(avail)
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", _linear_chunk_branches)
     budgets = dgamore_main.autodetect_memory_settings(_mock_comm())
     line = avail * dgamore_main.NODE_MEMORY_FRACTION
-    assert line / 3 - 2**20 <= budgets.chiq_aux <= line / 3
     assert line / 3 - 2**20 <= budgets.fq <= line / 3
     assert line / 3 - 2**20 <= budgets.sde <= line / 3
 
@@ -113,7 +112,7 @@ def test_chunk_budgets_take_the_minimum_over_the_nodes(fake_system, monkeypatch)
     two_nodes = lambda obj: [("node0", big), ("node1", small)]
     budgets = dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=two_nodes))
     tight = small * dgamore_main.NODE_MEMORY_FRACTION / 3
-    assert tight - 2**20 <= budgets.chiq_aux <= tight
+    assert tight - 2**20 <= budgets.sde <= tight
 
 
 def test_chunk_budgets_floor_when_only_the_floor_fits(fake_system, monkeypatch):
@@ -121,13 +120,26 @@ def test_chunk_budgets_floor_when_only_the_floor_fits(fake_system, monkeypatch):
     resident = 1024**3
 
     def heavy(**kw):
-        return {"chiq_aux": _mock_branch(baseline=resident, off_distributed=3 * kw["chunk_budgets"].chiq_aux)}
+        return {"fq": _mock_branch(baseline=resident, off_distributed=3 * kw["chunk_budgets"].fq)}
 
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", heavy)
     fake_system(int((resident + 3 * SLICE_CHUNK_BYTES + 2**20) / dgamore_main.NODE_MEMORY_FRACTION))
-    budget = dgamore_main.autodetect_memory_settings(_mock_comm()).chiq_aux
+    budget = dgamore_main.autodetect_memory_settings(_mock_comm()).fq
     assert SLICE_CHUNK_BYTES <= budget < SLICE_CHUNK_BYTES + 2**20
     fake_system(int((resident + 3 * SLICE_CHUNK_BYTES - 2**20) / dgamore_main.NODE_MEMORY_FRACTION))
+    with pytest.raises(MemoryError, match="Pairing-vertex construction"):
+        dgamore_main.autodetect_memory_settings(_mock_comm())
+
+
+def test_auxiliary_susceptibility_takes_no_budget_but_is_still_verified(fake_system, monkeypatch):
+    """The per-slice aux-chi sum gets no chunk budget, yet its fixed footprint must fit or the run stops upfront."""
+    resident = 1024**3
+    monkeypatch.setattr(
+        dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: {"chiq_aux": _mock_branch(baseline=resident)}
+    )
+    fake_system(int(2 * resident / dgamore_main.NODE_MEMORY_FRACTION))
+    assert dgamore_main.autodetect_memory_settings(_mock_comm()) == ChunkBudgets()
+    fake_system(int(resident / 2 / dgamore_main.NODE_MEMORY_FRACTION))
     with pytest.raises(MemoryError, match="Auxiliary susceptibility"):
         dgamore_main.autodetect_memory_settings(_mock_comm())
 
@@ -386,7 +398,7 @@ def test_local_step_overflow_raises_before_the_flag_loop(fake_system, monkeypatc
     monkeypatch.setattr(config.box, "niv_core", 40)
     monkeypatch.setattr(config.box, "niv_full", 100)
     params = {**FIXTURE_PARAMS, "niv_core": 40, "niv_full": 100, "niv_cut": 50}  # niv_cut = min(10 + 100 + 10, 50)
-    peaks = estimate_peaks(**params, n_ranks=1, with_eliashberg=False, chunk_budgets=ChunkBudgets(0, 0, 0))
+    peaks = estimate_peaks(**params, n_ranks=1, with_eliashberg=False, chunk_budgets=ChunkBudgets(0, 0))
     # array totals at the chunk floors without the per-rank footprint every branch carries alike
     totals = {k: bp.baseline - RANK_BASELINE_BYTES + bp.off_distributed + bp.off_single for k, bp in peaks.items()}
     local = totals.pop("local")

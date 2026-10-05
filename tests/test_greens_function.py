@@ -10,8 +10,11 @@ import numpy as np
 import pytest
 
 import dgamore.config as config
-from dgamore.greens_function import GreensFunction, update_mu
+from dgamore.greens_function import GreensFunction, get_total_fill, update_mu
+from dgamore.matsubara_frequencies import MFHelper
+from dgamore.mpi_utils import MpiDistributor
 from dgamore.self_energy import SelfEnergy
+from tests.conftest import run_parallel
 
 
 def test_symmetrize_orbitals_already_symmetrized():
@@ -362,6 +365,65 @@ def test_update_mu_forwards_newton_tolerance(monkeypatch):
         assert newton.call_args.kwargs["tol"] == 1e-6
         update_mu(mu, 1.0, ek, sig.mat, beta, sig.smom[0], tol=1e-10)
         assert newton.call_args.kwargs["tol"] == 1e-10
+
+
+def _causal_mu_inputs(n_bands: int, nk: tuple) -> tuple:
+    """Hermitian complex dispersion and a causal complex64 Sigma = s0 + a_k / (i v) with positive k-weights a_k."""
+    rng = np.random.default_rng(n_bands)
+    beta, n_k = 8.0, int(np.prod(nk))
+    h = rng.standard_normal((*nk, n_bands, n_bands)) + 0.3j * rng.standard_normal((*nk, n_bands, n_bands))
+    b = rng.standard_normal((n_k, n_bands, n_bands))
+    s0 = np.diag(rng.uniform(0.5, 1.0, n_bands))
+    sig = s0[..., None] + 0.2 * (b @ b.swapaxes(-1, -2))[..., None] / (1j * MFHelper.vn(24, beta))
+    return 0.5 * (h + np.conj(h.swapaxes(-1, -2))), sig.astype(np.complex64), beta, s0
+
+
+@pytest.mark.parametrize(
+    "n_bands, nk, size", [(1, (3, 2, 2), 1), (1, (3, 2, 2), 2), (2, (3, 2, 2), 3), (3, (3, 2, 2), 7), (3, (2, 2, 1), 7)]
+)
+def test_distributed_mu_search_is_bit_identical_to_the_serial_search(monkeypatch, n_bands, nk, size):
+    """Every rank's k-averaged G, filling and mu equal the serial evaluation bit for bit, empty ranks included."""
+    ek, sig, beta, s0 = _causal_mu_inputs(n_bands, nk)
+    invert, ordered_sum = GreensFunction._invert_last_orbital_block, MpiDistributor.ordered_sum
+    inverses, g_locs = [], []
+    with monkeypatch.context() as mp:
+        spy_inverse = staticmethod(lambda m: inverses.append(invert(m)) or inverses[-1])
+        mp.setattr(GreensFunction, "_invert_last_orbital_block", spy_inverse)
+        fill = get_total_fill(0.4, ek, sig, beta, s0)
+    mu = update_mu(0.1, fill, ek, sig, beta, s0)
+
+    def spy(dist, rows):
+        total = ordered_sum(dist, rows)
+        g_locs.append((dist.my_rank, total / dist.ntasks))
+        return total
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=sig.shape[0], comm=comm)
+        fill_rank = get_total_fill(0.4, ek, sig[d.my_slice], beta, s0, d)
+        return fill_rank, update_mu(0.1, fill, ek, sig[d.my_slice], beta, s0, mpi_dist=d)
+
+    monkeypatch.setattr(MpiDistributor, "ordered_sum", spy)
+    _, res = run_parallel(size, fn)
+    first = dict(reversed(g_locs))  # each rank's first g_loc is the evaluation at mu = 0.4
+    assert np.allclose(mu, 0.4, atol=1e-5) and np.array_equal(res, [(fill, mu)] * size)
+    assert len(first) == size and all(np.array_equal(g, np.mean(inverses[1], axis=0)) for g in first.values())
+
+
+@pytest.mark.parametrize("n_bands, nk, size", [(2, (3, 2, 2), 3), (3, (2, 2, 1), 7)])
+def test_distributed_mu_fallback_search_is_bit_identical_to_the_serial_search(monkeypatch, n_bands, nk, size):
+    """With Newton failing, the Brent search and the rootless return give the serial mu on every rank."""
+    ek, sig, beta, s0 = _causal_mu_inputs(n_bands, nk)
+    targets = (get_total_fill(0.4, ek, sig, beta, s0), 2.0 * n_bands + 1.0)
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=sig.shape[0], comm=comm)
+        return [update_mu(0.1, t, ek, sig[d.my_slice], beta, s0, mpi_dist=d) for t in targets]
+
+    with monkeypatch.context() as mp:
+        mp.setattr("dgamore.greens_function.opt.newton", MagicMock(side_effect=RuntimeError))
+        serial = [update_mu(0.1, t, ek, sig, beta, s0) for t in targets]
+        _, res = run_parallel(size, fn)
+    assert np.allclose(serial[0], 0.4, atol=1e-5) and serial[1] == 0.1 and np.array_equal(res, [serial] * size)
 
 
 def test_model_epot_chunked_matches_unchunked_reference(monkeypatch):

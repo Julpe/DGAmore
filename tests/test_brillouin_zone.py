@@ -791,6 +791,60 @@ def test_specify_auto_symmetries_accepts_non_contiguous_input():
     assert grid.is_auto is True
 
 
+_SWAP = np.array([[0, 1j], [-1, 0]])
+
+
+def _hand_set_auto_grid(us, sigmas=None, conjs=None):
+    """A 2x2x1 auto grid carrying the given per-k rotations, signs and anti-unitary flags without a discovery."""
+    grid = bz.KGrid(nk=(2, 2, 1), symmetries=[bz.KnownSymmetries.AUTO])
+    grid._auto_us = np.asarray(us, dtype=complex).reshape(2, 2, 1, *np.shape(us)[-2:])
+    grid._auto_sigmas = np.reshape(np.ones(4) if sigmas is None else np.asarray(sigmas, dtype=float), (2, 2, 1))
+    grid._auto_conjs = np.reshape(np.zeros(4, dtype=bool) if conjs is None else np.asarray(conjs), (2, 2, 1))
+    return grid
+
+
+def test_auto_monomial_map_reads_source_components_and_phases_off_the_rotation():
+    """Each group gathers the single non-zero entries of sigma U (x) U* (and U (x) U* again on four orbital axes)."""
+    grid = _hand_set_auto_grid(np.stack([np.eye(2), _SWAP, _SWAP, np.eye(2)]), sigmas=[1, 1, -1, 1])
+    group_of_k, perm, phase = grid.auto_monomial_map(np.complex64, 2)
+    assert group_of_k.tolist() == [0, 1, 2, 0] and perm.tolist() == [[0, 1, 2, 3], [3, 2, 1, 0], [3, 2, 1, 0]]
+    assert phase.dtype == np.complex64 and np.array_equal(phase, [[1, 1, 1, 1], [1, -1j, 1j, 1], [-1, 1j, -1j, -1]])
+    group_of_k, perm_4, phase_4 = grid.auto_monomial_map(np.complex64, 4)
+    assert group_of_k.tolist() == [0, 1, 1, 0] and np.array_equal(perm_4[1], np.add.outer(4 * perm[1], perm[1]).ravel())
+    assert np.array_equal(phase_4[1], np.multiply.outer(phase[1], phase[1]).ravel())
+
+
+@pytest.mark.parametrize(
+    "us, conjs",
+    [
+        (np.stack([np.eye(2), np.array([[1, 1], [1, -1]]) / np.sqrt(2)] * 2), None),
+        (np.stack([np.eye(2), _SWAP] * 2), [False, True, False, True]),
+        (np.stack([np.eye(2), _SWAP + 1e-14] * 2), None),
+        (np.stack([np.eye(2)] * 4), None),
+    ],
+    ids=["dense", "anti-unitary", "residue", "identity"],
+)
+def test_auto_monomial_map_is_none_without_an_exact_unitary_monomial_rotation(us, conjs):
+    """A dense, anti-unitary or inexact rotation, or groups that change nothing, leave the einsum unfold in charge."""
+    grid = _hand_set_auto_grid(us, conjs=conjs)
+    assert grid.auto_monomial_map(np.complex64, 4) is None and grid.auto_monomial_map(np.complex128, 2) is None
+
+
+def test_auto_monomial_map_judges_the_entries_in_the_target_dtype():
+    """An entry within single-precision rounding of 1 is exact in complex64 but not in complex128."""
+    grid = _hand_set_auto_grid(np.stack([np.eye(2), np.array([[0, 1 - 1e-10], [-1, 0]])] * 2))
+    assert grid.auto_monomial_map(np.complex64, 4) is not None and grid.auto_monomial_map(np.complex128, 4) is None
+
+
+def test_auto_monomial_map_is_cached_and_recomputed_for_replaced_rotations():
+    """The map is computed once per dtype and orbital-axis count and again after the rotations are replaced."""
+    grid = _hand_set_auto_grid(np.stack([np.eye(2), _SWAP] * 2))
+    first = grid.auto_monomial_map(np.complex64, 4)
+    assert grid.auto_monomial_map(np.complex64, 4) is first and grid.auto_monomial_map(np.complex128, 4) is not first
+    grid._auto_us = np.broadcast_to(np.eye(2, dtype=complex), grid._auto_us.shape).copy()
+    assert grid.auto_monomial_map(np.complex64, 4) is None
+
+
 def test_plain_symmetry_kgrid_two_dimensional_square_unchanged():
     """The plain-symmetry path keeps its IBZ: 4x4x1 square symmetry gives Gamma, X, M and one interior point."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())

@@ -39,6 +39,9 @@ from dgamore.n_point_base import DTYPE
 # established test hook of monkeypatching ``mpi_utils.MAX_MPI_BYTES`` to force the chunked path keeps working.
 MAX_MPI_BYTES = 2**31 - 1
 
+# MPI tag of the running sum that :meth:`MpiDistributor.ordered_sum` hands from rank to rank.
+ORDERED_SUM_TAG = 1400
+
 
 def build_node_shared_array(node_comm, compute_fn, dtype=None):
     r"""
@@ -831,6 +834,31 @@ class MpiDistributor:
         for i, j in row_chunks(rows, itemsize, per_row, limit=MAX_MPI_BYTES):
             self.comm.Allreduce(MPI.IN_PLACE, rank_result[i:j])
         return rank_result
+
+    def ordered_sum(self, rows: np.ndarray) -> np.ndarray:
+        """
+        Sums a row-distributed array over all its rows in global row order and returns the sum on every rank. The
+        running sum travels along the ranks in rank order: each rank adds it to its first row, reduces its rows over
+        the leading axis and hands the result to the next rank; the last rank broadcasts the total. numpy reduces the
+        leading axis row by row when it is the outermost axis in memory and the rows hold more than one element, so
+        for such arrays the result is bit-identical to ``np.add.reduce(full, axis=0)`` at any rank count (a leading
+        axis that is not outermost, e.g. Fortran order, is summed pairwise; an all-reduce of per-rank partial sums
+        regroups it; single-element rows are summed pairwise by numpy and agree only to rounding). The running sum
+        travels pickled, so the row sum must stay small. A single-rank communicator reduces locally.
+
+        :param rows: This rank's rows ``[my_size, ...]`` of the summed array (its first row may be overwritten).
+        :return: The sum over all rows, shape ``rows.shape[1:]``, on every rank.
+        """
+        if self.mpi_size == 1:
+            return np.add.reduce(rows, axis=0)
+        total = self.comm.recv(source=self.my_rank - 1, tag=ORDERED_SUM_TAG) if self.my_rank > 0 else None
+        if len(rows):
+            if total is not None:
+                rows[0] += total
+            total = np.add.reduce(rows, axis=0)
+        if self.my_rank < self.mpi_size - 1:
+            self.comm.send(total, dest=self.my_rank + 1, tag=ORDERED_SUM_TAG)
+        return self.comm.bcast(total, root=self.mpi_size - 1)
 
     @staticmethod
     def create_distributor(

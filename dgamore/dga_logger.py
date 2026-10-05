@@ -153,7 +153,7 @@ class DgaLogger:
         :param per: What a single copy belongs to, i.e. ``"rank"`` or ``"node"``; wording of the breakdown only.
         :param scale: Factor one copy's footprint is multiplied by, for a quantity reported through a stand-in
             object that holds a fraction of it (e.g. the frequency-summed auxiliary susceptibility standing in for
-            the full two-fermion one, which the chunked build never materializes).
+            the full two-fermion one, which the per-slice build never materializes).
         :return: None.
         """
         objects = [o for o in (obj if isinstance(obj, (list, tuple)) else [obj]) if o is not None]

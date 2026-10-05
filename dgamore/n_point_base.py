@@ -544,6 +544,9 @@ class IAmNonLocal(IHaveMat, ABC):
     need more than one momentum dimension for one- and two-particle quantities.
     """
 
+    # Bytes of full-BZ rows one step of the monomial unfold gathers and phases while they stay in cache.
+    _UNFOLD_CHUNK_BYTES = 256 * 1024
+
     def __init__(self, mat: np.ndarray, nq: tuple[int, int, int], has_compressed_q_dimension: bool = False):
         """
         Stores the array, the momentum-grid size and the momentum-layout flag.
@@ -829,7 +832,9 @@ class IAmNonLocal(IHaveMat, ABC):
         """
         return self._map_to_full_bz(k_grid, 4, nq)
 
-    def _map_to_full_bz(self, k_grid: "KGrid", num_orbital_dimensions: int, nq: tuple = None):
+    def _map_to_full_bz(
+        self, k_grid: "KGrid", num_orbital_dimensions: int, nq: tuple = None, out: np.ndarray | None = None
+    ):
         r"""
         Maps the object from the irreducible to the full Brillouin zone.
 
@@ -847,11 +852,17 @@ class IAmNonLocal(IHaveMat, ABC):
             4-index : :math:`M_{1234}(\mathbf{k}) = \sigma_{\mathbf{k}}^2\, U_{1a} [M_{abcd}(\mathbf{k}_{\mathrm{rep}})]^{[*conj_k]} U^\dagger_{b2} U_{3c} U^\dagger_{d4}`
 
         If ``k_grid`` is not yet in auto mode (``specify_auto_symmetries`` has not been called),
-        only the momentum expansion is performed and orbital indices are left unchanged.
+        only the momentum expansion is performed and orbital indices are left unchanged. When every changing rotation
+        is unitary and has a single entry :math:`\pm 1` or :math:`\pm i` per row
+        (:meth:`~dgamore.brillouin_zone.KGrid.auto_monomial_map`), expansion and transformation are one gather in
+        full-BZ order over row chunks of ``_UNFOLD_CHUNK_BYTES``, equal to the einsum path on finite input up to the
+        sign of zeros.
 
         :param k_grid: The momentum grid carrying the irreducible-to-full-BZ map and per-k orbital rotations.
         :param num_orbital_dimensions: Number of orbital axes to transform; must be 2 or 4.
         :param nq: Optional override for the number of momenta; if None the object's own ``nq`` is used.
+        :param out: Optional C-contiguous array of the unfolded shape and the object's dtype that receives the result
+            instead of a fresh allocation; it must not overlap the object's array, and its content is overwritten.
         :return: ``self`` expanded to the full BZ.
         :raises ValueError: If the object does not have a compressed momentum dimension.
         """
@@ -863,17 +874,31 @@ class IAmNonLocal(IHaveMat, ABC):
         if nq is not None:
             self._nq = nq
 
-        # Expand IBZ -> FBZ via the standard irrk_inv map (no orbital action yet).
         flat_inv = k_grid.irrk_inv.ravel()
         out_shape = (np.prod(self.nq), *self.current_shape[1:])
-        expanded = np.empty(out_shape, dtype=self.mat.dtype)
-        # mode="clip" writes straight into out (the default "raise" buffers a second output-sized array); the
-        # indices of irrk_inv are valid by construction, so clipping never acts
-        np.take(self.mat, flat_inv, axis=0, out=expanded, mode="clip")
-        self.mat = expanded
+        expanded = np.empty(out_shape, dtype=self.mat.dtype) if out is None else out
+        monomial = k_grid.auto_monomial_map(self.mat.dtype, num_orbital_dimensions) if k_grid.is_auto else None
+        if monomial is None:
+            # plain IBZ -> FBZ copy; mode="clip" writes straight into out (the default "raise" buffers a second
+            # output-sized array) and never acts, since the indices of irrk_inv are valid by construction
+            np.take(self.mat, flat_inv, axis=0, out=expanded, mode="clip")
+            self.mat = expanded
+        else:
+            group_of_k, perm, phase = monomial
+            n_comp, trailing = perm.shape[1], int(np.prod(self.current_shape[1 + num_orbital_dimensions :]))
+            # one source row per (irreducible momentum, orbital component); a strided view is copied once here
+            source = np.ascontiguousarray(self.mat).reshape(self.current_shape[0] * n_comp, trailing)
+            target = expanded.reshape(out_shape[0], n_comp, trailing)
+            rows = max(1, self._UNFOLD_CHUNK_BYTES // max(1, n_comp * trailing * target.itemsize))
+            for start in range(0, out_shape[0], rows):
+                part = slice(start, start + rows)
+                groups = group_of_k[part]
+                np.take(source, flat_inv[part, None] * n_comp + perm[groups], axis=0, out=target[part], mode="clip")
+                target[part] *= phase[groups][..., None]
+            self.mat = target.reshape(out_shape)
 
         # Apply per-k orbital transformation if auto-mode data is present.
-        if k_grid.is_auto:
+        if monomial is None and k_grid.is_auto:
             from dgamore import symmetry_reduction
 
             us = k_grid._auto_us.reshape(np.prod(k_grid.nk), *k_grid._auto_us.shape[3:])

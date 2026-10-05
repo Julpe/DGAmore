@@ -18,13 +18,14 @@ transients (known un-modeled cost: the mixing history of ``apply_mixing_strategy
 peaks). It defaults to ``1.0`` (no extra margin); the residual headroom for OS/allocator overhead lives in the
 driver's node-memory fraction (``NODE_MEMORY_FRACTION`` in :mod:`dgamore.DGAmore`), so the two margins do not compound.
 
-The chunk budgets of the three chunked builds are sized from this estimate: the driver hands
+The chunk budgets of the two chunked builds are sized from this estimate: the driver hands
 :func:`max_chunk_budget` the fit check of a branch and receives the largest budget that check accepts, and
 :func:`estimate_peaks` models each branch at the budget it was handed (:class:`ChunkBudgets`), so the fit check and
-the builds agree. All three builds are bit-invariant under their chunking (the self-energy contraction associates
-its bosonic sum in fixed blocks of :data:`SDE_W_BLOCK` frequencies folded in rank order, whatever its budget) and fill
+the builds agree. Both builds are bit-invariant under their chunking (the self-energy contraction associates its
+bosonic sum in fixed blocks of :data:`SDE_W_BLOCK` frequencies folded in rank order, whatever its budget) and fill
 the headroom below the currently available memory. Their per-chunk transients are modeled from their actual
-temporaries (assembled window, sliced local vertex, per-slice copies, transposed kernel columns).
+temporaries (the pairing vertex's window chain and per-slice solve buffers, transposed kernel columns); the
+auxiliary-susceptibility sum takes no budget, its transient is a fixed two compound slices.
 
 Each branch carries its **own** persistent per-rank ``baseline`` (the full-grid two-point objects resident at that
 branch's peak) and the portion of it (``giwk_shareable``) that the node-shared giwk window deduplicates
@@ -85,7 +86,7 @@ TEAM_MATVEC_TRANSIENT_VECTORS: int = 5
 TEAM_BUILD_CHUNK_BYTES: int = 64 * 1024**2
 
 
-# Floor and cap of the per-chunk byte budget of the chunked builds (auxiliary susceptibility and pairing vertex):
+# Floor and cap of the per-chunk byte budget of the chunked builds (self-energy contraction and pairing vertex):
 # the floor keeps per-chunk Python and dispatch overhead negligible, the cap bounds the transient on fat nodes.
 SLICE_CHUNK_BYTES: int = 2**28
 MAX_SLICE_CHUNK_BYTES: int = 2**32
@@ -97,18 +98,15 @@ MAX_CHUNK_BUDGET_BYTES: int = 2**40
 @dataclass(frozen=True)
 class ChunkBudgets:
     """
-    Per-rank chunk byte budgets of the three chunked builds, sized by the driver from the estimate (see
+    Per-rank chunk byte budgets of the two chunked builds, sized by the driver from the estimate (see
     :func:`max_chunk_budget`) and consumed both by :func:`estimate_peaks` and by the builds themselves.
     Every field defaults to the :data:`SLICE_CHUNK_BYTES` floor.
 
-    :ivar chiq_aux: Budget of the auxiliary-susceptibility sum
-        (:func:`dgamore.nonlocal_sde.create_auxiliary_chi_r_q_sum`).
     :ivar sde: Budget of one round of transposed irreducible kernel columns of the self-energy contraction
         (:func:`dgamore.nonlocal_sde._run_column_sde`).
     :ivar fq: Budget of the pairing-vertex build (:func:`dgamore.eliashberg_solver._build_pairing_vertex_pp`).
     """
 
-    chiq_aux: int = SLICE_CHUNK_BYTES
     sde: int = SLICE_CHUNK_BYTES
     fq: int = SLICE_CHUNK_BYTES
 
@@ -361,8 +359,8 @@ class BranchPeak:
 
     :ivar baseline: Per-rank persistent bytes (full-grid two-point objects) live at this branch's peak.
     :ivar giwk_shareable: The portion of ``baseline`` held in per-node shared-memory windows (the Green's functions,
-        the local vertex and the loop self-energy), deduplicated to one copy per node (0 for the Eliashberg branches,
-        whose ``giwk_dga`` is a private object).
+        the local vertex and the loop self-energy), deduplicated to one copy per node (for the Eliashberg branches
+        only the local vertex of the pairing-vertex build: ``giwk_dga`` is a private object).
     :ivar off_distributed: Per-rank transient bytes held by every rank in the fast (flag-off) path.
     :ivar off_single: Transient bytes held by a single rank in the fast (flag-off) path.
     :ivar on_distributed: Per-rank transient bytes held by every rank in the lean (flag-on) path.
@@ -415,36 +413,43 @@ def _bubble_block(q: int, nb: int, nw: int, nv: int) -> int:
     return q * nb**4 * nw * nv
 
 
-def _chiq_aux_transient(chunk: int, per_q_box: int, one_slice: int, vc: int) -> int:
+def _chiq_aux_transient(compound: int, n_bands: int) -> int:
     """
-    Returns the per-rank transient bytes of one chunk of the auxiliary-susceptibility sum: the assembled
-    Bethe-Salpeter window, the sliced local vertex (the window's bosonic range, at most one momentum's box), the
-    Fortran-ordered copy of the compound slice being LU-factorized and the window's summed output.
+    Returns the per-rank transient bytes of the auxiliary-susceptibility sum beyond its summed output: two compound
+    slices (the momentum-independent buffer of the current bosonic frequency and the factorized copy), the
+    column-sized temporaries alive during the next bosonic frequency's symmetry scan (128 slice columns for the
+    absolute values of one 256-column tile, plus four arrays of ``n_bands^2`` columns: the right-hand sides, the
+    vertex diagonal and the previous slice's solution and diagonal blocks) and two 256 x 256 tiles of the scan. Up
+    to eight bands this also covers the factorization step, whose workspace is 64 columns at the reference LAPACK
+    block size. It is the bound with every orbital pair solved: with pairs eliminated the slices span only the
+    other pairs.
 
-    :param chunk: Bytes of the assembled two-fermion window.
-    :param per_q_box: Bytes of one momentum's full two-fermion box.
-    :param one_slice: Bytes of one ``(q, w)`` compound slice.
-    :param vc: Number of fermionic frequencies of the core box (the summed output is the window over ``vc``).
+    :param compound: Side length of a ``(q, w)`` compound slice, ``n_bands^2`` times the fermionic frequencies.
+    :param n_bands: Number of bands :math:`B`.
     :return: The transient bytes.
     """
-    return chunk + min(chunk, per_q_box) + one_slice + chunk // vc
+    return DTYPE_BYTES * (2 * compound**2 + (128 + 4 * n_bands**2) * compound + 2 * 256**2)
 
 
-def _fq_transient(chunk: int, one_slice: int, streaming: bool) -> int:
+def _fq_transient(chunk: int, one_fermion: int, one_slice: int, streaming: bool) -> int:
     """
-    Returns the per-rank transient bytes of one chunk of the pairing-vertex build, as measured by RSS: the band build
-    holds the sliced local vertex and the assembled Bethe-Salpeter window with its pp-box chain (1.6 windows) plus one
-    slice's solve buffers (2 slices); the streamed full vertex inverts the whole window with numpy, which computes a
-    complex64 window in complex128 (6.2 windows plus 4.2 slices; a complex128 window needs about 3.7 and 1.4).
+    Returns the per-rank transient bytes of one chunk of the pairing-vertex build beyond its inputs, as traced: the
+    chain on the chunk's two-fermion window peaks at three windows (the two matmul products and the einsum's operand
+    copy, or the vertex and the negative-frequency half of the pp-band write) next to at most six of its one-fermion
+    windows (the bubble and three-leg-vertex windows and cuts, the first-frequency sum, the right three-leg vertex).
+    The Bethe-Salpeter slices are built and solved one at a time: the band solve holds four compound slices (the
+    per-frequency buffer, the solved copy and at most two of the Schur reduction's temporaries), the whole-slice
+    inverse of a streamed full vertex nine (beyond the one buffer it is built in, numpy inverts a complex64 slice in
+    complex128: the cast input, LAPACK's matrix and right-hand-side copies and the output take two slices each).
 
-    :param chunk: Bytes of the assembled two-fermion window.
-    :param one_slice: Bytes of one ``(q, w)`` compound slice.
+    :param chunk: Bytes of the chunk's two-fermion window on the box its chain runs on (the pp box for the band, the
+        core box for a streamed full vertex).
+    :param one_fermion: Bytes of the chunk's one-fermion window on the core box.
+    :param one_slice: Bytes of one ``(q, w)`` compound slice of the core box.
     :param streaming: Whether the full ladder vertex is streamed to disk (``save_fq``).
     :return: The transient bytes.
     """
-    if streaming:
-        return int(6.2 * chunk + 4.2 * one_slice)
-    return int(1.6 * chunk + 2 * one_slice)
+    return 3 * chunk + 6 * one_fermion + (9 if streaming else 4) * one_slice
 
 
 def _giwk_rspace(nk_tot: int, nb: int, nv: int) -> int:
@@ -501,20 +506,22 @@ def estimate_peaks(
     baseline additionally holds the R-space Green's-function copy, which is node-shared like giwk itself when the
     shared window is active (its ``giwk_shareable`` covers the node-shared arrays). The Eliashberg branches run after
     the self-consistency loop with ``sigma_dga`` freed and ``giwk_dga`` on rank 0 only, so their baseline is the
-    per-rank footprint alone (``giwk_shareable = 0``); the surviving copy is counted in their single-rank slots. The
-    ``sigma_loop`` branch is the loop's self-energy step after the SDE, which runs on rank 0 alone: the history plus
-    the largest of the mixing point (the proposal and the rebuilt previous iterate with the three linear-mixing
-    copies, or the accelerated least-squares solve) and the chemical-potential update (the previous iterate and the
-    node's new window next to two complex128 Green's-function arrays), which dominate the proposal tail and the
-    hand-over; the other node roots hold at most their received array and window then, which the single-rank slot
-    covers on every node. The ``sigma_interp`` branch, present when ``niv_interp`` is set, is the final re-gridding:
-    rank 0 interpolates the irreducible self-energy and unfolds the result next to the node-shared window, every rank
-    re-grids at most its share of the momenta it fits with a pole. The ``local`` branch is rank 0's local
-    Schwinger-Dyson step, the larger of the second channel's inversions (three core blocks next to the first channel's
-    outputs and its own generalized susceptibility) and its full vertex (next to both channels' irreducible vertices
-    and generalized susceptibilities and the first full vertex), plus the orbital symmetrization's copy of one full
-    vertex with ``symmetrize_orbitals``. Every branch's baseline includes the per-rank :data:`RANK_BASELINE_BYTES` and
-    the full-grid non-local interaction every rank keeps for the whole run.
+    per-rank footprint, plus for ``fq`` the node-shared local vertex the Bethe-Salpeter slices are built from (its
+    ``giwk_shareable``); the surviving copy is counted in their single-rank slots. The
+    ``sigma_loop`` branch is the loop's mixing step after the SDE, which runs on rank 0 alone: the history plus the
+    proposal and the rebuilt previous iterate with the three linear-mixing copies or the accelerated least-squares
+    solve, which dominate the proposal tail and the hand-over; the other node roots hold at most their received array
+    and window then, which the single-rank slot covers on every node. The ``mu_update`` branch is the
+    chemical-potential update after it: every rank holds two complex128 Green's-function arrays on its share of the
+    full-BZ momenta, next to rank 0's history and previous iterate and the node's new window. The ``sigma_interp``
+    branch, present when ``niv_interp`` is set, is the final re-gridding: rank 0 interpolates the irreducible
+    self-energy and unfolds the result next to the node-shared window, every rank re-grids at most its share of the
+    momenta it fits with a pole. The ``local`` branch is rank 0's local Schwinger-Dyson step, the larger of the second
+    channel's inversions (three core blocks next to the first channel's outputs and its own generalized
+    susceptibility) and its full vertex (next to both channels' irreducible vertices and generalized susceptibilities
+    and the first full vertex), plus the orbital symmetrization's copy of one full vertex with
+    ``symmetrize_orbitals``. Every branch's baseline includes the per-rank :data:`RANK_BASELINE_BYTES` and the
+    full-grid non-local interaction every rank keeps for the whole run.
 
     :param n_bands: Number of bands :math:`B`.
     :param nk_tot: Total number of momentum points (full BZ).
@@ -544,10 +551,11 @@ def estimate_peaks(
     :param symmetrize_orbitals: Whether the local vertices are symmetrized over orbitals
         (``config.dmft.symmetrize_orbitals`` is not empty), which copies one full vertex at a time.
     :param overhead: Global multiplicative factor accounting for un-modeled transient arrays.
-    :param chunk_budgets: Chunk byte budgets of the three chunked builds (see :class:`ChunkBudgets` and
+    :param chunk_budgets: Chunk byte budgets of the two chunked builds (see :class:`ChunkBudgets` and
         :func:`max_chunk_budget`); each modeled chunk is clamped to at least one slice of its build (a ``(q, w)``
-        compound slice, or one task's irreducible kernel columns of the self-energy contraction) and at most the
-        build's rank block. A zero budget yields that branch's residents plus a single slice's transient.
+        slice of the pairing vertex's window, or one task's irreducible kernel columns of the self-energy contraction)
+        and at most the build's rank block. A zero budget yields that branch's residents plus a single slice's
+        transient.
     :return: A dict mapping each branch key to its :class:`BranchPeak`.
     """
     nb = n_bands
@@ -606,15 +614,9 @@ def estimate_peaks(
         on_single=chi0q_off_single + mixing_history,
     )
 
-    # Chunked sum (verify-only): three resident one-fermion blocks (accumulated sum, kernel accumulator, inverse
-    # bubble) + the chunk transient at the driver-sized budget, clamped to [one (q, w) compound slice, rank block].
-    one_slice = DTYPE_BYTES * _two_fermion_block(1, nb, 1, vc)
-    per_q_box = DTYPE_BYTES * _two_fermion_block(1, nb, wp, vc)
-    rank_block = DTYPE_BYTES * _two_fermion_block(qi, nb, wp, vc)
-    chiq_aux_chunk = min(max(chunk_budgets.chiq_aux, one_slice), rank_block)
-    chiq_aux_distributed = scale * 3 * _bubble_block(qi, nb, wp, vc) + overhead * _chiq_aux_transient(
-        chiq_aux_chunk, per_q_box, one_slice, vc
-    )
+    # Per-slice sum (verify-only): three resident one-fermion blocks (summed output, kernel accumulator, inverse
+    # bubble) + the fixed per-slice transient, whatever the budgets.
+    chiq_aux_distributed = scale * 3 * _bubble_block(qi, nb, wp, vc) + overhead * _chiq_aux_transient(nb * nb * vc, nb)
     # One node-shared local vertex resident: f_dc_loc is niv_full x niv_core (summed index on the full box), the
     # surviving one a core-box square.
     local_vertex_shared = scale * max(_two_fermion_block(1, nb, wp, vf, vc), _two_fermion_block(1, nb, wp, vc))
@@ -651,15 +653,21 @@ def estimate_peaks(
     )
 
     if with_eliashberg:
-        # Slice-direct pairing-vertex build: pp accumulator + the two loaded one-fermion inputs + the measured chunk
-        # transient of the band build (or of the streamed full vertex) at the driver-sized budget, slice/block clamped.
-        fq_chunk = min(max(chunk_budgets.fq, one_slice), rank_block)
+        # Slice-direct pairing-vertex build: pp accumulator, two loaded one-fermion inputs and their momentum-group
+        # copies, chunk transient at the driver-sized budget; the band's window is the pp box, a streamed one the core.
+        one_slice = DTYPE_BYTES * _two_fermion_block(1, nb, 1, vc)
+        fq_nv, fq_nw = (vc, wp) if save_fq else (vpp, vpp)
+        window_slice = DTYPE_BYTES * _two_fermion_block(1, nb, 1, fq_nv)
+        fq_chunk = min(max(chunk_budgets.fq, window_slice), qi * fq_nw * window_slice)
+        q_group = max(1, fq_chunk // (fq_nw * window_slice))
         fq_distributed = scale * (
-            _two_fermion_block(qi, nb, 1, vpp) + 2 * _bubble_block(qi, nb, wp, vc)
-        ) + overhead * _fq_transient(fq_chunk, one_slice, save_fq)
+            _two_fermion_block(qi, nb, 1, vpp) + 2 * _bubble_block(qi + q_group, nb, wp, vc)
+        ) + overhead * _fq_transient(fq_chunk, fq_chunk * vc // fq_nv**2, one_slice, save_fq)
+        # the local vertex the slices are built from, node-shared (counted once per node)
+        local_vertex_fq = scale * _two_fermion_block(1, nb, wp, vc)
         peaks["fq"] = BranchPeak(
-            baseline=rank_base,
-            giwk_shareable=0.0,
+            baseline=rank_base + local_vertex_fq,
+            giwk_shareable=local_vertex_fq,
             off_distributed=fq_distributed,
             off_single=giwk_dga_single,
             on_distributed=fq_distributed,
@@ -679,15 +687,11 @@ def estimate_peaks(
             on_single=pairing_gather + giwk_dga_single,
         )
 
-    # Rank-0 loop step (verify-only): the history + two niv_cut Sigmas with 3 linear-mix copies, the accelerated solve
-    # (measured: 9 m + 10 complex64 core copies bound Anderson and Pulay in both precisions) or update_mu's G arrays.
+    # Rank-0 loop step (verify-only): the history + two niv_cut Sigmas with 3 linear-mix copies or the accelerated
+    # solve (measured: 9 m + 10 complex64 core copies bound Anderson and Pulay in both precisions).
     solve_width = mixing_pairs - 1
     mixing_solve = overhead * 8 * sigma_core * (9 * solve_width + 10) if solve_width > 0 else 0.0
-    sigma_loop_single = (
-        mixing_history
-        + scale * 2 * sigma_full
-        + max(scale * 3 * sigma_full, mixing_solve, overhead * 16 * 2 * sigma_full)
-    )
+    sigma_loop_single = mixing_history + scale * 2 * sigma_full + max(scale * 3 * sigma_full, mixing_solve)
     peaks["sigma_loop"] = BranchPeak(
         baseline=rank_base,
         giwk_shareable=0.0,
@@ -695,6 +699,19 @@ def estimate_peaks(
         off_single=sigma_loop_single,
         on_distributed=0.0,
         on_single=sigma_loop_single,
+    )
+
+    # Chemical-potential update (verify-only): every rank's two complex128 Green's-function arrays on its share of the
+    # full-BZ momenta, next to rank 0's history, previous iterate and the node's window.
+    mu_update_distributed = overhead * 16 * 2 * _giwk_rspace(_ceil_div(nk_tot, n_ranks), nb, 2 * niv_cut)
+    mu_update_single = mixing_history + scale * 2 * sigma_full
+    peaks["mu_update"] = BranchPeak(
+        baseline=rank_base,
+        giwk_shareable=0.0,
+        off_distributed=mu_update_distributed,
+        off_single=mu_update_single,
+        on_distributed=mu_update_distributed,
+        on_single=mu_update_single,
     )
 
     if niv_interp:

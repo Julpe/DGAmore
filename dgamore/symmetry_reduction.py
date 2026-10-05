@@ -1043,6 +1043,19 @@ def auto_transform_groups(us: np.ndarray, sigmas: np.ndarray, conjs: np.ndarray)
     return [members[g] for g in np.argsort(first)]
 
 
+def leaves_unchanged(u: np.ndarray, sigma: float, conj: bool) -> bool:
+    """
+    Tests whether the orbital transformation ``(U, sigma, conj)`` acts as the identity: ``sigma`` is 1, the
+    transformation is unitary and ``U`` is the identity up to :func:`numpy.allclose` in the dtype of ``U``.
+
+    :param u: The orbital unitary of shape ``(nb, nb)``.
+    :param sigma: The sign of the transformation.
+    :param conj: Whether the transformation is anti-unitary.
+    :return: True if the transformation leaves every tensor unchanged.
+    """
+    return sigma == 1.0 and not conj and np.allclose(u, np.eye(u.shape[0], dtype=u.dtype))
+
+
 def apply_auto_orbital_transform(
     mat: np.ndarray,
     us: np.ndarray,
@@ -1105,8 +1118,6 @@ def apply_auto_orbital_transform(
     sigma_power = num_orbital_dimensions // 2
     effective_sigmas = sigmas if sigma_power == 1 else (sigmas**sigma_power)
 
-    identity = np.eye(nb, dtype=mat.dtype)
-
     # Group local k-points by their (U, sigma, conj) signature so each equivalence
     # class can be transformed in one batched einsum.
     path_2 = path_4 = None
@@ -1116,7 +1127,7 @@ def apply_auto_orbital_transform(
         conj = bool(conjs[idx[0]])
 
         # Identity-like rows: skip entirely.
-        if sigma == 1.0 and not conj and np.allclose(u_ref, identity):
+        if leaves_unchanged(u_ref, sigma, conj):
             continue
 
         block = mat[idx]

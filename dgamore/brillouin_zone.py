@@ -10,6 +10,7 @@ Module to handle operations within the (irreducible) Brillouin zone. Heavily ins
 
 import warnings
 from enum import Enum
+from functools import reduce
 
 import numpy as np
 
@@ -414,6 +415,7 @@ class KGrid:
         self._auto_conjs = None  # shape (nx, ny, nz), bool
         self._auto_group = None  # the closed group of discovered operations
         self._auto_groups: dict = {}  # cached k-point groups of the orbital transformation, see auto_orbital_groups
+        self._auto_monomials: dict = {}  # cached gather form of monomial transformations, see auto_monomial_map
 
         self.nk = nk
         self.set_k_axes()
@@ -532,10 +534,74 @@ class KGrid:
         key = (np.dtype(dtype), num_orbital_dimensions)
         cached = self._auto_groups.get(key)
         if cached is None or any(a is not b for a, b in zip(cached[0], arrays)):
-            us = self._auto_us.reshape(self.nk_tot, *self._auto_us.shape[3:]).astype(dtype, copy=False)
-            sigmas = self._auto_sigmas.reshape(-1) ** (num_orbital_dimensions // 2)
+            us, sigmas = self._auto_us_and_sigmas(dtype, num_orbital_dimensions)
             cached = self._auto_groups[key] = (arrays, auto_transform_groups(us, sigmas, self._auto_conjs.reshape(-1)))
         return cached[1]
+
+    def _auto_us_and_sigmas(self, dtype, num_orbital_dimensions: int) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Returns the per-k orbital rotations held in ``dtype`` and the per-k signs raised to the power the
+        transformation of ``num_orbital_dimensions`` orbital axes applies, both over the flattened full BZ.
+
+        :param dtype: Element type of the tensors the transformation is applied to.
+        :param num_orbital_dimensions: Number of transformed orbital axes (2 or 4).
+        :return: The rotations of shape ``(nk_tot, nb, nb)`` and the signs of shape ``(nk_tot,)``.
+        """
+        us = self._auto_us.reshape(self.nk_tot, *self._auto_us.shape[3:]).astype(dtype, copy=False)
+        return us, self._auto_sigmas.reshape(-1) ** (num_orbital_dimensions // 2)
+
+    def auto_monomial_map(self, dtype, num_orbital_dimensions: int) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        r"""
+        Returns the orbital transformation of the groups of :meth:`auto_orbital_groups` as a gather, if every group's
+        :math:`U` (held in ``dtype``) has a single non-zero entry per row, equal to :math:`\pm 1` or :math:`\pm i`, and
+        no group is anti-unitary. Component ``i`` of a full-BZ k-point in group ``g`` is then ``phase[g, i]`` times the
+        component ``perm[g, i]`` of its irreducible representative, where ``phase`` holds the entries of
+        :math:`\sigma\, U \otimes U^* \otimes U \otimes U^*` (:math:`\sigma\, U \otimes U^*` for two orbital axes) and
+        a group the transformation leaves unchanged gets the identity. Every product is exact, so the gather equals
+        :func:`dgamore.symmetry_reduction.apply_auto_orbital_transform` on finite input up to the sign of zeros. The
+        map is computed once per dtype and orbital-axis count and recomputed with the groups.
+
+        :param dtype: Element type of the tensors the transformation is applied to.
+        :param num_orbital_dimensions: Number of transformed orbital axes (2 or 4).
+        :return: The tuple ``(group_of_k, perm, phase)`` of shapes ``(nk_tot,)``, ``(n_groups, nb**n)`` and
+            ``(n_groups, nb**n)``, ``n`` being ``num_orbital_dimensions`` and ``phase`` held in ``dtype``; None if a
+            group is not monomial or anti-unitary, or if no group changes anything.
+        """
+        groups = self.auto_orbital_groups(dtype, num_orbital_dimensions)
+        key = (np.dtype(dtype), num_orbital_dimensions)
+        cached = self._auto_monomials.get(key)
+        if cached is not None and cached[0] is groups:
+            return cached[1]
+
+        from dgamore.symmetry_reduction import leaves_unchanged
+
+        n = num_orbital_dimensions
+        us, sigmas = self._auto_us_and_sigmas(dtype, n)
+        conjs = self._auto_conjs.reshape(-1)
+        nb = us.shape[1]
+        identity = np.eye(nb, dtype=dtype)
+        group_of_k = np.empty(self.nk_tot, dtype=np.min_scalar_type(len(groups)))
+        perm = np.empty((len(groups), nb**n), dtype=np.intp)
+        phase = np.empty(perm.shape, dtype=dtype)
+        result, changes = None, False
+        for g, idx in enumerate(groups):
+            u, sigma, conj = us[idx[0]], sigmas[idx[0]], conjs[idx[0]]
+            # the rule by which apply_auto_orbital_transform skips a group
+            unchanged = leaves_unchanged(u, sigma, conj)
+            if unchanged:
+                u = identity
+            elif conj or not (np.isin(u, (0, 1, -1, 1j, -1j)).all() and (np.count_nonzero(u, axis=1) == 1).all()):
+                break
+            changes |= not unchanged
+            source = np.abs(u).argmax(axis=1)
+            entry = u[np.arange(nb), source]
+            group_of_k[idx] = g
+            perm[g] = np.ravel_multi_index(np.ix_(*[source] * n), (nb,) * n).ravel()
+            phase[g] = sigma * reduce(np.multiply.outer, [entry, entry.conj()] * (n // 2)).ravel()
+        else:
+            result = (group_of_k, perm, phase) if changes else None
+        self._auto_monomials[key] = (groups, result)
+        return result
 
     @property
     def is_auto(self) -> bool:
