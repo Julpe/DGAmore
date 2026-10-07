@@ -60,6 +60,13 @@ SDE_COLUMN_FACTOR: float = 1.75
 # size, so the contraction runs over the real-space rows in pieces of it (per-row results do not depend on it).
 SDE_CONTRACTION_CHUNK_BYTES: int = 32 * 1024**2
 
+# The chunk element budgets of dgamore.greens_function (_MOMENTUM_CHUNK_ELEMENTS of the occupation and in-box
+# potential-energy sums, _MODEL_EPOT_CHUNK_ELEMENTS of the Dyson build and the analytic potential-energy tail) and the
+# tail's default frequency count (GreensFunction.get_epot's niv_asympt); test-locked to those values.
+GF_MOMENTUM_CHUNK_ELEMENTS: int = 2**22
+GF_FREQUENCY_CHUNK_ELEMENTS: int = 2**20
+EPOT_NIV_ASYMPT: int = 50000
+
 # scipy.fft.ifftn(overwrite_x=True) transforms the c64 full-grid bubble in place, so no ifftn transient is allocated
 # beyond the multiply buffer (numpy.fft would allocate ~2x: returned array + work arrays). Per-iw peak = multiply buffer.
 CHI0Q_IFFTN_TRANSIENT_FACTOR: int = 0
@@ -452,6 +459,28 @@ def _fq_transient(chunk: int, one_fermion: int, one_slice: int, streaming: bool)
     return 3 * chunk + 6 * one_fermion + (9 if streaming else 4) * one_slice
 
 
+def _green_function_transients(n_k: int, nb: int, nv: int) -> tuple[int, int, int]:
+    """
+    Returns the transient bytes, beyond the Green's function and its self-energy, of the three steps of
+    :mod:`dgamore.greens_function` that run over a Green's function of ``n_k`` momenta and ``nv`` fermionic
+    frequencies, as traced: the Dyson build of :meth:`~dgamore.greens_function.GreensFunction.get_g_full` (the matrix
+    and its inverse of one frequency chunk next to the frequency-independent part on every momentum), the occupation
+    sum (3.5 complex128 arrays of one momentum chunk) and the
+    potential energy's analytic tail (three complex128 arrays of one frequency chunk of :data:`EPOT_NIV_ASYMPT`
+    frequencies).
+
+    :param n_k: Number of momenta the Green's function holds.
+    :param nb: Number of bands :math:`B`.
+    :param nv: Number of fermionic frequencies.
+    :return: The tuple ``(dyson, occupation, tail)`` of transient bytes.
+    """
+    elements = _giwk_rspace(n_k, nb, nv)
+    dyson = 2 * min(max(GF_FREQUENCY_CHUNK_ELEMENTS, n_k * nb**2), elements) + n_k * nb**2
+    occupation = 3.5 * min(max(GF_MOMENTUM_CHUNK_ELEMENTS, nb**2 * nv), elements)
+    tail = 3 * min(max(GF_FREQUENCY_CHUNK_ELEMENTS, n_k * nb), n_k * nb * 2 * EPOT_NIV_ASYMPT)
+    return 16 * dyson, int(16 * occupation), 16 * tail
+
+
 def _giwk_rspace(nk_tot: int, nb: int, nv: int) -> int:
     """
     Returns the element count of a momentum-space Green's function replicated over the full grid ``[nk_tot, nb^2, nv]``
@@ -484,6 +513,8 @@ def estimate_peaks(
     mixing_pairs: int = 0,
     niv_interp: int = 0,
     symmetrize_orbitals: bool = False,
+    do_spectrum_dmft: bool = False,
+    warm_start: bool = False,
     overhead: float = OVERHEAD_FACTOR,
     chunk_budgets: ChunkBudgets = ChunkBudgets(),
 ) -> dict[str, BranchPeak]:
@@ -513,7 +544,14 @@ def estimate_peaks(
     solve, which dominate the proposal tail and the hand-over; the other node roots hold at most their received array
     and window then, which the single-rank slot covers on every node. The ``mu_update`` branch is the
     chemical-potential update after it: every rank holds two complex128 Green's-function arrays on its share of the
-    full-BZ momenta, next to rank 0's history and previous iterate and the node's new window. The ``sigma_interp``
+    full-BZ momenta, next to rank 0's history and previous iterate and the node's new window. The ``energies`` branch
+    is the occupation and energy step after it: every rank holds its share's self-energy and Green's function on the
+    DMFT box and the largest of the Dyson, occupation and energy-tail transients of :mod:`dgamore.greens_function`
+    (bounded by its chunk sizes), next to the same rank-0 residents. The ``occupation`` branch is the start of the
+    non-local routine: every rank's fresh-start occupation on its share of the DMFT box (on a warm start its mu
+    search), with ``do_spectrum_dmft`` rank 0's DMFT lattice Green's function of the whole grid on that box (built
+    there, and reloaded with its core-box cut after the loop next to ``giwk_dga`` and ``sigma_dga``), and on a warm
+    start rank 0's starting iterate extended onto it. The ``sigma_interp``
     branch, present when ``niv_interp`` is set, is the final re-gridding: rank 0 interpolates the irreducible
     self-energy and unfolds the result next to the node-shared window, every rank re-grids at most its share of the
     momenta it fits with a pole. The ``local`` branch is rank 0's local Schwinger-Dyson step, the larger of the second
@@ -531,8 +569,8 @@ def estimate_peaks(
     :param niv_full: Number of positive fermionic full-region frequencies.
     :param niv_cut: Number of positive fermionic frequencies the full-grid ``giwk_full`` is built at
         (``min(niw_core + niv_full + 10, niv_dmft)`` in :func:`dgamore.nonlocal_sde.calculate_self_energy_q`).
-    :param niv_dmft: Number of positive fermionic frequencies of the DMFT input box (the rank-0 occupation and
-        energy step of every iteration concatenates the self-energy back to it).
+    :param niv_dmft: Number of positive fermionic frequencies of the DMFT input box (the fresh-start occupation and the
+        occupation and energy step of every iteration run on it).
     :param niv_pp: Number of positive fermionic frequencies of the pp (Eliashberg) box.
     :param n_ranks: Number of MPI ranks the q-points are distributed over.
     :param with_eliashberg: Whether the Eliashberg step runs (adds the ``"fq"`` and ``"lanczos"`` branches).
@@ -550,6 +588,11 @@ def estimate_peaks(
         ``"sigma_interp"`` branch).
     :param symmetrize_orbitals: Whether the local vertices are symmetrized over orbitals
         (``config.dmft.symmetrize_orbitals`` is not empty), which copies one full vertex at a time.
+    :param do_spectrum_dmft: Whether the DMFT spectrum is continued (``config.ana_cont.do_spectrum_dmft``), for which
+        rank 0 builds the DMFT lattice Green's function of the whole grid on the DMFT box.
+    :param warm_start: Whether the loop may start from a previous run's iterate
+        (``config.self_consistency.previous_sc_path`` is set), which rank 0 extends onto the DMFT box on the whole
+        grid while every rank re-solves mu on its momenta.
     :param overhead: Global multiplicative factor accounting for un-modeled transient arrays.
     :param chunk_budgets: Chunk byte budgets of the two chunked builds (see :class:`ChunkBudgets` and
         :func:`max_chunk_budget`); each modeled chunk is clamped to at least one slice of its build (a ``(q, w)``
@@ -640,9 +683,8 @@ def estimate_peaks(
     sde_distributed = scale * _bubble_block(qi, nb, wp, vc) + overhead * (
         sde_round * (1 + qi / nk_irr) + sde_columns + sde_slabs
     )
-    # rank-0 single: the sigma finalize buffers, or the occupation/energy step's DMFT-box sigma + giwk pair
-    # (its concatenation and Dyson-build transients are broadcast-assigned and v-chunked, so only the pair counts)
-    sde_single = scale * max(2 * sigma_core, 2 * _giwk_rspace(nk_tot, nb, 2 * niv_dmft)) + mixing_history
+    # rank-0 single: the sigma finalize buffers
+    sde_single = scale * 2 * sigma_core + mixing_history
     peaks["sde"] = BranchPeak(
         baseline=baseline_sde + rank_base,
         giwk_shareable=2 * giwk_sde + sigma_shared,
@@ -712,6 +754,48 @@ def estimate_peaks(
         off_single=mu_update_single,
         on_distributed=mu_update_distributed,
         on_single=mu_update_single,
+    )
+
+    # Occupation and energy step of every iteration (verify-only): every rank's self-energy and Green's function on its
+    # momenta of the DMFT box and the largest of the Dyson, occupation and energy-tail transients, next to rank 0's
+    # history, previous iterate and the node's window and its whole-grid moment-fit window (top fifth of the box).
+    share_k, dmft_box = _ceil_div(nk_tot, n_ranks), 2 * niv_dmft
+    energies_distributed = scale * 2 * _giwk_rspace(share_k, nb, dmft_box) + overhead * max(
+        _green_function_transients(share_k, nb, dmft_box)
+    )
+    energies_single = mu_update_single + scale * _giwk_rspace(nk_tot, nb, max(int(0.2 * niv_dmft), 4))
+    peaks["energies"] = BranchPeak(
+        baseline=rank_base,
+        giwk_shareable=0.0,
+        off_distributed=energies_distributed,
+        off_single=energies_single,
+        on_distributed=energies_distributed,
+        on_single=energies_single,
+    )
+
+    # Start of the non-local routine (verify-only): every rank's fresh-start occupation on its momenta of the DMFT box,
+    # on a warm start its mu search on its momenta of the niv_cut box instead; on rank 0 with do_spectrum_dmft the
+    # DMFT lattice Green's function of the whole grid on the DMFT box with its Dyson transient, and on a warm start
+    # the starting iterate extended onto the DMFT box on the whole grid next to its niv_cut copy and the occupation.
+    whole_box = _giwk_rspace(nk_tot, nb, dmft_box)
+    occupation_distributed = overhead * _green_function_transients(share_k, nb, dmft_box)[1]
+    if warm_start:
+        occupation_distributed = max(occupation_distributed, mu_update_distributed)
+    # with do_spectrum_dmft rank 0 also reloads that Green's function after the loop, cut to the core box, next to
+    # giwk_dga and sigma_dga
+    spectrum_single = max(
+        scale * whole_box + overhead * _green_function_transients(nk_tot, nb, dmft_box)[0],
+        scale * (whole_box + 2 * sigma_full + _giwk_rspace(nk_tot, nb, vc)),
+    )
+    warm_single = scale * (whole_box + sigma_full) + overhead * _green_function_transients(nk_tot, nb, dmft_box)[1]
+    occupation_single = max(spectrum_single if do_spectrum_dmft else 0.0, warm_single if warm_start else 0.0)
+    peaks["occupation"] = BranchPeak(
+        baseline=rank_base,
+        giwk_shareable=0.0,
+        off_distributed=occupation_distributed,
+        off_single=occupation_single,
+        on_distributed=occupation_distributed,
+        on_single=occupation_single,
     )
 
     if niv_interp:

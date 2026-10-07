@@ -1594,15 +1594,14 @@ def calculate_self_energy_q(
     sigma_dmft_full = sigma_dmft.copy()
 
     ek = config.lattice.hamiltonian.get_ek()
-    # the DMFT lattice Green's function on the whole DMFT box is read back only by the DMFT spectrum continuation and
-    # by a warm start, which holds its filling
-    if comm.rank == 0 and (config.ana_cont.do_spectrum_dmft or starting_iter > 0):
+    # the DMFT lattice Green's function on the whole DMFT box is built only for the DMFT spectrum continuation; a warm
+    # start holds its filling, which is summed without building it
+    if comm.rank == 0 and config.ana_cont.do_spectrum_dmft:
         giwk_full_dmft = GreensFunction.get_g_full(sigma_dmft_full, config.sys.mu_dmft, ek, config.sys.beta)
-        if config.ana_cont.do_spectrum_dmft:
-            giwk_full_dmft.save(output_dir=config.output.output_path, name="g_latt_dmft")
-        if starting_iter > 0:
-            n_dmft = giwk_full_dmft.get_fill_nonlocal()[0]
+        giwk_full_dmft.save(output_dir=config.output.output_path, name="g_latt_dmft")
         giwk_full_dmft.free()
+    if comm.rank == 0 and starting_iter > 0:
+        n_dmft = GreensFunction.get_occupation(sigma_dmft_full, config.sys.mu_dmft, ek, config.sys.beta)[0]
 
     if comm.rank == 0 or starting_iter == 0:
         sigma_old = sigma_old.concatenate_self_energies(sigma_dmft_full)
@@ -1613,7 +1612,7 @@ def calculate_self_energy_q(
         n_my, nb = mpi_dist_fullbz.my_size, ek.shape[-1]
         ek_my = ek.reshape(-1, nb, nb)[mpi_dist_fullbz.my_slice].reshape(n_my, 1, 1, nb, nb)
         occ_k_my = (
-            GreensFunction.get_g_full(sigma_old, mu_history[-1], ek_my, config.sys.beta).get_fill_nonlocal()[2]
+            GreensFunction.get_occupation(sigma_old, mu_history[-1], ek_my, config.sys.beta)[2]
             if n_my
             else np.zeros((0, 1, 1, nb, nb))
         )
@@ -1635,9 +1634,9 @@ def calculate_self_energy_q(
                 f"Warm start holds the DMFT lattice filling {n_dmft:.6f}: mu re-solved from {mu_previous} to "
                 f"{mu_history[-1]}."
             )
-            giwk_full = GreensFunction.get_g_full(sigma_old, mu_history[-1], ek, config.sys.beta)
-            _, config.sys.occ, config.sys.occ_k = giwk_full.get_fill_nonlocal()
-            giwk_full.free()
+            _, config.sys.occ, config.sys.occ_k = GreensFunction.get_occupation(
+                sigma_old, mu_history[-1], ek, config.sys.beta
+            )
             config.sys.n = n_dmft
         config.sys.n, config.sys.occ, config.sys.occ_k = comm.bcast(
             (config.sys.n, config.sys.occ, config.sys.occ_k), root=0

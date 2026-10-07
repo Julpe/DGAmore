@@ -20,9 +20,15 @@ from dgamore.mpi_utils import MpiDistributor
 from dgamore.self_energy import SelfEnergy
 from dgamore.two_point import TwoPoint
 
-# Element budget for one [k, band, v-chunk] temporary of the analytic potential-energy tail (~256 MB complex128); the
-# default niv_asympt = 50000 would otherwise materialize [nk_tot, n_bands, 2*niv_asympt] - several GB - per plain sum.
-_MODEL_EPOT_CHUNK_ELEMENTS: int = 2**24
+# Element budget for one [k, band, v-chunk] temporary of the analytic potential-energy tail (16 MiB complex128; the
+# tail holds three) and for one frequency chunk of the Dyson build; the default niv_asympt = 50000 would otherwise
+# materialize [nk_tot, n_bands, 2*niv_asympt] - several GB - per plain sum.
+_MODEL_EPOT_CHUNK_ELEMENTS: int = 2**20
+
+# Element budget of one momentum chunk of the frequency arrays in the occupation and potential-energy sums (64 MiB
+# in complex128); each sum holds a few such arrays at once, which for many momenta on a wide frequency box would otherwise
+# reach several GB.
+_MOMENTUM_CHUNK_ELEMENTS: int = 2**22
 
 
 def _fermi_dirac_density(h: np.ndarray, beta: float) -> np.ndarray:
@@ -381,28 +387,104 @@ class GreensFunction(TwoPoint):
         r"""
         Computes the filling and occupation from the momentum-resolved Green's function, using the analytic
         density-matrix of the model (moment) Green's function plus the box correction to accelerate convergence.
+        The box correction is summed in momentum chunks (see :meth:`get_occupation`); this object's array is not
+        read.
 
         :return: A tuple of (i) the total filling :math:`n`, (ii) the k-averaged occupation (shape ``[o1, o2]``),
             and (iii) the k-resolved occupation (shape ``[kx, ky, kz, o1, o2]``).
         """
-        mat = self._get_gfull_mat()
-        g_model = self._get_g_model_k_mat()
-        smom0 = self._sigma.smom[0][None, None, None, ...]
+        occ_k = self._occupation_k(self._sigma, self._mu, self._ek, self._beta, self.niv, self.n_bands)
+        self._n, self._occ, self._occ_k = self._fill_from_occupation(occ_k)
+        return self._n, self._occ, self._occ_k
 
-        mu_bands: np.ndarray = self._mu * np.eye(self.n_bands)[None, None, None, ...]
+    @staticmethod
+    def get_occupation(siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float) -> tuple[float, np.ndarray, np.ndarray]:
+        r"""
+        Returns the filling and occupation of the Green's function :meth:`get_g_full` builds from the same arguments,
+        bit for bit what :meth:`get_fill_nonlocal` gives on it, without building that Green's function. The Dyson
+        matrix and its moment model are inverted and summed over the frequencies one momentum chunk at a time
+        (:data:`_MOMENTUM_CHUNK_ELEMENTS` complex128 entries each), so beyond the result about three chunk-sized
+        arrays are alive however many momenta and frequencies the self-energy carries; the density-matrix part and
+        the momentum mean are evaluated on all momenta at once. Like :meth:`get_g_full`, the self-energy is
+        brought to its uncompressed momentum layout in place.
+
+        :param siw: The :class:`SelfEnergy` :math:`\Sigma` on the full fermionic range.
+        :param mu: Chemical potential :math:`\mu`.
+        :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
+        :param beta: Inverse temperature :math:`\beta`.
+        :return: A tuple of (i) the total filling :math:`n`, (ii) the k-averaged occupation (shape ``[o1, o2]``),
+            and (iii) the k-resolved occupation (shape ``[kx, ky, kz, o1, o2]``).
+        :raises ValueError: If the self-energy is neither momentum-local nor on the momenta of ``ek``.
+        """
+        siw.decompress_q_dimension()
+        occ_k = GreensFunction._occupation_k(siw, mu, ek, beta, siw.niv, siw.n_bands)
+        return GreensFunction._fill_from_occupation(occ_k)
+
+    @staticmethod
+    def _occupation_k(siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float, niv: int, n_bands: int) -> np.ndarray:
+        r"""
+        Returns the k-resolved occupation :math:`n_{12}(\mathbf{k}) = \rho_{12}(\mathbf{k}) + \frac{1}{\beta}
+        \sum_{\nu} [G - G_{\mathrm{mod}}]_{12}^{\mathbf{k}\nu}` with the moment model :math:`G_{\mathrm{mod}}` and its
+        analytic density matrix :math:`\rho` (see :func:`_fermi_dirac_density`). The real-or-complex arithmetic is
+        decided once from the whole dispersion; the frequency sums run in momentum chunks of
+        :data:`_MOMENTUM_CHUNK_ELEMENTS` Green's-function entries. Every entry is the same floating-point expression
+        as on the whole grid at once, so the result does not depend on the chunking.
+
+        :param siw: The :class:`SelfEnergy` :math:`\Sigma`, momentum-local or on the momenta of ``ek`` (uncompressed).
+        :param mu: Chemical potential :math:`\mu`.
+        :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`, shape ``[kx, ky, kz, o1, o2]``.
+        :param beta: Inverse temperature :math:`\beta`.
+        :param niv: Number of positive fermionic frequencies of the Green's function.
+        :param n_bands: Number of bands.
+        :return: The k-resolved occupation, shape ``[kx, ky, kz, o1, o2]``; entries of magnitude below 1e-12 get a
+            zero real part.
+        :raises ValueError: If the self-energy is neither momentum-local nor on the momenta of ``ek``.
+        """
+        eye_bands = np.eye(n_bands, n_bands)
+        iv = 1j * MFHelper.vn(niv, beta)
+        iv_bands = (iv[None, None, :] * eye_bands[..., None])[None]
+        mu_v = (mu * eye_bands[:, :, None])[None]
+        smom0 = siw.smom[0]
 
         # a complex (Hermitian) dispersion keeps its imaginary part; a real one keeps the real-part arithmetic
-        ek = np.real_if_close(self._ek)
-        rho_k = _fermi_dirac_density(ek + smom0 - mu_bands, self._beta)
-        box = mat - g_model if np.iscomplexobj(ek) else mat.real - g_model.real
-        occ_k = rho_k + np.sum(box, axis=-1) / self._beta
-        occ_k.real[np.abs(occ_k) < 1e-12] = 0.0
+        ek_density = np.real_if_close(ek)
+        rho_k = _fermi_dirac_density(ek_density + smom0[None, None, None] - mu * eye_bands[None, None, None], beta)
+        complex_box = np.iscomplexobj(ek_density)
 
+        nk = int(np.prod(ek.shape[:3]))
+        ek_flat = ek.reshape(nk, n_bands, n_bands)
+        sigma_flat = siw.mat.reshape(-1, n_bands, n_bands, siw.mat.shape[-1])
+        sigma_k = tuple(siw.mat.shape[:3]) if siw.mat.ndim == 6 else (sigma_flat.shape[0],)
+        if sigma_flat.shape[0] != 1 and sigma_k not in (tuple(ek.shape[:3]), (nk,)):
+            raise ValueError(f"The self-energy holds momenta {sigma_k}, the dispersion {tuple(ek.shape[:3])}.")
+        box_sum = np.empty((nk, n_bands, n_bands), dtype=np.complex128 if complex_box else np.float64)
+        step = max(1, _MOMENTUM_CHUNK_ELEMENTS // (n_bands**2 * iv.size))
+        for start in range(0, nk, step):
+            k = slice(start, min(nk, start + step))
+            sigma = sigma_flat if sigma_flat.shape[0] == 1 else sigma_flat[k]
+            g = GreensFunction._invert_last_orbital_block(iv_bands + mu_v - ek_flat[k, ..., None] - sigma)
+            g_model = GreensFunction._invert_last_orbital_block(
+                iv_bands + mu_v - ek_flat[k, ..., None] - smom0[None, ..., None]
+            )
+            box = g - g_model if complex_box else g.real - g_model.real
+            box_sum[k] = np.sum(box, axis=-1)
+            del g, g_model, box
+
+        occ_k = rho_k + box_sum.reshape(rho_k.shape) / beta
+        occ_k.real[np.abs(occ_k) < 1e-12] = 0.0
+        return occ_k
+
+    @staticmethod
+    def _fill_from_occupation(occ_k: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+        """
+        Returns the total filling and the k-averaged occupation of a k-resolved occupation.
+
+        :param occ_k: The k-resolved occupation, shape ``[kx, ky, kz, o1, o2]``.
+        :return: The tuple ``(n, occ, occ_k)``; k-averaged entries of magnitude below 1e-12 get a zero real part.
+        """
         occ_mean = np.mean(occ_k, axis=(0, 1, 2))
         occ_mean.real[np.abs(occ_mean) < 1e-12] = 0.0
-        n_el = 2.0 * np.trace(occ_mean).real
-        self._n, self._occ, self._occ_k = n_el, occ_mean, occ_k
-        return n_el, occ_mean, occ_k
+        return 2.0 * np.trace(occ_mean).real, occ_mean, occ_k
 
     def get_ekin(self) -> float:
         r"""
@@ -428,7 +510,9 @@ class GreensFunction(TwoPoint):
         :math:`\Sigma_{\mathrm{mod}} - \Sigma_\infty = -\Sigma_1/(\imath\nu)` and :math:`G_{\mathrm{mod}} = [\imath\nu +
         \mu - \varepsilon_{\mathbf{k}} - \Sigma_\infty]^{-1}`. The model subtraction cancels the :math:`1/\nu^2` tail of
         the correlation sum (remainder :math:`\sim 1/\nu^4`), while the large sum supplies the part beyond the stored
-        box.
+        box. The in-box trace is taken one chunk of the first momentum axis at a time
+        (:data:`_MOMENTUM_CHUNK_ELEMENTS` entries; a lone momentum only when the whole grid is one, a trailing one
+        joins the chunk before it), each momentum's trace bit for bit the one of all momenta at once.
 
         :param niv_asympt: Number of positive fermionic frequencies used for the asymptotic ("big") tail sum.
         :return: The potential energy per site.
@@ -439,10 +523,22 @@ class GreensFunction(TwoPoint):
         e_hartree = np.sum(smom0[None, None, None] * self._occ_k.swapaxes(-1, -2)).real
 
         # 2) In-box correlation Tr[(Sigma - Sigma_inf) G] (Sigma_inf counted above): contract the orbital trace with
-        # einsum (g orbital-transposed) to avoid the transpose_orbitals deepcopy of _ek/_sigma + a [k,o,o,v] temp.
-        dsigma = self._sigma.decompress_q_dimension().mat - smom0[..., None]
+        # einsum (g orbital-transposed) to avoid the transpose_orbitals deepcopy of _ek/_sigma; per momentum chunk, so
+        # Sigma - Sigma_inf stays chunk-sized. einsum reduces a lone output entry in another order, so no chunk holds a
+        # single momentum unless the whole grid is one.
+        sigma_mat = self._sigma.decompress_q_dimension().mat
         g = self.decompress_q_dimension().mat
-        e_corr = np.einsum("...abv,...bav->...", dsigma, g).sum().real / self._beta
+        trace_k = np.empty(np.broadcast_shapes(sigma_mat.shape, g.shape)[:-3], np.result_type(sigma_mat, smom0, g))
+        n_first, single_plane = g.shape[0], int(np.prod(g.shape[1:3])) == 1
+        step = max(2 if single_plane else 1, _MOMENTUM_CHUNK_ELEMENTS // int(np.prod(g.shape[1:])))
+        bounds = list(range(0, n_first, step)) + [n_first]
+        if single_plane and len(bounds) > 2 and bounds[-1] - bounds[-2] == 1:
+            del bounds[-2]  # a lone trailing momentum joins the chunk before it
+        for start, stop in zip(bounds[:-1], bounds[1:]):
+            k = slice(start, stop)
+            sigma = sigma_mat if sigma_mat.shape[0] == 1 else sigma_mat[k]
+            trace_k[k] = np.einsum("...abv,...bav->...", sigma - smom0[..., None], g[k])
+        e_corr = trace_k.sum().real / self._beta
 
         # 3) Analytic 1/v^2 model tail: replace the truncated box value by the large-box one.
         e_tail = self._model_epot(smom0, smom1, niv_asympt, self._beta) - self._model_epot(
@@ -504,18 +600,6 @@ class GreensFunction(TwoPoint):
         :return: The local Green's function array, shape ``[o1, o2, v]``.
         """
         return np.mean(self._get_gfull_mat(), axis=(0, 1, 2))
-
-    def _get_g_model_k_mat(self) -> np.ndarray:
-        """
-        Builds the k-resolved model Green's function from the zeroth self-energy moment and the band dispersion.
-        Subtracting it accelerates the Matsubara sum convergence when computing the k-resolved occupation.
-
-        :return: The k-resolved model Green's function array, shape ``[kx, ky, kz, o1, o2, v]``.
-        """
-        iv_bands, mu_bands = self._get_g_params_local()
-        smom0 = self._sigma.smom[0][None, None, None, ...]
-        mat = iv_bands[None, None, None] + mu_bands[None, None, None] - self._ek[..., None] - smom0[..., None]
-        return self._invert_last_orbital_block(mat)
 
     def _get_g_params_local(self):
         r"""
