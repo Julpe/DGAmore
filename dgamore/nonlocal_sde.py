@@ -518,12 +518,14 @@ def calculate_sigma_kernel_r_q(
     v_nonloc: Interaction,
     mpi_dist_irrq: MpiDistributor,
     annealer: "LambdaAnnealer | None" = None,
+    save_eliashberg: bool = False,
 ) -> FourPoint:
     r"""
     Returns the kernel for the self-energy calculation in a specific spin channel. Calculates the auxiliary
     susceptibility, the three-leg vertex and the physical susceptibility with shell correction. Also performs a
     :math:`\lambda`-correction on the physical susceptibility if specified in the config (dispatched by the band
-    count). Saves the physical susceptibility (and, if Eliashberg is enabled, the intermediate vertices) to file.
+    count). Saves the physical susceptibility (and, with ``save_eliashberg``, the per-rank Eliashberg intermediates)
+    to file.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
@@ -534,6 +536,8 @@ def calculate_sigma_kernel_r_q(
     :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param annealer: The active :class:`LambdaAnnealer` (its boson mass is applied to the physical susceptibility),
         or ``None`` when annealing is off.
+    :param save_eliashberg: Whether to write this rank's three-leg vertex and physical susceptibility for the
+        Eliashberg step (the self-consistency loop asks for it once per run).
     :return: The self-energy kernel for this channel as a :class:`FourPoint`.
     """
     logger = config.logger
@@ -556,7 +560,7 @@ def calculate_sigma_kernel_r_q(
     logger.info(f"Non-local three-leg vertex gamma^wv ({vrg_q_r.channel.value}) done.")
     logger.log_memory_usage(f"Three-leg vertex ({vrg_q_r.channel.value})", vrg_q_r, mpi_dist_irrq.comm.size)
 
-    if config.eliashberg.perform_eliashberg:
+    if save_eliashberg:
         vrg_q_r.save(
             name=f"vrg_q_{vrg_q_r.channel.value}_rank_{mpi_dist_irrq.comm.rank}",
             output_dir=config.output.eliashberg_path,
@@ -610,7 +614,7 @@ def calculate_sigma_kernel_r_q(
             "quantities (self-energy, Eliashberg eigenvalues) might be unreliable."
         )
 
-    if config.eliashberg.perform_eliashberg:
+    if save_eliashberg:
         chi_phys_q_r.save(
             name=f"chi_phys_q_{chi_phys_q_r.channel.value}_rank_{mpi_dist_irrq.comm.rank}",
             output_dir=config.output.eliashberg_path,
@@ -1248,6 +1252,8 @@ def calculate_sigma_proposal(
     current_iter: int,
     annealer: "LambdaAnnealer | None" = None,
     chunk_budgets: memory_estimator.ChunkBudgets | None = None,
+    save_eliashberg: bool = False,
+    eliashberg_only: bool = False,
 ) -> SelfEnergy | None:
     r"""
     Returns the raw (un-mixed) DGA self-energy proposal :math:`S(\Sigma_{\mathrm{in}})` at chemical potential
@@ -1262,7 +1268,8 @@ def calculate_sigma_proposal(
     equation already obeys time reversal.
 
     Single source of truth for the proposal map: it is called once per self-consistency iteration by
-    :func:`calculate_self_energy_q`. The local irreducible vertex is frozen, so every
+    :func:`calculate_self_energy_q`, plus once with ``eliashberg_only`` after a loop that converged before its last
+    scheduled iteration. The local irreducible vertex is frozen, so every
     evaluation rebuilds the bubble, the ladder susceptibilities and the SDE self-energy. The Hartree/Fock term reads
     ``config.sys.occ`` / ``occ_k``, which the caller sets consistently with :math:`\Sigma_{\mathrm{in}}`.
 
@@ -1282,8 +1289,13 @@ def calculate_sigma_proposal(
         is off.
     :param chunk_budgets: Chunk byte budgets, of which the self-energy contraction reads its own (sized by the driver
         from the memory estimate); ``None`` gives it the job-wide fair-share budget of :func:`_sde_chunk_budget`.
+    :param save_eliashberg: Whether to write this rank's Eliashberg intermediates (inverse bubble, three-leg vertices,
+        physical susceptibilities); the loop asks for it in its last scheduled iteration.
+    :param eliashberg_only: Whether to stop after the two channel kernels: the double-counting kernel and the SDE are
+        skipped and ``None`` is returned on every rank (the pass after a loop that converged before its last
+        iteration).
     :return: The raw full-BZ proposal :class:`SelfEnergy` (DMFT tail attached) on rank 0; ``None`` on every other rank,
-        since only rank 0 mixes it.
+        since only rank 0 mixes it, and on every rank with ``eliashberg_only``.
     """
     logger = config.logger
 
@@ -1313,19 +1325,22 @@ def calculate_sigma_proposal(
     )
     _free_shared_window(old_giwk_win, shared_node_comm)
 
-    # the local vertices are identical on every rank, so they are loaded once per node into shared windows
-    f_dc_loc, f_dc_win = _load_node_shared_local_vertex(
-        shared_node_comm,
-        os.path.join(config.output.output_path, "f_dc_loc.npy"),
-        SpinChannel.MAGN,
-        axes=(4, 0, 1, 5, 2, 3, 6),  # the order contract_first_pair_with_local_vertex reads as a view
-    )
-    kernel = calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc)
-    f_dc_loc.mat = None
-    if f_dc_win is None:
-        f_dc_loc.free()
-    _free_shared_window(f_dc_win, shared_node_comm)
-    logger.info("Calculated double-counting kernel.")
+    # the local vertices are identical on every rank, so they are loaded once per node into shared windows; the
+    # double-counting kernel only enters the SDE, which the Eliashberg-only pass skips
+    kernel = None
+    if not eliashberg_only:
+        f_dc_loc, f_dc_win = _load_node_shared_local_vertex(
+            shared_node_comm,
+            os.path.join(config.output.output_path, "f_dc_loc.npy"),
+            SpinChannel.MAGN,
+            axes=(4, 0, 1, 5, 2, 3, 6),  # the order contract_first_pair_with_local_vertex reads as a view
+        )
+        kernel = calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc)
+        f_dc_loc.mat = None
+        if f_dc_win is None:
+            f_dc_loc.free()
+        _free_shared_window(f_dc_win, shared_node_comm)
+        logger.info("Calculated double-counting kernel.")
 
     gchi0_q_full_sum = gchi0_q.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
     gchi0_q_core = gchi0_q.cut_niv(config.box.niv_core)
@@ -1340,7 +1355,7 @@ def calculate_sigma_proposal(
     if current_iter == 1:
         calculate_and_save_chi_q_r_rpa(gchi0_q_full_sum, u_loc, v_nonloc, mpi_dist_irrk)
 
-    if config.eliashberg.perform_eliashberg:
+    if save_eliashberg:
         gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
 
     chunk_bytes = _sde_chunk_budget(comm, shared_node_comm) if chunk_budgets is None else chunk_budgets.sde
@@ -1348,19 +1363,20 @@ def calculate_sigma_proposal(
     gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
         shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
     )
-    kernel.add(
-        calculate_sigma_kernel_r_q(
-            gamma_dens,
-            gchi0_q_core_inv,
-            gchi0_q_full_sum,
-            gchi0_q_core_sum,
-            u_loc,
-            v_nonloc,
-            mpi_dist_irrk,
-            annealer,
-        ),
-        copy=False,
+    channel_kernel = calculate_sigma_kernel_r_q(
+        gamma_dens,
+        gchi0_q_core_inv,
+        gchi0_q_full_sum,
+        gchi0_q_core_sum,
+        u_loc,
+        v_nonloc,
+        mpi_dist_irrk,
+        annealer,
+        save_eliashberg=save_eliashberg,
     )
+    if kernel is not None:
+        kernel.add(channel_kernel, copy=False)
+    channel_kernel.free()
     gamma_dens.mat = None
     if gamma_dens_win is None:
         gamma_dens.free()
@@ -1371,19 +1387,20 @@ def calculate_sigma_proposal(
     gamma_magn, gamma_magn_win = _load_node_shared_local_vertex(
         shared_node_comm, os.path.join(config.output.output_path, "gamma_magn_loc.npy"), SpinChannel.MAGN
     )
-    kernel.add(
-        calculate_sigma_kernel_r_q(
-            gamma_magn,
-            gchi0_q_core_inv,
-            gchi0_q_full_sum,
-            gchi0_q_core_sum,
-            u_loc,
-            v_nonloc,
-            mpi_dist_irrk,
-            annealer,
-        ).scale(3.0),
-        copy=False,
-    )
+    channel_kernel = calculate_sigma_kernel_r_q(
+        gamma_magn,
+        gchi0_q_core_inv,
+        gchi0_q_full_sum,
+        gchi0_q_core_sum,
+        u_loc,
+        v_nonloc,
+        mpi_dist_irrk,
+        annealer,
+        save_eliashberg=save_eliashberg,
+    ).scale(3.0)
+    if kernel is not None:
+        kernel.add(channel_kernel, copy=False)
+    channel_kernel.free()
     gchi0_q_core_inv.free()
     gchi0_q_full_sum.free()
     gchi0_q_core_sum.free()
@@ -1392,6 +1409,12 @@ def calculate_sigma_proposal(
         gamma_magn.free()
     _free_shared_window(gamma_magn_win, shared_node_comm)
     logger.info("Calculated kernel for magnetic channel.")
+
+    if eliashberg_only:
+        if giwk_win is not None:
+            giwk_full.mat = None
+        _release_shared_giwk(giwk_win, shared_node_comm)
+        return None
 
     logger.info("Starting calculation of DGA self-energy.")
 
@@ -1664,7 +1687,8 @@ def calculate_self_energy_q(
     annealer = LambdaAnnealer() if config.stabilization.use_lambda_annealing else None
     anneal_reset_iter = None
     release_iter = None
-    for current_iter in range(starting_iter + 1, starting_iter + config.self_consistency.max_iter + 1):
+    last_iter = starting_iter + config.self_consistency.max_iter
+    for current_iter in range(starting_iter + 1, last_iter + 1):
         logger.info("----------------------------------------")
         logger.info(f"Starting iteration {current_iter}.")
         logger.info("----------------------------------------")
@@ -1683,6 +1707,7 @@ def calculate_self_energy_q(
             current_iter,
             annealer=annealer,
             chunk_budgets=chunk_budgets,
+            save_eliashberg=config.eliashberg.perform_eliashberg and current_iter == last_iter,
         )
         # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
 
@@ -1812,6 +1837,28 @@ def calculate_self_energy_q(
                 break
         else:
             logger.info("Self-consistency not reached.")
+
+    # the Eliashberg step reads the intermediates of the final iterate, which the loop writes only in its last scheduled
+    # iteration; a loop that converged earlier builds them once from the converged sigma, still shared per node here
+    if config.eliashberg.perform_eliashberg and current_iter < last_iter:
+        logger.info("Building the Eliashberg intermediates from the converged self-energy.")
+        calculate_sigma_proposal(
+            sigma_old,
+            mu_history[-1],
+            u_loc,
+            v_nonloc,
+            v_nonloc_full,
+            sigma_dmft,
+            delta_sigma,
+            my_irr_q_list,
+            mpi_dist_irrk,
+            comm,
+            current_iter,
+            annealer=annealer,
+            chunk_budgets=chunk_budgets,
+            save_eliashberg=True,
+            eliashberg_only=True,
+        )
 
     # the interpolation reads the final sigma on every rank, so it runs while the shared window still holds it
     if config.self_energy_interpolation.do_interpolation:

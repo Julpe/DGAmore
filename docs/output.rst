@@ -344,9 +344,11 @@ Per-rank intermediates
 ----------------------
 
 When the Eliashberg step is enabled, the self-consistency loop additionally dumps the ingredients of the ladder
-vertex to ``eliashberg_path``, one file per MPI rank, so that the vertex can be assembled after the loop has
-converged. Their leading axis holds only the irreducible momenta of the writing rank, they are overwritten in every
-iteration, and they are deleted once the vertex has been built.
+vertex to ``eliashberg_path``, one file per MPI rank, so that the vertex can be assembled after the loop. They are
+written once: in the last scheduled iteration or, when the loop converges earlier, by one more kernel pass on the
+converged self-energy, whose Green's function the particle-particle bubble of the Eliashberg step uses as well. Their
+leading axis holds only the irreducible momenta of the writing rank, and they are deleted once the vertex has been
+built.
 
 .. list-table::
    :header-rows: 1

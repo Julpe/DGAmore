@@ -103,7 +103,9 @@ def test_streamed_full_vertex_matches_exact_bse_inversion(setup, no):
     zero_sum = FourPoint(np.zeros((n_q, no, no, no, no, n_w)), SpinChannel.NONE, (n_q, 1, 1), 1, 0, False, True, True)
 
     dist = _make_single_rank_distributor()
-    nonlocal_sde.calculate_sigma_kernel_r_q(gamma_r, gchi0_q_inv, zero_sum, zero_sum, u_loc, v_nonloc, dist)
+    nonlocal_sde.calculate_sigma_kernel_r_q(
+        gamma_r, gchi0_q_inv, zero_sum, zero_sum, u_loc, v_nonloc, dist, save_eliashberg=True
+    )
 
     config.sys.n_bands = no
     config.lattice.k_grid = bz.KGrid((n_q, 1, 1), symmetries=[])
