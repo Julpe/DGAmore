@@ -578,10 +578,11 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     """
     Verifies from the host memory available on every node the job runs on, together with an analytic estimate of
     each heavy step's peak, that the run fits: the FFT bubble, the per-slice auxiliary-susceptibility sum, the
-    Schwinger-Dyson contraction, the local Schwinger-Dyson pass, the self-consistency mixing step and
-    chemical-potential update, the final self-energy interpolation, the pairing-vertex construction and the Eliashberg
-    solver (which alone has two variants, in-memory versus its block-distributed grid fallback), and sizes the
-    chunk budgets of the two chunked builds from the same estimate.
+    Schwinger-Dyson contraction, the local Schwinger-Dyson pass, the occupation at the start of the non-local routine
+    (fresh or warm start, and the DMFT lattice Green's function of the DMFT spectrum), the self-consistency mixing
+    step, chemical-potential update and occupation and energy step, the final self-energy interpolation, the
+    pairing-vertex construction and the Eliashberg solver (which alone has two variants, in-memory versus its
+    block-distributed grid fallback), and sizes the chunk budgets of the two chunked builds from the same estimate.
     Must be called only after the irreducible BZ is known (i.e. after auto-symmetry discovery), as the estimate depends on ``k_grid.nk_irr``.
 
     The budget is a **node total**: on a node with ``r`` ranks the memory held by all of them at a branch's peak is
@@ -652,6 +653,8 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
             config.self_energy_interpolation.niv_target if config.self_energy_interpolation.do_interpolation else 0
         ),
         symmetrize_orbitals=bool(config.dmft.symmetrize_orbitals),
+        do_spectrum_dmft=config.ana_cont.do_spectrum_dmft,
+        warm_start=bool(config.self_consistency.previous_sc_path),
     )
 
     def node_total(bp: memory_estimator.BranchPeak, distributed: float, single: float, n_ranks: int) -> float:
@@ -745,6 +748,8 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         ("chiq_aux", "Auxiliary susceptibility"),
         ("sigma_loop", "self-consistency self-energy step"),
         ("mu_update", "chemical-potential update"),
+        ("energies", "occupation and energy step"),
+        ("occupation", "occupation at the start of the non-local routine"),
         ("sigma_interp", "self-energy interpolation"),
         ("fq", "Pairing-vertex construction"),
         ("lanczos", "Eliashberg solver"),

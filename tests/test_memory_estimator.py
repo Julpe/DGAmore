@@ -80,13 +80,17 @@ def test_constants():
 
 
 def test_keys_without_eliashberg():
-    """Without Eliashberg the estimator reports the chi0q, chiq_aux, sde, sigma_loop, mu_update and local branches."""
-    assert set(_peaks(with_eliashberg=False)) == {"chi0q", "chiq_aux", "sde", "sigma_loop", "mu_update", "local"}
+    """Without Eliashberg the estimator reports the chi0q, chiq_aux, sde, sigma_loop, mu_update, energies, occupation
+    and local branches."""
+    keys = {"chi0q", "chiq_aux", "sde", "sigma_loop", "mu_update", "energies", "occupation", "local"}
+    assert set(_peaks(with_eliashberg=False)) == keys
 
 
 def test_keys_with_eliashberg():
     """With Eliashberg the estimator adds the fq and lanczos branches."""
-    branches = {"chi0q", "chiq_aux", "sde", "sigma_loop", "mu_update", "fq", "lanczos", "local"}
+    branches = {
+        *("chi0q", "chiq_aux", "sde", "sigma_loop", "mu_update", "energies", "occupation", "fq", "lanczos", "local")
+    }
     assert set(_peaks(with_eliashberg=True)) == branches
 
 
@@ -372,13 +376,66 @@ def test_sde_round_follows_the_budget_in_whole_tasks_between_one_task_and_the_ra
     assert whole == pytest.approx(at[task] + (most - 1) * step)
 
 
-def test_sde_single_covers_the_rank0_occupation_step():
-    """The sde single-rank slot grows to the DMFT-box sigma/giwk pair once that exceeds the finalize buffers."""
+def test_sde_single_holds_the_finalize_buffers_whatever_the_dmft_box():
+    """The sde single-rank slot is rank 0's two core-box sigma buffers; the DMFT box does not enter it."""
     small = estimate_peaks(**{**TINY, "niv_dmft": TINY["niv_core"]})["sde"].off_single
     big = estimate_peaks(**{**TINY, "niv_dmft": 100 * TINY["niv_core"]})["sde"].off_single
     nb = TINY["n_bands"]
-    assert big == pytest.approx(SCALE * 2 * TINY["nk_tot"] * nb**2 * 2 * 100 * TINY["niv_core"])
-    assert small < big
+    assert small == big == pytest.approx(SCALE * 2 * TINY["nk_tot"] * nb**2 * 2 * TINY["niv_core"])
+
+
+def test_energies_branch_holds_each_ranks_share_pair_and_its_largest_green_function_transient():
+    """Every rank holds its share's sigma and Green's function on the DMFT box plus the largest of the Dyson,
+    occupation and energy-tail transients; rank 0 the loop's residents of the chemical-potential update and the
+    whole-grid moment-fit window (the top fifth of the box)."""
+    params = {**TINY, "niv_dmft": 100 * TINY["niv_core"]}
+    nb, share_k, box = params["n_bands"], -(-params["nk_tot"] // params["n_ranks"]), 2 * params["niv_dmft"]
+    peaks = estimate_peaks(**params)
+    bp = peaks["energies"]
+    transients = memory_estimator._green_function_transients(share_k, nb, box)
+    assert bp.off_distributed == pytest.approx(SCALE * 2 * share_k * nb**2 * box + max(transients))
+    fit_window = SCALE * params["nk_tot"] * nb**2 * int(0.2 * params["niv_dmft"])
+    assert bp.off_single == pytest.approx(peaks["mu_update"].off_single + fit_window)
+    assert bp.baseline == pytest.approx(_rank_base(params)) and bp.giwk_shareable == 0.0
+    assert (bp.on_distributed, bp.on_single) == (bp.off_distributed, bp.off_single)
+
+
+def test_green_function_transients_are_bounded_by_the_chunk_sizes():
+    """The Dyson, occupation and tail transients grow with the box up to their chunks and stay there."""
+    small = memory_estimator._green_function_transients(4, 2, 40)
+    assert small[0] == 16 * (2 * 4 * 4 * 40 + 4 * 4) and small[1] == int(16 * 3.5 * 4 * 4 * 40)
+    big = memory_estimator._green_function_transients(10**4, 3, 2000)
+    assert big[0] == 16 * (2 * memory_estimator.GF_FREQUENCY_CHUNK_ELEMENTS + 10**4 * 9)
+    assert big[1] == int(16 * 3.5 * memory_estimator.GF_MOMENTUM_CHUNK_ELEMENTS)
+    assert big[2] == 16 * 3 * memory_estimator.GF_FREQUENCY_CHUNK_ELEMENTS
+
+
+def test_occupation_branch_adds_the_dmft_lattice_green_function_on_rank0_only_with_the_dmft_spectrum():
+    """Every rank holds one momentum chunk's occupation transient; with the DMFT spectrum rank 0 also builds the
+    whole-grid Green's function on the DMFT box."""
+    nb, nk, box = TINY["n_bands"], TINY["nk_tot"], 2 * TINY["niv_dmft"]
+    share_k = -(-nk // TINY["n_ranks"])
+    plain = estimate_peaks(**TINY)["occupation"]
+    assert plain.off_distributed == memory_estimator._green_function_transients(share_k, nb, box)[1]
+    assert plain.off_single == 0.0 and plain.baseline == pytest.approx(_rank_base(TINY))
+    spectrum = estimate_peaks(**TINY, do_spectrum_dmft=True)["occupation"]
+    dyson = memory_estimator._green_function_transients(nk, nb, box)[0]
+    reload = SCALE * nk * nb**2 * (box + 2 * 2 * TINY["niv_cut"] + 2 * TINY["niv_core"])
+    assert spectrum.off_single == pytest.approx(max(SCALE * nk * nb**2 * box + dyson, reload))
+    assert spectrum.off_distributed == plain.off_distributed
+
+
+def test_occupation_branch_holds_the_warm_start_on_rank0_and_its_mu_search_on_every_rank():
+    """On a warm start rank 0 extends the whole-grid starting iterate onto the DMFT box next to its niv_cut copy and
+    the occupation chunks, and every rank searches mu on its momenta."""
+    nb, nk, box = TINY["n_bands"], TINY["nk_tot"], 2 * TINY["niv_dmft"]
+    peaks = estimate_peaks(**TINY, warm_start=True)
+    warm = peaks["occupation"]
+    occupation = memory_estimator._green_function_transients(nk, nb, box)[1]
+    sigma_full = nk * nb**2 * 2 * TINY["niv_cut"]
+    assert warm.off_single == pytest.approx(SCALE * (nk * nb**2 * box + sigma_full) + occupation)
+    assert warm.off_distributed >= peaks["mu_update"].off_distributed
+    assert estimate_peaks(**TINY)["occupation"].off_single == 0.0
 
 
 def test_sigma_loop_is_rank0_only_with_the_linear_mix_copies_or_the_accelerated_solve():

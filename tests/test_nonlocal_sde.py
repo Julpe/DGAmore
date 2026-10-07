@@ -982,7 +982,11 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
         save=lambda *a, **k: None,
         free=lambda: None,
     )
-    monkeypatch.setattr(nonlocal_sde, "GreensFunction", SimpleNamespace(get_g_full=lambda *a, **k: gf_stub))
+    monkeypatch.setattr(
+        nonlocal_sde,
+        "GreensFunction",
+        SimpleNamespace(get_g_full=lambda *a, **k: gf_stub, get_occupation=lambda *a, **k: gf_stub.get_fill_nonlocal()),
+    )
     monkeypatch.setattr(nonlocal_sde, "update_mu", lambda *a, **k: 0.5)
     monkeypatch.setattr(
         nonlocal_sde,
@@ -1118,12 +1122,21 @@ def test_warm_start_holds_the_dmft_filling_and_resolves_mu(monkeypatch, tmp_path
     monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3))
     monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [0.7])  # the predecessor's mu
 
+    built = []
+
     def g_full(siw, mu, ek, beta):
         n = 0.85 if np.isclose(siw.mat.reshape(-1)[0], 1.0 + 0.1j) and mu == 0.5 else 0.8621
         fill = (n, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1)))
         return SimpleNamespace(get_fill_nonlocal=lambda: fill, save=lambda *a, **k: None, free=lambda: None)
 
-    monkeypatch.setattr(nonlocal_sde, "GreensFunction", SimpleNamespace(get_g_full=g_full))
+    monkeypatch.setattr(
+        nonlocal_sde,
+        "GreensFunction",
+        SimpleNamespace(
+            get_g_full=lambda *a: built.append(a) or g_full(*a),
+            get_occupation=lambda *a: g_full(*a).get_fill_nonlocal(),
+        ),
+    )
     solves = []
     monkeypatch.setattr(nonlocal_sde, "update_mu", lambda mu0, n, *a, **k: solves.append((mu0, n)) or 0.42)
     fake, proposal_mus = nonlocal_sde.calculate_sigma_proposal, []
@@ -1139,6 +1152,36 @@ def test_warm_start_holds_the_dmft_filling_and_resolves_mu(monkeypatch, tmp_path
     assert all(n == 0.85 for _, n in solves)  # every later mu update holds the same filling
     infos = [str(c.args[0]) for c in logger.info.call_args_list]
     assert "Filling of the updated Green's function: 1.000000 (target 0.850000)." in infos  # the stub reports 1.0
+    assert built == []  # without the DMFT spectrum no whole-box Green's function is built, only its occupation
+
+
+def test_dmft_spectrum_builds_and_saves_the_lattice_green_function_once_next_to_a_warm_start(monkeypatch, tmp_path):
+    """With the DMFT spectrum rank 0 builds and saves the DMFT lattice Green's function once, at the DMFT chemical
+    potential; the warm start still takes its filling and its occupation from the occupation alone."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0)
+    config.sys.mu_dmft = 0.5
+    monkeypatch.setattr(config.ana_cont, "do_spectrum_dmft", True, raising=False)
+    start = SelfEnergy(
+        np.full((1, 1, 1, 16), 0.5 + 0.2j, dtype=np.complex64), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0
+    )
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3))
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [0.7])
+    monkeypatch.setattr(nonlocal_sde, "update_mu", lambda *a, **k: 0.42)
+    fill = (0.85, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1)))
+    built, saved, occupations = [], [], []
+
+    def g_full(siw, mu, ek, beta):
+        built.append(mu)
+        return SimpleNamespace(save=lambda **k: saved.append(k["name"]), free=lambda: None)
+
+    def occupation(siw, mu, ek, beta):
+        occupations.append(mu)
+        return fill
+
+    monkeypatch.setattr(nonlocal_sde, "GreensFunction", SimpleNamespace(get_g_full=g_full, get_occupation=occupation))
+    run()
+    assert built == [0.5] and saved == ["g_latt_dmft"]
+    assert occupations == [0.5, 0.42]  # the DMFT filling, then the start's occupation at the re-solved mu
 
 
 def test_warm_start_and_loop_solve_mu_on_every_rank_with_its_momenta(monkeypatch, tmp_path):
@@ -1520,6 +1563,57 @@ def test_update_occ_and_energies_distributed_carries_the_shell_offset_of_the_mix
     for _, occ, occ_k, ekin, epot in res:
         assert np.allclose(occ, occ_ref, atol=1e-6) and np.allclose(occ_k, occ_k_ref, atol=1e-6)
         assert np.allclose([ekin, epot], [ekin_ref, epot_ref], atol=1e-5)
+
+
+def test_energies_estimate_bounds_the_traced_peak_of_the_occupation_and_energy_step(monkeypatch):
+    """One rank's occupation and energy step holds its share's self-energy and Green's function on the DMFT box and the
+    largest chunked transient, within the estimator's energies branch (chunk sizes shrunk alike in code and model)."""
+    import dgamore.greens_function as gf_module
+
+    for module, name, value in (
+        (gf_module, "_MOMENTUM_CHUNK_ELEMENTS", 2**12),
+        (memory_estimator, "GF_MOMENTUM_CHUNK_ELEMENTS", 2**12),
+        (gf_module, "_MODEL_EPOT_CHUNK_ELEMENTS", 2**17),
+        (memory_estimator, "GF_FREQUENCY_CHUNK_ELEMENTS", 2**17),
+    ):
+        monkeypatch.setattr(module, name, value)
+    n_k, nb, niv_cut, niv_dmft, beta, mu = 64, 2, 20, 300, 9.0, 0.4
+    rng = np.random.default_rng(12)
+    config.sys.beta, config.sys.n_bands, config.sys.mu = beta, nb, mu
+    config.lattice.nk = (n_k, 1, 1)
+    config.lattice.k_grid = SimpleNamespace(nk_tot=n_k, nk=(n_k, 1, 1))
+    h = rng.standard_normal((n_k, nb, nb)) + 1j * rng.standard_normal((n_k, nb, nb))
+    config.lattice.hamiltonian = MagicMock(get_ek=MagicMock(return_value=0.5 * (h + h.conj().swapaxes(-1, -2))))
+    dmft = (rng.standard_normal((1, 1, 1, nb, nb, 2 * niv_dmft)) * 0.1 - 0.4j).astype(np.complex64)
+    sigma_dmft_full = SelfEnergy(dmft, (1, 1, 1), beta=beta)
+    sig = (rng.standard_normal((n_k, nb, nb, 2 * niv_cut)) * 0.1 + 0.3j).astype(np.complex64)
+    sigma_new = SelfEnergy(sig, (n_k, 1, 1), has_compressed_q_dimension=True, beta=beta)
+    dist = mpi_utils.MpiDistributor(ntasks=n_k, comm=create_comm_mock())
+    tracemalloc.start()
+    base = tracemalloc.get_traced_memory()[0]
+    nonlocal_sde._update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, dist, mu)
+    peak = tracemalloc.get_traced_memory()[1] - base
+    tracemalloc.stop()
+    modeled = memory_estimator.estimate_peaks(
+        n_bands=nb,
+        nk_tot=n_k,
+        nk_irr=n_k,
+        niw_core=5,
+        niv_core=5,
+        niv_full=5,
+        niv_cut=niv_cut,
+        niv_dmft=niv_dmft,
+        niv_pp=2,
+        n_ranks=1,
+        with_eliashberg=False,
+    )["energies"].off_distributed
+    # beyond the model: the energy tail's complex128 frequency grid (2 niv_asympt frequencies, alive through its sum;
+    # negligible beside a rank's baseline), the momentum-sized arrays and the frequency grids on the bands. The tail
+    # chunks dominate here, so one chunk more or less than modeled leaves the window on either side.
+    grid = 16 * 2 * memory_estimator.EPOT_NIV_ASYMPT
+    small = 8 * n_k * nb**2 * 16 + 4 * nb**2 * 2 * niv_dmft * 16
+    # (5 % for numpy's casting buffers, which another numpy version may size differently)
+    assert modeled < peak <= 1.05 * modeled + grid + small
 
 
 def test_update_occ_and_energies_distributed_pins_the_occupation_dtype_across_ranks(monkeypatch):

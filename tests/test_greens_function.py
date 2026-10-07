@@ -234,7 +234,10 @@ def test_get_fill_nonlocal_keeps_the_real_arithmetic_for_a_real_dispersion():
     sig = SelfEnergy(sig_mat, nk=nk, has_compressed_q_dimension=True, beta=beta)
     g = GreensFunction.get_g_full(sig, mu, ek, beta)
     _, _, occ_k = g.get_fill_nonlocal()
-    box = np.sum(g._get_gfull_mat().real - g._get_g_model_k_mat().real, axis=-1) / beta
+    iv_bands, mu_bands = g._get_g_params_local()
+    model = iv_bands[None, None, None] + mu_bands[None, None, None] - ek[..., None] - sig.smom[0][..., None]
+    g_model = GreensFunction._invert_last_orbital_block(model)
+    box = np.sum(g._get_gfull_mat().real - g_model.real, axis=-1) / beta
     ref = _fermi_dirac_density(ek.real + sig.smom[0][None, None, None] - mu * np.eye(nb), beta) + box
     ref.real[np.abs(ref) < 1e-12] = 0.0
     assert np.array_equal(occ_k, ref)
@@ -451,3 +454,107 @@ def test_model_epot_chunked_matches_unchunked_reference(monkeypatch):
 
     monkeypatch.setattr(gf_module, "_MODEL_EPOT_CHUNK_ELEMENTS", 50)
     assert np.allclose(g._model_epot(smom0, smom1, 37, beta), ref, atol=1e-10)
+
+
+def _chunking_inputs(complex_ek: bool, local_sigma: bool, nk=(3, 4, 2), nb=3, niv=9):
+    """A complex64 self-energy (momentum-local or on every momentum) and a Hermitian dispersion, complex or real."""
+    rng = np.random.default_rng(5 + 2 * complex_ek + local_sigma)
+    shape = (1, 1, 1) if local_sigma else nk
+    mat = (rng.standard_normal((*shape, nb, nb, 2 * niv)) * 0.2 - 0.6j).astype(np.complex64)
+    sigma = SelfEnergy(0.5 * (mat + mat.swapaxes(-2, -3)), shape, beta=7.3)
+    h = rng.standard_normal((*nk, nb, nb)) + (1j * rng.standard_normal((*nk, nb, nb)) if complex_ek else 0)
+    return sigma, (0.5 * (h + h.conj().swapaxes(-1, -2))).astype(np.complex128)
+
+
+@pytest.mark.parametrize("complex_ek", [True, False])
+@pytest.mark.parametrize("local_sigma", [True, False])
+@pytest.mark.parametrize("nk", [(3, 4, 2), (13, 1, 1)])
+def test_occupation_and_energies_do_not_depend_on_the_momentum_chunking(monkeypatch, complex_ek, local_sigma, nk):
+    """Momentum chunks of one momentum up to all of them give the occupation, filling and energies bit for bit,
+    also on a grid of single-momentum planes, where a lone momentum would change the energy trace's einsum."""
+    import dgamore.greens_function as gf_module
+
+    sigma, ek = _chunking_inputs(complex_ek, local_sigma, nk=nk)
+    mu, beta = np.float64(0.37), np.float64(7.3)
+
+    def evaluate(chunk):
+        monkeypatch.setattr(gf_module, "_MOMENTUM_CHUNK_ELEMENTS", chunk)
+        g = GreensFunction.get_g_full(sigma.copy(), mu, ek, beta)
+        fill = g.get_fill_nonlocal()
+        return (
+            fill,
+            (g.get_ekin(), g.get_epot(niv_asympt=200)),
+            GreensFunction.get_occupation(sigma.copy(), mu, ek, beta),
+        )
+
+    ref_fill, ref_energies, _ = evaluate(10**9)
+    for chunk in (1, 6 * 3 * 3 * 2 * 9):
+        fill, energies, direct = evaluate(chunk)
+        assert energies == ref_energies
+        for got in (fill, direct):
+            assert got[0] == ref_fill[0]
+            assert all(a.dtype == b.dtype and np.array_equal(a, b) for a, b in zip(got[1:], ref_fill[1:]))
+
+
+def test_get_occupation_is_get_fill_nonlocal_without_building_the_green_function(monkeypatch):
+    """The direct occupation equals the one of get_g_full's Green's function, builds none and, like get_g_full,
+    leaves the self-energy in its uncompressed momentum layout."""
+    nk, nb, niv, beta, mu = (2, 3, 1), 2, 7, 6.0, 0.25
+    rng = np.random.default_rng(8)
+    shape = (int(np.prod(nk)), nb, nb, 2 * niv)
+    sig = SelfEnergy(rng.standard_normal(shape) - 0.5j, nk=nk, has_compressed_q_dimension=True, beta=beta)
+    ek = _make_complex_hopping_ek(nk)
+    ref = GreensFunction.get_g_full(sig.copy(), mu, ek, beta).get_fill_nonlocal()
+    monkeypatch.setattr(GreensFunction, "get_g_full", MagicMock(side_effect=AssertionError("G was built")))
+    got = GreensFunction.get_occupation(sig, mu, ek, beta)
+    assert got[0] == ref[0] and np.array_equal(got[1], ref[1]) and np.array_equal(got[2], ref[2])
+    assert not sig.has_compressed_q_dimension
+
+
+def test_get_occupation_refuses_a_self_energy_on_other_momenta():
+    """A momentum-resolved self-energy must sit on the dispersion's momenta (a momentum-local one broadcasts)."""
+    sigma, ek = _chunking_inputs(True, False, nk=(8, 1, 1))
+    with pytest.raises(ValueError, match=r"momenta \(8, 1, 1\), the dispersion \(3, 1, 1\)"):
+        GreensFunction.get_occupation(sigma, 0.3, ek[:3], 7.3)
+    sigma, ek = _chunking_inputs(True, False, nk=(2, 3, 1))
+    with pytest.raises(ValueError, match="the dispersion"):  # as many momenta, but on another grid
+        GreensFunction.get_occupation(sigma, 0.3, ek.reshape(3, 2, 1, *ek.shape[3:]), 7.3)
+
+
+def test_get_occupation_holds_the_modeled_momentum_chunks_not_the_whole_box(monkeypatch):
+    """Beyond the momentum-sized arrays the occupation holds about three chunk-sized arrays, within the estimator's
+    occupation transient, a small fraction of one Green's function on the whole box."""
+    import tracemalloc
+
+    import dgamore.greens_function as gf_module
+    from dgamore import memory_estimator
+
+    monkeypatch.setattr(gf_module, "_MOMENTUM_CHUNK_ELEMENTS", 2**12)
+    monkeypatch.setattr(memory_estimator, "GF_MOMENTUM_CHUNK_ELEMENTS", 2**12)
+    n_k, nb, niv, beta = 64, 2, 400, 9.0
+    rng = np.random.default_rng(4)
+    mat = (rng.standard_normal((1, 1, 1, nb, nb, 2 * niv)) * 0.1 - 0.4j).astype(np.complex64)
+    sigma = SelfEnergy(mat, (1, 1, 1), beta=beta)
+    h = rng.standard_normal((n_k, nb, nb)) + 1j * rng.standard_normal((n_k, nb, nb))
+    ek = (0.5 * (h + h.conj().swapaxes(-1, -2))).reshape(n_k, 1, 1, nb, nb)
+    tracemalloc.start()
+    GreensFunction.get_occupation(sigma, 0.4, ek, beta)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    whole_box = n_k * nb**2 * 2 * niv * 16
+    # the momentum-sized arrays (density matrix, frequency sums, occupation) and the frequency grid on the bands
+    small = 6 * n_k * nb**2 * 16 + 2 * nb**2 * 2 * niv * 16
+    assert peak <= memory_estimator._green_function_transients(n_k, nb, 2 * niv)[1] + small < 0.2 * whole_box
+
+
+def test_chunk_constants_are_mirrored_by_the_memory_estimator():
+    """The estimator models the chunk sizes and the tail frequency count this module runs with."""
+    import inspect
+
+    import dgamore.greens_function as gf_module
+    from dgamore import memory_estimator
+
+    assert memory_estimator.GF_MOMENTUM_CHUNK_ELEMENTS == gf_module._MOMENTUM_CHUNK_ELEMENTS
+    assert memory_estimator.GF_FREQUENCY_CHUNK_ELEMENTS == gf_module._MODEL_EPOT_CHUNK_ELEMENTS
+    niv_asympt = inspect.signature(GreensFunction.get_epot).parameters["niv_asympt"].default
+    assert memory_estimator.EPOT_NIV_ASYMPT == niv_asympt

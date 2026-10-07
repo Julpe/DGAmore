@@ -153,8 +153,11 @@ def test_heaviest_branch_overflow_raises_while_lighter_branches_fit(fake_system)
         dgamore_main.autodetect_memory_settings(_mock_comm())
 
 
-def test_more_ranks_per_node_raise_the_distributed_node_total(fake_system):
+def test_more_ranks_per_node_raise_the_distributed_node_total(fake_system, monkeypatch):
     """A distributed branch's node total scales with ranks-per-node, overflowing only at 2 co-located ranks."""
+    # the energy step's analytic tail (EPOT_NIV_ASYMPT frequencies) outgrows this small box's other branches; shrink
+    # it so the branch under test stays the largest
+    monkeypatch.setattr(dgamore_main.memory_estimator, "EPOT_NIV_ASYMPT", 1)
     one = _node_total("chiq_aux", "off", r=1)
     two = _node_total("chiq_aux", "off", r=2)
     assert two > one  # distributed block counted r times (minus the one-copy giwk credit)
@@ -201,6 +204,41 @@ def test_autodetect_forwards_eliashberg_flags(fake_system, monkeypatch):
     dgamore_main.autodetect_memory_settings(_mock_comm())
     assert captured["save_pairing_vertex"] is True
     assert captured["n_eig"] == 3
+
+
+def test_autodetect_forwards_the_dmft_spectrum_and_warm_start_flags(fake_system, monkeypatch):
+    """The driver models the DMFT lattice Green's function under do_spectrum_dmft and a warm start whenever the run
+    may start from a previous one (previous_sc_path set)."""
+    fake_system(64 * 1024**3)
+    captured = []
+    real = dgamore_main.memory_estimator.estimate_peaks
+
+    def spy(**kwargs):
+        captured.append((kwargs["do_spectrum_dmft"], kwargs["warm_start"]))
+        return real(**kwargs)
+
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", spy)
+    for spectrum, path in ((False, ""), (True, "/a/previous/run"), (False, "/a/previous/run")):
+        monkeypatch.setattr(config.ana_cont, "do_spectrum_dmft", spectrum, raising=False)
+        monkeypatch.setattr(config.self_consistency, "previous_sc_path", path, raising=False)
+        captured.clear()
+        dgamore_main.autodetect_memory_settings(_mock_comm())
+        assert set(captured) == {(spectrum, bool(path))}
+
+
+@pytest.mark.parametrize(
+    "key, label",
+    [("energies", "occupation and energy step"), ("occupation", "occupation at the start of the non-local routine")],
+)
+def test_occupation_and_energy_branches_stop_an_oversized_run_by_name(fake_system, monkeypatch, key, label):
+    """Both verify-only branches of the occupation and energy steps refuse a run they do not fit, naming the step."""
+    resident = 1024**3
+    monkeypatch.setattr(
+        dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: {key: _mock_branch(resident, 0.0, resident)}
+    )
+    fake_system(int(1.5 * resident / dgamore_main.NODE_MEMORY_FRACTION))
+    with pytest.raises(MemoryError, match=label):
+        dgamore_main.autodetect_memory_settings(_mock_comm())
 
 
 def test_autodetect_forwards_the_mixing_pairs_the_loop_reaches(fake_system, monkeypatch):
@@ -395,6 +433,9 @@ def test_dgamore_excludes_osc_ucx_before_mpi_init():
 
 def test_local_step_overflow_raises_before_the_flag_loop(fake_system, monkeypatch):
     """A budget below the flag-less local single peak raises MemoryError naming the local Schwinger-Dyson step."""
+    # the energy step's analytic tail (EPOT_NIV_ASYMPT frequencies) outgrows this small box's other branches; shrink
+    # it so the branch under test stays the largest
+    monkeypatch.setattr(dgamore_main.memory_estimator, "EPOT_NIV_ASYMPT", 1)
     monkeypatch.setattr(config.box, "niv_core", 40)
     monkeypatch.setattr(config.box, "niv_full", 100)
     params = {**FIXTURE_PARAMS, "niv_core": 40, "niv_full": 100, "niv_cut": 50}  # niv_cut = min(10 + 100 + 10, 50)
