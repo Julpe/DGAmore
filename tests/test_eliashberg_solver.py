@@ -2672,7 +2672,9 @@ def _write_intermediates(chi0_mat, gamma_mat, u_mat, no):
     zero_sum = FourPoint(np.zeros((N_Q, no, no, no, no, N_W)), SpinChannel.NONE, (N_Q, 1, 1), 1, 0, False, True, True)
 
     dist = _make_single_rank_distributor()
-    nonlocal_sde.calculate_sigma_kernel_r_q(gamma_r, gchi0_q_inv, zero_sum, zero_sum, u_loc, v_nonloc, dist)
+    nonlocal_sde.calculate_sigma_kernel_r_q(
+        gamma_r, gchi0_q_inv, zero_sum, zero_sum, u_loc, v_nonloc, dist, save_eliashberg=True
+    )
     return gamma_r, u_loc, v_nonloc, dist
 
 

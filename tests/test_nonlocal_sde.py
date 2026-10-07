@@ -959,6 +959,77 @@ def test_select_and_apply_lambda_correction_dispatch(monkeypatch):
         multi.assert_called_once_with(chi)
 
 
+@pytest.mark.parametrize("save", [False, True])
+def test_kernel_step_writes_the_eliashberg_intermediates_only_when_asked(monkeypatch, save):
+    """The per-rank three-leg vertex and physical susceptibility are written only with save_eliashberg."""
+    config.eliashberg.perform_eliashberg = True  # the flag decides, not the config
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    vrg, chi = MagicMock(), MagicMock()
+    vrg.channel.value = "dens"
+    chi.channel = SpinChannel.DENS
+    monkeypatch.setattr(nonlocal_sde, "create_auxiliary_chi_r_q_sum", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(nonlocal_sde, "create_vrg_r_q", lambda *a: vrg)
+    monkeypatch.setattr(nonlocal_sde, "create_generalized_chi_q_with_shell_correction", lambda *a: chi)
+    monkeypatch.setattr(nonlocal_sde, "_select_and_apply_lambda_correction", lambda c: c)
+    monkeypatch.setattr(nonlocal_sde, "min_static_compound_eigenvalue", lambda c: 1.0)
+    monkeypatch.setattr(nonlocal_sde, "calculate_kernel_r_q", lambda *a: "kernel")
+    dist = MagicMock()
+    dist.comm.size, dist.comm.rank = 1, 0
+    dist.gather.side_effect = dist.scatter.side_effect = lambda m: m
+    args = [MagicMock() for _ in range(6)]
+
+    assert nonlocal_sde.calculate_sigma_kernel_r_q(*args, dist, None, save_eliashberg=save) == "kernel"
+
+    assert vrg.save.called == save
+    names = [c.kwargs["name"] for c in chi.save.call_args_list]
+    assert names == ["chi_phys_q_dens"] + (["chi_phys_q_dens_rank_0"] if save else [])
+
+
+def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_sde(monkeypatch, tmp_path):
+    """The post-loop pass writes the dumps of both channels, skips the double-counting kernel and the SDE, returns None."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    config.output.output_path = str(tmp_path)
+    config.sys.beta = 10.0
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
+    bubble = MagicMock()
+    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, None))
+    monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
+    monkeypatch.setattr(nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: bubble)
+    monkeypatch.setattr(nonlocal_sde, "_cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
+    loaded, saves = [], []
+
+    def load_vertex(node_comm, path, *a, **k):
+        loaded.append(os.path.basename(path))
+        return MagicMock(), None
+
+    def forbidden(*a, **k):
+        raise AssertionError("the Eliashberg-only pass must not reach the double-counting kernel or the SDE")
+
+    def kernel_step(*a, save_eliashberg=False, **k):
+        saves.append(save_eliashberg)
+        return MagicMock()
+
+    monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", load_vertex)
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_dc_kernel", forbidden)
+    monkeypatch.setattr(nonlocal_sde, "_run_column_sde", forbidden)
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_kernel_r_q", kernel_step)
+    args = [MagicMock() for _ in range(8)]  # mu, u_loc, v_nonloc, v_nonloc_full, sigma_dmft, delta_sigma, q list, dist
+
+    result = nonlocal_sde.calculate_sigma_proposal(
+        MagicMock(),
+        *args,
+        create_comm_mock(),
+        2,
+        chunk_budgets=memory_estimator.ChunkBudgets(1, 1),
+        save_eliashberg=True,
+        eliashberg_only=True,
+    )
+
+    assert result is None
+    assert loaded == ["gamma_dens_loc.npy", "gamma_magn_loc.npy"] and saves == [True, True]
+    assert bubble.cut_niv.return_value.invert.return_value.save.call_args.kwargs["name"] == "gchi0_q_inv_rank_0"
+
+
 def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, epsilon=1e-3):
     """Minimal single-k single-band environment for calculate_self_energy_q with a synthetic map and frozen mu."""
     config.lattice.k_grid = bz.KGrid((1, 1, 1), symmetries=[])
@@ -1069,6 +1140,62 @@ def test_loop_forwards_the_chunk_budgets_to_every_proposal(monkeypatch, tmp_path
     run(chunk_budgets=budgets)
     run()
     assert seen == [budgets, budgets, None, None]
+
+
+@pytest.mark.parametrize("start", [0, 3])  # a fresh run, and a warm start resuming after iteration 3
+@pytest.mark.parametrize(
+    "perform, epsilon, max_iter, expected",
+    [
+        # (iteration counted from the start, save_eliashberg, eliashberg_only) of every proposal call
+        (True, 0.0, 3, [(1, False, False), (2, False, False), (3, True, False)]),  # ends at max_iter: last only
+        (True, 1e-3, 2, [(1, False, False), (2, True, False)]),  # converges at the last iteration: no extra pass
+        (True, 1e-3, 5, [(1, False, False), (2, False, False), (2, True, True)]),  # converges early: one pass
+        (False, 1e-3, 5, [(1, False, False), (2, False, False)]),  # no Eliashberg step: never writes
+    ],
+)
+def test_loop_writes_the_eliashberg_intermediates_once(
+    monkeypatch, tmp_path, perform, epsilon, max_iter, expected, start
+):
+    """The loop writes the dumps in its last scheduled iteration only, or in one pass after converging earlier; a warm
+    start counts its schedule from the resumed iteration."""
+    step = lambda s, n, a: s.copy()  # a fixed point: converges at the first check unless epsilon is zero
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, step, max_iter=max_iter, epsilon=epsilon)
+    config.eliashberg.perform_eliashberg = perform
+    if start:
+        mat = np.full((1, 1, 1, 16), 1.0 + 0.1j, dtype=np.complex64)
+        resumed = SelfEnergy(mat, (1, 1, 1), has_compressed_q_dimension=True, beta=10.0)
+        monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (resumed, start))
+        monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [config.sys.mu])
+    fake, seen = nonlocal_sde.calculate_sigma_proposal, []
+
+    def spy(*args, **kwargs):
+        seen.append((args[-1] - start, kwargs.get("save_eliashberg", False), kwargs.get("eliashberg_only", False)))
+        return fake(*args, **kwargs)
+
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", spy)
+    run()
+    assert seen == expected
+
+
+def test_early_converged_loop_builds_the_eliashberg_intermediates_from_the_final_sigma_and_mu(monkeypatch, tmp_path):
+    """The post-loop pass starts from the returned self-energy and the last chemical potential, like a next iteration."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=5, epsilon=1e-3)
+    config.eliashberg.perform_eliashberg = True
+    mus = iter([0.51, 0.52])
+    monkeypatch.setattr(nonlocal_sde, "update_mu", lambda *a, **k: next(mus))
+    fake, passes = nonlocal_sde.calculate_sigma_proposal, []
+
+    def spy(sigma_in, mu, *args, **kwargs):
+        if kwargs.get("eliashberg_only"):
+            passes.append((sigma_in.mat.copy(), mu, args[-1]))
+        return fake(sigma_in, mu, *args, **kwargs)
+
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", spy)
+    result = run()
+    assert len(passes) == 1
+    sigma_mat, mu, current_iter = passes[0]
+    assert np.array_equal(sigma_mat.reshape(-1), result.mat.reshape(-1))
+    assert mu == 0.52 and current_iter == 2
 
 
 def test_resumed_run_shares_the_starting_iterate_per_node_before_the_first_proposal(monkeypatch, tmp_path):
