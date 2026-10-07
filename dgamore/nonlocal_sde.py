@@ -1146,9 +1146,11 @@ def _update_occ_and_energies_distributed(
     built the whole DMFT-box Green's function and its asymptotic tail sums on rank 0 while every other rank idled).
     The self-energy moments are fitted from the momentum-averaged concatenated self-energy, allreduced first so
     they match the full-box fit on every rank; the k-resolved occupation is allgathered and the k-summed scalars
-    are recombined with each rank's momentum count as weight. The momentum-dependent constant the mixed
-    self-energy carries in its shell (see :meth:`SelfEnergy.shell_offset_from`) is carried into the DMFT-box
-    extension and its moment fit.
+    are recombined with each rank's momentum count as weight. The real-or-complex arithmetic of the occupation is
+    decided on the whole dispersion, so a rank whose momenta all have a real :math:`H(\mathbf{k})` keeps the
+    complex arithmetic of a complex dispersion and the occupation does not depend on the rank count. The
+    momentum-dependent constant the mixed self-energy carries in its shell (see
+    :meth:`SelfEnergy.shell_offset_from`) is carried into the DMFT-box extension and its moment fit.
 
     :param sigma_new: The mixed :class:`SelfEnergy` (full BZ, compressed momenta, identical on every rank).
     :param sigma_dmft_full: The DMFT :class:`SelfEnergy` supplying the shell frequencies (momentum-local).
@@ -1185,7 +1187,7 @@ def _update_occ_and_energies_distributed(
     ek = config.lattice.hamiltonian.get_ek()
     ek_slice = ek.reshape(nk_tot, n_bands, n_bands)[mpi_dist_fullbz.my_slice].reshape(n_my, 1, 1, n_bands, n_bands)
     giwk_occ = GreensFunction.get_g_full(sigma_occ, mu, ek_slice, config.sys.beta)
-    _, _, occ_k_slice = giwk_occ.get_fill_nonlocal()
+    _, _, occ_k_slice = giwk_occ.get_fill_nonlocal(real_dispersion=np.isrealobj(np.real_if_close(ek)))
     ekin, epot = giwk_occ.get_ekin(), giwk_occ.get_epot()
     giwk_occ.free()
     sigma_occ.free()
@@ -1631,11 +1633,12 @@ def calculate_self_energy_q(
 
     if starting_iter == 0:
         # a fresh start holds the momentum-local DMFT sigma on every rank, so each rank evaluates the filling of the
-        # full DMFT box on its own momentum slice and the slices are assembled exactly (zero-padded reduction)
+        # full DMFT box on its own momentum slice (arithmetic decided on all momenta) and assembles it exactly
         n_my, nb = mpi_dist_fullbz.my_size, ek.shape[-1]
         ek_my = ek.reshape(-1, nb, nb)[mpi_dist_fullbz.my_slice].reshape(n_my, 1, 1, nb, nb)
+        real_ek = np.isrealobj(np.real_if_close(ek))
         occ_k_my = (
-            GreensFunction.get_occupation(sigma_old, mu_history[-1], ek_my, config.sys.beta)[2]
+            GreensFunction.get_occupation(sigma_old, mu_history[-1], ek_my, config.sys.beta, real_ek)[2]
             if n_my
             else np.zeros((0, 1, 1, nb, nb))
         )

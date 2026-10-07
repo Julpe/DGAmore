@@ -1793,6 +1793,43 @@ def test_update_occ_and_energies_distributed_pins_the_occupation_dtype_across_ra
         )
 
 
+def _dispersion_with_a_real_half(rng, nk: tuple, o: int) -> np.ndarray:
+    """A Hermitian dispersion whose first half of the momenta is real and whose second half is complex."""
+    h = rng.standard_normal((int(np.prod(nk)), o, o)) + 1j * rng.standard_normal((int(np.prod(nk)), o, o))
+    h[: h.shape[0] // 2].imag = 0.0
+    return (h + h.conj().swapaxes(-1, -2)).reshape(*nk, o, o)
+
+
+def test_update_occ_and_energies_distributed_decides_the_arithmetic_on_the_whole_dispersion(monkeypatch):
+    """A rank whose momenta all have a real H(k) keeps the complex occupation of a complex dispersion."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, o, niv, niv_dmft, beta, mu = (4, 1, 1), 2, 3, 8, 9.0, 0.4
+    nk_tot = int(np.prod(nk))
+    rng = np.random.default_rng(23)
+    config.sys.beta, config.sys.n_bands, config.sys.mu = beta, o, mu
+    config.lattice.nk = nk
+    config.lattice.k_grid = SimpleNamespace(nk_tot=nk_tot, nk=nk)
+    ek = _dispersion_with_a_real_half(rng, nk, o)
+    config.lattice.hamiltonian = MagicMock(get_ek=MagicMock(return_value=ek))
+    sig_mat = (rng.standard_normal((nk_tot, o, o, 2 * niv)) * 0.1 + 0.3j).astype(np.complex64)
+    dmft_mat = (rng.standard_normal((1, 1, 1, o, o, 2 * niv_dmft)) * 0.1 + 0.2j).astype(np.complex64)
+    sigma_new = SelfEnergy(sig_mat.copy(), nk, has_compressed_q_dimension=True, beta=beta)
+    sigma_dmft_full = SelfEnergy(dmft_mat.copy(), (1, 1, 1), beta=beta)
+    sigma_ref = sigma_new.copy().concatenate_self_energies(
+        sigma_dmft_full, shell_offset=sigma_new.shell_offset_from(sigma_dmft_full)
+    )
+    _, occ_ref, occ_k_ref = GreensFunction.get_g_full(sigma_ref, mu, ek, beta).get_fill_nonlocal()
+    sigmas = [(sigma_new.copy(), sigma_dmft_full.copy()) for _ in range(2)]
+
+    def fn(comm, rank):
+        d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
+        return nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
+
+    _, res = run_parallel(2, fn)
+    assert np.abs(occ_k_ref.reshape(nk_tot, o, o)[: nk_tot // 2].imag).max() > 1e-3
+    assert all(np.array_equal(occ, occ_ref) and np.array_equal(occ_k, occ_k_ref) for _, occ, occ_k, _, _ in res)
+
+
 def test_share_sigma_per_node_hands_rank0_sigma_with_its_metadata_to_every_rank_once_per_node(monkeypatch):
     """Rank 0's Sigma reaches every rank, metadata included, as a view of its node's single shared buffer."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
@@ -1836,6 +1873,37 @@ def test_assemble_occupation_from_momentum_slices_matches_the_full_grid_filling(
     _, res = run_parallel(3, fn)
     for n_el, occ, occ_k in res:
         assert n_el == n_ref and np.array_equal(occ, occ_ref) and np.array_equal(occ_k, occ_k_ref)
+
+
+def test_fresh_start_occupation_decides_the_arithmetic_on_the_whole_dispersion(monkeypatch, tmp_path):
+    """A fresh start whose rank holds only real-H(k) momenta assembles the whole-grid occupation of a complex H(k)."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0)
+    nk, o, rng = (4, 1, 1), 2, np.random.default_rng(29)
+    config.sys.n_bands = o
+    config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
+    ek = _dispersion_with_a_real_half(rng, nk, o)
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: ek)
+    mat = (rng.standard_normal((1, o, o, 16)) * 0.1 + 0.3j).astype(np.complex64)
+    ref = GreensFunction.get_occupation(
+        SelfEnergy(mat.copy(), has_compressed_q_dimension=True, beta=10.0), 0.5, ek, 10.0
+    )
+    monkeypatch.setattr(nonlocal_sde.GreensFunction, "get_occupation", GreensFunction.get_occupation)
+    assembled, assemble = [], nonlocal_sde._assemble_occupation
+    monkeypatch.setattr(
+        nonlocal_sde, "_assemble_occupation", lambda *a: assembled.append(assemble(*a)) or assembled[-1]
+    )
+
+    def fn(comm, rank):
+        sigma_dmft = SelfEnergy(mat.copy(), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0)
+        nonlocal_sde.calculate_self_energy_q(comm, None, MagicMock(), sigma_dmft, sigma_dmft.copy())
+
+    run_parallel(2, fn, hostnames=["n0", "n0"])
+    assert len(assembled) == 2 and np.abs(ref[2].reshape(4, o, o)[:2].imag).max() > 1e-3
+    assert all(
+        n == ref[0] and np.array_equal(occ, ref[1]) and np.array_equal(occ_k, ref[2]) for n, occ, occ_k in assembled
+    )
 
 
 def _column_sde_setup(auto: bool, nk=(4, 4, 2), o=2, niw=3, niv=2, seed=41):

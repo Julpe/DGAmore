@@ -383,22 +383,26 @@ class GreensFunction(TwoPoint):
         # the local Green's function carries a single-momentum dimension; index it away for the orbital algebra
         return self.mat[0, 0, 0][..., self.niv + niv_cut_range[None, :] - wn[:, None]]
 
-    def get_fill_nonlocal(self) -> tuple[float, np.ndarray, np.ndarray]:
+    def get_fill_nonlocal(self, real_dispersion: bool | None = None) -> tuple[float, np.ndarray, np.ndarray]:
         r"""
         Computes the filling and occupation from the momentum-resolved Green's function, using the analytic
         density-matrix of the model (moment) Green's function plus the box correction to accelerate convergence.
         The box correction is summed in momentum chunks (see :meth:`get_occupation`); this object's array is not
         read.
 
+        :param real_dispersion: Whether the dispersion is real, so the occupation takes the real-part arithmetic
+            (see :meth:`_occupation_k`); None decides on this object's dispersion.
         :return: A tuple of (i) the total filling :math:`n`, (ii) the k-averaged occupation (shape ``[o1, o2]``),
             and (iii) the k-resolved occupation (shape ``[kx, ky, kz, o1, o2]``).
         """
-        occ_k = self._occupation_k(self._sigma, self._mu, self._ek, self._beta, self.niv, self.n_bands)
+        occ_k = self._occupation_k(self._sigma, self._mu, self._ek, self._beta, self.niv, self.n_bands, real_dispersion)
         self._n, self._occ, self._occ_k = self._fill_from_occupation(occ_k)
         return self._n, self._occ, self._occ_k
 
     @staticmethod
-    def get_occupation(siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float) -> tuple[float, np.ndarray, np.ndarray]:
+    def get_occupation(
+        siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float, real_dispersion: bool | None = None
+    ) -> tuple[float, np.ndarray, np.ndarray]:
         r"""
         Returns the filling and occupation of the Green's function :meth:`get_g_full` builds from the same arguments,
         bit for bit what :meth:`get_fill_nonlocal` gives on it, without building that Green's function. The Dyson
@@ -412,21 +416,34 @@ class GreensFunction(TwoPoint):
         :param mu: Chemical potential :math:`\mu`.
         :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
         :param beta: Inverse temperature :math:`\beta`.
+        :param real_dispersion: Whether the dispersion is real, so the occupation takes the real-part arithmetic
+            (see :meth:`_occupation_k`); None decides on ``ek``.
         :return: A tuple of (i) the total filling :math:`n`, (ii) the k-averaged occupation (shape ``[o1, o2]``),
             and (iii) the k-resolved occupation (shape ``[kx, ky, kz, o1, o2]``).
         :raises ValueError: If the self-energy is neither momentum-local nor on the momenta of ``ek``.
         """
         siw.decompress_q_dimension()
-        occ_k = GreensFunction._occupation_k(siw, mu, ek, beta, siw.niv, siw.n_bands)
+        occ_k = GreensFunction._occupation_k(siw, mu, ek, beta, siw.niv, siw.n_bands, real_dispersion)
         return GreensFunction._fill_from_occupation(occ_k)
 
     @staticmethod
-    def _occupation_k(siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float, niv: int, n_bands: int) -> np.ndarray:
+    def _occupation_k(
+        siw: SelfEnergy,
+        mu: float,
+        ek: np.ndarray,
+        beta: float,
+        niv: int,
+        n_bands: int,
+        real_dispersion: bool | None = None,
+    ) -> np.ndarray:
         r"""
         Returns the k-resolved occupation :math:`n_{12}(\mathbf{k}) = \rho_{12}(\mathbf{k}) + \frac{1}{\beta}
         \sum_{\nu} [G - G_{\mathrm{mod}}]_{12}^{\mathbf{k}\nu}` with the moment model :math:`G_{\mathrm{mod}}` and its
-        analytic density matrix :math:`\rho` (see :func:`_fermi_dirac_density`). The real-or-complex arithmetic is
-        decided once from the whole dispersion; the frequency sums run in momentum chunks of
+        analytic density matrix :math:`\rho` (see :func:`_fermi_dirac_density`). A real dispersion takes the real
+        part of the dispersion and of the frequency sums, a complex (Hermitian) one keeps their imaginary parts. The
+        decision is taken once for all momenta: from ``real_dispersion`` when given, which lets a caller holding only
+        some momenta of a complex dispersion keep its complex arithmetic, otherwise from ``ek`` (real when its
+        imaginary part vanishes to rounding). The frequency sums run in momentum chunks of
         :data:`_MOMENTUM_CHUNK_ELEMENTS` Green's-function entries. Every entry is the same floating-point expression
         as on the whole grid at once, so the result does not depend on the chunking.
 
@@ -436,6 +453,7 @@ class GreensFunction(TwoPoint):
         :param beta: Inverse temperature :math:`\beta`.
         :param niv: Number of positive fermionic frequencies of the Green's function.
         :param n_bands: Number of bands.
+        :param real_dispersion: Whether the dispersion is real; None decides on ``ek``.
         :return: The k-resolved occupation, shape ``[kx, ky, kz, o1, o2]``; entries of magnitude below 1e-12 get a
             zero real part.
         :raises ValueError: If the self-energy is neither momentum-local nor on the momenta of ``ek``.
@@ -446,10 +464,11 @@ class GreensFunction(TwoPoint):
         mu_v = (mu * eye_bands[:, :, None])[None]
         smom0 = siw.smom[0]
 
-        # a complex (Hermitian) dispersion keeps its imaginary part; a real one keeps the real-part arithmetic
-        ek_density = np.real_if_close(ek)
+        if real_dispersion is None:
+            real_dispersion = np.isrealobj(np.real_if_close(ek))
+        ek_density = ek.real if real_dispersion else ek
         rho_k = _fermi_dirac_density(ek_density + smom0[None, None, None] - mu * eye_bands[None, None, None], beta)
-        complex_box = np.iscomplexobj(ek_density)
+        complex_box = not real_dispersion
 
         nk = int(np.prod(ek.shape[:3]))
         ek_flat = ek.reshape(nk, n_bands, n_bands)
