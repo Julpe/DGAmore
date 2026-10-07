@@ -511,6 +511,19 @@ def test_get_occupation_is_get_fill_nonlocal_without_building_the_green_function
     assert not sig.has_compressed_q_dimension
 
 
+def test_occupation_of_a_real_slice_of_a_complex_dispersion_takes_the_given_arithmetic():
+    """A real-H(k) momentum of a complex dispersion, told the dispersion is complex, gives its whole-grid occupation."""
+    nb, niv, beta, mu = 2, 6, 7.0, 0.3
+    rng = np.random.default_rng(12)
+    sig = SelfEnergy((rng.standard_normal((1, 1, 1, nb, nb, 2 * niv)) * 0.2 - 0.6j).astype(np.complex64), beta=beta)
+    ek = _make_complex_hopping_ek((4, 1, 1))
+    whole = GreensFunction.get_occupation(sig.copy(), mu, ek, beta)[2]
+    direct = GreensFunction.get_occupation(sig.copy(), mu, ek[:1], beta, real_dispersion=False)[2]
+    filled = GreensFunction.get_g_full(sig.copy(), mu, ek[:1], beta).get_fill_nonlocal(real_dispersion=False)[2]
+    assert np.abs(whole[:1].imag).max() > 1e-3
+    assert np.array_equal(direct, whole[:1]) and np.array_equal(filled, whole[:1])
+
+
 def test_get_occupation_refuses_a_self_energy_on_other_momenta():
     """A momentum-resolved self-energy must sit on the dispersion's momenta (a momentum-local one broadcasts)."""
     sigma, ek = _chunking_inputs(True, False, nk=(8, 1, 1))
