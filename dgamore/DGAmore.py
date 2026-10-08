@@ -58,15 +58,15 @@ NODE_MEMORY_FRACTION: float = 0.95
 
 def main():
     """
-    Console-script entry point. Runs :func:`run_dga_routine` on every rank; when any rank leaves it through an
-    exception, that rank logs its traceback, flushes the log and aborts the whole MPI job, so the other ranks cannot
-    block forever in a collective the failed rank never joins.
+    Console-script entry point. Runs :func:`run_dga_routine` on every rank and exits with its status; when any rank
+    leaves it through an exception, that rank logs its traceback, flushes the log and aborts the whole MPI job, so the
+    other ranks cannot block forever in a collective the failed rank never joins.
 
     :return: None.
     """
     comm = MPI.COMM_WORLD
     try:
-        run_dga_routine(comm)
+        status = run_dga_routine(comm)
     except BaseException:
         config.logger.error(
             f"Rank {comm.rank} failed, aborting all ranks.\n{traceback.format_exc()}", allowed_ranks=(comm.rank,)
@@ -75,17 +75,19 @@ def main():
         logging.shutdown()
         comm.Abort(1)
     MPI.Finalize()
+    sys.exit(status)
 
 
-def run_dga_routine(comm: MPI.Comm) -> None:
+def run_dga_routine(comm: MPI.Comm) -> int:
     """
     Runs the complete DGA pipeline end to end: config parsing and folder setup, DMFT input loading, the local
     Schwinger-Dyson step (per inequivalent atom, assembled into full multi-band quantities), the non-local
     ladder-DGA self-energy and Green's function, optional analytic continuation, and the optional Eliashberg
-    solution -- saving and plotting results throughout.
+    solution -- saving and plotting results throughout. With more processes than momenta in the irreducible BZ it
+    logs an error and returns right after the config reaches every rank.
 
     :param comm: The MPI communicator.
-    :return: None.
+    :return: The exit status: 1 when there are more processes than momenta in the irreducible BZ, else 0.
     """
     config_parser = ConfigParser().parse_config(comm)
     logger = config.logger
@@ -136,6 +138,15 @@ def run_dga_routine(comm: MPI.Comm) -> None:
                 config.ana_cont,
             ) = pickle.loads(blob)
         del payload, blob
+
+    # every rank holds the same grid now, so all of them leave together
+    nk_irr = config.lattice.k_grid.nk_irr
+    if comm.size > nk_irr:
+        logger.error(
+            f"Running on {comm.size} processes, but the irreducible BZ holds only {nk_irr} momenta. Increase the "
+            f"k-grid or reduce the number of processes to at most {nk_irr}."
+        )
+        return 1
 
     setup_lambda_correction_settings()
 
@@ -572,6 +583,7 @@ def run_dga_routine(comm: MPI.Comm) -> None:
             logger.info("Plotted singlet and triplet gap functions.")
 
     logger.info("Exiting ...")
+    return 0
 
 
 def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
