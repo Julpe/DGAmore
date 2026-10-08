@@ -5,11 +5,20 @@
 import numpy as np
 import pytest
 
+import dgamore.config as config
 import dgamore.memory_estimator as memory_estimator
+import dgamore.nonlocal_sde as nonlocal_sde
+from dgamore.four_point import FourPoint
+from dgamore.interaction import LocalInteraction
+from dgamore.jacobian_stabilization import TRACKER_PAIRS
+from dgamore.local_four_point import LocalFourPoint
 from dgamore.memory_estimator import (
     ARPACK_EXTRA_VECTORS,
     CHI0Q_IFFTN_TRANSIENT_FACTOR,
     DTYPE_BYTES,
+    EXACT_CHECK_BASIS,
+    EXACT_JACOBIAN_MODES,
+    EXACT_JACOBIAN_NCV,
     LANCZOS_VERTEX_FACTOR,
     MAX_CHUNK_BUDGET_BYTES,
     MAX_SLICE_CHUNK_BYTES,
@@ -21,13 +30,17 @@ from dgamore.memory_estimator import (
     SLICE_CHUNK_BYTES,
     BranchPeak,
     ChunkBudgets,
+    _giwk_rspace,
     column_sde_schedule,
     column_sde_slabs,
     dynamic_chunk_budget,
     estimate_peaks,
+    exact_jacobian_budgets,
+    jacobian_tracker_bytes,
     max_chunk_budget,
 )
-from dgamore.n_point_base import DTYPE
+from dgamore.n_point_base import DTYPE, SpinChannel
+from tests.conftest import traced_peak
 
 BASE = dict(
     n_bands=1,
@@ -208,12 +221,13 @@ def test_giwk_shareable_is_every_array_of_each_sde_section_baseline():
 
 
 def test_mixing_history_sits_in_the_rank0_slot_of_every_proposal_branch():
-    """Each of rank 0's mixing pairs adds two core-box Sigma copies to the single slot of every proposal branch."""
+    """Each mixing pair adds two core-box Sigma copies to every proposal branch's single slot, none after the loop."""
     pairs = 2 * BASE["nk_tot"] * BASE["n_bands"] ** 2 * 2 * BASE["niv_core"]
-    linear, anderson = _peaks(), _peaks(mixing_pairs=4)
+    linear, anderson = _peaks(niv_interp=40), _peaks(mixing_pairs=4, niv_interp=40)
     for key in ("chi0q", "chiq_aux", "sde"):
         assert anderson[key].off_single - linear[key].off_single == pytest.approx(SCALE * 4 * pairs)
         assert anderson[key].off_distributed == linear[key].off_distributed
+    assert anderson["sigma_interp"].off_single == linear["sigma_interp"].off_single
 
 
 def test_eliashberg_branches_share_only_the_local_vertex_of_the_pairing_vertex_build():
@@ -615,3 +629,262 @@ def test_dynamic_chunk_budget_scales_floors_and_caps():
     assert floor < mid < cap
     assert dynamic_chunk_budget(total_bytes=4000 * 2**30, node_ranks=2) == cap
     assert dynamic_chunk_budget(total_bytes=600 * 2**30, node_ranks=48) == 2 * mid
+
+
+def test_jacobian_tracker_residents_and_sector_history_join_the_loop_slots_and_its_transient_the_mixing_step():
+    """With the tracker its residents and a sector-sized history fill the rank-0 slots, the solve has sector rows."""
+    kw = dict(overhead=1.0, niv_interp=2 * BASE["niv_core"])
+    core = DTYPE_BYTES * BASE["nk_tot"] * BASE["n_bands"] ** 2 * (2 * BASE["niv_core"])
+    sector, k = BASE["nk_irr"] * BASE["n_bands"] ** 2 * (2 * BASE["niv_core"]), TRACKER_PAIRS - 1
+    # window, predecessor, estimate, snapshot and held flips in the storage precision; four tall float64 arrays
+    resident = (TRACKER_PAIRS * DTYPE_BYTES + DTYPE_BYTES * k + 3 * DTYPE_BYTES * k + 4 * 8 * k) * sector
+    transient = 7 * np.dtype(np.float64).itemsize * sector * k
+    assert jacobian_tracker_bytes(BASE["nk_irr"], BASE["n_bands"], 2 * BASE["niv_core"]) == (resident, transient)
+    sigma_full = _giwk_rspace(BASE["nk_tot"], BASE["n_bands"], 2 * BASE["niv_cut"])
+    for pairs in (0, 4, 40):
+        off = _peaks(**kw, mixing_pairs=pairs)
+        on = _peaks(**kw, mixing_pairs=pairs, with_jacobian_tracker=True)
+        window, history = 2 * pairs * core, 2 * pairs * (DTYPE_BYTES // 2) * sector
+        for key in ("chi0q", "chiq_aux", "sde", "mu_update"):
+            assert on[key].off_single == pytest.approx(off[key].off_single - window + history + resident), key
+            assert on[key].on_single == pytest.approx(off[key].on_single - window + history + resident), key
+            assert on[key].off_distributed == pytest.approx(off[key].off_distributed), key
+        assert on["sigma_interp"].off_single == pytest.approx(off["sigma_interp"].off_single + resident)
+        solve = 4 * sector * (9 * (pairs - 1) + 10) if pairs > 1 else 0
+        step = max(DTYPE_BYTES * 3 * sigma_full, solve, transient)
+        expected = history + resident + 2 * core + DTYPE_BYTES * 2 * sigma_full + step
+        assert on["sigma_loop"].off_single == pytest.approx(expected)
+        assert (step == solve) == (pairs == 40)
+
+
+def test_jacobian_tracker_residents_count_97_sector_columns_with_exact_checks_and_55_without_in_complex64():
+    """With exact checks the tracker holds 97 float64 sector columns (complex64 window, file, Ritz sets), 55 without."""
+    nk_irr, nb, nv = BASE["nk_irr"], BASE["n_bands"], 2 * BASE["niv_core"]
+    column, storage = 8 * nk_irr * nb**2 * nv, DTYPE_BYTES / np.dtype(np.complex64).itemsize
+    # the window, the predecessor file, the Ritz sets and the check candidate double in a complex128 run
+    exact = (97 + (7 + 12 + 38 + 2) * (storage - 1)) * column
+    secant = (55 + (7 + 6 + 18) * (storage - 1)) * column
+    assert jacobian_tracker_bytes(nk_irr, nb, nv, with_exact_jacobian=True) == (exact, 42 * column)
+    assert jacobian_tracker_bytes(nk_irr, nb, nv) == (secant, 42 * column)
+    both = _peaks(with_jacobian_tracker=True, with_exact_jacobian=True, overhead=1.0)
+    tracker = _peaks(with_jacobian_tracker=True, overhead=1.0)
+    for key in ("chi0q", "chiq_aux", "sde", "sigma_loop"):
+        assert both[key].off_single == pytest.approx(tracker[key].off_single + exact - secant), key
+
+
+# a grid whose core blocks dwarf the per-slice Bethe-Salpeter solve's fixed transient, so the solve's phase stays small
+LARGE_GRID = dict(nk_tot=128 * 128, nk_irr=2145)
+
+
+@pytest.mark.parametrize("niv_full, width", [(30, 1), (30, 2), (150, 1), (150, 2)])
+def test_exact_jacobian_bubble_phase_is_the_response_beside_the_second_bubbles_buffers_or_the_dc_attachment(
+    niv_full, width
+):
+    """The bubble phase is max(full + max(half a full block, 2 core), parts + 2 core) beside earlier columns' parts."""
+    chunk_budgets = ChunkBudgets(exact=0, exact_block=width)
+    params = dict(niv_full=niv_full, niv_cut=niv_full + 40, niv_dmft=400, overhead=1.0, chunk_budgets=chunk_budgets)
+    bp = _peaks(with_exact_jacobian=True, **LARGE_GRID, **params)["exact_jacobian"]
+    qi = -(-LARGE_GRID["nk_irr"] // BASE["n_ranks"])
+    core = DTYPE_BYTES * qi * BASE["n_bands"] ** 4 * (BASE["niw_core"] + 1) * 2 * BASE["niv_core"]
+    full, parts = core * niv_full / BASE["niv_core"], (2 + 1 / BASE["niv_core"]) * core
+    bubble = max(full + max(0.5 * full, 2 * core), parts + 2 * core) + (width - 1) * parts
+    assert bp.off_distributed == pytest.approx(4 * core + bubble)
+
+
+def test_jacobian_tracker_keeps_44_sector_columns_after_the_loop_with_exact_checks_in_complex64():
+    """After the loop the tracker keeps snapshot, held flips, predecessor and reflector basis: 44 F in complex64."""
+    nk_irr, nb, nv = BASE["nk_irr"], BASE["n_bands"], 2 * BASE["niv_core"]
+    column, storage = 8 * nk_irr * nb**2 * nv, DTYPE_BYTES / np.dtype(np.complex64).itemsize
+    after = jacobian_tracker_bytes(nk_irr, nb, nv, with_exact_jacobian=True, after_loop=True)
+    assert after == ((44 + (12 + 16) * (storage - 1)) * column, 0)
+
+
+@pytest.mark.parametrize("mixing_pairs, ncv", [(0, 40), (4, 40), (0, 400)])
+def test_exact_jacobian_rank_0_slot_is_the_larger_of_an_in_loop_check_and_the_end_of_rung_solve(
+    mixing_pairs, ncv, monkeypatch
+):
+    """Rank 0 holds a product beside the check, history, tracker and proposal, or ARPACK and the released tracker."""
+    monkeypatch.setattr(memory_estimator, "EXACT_JACOBIAN_NCV", ncv)
+    kw = dict(with_exact_jacobian=True, with_jacobian_tracker=True, mixing_pairs=mixing_pairs, overhead=1.0)
+    bp = _peaks(**kw)["exact_jacobian"]
+    nk_irr, nb, nv = BASE["nk_irr"], BASE["n_bands"], 2 * BASE["niv_core"]
+    vector = 8 * nk_irr * nb**2 * nv
+    sigma_core = DTYPE_BYTES * _giwk_rspace(BASE["nk_tot"], nb, nv)
+    sigma_full = DTYPE_BYTES * _giwk_rspace(BASE["nk_tot"], nb, 2 * BASE["niv_cut"])
+    product = 2 * sigma_core + DTYPE_BYTES * BASE["nk_tot"] * nb**4
+    history = 2 * mixing_pairs * (DTYPE_BYTES // 2) * nk_irr * nb**2 * nv
+    in_loop = history + jacobian_tracker_bytes(nk_irr, nb, nv, True)[0] + sigma_full
+    in_loop += (4 * EXACT_CHECK_BASIS + 4) * vector
+    end_of_rung = jacobian_tracker_bytes(nk_irr, nb, nv, True, after_loop=True)[0]
+    end_of_rung += (2 * (ncv + 1) + 3 * EXACT_JACOBIAN_MODES + 11) * vector
+    assert bp.off_single == pytest.approx(product + max(in_loop, end_of_rung))
+    assert (end_of_rung > in_loop) == (ncv > 100)
+
+
+@pytest.mark.parametrize("width_cost, width", [(1 / 8, 4), (1 / 3, 2), (1.0, None)])
+def test_exact_jacobian_budgets_take_the_widest_block_that_fits_and_the_budget_it_leaves(width_cost, width):
+    """The exact products take the widest block that fits at the floor and the budget left, apart from the loop's."""
+    line, loop = 3 * 1024**3, ChunkBudgets(sde=2, fq=3)
+    budgets = exact_jacobian_budgets(
+        lambda trial: 3 * trial.exact + width_cost * line * trial.exact_block <= line, loop
+    )
+    assert (budgets.sde, budgets.fq) == (2, 3)
+    if width is None:
+        assert budgets == ChunkBudgets(2, 3, SLICE_CHUNK_BYTES, 1, True, True)
+    else:
+        left = (line - width_cost * line * width) / 3
+        assert budgets.exact_block == width and not budgets.exact_vertices_per_phase
+        assert left - 2**20 <= budgets.exact <= left
+
+
+@pytest.mark.parametrize(
+    "local, vrg, residency, width",
+    [
+        (0.1, 0.1, (False, False), 4),
+        (0.45, 0.1, (False, False), 2),
+        (0.7, 0.1, (True, False), 4),
+        (0.4, 0.4, (True, False), 3),
+        (0.1, 0.7, (False, True), 4),
+        (0.7, 0.7, (True, True), 4),
+        (0.1, 0.0, (False, False), 4),
+        (0.6, 0.0, (False, False), 1),
+        (0.7, 0.0, (True, False), 4),
+    ],
+)
+def test_exact_jacobian_budgets_take_the_widest_block_of_the_cheapest_residency_that_fits(local, vrg, residency, width):
+    """Both vertex sets held, local ones per phase, three-leg ones per group, then both: the first that fits at all."""
+    line = 3 * 1024**3
+
+    def fits(trial: ChunkBudgets) -> bool:
+        """Whether the trial fits the line, each vertex set held unless loaded per phase or recomputed per group."""
+        held = (0.0 if trial.exact_vertices_per_phase else local) + (0.0 if trial.exact_vrg_per_group else vrg)
+        return 3 * trial.exact + (0.1 * trial.exact_block + held) * line <= line
+
+    budgets = exact_jacobian_budgets(fits, ChunkBudgets())
+    assert (budgets.exact_vertices_per_phase, budgets.exact_vrg_per_group) == residency
+    assert budgets.exact_block == width and fits(budgets)
+
+
+@pytest.mark.parametrize("budget, group_momenta", [(0, 1), (MAX_CHUNK_BUDGET_BYTES, 12)])
+def test_exact_jacobian_branch_recomputing_the_three_leg_vertices_holds_two_core_blocks_fewer(budget, group_momenta):
+    """Per-group three-leg vertices hold two residents fewer and add one momentum group's slice to the solve."""
+    held = _peaks(with_exact_jacobian=True, overhead=1.0, chunk_budgets=ChunkBudgets(exact=budget))["exact_jacobian"]
+    budgets = ChunkBudgets(exact=budget, exact_vrg_per_group=True)
+    per_group = _peaks(with_exact_jacobian=True, overhead=1.0, chunk_budgets=budgets)["exact_jacobian"]
+    qi = -(-BASE["nk_irr"] // BASE["n_ranks"])
+    core = DTYPE_BYTES * qi * BASE["n_bands"] ** 4 * (BASE["niw_core"] + 1) * 2 * BASE["niv_core"]
+    # one momentum per group at the floor, the rank's twelve at the cap
+    assert held.off_distributed - per_group.off_distributed == pytest.approx((2 - group_momenta / qi) * core)
+    assert (held.baseline, held.off_single) == (per_group.baseline, per_group.off_single)
+
+
+@pytest.mark.parametrize("budget, width", [(0, 1), (0, 4), (MAX_CHUNK_BUDGET_BYTES, 1), (MAX_CHUNK_BUDGET_BYTES, 2)])
+def test_exact_jacobian_solve_phase_is_the_parts_six_plus_two_m_group_slices_and_the_per_slice_transient(budget, width):
+    """The solve phase: m column parts, 6 + 2 m group slices, the sum's slice transient and 4 m - 3 more columns."""
+    bp = _peaks(with_exact_jacobian=True, overhead=1.0, chunk_budgets=ChunkBudgets(exact=budget, exact_block=width))
+    nb, vc = BASE["n_bands"], 2 * BASE["niv_core"]
+    qi, compound = -(-BASE["nk_irr"] // BASE["n_ranks"]), nb * nb * vc
+    core = DTYPE_BYTES * qi * nb**4 * (BASE["niw_core"] + 1) * vc
+    group = core / qi if budget == 0 else core
+    # the frequency sum's two slices, 128 + 4 nb^2 columns and two tiles, then four nb^2 columns per right-hand side
+    solve = DTYPE_BYTES * (2 * compound**2 + (128 + 4 * nb**2) * compound + 2 * 256**2)
+    solve += DTYPE_BYTES * (4 * width - 3) * nb**2 * compound
+    kernel = width * (2 + 2 / vc) * core + (6 + 2 * width) * group + solve
+    assert bp["exact_jacobian"].off_distributed == pytest.approx(4 * core + kernel)
+
+
+@pytest.mark.parametrize("o, niv, n_rhs", [(6, 20, 1), (6, 20, 4), (8, 10, 2), (8, 10, 4)])
+def test_exact_solve_transient_bounds_the_traced_peak_of_the_right_hand_side_solve(o, niv, n_rhs, monkeypatch):
+    """The modeled transient covers the traced per-slice solve of n_rhs systems above its solutions, up to 8 bands."""
+    monkeypatch.setattr(config.sys, "beta", 9.0, raising=False)
+    vn, n, rng = 2 * niv, o * o * 2 * niv, np.random.default_rng(5)
+    gamma = LocalFourPoint(rng.standard_normal((o,) * 4 + (2, vn, vn)) + 0j, SpinChannel.DENS, 1, 2, False, True)
+    # two momenta and two bosonic frequencies: every slice after the first meets its predecessor's right-hand sides
+    shape, meta = (2,) + (o,) * 4 + (2, vn), (SpinChannel.NONE, (2, 1, 1), 1, 1, False, True, True)
+    gchi0_q_inv = FourPoint(rng.standard_normal(shape) + 30.0, *meta)
+    u_loc = LocalInteraction(np.ones((o,) * 4), SpinChannel.NONE)
+    rhs = [FourPoint(rng.standard_normal(shape) + 0j, *meta) for _ in range(n_rhs)]
+    nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=rhs)
+    solved, peak = traced_peak(lambda: nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=rhs))
+    above = peak - sum(x.mat.nbytes for x in solved)
+    assert 2 * n**2 * DTYPE_BYTES < above <= memory_estimator._exact_solve_transient(n, o, n_rhs)
+
+
+@pytest.mark.parametrize("per_group, residents", [(False, 4), (True, 2)])
+def test_exact_jacobian_build_phase_holds_three_core_blocks_six_susceptibilities_and_its_own_three_leg_vertex(
+    per_group, residents
+):
+    """The build's last channel holds 3 core blocks and 6 susceptibilities, and its three-leg vertex per group."""
+    budgets = ChunkBudgets(exact=0, exact_vrg_per_group=per_group)
+    bp = _peaks(with_exact_jacobian=True, overhead=1.0, chunk_budgets=budgets, **LARGE_GRID)["exact_jacobian"]
+    vc = 2 * BASE["niv_core"]
+    qi = -(-LARGE_GRID["nk_irr"] // BASE["n_ranks"])
+    core = DTYPE_BYTES * qi * BASE["n_bands"] ** 4 * (BASE["niw_core"] + 1) * vc
+    attachment, build = (4 + 2 / vc) * core, (3 + per_group + 6 / vc) * core
+    assert bp.off_distributed == pytest.approx(residents * core + max(attachment, build))
+    assert (build > attachment) == per_group
+
+
+def test_exact_jacobian_branch_is_present_only_with_the_flag_and_leaves_the_other_branches_alone():
+    """The converged-point Jacobian adds its own branch, only when it is enabled, and changes no other branch."""
+    off, on = _peaks(), _peaks(with_exact_jacobian=True)
+    assert "exact_jacobian" not in off and set(on) == set(off) | {"exact_jacobian"}
+    assert all(on[key] == off[key] for key in off)
+
+
+def test_exact_jacobian_branch_grows_with_its_block_width_and_leaves_the_other_branches_alone():
+    """A wider block of exact products raises the exact branch's per-rank peak and no other branch."""
+    narrow = _peaks(with_exact_jacobian=True, chunk_budgets=ChunkBudgets(exact_block=1))
+    wide = _peaks(with_exact_jacobian=True, chunk_budgets=ChunkBudgets(exact_block=4))
+    assert wide["exact_jacobian"].off_distributed > narrow["exact_jacobian"].off_distributed
+    assert all(wide[key] == narrow[key] for key in narrow if key != "exact_jacobian")
+
+
+def test_exact_jacobian_branch_counts_its_node_windows_and_rank_0s_check_exactly():
+    """Node: loop Sigma, G, dG, G_R, three vertices, the block, bubble windows; rank 0: a product and its solver."""
+    bp = _peaks(with_exact_jacobian=True, overhead=1.0)["exact_jacobian"]
+    nk, niv, niw, nivf, cut = BASE["nk_tot"], BASE["niv_core"], BASE["niw_core"], BASE["niv_full"], BASE["niv_cut"]
+    sigma_full, sigma_core, sector = nk * 2 * cut, nk * 2 * niv, 2 * BASE["nk_irr"] * niv
+    vertices = (niw + 1) * 2 * nivf * 2 * niv + 2 * (niw + 1) * (2 * niv) ** 2
+    windows = DTYPE_BYTES * (3 * sigma_full + nk * 2 * (niv + niw) + vertices) + 8 * EXACT_CHECK_BASIS * sector
+    bubble_windows = DTYPE_BYTES * 2 * nk * 2 * (nivf + niw)
+    assert bp.giwk_shareable == pytest.approx(windows + bubble_windows)
+    assert bp.baseline == pytest.approx(windows + bubble_windows + _rank_base(BASE))
+    arpack = 8 * (2 * (EXACT_JACOBIAN_NCV + 1) + 3 * EXACT_JACOBIAN_MODES + 11) * sector
+    check = 8 * (4 * EXACT_CHECK_BASIS + 4) * sector
+    product = DTYPE_BYTES * (2 * sigma_core + nk * BASE["n_bands"] ** 4)
+    assert bp.off_single == pytest.approx(product + max(DTYPE_BYTES * sigma_full + check, arpack))
+
+
+def test_exact_jacobian_branch_holds_one_local_vertex_when_they_load_per_phase():
+    """Vertices loaded per phase leave the larger one on the node instead of all three, and change nothing else."""
+    held = _peaks(with_exact_jacobian=True)["exact_jacobian"]
+    per_phase = _peaks(with_exact_jacobian=True, chunk_budgets=ChunkBudgets(exact_vertices_per_phase=True))
+    per_phase = per_phase["exact_jacobian"]
+    wp, vc, vf = BASE["niw_core"] + 1, 2 * BASE["niv_core"], 2 * BASE["niv_full"]
+    f_dc, gamma = wp * vf * vc, wp * vc * vc
+    assert f_dc > gamma and held.giwk_shareable - per_phase.giwk_shareable == pytest.approx(DTYPE_BYTES * 2 * gamma)
+    assert held.baseline - per_phase.baseline == pytest.approx(held.giwk_shareable - per_phase.giwk_shareable)
+    assert (per_phase.off_distributed, per_phase.off_single) == (held.off_distributed, held.off_single)
+
+
+def test_exact_jacobian_branch_is_sized_by_its_own_budget_and_not_the_loops():
+    """The exact products' transients follow ChunkBudgets.exact, not the loop's sde and fq budgets."""
+
+    def exact(**budgets):
+        return _peaks(with_exact_jacobian=True, chunk_budgets=ChunkBudgets(**budgets))["exact_jacobian"].off_distributed
+
+    small = exact(exact=0)
+    assert exact(exact=MAX_CHUNK_BUDGET_BYTES) > small
+    assert exact(exact=0, sde=MAX_CHUNK_BUDGET_BYTES, fq=MAX_CHUNK_BUDGET_BYTES) == small
+
+
+def test_exact_jacobian_branch_grows_with_the_box_and_holds_the_eigenvectors_on_rank_0():
+    """The branch grows with the momentum grid and the core box; rank 0 holds the Arnoldi basis and the eigenvectors."""
+    small = _peaks(with_exact_jacobian=True)["exact_jacobian"]
+    for bigger in (dict(nk_tot=2 * BASE["nk_tot"], nk_irr=2 * BASE["nk_irr"]), dict(niv_core=BASE["niv_core"] + 5)):
+        big = _peaks(with_exact_jacobian=True, **bigger)["exact_jacobian"]
+        assert _off_node_total(big, 4) > _off_node_total(small, 4), bigger
+    sector = 2 * BASE["nk_irr"] * BASE["n_bands"] ** 2 * BASE["niv_core"]
+    arnoldi = np.dtype(np.float64).itemsize * (4 * EXACT_CHECK_BASIS + 4) * sector
+    assert small.off_single > arnoldi and small.giwk_shareable < small.baseline

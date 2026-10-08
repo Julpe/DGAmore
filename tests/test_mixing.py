@@ -5,15 +5,20 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import contextlib
+from collections.abc import Callable
 from copy import deepcopy
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import numpy as np
 import pytest
 
+import dgamore.brillouin_zone as bz
 import dgamore.n_point_base as n_point_base
+import dgamore.nonlocal_sde as nonlocal_sde
+from dgamore.jacobian_stabilization import JacobianTracker, to_mat, to_vec
 from dgamore.self_energy import SelfEnergy
-from dgamore.nonlocal_sde import apply_mixing_strategy
+from dgamore.nonlocal_sde import _core_pair, apply_mixing_strategy
+from dgamore.sigma_jacobian import tracker_sector_maps
 
 BETA = 10.0
 NB = 1
@@ -33,9 +38,53 @@ def make_sigma_mat(value: complex, nk: tuple[int, int, int] = NK, nb: int = NB, 
     return np.full((*nk, nb, nb, 2 * niv), value, dtype=np.complex64)
 
 
-def make_pairs(values: list[tuple[complex, complex]]) -> list[tuple[np.ndarray, np.ndarray]]:
+def make_pairs(
+    values: list[tuple[complex, complex]], nk: tuple[int, int, int] = NK
+) -> list[tuple[np.ndarray, np.ndarray]]:
     """Builds a mixing history of (iterate, proposal) pairs from constant fill-value tuples, oldest first."""
-    return [(make_sigma_mat(x), make_sigma_mat(f)) for x, f in values]
+    return [(make_sigma_mat(x, nk=nk), make_sigma_mat(f, nk=nk)) for x, f in values]
+
+
+def sector_pairs(tracker: JacobianTracker, pairs: list) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Returns window pairs as the history entries of a tracker run, their real vectors in the tracker's coordinates."""
+    return [tracker.record(x, f)[:2] for x, f in pairs]
+
+
+def make_flip_basis() -> np.ndarray:
+    """Returns a normalized single-column real basis of one direction of the vectorized core window."""
+    direction = np.arange(2 * NIV_CORE, dtype=np.complex64).reshape(*NK, NB, NB, 2 * NIV_CORE) + 1.0j
+    vec = to_vec(direction)
+    return (vec / np.linalg.norm(vec))[:, None]
+
+
+def plant_reflector(tracker: JacobianTracker, q: np.ndarray) -> None:
+    """Installs the reflector of the single direction the column q spans, without a per-direction damping map."""
+    tracker.q, tracker.w = q, q.T
+
+
+def plant_nonuniform(tracker: JacobianTracker, q: np.ndarray, damping: float) -> None:
+    """Installs a certified map of one direction with the given signed damping on the span of the single column q."""
+    tracker._nonuniform = (q, q.T, np.array([[damping]]))
+
+
+def reflect_by_hand(q: np.ndarray, iterate: np.ndarray, proposal: np.ndarray) -> np.ndarray:
+    """Reflects the residual of a proposal on the subspace spanned by q, without going through the tracker."""
+    x = to_vec(iterate)
+    residual = to_vec(proposal) - x
+    return to_mat(x + (residual - 2.0 * q @ (q.T @ residual)), proposal.shape).astype(proposal.dtype)
+
+
+def random_windows() -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Returns four random complex64 core iterates and four proposals, drawn in that order from seed 0."""
+    shape = (*NK, NB, NB, 2 * NIV_CORE)
+    rng = np.random.default_rng(0)
+    mats = [(rng.standard_normal(shape) + 1.0j * rng.standard_normal(shape)).astype(np.complex64) for _ in range(8)]
+    return mats[:4], mats[4:]
+
+
+def sigma_of(window: np.ndarray) -> SelfEnergy:
+    """Wraps a copy of a core window in a SelfEnergy of the default grid."""
+    return SelfEnergy(window.copy(), NK, beta=BETA)
 
 
 def make_config_mock(strategy: str = "linear", mixing: float = 0.5, n_hist: int = 3, niv_core: int = NIV_CORE):
@@ -64,9 +113,10 @@ def run_pulay(
     mixing: float = 0.5,
     n_hist: int = 3,
     niv_core: int = NIV_CORE,
+    tracker: JacobianTracker | None = None,
 ) -> SelfEnergy:
     with patch_config(strategy="pulay", mixing=mixing, n_hist=n_hist, niv_core=niv_core):
-        return apply_mixing_strategy(sigma_new, sigma_old, mixing_history=list(history_pairs))
+        return apply_mixing_strategy(sigma_new, sigma_old, mixing_history=list(history_pairs), tracker=tracker)
 
 
 def run_anderson(
@@ -76,12 +126,13 @@ def run_anderson(
     mixing: float = 0.5,
     n_hist: int = 3,
     niv_core: int = NIV_CORE,
+    tracker: JacobianTracker | None = None,
 ) -> SelfEnergy:
     with patch_config(strategy="anderson", mixing=mixing, n_hist=n_hist, niv_core=niv_core):
-        return apply_mixing_strategy(sigma_new, sigma_old, mixing_history=list(history_pairs))
+        return apply_mixing_strategy(sigma_new, sigma_old, mixing_history=list(history_pairs), tracker=tracker)
 
 
-def make_affine_history(j: float, fixed_point: complex, alpha: float, n_pairs: int):
+def make_affine_history(j: float, fixed_point: complex, alpha: float, n_pairs: int, nk: tuple[int, int, int] = NK):
     """Simulates linear-mixing iterations of the affine map S(x) = fp + j*(x - fp) and returns pairs, x_n, S(x_n)."""
     s = lambda x: fixed_point + j * (x - fixed_point)
     x = 0.0 + 0.0j
@@ -89,7 +140,7 @@ def make_affine_history(j: float, fixed_point: complex, alpha: float, n_pairs: i
     for _ in range(n_pairs):
         pairs.append((x, s(x)))
         x = alpha * s(x) + (1 - alpha) * x
-    return make_pairs(pairs), x, s(x)
+    return make_pairs(pairs, nk=nk), x, s(x)
 
 
 def test_linear_mixing_basic():
@@ -424,8 +475,7 @@ def test_accelerated_mixing_accepts_compressed_input():
     fixed_point = 2.0 + 1.0j
     alpha = 0.2
     nk = (2, 2, 1)
-    pairs, x_n, s_x_n = make_affine_history(j=0.5, fixed_point=fixed_point, alpha=alpha, n_pairs=3)
-    pairs = [(np.tile(x, (*nk, 1, 1, 1)), np.tile(f, (*nk, 1, 1, 1))) for x, f in pairs]
+    pairs, x_n, s_x_n = make_affine_history(j=0.5, fixed_point=fixed_point, alpha=alpha, n_pairs=3, nk=nk)
     sigma_new = make_sigma(s_x_n, nk=nk).compress_q_dimension()
     sigma_old = make_sigma(x_n, nk=nk).compress_q_dimension()
 
@@ -574,3 +624,262 @@ def test_accelerated_mixing_reproduces_the_plain_least_squares_formulas_bit_for_
         result = apply_mixing_strategy(sigma_new, sigma_old, None, history)
     expected = step(history, 0.3).astype(dtype)
     assert np.array_equal(result.mat[..., niv - NIV_CORE : niv + NIV_CORE].reshape(-1), expected)
+
+
+def test_linear_mixing_records_pair_when_history_given():
+    """Linear mixing records its genuine pair too when it is handed a history."""
+    history = []
+
+    with patch_config(strategy="linear", mixing=0.5):
+        apply_mixing_strategy(make_sigma(2.0), make_sigma(1.0), mixing_history=history)
+
+    assert len(history) == 1
+    assert np.allclose(history[0][0], 1.0, atol=1e-6)
+    assert np.allclose(history[0][1], 2.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("with_history", [True, False], ids=["recorded", "without_history"])
+def test_an_active_tracker_mixes_the_reflected_proposal_and_records_it_as_the_used_one(with_history):
+    """An active tracker mixes the reflected proposal, with or without a history, and records it as the used one."""
+    q = make_flip_basis()
+    tracker = JacobianTracker(p_config=0.5)
+    plant_reflector(tracker, q)
+    history = [] if with_history else None
+
+    with patch_config(strategy="linear", mixing=0.5):
+        result = apply_mixing_strategy(make_sigma(2.0 + 1.0j), make_sigma(1.0), mixing_history=history, tracker=tracker)
+
+    expected = reflect_by_hand(q, make_sigma_mat(1.0), make_sigma_mat(2.0 + 1.0j))
+    if with_history:
+        iterate, used = history[-1]
+        assert np.array_equal(iterate, to_vec(make_sigma_mat(1.0))) and np.allclose(used, to_vec(expected), atol=1e-6)
+    assert np.allclose(result.mat, tracker.p_eff * expected + (1 - tracker.p_eff) * make_sigma_mat(1.0), atol=1e-6)
+
+
+def test_core_pair_is_the_pair_the_mixing_records_and_keeps_both_layouts():
+    """_core_pair gives bit for bit the pair the mixing records, and each self-energy keeps its momentum layout."""
+    sigma_new, sigma_old = make_sigma(2.0 + 1.0j), make_sigma(1.0).compress_q_dimension()
+    history = []
+    with patch_config(strategy="linear", mixing=0.5):
+        iterate, proposal = _core_pair(sigma_new, sigma_old)
+        assert not sigma_new.has_compressed_q_dimension and sigma_old.has_compressed_q_dimension
+        apply_mixing_strategy(sigma_new, sigma_old, mixing_history=history)
+    assert np.array_equal(history[-1][0], iterate) and np.array_equal(history[-1][1], proposal)
+
+
+def test_the_mixing_copies_the_pair_only_for_a_window_history_and_keeps_the_damped_step_bit_for_bit(monkeypatch):
+    """Only a history without a tracker copies the pair, and an active tracker's damped step equals one on copies."""
+    tracker = JacobianTracker(p_config=0.5)
+    plant_reflector(tracker, make_flip_basis())
+    plant_nonuniform(tracker, make_flip_basis(), 0.25)
+    rng = np.random.default_rng(3)
+    shape = (*NK, NB, NB, 2 * NIV_CORE)
+    new, old = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape) for _ in range(2))
+    sigma_new, sigma_old = SelfEnergy(new, NK, beta=BETA), SelfEnergy(old, NK, beta=BETA)
+    raw, iterate = sigma_new.mat.copy(), sigma_old.mat.copy()
+    copies = []
+    core_pair = nonlocal_sde._core_pair
+    monkeypatch.setattr(
+        nonlocal_sde, "_core_pair", lambda *a, copy=True: copies.append(copy) or core_pair(*a, copy=copy)
+    )
+    with patch_config(strategy="linear", mixing=0.5):
+        result = apply_mixing_strategy(sigma_new, sigma_old, tracker=tracker)
+        apply_mixing_strategy(make_sigma(2.0), make_sigma(1.0), mixing_history=[], tracker=tracker)
+        apply_mixing_strategy(make_sigma(2.0), make_sigma(1.0), mixing_history=[])
+    mixed = tracker.p_eff * tracker.reflect(raw, iterate) + (1 - tracker.p_eff) * iterate
+    expected = tracker.stabilize_step(mixed, iterate, raw - iterate)
+    assert copies == [False, False, True]
+    assert np.array_equal(result.mat, expected)
+
+
+def test_an_accelerated_step_against_the_flip_takes_the_stabilized_damped_step(monkeypatch):
+    """An accelerated step against the flipped damped step is replaced by the stabilized damped step and warned."""
+    tracker = JacobianTracker(p_config=0.5)
+    plant_reflector(tracker, make_flip_basis())
+    plant_nonuniform(tracker, make_flip_basis(), 0.25)
+    pairs = make_pairs([(0.0, 1.0), (0.5, 1.5), (1.0, 2.0)])
+    with patch_config(strategy="linear", mixing=0.5):
+        expected = apply_mixing_strategy(make_sigma(2.0 + 1.0j), make_sigma(1.5), tracker=tracker)
+    monkeypatch.setattr(JacobianTracker, "opposes_flip", lambda self, *a: True)
+    for strategy in ("anderson", "pulay"):
+        with patch_config(strategy=strategy, mixing=0.5, n_hist=3):
+            result = apply_mixing_strategy(
+                make_sigma(2.0 + 1.0j), make_sigma(1.5), None, sector_pairs(tracker, pairs), tracker
+            )
+            warnings = [str(call.args[0]) for call in nonlocal_sde.config.logger.warning.call_args_list]
+        assert np.array_equal(result.mat, expected.mat)
+        assert any("opposes the flipped damped step" in warning for warning in warnings)
+
+
+def test_flat_certified_mode_advances_the_full_residual():
+    """A certified mode damped at one advances its whole residual past the mixing, not the damped fraction."""
+    q = make_flip_basis()
+    tracker = JacobianTracker(p_config=0.5)
+    plant_nonuniform(tracker, q, 1.0)
+
+    with patch_config(strategy="linear", mixing=0.5):
+        result = apply_mixing_strategy(make_sigma(2.0 + 1.0j), make_sigma(1.0), tracker=tracker)
+
+    residual = to_vec(make_sigma_mat(2.0 + 1.0j)) - to_vec(make_sigma_mat(1.0))
+    step = to_vec(result.mat) - to_vec(make_sigma_mat(1.0))
+    assert np.allclose(q.T @ step, q.T @ residual, atol=1e-4)
+
+
+def test_linear_mixing_with_a_stable_only_map_steps_each_certified_direction_on_its_own():
+    """A stiff certified direction takes its own step, a flat one its whole residual, an uncertified one p_eff."""
+    second = to_vec((np.arange(2 * NIV_CORE, dtype=np.complex64) ** 2 - 0.5j).reshape(*NK, NB, NB, 2 * NIV_CORE))
+    span = np.linalg.qr(np.column_stack([make_flip_basis(), second]))[0]
+    tracker = JacobianTracker(p_config=0.5)
+    tracker.p_eff = 0.1
+    tracker._nonuniform = (span, span.T, np.diag([0.025, 1.0]))
+
+    with patch_config(strategy="linear", mixing=0.5):
+        result = apply_mixing_strategy(make_sigma(2.0 + 1.0j), make_sigma(1.0), tracker=tracker)
+
+    residual = to_vec(make_sigma_mat(2.0 + 1.0j)) - to_vec(make_sigma_mat(1.0))
+    step = to_vec(result.mat) - to_vec(make_sigma_mat(1.0))
+    assert np.isclose(span[:, 0] @ step, 0.025 * (span[:, 0] @ residual), atol=1e-4)
+    assert np.isclose(span[:, 1] @ step, span[:, 1] @ residual, atol=1e-4)
+    assert np.allclose(step - span @ (span.T @ step), 0.1 * (residual - span @ (span.T @ residual)), atol=1e-4)
+
+
+@pytest.mark.parametrize("run", [run_anderson, run_pulay])
+def test_an_accelerated_scheme_accelerates_reflected_map(monkeypatch, run):
+    """An active tracker makes Anderson or Pulay accelerate the reflected map, as tracker-free on reflected input."""
+    q = make_flip_basis()
+    tracker = JacobianTracker(p_config=0.5)
+    plant_reflector(tracker, q)
+    monkeypatch.setattr(JacobianTracker, "opposes_flip", lambda self, *a: False)
+    alpha = tracker.p_eff
+    iterates, raws = random_windows()
+
+    history = [(it, reflect_by_hand(q, it, raw)) for it, raw in zip(iterates[:3], raws[:3])]
+    result = run(
+        sigma_of(raws[3]), sigma_of(iterates[3]), sector_pairs(tracker, history), mixing=alpha, tracker=tracker
+    )
+
+    expected = run(sigma_of(reflect_by_hand(q, iterates[3], raws[3])), sigma_of(iterates[3]), history, mixing=alpha)
+    assert np.allclose(result.mat, expected.mat, atol=1e-6)
+
+    raw_history = list(zip(iterates[:3], raws[:3]))
+    result_without_tracker = run(sigma_of(raws[3]), sigma_of(iterates[3]), raw_history, mixing=alpha)
+    # discriminating check: the tracker's reflection must actually change the accelerated step
+    assert not np.allclose(result.mat, result_without_tracker.mat, atol=1e-6)
+
+
+def test_tracker_p_eff_overrides_configured_mixing():
+    """The tracker's effective damping replaces the configured mixing parameter."""
+    tracker = JacobianTracker(p_config=0.5)
+    tracker.p_eff = 0.1
+
+    with patch_config(strategy="linear", mixing=0.5):
+        result = apply_mixing_strategy(make_sigma(2.0), make_sigma(1.0), tracker=tracker)
+
+    assert np.allclose(result.mat, 1.1, atol=1e-6)
+
+
+@pytest.mark.parametrize("run", [run_anderson, run_pulay])
+def test_accelerated_step_keeps_the_configured_mixing_with_and_without_a_basis(monkeypatch, run):
+    """An accelerated step keeps the configured mixing whether or not a basis is installed."""
+    iterates, raws = random_windows()
+    x_n, s_x_n = iterates[3], raws[3]
+    pairs = list(zip(iterates[:3], raws[:3]))
+    tracker = JacobianTracker(p_config=0.5)
+    tracker.p_eff = 0.1
+    monkeypatch.setattr(JacobianTracker, "opposes_flip", lambda self, *a: False)
+    with_bound_ignored = run(sigma_of(s_x_n), sigma_of(x_n), sector_pairs(tracker, pairs), mixing=0.5, tracker=tracker)
+    reference = run(sigma_of(s_x_n), sigma_of(x_n), pairs, mixing=0.5)
+    assert np.allclose(with_bound_ignored.mat, reference.mat, atol=1e-6)
+    plant_reflector(tracker, make_flip_basis())
+    reflected_pairs = [(it, reflect_by_hand(tracker.q, it, raw)) for it, raw in pairs]
+    with_basis = run(
+        sigma_of(s_x_n), sigma_of(x_n), sector_pairs(tracker, reflected_pairs), mixing=0.5, tracker=tracker
+    )
+    expected = run(sigma_of(reflect_by_hand(tracker.q, x_n, s_x_n)), sigma_of(x_n), reflected_pairs, mixing=0.5)
+    assert np.allclose(with_basis.mat, expected.mat, atol=1e-6)
+
+
+@pytest.mark.parametrize("run", [run_anderson, run_pulay])
+def test_the_stabilized_step_reaches_the_damped_step_and_not_the_accelerated_one(monkeypatch, run):
+    """An accelerated step keeps the step it computed, while the warm-up step of the same scheme is stabilized."""
+    tracker = JacobianTracker(p_config=0.5)
+    plant_nonuniform(tracker, make_flip_basis(), 1.0)
+    spy = create_autospec(JacobianTracker.stabilize_step, wraps=JacobianTracker.stabilize_step)
+    monkeypatch.setattr(JacobianTracker, "stabilize_step", spy)
+    pairs = make_pairs([(0.0, 1.0), (0.5, 1.5), (1.0, 2.0), (1.5, 2.5)])
+
+    run(make_sigma(2.0 + 1.0j), make_sigma(1.0), sector_pairs(tracker, pairs), n_hist=3, tracker=tracker)
+    assert not spy.called
+    run(make_sigma(2.0 + 1.0j), make_sigma(1.0), sector_pairs(tracker, pairs[:1]), n_hist=3, tracker=tracker)
+    assert spy.call_count == 1
+
+
+def _d4_sector_maps() -> tuple[bz.KGrid, int, tuple[int, ...], Callable, Callable]:
+    """The 4x4 square grid with two bands, its core-window shape and the tracker's sector maps on it."""
+    grid, nb = bz.KGrid((4, 4, 1), symmetries=bz.two_dimensional_square_symmetries()), 2
+    return grid, nb, (*grid.nk, nb, nb, 2 * NIV_CORE), *tracker_sector_maps(grid, NIV_CORE, nb, BETA)
+
+
+@pytest.mark.parametrize("case", ["symmetric", "asymmetric", "clamped"])
+@pytest.mark.parametrize("strategy", ["anderson", "pulay"])
+def test_a_tracker_mixes_its_sector_vectors_as_the_window_mixing_mixes_the_symmetric_windows(
+    monkeypatch, strategy, case
+):
+    """A sector history steps as the window mixing of the symmetric part, clamped alike, and the rest linearly."""
+    monkeypatch.setattr(n_point_base, "DTYPE", np.complex128)
+    grid, nb, shape, to_sector, from_sector = _d4_sector_maps()
+    rng = np.random.default_rng(5)
+    windows = [rng.standard_normal(shape) + 1j * rng.standard_normal(shape) for _ in range(6)]
+    if case == "clamped":
+        windows[3:] = [iterate + 1e-3 * residual for iterate, residual in zip(windows[:3], windows[3:])]
+    projected = [np.reshape(from_sector(to_sector(window)), shape) for window in windows]
+    windows = windows if case == "asymmetric" else projected
+    sigma = lambda window: SelfEnergy(window.copy(), grid.nk, calc_smom=False, beta=BETA)
+    tracker = JacobianTracker(0.5, to_sector=to_sector, from_sector=from_sector)
+    sector_history, window_history = [], []
+    with patch_config(strategy=strategy, mixing=0.5, n_hist=2):
+        for k in range(3):
+            stepped = apply_mixing_strategy(sigma(windows[k + 3]), sigma(windows[k]), None, sector_history, tracker)
+            expected = apply_mixing_strategy(sigma(projected[k + 3]), sigma(projected[k]), None, window_history)
+        logged = [str(call.args[0]) for call in nonlocal_sde.config.logger.info.call_args_list]
+        warned = [str(call.args[0]) for call in nonlocal_sde.config.logger.warning.call_args_list]
+    size = 2 * grid.nk_irr * nb**2 * NIV_CORE
+    linear = lambda pairs: 0.5 * pairs[2] + 0.5 * pairs[5]
+    assert sum("applied (m=2" in line for line in logged) == 2
+    assert sum("step clamped" in line for line in warned) == (2 if case == "clamped" else 0)
+    assert all(vector.shape == (size,) and vector.dtype == np.float64 for pair in sector_history for vector in pair)
+    assert np.allclose(stepped.mat - expected.mat, linear(windows) - linear(projected), rtol=0.0, atol=1e-10)
+
+
+@pytest.mark.parametrize("strategy", ["anderson", "pulay"])
+def test_a_tracker_run_converges_to_a_fixed_point_that_breaks_the_lattice_symmetry(monkeypatch, strategy):
+    """A tracker run mixing on its sector reaches the fixed point of an affine map that breaks the lattice symmetry."""
+    monkeypatch.setattr(n_point_base, "DTYPE", np.complex128)
+    grid, nb, shape, to_sector, from_sector = _d4_sector_maps()
+    rng = np.random.default_rng(3)
+    symmetric = np.reshape(from_sector(rng.standard_normal(2 * grid.nk_irr * nb**2 * NIV_CORE)), shape)
+    fixed_point = symmetric + 1e-3 * (rng.standard_normal(shape) + 1j * rng.standard_normal(shape))
+    sigma = lambda window: SelfEnergy(window.copy(), grid.nk, calc_smom=False, beta=BETA)
+    tracker = JacobianTracker(0.5, to_sector=to_sector, from_sector=from_sector)
+    iterate, history = np.zeros(shape, dtype=np.complex128), []
+    with patch_config(strategy=strategy, mixing=1.0, n_hist=2):
+        for _ in range(10):
+            proposal = fixed_point + 0.2 * (iterate - fixed_point)
+            iterate = apply_mixing_strategy(sigma(proposal), sigma(iterate), None, history, tracker).mat.copy()
+    assert np.allclose(iterate, fixed_point, rtol=0.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("strategy", ["anderson", "pulay"])
+def test_the_guard_of_an_accelerated_tracker_step_reads_the_sector_update_and_the_raw_residual(monkeypatch, strategy):
+    """A complex64 tracker run records float32 sector pairs; its step guard reads the sector update and raw residual."""
+    tracker = JacobianTracker(p_config=0.5)
+    plant_reflector(tracker, make_flip_basis())
+    spy = create_autospec(JacobianTracker.opposes_flip, wraps=JacobianTracker.opposes_flip)
+    monkeypatch.setattr(JacobianTracker, "opposes_flip", spy)
+    iterates, raws = random_windows()
+    history = sector_pairs(tracker, list(zip(iterates[:3], raws[:3])))
+    with patch_config(strategy=strategy, mixing=0.5, n_hist=3):
+        apply_mixing_strategy(sigma_of(raws[3]), sigma_of(iterates[3]), None, history, tracker)
+    _, step, residual = spy.call_args.args
+    assert all(vector.shape == step.shape == (4 * NIV_CORE,) and vector.dtype == np.float32 for vector in history[-1])
+    assert np.isrealobj(step) and np.allclose(residual, raws[3] - iterates[3], rtol=0.0, atol=1e-6)

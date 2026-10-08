@@ -5,6 +5,8 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import contextlib
+import fnmatch
+import gc
 import os
 import threading
 import tracemalloc
@@ -19,13 +21,15 @@ import dgamore.config as config
 import dgamore.memory_estimator as memory_estimator
 import dgamore.mpi_utils as mpi_utils
 import dgamore.nonlocal_sde as nonlocal_sde
+import dgamore.sigma_jacobian as sigma_jacobian
 from dgamore.four_point import FourPoint
 from dgamore.greens_function import GreensFunction
 from dgamore.hamiltonian import Hamiltonian
 from dgamore.interaction import Interaction, LocalInteraction
+from dgamore.jacobian_stabilization import JACOBIAN_FILE, JacobianTracker, load_spectrum, TRACKER_PAIRS, to_mat, to_vec
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.local_sde import get_local_hartree_fock
-from dgamore.n_point_base import SpinChannel
+from dgamore.n_point_base import DTYPE, SpinChannel
 from tests.conftest import FAKE_MPI, run_parallel
 from dgamore.nonlocal_sde import (
     _build_giwk_full,
@@ -38,7 +42,9 @@ from dgamore.nonlocal_sde import (
 )
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore.self_energy import SelfEnergy
+from dgamore.sigma_jacobian import tracker_sector_maps
 from tests.conftest import FAKE_MPI, create_comm_mock, patch_mini_pole_with_exact_single_pole_fit, run_parallel
+from tests.conftest import linear_pairs
 
 LOCAL_SDE_DATA = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/local_sde"
 
@@ -220,6 +226,25 @@ def test_nonlocal_hartree_fock_matches_the_local_one_for_a_generic_tensor():
     v_zero = Interaction(np.zeros((nk_tot, nb, nb, nb, nb)), SpinChannel.NONE, nk, has_compressed_q_dimension=True)
     hartree, fock = get_hartree_fock(u_loc, v_zero)
     assert np.allclose((hartree + fock)[0, ..., 0], get_local_hartree_fock(u_loc, occ), atol=1e-6)
+
+
+def test_hartree_fock_of_explicit_occupations_equals_the_config_path_and_is_linear():
+    """Explicit occupations give the config-path term, and the term is linear in the occupations it is handed."""
+    nb, nk = 2, (3, 2, 1)
+    nk_tot = int(np.prod(nk))
+    config.lattice.nk = nk
+    config.sys.n_bands = nb
+    rng = np.random.default_rng(6)
+    u_loc = LocalInteraction(rng.standard_normal((nb, nb, nb, nb)), SpinChannel.NONE)
+    v_nonloc = Interaction(rng.standard_normal((nk_tot, nb, nb, nb, nb)), SpinChannel.NONE, nk, True)
+    occ_k_a, occ_k_b = rng.standard_normal((2, *nk, nb, nb)) + 1j * rng.standard_normal((2, *nk, nb, nb))
+    config.sys.occ_k, config.sys.occ = occ_k_a, occ_k_a.mean(axis=(0, 1, 2))
+    via_config = sum(get_hartree_fock(u_loc, v_nonloc))
+    explicit = sum(get_hartree_fock(u_loc, v_nonloc, occ=occ_k_a.mean(axis=(0, 1, 2)), occ_k=occ_k_a))
+    both = sum(get_hartree_fock(u_loc, v_nonloc, occ=(occ_k_a + occ_k_b).mean(axis=(0, 1, 2)), occ_k=occ_k_a + occ_k_b))
+    only_b = sum(get_hartree_fock(u_loc, v_nonloc, occ=occ_k_b.mean(axis=(0, 1, 2)), occ_k=occ_k_b))
+    assert np.array_equal(explicit, via_config)
+    assert np.allclose(both, explicit + only_b, atol=1e-5)
 
 
 def _constant_chi(mat: np.ndarray):
@@ -563,15 +588,15 @@ def _compound_of(chi, o: int) -> np.ndarray:
 
 
 def test_restrict_chi_phys_floors_negative_inverse_eigenvalues():
-    """A chi block with a negative eigenvalue comes back with its inverse eigenvalue floored, positive pairs kept."""
+    """A static chi block with a negative eigenvalue gets its inverse eigenvalue floored, positive pairs kept."""
     rng = np.random.default_rng(4)
-    o, nq, nw, floor = 2, 2, 3, 1e-4
+    o, nq, floor = 2, 2, 1e-4
     q_mat = np.linalg.qr(rng.standard_normal((4, 4)) + 1j * rng.standard_normal((4, 4)))[0]
     eigs_in = np.array([-5.0, 0.5, 1.0, 2.0])
-    comp = np.tile((q_mat * eigs_in) @ q_mat.conj().T, (nq, nw, 1, 1))
+    comp = np.tile((q_mat * eigs_in) @ q_mat.conj().T, (nq, 1, 1, 1))
     chi = _chi_from_compound(comp, o)
     out, n_floored = nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues(chi, floor=floor)
-    assert n_floored == nq * nw
+    assert n_floored == nq
     out_comp = _compound_of(out, o).astype(np.complex128)
     ev = np.sort(np.linalg.eigvalsh(0.5 * (out_comp + np.conj(np.transpose(out_comp, (0, 1, 3, 2))))), axis=-1)
     expected = np.sort(np.array([1.0 / floor, 0.5, 1.0, 2.0]))
@@ -581,17 +606,19 @@ def test_restrict_chi_phys_floors_negative_inverse_eigenvalues():
     assert np.allclose(proj_out @ q_mat[:, 1:], proj_pos @ q_mat[:, 1:], atol=1e-3)
 
 
-def test_restrict_chi_phys_leaves_positive_definite_input_unchanged():
-    """A positive-definite chi with negative off-diagonal entries passes through unchanged."""
+def test_restrict_chi_phys_leaves_a_healthy_input_bit_identical():
+    """A positive-definite static chi and smaller finite-frequency blocks pass through bit for bit."""
     rng = np.random.default_rng(5)
     o, nq, nw = 2, 2, 3
-    a = rng.standard_normal((nq, nw, 4, 4)) + 1j * rng.standard_normal((nq, nw, 4, 4))
-    comp = a @ np.conj(np.transpose(a, (0, 1, 3, 2))) + 0.1 * np.eye(4)
+    a = rng.standard_normal((nq, 1, 4, 4)) + 1j * rng.standard_normal((nq, 1, 4, 4))
+    static = a @ np.conj(np.transpose(a, (0, 1, 3, 2))) + 0.1 * np.eye(4)
+    comp = np.concatenate([static / (1.0 + w) for w in range(nw)], axis=1)
+    comp[:, 2] -= 0.05 * np.eye(4) * np.linalg.eigvalsh(static[:, 0])[:, :1, None]
     assert (comp.real < 0).any()
     chi = _chi_from_compound(comp, o)
-    out, n_floored = nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues(chi, floor=1e-4)
-    assert n_floored == 0
-    assert np.allclose(_compound_of(out, o), comp, atol=1e-3)
+    out, n_restricted = nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues(chi, floor=1e-4)
+    assert n_restricted == 0
+    assert np.array_equal(out.mat, chi.mat)
 
 
 def test_restrict_chi_phys_matches_scalar_clamp_for_single_band():
@@ -602,6 +629,68 @@ def test_restrict_chi_phys_matches_scalar_clamp_for_single_band():
     out, n_floored = nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues(chi, floor=floor)
     assert n_floored == 1
     assert np.allclose(out.mat.ravel() / np.array([1.0 / floor, 0.3]), 1.0, atol=1e-3)
+
+
+def test_restrict_chi_phys_clips_a_first_frequency_pole_to_the_static_bound():
+    """A finite-frequency chi outside [-chi(q, 0), chi(q, 0)] is clipped to it, real and imaginary part alike."""
+    comp = np.array(
+        [[[[0.10]], [[7.0 + 0.2j]], [[-0.005]]], [[[0.05]], [[-6.0 - 0.1j]], [[0.02]]]], dtype=np.complex128
+    )
+    chi = _chi_from_compound(comp, 1)
+    out, n_restricted = nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues(chi, floor=1e-4)
+    expected = np.array([[0.10, 0.10 + 0.10j, -0.005], [0.05, -0.05 - 0.05j, 0.02]])
+    assert n_restricted == 4
+    assert np.allclose(_compound_of(out, 1)[..., 0, 0], expected, atol=1e-6)
+
+
+def test_restrict_chi_phys_clips_finite_frequency_eigenvalues_on_their_eigenvectors():
+    """Multi-orbital finite-frequency eigenvalues are clipped to the largest static one, eigenvectors unchanged."""
+    rng = np.random.default_rng(7)
+    q_mat = np.linalg.qr(rng.standard_normal((4, 4)) + 1j * rng.standard_normal((4, 4)))[0]
+    static = np.diag([1.0, 0.6, 0.3, 0.2]).astype(np.complex128)
+    finite = (q_mat * np.array([8.0, 0.3, -0.2, -9.0])) @ q_mat.conj().T
+    chi = _chi_from_compound(np.stack([static, finite])[None], 2)
+    out, n_restricted = nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues(chi, floor=1e-4)
+    expected = (q_mat * np.array([1.0, 0.3, -0.2, -1.0])) @ q_mat.conj().T
+    assert n_restricted == 2
+    assert np.allclose(_compound_of(out, 2)[0, 1], expected, atol=1e-5)
+    assert np.allclose(_compound_of(out, 2)[0, 0], static, atol=1e-6)
+
+
+def test_restrict_chi_phys_returns_the_half_range_of_a_full_range_input():
+    """A full-range input is restricted on its non-negative frequencies and returned in the half range."""
+    comp = np.array([[[[0.05]], [[7.0]], [[0.10]], [[7.0]], [[0.05]]]], dtype=np.complex128)
+    chi = _chi_from_compound(comp, 1)
+    chi._full_niw_range = True
+    out, n_restricted = nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues(chi, floor=1e-4)
+    assert not out.full_niw_range and n_restricted == 1
+    assert np.allclose(_compound_of(out, 1)[0, :, 0, 0], [0.10, 0.10, 0.05], atol=1e-6)
+
+
+def test_restrict_chi_phys_pins_a_crossed_static_mode_at_twice_the_largest_healthy_one():
+    """Without an explicit floor a crossed static mode is pinned at twice the channel's largest healthy value."""
+    comp = np.array([[[[0.5]]], [[[0.2]]], [[[-0.3]]]], dtype=np.complex128)
+    out, n_restricted = nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues(_chi_from_compound(comp, 1))
+    assert n_restricted == 1
+    assert np.allclose(_compound_of(out, 1)[:, 0, 0, 0], [0.5, 0.2, 1.0], atol=1e-6)
+
+
+def test_restrict_chi_phys_takes_the_largest_healthy_value_over_all_ranks():
+    """The healthy maximum is reduced over the ranks, so every rank pins its crossed modes at the same value."""
+    comm = MagicMock(size=2, **{"allreduce.return_value": 0.25})
+    comp = np.array([[[[0.5]]], [[[-0.3]]]], dtype=np.complex128)
+    out, _ = nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues(_chi_from_compound(comp, 1), comm)
+    assert np.allclose(comm.allreduce.call_args.args[0], 2.0, atol=1e-6)
+    assert np.allclose(_compound_of(out, 1)[:, 0, 0, 0], [0.5, 8.0], atol=1e-5)
+
+
+def test_restrict_chi_phys_falls_back_to_a_fixed_floor_without_a_healthy_block():
+    """With every static block crossed the inverse is floored at the fallback, pinning chi at its inverse."""
+    comp = np.array([[[[-0.5]]], [[[-0.3]]]], dtype=np.complex128)
+    out, n_restricted = nonlocal_sde.restrict_chi_phys_to_positive_eigenvalues(_chi_from_compound(comp, 1))
+    pinned = 1.0 / nonlocal_sde._RESTRICTION_FALLBACK_FLOOR
+    assert n_restricted == 2
+    assert np.allclose(_compound_of(out, 1)[:, 0, 0, 0], [pinned, pinned], atol=1e-3)
 
 
 def test_min_static_compound_eigenvalue_reports_definiteness():
@@ -656,7 +745,7 @@ def test_load_node_shared_local_vertex_private_path_applies_transform(monkeypatc
 
 
 def test_load_node_shared_local_vertex_loads_once_per_node(monkeypatch):
-    """With a node communicator the file is read once per node (the root) and every rank maps the same values."""
+    """With a node communicator the root maps the file once per node and every rank reads the same values."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     rng = np.random.default_rng(82)
     mat = (rng.standard_normal((2, 2, 2, 2, 3, 4, 4)) + 1j * rng.standard_normal((2, 2, 2, 2, 3, 4, 4))).astype(
@@ -665,7 +754,7 @@ def test_load_node_shared_local_vertex_loads_once_per_node(monkeypatch):
     load_calls = []
 
     def fake_load(*a, **k):
-        load_calls.append(1)
+        load_calls.append(k.get("mmap_mode"))
         return mat.copy()
 
     monkeypatch.setattr(np, "load", fake_load)
@@ -679,7 +768,7 @@ def test_load_node_shared_local_vertex_loads_once_per_node(monkeypatch):
         return res
 
     _, res = run_parallel(2, fn, hostnames=["n0", "n0"])
-    assert len(load_calls) == 1  # one read per node, not per rank
+    assert load_calls == ["r"]  # one mapped read per node, not per rank
     assert np.array_equal(res[0], mat) and np.array_equal(res[1], mat)
 
 
@@ -716,12 +805,45 @@ def stab_logger(monkeypatch):
 
 
 def test_mixing_history_cap_uses_most_recent_reset_event():
-    """The history cap counts iterations since the later of the restriction release and the annealing-mass change."""
+    """The history cap counts iterations since the latest of the release, the mass change and the tracker event."""
     assert nonlocal_sde._mixing_history_cap(10, None, None) is None
     assert nonlocal_sde._mixing_history_cap(10, 7, None) == 2
     assert nonlocal_sde._mixing_history_cap(10, None, 8) == 1
     assert nonlocal_sde._mixing_history_cap(10, 7, 9) == 0
     assert nonlocal_sde._mixing_history_cap(9, 4, 9) == 0
+    assert nonlocal_sde._mixing_history_cap(10, None, None, 8) == 1
+    assert nonlocal_sde._mixing_history_cap(10, 7, None, 9) == 0
+    assert nonlocal_sde._mixing_history_cap(10, 9, 5, 6) == 0
+
+
+def test_update_jacobian_tracker_windows_and_allow_flip():
+    """The tracker sees the raw pairs since the last scaffold event and pauses flips while a scaffold is active."""
+    tracker = create_autospec(JacobianTracker, instance=True)
+    tracker.update_recorded.return_value = True
+    window = [(np.full(2, float(i)), np.full(2, i + 0.5), 1e-6) for i in range(6)]
+
+    def seen():
+        return [float(entry[0][0]) for entry in tracker.update_recorded.call_args.args[0]]
+
+    assert nonlocal_sde._update_jacobian_tracker(tracker, window, 10, None, None, None) is True
+    assert seen() == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    assert tracker.update_recorded.call_args.kwargs["allow_flip"] is True
+    nonlocal_sde._update_jacobian_tracker(tracker, window, 10, 7, None, None)
+    assert seen() == [3.0, 4.0, 5.0]
+    config.stabilization.use_lambda_correction = True
+    nonlocal_sde._update_jacobian_tracker(tracker, window, 10, None, None, None)
+    assert tracker.update_recorded.call_args.kwargs["allow_flip"] is False
+    config.stabilization.use_lambda_correction = False
+    config.stabilization.use_chi_phys_restriction = True
+    nonlocal_sde._update_jacobian_tracker(tracker, window, 10, None, None, None)
+    assert tracker.update_recorded.call_args.kwargs["allow_flip"] is False
+    config.stabilization.use_chi_phys_restriction = False
+    nonlocal_sde._update_jacobian_tracker(tracker, window, 10, None, 8, None)
+    assert seen() == [4.0, 5.0]
+    tracker.update_recorded.return_value = False
+    annealer = SimpleNamespace(mass_present=True)
+    assert nonlocal_sde._update_jacobian_tracker(tracker, window, 10, None, None, annealer) is False
+    assert tracker.update_recorded.call_args.kwargs["allow_flip"] is False
 
 
 def _make_resid_sigma(mat):
@@ -934,7 +1056,7 @@ def test_select_and_apply_lambda_correction_dispatch(monkeypatch):
         config.stabilization.use_lambda_correction = True
         config.sys.n_bands = 1
         assert nonlocal_sde._select_and_apply_lambda_correction(chi) is sentinel
-        single.assert_called_once_with(chi)
+        single.assert_called_once_with(chi, lambda_previous=None)
 
     with monkeypatch.context() as mp:
         multi = MagicMock(return_value=sentinel)
@@ -950,7 +1072,7 @@ def test_select_and_apply_lambda_correction_dispatch(monkeypatch):
         mp.setattr(nonlocal_sde.LambdaCorrection, "perform", single)
         config.sys.n_bands = 1
         assert nonlocal_sde._select_and_apply_lambda_correction(chi) is sentinel
-        single.assert_called_once_with(chi)
+        single.assert_called_once_with(chi, lambda_previous=None)
     with monkeypatch.context() as mp:
         multi = MagicMock(return_value=sentinel)
         mp.setattr(nonlocal_sde.MultiOrbitalLambdaCorrection, "perform", multi)
@@ -971,7 +1093,10 @@ def test_kernel_step_writes_the_eliashberg_intermediates_only_when_asked(monkeyp
     monkeypatch.setattr(nonlocal_sde, "create_vrg_r_q", lambda *a: vrg)
     monkeypatch.setattr(nonlocal_sde, "create_generalized_chi_q_with_shell_correction", lambda *a: chi)
     monkeypatch.setattr(nonlocal_sde, "_select_and_apply_lambda_correction", lambda c: c)
+    monkeypatch.setattr(nonlocal_sde, "_select_and_apply_lambda_correction", lambda c, lambda_previous=None: c)
     monkeypatch.setattr(nonlocal_sde, "min_static_compound_eigenvalue", lambda c: 1.0)
+    monkeypatch.setattr(nonlocal_sde.LambdaAnnealer, "_static_gap", staticmethod(lambda c, dist: 1.0))
+    monkeypatch.setattr(nonlocal_sde, "max_compound_norm", lambda c, w_offset: 1.0)
     monkeypatch.setattr(nonlocal_sde, "calculate_kernel_r_q", lambda *a: "kernel")
     dist = MagicMock()
     dist.comm.size, dist.comm.rank = 1, 0
@@ -1030,12 +1155,12 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
     assert bubble.cut_niv.return_value.invert.return_value.save.call_args.kwargs["name"] == "gchi0_q_inv_rank_0"
 
 
-def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, epsilon=1e-3):
-    """Minimal single-k single-band environment for calculate_self_energy_q with a synthetic map and frozen mu."""
+def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, epsilon=1e-3, v=0.0):
+    """Minimal single-k single-band environment for calculate_self_energy_q: synthetic map, frozen mu, V^q = v."""
     config.lattice.k_grid = bz.KGrid((1, 1, 1), symmetries=[])
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
     config.box.niw_core, config.box.niv_core, config.box.niv_full, config.box.niv_dmft = 1, 2, 2, 8
-    config.sys.beta, config.sys.mu, config.sys.n = 10.0, 0.5, 1.0
+    config.sys.beta, config.sys.mu, config.sys.n, config.sys.n_bands = 10.0, 0.5, 1.0, 1
     config.output.output_path = str(tmp_path)
     config.self_consistency.previous_sc_path = ""
     config.self_consistency.mixing_strategy = "linear"
@@ -1045,6 +1170,7 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     config.self_energy_interpolation.do_interpolation = False
     logger = MagicMock()
     monkeypatch.setattr(config, "logger", logger, raising=False)
+    monkeypatch.setattr(gc, "collect", lambda *args, **kwargs: 0)
 
     gf_stub = SimpleNamespace(
         get_fill_nonlocal=lambda: (1.0, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1))),
@@ -1077,6 +1203,7 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     mat = np.full((1, 1, 1, 16), 1.0 + 0.1j, dtype=np.complex64)
 
     v_nonloc = MagicMock()
+    v_nonloc.mat = np.full((1, 1, 1, 1, 1, 1, 1), v)
     v_nonloc.copy.return_value = v_nonloc
     v_nonloc.reduce_q.return_value = v_nonloc
 
@@ -1311,6 +1438,27 @@ def test_dmft_spectrum_builds_and_saves_the_lattice_green_function_once_next_to_
     assert occupations == [0.5, 0.42]  # the DMFT filling, then the start's occupation at the re-solved mu
 
 
+def test_fresh_start_occupies_a_real_reading_slice_of_a_complex_dispersion_as_complex(monkeypatch, tmp_path):
+    """Every rank occupies its slice of a complex dispersion told the dispersion is complex, also the rank whose
+    slice alone reads as real."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0)
+    config.lattice.k_grid = bz.KGrid((2, 1, 1), symmetries=[])
+    ek = np.array([0.0, 0.3j]).reshape(2, 1, 1, 1, 1)  # the first momentum real alone, the whole dispersion complex
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: ek)
+    occupied, fill = [], (1.0, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1)))
+    greens = vars(nonlocal_sde.GreensFunction) | {
+        "get_occupation": lambda *a: occupied.append((threading.current_thread().name, *a[2:])) or fill
+    }
+    monkeypatch.setattr(nonlocal_sde, "GreensFunction", SimpleNamespace(**greens))
+    run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
+    assert sorted((name, ek_my.ravel().tolist(), real) for name, ek_my, _, real in occupied) == [
+        ("rank0", [0.0], False),
+        ("rank1", [0.3j], False),
+    ]
+
+
 def test_warm_start_and_loop_solve_mu_on_every_rank_with_its_momenta(monkeypatch, tmp_path):
     """Both mu searches run on every rank on its own rows of the start and of the mixed iterate with one moment."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
@@ -1349,10 +1497,50 @@ def test_loop_concatenates_the_previous_iterate_on_rank0_only(monkeypatch, tmp_p
     assert seen == ["rank0"] * 3
 
 
-def test_loop_measures_the_step_residual_on_rank0_only(monkeypatch, tmp_path):
-    """The step residual only decides convergence on rank 0, so no other rank evaluates it."""
+def test_loop_measures_the_step_and_map_residuals_on_rank0_only(monkeypatch, tmp_path):
+    """The step and map residuals only matter on rank 0, so no other rank evaluates them, two per iteration."""
     seen = _run_loop_on_two_node_ranks(monkeypatch, tmp_path, "_relative_sigma_residual", nonlocal_sde)
-    assert seen == ["rank0"] * 3
+    assert seen == ["rank0"] * 6
+
+
+_FIXED_POINT = 0.3 - 0.2j
+_STABLE_GAINS = np.linspace(-0.4, -0.04, 8)
+_UNSTABLE_GAINS = np.array([-0.40, -0.34, 1.30, -0.28, -0.22, -0.16, -0.10, -0.04])
+_DEGENERATE_STABLE_GAINS = np.full(8, 0.5)
+
+
+def _mirrored(window: np.ndarray) -> np.ndarray:
+    """Sets the negative frequencies of a single-band window to the Hermitian mirror of the positive ones, in place."""
+    niv = window.shape[-1] // 2
+    window[..., :niv] = np.conj(window[..., niv:][..., ::-1])
+    return window
+
+
+def _affine_core_step(gains: np.ndarray):
+    """A synthetic map S(x) = x* + A (x - x*) on the core window, A = diag(gains) in [Re; Im], Hermitian in nu."""
+
+    def step(sigma_in, n_call, annealer):
+        sigma_out = sigma_in.copy()
+        niv_core = config.box.niv_core
+        window = sigma_out.mat[..., sigma_out.niv - niv_core : sigma_out.niv + niv_core]
+        target = to_vec(np.full(window.shape, _FIXED_POINT))
+        window[...] = _mirrored(to_mat(target + gains * (to_vec(window) - target), window.shape))
+        return sigma_out
+
+    return step
+
+
+def _core_distance(sigma):
+    """Returns the relative L2 distance of a self-energy's core window from the synthetic map's fixed point."""
+    window = sigma.mat[..., sigma.niv - config.box.niv_core : sigma.niv + config.box.niv_core]
+    target = to_vec(_mirrored(np.full(window.shape, _FIXED_POINT)))
+    return float(np.linalg.norm(to_vec(window) - target) / np.linalg.norm(target))
+
+
+def _affine_loop(monkeypatch, tmp_path, gains, max_iter, epsilon, tracked=True):
+    """Sets the loop up on the synthetic affine map of the given gains, with the Jacobian tracking on if tracked."""
+    config.stabilization.use_jacobian_stabilization = tracked
+    return _setup_self_energy_loop(monkeypatch, tmp_path, _affine_core_step(gains), max_iter=max_iter, epsilon=epsilon)
 
 
 def test_loop_annealing_runs_pure_phase_after_mass_snaps_to_zero(monkeypatch, tmp_path):
@@ -1402,6 +1590,420 @@ def test_loop_one_shot_lambda_correction_never_fires_release(monkeypatch, tmp_pa
     assert len(calls) == 2
     assert config.lambda_correction.perform_lambda_correction is True
     assert not any("lambda correction reached" in str(c.args[0]) for c in logger.info.call_args_list)
+
+
+def test_loop_flag_off_never_builds_tracker_or_history(monkeypatch, tmp_path):
+    """With the Jacobian flag off the loop mixes without a tracker and allocates no pair history for linear mixing."""
+    run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy())
+    spy = create_autospec(nonlocal_sde.apply_mixing_strategy, wraps=nonlocal_sde.apply_mixing_strategy)
+    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", spy)
+    run()
+    assert len(calls) == 2 and len(spy.call_args_list) == 2
+    assert all(call.args[3] is None and call.args[4] is None for call in spy.call_args_list)
+
+
+def test_loop_warns_when_the_step_converges_but_the_map_residual_does_not(monkeypatch, tmp_path):
+    """Steps that stop while the map residual stays put far above epsilon converge with a stalled-step warning."""
+    run, _, logger = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=10, epsilon=1e-3, tracked=False)
+    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", lambda new, old, *a, **k: old.copy())
+    run()
+    assert any("stalled" in call[0][0] for call in logger.warning.call_args_list)
+
+
+@pytest.mark.parametrize(
+    "mixing, epsilon", [(0.08, 1e-3), (0.5, 5e-4)], ids=["slowly_damped_still_falling", "map_residual_follows_step"]
+)
+def test_loop_gives_no_stall_warning_while_the_map_residual_still_falls(monkeypatch, tmp_path, mixing, epsilon):
+    """A slowly damped map (residual above ten epsilon, still falling) or a plainly contracting one is not flagged."""
+    run, calls, logger = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=80, epsilon=epsilon, tracked=False)
+    config.self_consistency.mixing = mixing
+    run()
+    assert len(calls) < 80
+    assert not any("stalled" in call[0][0] for call in logger.warning.call_args_list)
+
+
+@pytest.mark.parametrize("use_exact_jacobian, max_iter, expected", [(True, 80, 1), (False, 80, 0), (True, 3, 0)])
+def test_loop_evaluates_the_exact_jacobian_once_after_pure_convergence(
+    monkeypatch, tmp_path, use_exact_jacobian, max_iter, expected
+):
+    """The exact spectrum is evaluated once, at the converged iterate, only with the flag on and pure convergence."""
+    run, calls, _ = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=max_iter, epsilon=5e-4)
+    config.stabilization.use_exact_jacobian = use_exact_jacobian
+    seen = []
+    monkeypatch.setattr(nonlocal_sde, "_install_exact_jacobian", lambda tracker, sigma, mu, *a: seen.append(sigma))
+    result = run()
+    assert len(seen) == expected
+    if expected:
+        assert len(calls) < max_iter and seen[0] is result
+
+
+def test_loop_releases_the_trackers_loop_state_before_the_exact_jacobian(monkeypatch, tmp_path):
+    """After pure convergence rank 0's tracker drops its loop state before the converged-point Jacobian is built."""
+    run, _, _ = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=80, epsilon=5e-4)
+    config.stabilization.use_exact_jacobian = True
+    events, release = [], JacobianTracker.release_after_loop
+
+    def release_after_loop(tracker):
+        events.append("release")
+        release(tracker)
+
+    def install(tracker, *args):
+        events.append(("exact", tracker.w is None and tracker._last_u is None))
+
+    monkeypatch.setattr(JacobianTracker, "release_after_loop", release_after_loop)
+    monkeypatch.setattr(nonlocal_sde, "_install_exact_jacobian", install)
+    run()
+    assert events == ["release", ("exact", True)]
+
+
+@pytest.mark.parametrize(
+    "v, tracked, exact, expected",
+    [(0.3, True, True, [(0, True)]), (0.3, True, False, [(0, False)]), (0.0, True, True, []), (0.3, False, False, [])],
+)
+def test_loop_warns_once_before_iterating_that_the_tracker_misses_the_v_offset(
+    monkeypatch, tmp_path, v, tracked, exact, expected
+):
+    """With the tracker and a non-zero V^q the loop warns once before its first proposal, naming the exact Jacobian."""
+    run, calls, logger = _setup_self_energy_loop(
+        monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0, v=v
+    )
+    config.stabilization.use_jacobian_stabilization = tracked
+    config.stabilization.use_exact_jacobian = exact
+    seen = []
+    logger.warning.side_effect = lambda message, *a, **k: seen.append((len(calls), message))
+    run()
+    assert [(n, "exact Jacobian" in message) for n, message in seen if "V^q" in message] == expected
+
+
+def test_install_exact_jacobian_frees_the_operator_and_installs_rank_0s_spectrum(monkeypatch, stab_logger):
+    """The helper builds the operator, solves from rank 0's tracker directions, frees it, and installs on rank 0."""
+    spectrum = (np.array([0.5 + 0.0j]), np.array([1e-10]), np.ones((4, 1), dtype=np.complex128))
+
+    def solve_before_free(jac, comm, *starts):
+        assert not jac.free.called
+        return spectrum
+
+    operator, solve, tracker = MagicMock(), MagicMock(side_effect=solve_before_free), MagicMock()
+    tracker.start_directions.return_value = ("least stable", "stiffest")
+    monkeypatch.setattr(sigma_jacobian, "ExactJacobian", operator)
+    monkeypatch.setattr(sigma_jacobian, "leading_eigenpairs", solve)
+    args = ("sigma", 1.5, "u", "v", None, "dmft", "irr", "fbz")
+    nonlocal_sde._install_exact_jacobian(tracker, *args, create_comm_mock())
+    assert operator.call_args.args[1] == 1.5 and solve.call_args.args[0] is operator.return_value
+    assert solve.call_args.args[2:] == ("least stable", "stiffest")
+    assert operator.return_value.free.call_count == 1
+    tracker.install_exact_spectrum.assert_called_once_with(*spectrum)
+    operator.return_value.free.reset_mock()
+    nonlocal_sde._install_exact_jacobian(tracker, *args, MagicMock(rank=1))
+    assert operator.return_value.free.call_count == 1 and tracker.install_exact_spectrum.call_count == 1
+    assert solve.call_args.args[2:] == (None, None) and tracker.start_directions.call_count == 1
+    operator.return_value.free.reset_mock()
+    solve.side_effect = RuntimeError("ARPACK")
+    with pytest.raises(RuntimeError):
+        nonlocal_sde._install_exact_jacobian(tracker, *args, create_comm_mock())
+    assert operator.return_value.free.call_count == 0
+
+
+def test_loop_tracker_stabilizes_unstable_synthetic_map(monkeypatch, tmp_path):
+    """A map with one unstable direction runs away under plain mixing and reaches its fixed point with the flag on."""
+    # the unstable gain sits on the real part of the first positive core frequency, the window the step residual reads
+    run, calls, _ = _affine_loop(monkeypatch, tmp_path, _UNSTABLE_GAINS, max_iter=55, epsilon=1e-3, tracked=False)
+    diverged = run()
+    assert len(calls) == 55
+    assert _core_distance(diverged) > 1e3
+    run, calls, _ = _affine_loop(monkeypatch, tmp_path, _UNSTABLE_GAINS, max_iter=80, epsilon=5e-4)
+    stabilized = run()
+    assert len(calls) < 80
+    assert _core_distance(stabilized) < 1e-2
+
+
+def test_loop_tracker_stabilizes_map_with_degenerate_stable_gains(monkeypatch, tmp_path):
+    """A map sharing one stable gain across all directions leaves a rank-deficient secant window but still converges."""
+    run, calls, _ = _affine_loop(monkeypatch, tmp_path, _DEGENERATE_STABLE_GAINS, max_iter=80, epsilon=5e-4)
+    stabilized = run()
+    assert len(calls) < 80
+    assert _core_distance(stabilized) < 1e-2
+
+
+def test_loop_tracker_pauses_flips_while_scaffold_active(monkeypatch, tmp_path):
+    """Flips stay paused while the lambda-correction scaffold is active and are allowed again after its release."""
+    run, _, _ = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=30, epsilon=1e-3)
+    config.stabilization.use_lambda_correction = True
+    spy = create_autospec(JacobianTracker.update_recorded, wraps=JacobianTracker.update_recorded)
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "update_recorded", spy)
+    run()
+    flags = [call.kwargs["allow_flip"] for call in spy.call_args_list]
+    assert flags.count(False) > 0 and flags.count(True) > 0
+    assert flags.index(True) == flags.count(False)
+
+
+def test_loop_tracker_keeps_its_vectors_on_the_weighted_sector_of_the_window(monkeypatch, tmp_path):
+    """The loop's tracker records and estimates on the weighted sector, half the real window of one momentum."""
+    run, _, _ = _affine_loop(monkeypatch, tmp_path, _UNSTABLE_GAINS, max_iter=15, epsilon=1e-3)
+    spy = create_autospec(JacobianTracker.record, wraps=JacobianTracker.record)
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "record", spy)
+    run()
+    tracker, window = spy.call_args.args[0], spy.call_args.args[1]
+    recorded = tracker.record(window, window)[0].size
+    assert recorded == tracker._last_certified[4].shape[0] == 2 * config.box.niv_core == to_vec(window).size // 2
+    norm = np.linalg.norm(window)
+    assert np.allclose(np.linalg.norm(tracker._to_sector(_mirrored(window.copy()))), norm, atol=1e-6 * norm)
+
+
+def test_loop_tracker_event_feeds_history_cap(monkeypatch, tmp_path):
+    """A tracker event reaches the accelerated-mixing cap while the tracker's own raw window is never shortened."""
+    run, _, _ = _affine_loop(monkeypatch, tmp_path, _UNSTABLE_GAINS, max_iter=15, epsilon=1e-3)
+    cap_spy = create_autospec(nonlocal_sde._mixing_history_cap, wraps=nonlocal_sde._mixing_history_cap)
+    update_spy = create_autospec(JacobianTracker.update_recorded, wraps=JacobianTracker.update_recorded)
+    monkeypatch.setattr(nonlocal_sde, "_mixing_history_cap", cap_spy)
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "update_recorded", update_spy)
+    run()
+    events = [call.args[3] for call in cap_spy.call_args_list if len(call.args) == 4 and call.args[3] is not None]
+    lengths = [len(call.args[1]) for call in update_spy.call_args_list]
+    assert events and min(events) > 1
+    assert lengths == sorted(lengths) and lengths[-1] == TRACKER_PAIRS
+
+
+def test_loop_tracker_reflects_the_step_of_the_iteration_that_installs_the_reflector(monkeypatch, tmp_path):
+    """The tracker updates before the step, so the iteration that installs a reflector already mixes its reflection."""
+    order, step = [], _affine_core_step(_UNSTABLE_GAINS)
+
+    def marked_step(sigma_in, n_call, annealer):
+        order.append("proposal")
+        return step(sigma_in, n_call, annealer)
+
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, marked_step, max_iter=15, epsilon=1e-3)
+    config.stabilization.use_jacobian_stabilization = True
+    update, reflect = JacobianTracker.update_recorded, JacobianTracker.reflect
+
+    def update_spy(self, *args, **kwargs):
+        changed = update(self, *args, **kwargs)
+        order.append("install" if changed and self.q is not None else "update")
+        return changed
+
+    def reflect_spy(self, proposal, iterate):
+        order.append("reflect")
+        return reflect(self, proposal, iterate)
+
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "update_recorded", update_spy)
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "reflect", reflect_spy)
+    run()
+    first = order.index("install")
+    assert order[first - 1] == "proposal" and order[first + 1] == "reflect"
+
+
+@pytest.mark.parametrize("exact", [False, True], ids=["tracker_update_switch", "exact_check_switch"])
+def test_loop_tracker_switch_caps_the_history_of_the_same_iteration(monkeypatch, tmp_path, exact):
+    """A tracker-update or exact-check switch caps its own iteration's history at zero and the next one at one."""
+    run, _, _ = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=6, epsilon=0.0)
+    config.stabilization.use_exact_jacobian = exact
+    config.self_consistency.mixing_strategy = "anderson"
+    updates, caps, requests = [], [], iter([None, None, None, np.ones((4, 1)), None, None])
+    if exact:
+        monkeypatch.setattr(nonlocal_sde, "_update_jacobian_tracker", lambda *a: False)
+        monkeypatch.setattr(JacobianTracker, "exact_check_request", lambda self: next(requests))
+        monkeypatch.setattr(nonlocal_sde, "_run_exact_check", lambda *a: True)
+    else:
+        monkeypatch.setattr(nonlocal_sde, "_update_jacobian_tracker", lambda *a: updates.append(1) or len(updates) == 4)
+    mix = nonlocal_sde.apply_mixing_strategy
+    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", lambda *a, **k: caps.append(a[2]) or mix(*a, **k))
+    run()
+    assert caps[:3] == [None] * 3 and caps[3] == 0 and caps[4] == 1
+
+
+def test_loop_runs_a_requested_exact_check_on_every_rank_before_the_step(monkeypatch, tmp_path):
+    """A request of the tracker brings both ranks into one exact check, after the proposal and before rank 0 mixes."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0)
+    config.stabilization.use_jacobian_stabilization = True
+    config.stabilization.use_exact_jacobian = True
+    requests = iter([None, np.ones((8, 1)), None])
+    monkeypatch.setattr(JacobianTracker, "exact_check_request", lambda self: next(requests))
+    events, mix = [], nonlocal_sde.apply_mixing_strategy
+
+    def record(what):
+        events.append((threading.current_thread().name, what))
+
+    monkeypatch.setattr(nonlocal_sde, "_run_exact_check", lambda *a: record("check") or False)
+    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", lambda *a, **k: record("mix") or mix(*a, **k))
+    run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
+    names = sorted({name for name, _ in events})
+    by_rank = [[what for name, what in events if name == thread] for thread in names]
+    assert sorted(by_rank, key=len) == [["check"], ["mix", "check", "mix", "mix"]]
+
+
+def test_loop_never_asks_for_an_exact_check_with_the_flag_off(monkeypatch, tmp_path):
+    """Without use_exact_jacobian the loop never asks the tracker for an exact check."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0)
+    config.stabilization.use_jacobian_stabilization = True
+    asked = MagicMock(return_value=None)
+    monkeypatch.setattr(JacobianTracker, "exact_check_request", asked)
+    run()
+    assert asked.call_count == 0
+
+
+def test_run_exact_check_frees_the_operator_and_installs_rank_0s_pairs(monkeypatch):
+    """The helper builds the operator, checks, frees it unless the check raises, and installs on rank 0 only."""
+    pairs = (np.array([-0.7 + 0.0j]), np.array([1e-6]), np.ones((4, 1), dtype=np.complex128), 5)
+    operator, check, tracker = MagicMock(), MagicMock(return_value=pairs), MagicMock()
+    tracker.install_exact_check.return_value = True
+    monkeypatch.setattr(sigma_jacobian, "ExactJacobian", operator)
+    monkeypatch.setattr(sigma_jacobian, "certify_subspace", check)
+    args = ("start", "sigma", 1.5, "u", "v", None, "dmft", "irr", "fbz")
+    assert nonlocal_sde._run_exact_check(tracker, *args, create_comm_mock()) is True
+    assert operator.call_args.args[:2] == ("sigma", 1.5)
+    assert check.call_args.args[:2] == (operator.return_value, "start")
+    assert operator.return_value.free.call_count == 1
+    tracker.install_exact_check.assert_called_once_with(*pairs[:3])
+    assert nonlocal_sde._run_exact_check(tracker, *args, MagicMock(rank=1)) is False
+    assert operator.return_value.free.call_count == 2 and tracker.install_exact_check.call_count == 1
+    check.side_effect = RuntimeError("check")
+    with pytest.raises(RuntimeError):
+        nonlocal_sde._run_exact_check(tracker, *args, create_comm_mock())
+    assert operator.return_value.free.call_count == 2
+
+
+def test_loop_tracker_runs_on_rank0_only_on_two_node_ranks(monkeypatch, tmp_path):
+    """On one node only rank 0 tracks, saves and returns sigma; rank 1 reads rank 0's mixed iterate from one buffer."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    step, inputs, buffers = _affine_core_step(_STABLE_GAINS), {"rank0": [], "rank1": []}, {"rank0": [], "rank1": []}
+
+    def recording_step(sigma_in, n, annealer):
+        inputs[threading.current_thread().name].append(sigma_in.mat.reshape(-1).copy())
+        buffers[threading.current_thread().name].append(sigma_in.mat.__array_interface__["data"][0])
+        return step(sigma_in, n, annealer)
+
+    run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, recording_step, max_iter=4, epsilon=0.0)
+    config.stabilization.use_jacobian_stabilization = True
+    update, save_iteration = JacobianTracker.update_recorded, nonlocal_sde._save_sigma_iteration
+    updates, estimates, saves = [], [], []
+
+    def update_spy(self, *args, **kwargs):
+        updates.append(threading.current_thread().name)
+        changed = update(self, *args, **kwargs)
+        estimates.append(self.estimated)
+        return changed
+
+    def save_spy(sigma, base_name, current_iter):
+        if base_name == "sigma_dga_proposal":
+            saves.append(threading.current_thread().name)
+        return save_iteration(sigma, base_name, current_iter)
+
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "update_recorded", update_spy)
+    monkeypatch.setattr(nonlocal_sde, "_save_sigma_iteration", save_spy)
+    monkeypatch.setattr(nonlocal_sde, "_save_jacobian_spectrum", lambda tracker, converged, *rows: None)
+    mix, mixed = nonlocal_sde.apply_mixing_strategy, []
+
+    def mix_spy(*args, **kwargs):
+        out = mix(*args, **kwargs)
+        mixed.append(out.mat.reshape(-1).copy())  # copied here: sharing the window drops rank 0's own array
+        return out
+
+    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", mix_spy)
+    _, results = run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
+    assert len(calls) == 8 and updates == ["rank0"] * 4 and saves == ["rank0"] * 4
+    assert any(estimates)
+    assert results[0] is not None and results[1] is None
+    assert len(mixed) == 4 and len(inputs["rank0"]) == len(inputs["rank1"]) == 4
+    assert all(np.array_equal(a, b) for a, b in zip(inputs["rank0"], inputs["rank1"]))
+    assert all(np.array_equal(m, x) for m, x in zip(mixed[:-1], inputs["rank1"][1:]))
+    assert buffers["rank0"][1:] == buffers["rank1"][1:]
+
+
+def test_loop_tracker_logs_at_convergence(monkeypatch, tmp_path):
+    """At convergence the loop logs the tracker's flipped-direction count, effective damping and predicted rate."""
+    run, calls, logger = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=30, epsilon=1e-3)
+    run()
+    assert len(calls) < 30
+    assert any(
+        "Jacobian tracker at convergence" in str(c.args[0]) and "flipped" in str(c.args[0])
+        for c in logger.info.call_args_list
+    )
+
+
+def test_loop_runs_to_max_iter_and_warns_when_the_minimum_iteration_count_exceeds_it(monkeypatch, tmp_path):
+    """A minimum above max_iter keeps a converged run going to the last iteration, which converges with a warning."""
+    run, calls, logger = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=30, epsilon=1e-3)
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "minimum_iterations", lambda self, outside_band=False: 999)
+    run()
+    assert len(calls) == 30
+    assert any("below the minimum 999" in str(c.args[0]) for c in logger.warning.call_args_list)
+    assert any("reached at iteration 30." in str(c.args[0]) for c in logger.info.call_args_list)
+
+
+def test_loop_converges_on_time_and_warns_when_only_a_mode_inside_its_band_asks_for_more(monkeypatch, tmp_path):
+    """A minimum set by modes inside their undecidable band alone does not hold the convergence back, it warns."""
+    run, calls, logger = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=30, epsilon=1e-3)
+    monkeypatch.setattr(
+        nonlocal_sde.JacobianTracker, "minimum_iterations", lambda self, outside_band=False: 0 if outside_band else 999
+    )
+    run()
+    assert len(calls) < 26
+    assert not any("continuing, so that a flat direction" in str(c.args[0]) for c in logger.info.call_args_list)
+    assert any("below the minimum 999" in str(c.args[0]) for c in logger.warning.call_args_list)
+
+
+def test_loop_does_not_declare_convergence_before_the_minimum_iteration_count(monkeypatch, tmp_path):
+    """A run converging before the certified minimum logs why it continues and stops once the minimum has passed."""
+    run, calls, logger = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=30, epsilon=1e-3)
+    run()
+    natural = len(calls)
+    calls.clear()
+    monkeypatch.setattr(JacobianTracker, "minimum_iterations", lambda self, outside_band=False: natural + 4)
+    run()
+    assert natural < 26 and len(calls) == natural + 4
+    assert any("continuing, so that a flat direction" in str(c.args[0]) for c in logger.info.call_args_list)
+    assert not any("below the minimum" in str(c.args[0]) for c in logger.warning.call_args_list)
+
+
+@pytest.mark.parametrize(
+    "strategy, applied",
+    [("linear", "linearly mixed"), ("pulay", "Pulay mixing applied"), ("anderson", "Anderson acceleration applied")],
+)
+def test_loop_stabilizes_the_damped_step_of_every_strategy(monkeypatch, tmp_path, strategy, applied):
+    """Every strategy hands exactly its damped steps and its linear fallbacks to the stabilized step."""
+    run, calls, logger = _affine_loop(monkeypatch, tmp_path, _UNSTABLE_GAINS, max_iter=8, epsilon=1e-3)
+    config.self_consistency.mixing_strategy = strategy
+    config.self_consistency.mixing_history_length = 2
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "active", property(lambda self: True))
+    spy = create_autospec(JacobianTracker.stabilize_step, wraps=JacobianTracker.stabilize_step)
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "stabilize_step", spy)
+    run()
+    fallbacks = sum("falling back to linear mixing" in str(c.args[0]) for c in logger.warning.call_args_list)
+    damped = sum("linearly mixed" in str(c.args[0]) for c in logger.info.call_args_list) + fallbacks
+    assert len(calls) > 3 and 0 < damped <= len(calls) and len(spy.call_args_list) == damped
+    assert any(applied in str(c.args[0]) for c in logger.info.call_args_list)
+
+
+@pytest.mark.parametrize(
+    "strategy, warned",
+    [("pulay", "Pulay SVD ill-conditioned"), ("anderson", "Anderson SVD failed")],
+)
+def test_loop_stabilizes_the_mixed_step_of_an_ill_conditioned_accelerated_fallback(
+    monkeypatch, tmp_path, strategy, warned
+):
+    """An accelerated step of either scheme falling back to linear mixing still hands its result to the step."""
+    run, calls, logger = _affine_loop(monkeypatch, tmp_path, _UNSTABLE_GAINS, max_iter=8, epsilon=1e-3)
+    config.self_consistency.mixing_strategy = strategy
+    config.self_consistency.mixing_history_length = 2
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "active", property(lambda self: True))
+    real_svd = np.linalg.svd
+
+    def rank_deficient_svd(matrix, *args, **kwargs):
+        """Returns an all-zero decomposition for the accelerated least-squares problem and the true one elsewhere."""
+        if kwargs.get("full_matrices") is False:
+            width = matrix.shape[1]
+            return np.zeros_like(matrix), np.zeros(width), np.zeros((width, width))
+        return real_svd(matrix, *args, **kwargs)
+
+    monkeypatch.setattr(np.linalg, "svd", rank_deficient_svd)
+    spy = create_autospec(JacobianTracker.stabilize_step, wraps=JacobianTracker.stabilize_step)
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "stabilize_step", spy)
+    run()
+    assert len(spy.call_args_list) == len(calls)
+    assert any(warned in str(c.args[0]) for c in logger.warning.call_args_list)
 
 
 def test_annealer_update_without_measured_gaps_is_inert():
@@ -1741,6 +2343,29 @@ def test_energies_estimate_bounds_the_traced_peak_of_the_occupation_and_energy_s
     small = 8 * n_k * nb**2 * 16 + 4 * nb**2 * 2 * niv_dmft * 16
     # (5 % for numpy's casting buffers, which another numpy version may size differently)
     assert modeled < peak <= 1.05 * modeled + grid + small
+
+
+def test_update_occ_and_energies_distributed_serves_a_rank_without_momenta(monkeypatch):
+    """With more ranks than momenta the rank without any adds nothing and every rank gets the one-rank result."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, o, niv, niv_dmft, beta, mu = (2, 1, 1), 1, 2, 6, 9.0, 0.4
+    rng = np.random.default_rng(3)
+    config.sys.beta, config.sys.n_bands, config.sys.mu = beta, o, mu
+    config.lattice.nk = nk
+    config.lattice.k_grid = SimpleNamespace(nk_tot=2, nk=nk)
+    config.lattice.hamiltonian = MagicMock(get_ek=MagicMock(return_value=rng.standard_normal((*nk, o, o))))
+    mat = (rng.standard_normal((2, o, o, 2 * niv)) * 0.1 + 0.3j).astype(np.complex64)
+    sigma_new = SelfEnergy(mat, nk, has_compressed_q_dimension=True, beta=beta)
+    dmft = (rng.standard_normal((1, 1, 1, o, o, 2 * niv_dmft)) * 0.1 + 0.2j).astype(np.complex64)
+    sigma_dmft_full = SelfEnergy(dmft, (1, 1, 1), beta=beta)
+
+    def fn(comm, rank):
+        d_full = mpi_utils.MpiDistributor(ntasks=2, comm=comm)
+        return nonlocal_sde._update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, d_full, mu)
+
+    (_, one), (_, three) = run_parallel(1, fn), run_parallel(3, fn)
+    for result in three:
+        assert all(np.allclose(a, b, atol=1e-10) for a, b in zip(result, one[0]))
 
 
 def test_update_occ_and_energies_distributed_pins_the_occupation_dtype_across_ranks(monkeypatch):
@@ -2150,3 +2775,734 @@ def test_interpolate_sigma_without_flagged_momenta_equals_the_plain_interpolatio
 
     assert not sigma.pole_fit_mask().any()
     assert np.array_equal(result.mat, sigma.interpolate(2.0, 6).mat)
+
+
+def _grid_config(nk=(2, 2, 1), niv_core=4, beta=10.0):
+    """Sets the target grid the expander reads from the config."""
+    config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
+    config.box.niv_core = niv_core
+    config.sys.beta = beta
+    config.sys.n_bands = 1
+
+
+def _grid_state(shape, beta):
+    """A carried spectrum's grid keys, for the grid the config holds."""
+    grid = config.lattice.k_grid
+    return dict(shape=np.array(shape), beta=np.float64(beta), irrk_ind=grid.irrk_ind, irrk_count=grid.irrk_count)
+
+
+def test_jacobian_expander_is_the_identity_on_equal_grids():
+    """Equal sector and temperature expand a stored column to the same real vector."""
+    _grid_config()
+    column = np.arange(2 * config.lattice.k_grid.nk_irr * 4, dtype=np.float32)
+    out = nonlocal_sde._jacobian_expander(_grid_state([2, 2, 1, 1, 1, 8], 10.0))(column)
+    assert out.dtype == np.float64 and np.array_equal(out, column)
+
+
+def test_jacobian_expander_regrids_frequencies_and_zeroes_beyond_the_source_range():
+    """A cooling step re-grids a linear column exactly onto the new frequencies and zeroes it above the source range."""
+    _grid_config(nk=(1, 1, 1), niv_core=8, beta=20.0)
+    vn_src, vn_tgt = MFHelper.vn(4, 10.0)[4:], MFHelper.vn(8, 20.0)[8:]
+    weight = np.sqrt(2.0)
+    column = to_vec((1.0 + 1j * vn_src) * weight).astype(np.float32)  # PCHIP reproduces a linear function exactly
+    out = to_mat(nonlocal_sde._jacobian_expander(_grid_state([1, 1, 1, 1, 1, 8], 10.0))(column), (8,)) / weight
+    inside = vn_tgt <= vn_src.max()
+    assert np.allclose(out[inside], 1.0 + 1j * vn_tgt[inside], atol=1e-6)
+    assert np.array_equal(out[~inside], np.zeros_like(out[~inside]))
+
+
+def test_jacobian_expander_drops_the_vectors_of_another_sector(stab_logger):
+    """Another grid or another symmetry reduction carries its eigenvalues without vectors."""
+    _grid_config(nk=(4, 4, 1))
+    reduced = bz.KGrid((4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    states = [
+        _grid_state([2, 2, 1, 1, 1, 8], 10.0),
+        {**_grid_state([4, 4, 1, 1, 1, 8], 10.0), "irrk_ind": reduced.irrk_ind, "irrk_count": reduced.irrk_count},
+    ]
+    for state in states:
+        assert nonlocal_sde._jacobian_expander(state)(np.ones(16 * 8, dtype=np.complex64)).size == 0
+    assert config.logger.warning.call_count == 2
+
+
+def test_jacobian_expander_refuses_a_different_orbital_count(stab_logger):
+    """A predecessor with another orbital count cannot be carried."""
+    _grid_config()
+    assert nonlocal_sde._jacobian_expander({"shape": np.array([2, 2, 1, 2, 2, 8]), "beta": np.float64(10.0)}) is None
+    config.logger.warning.assert_called_once()
+
+
+def test_carry_jacobian_spectrum_reads_the_predecessor_file(monkeypatch, tmp_path, stab_logger):
+    """The predecessor's spectrum file is loaded, expanded and handed to the tracker with flips allowed."""
+    config.self_consistency.previous_sc_path = str(tmp_path)
+    state = {"converged": np.bool_(True), "lam_pi": np.zeros(0, dtype=np.complex128)}
+    monkeypatch.setattr(nonlocal_sde.os.path, "isfile", lambda path: path.endswith(JACOBIAN_FILE))
+    monkeypatch.setattr(nonlocal_sde, "load_spectrum", lambda path: state)
+    monkeypatch.setattr(nonlocal_sde, "_jacobian_expander", lambda st: (lambda column: column))
+    tracker = MagicMock()
+    nonlocal_sde._carry_jacobian_spectrum(tracker, None)
+    tracker.carry_in.assert_called_once()
+    assert tracker.carry_in.call_args.kwargs["allow_flip"] is True
+    assert tracker.carry_in.call_args.kwargs["beta"] == config.sys.beta
+    config.logger.warning.assert_not_called()
+
+
+def test_carry_jacobian_spectrum_warns_for_an_unconverged_predecessor_and_pauses_under_a_scaffold(
+    monkeypatch, tmp_path, stab_logger
+):
+    """An unconverged predecessor is carried with a warning, and an active scaffold keeps the flip pending."""
+    config.self_consistency.previous_sc_path = str(tmp_path)
+    config.stabilization.use_chi_phys_restriction = True
+    monkeypatch.setattr(nonlocal_sde.os.path, "isfile", lambda path: True)
+    monkeypatch.setattr(
+        nonlocal_sde, "load_spectrum", lambda path: {"converged": np.bool_(False), "lam_pi": np.zeros(0, dtype=complex)}
+    )
+    monkeypatch.setattr(nonlocal_sde, "_jacobian_expander", lambda st: (lambda column: column))
+    tracker = MagicMock()
+    nonlocal_sde._carry_jacobian_spectrum(tracker, None)
+    assert tracker.carry_in.call_args.kwargs["allow_flip"] is False
+    config.logger.warning.assert_called_once()
+
+
+def test_carry_jacobian_spectrum_skips_a_missing_file_and_a_refused_expansion(monkeypatch, tmp_path, stab_logger):
+    """No file means nothing carried with an info line; a refused expander means nothing carried."""
+    config.self_consistency.previous_sc_path = str(tmp_path)
+    tracker = MagicMock()
+    monkeypatch.setattr(nonlocal_sde.os.path, "isfile", lambda path: False)
+    nonlocal_sde._carry_jacobian_spectrum(tracker, None)
+    tracker.carry_in.assert_not_called()
+    monkeypatch.setattr(nonlocal_sde.os.path, "isfile", lambda path: True)
+    monkeypatch.setattr(
+        nonlocal_sde, "load_spectrum", lambda path: {"converged": np.bool_(True), "lam_pi": np.zeros(0, dtype=complex)}
+    )
+    monkeypatch.setattr(nonlocal_sde, "_jacobian_expander", lambda st: None)
+    nonlocal_sde._carry_jacobian_spectrum(tracker, None)
+    tracker.carry_in.assert_not_called()
+
+
+def test_save_jacobian_spectrum_passes_the_window_shape_and_the_path(tmp_path):
+    """The loop's writer hands the window shape, beta and the output path to the tracker's writer."""
+    config.output.output_path = str(tmp_path)
+    _grid_config(nk=(2, 2, 1), niv_core=3)
+    tracker = MagicMock()
+    width = TRACKER_PAIRS - 1
+    rows = ([np.ones(width, dtype=np.complex128)], [np.zeros(width)], [0.4])
+    nonlocal_sde._save_jacobian_spectrum(tracker, True, *rows)
+    args, kwargs = tracker.save_spectrum.call_args
+    traces = kwargs["traces"]
+    assert args == (os.path.join(str(tmp_path), JACOBIAN_FILE), (2, 2, 1, 1, 1, 6), 10.0, True, DTYPE)
+    assert set(traces) == {"eigenvalues", "eigenvalue_residuals", "damping", "irrk_ind", "irrk_count"}
+    assert np.array_equal(traces["irrk_ind"], config.lattice.k_grid.irrk_ind)
+    assert np.array_equal(traces["damping"], np.array([0.4]))
+    assert traces["eigenvalues"].shape == (1, width) and traces["eigenvalue_residuals"].shape == (1, width)
+
+
+def test_append_jacobian_eigenvalues_writes_nan_rows_without_an_estimate(monkeypatch, tmp_path):
+    """The writer appends an all-nan row while the tracker produced no estimate, and the tracker's row otherwise."""
+    config.output.output_path = str(tmp_path)
+    rows_lam, rows_res, rows_damping = [], [], []
+    tracker = MagicMock(estimated=False, p_eff=0.2)
+    nonlocal_sde._append_jacobian_eigenvalues(tracker, rows_lam, rows_res, rows_damping)
+    lam_known = np.array([2.0 + 1j, 1.5 - 0.5j, 0.5 + 0j, 0.2 + 0j, 0.1 - 0.1j, 0.1 + 0.1j])
+    res_known = np.array([1e-3, 2e-3, 3e-3, 4e-3, 5e-3, 6e-3])
+    assert lam_known.size == TRACKER_PAIRS - 1
+    tracker.estimated, tracker.p_eff = True, 0.1
+    tracker.leading.return_value = (lam_known, res_known)
+    nonlocal_sde._append_jacobian_eigenvalues(tracker, rows_lam, rows_res, rows_damping)
+    saved = load_spectrum(os.path.join(config.output.output_path, JACOBIAN_FILE))
+    lam_rows, res_rows = saved["eigenvalues"], saved["eigenvalue_residuals"]
+    assert np.isnan(lam_rows[0]).all() and np.isnan(res_rows[0]).all()
+    assert np.array_equal(lam_rows[1], lam_known) and np.array_equal(res_rows[1], res_known)
+    assert np.array_equal(saved["damping"], np.array([0.2, 0.1]))
+    assert set(saved) == {"eigenvalues", "eigenvalue_residuals", "damping"}
+    assert os.listdir(tmp_path) == [JACOBIAN_FILE]
+
+
+def test_append_jacobian_eigenvalues_keeps_the_previous_file_when_the_write_fails(monkeypatch, tmp_path):
+    """A write that dies midway leaves the previous jacobian.npz readable, since the file is renamed into place."""
+    config.output.output_path = str(tmp_path)
+    tracker = MagicMock(estimated=False, p_eff=0.3)
+    rows = ([], [], [])
+    nonlocal_sde._append_jacobian_eigenvalues(tracker, *rows)
+
+    def truncated_write(handle, **arrays):
+        handle.write(b"PK")
+        raise OSError("disk quota exceeded")
+
+    monkeypatch.setattr(np, "savez", truncated_write)
+    with pytest.raises(OSError):
+        nonlocal_sde._append_jacobian_eigenvalues(tracker, *rows)
+    assert np.array_equal(load_spectrum(str(tmp_path / JACOBIAN_FILE))["damping"], np.array([0.3]))
+
+
+@pytest.mark.parametrize("content", [b"", b"PK\x03\x04 truncated"])
+def test_carry_jacobian_spectrum_warns_and_carries_nothing_from_an_unreadable_file(tmp_path, stab_logger, content):
+    """An empty or truncated jacobian.npz of the predecessor is warned about and carried as nothing."""
+    config.self_consistency.previous_sc_path = str(tmp_path)
+    (tmp_path / JACOBIAN_FILE).write_bytes(content)
+    tracker = MagicMock()
+    nonlocal_sde._carry_jacobian_spectrum(tracker, None)
+    tracker.carry_in.assert_not_called()
+    assert "could not be read" in config.logger.warning.call_args.args[0]
+
+
+@pytest.mark.parametrize("epsilon, converged", [(0.0, False), (1e-3, True)], ids=["unconverged", "converged"])
+def test_loop_writes_the_spectrum_file_at_the_end(monkeypatch, tmp_path, epsilon, converged):
+    """With the flag on, the loop ends by saving the tracker's spectrum, flagged converged only if it converged."""
+    config.stabilization.use_jacobian_stabilization = True
+    saved = []
+    # epsilon=0.0 forces non-convergence: a zero step residual is not below zero, so the identity map cannot converge
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=epsilon)
+    monkeypatch.setattr(
+        nonlocal_sde, "_save_jacobian_spectrum", lambda tracker, converged, *rows: saved.append(converged)
+    )
+    run()
+    assert saved == [converged]
+
+
+def test_loop_writes_the_eigenvalue_rows_every_iteration(monkeypatch, tmp_path):
+    """With the flag on, the loop calls the per-iteration eigenvalue writer once for every iteration."""
+    config.stabilization.use_jacobian_stabilization = True
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2)
+    append = MagicMock()
+    monkeypatch.setattr(nonlocal_sde, "_append_jacobian_eigenvalues", append)
+    monkeypatch.setattr(nonlocal_sde, "_save_jacobian_spectrum", lambda tracker, converged, *rows: None)
+    run()
+    assert append.call_count == 2
+
+
+def test_loop_marks_a_scaffolded_phase_exit_as_not_converged(monkeypatch, tmp_path):
+    """A restriction released on the final iteration exits without the pure branch, so the saved flag is False."""
+    config.stabilization.use_jacobian_stabilization = True
+    config.stabilization.use_chi_phys_restriction = True
+    saved = []
+    # relaxed threshold (10x epsilon) plus a zero step residual converges the identity map on the last iteration
+    run, _, logger = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2)
+    monkeypatch.setattr(
+        nonlocal_sde, "_save_jacobian_spectrum", lambda tracker, converged, *rows: saved.append(converged)
+    )
+    run()
+    assert any("no unrestricted iterations remain" in str(c.args[0]) for c in logger.warning.call_args_list)
+    assert saved == [False]
+
+
+@pytest.mark.parametrize("resumed", [False, True], ids=["fresh_start", "resumed"])
+def test_loop_carries_the_spectrum_only_when_resuming(monkeypatch, tmp_path, resumed):
+    """A run starting from a previous one asks for its spectrum before the first iteration, a fresh one never."""
+    config.stabilization.use_jacobian_stabilization = True
+    carried = []
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1)
+    if resumed:  # previous_sc_path stays empty: a starting iteration above zero is what triggers the carry-over
+        monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda sigma: (sigma, 5))
+        monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [0.5])
+    monkeypatch.setattr(nonlocal_sde, "_carry_jacobian_spectrum", lambda tracker, annealer: carried.append(tracker))
+    monkeypatch.setattr(nonlocal_sde, "_save_jacobian_spectrum", lambda tracker, converged, *rows: None)
+    run()
+    assert len(carried) == int(resumed) and all(isinstance(t, nonlocal_sde.JacobianTracker) for t in carried)
+
+
+def _fake_previous_run(monkeypatch, tmp_path, iterate_iters, niv=4, subfolder=True, run_folder_iters=()):
+    """Fakes the raw per-iteration sigma files of a previous run through glob and np.load; returns a default sigma."""
+    folder = os.path.join(str(tmp_path), config.self_consistency.sigma_iterates_subfolder_name if subfolder else "")
+    files = {os.path.join(folder, f"sigma_dga_iteration_{it}.npy"): it for it in iterate_iters}
+    files.update({os.path.join(str(tmp_path), f"sigma_dga_iteration_{it}.npy"): it for it in run_folder_iters})
+    monkeypatch.setattr(nonlocal_sde.glob, "glob", lambda pattern: [f for f in files if fnmatch.fnmatch(f, pattern)])
+    monkeypatch.setattr(np, "load", lambda f: np.full((1, 1, 1, 1, 1, 2 * niv), files[f], dtype=np.complex64))
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    config.self_consistency.previous_sc_path = str(tmp_path)
+    config.self_consistency.use_interpolated_sigma = False
+    config.self_consistency.mixing_history_length = 2
+    config.box.niv_core = 2
+    config.lattice.k_grid = bz.KGrid((1, 1, 1), symmetries=[])
+    config.sys.beta = 10.0
+    return SelfEnergy(np.zeros((1, 1, 1, 1, 1, 8), dtype=np.complex64), (1, 1, 1), beta=10.0)
+
+
+def test_loop_saves_the_raw_proposal_only_with_jacobian_stabilization(monkeypatch, tmp_path):
+    """The un-mixed proposal lands next to the mixed iterate in the iterates subfolder only with the tracking on."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2)
+    save = MagicMock()
+    monkeypatch.setattr(SelfEnergy, "save", save)
+    monkeypatch.setattr(nonlocal_sde, "_save_jacobian_spectrum", lambda tracker, converged, *rows: None)
+    run()
+    untracked = [call.kwargs["name"] for call in save.call_args_list]
+    save.reset_mock()
+    config.stabilization.use_jacobian_stabilization = True
+    run()
+    tracked = [call.kwargs["name"] for call in save.call_args_list]
+    assert "sigma_dga_iteration_1" in untracked and "sigma_dga_proposal_iteration_1" not in untracked
+    assert "sigma_dga_iteration_1" in tracked and "sigma_dga_proposal_iteration_1" in tracked
+    assert all(call.kwargs["output_dir"] == config.output.sigma_iterates_path for call in save.call_args_list)
+
+
+def test_loop_saves_the_core_window_of_the_proposal_as_the_map_returned_it(monkeypatch, tmp_path):
+    """The saved proposal is the raw map output's core window, neither reflected nor mixed, unlike the next iterate."""
+    run, _, _ = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=3, epsilon=0.0)
+    proposal_map, mixing = nonlocal_sde.calculate_sigma_proposal, nonlocal_sde.apply_mixing_strategy
+    save_iteration = nonlocal_sde._save_sigma_iteration
+    produced, saved, mixed_in, mixed_out = [], [], [], []
+
+    def proposal_spy(*args, **kwargs):
+        sigma = proposal_map(*args, **kwargs)
+        produced.append(sigma.mat.reshape(-1).copy())
+        return sigma
+
+    def save_spy(sigma, base_name, current_iter):
+        if base_name == "sigma_dga_proposal":
+            saved.append(sigma.mat.reshape(-1).copy())
+        return save_iteration(sigma, base_name, current_iter)
+
+    def mixing_spy(sigma_new, *args, **kwargs):
+        mixed_in.append(sigma_new.mat.reshape(-1).copy())
+        mixed = mixing(sigma_new, *args, **kwargs)
+        mixed_out.append(mixed.mat.reshape(-1).copy())
+        return mixed
+
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", proposal_spy)
+    monkeypatch.setattr(nonlocal_sde, "_save_sigma_iteration", save_spy)
+    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", mixing_spy)
+    reflect = MagicMock(side_effect=lambda proposal, iterate: np.zeros_like(proposal))
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "active", property(lambda self: True))
+    monkeypatch.setattr(nonlocal_sde.JacobianTracker, "reflect", reflect)
+    monkeypatch.setattr(nonlocal_sde, "_save_jacobian_spectrum", lambda tracker, converged, *rows: None)
+    run()
+    core = slice(config.box.niv_dmft - config.box.niv_core, config.box.niv_dmft + config.box.niv_core)
+    assert len(saved) == 3 and len(produced) == 3 and reflect.call_count == 3
+    assert all(np.array_equal(s, p[core]) for s, p in zip(saved, produced))
+    assert all(np.array_equal(s, m[core]) for s, m in zip(saved, mixed_in))
+    assert not any(np.array_equal(s, m[core]) for s, m in zip(saved, mixed_out))
+
+
+def test_get_starting_sigma_reads_the_iterates_subfolder_before_the_run_folder(monkeypatch, tmp_path):
+    """The highest iterate of the Sigma_Iterates subfolder is the primary read path; run-folder files never win."""
+    default = _fake_previous_run(monkeypatch, tmp_path, [3, 9], run_folder_iters=(4, 12))
+    sigma, starting_iter = nonlocal_sde.get_starting_sigma(default)
+    # the loaded array carries the iteration number of the file it came from
+    assert starting_iter == 9
+    assert np.array_equal(sigma.mat, np.full(sigma.mat.shape, 9.0, dtype=sigma.mat.dtype))
+
+
+def test_get_starting_sigma_falls_back_to_files_in_the_run_folder(monkeypatch, tmp_path):
+    """A run written before the Sigma_Iterates subfolder existed is still resumed from its run folder."""
+    default = _fake_previous_run(monkeypatch, tmp_path, [2, 4], subfolder=False)
+    assert nonlocal_sde.get_starting_sigma(default)[1] == 4
+
+
+def test_get_starting_sigma_without_previous_run_returns_default(monkeypatch, tmp_path):
+    """Without a usable previous run the DMFT self-energy starts the loop at iteration zero."""
+    default = _fake_previous_run(monkeypatch, tmp_path, [])
+    assert nonlocal_sde.get_starting_sigma(default) == (default, 0)
+
+
+def test_loop_threads_one_persistent_lambda_dict_to_every_proposal(monkeypatch, tmp_path):
+    """The per-iteration lambda correction gets one dict for the whole run, while the one-shot correction gets None."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
+    fake, seen = nonlocal_sde.calculate_sigma_proposal, []
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["lambda_previous"])
+        return fake(*args, **kwargs)
+
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", spy)
+    config.stabilization.use_lambda_correction = True
+    run()
+    config.lambda_correction.perform_lambda_correction = True
+    run()
+    assert seen[0] == {} and seen[0] is seen[1]
+    assert seen[2] is None and seen[3] is None
+
+
+def _drifting_pairs(value: float, k: int) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Three (iterate, proposal) pairs of a (1, 1, 1, 1, 1, 2) window, lambda_Pi = value on the first coordinate."""
+    pairs = linear_pairs(np.diag([1.0 - value, 0.5]), np.zeros(2), 0.07, 3, [4.0 * 0.7**k] * 2)
+    return tuple([vector.reshape(1, 1, 1, 1, 1, 2) for vector in vectors] for vectors in pairs)
+
+
+def _two_rung_state(lam_pi: complex) -> dict[str, np.ndarray]:
+    """The beta = 20 spectrum file of one mode on the frequency-constant column, matched to 0.09 at beta = 15."""
+    return {
+        "lam_pi": np.array([lam_pi]),
+        "res": np.zeros(1),
+        "flip": np.zeros(1, dtype=bool),
+        "predicted": np.zeros(1, dtype=bool),
+        "stored": np.ones(1, dtype=bool),
+        "lam_prev": np.array([0.09 + 0.0j]),
+        "res_prev": np.zeros(1),
+        "beta_prev": np.array([15.0]),
+        "u_re": np.ones((8, 1), dtype=np.float32),
+        "u_im": np.zeros((8, 1), dtype=np.float32),
+        **_grid_state((1, 1, 1, 1, 1, 8), 20.0),
+        "p_eff": np.float64(0.4),
+        "converged": np.bool_(True),
+        "exact": np.bool_(False),
+    }
+
+
+def test_a_carried_run_logs_the_cross_rung_pre_flip(tmp_path, stab_logger):
+    """A predecessor file carrying two rungs of a falling mode makes the rung pre-flip it and log the prediction."""
+    _grid_config(nk=(1, 1, 1), niv_core=4, beta=25.0)
+    config.self_consistency.previous_sc_path = str(tmp_path)
+    np.savez_compressed(str(tmp_path / JACOBIAN_FILE), **_two_rung_state(0.03 + 0.0j))
+    tracker = JacobianTracker(0.4, logger=config.logger)
+    nonlocal_sde._carry_jacobian_spectrum(tracker, None)
+    assert tracker.q is not None and tracker.q.shape[1] == 1 and tracker._flip.tolist() == [True]
+    assert any("cross-rung prediction" in str(c.args[0]) for c in config.logger.info.call_args_list)
+
+
+@pytest.mark.parametrize("missing", ["exact", "lam_prev", "irrk_ind", "res", "converged", "stored", "u_re"])
+def test_carry_jacobian_spectrum_leaves_the_tracker_untouched_by_a_file_without_a_key(tmp_path, stab_logger, missing):
+    """A predecessor file lacking a key of the spectrum layout is warned about and changes nothing in the tracker."""
+    _grid_config(nk=(1, 1, 1), niv_core=4, beta=25.0)
+    config.self_consistency.previous_sc_path = str(tmp_path)
+    state = _two_rung_state(0.03 + 0.5j)
+    del state[missing]
+    np.savez(str(tmp_path / JACOBIAN_FILE), **state)
+    tracker = JacobianTracker(0.4, logger=config.logger)
+    nonlocal_sde._carry_jacobian_spectrum(tracker, None)
+    assert tracker.p_eff == 0.4 and tracker.last_lam_pi is None and not tracker.active
+    assert f"lacks the key '{missing}'" in config.logger.warning.call_args.args[0]
+
+
+def _constant_direction_pairs(value: float, k: int) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Three pairs of an eight-frequency window with lambda_Pi = value on the frequency-constant direction."""
+    v = np.ones(8) / np.sqrt(8.0)
+    gains = 0.5 * np.eye(8) + (0.5 - value) * np.outer(v, v)
+    # symmetric in nu (frequency index 1 mirrors onto 6), as the windows the sector holds
+    x = (4.0 * 0.7**k) * (v + 0.3 * (np.eye(8)[:, 1] + np.eye(8)[:, 6])).astype(np.complex128)
+    pairs = linear_pairs(gains, np.zeros(8), 0.07, 3, x)
+    return tuple([vector.reshape(1, 1, 1, 1, 1, 8) for vector in vectors] for vectors in pairs)
+
+
+@pytest.mark.parametrize("sector, beta_second", [(False, 10.0), (True, 20.0)], ids=["same_grid", "cooling_rung"])
+def test_the_predecessor_columns_reach_the_saved_spectrum_of_a_carried_run(tmp_path, stab_logger, sector, beta_second):
+    """A carried run matches its vectors to the predecessor's columns, re-gridded on cooling, and writes lam_prev."""
+    _grid_config(nk=(1, 1, 1), niv_core=4 if sector else 1, beta=10.0)
+    pairs = _constant_direction_pairs if sector else _drifting_pairs
+    maps = (lambda beta: tracker_sector_maps(config.lattice.k_grid, 4, 1, beta)) if sector else (lambda beta: ())
+    config.self_consistency.previous_sc_path = str(tmp_path / "rung1")
+    (tmp_path / "rung1").mkdir()
+    (tmp_path / "rung2").mkdir()
+    first = JacobianTracker(0.4, None, *maps(10.0))
+    for k in range(2):
+        first.update(*pairs(0.09, k))
+    config.output.output_path = str(tmp_path / "rung1")
+    nonlocal_sde._save_jacobian_spectrum(first, True, [], [], [])
+    config.sys.beta = beta_second
+    config.output.output_path = str(tmp_path / "rung2")
+    second = JacobianTracker(0.4, config.logger, *maps(beta_second))
+    nonlocal_sde._carry_jacobian_spectrum(second, None)
+    for k in range(2):
+        second.update(*pairs(0.03, k))
+    nonlocal_sde._save_jacobian_spectrum(second, True, [], [], [])
+    saved = load_spectrum(str(tmp_path / "rung2" / JACOBIAN_FILE))
+    stored = saved["stored"]
+    assert np.allclose(saved["lam_pi"][stored], [0.03], atol=1e-8)
+    assert np.allclose(saved["lam_prev"][stored], [0.09], atol=1e-8) and saved["beta_prev"][stored][0] == 10.0
+    if not sector:
+        assert np.isnan(saved["lam_prev"][~stored]).all()
+
+
+def test_carry_jacobian_spectrum_skips_an_unfinished_predecessor_file(tmp_path, stab_logger):
+    """A jacobian.npz holding only the per-iteration traces, the mark of a run that never ended, carries nothing."""
+    config.self_consistency.previous_sc_path = str(tmp_path)
+    np.savez_compressed(
+        str(tmp_path / JACOBIAN_FILE),
+        eigenvalues=np.full((2, 3), np.nan, dtype=np.complex128),
+        eigenvalue_residuals=np.full((2, 3), np.nan),
+        damping=np.array([0.4, 0.4]),
+    )
+    tracker = MagicMock()
+    nonlocal_sde._carry_jacobian_spectrum(tracker, None)
+    tracker.carry_in.assert_not_called()
+    assert any("no certified spectrum" in str(c.args[0]) for c in config.logger.info.call_args_list)
+
+
+def test_carry_jacobian_spectrum_reads_only_the_jacobian_file(tmp_path, stab_logger):
+    """A folder holding a spectrum file under any other name than jacobian.npz carries nothing."""
+    config.self_consistency.previous_sc_path = str(tmp_path)
+    np.savez_compressed(str(tmp_path / "jacobian_spectrum.npz"), lam_pi=np.array([-0.5 + 0j]), converged=np.bool_(True))
+    tracker = MagicMock()
+    nonlocal_sde._carry_jacobian_spectrum(tracker, None)
+    tracker.carry_in.assert_not_called()
+    assert any(f"No {JACOBIAN_FILE}" in str(c.args[0]) for c in config.logger.info.call_args_list)
+
+
+def test_max_compound_norm_reads_the_requested_bosonic_frequency():
+    """The largest compound spectral norm over momenta is read at the static and at the first bosonic frequency."""
+    rng = np.random.default_rng(5)
+    comp = rng.standard_normal((3, 2, 4, 4)) + 1j * rng.standard_normal((3, 2, 4, 4))
+    chi = _chi_from_compound(comp, 2)
+    for w in (0, 1):
+        expected = np.linalg.norm(comp[:, w], ord=2, axis=(-2, -1)).max()
+        assert np.allclose(nonlocal_sde.max_compound_norm(chi, w), expected, atol=1e-5)
+    assert nonlocal_sde.max_compound_norm(chi, 2) == 0.0
+
+
+def test_monitor_chi_phys_warns_when_the_first_frequency_exceeds_the_static_value(stab_logger):
+    """A first-frequency susceptibility above twice the static one warns, a decreasing one does not."""
+    healthy = _chi_from_compound(np.array([[[[0.10]], [[0.08]]], [[[0.05]], [[-0.07]]]], dtype=complex), 1)
+    nonlocal_sde._monitor_chi_phys(healthy, _single_rank_dist())
+    stab_logger.warning.assert_not_called()
+    broken = _chi_from_compound(np.array([[[[0.10]], [[0.08]]], [[[0.05]], [[-5.3]]]], dtype=complex), 1)
+    nonlocal_sde._monitor_chi_phys(broken, _single_rank_dist())
+    assert "first bosonic frequency" in stab_logger.warning.call_args.args[0]
+
+
+def test_monitor_chi_phys_logs_the_smallest_static_inverse_eigenvalue(stab_logger):
+    """The smallest eigenvalue of the static inverse compound susceptibility over all momenta is logged."""
+    chi = _chi_from_compound(np.array([[[[0.10]], [[0.08]]], [[[0.05]], [[0.01]]]], dtype=complex), 1)
+    nonlocal_sde._monitor_chi_phys(chi, _single_rank_dist())
+    lines = [str(call.args[0]) for call in stab_logger.info.call_args_list]
+    assert any("static susceptibility (dens): 0.050000, and of its inverse: 10.000000." in line for line in lines)
+
+
+def _single_band_sigma(nk, niv, beta, seed):
+    """A decaying single-band self-energy on a k-grid (compressed momentum layout) and a dispersion for it."""
+    rng = np.random.default_rng(seed)
+    iv = 1j * MFHelper.vn(niv, beta)
+    mat = 0.2 * rng.standard_normal((int(np.prod(nk)), 1, 1, 2 * niv)) + 0.3 + 1.0 / iv
+    ek = rng.standard_normal((*nk, 1, 1))
+    return SelfEnergy(mat.astype(np.complex128), nk=nk, has_compressed_q_dimension=True, beta=beta), ek
+
+
+def test_first_frequency_local_vertex_reads_the_full_bosonic_range_and_needs_both_files(tmp_path):
+    """On the full bosonic range w1 is index niw_core + 1, and without g_dmft.npy there is no vertex."""
+    beta, niw, niv, niv_dmft = 12.5, 3, 4, 10
+    config.sys.beta, config.box.niw_core, config.output.output_path = beta, niw, str(tmp_path)
+    gchi = np.random.default_rng(4).standard_normal((1, 1, 1, 1, 2 * niw + 1, 2 * niv, 2 * niv)) + 0.5j
+    _write_npy(tmp_path / "gchi_dens_loc.npy", gchi)
+    assert nonlocal_sde.first_frequency_local_vertex() is None
+    g = np.full((1, 1, 1, 1, 1, 2 * niv_dmft), 0.3 - 0.2j)
+    _write_npy(tmp_path / "g_dmft.npy", g)
+    expected = 1.0 / gchi[0, 0, 0, 0, niw + 1, niv, niv] - 1.0 / (-beta * g[..., niv_dmft] * g[..., niv_dmft - 1])
+    assert np.isclose(nonlocal_sde.first_frequency_local_vertex(), expected.real.item(), atol=1e-12)
+
+
+def test_first_frequency_pole_ratio_is_the_local_vertex_times_the_q0_bubble_element():
+    """R = gamma_loc beta Re<G(k, pi T) G(k, -pi T)>_k, from the iterate's own nu = +-pi T values."""
+    beta, mu, gamma_loc = 10.0, 0.4, 0.07
+    sigma, ek = _single_band_sigma((4, 4, 1), 8, beta, seed=5)
+    config.sys.beta, config.lattice.hamiltonian = beta, SimpleNamespace(get_ek=lambda: ek)
+    nu0, s = np.pi / beta, sigma.mat[:, 0, 0]
+    g_plus = 1.0 / (1j * nu0 + mu - ek.reshape(-1) - s[:, 8])
+    g_minus = 1.0 / (-1j * nu0 + mu - ek.reshape(-1) - s[:, 7])
+    expected = gamma_loc * beta * np.mean(g_plus * g_minus).real
+    assert np.isclose(nonlocal_sde.first_frequency_pole_ratio(sigma, mu, gamma_loc), expected, atol=1e-12)
+    # a momentum-local self-energy (the DMFT start) enters every momentum alike
+    local = SelfEnergy(sigma.mat[:1].copy(), nk=(1, 1, 1), has_compressed_q_dimension=True, beta=beta)
+    tiled = SelfEnergy(np.repeat(sigma.mat[:1], 16, axis=0), nk=(4, 4, 1), has_compressed_q_dimension=True, beta=beta)
+    assert np.isclose(
+        nonlocal_sde.first_frequency_pole_ratio(local, mu, gamma_loc),
+        nonlocal_sde.first_frequency_pole_ratio(tiled, mu, gamma_loc),
+        atol=1e-12,
+    )
+
+
+def _write_npy(path, arr):
+    """Writes a real .npy file (the autouse fixture turns np.save into a no-op)."""
+    with open(path, "wb") as f:
+        np.lib.format.write_array(f, np.asarray(arr))
+
+
+def test_first_frequency_local_vertex_reads_the_saved_local_files(tmp_path):
+    """gamma_loc = 1/gchi_loc(w1; pi T, pi T) - 1/(-beta G(pi T) G(-pi T)) from the saved files, None for two bands."""
+    beta, niw, niv, niv_dmft = 12.5, 3, 4, 10
+    config.sys.beta, config.box.niw_core, config.output.output_path = beta, niw, str(tmp_path)
+    rng = np.random.default_rng(2)
+    shape = (1, 1, 1, 1, niw + 1, 2 * niv, 2 * niv)
+    gchi = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    g = rng.standard_normal((1, 1, 1, 1, 1, 2 * niv_dmft)) + 1j * rng.standard_normal((1, 1, 1, 1, 1, 2 * niv_dmft))
+    _write_npy(tmp_path / "gchi_dens_loc.npy", gchi)  # np.save is mocked in every test
+    _write_npy(tmp_path / "g_dmft.npy", g)
+    g0 = g[0, 0, 0, 0, 0]
+    expected = 1.0 / gchi[0, 0, 0, 0, 1, niv, niv] - 1.0 / (-beta * g0[niv_dmft] * g0[niv_dmft - 1])
+    assert np.isclose(nonlocal_sde.first_frequency_local_vertex(), expected.real, atol=1e-12)
+    _write_npy(tmp_path / "gchi_dens_loc.npy", np.zeros((2, 2, 2, 2, niw + 1, 2 * niv, 2 * niv)))
+    assert nonlocal_sde.first_frequency_local_vertex() is None
+
+
+def test_loop_logs_the_first_frequency_pole_ratio_of_every_evaluated_iterate(monkeypatch, tmp_path):
+    """Rank 0 logs R of the iterate each proposal evaluates and warns once R reaches 1."""
+    run, calls, logger = _setup_self_energy_loop(
+        monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0
+    )
+    monkeypatch.setattr(nonlocal_sde, "first_frequency_local_vertex", lambda: 0.07)
+    ratios = iter([0.95, 1.02])
+    seen = []
+
+    def ratio(sigma, mu, gamma_loc):
+        seen.append((mu, gamma_loc, len(calls)))
+        return next(ratios)
+
+    monkeypatch.setattr(nonlocal_sde, "first_frequency_pole_ratio", ratio)
+    run()
+    assert seen == [(0.5, 0.07, 0), (0.5, 0.07, 1)]  # measured before each proposal, at the iterate's mu
+    infos = [str(c.args[0]) for c in logger.info.call_args_list]
+    warnings = [str(c.args[0]) for c in logger.warning.call_args_list]
+    assert any("First-frequency density pole ratio R = 0.9500" in line for line in infos)
+    assert sum("R = 1.0200" in line and "pole ring" in line for line in warnings) == 1
+
+
+def test_update_occ_and_energies_distributed_decides_the_complex_occupation_on_the_whole_dispersion(monkeypatch):
+    """A rank whose slice of a complex dispersion is real keeps the imaginary occupation, as one rank does."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, o, niv, niv_dmft, beta, mu = (4, 4, 1), 2, 3, 8, 9.0, 0.4
+    nk_tot = int(np.prod(nk))
+    rng = np.random.default_rng(19)
+    config.sys.beta, config.sys.n_bands, config.sys.mu = beta, o, mu
+    config.lattice.nk = nk
+    config.lattice.k_grid = SimpleNamespace(nk_tot=nk_tot, nk=nk)
+    kx, ky = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nk[:2]), indexing="ij")
+    ek = np.zeros((*nk, o, o), dtype=np.complex128)
+    # the inter-orbital hopping is real on the kx = 0 row, the slice of rank 0 of four
+    ek[..., 0, 1] = (0.4 * (np.exp(1j * (kx + ky)) + np.exp(1j * (2 * kx - ky))))[..., None]
+    ek[..., 1, 0] = np.conj(ek[..., 0, 1])
+    ek[..., 0, 0], ek[..., 1, 1] = -0.3, 0.2
+    config.lattice.hamiltonian = MagicMock(get_ek=MagicMock(return_value=ek))
+    mat = (rng.standard_normal((nk_tot, o, o, 2 * niv)) * 0.1 + 0.3j).astype(np.complex64)
+    sigma_new = SelfEnergy(mat, nk, has_compressed_q_dimension=True, beta=beta)
+    dmft = (rng.standard_normal((1, 1, 1, o, o, 2 * niv_dmft)) * 0.1 + 0.2j).astype(np.complex64)
+    sigma_dmft_full = SelfEnergy(dmft, (1, 1, 1), beta=beta)
+
+    def fn(comm, rank):
+        d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
+        return nonlocal_sde._update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, d_full, mu)
+
+    (_, one), (_, four) = run_parallel(1, fn), run_parallel(4, fn)
+    assert np.abs(one[0][2].reshape(nk_tot, o, o)[:4].imag).max() > 1e-6
+    for result in four:
+        assert np.array_equal(result[2], one[0][2]) and np.array_equal(result[1], one[0][1])
+
+
+def test_warm_start_reads_the_dmft_filling_without_building_the_dmft_box_greens_function(monkeypatch, tmp_path):
+    """Without the DMFT spectrum continuation a resumed run takes the DMFT filling from the Dyson sums alone."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0)
+    config.sys.mu_dmft = 0.5
+    start = SelfEnergy(
+        np.full((1, 1, 1, 16), 0.5 + 0.2j, dtype=np.complex64), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0
+    )
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3))
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [0.7])
+    built, fillings = [], []
+    fill = (0.85, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1)))
+    greens = SimpleNamespace(
+        get_g_full=lambda *a: built.append(a) or SimpleNamespace(save=lambda *a, **k: None, free=lambda: None),
+        get_occupation=lambda *a: fillings.append(a) or fill,
+    )
+    monkeypatch.setattr(nonlocal_sde, "GreensFunction", greens)
+    run()
+    assert built == [] and fillings[0][1] == 0.5 and np.allclose(fillings[0][0].mat, 1.0 + 0.1j)
+    config.ana_cont.do_spectrum_dmft = True
+    run()
+    assert len(built) == 1 and built[0][1] == 0.5
+
+
+def test_loop_reads_a_damped_step_at_the_configured_mixing(monkeypatch, tmp_path):
+    """A damped step at a lowered p_eff converges once its residual times p_config / p_eff is below epsilon."""
+    run, calls, logger = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=150, epsilon=1e-3)
+    monkeypatch.setattr(
+        JacobianTracker, "update_recorded", lambda self, entries, allow_flip=True: setattr(self, "p_eff", 0.1)
+    )
+    run()
+    verdicts = [str(c.args[0]) for c in logger.info.call_args_list if "Self-energy convergence: True" in str(c.args[0])]
+    map_residual = float(verdicts[-1].split("map residual=")[1].split(",")[0])
+    assert len(calls) < 150 and "at the configured mixing" in verdicts[-1]
+    assert map_residual < 1e-3 / 0.5 * 1.01
+
+
+@pytest.mark.parametrize("exact", [True, False])
+def test_loop_builds_the_tracker_with_exact_checks_only_with_the_exact_jacobian(monkeypatch, tmp_path, exact):
+    """The tracker forms exact-check requests, and keeps start columns, only when the loop runs exact checks."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0)
+    config.stabilization.use_jacobian_stabilization = True
+    config.stabilization.use_exact_jacobian = exact
+    update, seen = JacobianTracker.update_recorded, []
+    monkeypatch.setattr(
+        JacobianTracker,
+        "update_recorded",
+        lambda self, *a, **k: seen.append(self._exact_checks) or update(self, *a, **k),
+    )
+    monkeypatch.setattr(nonlocal_sde, "_run_exact_check", lambda *a: False)
+    run()
+    assert seen == [exact] * 3
+
+
+def test_loop_records_the_tracker_pairs_and_mixes_linearly_without_copying_the_core_windows(monkeypatch, tmp_path):
+    """With linear mixing the tracker's record and the mixing read the core windows in place; no pair is copied."""
+    run, calls, _ = _affine_loop(monkeypatch, tmp_path, _UNSTABLE_GAINS, max_iter=8, epsilon=1e-3)
+    core_pair, copies = nonlocal_sde._core_pair, []
+    monkeypatch.setattr(
+        nonlocal_sde, "_core_pair", lambda *a, copy=True: copies.append(copy) or core_pair(*a, copy=copy)
+    )
+    run()
+    assert len(copies) == 2 * len(calls) and not any(copies)
+
+
+def test_monitor_chi_phys_reduces_its_monitors_over_the_ranks():
+    """A negative static eigenvalue on one rank is reported by every rank, as information without a warning."""
+    logger = MagicMock()
+
+    def fn(comm, rank):
+        static = 0.1 if rank == 0 else -0.2
+        chi = _chi_from_compound(np.array([[[[static]], [[0.05]]]], dtype=complex), 1)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(config, "logger", logger, raising=False)
+            nonlocal_sde._monitor_chi_phys(chi, SimpleNamespace(comm=comm))
+
+    run_parallel(2, fn)
+    infos = [str(call.args[0]) for call in logger.info.call_args_list]
+    warnings = [str(call.args[0]) for call in logger.warning.call_args_list]
+    assert sum("Lowest eigenvalue of the static susceptibility (dens): -0.200000" in line for line in infos) == 2
+    assert not warnings
+
+
+def test_min_static_compound_eigenvalue_of_a_rank_without_momenta_is_infinite():
+    """A rank holding no momentum adds +inf to the minimum reduction instead of failing on an empty array."""
+    empty = _chi_from_compound(np.zeros((0, 2, 4, 4), dtype=complex), 2)
+    assert nonlocal_sde.min_static_compound_eigenvalue(empty) == np.inf
+
+
+def test_monitor_chi_phys_serves_a_rank_without_momenta():
+    """A rank holding no momentum joins every monitor reduction, and both ranks log the other rank's values."""
+    logger = MagicMock()
+
+    def fn(comm, rank):
+        comp = np.array([[[[0.1]], [[0.05]]]], dtype=complex) if rank == 0 else np.zeros((0, 2, 1, 1), dtype=complex)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(config, "logger", logger, raising=False)
+            nonlocal_sde._monitor_chi_phys(_chi_from_compound(comp, 1), SimpleNamespace(comm=comm))
+
+    run_parallel(2, fn)
+    infos = [str(call.args[0]) for call in logger.info.call_args_list]
+    assert sum("(dens): 0.100000, and of its inverse: 10.000000." in line for line in infos) == 2
+
+
+def test_sigma_kernel_pipeline_restricts_chi_phys_and_reports_the_count_of_every_rank(monkeypatch, stab_logger):
+    """With the restriction on, the pipeline pins each rank's crossed static mode and logs the count over all ranks."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    config.stabilization.use_chi_phys_restriction = True
+    config.sys.beta, config.sys.n_bands = 10.0, 1
+    logger, kernels, aux = stab_logger, {}, MagicMock(channel=SpinChannel.DENS)
+    monkeypatch.setattr(nonlocal_sde, "create_auxiliary_chi_r_q_sum", lambda *a, **k: aux)
+    monkeypatch.setattr(nonlocal_sde, "create_vrg_r_q", lambda *a: aux)
+    monkeypatch.setattr(
+        nonlocal_sde,
+        "create_generalized_chi_q_with_shell_correction",
+        lambda *a: _chi_from_compound(
+            np.array([[[[0.1]], [[0.05]]], [[[-0.2]], [[0.05]]]], dtype=complex), 1
+        ).take_q_index_slice(*((0, 1) if threading.current_thread().name == "rank0" else (1, 2))),
+    )
+    monkeypatch.setattr(
+        nonlocal_sde,
+        "calculate_kernel_r_q",
+        lambda vrg, chi, v, u: kernels.setdefault(threading.current_thread().name, chi),
+    )
+
+    def fn(comm, rank):
+        dist = mpi_utils.MpiDistributor(ntasks=2, comm=comm)
+        nonlocal_sde.calculate_sigma_kernel_r_q(None, None, None, None, None, None, dist)
+
+    run_parallel(2, fn)
+    warnings = [str(call.args[0]) for call in logger.warning.call_args_list]
+    assert sum("(dens): 1 eigenvalues restricted" in line for line in warnings) == 2
+    assert np.allclose(_compound_of(kernels["rank1"], 1)[0, 0], 0.2, atol=1e-6)
+    assert np.allclose(_compound_of(kernels["rank0"], 1)[0, 0], 0.1, atol=1e-6)

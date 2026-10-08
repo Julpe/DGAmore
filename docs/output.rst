@@ -7,7 +7,11 @@ configuration section, in a run-specific subdirectory whose name encodes the mom
 following the pattern ``LDGA_Nk<nk_tot>_Nq<nk_tot>_wc<niw_core>_vc<niv_core>_vs<niv_shell>``. That directory is
 referred to as ``output_path`` below and holds the main results; the quantities of the Eliashberg step go to the
 subfolder ``eliashberg_path`` and the figures to the subfolder ``plotting_path``, both named in the configuration
-file and described on the :doc:`configuration` page.
+file and described on the :doc:`configuration` page, and the per-iteration self-energies of the self-consistency
+loop to the fixed subfolder ``Sigma_Iterates``. That subfolder is a change of the folder layout: earlier versions
+wrote ``sigma_dga_iteration_<i>.npy`` into the run folder itself. A resumed run reads the iterates from
+``Sigma_Iterates`` and falls back to the run folder for a predecessor of the earlier layout, but a script of your own
+that reads them from the run folder has to look in the subfolder now.
 
 Because a ``.npy`` file stores only the array, none of the metadata that the corresponding class carries survives the
 round trip: the spin channel, the frequency notation, the momentum layout and the two frequency ranges have to be
@@ -21,8 +25,10 @@ The following symbols are used throughout this page:
 
 * :math:`n_{\mathrm{o}}` (written ``no`` in the tables) is the number of bands (orbitals) of the full multi-band
   problem,
-* ``(nkx, nky, nkz)`` is the momentum grid ``nk``, :math:`n_{\mathbf{q}}^{\mathrm{irr}}` (written ``nq_irr``) the
-  number of momenta in the irreducible Brillouin zone and ``nq_rank`` the number of them held by one MPI rank,
+* ``(nkx, nky, nkz)`` is the momentum grid ``nk``, :math:`n_{\mathbf{q}}^{\mathrm{irr}}` (written ``nq_irr``, or
+  :math:`n_{\mathbf{k}}^{\mathrm{irr}}` and ``nk_irr`` for the same irreducible momenta of a single-particle
+  quantity) the number of momenta in the irreducible Brillouin zone and ``nq_rank`` the number of them held by one MPI
+  rank,
 * ``niw_core``, ``niv_core``, ``niv_full`` (``= niv_core + niv_shell``) and ``niv_dmft`` are the frequency-box sizes
   of the ``box_sizes`` configuration section,
 * ``niv_pp = min(niw_core // 2, niv_core // 2)`` is the fermionic box of the particle-particle (Eliashberg)
@@ -293,7 +299,7 @@ separate momentum axes.
    * - ``g_latt_dmft.npy``
      - Lattice Green's function built from the DMFT self-energy (written when ``do_spectrum_dmft`` is enabled)
      - ``[nkx, nky, nkz, no, no, 2 niv]``
-   * - ``sigma_dga_iteration_<i>.npy``
+   * - ``Sigma_Iterates/sigma_dga_iteration_<i>.npy``
      - Self-energy after self-consistency iteration ``i`` (also read back when a run is resumed)
      - ``[nkx, nky, nkz, no, no, 2 niv]``
    * - | ``sigma_dga_interpolated``
@@ -301,6 +307,54 @@ separate momentum axes.
      - The final self-energy re-gridded to the target temperature and frequency box (see the
        :ref:`self-energy interpolation section <self-energy-interpolation>`)
      - ``[nkx, nky, nkz, no, no, 2 n]``
+   * - ``Sigma_Iterates/sigma_dga_proposal_iteration_<i>.npy``
+     - Core window of the un-mixed self-energy proposal of iteration ``i``, the map's output for the iterate the
+       iteration started from: ``sigma_dga_iteration_<i-1>``, except on a run's first iteration, whose input is the
+       DMFT self-energy on a fresh run and, on a resumed run, the predecessor's last or interpolated iterate in the
+       predecessor's folder (``use_jacobian_stabilization`` only, as the offline record of the pairs the tracker reads
+       from memory)
+     - ``[nkx, nky, nkz, no, no, 2 niv_core]``
+   * - ``jacobian.npz``
+     - The one Jacobian record of a run (``use_jacobian_stabilization`` only), rewritten every iteration with the
+       three per-iteration traces and completed at the end of the loop with the certified spectrum; it is stored
+       uncompressed and every rewrite goes to a temporary name that is then renamed onto ``jacobian.npz``, so a run
+       killed while writing leaves the previous version. Traces:
+       ``eigenvalues``, every Ritz value :math:`\lambda_\Pi` of every iteration's estimate (up to six), largest
+       modulus first and ``nan``-padded, ``nan`` where the tracker produced no estimate on that iteration (row 0 is the
+       run's first iteration, ``starting_iter + 1`` on a resumed rung, and rows measured while a
+       susceptibility-reshaping or annealing scaffold shaped the map are included); ``eigenvalue_residuals``, the
+       matching error bounds, the Ritz residual times the condition number of the value in the projected map, ``nan``
+       likewise; ``damping``, the effective damping ``p_eff`` the tracker ran at, a
+       number on every row since it holds its last value through an iteration without an estimate. Spectrum, from the
+       latest of the tracker's updates that certified a mode with flips allowed, its in-loop exact checks and the set it
+       carried in, or from the exact spectrum at the pure fixed point, followed by the reflected flips that snapshot no
+       longer matches, with the values of the snapshot that certified them: every certified Ritz value (``lam_pi``)
+       with its error bound (``res``), its flip decision (``flip``) and whether that flip was predicted
+       (``predicted``), for every mode whose real part lies below the storage band :math:`+0.1` (:math:`+1` in an exact
+       spectrum; ``stored``, a band distinct from the flip band :math:`-\max(10^{-2}, \mathrm{res})`) the real and the
+       imaginary part of its Ritz vector in the tracker's coordinates, the irreducible momenta and the positive core
+       frequencies weighted by :math:`\sqrt{2 m_{\mathbf{k}}}` (``u_re``, ``u_im``, real, in the precision the loop
+       stores its self-energies in), the grid's irreducible momenta and star sizes these coordinates belong to
+       (``irrk_ind``, ``irrk_count``), per mode the
+       eigenvalue, error bound and inverse temperature of the predecessor mode it matched (``lam_prev``, ``res_prev``,
+       ``beta_prev``, ``nan`` without a match or a predecessor), plus the window ``shape``, ``beta``, ``p_eff``, whether
+       the run ``converged`` and whether the spectrum is ``exact``, i.e. comes from the exact Jacobian
+       (``use_exact_jacobian``): the leading eigenpairs at the pure fixed point, residual bounds at the ARPACK
+       tolerance, or, in a run that stopped short of it (``converged`` false), the last in-loop exact check, whose
+       Arnoldi residuals reach up to the certification gate at a non-converged iterate. A run that never ends its
+       loop leaves the traces alone, which a successor does not carry. Read by a successor run started from this folder,
+       which re-derives the flip decisions and the damping from ``lam_pi``, ``res``, ``lam_prev``, ``res_prev``,
+       ``beta_prev`` and the vectors (``flip``, ``predicted`` and ``p_eff`` are records and never read back),
+       the vectors on the same momentum grid and symmetry reduction only. Size: about
+       :math:`16\,n_{\mathbf{k}}^{\mathrm{irr}}\,n_{\mathrm{o}}^{2}\,\mathrm{niv}_{\mathrm{core}}` bytes per stored
+       mode in single precision, twice that in double (126 MB on a cubic :math:`50^3` grid, 3276 irreducible momenta,
+       with four bands and 150 core frequencies). At most six modes are stored (more from an exact spectrum, and a few
+       more when reflected flips join the snapshot), a few kilobytes plus the traces when no mode qualifies.
+     - ``[n, 6]`` for ``eigenvalues``, ``eigenvalue_residuals``; ``[n]`` for ``damping``; ``[m]`` for ``lam_pi``,
+       ``res``, ``flip``, ``predicted``, ``stored``, ``lam_prev``, ``res_prev``, ``beta_prev``; ``[n_s, k]`` for
+       ``u_re``, ``u_im`` (``n_s`` the sector length :math:`2 n_{\mathbf{k}}^{\mathrm{irr}} n_{\mathrm{o}}^{2}
+       \mathrm{niv}_{\mathrm{core}}`, ``k`` the stored count); ``[nk_irr]`` for ``irrk_ind``, ``irrk_count``;
+       ``shape`` as ``[6]``; ``beta``, ``p_eff``, ``converged`` and ``exact`` as scalars
    * - ``mu_history.npy``
      - Chemical potential of every self-consistency iteration, ``float64``
      - ``[n_iterations]``

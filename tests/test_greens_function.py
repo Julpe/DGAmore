@@ -10,11 +10,13 @@ import numpy as np
 import pytest
 
 import dgamore.config as config
+import dgamore.greens_function as gf_module
 from dgamore.greens_function import GreensFunction, get_total_fill, update_mu
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.self_energy import SelfEnergy
 from tests.conftest import run_parallel
+from tests.conftest import traced_peak
 
 
 def test_symmetrize_orbitals_already_symmetrized():
@@ -571,3 +573,166 @@ def test_chunk_constants_are_mirrored_by_the_memory_estimator():
     assert memory_estimator.GF_FREQUENCY_CHUNK_ELEMENTS == gf_module._MODEL_EPOT_CHUNK_ELEMENTS
     niv_asympt = inspect.signature(GreensFunction.get_epot).parameters["niv_asympt"].default
     assert memory_estimator.EPOT_NIV_ASYMPT == niv_asympt
+
+
+def _dense_inputs(nk=(4, 4, 1), nbands=2, niv=256, beta=10.0, mu=0.3, seed=0):
+    """Random hermitian dispersion and a decaying self-energy on a k-grid large enough to make memory peaks visible."""
+    rng = np.random.default_rng(seed)
+    nk_tot = int(np.prod(nk))
+    ek = rng.standard_normal((*nk, nbands, nbands))
+    ek = ek + ek.swapaxes(-1, -2)
+    iv = 1j * (2 * np.arange(-niv, niv) + 1) * np.pi / beta
+    tail = 0.5 / iv
+    sig_mat = 0.1 * rng.standard_normal((nk_tot, nbands, nbands, 2 * niv)) + 0.2 + tail[None, None, None, :]
+    sig = SelfEnergy(sig_mat.astype(np.complex128), nk=nk, has_compressed_q_dimension=True, beta=beta)
+    return nk, ek, sig, beta, mu
+
+
+def _reference_fill_nonlocal(sig, mu, ek, beta):
+    """Brute-force k-resolved occupation: full [k, o, o, v] G and model G, summed over the whole frequency box."""
+    from dgamore.greens_function import _fermi_dirac_density
+
+    nb, niv = sig.n_bands, sig.niv
+    iv = 1j * MFHelper.vn(niv, beta)
+    eye = np.eye(nb)
+    iv_bands = (iv[None, None, :] * eye[..., None])[None, None, None]
+    mu_bands = (mu * eye)[None, None, None, :, :, None]
+    smom0 = sig.smom[0]
+    sig_mat = sig.copy().decompress_q_dimension().mat
+    g = np.linalg.inv(np.moveaxis(iv_bands + mu_bands - ek[..., None] - sig_mat, -1, -3))
+    g_model = np.linalg.inv(
+        np.moveaxis(iv_bands + mu_bands - ek[..., None] - smom0[None, None, None, :, :, None], -1, -3)
+    )
+    g, g_model = np.moveaxis(g, -3, -1), np.moveaxis(g_model, -3, -1)
+    rho_k = _fermi_dirac_density(ek.real + smom0[None, None, None] - mu * eye[None, None, None], beta)
+    occ_k = rho_k + np.sum(g.real - g_model.real, axis=-1) / beta
+    occ = np.mean(occ_k, axis=(0, 1, 2))
+    return 2.0 * np.trace(occ).real, occ, occ_k
+
+
+def test_get_fill_nonlocal_matches_brute_force_reference():
+    """The (chunked) k-resolved filling equals the single-pass full-box reference."""
+    nk, ek, sig, beta, mu = _dense_inputs()
+    n_ref, occ_ref, occ_k_ref = _reference_fill_nonlocal(sig, mu, ek, beta)
+
+    n, occ, occ_k = GreensFunction.get_g_full(sig, mu, ek, beta).get_fill_nonlocal()
+
+    assert np.isclose(n, n_ref, rtol=0, atol=1e-12)
+    assert np.allclose(occ, occ_ref, rtol=0, atol=1e-12)
+    assert np.allclose(occ_k, occ_k_ref, rtol=0, atol=1e-12)
+
+
+def test_get_fill_nonlocal_stays_within_a_momentum_chunk(monkeypatch):
+    """get_fill_nonlocal builds no full-box [k, o, o, v] Dyson or model array: the chunked peak stays below one."""
+    nk, ek, sig, beta, mu = _dense_inputs()
+    g = GreensFunction.get_g_full(sig, mu, ek, beta)
+    full_box_bytes = g.nq_tot * g.n_bands**2 * 2 * g.niv * 16
+    monkeypatch.setattr(gf_module, "_MOMENTUM_CHUNK_ELEMENTS", g.nq_tot * g.n_bands**2 * (2 * g.niv // 16))
+
+    _, peak = traced_peak(g.get_fill_nonlocal)
+
+    assert peak < 0.5 * full_box_bytes, f"peak {peak} B vs full box {full_box_bytes} B"
+
+
+def test_get_occupation_matches_full_greens_function(monkeypatch):
+    """The sigma-only entry point reports what building G^k first reports, without ever holding G^k."""
+    nk, ek, sig, beta, mu = _dense_inputs()
+    g = GreensFunction.get_g_full(sig, mu, ek, beta)
+    n_ref, occ_ref, occ_k_ref = g.get_fill_nonlocal()
+    full_box_bytes = g.nq_tot * g.n_bands**2 * 2 * g.niv * 16
+    monkeypatch.setattr(gf_module, "_MOMENTUM_CHUNK_ELEMENTS", g.nq_tot * g.n_bands**2 * (2 * g.niv // 16))
+
+    (n, occ, occ_k), peak = traced_peak(lambda: GreensFunction.get_occupation(sig, mu, ek, beta))
+
+    assert np.isclose(n, n_ref, rtol=0, atol=1e-13)
+    assert np.allclose(occ, occ_ref, rtol=0, atol=1e-13)
+    assert np.allclose(occ_k, occ_k_ref, rtol=0, atol=1e-13)
+    assert peak < 0.5 * full_box_bytes, f"peak {peak} B vs full box {full_box_bytes} B"
+
+
+def test_get_fill_nonlocal_local_sigma_broadcasts_over_k():
+    """A momentum-local self-energy ([1, 1, 1, o, o, v]) yields the same k-resolved occupation as its tiled copy."""
+    nk, ek, sig, beta, mu = _dense_inputs()
+    local_mat = sig.mat[:1]
+    sig_local = SelfEnergy(local_mat.copy(), nk=(1, 1, 1), has_compressed_q_dimension=True, beta=beta)
+    tiled = np.broadcast_to(local_mat, (int(np.prod(nk)), *local_mat.shape[1:])).copy()
+    sig_tiled = SelfEnergy(tiled, nk=nk, has_compressed_q_dimension=True, beta=beta)
+
+    n_loc, occ_loc, occ_k_loc = GreensFunction.get_occupation(sig_local, mu, ek, beta)
+    n_til, occ_til, occ_k_til = GreensFunction.get_occupation(sig_tiled, mu, ek, beta)
+
+    assert occ_k_loc.shape == (*nk, sig.n_bands, sig.n_bands)
+    assert np.allclose(occ_k_loc, occ_k_til, rtol=0, atol=1e-13)
+    assert np.isclose(n_loc, n_til, rtol=0, atol=1e-13)
+
+
+def test_get_occupation_is_chunk_schedule_independent(monkeypatch):
+    """occ_k is bit-identical across chunk budgets, and a momentum slice reports the full grid's rows."""
+    nk, ek, sig, beta, mu = _dense_inputs(nk=(4, 2, 1), nbands=2, niv=8)
+    nb, nk_tot = sig.n_bands, int(np.prod(nk))
+    sig_local = SelfEnergy(sig.mat[:1].copy(), nk=(1, 1, 1), has_compressed_q_dimension=True, beta=beta)
+    ek_flat = ek.reshape(nk_tot, 1, 1, nb, nb)
+    monkeypatch.setattr(gf_module, "_MOMENTUM_CHUNK_ELEMENTS", 3 * nb**2 * 2 * sig.niv)
+
+    occ_k = GreensFunction.get_occupation(sig_local, mu, ek, beta)[2]
+    occ_k_slice = GreensFunction.get_occupation(sig_local, mu, ek_flat[2:7], beta)[2]
+    monkeypatch.setattr(gf_module, "_MOMENTUM_CHUNK_ELEMENTS", 2**24)
+    occ_k_one_chunk = GreensFunction.get_occupation(sig_local, mu, ek, beta)[2]
+
+    # the budget splits the eight momenta into three chunks and the five-momentum slice into two
+    assert np.array_equal(occ_k_slice.reshape(5, nb, nb), occ_k.reshape(nk_tot, nb, nb)[2:7])
+    assert np.array_equal(occ_k, occ_k_one_chunk)
+
+
+def test_get_fill_nonlocal_keeps_the_whole_dispersions_complex_decision_on_a_real_slice():
+    """A slice of a complex dispersion that is real alone reports the full grid's complex rows when told so."""
+    nk, ek, sig, beta, mu = _dense_inputs(nk=(4, 4, 1), nbands=2, niv=8)
+    kx, ky, _ = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nk), indexing="ij")
+    ek = ek.astype(complex)
+    ek[..., 0, 1] = 0.4 * (np.exp(1j * (kx + ky)) + np.exp(1j * (2 * kx - ky)))
+    ek[..., 1, 0] = ek[..., 0, 1].conj()
+    sig_local = SelfEnergy(sig.mat[:1].copy(), nk=(1, 1, 1), has_compressed_q_dimension=True, beta=beta)
+    rows = ek.reshape(16, 1, 1, 2, 2)[:4]
+
+    occ_k = GreensFunction.get_occupation(sig_local, mu, ek, beta)[2].reshape(16, 2, 2)
+    occ_k_slice = GreensFunction.get_g_full(sig_local, mu, rows, beta).get_fill_nonlocal(real_dispersion=False)[2]
+
+    assert np.array_equal(np.real_if_close(rows), rows.real) and np.abs(occ_k[:4].imag).max() > 1e-6
+    assert np.array_equal(occ_k_slice.reshape(4, 2, 2), occ_k[:4])
+
+
+def test_forced_complex_occupation_refuses_a_self_energy_on_other_momenta():
+    """A real dispersion told it is complex still needs a momentum-local self-energy or one on its momenta."""
+    sigma, ek = _chunking_inputs(False, False, nk=(8, 1, 1))
+    with pytest.raises(ValueError, match=r"momenta \(8, 1, 1\), the dispersion \(3, 1, 1\)"):
+        GreensFunction.get_occupation(sigma, 0.3, ek[:3], 7.3, real_dispersion=False)
+    sigma, ek = _chunking_inputs(False, False, nk=(2, 3, 1))
+    with pytest.raises(ValueError, match="the dispersion"):  # as many momenta, but on another grid
+        GreensFunction.get_occupation(sigma, 0.3, ek.reshape(3, 2, 1, *ek.shape[3:]), 7.3, real_dispersion=False)
+
+
+@pytest.mark.parametrize("n_ranks", [1, 2, 4])
+def test_momentum_slices_given_the_complex_decision_assemble_the_full_grid(monkeypatch, n_ranks):
+    """Momentum slices of a complex dispersion, some real alone, report the full grid's rows bit for bit with
+    real_dispersion=False in any momentum chunking, also for a momentum-resolved self-energy."""
+    nk, ek, sig, beta, mu = _dense_inputs(nk=(2, 4, 1), nbands=2, niv=8)
+    kx, ky, _ = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nk), indexing="ij")
+    ek = ek.astype(complex)
+    ek[..., 0, 1] = 0.4 * (np.exp(1j * (kx + ky)) + np.exp(1j * (2 * kx - ky)))
+    ek[..., 1, 0] = ek[..., 0, 1].conj()
+    rows = ek.reshape(8, 1, 1, 2, 2)
+
+    occ_k = GreensFunction.get_occupation(sig.copy(), mu, ek, beta)[2].reshape(8, 2, 2)
+    # the kx = 0 half of the grid is real alone
+    assert np.array_equal(np.real_if_close(rows[:4]), rows[:4].real) and np.abs(occ_k[:4].imag).max() > 1e-6
+    for chunk in (1, 2 * 2**2 * 2 * 8, 10**9):  # one momentum, two, all
+        monkeypatch.setattr(gf_module, "_MOMENTUM_CHUNK_ELEMENTS", chunk)
+        parts = []
+        for idx in np.array_split(np.arange(8), n_ranks):
+            sig_my = SelfEnergy(
+                sig.mat[idx], nk=(idx.size, 1, 1), has_compressed_q_dimension=True, calc_smom=False, beta=beta
+            )
+            sig_my._smom0, sig_my._smom1 = sig.smom
+            g_my = GreensFunction.get_g_full(sig_my, mu, rows[idx], beta)
+            parts.append(g_my.get_fill_nonlocal(real_dispersion=False)[2])
+        assert np.array_equal(np.concatenate(parts).reshape(8, 2, 2), occ_k)

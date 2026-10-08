@@ -20,7 +20,7 @@ from dgamore.greens_function import GreensFunction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore.mpi_utils import MpiDistributor
-from dgamore.n_point_base import SpinChannel, FrequencyNotation
+from dgamore.n_point_base import SpinChannel, FrequencyNotation, zero_small_values
 
 # bytes of one sub-chunk round's full-grid buffer in the distributed bubble: about one rank's L3 share
 ROUND_BUFFER_BYTES = 4 * 1024**2
@@ -63,13 +63,16 @@ class BubbleGenerator:
         k_grid: KGrid,
         beta: float,
         node_comm=None,
+        subtract_from: FourPoint | None = None,
     ) -> FourPoint:
         r"""
         Returns the momentum-dependent generalized bare susceptibility :math:`\chi^{\mathrm{q}\nu}_{0;1234} = -\beta
         \sum_{\mathbf{k}} G^{\mathrm{k}}_{14}\, G^{\mathrm{k}-\mathrm{q}}_{32}`, evaluated via an FFT over the BZ with
         preallocated buffers. On a multi-rank run the bosonic-frequency loop is distributed across all ranks (see
         :meth:`_create_generalized_chi0_q_fft_distributed`); on a single rank the whole bubble is computed on rank 0
-        over the irreducible BZ and scattered across ranks.
+        over the irreducible BZ and scattered across ranks. With ``subtract_from`` the bubble is subtracted from that
+        bubble in place instead of returned: the multi-rank path scales, filters and subtracts every column block as
+        it arrives, so the bubble's own array is never built; a single rank subtracts the finished bubble.
 
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
         :param giwk: The momentum-dependent :class:`GreensFunction`.
@@ -79,11 +82,14 @@ class BubbleGenerator:
         :param beta: Inverse temperature :math:`\beta`.
         :param node_comm: Optional node-local communicator; when given, the distributed path builds its R-space
             Green's functions once per node in shared-memory windows.
-        :return: The bubble as a :class:`FourPoint` over the irreducible BZ (compressed momentum, half niw range).
+        :param subtract_from: A bubble of the same box on this rank's irreducible q-points that the bubble is
+            subtracted from in place, or ``None``.
+        :return: The bubble as a :class:`FourPoint` over the irreducible BZ (compressed momentum, half niw range), or
+            ``subtract_from`` minus the bubble.
         """
         if mpi_dist_irrk.comm.size > 1:
             return BubbleGenerator._create_generalized_chi0_q_fft_distributed(
-                mpi_dist_irrk, giwk, niw, niv, k_grid, beta, node_comm
+                mpi_dist_irrk, giwk, niw, niv, k_grid, beta, node_comm, subtract_from
             )
 
         gchi0_q_mat = None
@@ -114,9 +120,10 @@ class BubbleGenerator:
             gchi0_q_mat *= -beta / k_grid.nk_tot
         gchi0_q_mat = mpi_dist_irrk.scatter(gchi0_q_mat)
 
-        return FourPoint(
+        bubble = FourPoint(
             gchi0_q_mat, SpinChannel.NONE, k_grid.nk, 1, 1, full_niw_range=False, has_compressed_q_dimension=True
         ).filter_small_values()
+        return bubble if subtract_from is None else subtract_from.sub(bubble, copy=False)
 
     @staticmethod
     def _create_generalized_chi0_q_fft_distributed(
@@ -127,6 +134,7 @@ class BubbleGenerator:
         k_grid: KGrid,
         beta: float,
         node_comm=None,
+        subtract_from: FourPoint | None = None,
     ) -> FourPoint:
         r"""
         Distributed evaluation of :meth:`create_generalized_chi0_q_fft`: the flattened bosonic-fermionic
@@ -139,7 +147,9 @@ class BubbleGenerator:
         stays within ``ROUND_BUFFER_BYTES`` (its column-wise fill is a strided write, so a larger buffer would stream
         every cache line through memory once per column; a column above the budget runs alone); the exchange is
         pipelined per sub-chunk on a globally derived schedule, so no rank ever holds more than its final irr-BZ
-        slice plus one sub-chunk in flight.
+        slice plus one sub-chunk in flight. With ``subtract_from`` every column block is scaled and filtered as the
+        finished bubble is and subtracted from that bubble's columns as it arrives, so no slice of its own is
+        allocated (the same elementwise operations, hence the bits of ``subtract_from.sub(bubble)``).
 
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
         :param giwk: The momentum-dependent :class:`GreensFunction`.
@@ -148,7 +158,10 @@ class BubbleGenerator:
         :param k_grid: The :class:`KGrid` over which the BZ sum/FFT is performed.
         :param beta: Inverse temperature :math:`\beta`.
         :param node_comm: Optional node-local communicator for the shared R-space Green's functions.
-        :return: The bubble as a :class:`FourPoint` over the irreducible BZ (compressed momentum, half niw range).
+        :param subtract_from: A bubble of the same box on this rank's irreducible q-points that the bubble is
+            subtracted from in place, or ``None``.
+        :return: The bubble as a :class:`FourPoint` over the irreducible BZ (compressed momentum, half niw range), or
+            ``subtract_from`` minus the bubble.
         """
         comm = mpi_dist_irrk.comm
         rank, size = comm.rank, comm.size
@@ -185,8 +198,21 @@ class BubbleGenerator:
 
         my_q_slice = mpi_dist_irrk.slices[rank]
         my_nq = (my_q_slice.stop - my_q_slice.start) if my_q_slice is not None else 0
-        gchi0_q_mat = np.empty((my_nq, nb, nb, nb, nb, len(wn), vpos), dtype=g_r_mat.dtype)
-        gchi0_cols = gchi0_q_mat.reshape(my_nq, nb**4, total_cols)  # contiguous view, columns w-major
+        if subtract_from is None:
+            gchi0_q_mat = np.empty((my_nq, nb, nb, nb, nb, len(wn), vpos), dtype=g_r_mat.dtype)
+        else:
+            gchi0_q_mat = subtract_from.mat
+        gchi0_cols = np.reshape(gchi0_q_mat, (my_nq, nb**4, total_cols), copy=False)  # contiguous view, columns w-major
+
+        def deliver(c0: int, c1: int, block: np.ndarray) -> None:
+            """Writes a column block of this rank's momenta, or subtracts it scaled and filtered (``subtract_from``)."""
+            cols = gchi0_cols[:, :, c0:c1]
+            if subtract_from is None:
+                cols[...] = block.reshape(cols.shape)
+                return
+            block *= -beta / nk_tot
+            zero_small_values(block)
+            cols -= block.reshape(cols.shape)
 
         def round_cols(r: int, rnd: int) -> tuple[int, int]:
             c0 = col_bounds[r] + rnd * sub_cols
@@ -213,7 +239,7 @@ class BubbleGenerator:
                     ]
                 )
                 if my_nq:
-                    gchi0_cols[:, :, c0:c1] = chunk_irr[my_q_slice].reshape(my_nq, nb**4, n_mine)
+                    deliver(c0, c1, chunk_irr[my_q_slice])
 
             # ring exchange of this round's sub-chunks onto the irr-BZ q-distribution
             for step in range(1, size):
@@ -227,13 +253,13 @@ class BubbleGenerator:
 
                 s0, s1 = round_cols(src, rnd)
                 if my_nq and s1 > s0:
-                    staging = np.empty((my_nq, nb, nb, nb, nb, s1 - s0), dtype=gchi0_q_mat.dtype)
+                    staging = np.empty((my_nq, nb, nb, nb, nb, s1 - s0), dtype=g_r_mat.dtype)
                     reqs += mpi_utils._irecv_rows_into(comm, staging, src, base_tag=500 + step)
 
                 if reqs:
                     mpi_utils.MPI.Request.Waitall(reqs)
                 if staging is not None:
-                    gchi0_cols[:, :, s0:s1] = staging.reshape(my_nq, nb**4, s1 - s0)
+                    deliver(s0, s1, staging)
 
         del buf
         g_r_mat = g_r_rev_mat = None
@@ -242,6 +268,8 @@ class BubbleGenerator:
                 node_comm.Barrier()
                 win.Free()
 
+        if subtract_from is not None:
+            return subtract_from
         gchi0_q_mat *= -beta / nk_tot
         return FourPoint(
             gchi0_q_mat, SpinChannel.NONE, k_grid.nk, 1, 1, full_niw_range=False, has_compressed_q_dimension=True

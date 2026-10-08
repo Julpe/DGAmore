@@ -12,6 +12,7 @@ vertices, interaction, gap function) compose these mixins.
 """
 
 import gc
+import threading
 from abc import ABC
 from contextlib import contextmanager
 from copy import deepcopy
@@ -26,8 +27,17 @@ from dgamore.brillouin_zone import KGrid
 # precision (doubling memory). All IHaveMat-derived objects store .mat in this dtype; also exposed as IHaveMat.DTYPE.
 DTYPE = np.complex64
 
-# When True, free() (and hence every destructor) skips its gc sweep; deferred_collection() flips it and collects once.
-_defer_gc: bool = False
+
+class _Deferral(threading.local):
+    """
+    Nesting depth of :func:`deferred_collection` in the current thread: while it is positive, :meth:`IHaveMat.free`
+    (and hence every destructor) of that thread skips its gc sweep.
+    """
+
+    depth = 0
+
+
+_deferral = _Deferral()
 
 
 @contextmanager
@@ -36,17 +46,31 @@ def deferred_collection():
     Context manager batching the garbage-collector sweeps of :meth:`IHaveMat.free` into a single one at exit. Inside
     the context, releasing an n-point object only drops its array reference; the full ``gc.collect()`` (an
     all-generations heap walk, milliseconds each) runs once when the context closes. Use it around loops that create
-    and release many small n-point objects, where a per-object sweep costs more than the loop's arithmetic.
+    and release many small n-point objects, where a per-object sweep costs more than the loop's arithmetic. Nested
+    contexts collect once, when the outermost one closes; the deferral holds for the thread that opened the context.
 
     :return: A context manager (no value is bound).
     """
-    global _defer_gc
-    _defer_gc = True
+    depth = _deferral.depth
+    _deferral.depth = depth + 1
     try:
         yield
     finally:
-        _defer_gc = False
-        gc.collect()
+        _deferral.depth = depth
+        if depth == 0:
+            gc.collect()
+
+
+def zero_small_values(view: np.ndarray, threshold: float = 1e-12) -> None:
+    """
+    Zeroes the entries of ``view`` whose real and imaginary parts are both below ``threshold`` in absolute value, in
+    place (the mask of :meth:`IHaveMat.filter_small_values`, whose default threshold it shares).
+
+    :param view: The complex array to filter.
+    :param threshold: Values whose real and imaginary parts are both below this magnitude are zeroed.
+    :return: None.
+    """
+    view[(np.abs(view.real) < threshold) & (np.abs(view.imag) < threshold)] = 0.0
 
 
 class SpinChannel(Enum):
@@ -332,7 +356,7 @@ class IHaveMat(ABC):
         if self._mat is not None:
             self._mat = None
 
-        if not _defer_gc:
+        if not _deferral.depth:
             gc.collect()
 
         if trim:
@@ -396,30 +420,26 @@ class IHaveMat(ABC):
         temp_bytes_per_elem = mat.dtype.itemsize + 2
         budget_bytes = self._FILTER_CHUNK_BYTES  # cap the per-chunk temporaries (class attribute; patchable in tests)
 
-        def _zero_below(view: np.ndarray) -> None:
-            """Zeroes the entries of ``view`` whose real and imag parts are both below ``threshold`` (in place)."""
-            view[(np.abs(view.real) < threshold) & (np.abs(view.imag) < threshold)] = 0.0
-
         if mat.flags["C_CONTIGUOUS"]:
             # A flat view is free for a C-contiguous array; chunk it along the single flat axis.
             flat = mat.reshape(-1)
             n = flat.shape[0]
             step = max(1, budget_bytes // temp_bytes_per_elem)
             if step >= n:
-                _zero_below(flat)
+                zero_small_values(flat, threshold)
             else:
                 for i in range(0, n, step):
-                    _zero_below(flat[i : i + step])
+                    zero_small_values(flat[i : i + step], threshold)
         else:
             # Non-contiguous: reshape(-1) would copy the whole array, so chunk axis 0 (slices stay views).
             n = mat.shape[0]
             rest_elems = max(1, mat.size // n)
             step = max(1, budget_bytes // (rest_elems * temp_bytes_per_elem))
             if step >= n:
-                _zero_below(mat)
+                zero_small_values(mat, threshold)
             else:
                 for i in range(0, n, step):
-                    _zero_below(mat[i : i + step])
+                    zero_small_values(mat[i : i + step], threshold)
         return self
 
     @classmethod
@@ -738,7 +758,7 @@ class IAmNonLocal(IHaveMat, ABC):
         copy._nq = (1, 1, 1)
         return copy
 
-    def take_q_index_slice(self, start: int, stop: int):
+    def take_q_index_slice(self, start: int, stop: int, copy: bool = True):
         r"""
         Returns a **new** object restricted to the index window ``[start, stop)`` of the compressed momentum axis.
         The momentum-range counterpart of :meth:`filter_q_index`, letting a caller walk the rank-local momenta in
@@ -746,14 +766,15 @@ class IAmNonLocal(IHaveMat, ABC):
 
         :param start: First momentum index of the window.
         :param stop: One past the last momentum index of the window.
-        :return: A compressed copy containing those momenta (``nq = (stop - start, 1, 1)``).
+        :param copy: Whether the new object holds a copy (default, so it does not keep the parent array alive) or a
+            view of the parent's array, for a caller that keeps the parent anyway.
+        :return: A compressed object containing those momenta (``nq = (stop - start, 1, 1)``).
         """
         if not self.has_compressed_q_dimension:
             self.compress_q_dimension()
 
         result = self._clone_without_mat()
-        # ``.copy()`` so the returned object does not keep the full parent array alive via a view
-        result.mat = self.mat[start:stop].copy()
+        result.mat = self.mat[start:stop].copy() if copy else self.mat[start:stop]
         result.update_original_shape()
         result._nq = (stop - start, 1, 1)
         return result
