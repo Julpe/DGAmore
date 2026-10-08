@@ -19,6 +19,7 @@ API Reference
    dgamore.greens_function
    dgamore.hamiltonian
    dgamore.interaction
+   dgamore.jacobian_stabilization
    dgamore.lambda_ops
    dgamore.local_four_point
    dgamore.local_n_point
@@ -32,6 +33,7 @@ API Reference
    dgamore.nonlocal_sde
    dgamore.plotting
    dgamore.self_energy
+   dgamore.sigma_jacobian
    dgamore.symmetrize
    dgamore.symmetry_reduction
    dgamore.two_point

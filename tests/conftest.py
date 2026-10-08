@@ -7,6 +7,7 @@
 import gc
 import logging
 import os
+import tracemalloc
 from unittest.mock import MagicMock
 
 import mpi4py.MPI as MPI
@@ -470,3 +471,41 @@ def patch_mini_pole_with_exact_single_pole_fit(monkeypatch, x: float):
     mini_pole = MagicMock(side_effect=fit)
     mini_pole.cal_G_vector = self_energy_module.MiniPole.cal_G_vector
     monkeypatch.setattr(self_energy_module, "MiniPole", mini_pole)
+
+
+def traced_peak(fn):
+    """Runs fn under tracemalloc and returns its result and the peak bytes traced above the level at its start."""
+    tracemalloc.start()
+    tracemalloc.reset_peak()
+    try:
+        entry = tracemalloc.get_traced_memory()[0]
+        result = fn()
+        peak = tracemalloc.get_traced_memory()[1] - entry
+    finally:
+        tracemalloc.stop()
+    return result, peak
+
+
+def p_orbital_hk(nk: tuple[int, int, int], equal_orbitals: bool = True) -> np.ndarray:
+    """A p_x/p_y dispersion with an inter-orbital hopping, whose mirrors flip the sign of one orbital; with equal
+    orbitals the diagonal mirrors also swap them."""
+    kx, ky, _ = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nk), indexing="ij")
+    hk = np.zeros((*nk, 2, 2), dtype=complex)
+    hk[..., 0, 0] = -2.0 * np.cos(kx) - 0.6 * np.cos(ky)
+    hk[..., 1, 1] = -2.0 * np.cos(ky) - 0.6 * np.cos(kx) if equal_orbitals else -1.4 * np.cos(ky) - 0.5 * np.cos(kx)
+    hk[..., 0, 1] = hk[..., 1, 0] = 0.3 * np.sin(kx) * np.sin(ky)
+    return hk
+
+
+def linear_pairs(
+    mat: np.ndarray, shift: np.ndarray, p: float, n_iter: int, x0: list[float]
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Returns the (iterate, proposal) lists of a damped linear iteration as complex core-window arrays."""
+    x = np.asarray(x0, dtype=np.complex128)
+    iterates, proposals = [], []
+    for _ in range(n_iter):
+        proposal = (mat @ x.real + shift).astype(np.complex128)
+        iterates.append(x.copy())
+        proposals.append(proposal.copy())
+        x = x + p * (proposal - x)
+    return iterates, proposals

@@ -240,6 +240,26 @@ def test_subtracts_self_energy_and_numpy_array_correctly():
     assert np.allclose(result.mat, self_energy.mat - array)
 
 
+@pytest.mark.parametrize("operand", ["complex64 array", "complex128 array", "self-energy of the other layout"])
+def test_in_place_add_returns_self_holding_the_bits_of_the_out_of_place_sum(operand):
+    """add(copy=False) sums into the complex64 array of self and returns self, with the bits of the copy branch."""
+    rng = np.random.default_rng(3)
+    shape = mat_compressed.shape
+    start = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    self_energy = _se(start, nk=nk, has_compressed_q_dimension=True)
+    other = {
+        "complex64 array": (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64),
+        "complex128 array": rng.standard_normal(shape) + 1j * rng.standard_normal(shape),
+        "self-energy of the other layout": _se(
+            rng.standard_normal((*nk, 2, 2, 2 * niv)) + 1j, nk=nk, has_compressed_q_dimension=False
+        ),
+    }[operand]
+    expected = self_energy + other
+    result = self_energy.add(other, copy=False)
+    assert result is self_energy and result.mat is start and start.dtype == np.complex64
+    assert np.array_equal(start, expected.mat)
+
+
 def test_interpolate_on_a_subset_of_momenta_gives_exactly_the_rows_of_the_full_interpolation():
     """Every momentum is re-gridded on its own, so interpolating a subset of rows reproduces those rows bit for bit."""
     rng = np.random.default_rng(21)

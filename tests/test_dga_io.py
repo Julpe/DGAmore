@@ -107,6 +107,7 @@ def _recorded_folder_creations(monkeypatch, do_plotting: bool, do_spectrum: bool
     monkeypatch.setattr(os.path, "exists", lambda path: False)
     monkeypatch.setattr(os, "makedirs", lambda path: created.append(path))
     config.output.output_path = "/run"
+    config.output.sigma_iterates_path = "/run/Sigma_Iterates"
     config.output.plotting_path = "/run/Plots"
     config.output.eliashberg_path = "/run/Eliashberg"
     config.output.do_plotting = do_plotting
@@ -121,11 +122,11 @@ def test_create_output_folders_makes_the_plots_folder_for_a_spectrum_plot_withou
     """A requested spectrum plot needs the plots folder even when the general plotting switch is off."""
     created = _recorded_folder_creations(monkeypatch, do_plotting=False, do_spectrum=True, plot_spectrum=True)
 
-    assert created == ["/run", "/run/Plots"]
+    assert created == ["/run", "/run/Sigma_Iterates", "/run/Plots"]
 
 
 def test_create_output_folders_skips_the_plots_folder_when_nothing_is_plotted(monkeypatch):
-    """Without general plotting and without a spectrum plot only the run folder is created."""
+    """Without general plotting and without a spectrum plot only the run folder and its iterate folder are created."""
     created = _recorded_folder_creations(monkeypatch, do_plotting=False, do_spectrum=True, plot_spectrum=False)
 
-    assert created == ["/run"]
+    assert created == ["/run", "/run/Sigma_Iterates"]

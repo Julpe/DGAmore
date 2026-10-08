@@ -547,6 +547,12 @@ def run_dga_routine(comm: MPI.Comm) -> int:
             return name if parity == "none" else f"{name} {parity}"
 
         if comm.rank == 0:
+            if eliashberg_solver.even_sectors_degenerate(results):
+                logger.warning(
+                    "The leading singlet-even and triplet-even Eliashberg eigenvalues agree to within "
+                    f"{eliashberg_solver.EVEN_SECTOR_DEGENERACY:.0%}. Such a coincidence can mark an unphysical fixed "
+                    "point of the self-consistency; it is expected for an SU(2N)-symmetric interaction."
+                )
             with open(os.path.join(config.output.eliashberg_path, "eigenvalues.txt"), "w") as eig_file:
                 for (channel, parity), (lambdas, _gaps) in results.items():
                     eig_file.write(
@@ -616,9 +622,13 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     total stays inside every node's line of available memory (identical on every rank, as the estimate is). The
     results of both builds do not depend on their chunking. The fit checks then model exactly the budgets the
     builds receive.
+    The exact Jacobian (``stabilization.use_exact_jacobian``) gets its own budgets
+    (:func:`dgamore.memory_estimator.exact_jacobian_budgets`); when even one column in its leanest residency does not
+    fit, it is disabled with a warning instead of raising and the other branches are re-checked without it.
 
     :param comm: The MPI communicator (used to group ranks by node).
-    :return: The per-rank chunk byte budgets of the chunked builds (:class:`~dgamore.memory_estimator.ChunkBudgets`).
+    :return: The per-rank chunk byte budgets of the chunked builds and the exact Jacobian's block width
+        (:class:`~dgamore.memory_estimator.ChunkBudgets`).
     :raises MemoryError: If the code path selected for some branch overflows some node's budget.
     """
     logger = config.logger
@@ -667,6 +677,8 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         symmetrize_orbitals=bool(config.dmft.symmetrize_orbitals),
         do_spectrum_dmft=config.ana_cont.do_spectrum_dmft,
         warm_start=bool(config.self_consistency.previous_sc_path),
+        with_jacobian_tracker=config.stabilization.use_jacobian_stabilization,
+        with_exact_jacobian=config.stabilization.use_exact_jacobian,
     )
 
     def node_total(bp: memory_estimator.BranchPeak, distributed: float, single: float, n_ranks: int) -> float:
@@ -700,7 +712,14 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
             )
         )
 
+    def exact_fits(trial: memory_estimator.ChunkBudgets) -> bool:
+        """Whether the exact Jacobian's branch fits every node at the chunk budgets ``trial``."""
+        bp = estimate(chunk_budgets=trial)["exact_jacobian"]
+        return fits_everywhere(bp, bp.off_distributed, bp.off_single)
+
     budgets = memory_estimator.ChunkBudgets(sde=sized_budget("sde"), fq=sized_budget("fq"))
+    if config.stabilization.use_exact_jacobian:
+        budgets = memory_estimator.exact_jacobian_budgets(exact_fits, budgets)
     peaks = estimate(chunk_budgets=budgets)
 
     def team_need(n_ranks: int) -> float:
@@ -730,6 +749,29 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         f"{budget_label(budgets.fq)}."
     )
 
+    # The exact Jacobian is optional: a job it does not fit runs without it and keeps the tracker's estimate, whose
+    # residents then shrink to the secant tracker's in every other branch.
+    if "exact_jacobian" in peaks:
+        bp_exact = peaks["exact_jacobian"]
+        if not fits_everywhere(bp_exact, bp_exact.off_distributed, bp_exact.off_single):
+            worst = max(
+                node_total(bp_exact, bp_exact.off_distributed, bp_exact.off_single, r) for r, *_ in nodes.values()
+            )
+            config.stabilization.use_exact_jacobian = False
+            peaks = estimate(chunk_budgets=budgets, with_exact_jacobian=False)
+            logger.warning(
+                f"The exact Jacobian needs {worst / 1024**3:.3f} GB on a node, which exceeds "
+                f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory; it is disabled and jacobian.npz keeps "
+                "the tracker's estimate."
+            )
+        else:
+            logger.info(
+                f"Exact-Jacobian products: chunk budget {budget_label(budgets.exact)} per rank, blocks of "
+                f"{budgets.exact_block}"
+                + (", local vertices loaded per phase" if budgets.exact_vertices_per_phase else "")
+                + (", three-leg vertices recomputed per momentum group" if budgets.exact_vrg_per_group else "")
+                + "."
+            )
     # The Schwinger-Dyson contraction always runs the column-distributed real-space path (the q-loop variant is
     # unused - it peaked HIGHER); its single path is still checked so an oversized box fails fast, not mid-run.
     if "sde" in peaks:
@@ -791,7 +833,10 @@ def _resolve_option_exclusivity() -> None:
     ``use_chi_phys_restriction`` and the lambda-annealing scaffold - all modify the physical susceptibility and cannot run
     together (a sum-rule calibration must not see a floored or mass-shifted chi, and the two scaffolds would fight).
     Precedence: lambda correction > use_chi_phys_restriction > lambda annealing. Conflicting options are disabled
-    with a warning.
+    with a warning. Separately, ``use_jacobian_stabilization`` cannot run in a one-shot run, i.e. with the one-shot
+    ``perform_lambda_correction`` or with ``max_iter`` 1 (a single iteration has no history), and is disabled with a
+    warning there, and ``use_exact_jacobian`` needs ``use_jacobian_stabilization`` (the exact spectrum is written
+    through the tracker) and is disabled with a warning without it.
 
     :return: None.
     """
@@ -811,6 +856,17 @@ def _resolve_option_exclusivity() -> None:
                 f"'{name}' was enabled together with {kept} - these are mutually exclusive. Keeping {kept} and "
                 f"disabling '{name}'."
             )
+
+    if config.lambda_correction.perform_lambda_correction and config.stabilization.use_jacobian_stabilization:
+        disable_option("use_jacobian_stabilization", "the one-shot lambda correction")
+    if config.self_consistency.max_iter == 1:
+        disable_option("use_jacobian_stabilization", "a one-shot run (max_iter 1)")
+
+    if config.stabilization.use_exact_jacobian and not config.stabilization.use_jacobian_stabilization:
+        config.stabilization.use_exact_jacobian = False
+        config.logger.warning(
+            "'use_exact_jacobian' needs 'use_jacobian_stabilization', which is off; the exact Jacobian is disabled."
+        )
 
     if config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction:
         disable_option("use_chi_phys_restriction", "the lambda correction")

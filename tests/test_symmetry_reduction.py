@@ -15,6 +15,7 @@ import pytest
 from unittest.mock import MagicMock
 
 import dgamore.symmetry_reduction as sr
+from tests.conftest import p_orbital_hk
 
 
 def test_enumerate_integer_matrices_returns_only_gl3z_matrices():
@@ -1660,3 +1661,16 @@ def test_forced_multiplicity_reads_the_irreducible_dimensions_of_the_group(matri
     ops = [{"M": m, "q": np.zeros(3, dtype=int), "U": np.eye(1), "sigma": 1, "conj": False} for m in matrices]
     group = sr._close_group(ops, 1, nk)
     assert tuple(sr.forced_multiplicity(group, nk, parity) for parity in (None, 1, -1)) == expected
+
+
+def test_stabilizer_unitaries_list_each_element_with_the_points_it_fixes():
+    """Every unitary element comes with exactly the given points it maps onto themselves, the identity first."""
+    nk = (4, 4, 1)
+    group = sr.get_symmetry_reduction(p_orbital_hk(nk, equal_orbitals=False))["group"]
+    points = np.arange(int(np.prod(nk)))
+    stabilizers = sr.stabilizer_unitaries(group, nk, points)
+    assert len(stabilizers) == len(group) and np.array_equal(stabilizers[0][0], points)
+    assert np.allclose(stabilizers[0][1], stabilizers[0][1][0, 0] * np.eye(2))
+    for (positions, _), g in zip(stabilizers, sr._ordered(group, nk)):
+        action = sr._g_action_on_kgrid(g, nk)
+        assert np.array_equal(positions, np.flatnonzero(action == points)) and 0 in positions

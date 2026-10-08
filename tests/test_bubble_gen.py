@@ -9,15 +9,20 @@ independent, explicit hand-rolled reference of the documented formula (small ran
 which both validates correctness and locks the behavior of the memory-optimized methods.
 """
 
+import types
+
 import numpy as np
 import pytest
 
 import dgamore.config as config
+import dgamore.mpi_utils as mpi_utils
 from dgamore import brillouin_zone as bz
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.greens_function import GreensFunction
 from dgamore.matsubara_frequencies import MFHelper
+from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import FrequencyNotation
+from tests.conftest import FAKE_MPI, create_comm_mock, run_parallel, traced_peak
 
 
 def _make_local_g(nb: int, niv: int, seed: int = 0) -> GreensFunction:
@@ -351,3 +356,62 @@ def test_fft_bubble_distributed_with_fewer_columns_than_ranks(monkeypatch):
     _, res = run_parallel(5, fn)
     assembled = np.concatenate(res, axis=0)
     assert np.allclose(assembled, ref.mat, atol=1e-5)
+
+
+@pytest.mark.parametrize("size", [1, 2])
+def test_fft_bubble_subtracted_in_place_has_the_bits_of_the_difference_of_both_bubbles(size, monkeypatch):
+    """A bubble subtracted from another as its blocks arrive equals a.sub(b) of the two built bubbles bit for bit."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 2, 2, 2.5
+    greens = [_make_momentum_g(nk, nb, niv + niw + 2, seed=seed) for seed in (14, 15)]
+    for g in greens:
+        g.mat[..., 1, 0, :] *= 1e-7  # bubble entries below the filter threshold
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+        a, b, target = (
+            BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, beta) for g in (*greens, greens[0])
+        )
+        out = BubbleGenerator.create_generalized_chi0_q_fft(dist, greens[1], niw, niv, q_grid, beta, subtract_from=a)
+        return out is a, a.mat, target.sub(b, copy=False).mat
+
+    _, results = run_parallel(size, fn)
+    assert all(same and np.array_equal(out, ref) for same, out, ref in results)
+    assert np.any(np.concatenate([ref for *_, ref in results]) == 0)
+
+
+def test_distributed_fft_bubble_subtracted_in_place_never_allocates_its_own_array():
+    """The column path subtracting into a bubble peaks below the bubble it would otherwise build, on one rank."""
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 6, 6, 2.5
+    g = _make_momentum_g(nk, nb, niv + niw + 2, seed=16)
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock(), name="Q")
+    peaks = []
+    for subtract in (False, True):
+        target = BubbleGenerator._create_generalized_chi0_q_fft_distributed(dist, g, niw, niv, q_grid, beta)
+        _, peak = traced_peak(
+            lambda: BubbleGenerator._create_generalized_chi0_q_fft_distributed(
+                dist, g, niw, niv, q_grid, beta, subtract_from=target if subtract else None
+            )
+        )
+        peaks.append(peak)
+    assert peaks[0] - peaks[1] >= 0.95 * target.mat.nbytes
+
+
+def test_distributed_fft_bubble_subtracts_received_blocks_in_the_precision_they_were_sent_in(monkeypatch):
+    """On 2 ranks a complex64 bubble subtracted into a complex128 target keeps its own rounding in every block."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 2, 2, 2.5
+    greens = [_make_momentum_g(nk, nb, niv + niw + 2, seed=seed) for seed in (17, 18)]
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+        a, b = (BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, beta) for g in greens)
+        target = types.SimpleNamespace(mat=a.mat.astype(np.complex128))
+        BubbleGenerator.create_generalized_chi0_q_fft(dist, greens[1], niw, niv, q_grid, beta, subtract_from=target)
+        return b.mat.dtype, target.mat, a.mat.astype(np.complex128) - b.mat
+
+    _, results = run_parallel(2, fn)
+    assert all(dtype == np.complex64 and np.array_equal(out, ref) for dtype, out, ref in results)
