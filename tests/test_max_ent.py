@@ -171,9 +171,10 @@ def _build_giwk_mat(nk, n_bands, niv, seed=1):
     return mat.astype(np.complex64)
 
 
-def _setup_maxent_config(tmp_path, nk, n_bands, niv_core=3, w_count=7, seed=0):
+def _setup_maxent_config(tmp_path, nk, n_bands, niv_core=3, w_count=7, seed=0, symmetries=None):
     config.lattice.nk = nk
-    config.lattice.k_grid = bz.KGrid(nk, symmetries=bz.two_dimensional_square_symmetries())
+    symmetries = bz.two_dimensional_square_symmetries() if symmetries is None else symmetries
+    config.lattice.k_grid = bz.KGrid(nk, symmetries=symmetries)
     config.box.niv_core = niv_core
     config.sys.beta = 10.0
     config.sys.n_bands = n_bands
@@ -282,11 +283,14 @@ def test_perform_maxent_giwk_sets_up_one_continuation_problem_per_rank(tmp_path,
     assert instance.solve.call_count == n_solves
 
 
-@pytest.mark.parametrize("size", [1, 2])
-def test_perform_maxent_giwk_continues_band_diagonal_and_unfolds(tmp_path, patch_maxent_mpi, size):
+@pytest.mark.parametrize(
+    "size, symmetries",
+    [(1, None), (2, None), (2, [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.X_Y_SYM, bz.KnownSymmetries.Y_INV])],
+)
+def test_perform_maxent_giwk_continues_band_diagonal_and_unfolds(tmp_path, patch_maxent_mpi, size, symmetries):
     """perform_maxent_giwk continues the band-diagonal G and unfolds it, unlike orbital-diagonal continuation."""
     nk, n_bands, niv_core, w_count = (4, 4, 1), 2, 3, 7
-    hk = _setup_maxent_config(tmp_path, nk, n_bands, niv_core, w_count, seed=7)
+    hk = _setup_maxent_config(tmp_path, nk, n_bands, niv_core, w_count, seed=7, symmetries=symmetries)
     mat = _build_giwk_mat(nk, n_bands, niv=4, seed=11)
     k_grid = config.lattice.k_grid
 

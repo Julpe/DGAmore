@@ -22,6 +22,7 @@ from dgamore.four_point import FourPoint, _is_complex_symmetric
 from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.n_point_base import SpinChannel, FrequencyNotation, IAmNonLocal, deferred_collection
+from tests.conftest import ten_times_the_floor
 
 
 @pytest.fixture
@@ -691,6 +692,40 @@ def test_matmul_fourpoint_vs_fourpoint_mixed_vn_dims(rng):
     assert out.num_vn_dimensions == 2
     assert out.current_shape[0] == qtot
     assert len(out.current_shape) == 1 + 4 + 1 + 2
+
+
+@pytest.mark.parametrize("left_hand_side", [True, False])
+@pytest.mark.parametrize("right_vn", [1, 0, None])
+def test_matmul_in_place_writes_the_bits_of_the_copying_product_into_self(rng, right_vn, left_hand_side):
+    """copy=False writes exactly the copying product into this object's array and returns the object."""
+    c = lambda *s: (rng.standard_normal(s) + 1j * rng.standard_normal(s)).astype(np.complex64)
+    meta = (SpinChannel.DENS, (3, 1, 1), 1)
+    target = FourPoint(c(3, 2, 2, 2, 2, 4, 6), *meta, 1, False, True, True)
+    if right_vn is None:
+        other = Interaction(c(3, 2, 2, 2, 2), SpinChannel.DENS, (3, 1, 1), True)
+    else:
+        other = FourPoint(c(3, 2, 2, 2, 2, 4, *[6] * right_vn), *meta, right_vn, False, True, True)
+    expected = deepcopy(target).matmul(other, left_hand_side).mat
+    buffer = target.mat
+
+    out = target.matmul(other, left_hand_side, copy=False)
+
+    assert out is target and np.shares_memory(out.mat, buffer)
+    assert np.array_equal(out.mat, expected)
+
+
+def test_matmul_in_place_refuses_a_product_of_another_shape(rng):
+    """copy=False raises for a product with more fermionic axes than the object and for the compound branch."""
+    c = lambda *s: rng.standard_normal(s) + 1j * rng.standard_normal(s)
+    meta = (SpinChannel.DENS, (2, 1, 1), 1)
+    no_fermion = FourPoint(c(2, 2, 2, 2, 2, 3), *meta, 0, False, True, True)
+    one_fermion = FourPoint(c(2, 2, 2, 2, 2, 3, 4), *meta, 1, False, True, True)
+    two_fermion = FourPoint(c(2, 2, 2, 2, 2, 3, 4, 4), *meta, 2, False, True, True)
+
+    with pytest.raises(ValueError, match="in-place product"):
+        no_fermion.matmul(one_fermion, copy=False)
+    with pytest.raises(ValueError, match="in-place product"):
+        two_fermion.matmul(deepcopy(two_fermion), copy=False)
 
 
 def test_identity_shapes_and_like(rng):
@@ -1513,3 +1548,179 @@ def test_map_to_full_bz_unfolds_into_the_given_buffer(rng):
     out = np.empty((grid.nk_tot, *shape[1:]), dtype=np.complex64)
     unfolded = FourPoint(mat, SpinChannel.NONE, grid.nk, 1, 0, False, True, True).map_to_full_bz(grid, out=out)
     assert np.shares_memory(unfolded.mat, out) and np.array_equal(out, mat[grid.irrk_inv.ravel()])
+
+
+def test_take_wn_slice_view_adds_in_place_into_the_bosonic_window_of_the_parent():
+    """A bosonic window view of a compressed FourPoint, taken without a copy, accumulates in place into its parent."""
+    nq, nb, n_w, niv = 3, 2, 4, 2
+    part = np.random.default_rng(5).standard_normal((nq, nb, nb, nb, nb, 2, 2 * niv)).astype(np.complex64)
+    parent = FourPoint(
+        np.zeros((nq, nb, nb, nb, nb, n_w, 2 * niv), dtype=np.complex64),
+        SpinChannel.NONE,
+        (nq, 1, 1),
+        1,
+        1,
+        full_niw_range=False,
+        has_compressed_q_dimension=True,
+    )
+    other = FourPoint(part, SpinChannel.NONE, (nq, 1, 1), 1, 1, full_niw_range=False, has_compressed_q_dimension=True)
+
+    parent.take_wn_slice(1, 3, copy=False).add(other, copy=False)
+
+    assert np.array_equal(parent.mat[..., 1:3, :], part)
+    assert not np.any(parent.mat[..., [0, 3], :])
+
+
+@pytest.mark.parametrize("copy", [True, False])
+@pytest.mark.parametrize("left", [True, False])
+@pytest.mark.parametrize("num_vn", [0, 1])
+@pytest.mark.parametrize("local", [True, False])
+def test_matmul_per_wn_gives_every_bosonic_window_its_window_of_the_whole_product(local, num_vn, left, copy):
+    """With per_wn an interaction product of a bosonic window is that window of the whole product, in place too."""
+    rng = np.random.default_rng(5)
+    nq, o, n_w = 3, 2, 7
+    shape = (nq, o, o, o, o, n_w) + (12,) * num_vn
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    u_shape = (o,) * 4 if local else (nq,) + (o,) * 4
+    u_mat = rng.standard_normal(u_shape) + 1j * rng.standard_normal(u_shape)
+    u = LocalInteraction(u_mat) if local else Interaction(u_mat, SpinChannel.NONE, (nq, 1, 1), True)
+
+    def product(w0: int, w1: int, per_wn: bool) -> np.ndarray:
+        """The product of a fresh object holding the bosonic window [w0, w1), written over it unless copy."""
+        window = np.take(mat, np.arange(w0, w1), axis=5)
+        x = FourPoint(window, SpinChannel.DENS, (nq, 1, 1), 1, num_vn, False, True, True)
+        return x.matmul(u, left, copy, per_wn=per_wn).mat
+
+    whole = product(0, n_w, True)
+    bounds = [(w0, min(n_w, w0 + width)) for width in (1, 3) for w0 in range(0, n_w, width)]
+    windows = [(product(w0, w1, True), np.take(whole, np.arange(w0, w1), axis=5)) for w0, w1 in bounds]
+    assert all(np.allclose(p, w, rtol=0, atol=ten_times_the_floor(whole)) for p, w in windows)
+    assert np.allclose(whole, product(0, n_w, False), atol=1e-5 * np.abs(whole).max())
+
+
+@pytest.mark.parametrize("left", [True, False])
+@pytest.mark.parametrize("num_vn", [0, 1])
+def test_matmul_per_wn_with_a_momentum_dependent_interaction_gives_every_momentum_its_row_of_the_whole(num_vn, left):
+    """With per_wn and a momentum-dependent interaction one momentum's product is that row of the whole product."""
+    rng = np.random.default_rng(6)
+    nq, o, n_w = 3, 2, 4
+    shape = (nq, o, o, o, o, n_w) + (12,) * num_vn
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    x = FourPoint(mat, SpinChannel.DENS, (nq, 1, 1), 1, num_vn, False, True, True)
+    u_mat = rng.standard_normal((nq,) + (o,) * 4) + 1j * rng.standard_normal((nq,) + (o,) * 4)
+    u = Interaction(u_mat, SpinChannel.NONE, (nq, 1, 1), True)
+
+    whole = x.matmul(u, left_hand_side=left, per_wn=True).mat
+    rows = [
+        x.take_q_index_slice(q, q + 1).matmul(u.take_q_index_slice(q, q + 1), left_hand_side=left, per_wn=True).mat
+        for q in range(nq)
+    ]
+
+    atol = ten_times_the_floor(whole)
+    assert all(np.allclose(row, whole[q : q + 1], rtol=0, atol=atol) for q, row in enumerate(rows))
+
+
+def _spy_factorizations_of_slices(monkeypatch) -> list[bool]:
+    """Records the symmetry decision of every factorization, solved once or several times, in call order."""
+    flags, real = [], four_point._factorization
+    monkeypatch.setattr(four_point, "_factorization", lambda buf, sym: flags.append(bool(sym)) or real(buf, sym))
+    return flags
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+@pytest.mark.parametrize("o, two_atoms", [(1, False), (2, False), (4, True)])
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize("nq, members", [(1, 2), (3, 1), (3, 0)])
+def test_invert_with_local_kernel_and_slice_rhs_matches_a_sum_and_an_rhs_pass(
+    rng, monkeypatch, dtype, o, two_atoms, full, nq, members
+):
+    """Per-slice right-hand sides built from the slice's sum solve against its one factorization as two passes do."""
+    monkeypatch.setattr(npb, "DTYPE", dtype)
+    beta = config.sys.beta = np.float64(8.0)
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, o, nq=nq, full=full, two_atoms=two_atoms)
+    shape, meta = chi0.current_shape, (SpinChannel.NONE, (nq, 1, 1), 1, 1, False, True, True)
+    mixer = FourPoint(rng.standard_normal(shape) + 1j * rng.standard_normal(shape), *meta)
+    kernel, calls = (gamma, u_r, 1.0 / beta**2, beta, inactive), []
+
+    def slice_rhs(i: int, w: int, total: FourPoint) -> list[FourPoint]:
+        """The members mixer @ total and its double, from the slice's sum."""
+        calls.append((i, w, total.current_shape))
+        b = mixer.take_q_index_slice(i, i + 1, copy=False).take_wn_slice(w, w + 1, copy=False) @ total
+        return [b, b.scale(2.0, copy=True)][:members]
+
+    total = chi0.invert_with_local_kernel_and_sum_over_last_vn(*kernel)
+    rhs = [mixer @ total, (mixer @ total).scale(2.0)][:members]
+    two_pass = chi0.invert_with_local_kernel_and_sum_over_last_vn(*kernel, rhs=rhs) if rhs else []
+    flags = _spy_factorizations_of_slices(monkeypatch)
+    fused, solved = chi0.invert_with_local_kernel_and_sum_over_last_vn(*kernel, slice_rhs=slice_rhs)
+
+    assert calls == [(i, w, (1, o, o, o, o, 1, 6)) for w in range(3) for i in range(nq)] and len(flags) == 3 * nq
+    assert fused.mat.dtype == dtype and fused.channel == gamma.channel
+    assert np.allclose(fused.mat, total.mat, rtol=0, atol=ten_times_the_floor(total.mat))
+    assert len(solved) == members
+    assert all(np.allclose(s.mat, r.mat, rtol=0, atol=ten_times_the_floor(r.mat)) for s, r in zip(solved, two_pass))
+
+
+def test_invert_with_local_kernel_and_slice_rhs_without_momenta_calls_nothing(rng):
+    """A rank without momenta factorizes no slice, never calls the hook and returns the empty sum and no solutions."""
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, _ = _kernel_inputs(rng, 2, nq=0)
+    total, solved = chi0.invert_with_local_kernel_and_sum_over_last_vn(
+        gamma, u_r, 1.0 / 8.0**2, 8.0, slice_rhs=MagicMock(side_effect=AssertionError)
+    )
+    assert total.mat.shape == (0, 2, 2, 2, 2, 3, 6) and solved == []
+
+
+def test_invert_with_local_kernel_and_slice_rhs_sweeps_the_heap_once_per_call(rng, monkeypatch):
+    """The per-slice objects of the hook are released without a garbage-collector sweep each: one sweep per call."""
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, _ = _kernel_inputs(rng, 2)
+    sweeps = []
+    monkeypatch.setattr(npb.gc, "collect", lambda *args: sweeps.append(1) or 0)
+    result = chi0.invert_with_local_kernel_and_sum_over_last_vn(
+        gamma, u_r, 1.0 / 8.0**2, 8.0, slice_rhs=lambda i, w, total: [total.scale(2.0, copy=True)]
+    )
+    assert len(sweeps) == 1 and len(result[1]) == 1
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+@pytest.mark.parametrize("copy", [True, False])
+@pytest.mark.parametrize("left", [True, False])
+@pytest.mark.parametrize("o, num_vn, local", [(2, 0, False), (2, 1, True), (2, 1, False), (2, 2, True), (1, 1, False)])
+def test_matmul_per_wn_is_every_bosonic_frequency_multiplied_on_its_own(
+    monkeypatch, dtype, copy, left, o, num_vn, local
+):
+    """With per_wn every frequency of an interaction product has the bits of its own single-frequency product."""
+    monkeypatch.setattr(npb, "DTYPE", dtype)
+    rng = np.random.default_rng(8)
+    nq, n_w = 3, 5
+    shape = (nq, o, o, o, o, n_w) + (6,) * num_vn
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    u_mat = rng.standard_normal((o,) * 4 if local else (nq,) + (o,) * 4) + 0.5j
+    u = LocalInteraction(u_mat) if local else Interaction(u_mat, SpinChannel.NONE, (nq, 1, 1), True)
+
+    def product(w: np.ndarray, per_wn: bool) -> np.ndarray:
+        """The product of the frequencies ``w`` of ``mat``."""
+        x = FourPoint(np.take(mat, w, axis=5), SpinChannel.DENS, (nq, 1, 1), 1, num_vn, False, True, True)
+        return x.matmul(u, left, copy, per_wn=per_wn).mat
+
+    whole = product(np.arange(n_w), True)
+    assert whole.dtype == dtype
+    assert all(np.array_equal(np.take(whole, [w], axis=5), product(np.array([w]), False)) for w in range(n_w))
+
+
+@pytest.mark.parametrize("two_atoms", [False, True])
+def test_invert_with_local_kernel_without_slice_rhs_solves_each_slice_in_one_call(rng, two_atoms, monkeypatch):
+    """Without a per-slice hook every slice is factorized and solved in one call; the hook's factorization is unused."""
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, 4 if two_atoms else 2, two_atoms=two_atoms)
+    rhs = FourPoint(rng.standard_normal(chi0.current_shape) + 0j, SpinChannel.NONE, (3, 1, 1), 1, 1, False, True, True)
+
+    def factorization(buf, symmetric):
+        raise AssertionError("the hook's factorization runs without a hook")
+
+    monkeypatch.setattr(four_point, "_factorization", factorization)
+    kernel = (gamma, u_r, 1.0 / 8.0**2, 8.0, inactive)
+    summed = chi0.invert_with_local_kernel_and_sum_over_last_vn(*kernel)
+    (solved,) = chi0.invert_with_local_kernel_and_sum_over_last_vn(*kernel, [rhs])
+    assert summed.mat.shape == solved.mat.shape == chi0.current_shape

@@ -176,7 +176,8 @@ def run_dga_routine(comm: MPI.Comm) -> int:
     chunk_budgets = autodetect_memory_settings(comm)
 
     u_loc = config.lattice.hamiltonian.get_local_u()
-    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
+    # rank 0 alone holds the full-grid interaction; the other ranks receive their irreducible momenta from it
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid) if comm.rank == 0 else None
 
     if comm.rank == 0:
         sigma_loc_full, sigma_dmft_full, g_dmft_full = (None,) * 3
@@ -547,6 +548,12 @@ def run_dga_routine(comm: MPI.Comm) -> int:
             return name if parity == "none" else f"{name} {parity}"
 
         if comm.rank == 0:
+            if eliashberg_solver.even_sectors_degenerate(results):
+                logger.warning(
+                    "The leading singlet-even and triplet-even Eliashberg eigenvalues agree to within "
+                    f"{eliashberg_solver.EVEN_SECTOR_DEGENERACY:.0%}. Such a coincidence can mark an unphysical fixed "
+                    "point of the self-consistency; it is expected for an SU(2N)-symmetric interaction."
+                )
             with open(os.path.join(config.output.eliashberg_path, "eigenvalues.txt"), "w") as eig_file:
                 for (channel, parity), (lambdas, _gaps) in results.items():
                     eig_file.write(
@@ -597,45 +604,63 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     block-distributed grid fallback), and sizes the chunk budgets of the two chunked builds from the same estimate.
     Must be called only after the irreducible BZ is known (i.e. after auto-symmetry discovery), as the estimate depends on ``k_grid.nk_irr``.
 
-    The budget is a **node total**: on a node with ``r`` ranks the memory held by all of them at a branch's peak is
-    ``r * (baseline + distributed) + single`` (every rank holds the branch's persistent baseline; a *distributed*
-    transient is held by every rank at once, a *single-rank* transient by one rank while the others idle), minus
-    ``(r - 1) * giwk_shareable`` for the branch's node-shared windows, and this must not exceed
+    The budget is a **node total** (see :func:`dgamore.memory_estimator.node_total`): every rank of a node holds the
+    branch's persistent baseline and its *distributed* transient at the rank's own task counts (ranks with equal
+    irreducible and full-BZ counts share one estimate; the Schwinger-Dyson contraction's column schedule stays the
+    busiest rank's), the node holding rank 0 adds the *single-rank* transient
+    rank 0 builds while the others idle, every other node the branch's ``remote_single`` (all of the single-rank
+    transient when the branch sets none), and the node-shared windows count once; this must not exceed
     ``NODE_MEMORY_FRACTION`` times the node budget - ``psutil.virtual_memory().available``, capped by the cgroup
-    memory limit when the scheduler sets one (see :func:`dgamore.mpi_utils.cgroup_memory_limit`). Each
-    node's rank count and available memory are collected with a single ``allgather`` of
-    ``(hostname, available_bytes)``; a branch's path is judged to "fit" only if it fits on **every**
-    node (the flags are process-wide, so the tightest node governs, and a single-rank transient may land on any
-    node). The
-    Eliashberg solver's single-rank peak is doubled on a single-node multi-rank job because the singlet and triplet
-    solves then run concurrently on the same node. A :class:`MemoryError` is raised only if the
-    path that would actually run does not fit.
+    memory limit when the scheduler sets one (see :func:`dgamore.mpi_utils.cgroup_memory_limit`). Each node's ranks
+    and available memory are collected with a single ``allgather`` of ``(hostname, available_bytes)`` in rank
+    order; a branch's path is judged to "fit" only if it fits on **every** node (the flags are process-wide, so the
+    tightest node governs). On a multi-rank job the in-memory Eliashberg solve is judged by the team solve's node
+    formula, with rank 0's full-grid interaction on rank 0's node. A :class:`MemoryError` is raised only if the path
+    that would actually run does not fit.
 
     The two chunked builds get the memory their residents leave below the node budget: for every chunked branch
     :func:`dgamore.memory_estimator.max_chunk_budget` searches the largest per-rank chunk budget whose modeled node
     total stays inside every node's line of available memory (identical on every rank, as the estimate is). The
     results of both builds do not depend on their chunking. The fit checks then model exactly the budgets the
     builds receive.
+    The exact Jacobian (``stabilization.use_exact_jacobian``) gets its own budgets
+    (:func:`dgamore.memory_estimator.exact_jacobian_budgets`); when even one column in its leanest residency does not
+    fit, it is disabled with a warning instead of raising and the other branches are re-checked without it.
 
     :param comm: The MPI communicator (used to group ranks by node).
-    :return: The per-rank chunk byte budgets of the chunked builds (:class:`~dgamore.memory_estimator.ChunkBudgets`).
+    :return: The per-rank chunk byte budgets of the chunked builds and the exact Jacobian's block width
+        (:class:`~dgamore.memory_estimator.ChunkBudgets`).
     :raises MemoryError: If the code path selected for some branch overflows some node's budget.
     """
     logger = config.logger
 
     # Gather (hostname, available bytes) from every rank in a single collective and reduce to one entry per node:
-    # the rank count and the (minimum, conservative) available memory on that node.
+    # the node's ranks (in rank order) and the (minimum, conservative) available memory on that node.
     node_available = psutil.virtual_memory().available
     cgroup_limit = mpi_utils.cgroup_memory_limit()
     if cgroup_limit is not None:
         node_available = min(node_available, cgroup_limit)
     hostname = socket.gethostname()
     nodes: dict[str, list] = {}
-    for host, avail in comm.allgather((hostname, node_available)):
+    for rank, (host, avail) in enumerate(comm.allgather((hostname, node_available))):
         if host not in nodes:
-            nodes[host] = [0, avail]
-        nodes[host][0] += 1
+            nodes[host] = [[], avail]
+        nodes[host][0].append(rank)
         nodes[host][1] = min(nodes[host][1], avail)
+    nk_irr, nk_tot = config.lattice.k_grid.nk_irr, config.lattice.k_grid.nk_tot
+
+    def counts(rank: int) -> tuple[int, int]:
+        """The rank's irreducible and full-BZ task counts, which alone set its distributed terms."""
+        irreducible = memory_estimator.rank_tasks(nk_irr, comm.size, rank)
+        return irreducible, memory_estimator.rank_tasks(nk_tot, comm.size, rank)
+
+    # per node: [representative rank, number of ranks] per distinct pair of counts, whether it holds rank 0, its line
+    node_groups = []
+    for ranks, avail in nodes.values():
+        groups: dict[tuple[int, int], list[int]] = {}
+        for rank in ranks:
+            groups.setdefault(counts(rank), [rank, 0])[1] += 1
+        node_groups.append((list(groups.values()), 0 in ranks, avail * NODE_MEMORY_FRACTION))
 
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
     # Must mirror the giwk_full window the SDE section starts from in nonlocal_sde.calculate_self_energy_q.
@@ -643,8 +668,8 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     estimate = functools.partial(
         memory_estimator.estimate_peaks,
         n_bands=config.sys.n_bands,
-        nk_tot=config.lattice.k_grid.nk_tot,
-        nk_irr=config.lattice.k_grid.nk_irr,
+        nk_tot=nk_tot,
+        nk_irr=nk_irr,
         niw_core=config.box.niw_core,
         niv_core=config.box.niv_core,
         niv_full=config.box.niv_full,
@@ -667,56 +692,79 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         symmetrize_orbitals=bool(config.dmft.symmetrize_orbitals),
         do_spectrum_dmft=config.ana_cont.do_spectrum_dmft,
         warm_start=bool(config.self_consistency.previous_sc_path),
+        with_jacobian_tracker=config.stabilization.use_jacobian_stabilization,
     )
+    # the estimates of this call, keyed by the counts, the budgets and the exact-Jacobian flag, which can be disabled
+    estimates: dict = {}
 
-    def node_total(bp: memory_estimator.BranchPeak, distributed: float, single: float, n_ranks: int) -> float:
-        """Memory held on a node with ``n_ranks`` ranks at a branch's peak (see :func:`autodetect_memory_settings`).
-        The branch's node-shared windows are counted once per node instead of once per rank."""
-        total = n_ranks * (bp.baseline + distributed) + single
-        total -= (n_ranks - 1) * bp.giwk_shareable
-        return total
+    def rank_estimate(rank: int, chunk_budgets: memory_estimator.ChunkBudgets) -> dict:
+        """The estimate of ``rank``'s branches at ``chunk_budgets``, shared by every rank with its counts."""
+        key = (counts(rank), chunk_budgets, config.stabilization.use_exact_jacobian)
+        if key not in estimates:
+            estimates[key] = estimate(
+                chunk_budgets=chunk_budgets, rank=rank, with_exact_jacobian=config.stabilization.use_exact_jacobian
+            )
+        return estimates[key]
 
-    def fits_everywhere(bp: memory_estimator.BranchPeak, distributed: float, single: float) -> bool:
-        """Whether a transient (per-rank ``distributed`` + one-off ``single``) fits the node budget on every node."""
-        return all(
-            node_total(bp, distributed, single, r) <= avail * NODE_MEMORY_FRACTION for r, avail in nodes.values()
-        )
+    def node_totals(key: str, chunk_budgets: memory_estimator.ChunkBudgets, grid: bool = False) -> list:
+        """The pairs ``(node total, line)`` of the branch ``key`` on every node (see
+        :func:`dgamore.memory_estimator.node_total`)."""
+        return [
+            (
+                memory_estimator.node_total(
+                    [(n, rank_estimate(rank, chunk_budgets)[key]) for rank, n in groups], holds_rank_zero, grid
+                ),
+                line,
+            )
+            for groups, holds_rank_zero, line in node_groups
+        ]
+
+    def fits_everywhere(key: str, chunk_budgets: memory_estimator.ChunkBudgets, grid: bool = False) -> bool:
+        """Whether the branch ``key`` at ``chunk_budgets`` fits the node budget on every node."""
+        return all(total <= line for total, line in node_totals(key, chunk_budgets, grid))
+
+    def worst(totals: list) -> float:
+        """The node total of the node that overflows its line the most, from the pairs ``(node total, line)``."""
+        return max(totals, key=lambda pair: pair[0] - pair[1])[0]
 
     zero_budgets = memory_estimator.ChunkBudgets(0, 0)
-
-    def branch_total(key: str, budget: int, r: int) -> float:
-        """Node total of the chunked branch ``key`` on an ``r``-rank node at the chunk ``budget``."""
-        bp = estimate(chunk_budgets=dataclasses.replace(zero_budgets, **{key: budget}))[key]
-        return node_total(bp, bp.off_distributed, bp.off_single, r)
 
     def sized_budget(key: str) -> int:
         """Largest per-rank chunk budget of the chunked branch ``key`` that keeps every node inside its line of
         available memory."""
-        if key not in estimate(chunk_budgets=zero_budgets):
+        if key not in rank_estimate(0, zero_budgets):
             return memory_estimator.SLICE_CHUNK_BYTES
         return memory_estimator.max_chunk_budget(
-            lambda budget: all(
-                branch_total(key, budget, r) <= avail * NODE_MEMORY_FRACTION for r, avail in nodes.values()
-            )
+            lambda budget: fits_everywhere(key, dataclasses.replace(zero_budgets, **{key: budget}))
         )
 
     budgets = memory_estimator.ChunkBudgets(sde=sized_budget("sde"), fq=sized_budget("fq"))
-    peaks = estimate(chunk_budgets=budgets)
+    if config.stabilization.use_exact_jacobian:
+        budgets = memory_estimator.exact_jacobian_budgets(
+            lambda trial: fits_everywhere("exact_jacobian", trial), budgets, config.box.niw_core + 1
+        )
+    peaks = rank_estimate(0, budgets)
 
-    def team_need(n_ranks: int) -> float:
-        """Node peak of the team solve's leanest round (one channel's sectors per node), as its planner models it."""
+    def team_need(n_ranks: int, holds_rank_zero: bool) -> float:
+        """Node peak of the team solve's leanest round (one channel's sectors per node), as its planner models it,
+        with rank 0's full-grid interaction on rank 0's node."""
         n_parities = 2 if config.eliashberg.resolve_frequency_parity else 1
-        return n_ranks * peaks["lanczos"].baseline + memory_estimator.lanczos_team_bytes(
-            config.sys.n_bands,
-            config.lattice.k_grid.nk_tot,
-            config.lattice.k_grid.nk_irr,
-            niv_pp,
-            config.eliashberg.n_eig,
-            1,
-            n_parities,
-            n_ranks,
-            eliashberg_solver.wedge_window_points(config.lattice.k_grid),
-            eliashberg_solver.block_size(config.lattice.k_grid),
+        interaction = memory_estimator.interaction_bytes(config.sys.n_bands, nk_tot) if holds_rank_zero else 0.0
+        return (
+            n_ranks * peaks["lanczos"].baseline
+            + interaction
+            + memory_estimator.lanczos_team_bytes(
+                config.sys.n_bands,
+                nk_tot,
+                nk_irr,
+                niv_pp,
+                config.eliashberg.n_eig,
+                1,
+                n_parities,
+                n_ranks,
+                eliashberg_solver.wedge_window_points(config.lattice.k_grid),
+                eliashberg_solver.block_size(config.lattice.k_grid),
+            )
         )
 
     logger.info(f"Auto memory detection (node-total budget): {len(nodes)} node(s).")
@@ -730,27 +778,44 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         f"{budget_label(budgets.fq)}."
     )
 
+    # The exact Jacobian is optional: a job it does not fit runs without it and keeps the tracker's estimate, whose
+    # residents then shrink to the secant tracker's in every other branch.
+    if "exact_jacobian" in peaks:
+        if not fits_everywhere("exact_jacobian", budgets):
+            exact_worst = worst(node_totals("exact_jacobian", budgets))
+            config.stabilization.use_exact_jacobian = False
+            peaks = rank_estimate(0, budgets)
+            logger.warning(
+                f"The exact Jacobian needs {exact_worst / 1024**3:.3f} GB on a node, which exceeds "
+                f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory; it is disabled and jacobian.npz keeps "
+                "the tracker's estimate."
+            )
+        else:
+            logger.info(
+                f"Exact-Jacobian products: chunk budget {budget_label(budgets.exact)} per rank, blocks of "
+                f"{budgets.exact_block}, windows of {budgets.exact_window} bosonic frequencies"
+                + (", local vertices loaded per window" if budgets.exact_vertices_per_window else "")
+                + (", three-leg vertices recomputed per window" if budgets.exact_vrg_per_window else "")
+                + "."
+            )
     # The Schwinger-Dyson contraction always runs the column-distributed real-space path (the q-loop variant is
     # unused - it peaked HIGHER); its single path is still checked so an oversized box fails fast, not mid-run.
     if "sde" in peaks:
-        bp_sde = peaks["sde"]
-        if not fits_everywhere(bp_sde, bp_sde.off_distributed, bp_sde.off_single):
-            worst = max(node_total(bp_sde, bp_sde.off_distributed, bp_sde.off_single, r) for r, *_ in nodes.values())
+        if not fits_everywhere("sde", budgets):
             raise MemoryError(
-                f"The Schwinger-Dyson equation needs {worst / 1024**3:.3f} GB on a node, which exceeds "
+                f"The Schwinger-Dyson equation needs {worst(node_totals('sde', budgets)) / 1024**3:.3f} GB on a node, "
+                "which exceeds "
                 f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory. Use more nodes, fewer ranks per node, a "
                 f"smaller frequency box or k-grid."
             )
     # The local Schwinger-Dyson step runs serially on rank 0 before the loop and has no memory switch either;
     # its single-rank peak is checked so an oversized multi-band box fails fast, not minutes into the run.
     if "local" in peaks:
-        bp_local = peaks["local"]
-        if not fits_everywhere(bp_local, bp_local.off_distributed, bp_local.off_single):
-            worst = max(
-                node_total(bp_local, bp_local.off_distributed, bp_local.off_single, r) for r, *_ in nodes.values()
-            )
+        if not fits_everywhere("local", budgets):
             raise MemoryError(
-                f"The local Schwinger-Dyson step needs {worst / 1024**3:.3f} GB on rank 0's node, which exceeds "
+                f"The local Schwinger-Dyson step needs {worst(node_totals('local', budgets)) / 1024**3:.3f} GB on rank "
+                "0's node, "
+                "which exceeds "
                 f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory. Use a smaller frequency box or fewer bands."
             )
     # Single-path branches: the bubble always runs the FFT evaluation, the pairing vertex the chunked slice build,
@@ -769,15 +834,14 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     for key, label in verify_only:
         if key not in peaks:
             continue
-        bp = peaks[key]
-        fits_in_memory = fits_everywhere(bp, bp.off_distributed, bp.off_single)
+        totals = node_totals(key, budgets)
         if key == "lanczos" and comm.size > 1:
-            fits_in_memory = all(team_need(r) <= avail * NODE_MEMORY_FRACTION for r, avail in nodes.values())
-        fits_grid = key == "lanczos" and fits_everywhere(bp, bp.on_distributed, bp.on_single)
+            totals = [(team_need(len(ranks), 0 in ranks), a * NODE_MEMORY_FRACTION) for ranks, a in nodes.values()]
+        fits_in_memory = all(total <= line for total, line in totals)
+        fits_grid = key == "lanczos" and fits_everywhere(key, budgets, grid=True)
         if not fits_in_memory and not fits_grid:
-            worst = max(node_total(bp, bp.off_distributed, bp.off_single, r) for r, *_ in nodes.values())
             raise MemoryError(
-                f"The {label} needs {worst / 1024**3:.3f} GB on a node, which exceeds "
+                f"The {label} needs {worst(totals) / 1024**3:.3f} GB on a node, which exceeds "
                 f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory. Use more nodes, fewer ranks per node, "
                 f"a smaller frequency box or k-grid."
             )
@@ -791,7 +855,10 @@ def _resolve_option_exclusivity() -> None:
     ``use_chi_phys_restriction`` and the lambda-annealing scaffold - all modify the physical susceptibility and cannot run
     together (a sum-rule calibration must not see a floored or mass-shifted chi, and the two scaffolds would fight).
     Precedence: lambda correction > use_chi_phys_restriction > lambda annealing. Conflicting options are disabled
-    with a warning.
+    with a warning. Separately, ``use_jacobian_stabilization`` cannot run in a one-shot run, i.e. with the one-shot
+    ``perform_lambda_correction`` or with ``max_iter`` 1 (a single iteration has no history), and is disabled with a
+    warning there, and ``use_exact_jacobian`` needs ``use_jacobian_stabilization`` (the exact spectrum is written
+    through the tracker) and is disabled with a warning without it.
 
     :return: None.
     """
@@ -811,6 +878,17 @@ def _resolve_option_exclusivity() -> None:
                 f"'{name}' was enabled together with {kept} - these are mutually exclusive. Keeping {kept} and "
                 f"disabling '{name}'."
             )
+
+    if config.lambda_correction.perform_lambda_correction and config.stabilization.use_jacobian_stabilization:
+        disable_option("use_jacobian_stabilization", "the one-shot lambda correction")
+    if config.self_consistency.max_iter == 1:
+        disable_option("use_jacobian_stabilization", "a one-shot run (max_iter 1)")
+
+    if config.stabilization.use_exact_jacobian and not config.stabilization.use_jacobian_stabilization:
+        config.stabilization.use_exact_jacobian = False
+        config.logger.warning(
+            "'use_exact_jacobian' needs 'use_jacobian_stabilization', which is off; the exact Jacobian is disabled."
+        )
 
     if config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction:
         disable_option("use_chi_phys_restriction", "the lambda correction")

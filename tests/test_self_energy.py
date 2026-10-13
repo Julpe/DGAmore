@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from scipy.integrate import IntegrationWarning
 
+from dgamore import brillouin_zone as bz
 from dgamore import config
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore import self_energy as self_energy_module
@@ -238,6 +239,37 @@ def test_subtracts_self_energy_and_numpy_array_correctly():
     array = np.random.rand(*mat_decompressed.shape)
     result = self_energy - array
     assert np.allclose(result.mat, self_energy.mat - array)
+
+
+@pytest.mark.parametrize("operand", ["complex64 array", "complex128 array", "self-energy of the other layout"])
+def test_in_place_add_returns_self_holding_the_bits_of_the_out_of_place_sum(operand):
+    """add(copy=False) sums into the complex64 array of self and returns self, with the bits of the copy branch."""
+    rng = np.random.default_rng(3)
+    shape = mat_compressed.shape
+    start = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    self_energy = _se(start, nk=nk, has_compressed_q_dimension=True)
+    other = {
+        "complex64 array": (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64),
+        "complex128 array": rng.standard_normal(shape) + 1j * rng.standard_normal(shape),
+        "self-energy of the other layout": _se(
+            rng.standard_normal((*nk, 2, 2, 2 * niv)) + 1j, nk=nk, has_compressed_q_dimension=False
+        ),
+    }[operand]
+    expected = self_energy + other
+    result = self_energy.add(other, copy=False)
+    assert result is self_energy and result.mat is start and start.dtype == np.complex64
+    assert np.array_equal(start, expected.mat)
+
+
+def test_reducing_to_the_irreducible_list_and_unfolding_returns_the_symmetric_self_energy():
+    """On a grid whose irreducible list is not in ascending flat order, reduce and unfold recover the self-energy."""
+    grid = bz.KGrid((6, 6, 1), [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.X_Y_SYM, bz.KnownSymmetries.Y_INV])
+    kx, ky = np.meshgrid(2 * np.pi * np.arange(6) / 6, 2 * np.pi * np.arange(6) / 6, indexing="ij")
+    symmetric = (np.cos(kx) + np.cos(ky) + 0.3 * np.cos(kx) * np.cos(ky))[..., None, None, None, None]
+    sigma = SelfEnergy(np.broadcast_to(symmetric, (6, 6, 1, 1, 1, 4)).astype(np.complex64), (6, 6, 1), beta=10.0)
+    assert np.any(np.diff(grid.irrk_ind) < 0)
+    unfolded = sigma.reduce_q(grid.get_irrq_list()).map_to_full_bz(grid).decompress_q_dimension()
+    assert np.array_equal(unfolded.mat, sigma.mat)
 
 
 def test_interpolate_on_a_subset_of_momenta_gives_exactly_the_rows_of_the_full_interpolation():

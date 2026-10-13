@@ -209,42 +209,38 @@ class SelfEnergy(TwoPoint):
         """
         return self.sub(other)
 
-    def add(self, other) -> "SelfEnergy":
+    def add(self, other, copy: bool = True) -> "SelfEnergy":
         """
         Adds another :class:`SelfEnergy` (momentum dimensions are aligned first) or a numpy array; see :meth:`_add`.
 
         :param other: A :class:`SelfEnergy` or numpy array.
-        :return: A new :class:`SelfEnergy` holding the sum (moments not recomputed).
+        :param copy: If True (default), return a new :class:`SelfEnergy`; if False, add ``other`` into ``self.mat`` in
+            place (it must broadcast to that shape, and the sum is cast to its dtype) and return ``self``.
+        :return: A new :class:`SelfEnergy` holding the sum (moments not recomputed), or ``self`` when ``copy=False``.
         """
-        return self._add(other)
+        return self._add(other, copy=copy)
 
-    def _add(self, other, subtract: bool = False) -> "SelfEnergy":
+    def _add(self, other, subtract: bool = False, copy: bool = True) -> "SelfEnergy":
         """
         Adds another :class:`SelfEnergy` (momentum dimensions are aligned first) or a numpy array.
 
         :param other: A :class:`SelfEnergy` or numpy array.
         :param subtract: If True, subtract ``other`` instead of adding it (used by :meth:`sub` to avoid a negated copy).
-        :return: A new :class:`SelfEnergy` holding the sum (moments not recomputed).
+        :param copy: If True (default), return a new :class:`SelfEnergy`; if False, accumulate into ``self.mat`` in
+            place and return ``self``.
+        :return: A new :class:`SelfEnergy` holding the sum (moments not recomputed), or ``self`` when ``copy=False``.
         :raises ValueError: If ``other`` is neither a :class:`SelfEnergy` nor a numpy array.
         """
         if not isinstance(other, (SelfEnergy, np.ndarray)):
             raise ValueError(f"Can not add {type(other)} to {type(self)}.")
 
         op = np.subtract if subtract else np.add
-
-        if isinstance(other, np.ndarray):
-            return SelfEnergy(
-                op(self.mat, other),
-                self.nq,
-                self.full_niv_range,
-                self.has_compressed_q_dimension,
-                False,
-                beta=self._beta,
-            )
-
-        other = self._align_q_dimensions_for_operations(other)
+        other_mat = other if isinstance(other, np.ndarray) else self._align_q_dimensions_for_operations(other).mat
+        if not copy:
+            op(self.mat, other_mat, out=self.mat)
+            return self
         return SelfEnergy(
-            op(self.mat, other.mat),
+            op(self.mat, other_mat),
             self.nq,
             self.full_niv_range,
             self.has_compressed_q_dimension,

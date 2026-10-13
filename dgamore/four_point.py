@@ -12,6 +12,7 @@ bottleneck of the non-local ladder DGA step, so several variants are provided th
 mirrors the thesis (Chapters 3 & 4).
 """
 
+import contextlib
 import gc
 import warnings
 from collections.abc import Callable, Iterator
@@ -23,7 +24,7 @@ from scipy.linalg import LinAlgWarning
 from dgamore.brillouin_zone import KGrid
 from dgamore.interaction import Interaction, LocalInteraction
 from dgamore.local_four_point import LocalFourPoint
-from dgamore.n_point_base import IAmNonLocal, SpinChannel, FrequencyNotation, DTYPE
+from dgamore.n_point_base import IAmNonLocal, SpinChannel, FrequencyNotation, DTYPE, deferred_collection
 
 
 def _is_complex_symmetric(buf: np.ndarray) -> bool:
@@ -74,6 +75,28 @@ def _factorize_and_solve(buf: np.ndarray, rhs: np.ndarray, symmetric: bool) -> n
         return sytrs(ldu, ipiv, rhs, lower=1)[0]
     lu_and_piv = sp.linalg.lu_factor(buf, overwrite_a=True, check_finite=False)
     return sp.linalg.lu_solve(lu_and_piv, rhs, check_finite=False)
+
+
+def _factorization(buf: np.ndarray, symmetric: bool) -> Callable[[np.ndarray], np.ndarray]:
+    """
+    Factorizes the Fortran-order ``buf`` in place, with the complex-symmetric Bunch-Kaufman factorization (``?sytrf``
+    with the optimal ``lwork``; it reads only the lower triangle) if ``symmetric``, else with an LU, and returns the
+    solve ``rhs -> x`` of ``buf @ x = rhs`` against it (``?sytrs`` or the LU solve). A solve leaves the factorization
+    as it is, so one factorization serves any number of solves.
+
+    :param buf: The square system matrix in Fortran order; overwritten by its factorization.
+    :param symmetric: Whether ``buf`` is factorized as complex-symmetric.
+    :return: The solve.
+    """
+    if symmetric:
+        sytrf, sytrs, sytrf_lwork = sp.linalg.get_lapack_funcs(("sytrf", "sytrs", "sytrf_lwork"), dtype=buf.dtype)
+        lwork = int(sytrf_lwork(buf.shape[0], lower=1)[0].real)
+        ldu, ipiv, info = sytrf(buf, lower=1, lwork=lwork, overwrite_a=1)
+        if info > 0:
+            warnings.warn(f"Diagonal number {info} is exactly zero. Singular matrix.", LinAlgWarning)
+        return lambda rhs: sytrs(ldu, ipiv, rhs, lower=1)[0]
+    lu_and_piv = sp.linalg.lu_factor(buf, overwrite_a=True, check_finite=False)
+    return lambda rhs: sp.linalg.lu_solve(lu_and_piv, rhs, check_finite=False)
 
 
 def _split_pairs(o: int, inactive_pairs: np.ndarray | None) -> tuple[np.ndarray, np.ndarray, bool, tuple]:
@@ -146,6 +169,7 @@ def _summed_slice_solver(
     outs: list[np.ndarray],
     rhs_mats: list[np.ndarray],
     inactive_pairs: np.ndarray | None,
+    slice_rhs: Callable[[int, int], list[np.ndarray]] | None = None,
 ) -> None:
     r"""
     Solves the compound slices one at a time for the :math:`o^2` right-hand sides that select the sum over the last
@@ -159,7 +183,10 @@ def _summed_slice_solver(
     :math:`\nu`, are eliminated one fermionic frequency at a time: ``blocks`` then carry the matrix over the active
     pairs :math:`S = M_{aa} - M_{ai} M_{ii}^{-1} M_{ia}` and the eliminated pairs follow by back-substitution. With
     right-hand-side arrays ``rhs_mats`` (see :func:`_slice_right_hand_sides`) they replace the frequency-sum selector,
-    every member is solved against the slice's one factorization and member ``k`` goes to ``outs[k]``.
+    every member is solved against the slice's one factorization and member ``k`` goes to ``outs[k]``. With
+    ``slice_rhs`` each slice is solved for the selector into ``outs[0]`` first; ``slice_rhs(i, w)``, called right
+    after, returns the slice's own right-hand sides as arrays ``[1, o1, o2, o3, o4, 1, v]``, which are solved against
+    the same factorization, member ``k`` into ``outs[k + 1]`` (appended at the first slice that returns members).
 
     :param slices: The slice generator, called once with ``(buf, pairs)``.
     :param src: The array the slices are built from, ``[q, o1, o2, o3, o4, w, v, ...]``; it fixes the band count,
@@ -168,6 +195,7 @@ def _summed_slice_solver(
     :param rhs_mats: The right-hand-side arrays ``[q, o1, o2, o3, o4, w, v]``, one per system, or empty.
     :param inactive_pairs: Flat indices ``x * o + y`` of the orbital pairs that couple only at equal fermionic
         frequency, or None.
+    :param slice_rhs: The callable ``(i, w) -> list`` of the per-slice right-hand sides, or None.
     """
     o, vn, dtype = src.shape[1], src.shape[6], src.dtype
     pairs, inactive, eliminate, index = _split_pairs(o, inactive_pairs)
@@ -183,6 +211,43 @@ def _summed_slice_solver(
         rhs_act[np.arange(n_p), :, pairs] = 1.0
         rhs_ina = np.zeros((vn, inactive.size, o * o), dtype=dtype)
         rhs_ina[:, np.arange(inactive.size), inactive] = 1.0
+
+    if slice_rhs is not None:
+        for i, w, diag, fill in slices(buf, pairs):
+            if eliminate:
+                d_ii, d_ia, d_ai, d_aa = _pair_blocks(diag, index)
+                y_a = np.linalg.solve(d_ii, d_ia)
+                symmetric = fill(d_aa - d_ai @ y_a)
+            else:
+                symmetric = fill(_diagonal_blocks(diag))
+            solve = _factorization(buf, symmetric)
+
+            def solve_into(b: np.ndarray | None, targets: list[np.ndarray]) -> None:
+                """Solves for ``b`` (None: the selector) and writes member ``k`` of the solution to ``targets[k]``."""
+                if not eliminate:
+                    solution = solve(selector if b is None else b)
+                else:
+                    if b is None:
+                        b_act, b_ina = rhs_act, rhs_ina
+                    else:
+                        rows = b.reshape(o * o, vn, -1)
+                        b_act, b_ina = rows[pairs], rows[inactive].transpose(1, 0, 2)
+                    y_r = np.linalg.solve(d_ii, b_ina)
+                    rhs = (b_act - (d_ai @ y_r).transpose(1, 0, 2)).reshape(n_p * vn, -1)
+                    x_act = solve(rhs).reshape(n_p, vn, -1)
+                    solution = np.empty((o * o, vn, x_act.shape[-1]), dtype=dtype)
+                    solution[pairs] = x_act
+                    solution[inactive] = (y_r - y_a @ x_act.transpose(1, 0, 2)).transpose(1, 0, 2)
+                for out, part in zip(targets, np.moveaxis(solution.reshape(o, o, vn, len(targets), o, o), 3, 0)):
+                    out[i, :, :, :, :, w] = part.transpose(0, 1, 4, 3, 2)
+
+            solve_into(None, outs[:1])
+            members = slice_rhs(i, w)
+            if members:
+                if len(outs) == 1:
+                    outs += [np.empty_like(outs[0]) for _ in members]
+                solve_into(_slice_right_hand_sides(members, 0, 0, dtype), outs[1:])
+        return
 
     for i, w, diag, fill in slices(buf, pairs):
         b = _slice_right_hand_sides(rhs_mats, i, w, dtype)
@@ -1068,7 +1133,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
         return FourPoint(result_mat, self.channel, self.nq, 1, 2, False, True, True, self.frequency_notation)
 
-    def matmul(self, other, left_hand_side: bool = True) -> "FourPoint":
+    def matmul(self, other, left_hand_side: bool = True, copy: bool = True, per_wn: bool = False) -> "FourPoint":
         """
         Matrix-multiplies this object with a FourPoint, LocalFourPoint, Interaction or LocalInteraction operand. How
         the product is wired depends on the frequency and momentum dimensions of the two operands. einsum is
@@ -1079,11 +1144,20 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, or :class:`LocalInteraction`.
             Local operands are broadcast over the momentum axis.
         :param left_hand_side: If True, compute ``self @ other``; if False, compute ``other @ self``.
-        :return: A new :class:`FourPoint` in the half bosonic frequency range, carrying the non-NONE channel and the
-            :attr:`~dgamore.n_point_base.IHaveChannel.frequency_notation` of ``self``. All branches contract in
-            the compound space of that notation (ph: rows {1,2,v}, cols {4,3,v'}; pp: rows {1,3,v}, cols
+        :param copy: If True, return the product as a new object; if False, write it into this object's array in place
+            and return ``self`` (only for an interaction or an operand with fewer than two fermionic frequency axes
+            whose product has this object's shape).
+        :param per_wn: Whether a product with an interaction operand takes the bosonic frequency as a batch index,
+            the interaction broadcast over it: each frequency's product then is its own matrix product and does not
+            depend on the other frequencies the object holds (one band multiplies elementwise and needs no batch
+            index). Products with the other operand types treat the bosonic frequency as a batch index already and
+            ignore it.
+        :return: A new :class:`FourPoint` (or ``self``) in the half bosonic frequency range, carrying the non-NONE
+            channel and the :attr:`~dgamore.n_point_base.IHaveChannel.frequency_notation` of ``self``. All branches
+            contract in the compound space of that notation (ph: rows {1,2,v}, cols {4,3,v'}; pp: rows {1,3,v}, cols
             {4,2,v'}; see :meth:`to_compound_indices`).
-        :raises ValueError: If ``other`` has an unsupported type, or if the operands' frequency notations differ.
+        :raises ValueError: If ``other`` has an unsupported type, if the operands' frequency notations differ, or if
+            ``copy=False`` asks for a product of another shape than this object's.
         """
         if not isinstance(other, (FourPoint, LocalFourPoint, Interaction, LocalInteraction)):
             raise ValueError(f"Multiplication {type(self)} @ {type(other)} not supported.")
@@ -1103,18 +1177,22 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
                 else ("afce", "ebfd", "abcd")
             )
             suffix = {0: "w", 1: "wv", 2: "wvp"}.get(self.num_vn_dimensions, "")
+            # one band multiplies elementwise, so its frequencies keep their bits without the batch index
+            batch_w = "w" if per_wn and self.num_wn_dimensions == 1 and self.n_bands > 1 else ""
             einsum_str = (
-                f"q{left_orbs}{suffix},{q_prefix}{right_orbs}->q{final_orbs}{suffix}"
+                f"q{left_orbs}{suffix},{q_prefix}{right_orbs}{batch_w}->q{final_orbs}{suffix}"
                 if left_hand_side
-                else f"{q_prefix}{left_orbs},q{right_orbs}{suffix}->q{final_orbs}{suffix}"
+                else f"{q_prefix}{left_orbs}{batch_w},q{right_orbs}{suffix}->q{final_orbs}{suffix}"
             )
-
+            u = other.mat
+            if batch_w:
+                u = np.broadcast_to(u[..., None], u.shape + (self.mat.shape[-1 - self.num_vn_dimensions],))
+            operands = (self.mat, u) if left_hand_side else (u, self.mat)
+            if not copy:
+                np.einsum(einsum_str, *operands, out=self.mat, optimize=True)
+                return self
             return FourPoint(
-                (
-                    np.einsum(einsum_str, self.mat, other.mat, optimize=True)
-                    if left_hand_side
-                    else np.einsum(einsum_str, other.mat, self.mat, optimize=True)
-                ),
+                np.einsum(einsum_str, *operands, optimize=True),
                 self.channel,
                 self.nq,
                 self.num_wn_dimensions,
@@ -1153,12 +1231,17 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
                 else f"{q_prefix}{left_orbs}{suffix_other},q{right_orbs}{suffix_self}->q{final_orbs}{suffix_result}"
             )
 
+            operands = (self.mat, other.mat) if left_hand_side else (other.mat, self.mat)
+            if not copy:
+                if suffix_result != suffix_self:
+                    raise ValueError(
+                        "An in-place product (copy=False) must have the shape of the object it is written to."
+                    )
+                np.einsum(einsum_str, *operands, out=self.mat, optimize=True)
+                self.channel = channel
+                return self
             return FourPoint(
-                (
-                    np.einsum(einsum_str, self.mat, other.mat, optimize=True)
-                    if left_hand_side
-                    else np.einsum(einsum_str, other.mat, self.mat, optimize=True)
-                ),
+                np.einsum(einsum_str, *operands, optimize=True),
                 channel,
                 self.nq,
                 self.num_wn_dimensions,
@@ -1168,6 +1251,9 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
                 self.has_compressed_q_dimension,
                 self.frequency_notation,
             )
+
+        if not copy:
+            raise ValueError("An in-place product (copy=False) must have the shape of the object it is written to.")
 
         is_self_full_niw_range = self.full_niw_range
         is_other_full_niw_range = other.full_niw_range
@@ -1391,7 +1477,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         beta: float,
         inactive_pairs: np.ndarray | None = None,
         rhs: "list[FourPoint] | None" = None,
-    ) -> "FourPoint | list[FourPoint]":
+        slice_rhs: "Callable[[int, int, FourPoint], list[FourPoint]] | None" = None,
+    ) -> "FourPoint | list[FourPoint] | tuple[FourPoint, list[FourPoint]]":
         r"""
         Returns the sum over the last fermionic frequency of the inverse of the matrix with this object on the
         fermionic frequency diagonal plus a momentum-independent kernel,
@@ -1422,6 +1509,16 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         the :math:`1/\beta` of the sum, all members against the slice's one factorization, bit for bit what
         :meth:`invert_and_sum_over_last_vn_v2` gives for them on the assembled matrix.
 
+        With ``slice_rhs`` (``rhs`` None) one factorization per slice serves both: the slice is solved for the sum
+        first, which ``slice_rhs(i, w, total)`` then receives as a one-momentum, one-frequency :class:`FourPoint`
+        (``i`` and ``w`` the momentum and bosonic index of the slice in this object), and the right-hand sides it
+        returns, one-momentum, one-frequency objects in the layout of ``total``, are solved as with ``rhs``. The sum
+        and the solutions have the bits of a call without ``slice_rhs`` and of one with the same right-hand sides as
+        ``rhs``. ``total`` views the result, so ``slice_rhs`` must not write to it. Beyond those of the summed solve
+        only one slice's right-hand sides and solutions are alive at a time, and the objects ``slice_rhs`` creates
+        are released without a garbage-collector sweep per slice (see
+        :func:`~dgamore.n_point_base.deferred_collection`).
+
         :param kernel: The momentum-independent two-fermion kernel :math:`K` on the fermionic box of this object (full
             or half bosonic range; read via a half-range view).
         :param shift: The frequency-independent shift :math:`C`.
@@ -1431,28 +1528,42 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             vanish, or None.
         :param rhs: Right-hand sides in the layout of the result, ``[q, o1, o2, o3, o4, w, v]`` (compressed
             momenta, half niw range), one object per system, or None for the sum over the last fermionic frequency.
+        :param slice_rhs: The callable ``(i, w, total) -> list[FourPoint]`` that returns the right-hand sides of
+            slice ``(i, w)`` from its sum ``total``, or None.
         :return: The sum as a new one-fermion :class:`FourPoint` in the channel of ``kernel`` (half niw range,
-            compressed momenta, stored in the memory layout of this object's array), or with ``rhs`` the solutions as
-            a list of such objects, one per member; ``self`` is brought to the half niw range and compressed momenta
-            in place.
+            compressed momenta, stored in the memory layout of this object's array), with ``rhs`` the solutions as
+            a list of such objects, one per member, or with ``slice_rhs`` the tuple ``(sum, solutions)``; ``self`` is
+            brought to the half niw range and compressed momenta in place.
         """
         diagonal = self.to_half_niw_range().compress_q_dimension().mat  # [q, o1, o2, o3, o4, w, v]
         rhs_mats = [] if rhs is None else [b.to_half_niw_range().compress_q_dimension().mat for b in rhs]
         # this object's memory layout, which fixes the bits of later frequency sums
         outs = [np.empty_like(diagonal) for _ in range(max(len(rhs_mats), 1))]
-        _summed_slice_solver(
-            lambda buf, pairs: _local_kernel_slices(diagonal, kernel, shift, scale, 0, buf, pairs),
-            diagonal,
-            outs,
-            rhs_mats,
-            inactive_pairs,
-        )
 
-        if rhs is None:
+        def hook(i: int, w: int) -> list[np.ndarray]:
+            """Scales the slice's selector solution into its sum and returns the arrays of its right-hand sides."""
+            total = outs[0][i : i + 1, :, :, :, :, w : w + 1]
+            total /= beta
+            obj = FourPoint(total, kernel.channel, (1, 1, 1), 1, 1, False, has_compressed_q_dimension=True)
+            return [b.mat for b in slice_rhs(i, w, obj)]
+
+        with deferred_collection() if slice_rhs else contextlib.nullcontext():
+            _summed_slice_solver(
+                lambda buf, pairs: _local_kernel_slices(diagonal, kernel, shift, scale, 0, buf, pairs),
+                diagonal,
+                outs,
+                rhs_mats,
+                inactive_pairs,
+                None if slice_rhs is None else hook,
+            )
+
+        if rhs is None and slice_rhs is None:
             outs[0] /= beta
         results = [
             FourPoint(out, kernel.channel, self.nq, 1, 1, False, has_compressed_q_dimension=True) for out in outs
         ]
+        if slice_rhs is not None:
+            return results[0], results[1:]
         return results[0] if rhs is None else results
 
     def invert_on_anti_diagonal(

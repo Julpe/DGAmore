@@ -57,6 +57,9 @@ from dgamore.symmetry_reduction import (
     point_group_orbits,
 )
 
+EVEN_SECTOR_DEGENERACY = 1e-2  # largest relative difference of the leading singlet-even and triplet-even eigenvalues
+# at which even_sectors_degenerate reports them as coinciding
+
 
 def delete_files(filepath: str, *args) -> None:
     """
@@ -715,6 +718,23 @@ def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
 
 
 # --- Physical-gap symmetry sectors (frequency parity + forced momentum/orbital parity) ---
+def even_sectors_degenerate(results: dict) -> bool:
+    """
+    Returns whether the leading singlet-even and triplet-even eigenvalues agree to the relative tolerance
+    ``EVEN_SECTOR_DEGENERACY``, i.e. to 1 %. False when either sector was not solved (no frequency-parity resolution, or
+    no converged eigenvalue).
+
+    :param results: The solver output ``{(channel, parity): (lambdas, gaps)}``.
+    :return: Whether the two leading even eigenvalues coincide.
+    """
+    leading = []
+    for channel in (SpinChannel.SING, SpinChannel.TRIP):
+        if (channel, "even") not in results or len(results[(channel, "even")][0]) == 0:
+            return False
+        leading.append(float(np.max(np.asarray(results[(channel, "even")][0]).real)))
+    return abs(leading[0] - leading[1]) <= EVEN_SECTOR_DEGENERACY * max(abs(leading[0]), abs(leading[1]))
+
+
 def _frequency_parity_sectors(resolve_frequency_parity: bool) -> list[tuple[str, int | None]]:
     r"""
     Returns the list of gap sectors to solve, each a ``(label, eps_T)`` pair where ``eps_T`` is the requested
@@ -2715,7 +2735,7 @@ def solve(
     giwk_dga: GreensFunction | None,
     g_dmft: GreensFunction,
     u_loc: LocalInteraction,
-    v_nonloc: Interaction,
+    v_nonloc: Interaction | None,
     comm: MPI.Comm,
     chunk_budgets: memory_estimator.ChunkBudgets | None = None,
 ):
@@ -2731,7 +2751,7 @@ def solve(
         there is its only reader); ``None`` on every other rank.
     :param g_dmft: The local (DMFT) :class:`GreensFunction` (used for the local diagrams).
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` on the full q-grid; only read on rank 0.
     :param comm: The MPI communicator.
     :param chunk_budgets: Chunk byte budgets sized by the driver from the memory estimate, of which the pairing-vertex
         budget is used; ``None`` gives the fair-share budget of
@@ -2748,10 +2768,7 @@ def solve(
     mpi_dist_irrk = MpiDistributor.create_distributor(
         ntasks=config.lattice.k_grid.nk_irr, comm=comm, name="Q", output_path=config.output.output_path
     )
-    irrk_q_list = config.lattice.k_grid.get_irrq_list()
-    my_irr_q_list = irrk_q_list[mpi_dist_irrk.my_slice]
-
-    v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
+    v_nonloc = nonlocal_sde.scatter_irreducible_interaction(v_nonloc, mpi_dist_irrk)
 
     parities = [parity for parity, _ in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)]
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
