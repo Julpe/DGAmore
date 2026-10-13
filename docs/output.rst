@@ -69,8 +69,8 @@ reads off the stored (full-box) first axis via the compound symmetry
 :math:`F^{\omega\nu\nu'}_{1234} = F^{\omega\nu'\nu}_{4321}` of the symmetrized local vertex.
 
 **Data type.** The n-point objects store their array as ``complex64`` to save memory, and the files inherit that
-data type. The few purely real outputs (the chemical-potential history and the spectral functions) are stored as
-``float64`` and ``float32`` respectively.
+data type, as does the Hermitian orbital spectral matrix. The few purely real outputs (the chemical-potential history
+and the band-resolved spectral functions) are stored as ``float64`` and ``float32`` respectively.
 
 Reading a quantity back
 -----------------------
@@ -380,13 +380,22 @@ The analytic continuation and a few diagnostics do not follow the n-point layout
      - Quantity
      - Array layout
    * - ``spectral_function_dga.npy``
-     - DΓA spectral function :math:`A(\mathbf{k}, \omega)` in the full Brillouin zone, ``float32``
-       (written when ``do_spectrum_dga`` is enabled)
+     - Band-resolved DΓA spectral function :math:`A(\mathbf{k}, \omega)`, the diagonal in the eigenbasis of
+       :math:`H(\mathbf{k})`, in the full Brillouin zone, ``float32`` (written when ``do_spectrum_dga`` is enabled)
      - ``[nkx, nky, nkz, no, w_count]``
    * - ``spectral_function_dmft.npy``
      - DMFT spectral function on the same real-frequency grid and in the same momentum layout
        (written when ``do_spectrum_dmft`` is enabled)
      - ``[nkx, nky, nkz, no, w_count]``
+   * - ``spectral_function_matrix_dga.npy``
+     - DΓA orbital spectral matrix :math:`A_{12}(\mathbf{k}, \omega)`, off-diagonal elements included, in the
+       irreducible Brillouin zone in the order of ``k_grid.irrk_ind``, ``complex64``; per momentum and frequency its
+       negative eigenvalues are cut and the rest rescaled to the band-resolved trace (written when
+       ``do_spectrum_dga`` is enabled)
+     - ``[nk_irr, no, no, w_count]``
+   * - ``spectral_function_matrix_dmft.npy``
+     - DMFT orbital spectral matrix in the same layout (written when ``do_spectrum_dmft`` is enabled)
+     - ``[nk_irr, no, no, w_count]``
    * - ``oz_coeff.txt``
      - Ornstein-Zernike fit of the magnetic susceptibility, one line per orbital combination with the columns
        ``o1 o2 o3 o4 A xi``
@@ -397,3 +406,14 @@ The analytic continuation and a few diagnostics do not follow the n-point layout
    * - ``gap_parity.txt``
      - One line per saved gap function with its wave-symmetry label and the measured parity expectation values
      - text
+
+The orbital spectral matrix keeps the irreducible zone of the four-point quantities and unfolds the same way, through
+:meth:`~dgamore.two_point.TwoPoint.map_to_full_bz` on the run's grid (see above), which also rotates the orbitals of
+symmetry-related momenta:
+
+.. code-block:: python
+
+   from dgamore.two_point import TwoPoint
+
+   a_matrix = TwoPoint.load(f"{run}/spectral_function_matrix_dga.npy", nk, has_compressed_q_dimension=True)
+   a_matrix = a_matrix.map_to_full_bz(k_grid).decompress_q_dimension().mat  # [nkx, nky, nkz, no, no, w_count]
