@@ -415,7 +415,7 @@ class LocalNPoint(IHaveMat):
         self._full_niw_range = False
         return self
 
-    def take_wn_slice(self, start: int, stop: int):
+    def take_wn_slice(self, start: int, stop: int, copy: bool = True):
         r"""
         Returns a **new** object restricted to the bosonic index window ``[start, stop)`` of a half (positive)
         bosonic range object, i.e. to :math:`\omega = \mathrm{start}, \ldots, \mathrm{stop}-1`. Lets a caller walk the
@@ -426,6 +426,8 @@ class LocalNPoint(IHaveMat):
 
         :param start: First bosonic index of the window.
         :param stop: One past the last bosonic index of the window.
+        :param copy: Whether the new object holds a copy (default, so it does not keep the parent array alive) or a
+            view of the parent's array, for a caller that keeps the parent anyway.
         :return: A new object holding that bosonic window (orbital, fermionic and momentum layout unchanged).
         :raises ValueError: If the object has no bosonic frequency dimension, or is not in the half niw range.
         """
@@ -441,7 +443,7 @@ class LocalNPoint(IHaveMat):
         slicer = [slice(None)] * self.mat.ndim
         slicer[axis] = slice(start, stop)
         result = self._clone_without_mat()
-        result.mat = self.mat[tuple(slicer)].copy()
+        result.mat = self.mat[tuple(slicer)].copy() if copy else self.mat[tuple(slicer)]
         result.update_original_shape()
         return result
 

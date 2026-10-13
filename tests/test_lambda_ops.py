@@ -549,3 +549,245 @@ def test_find_lambda_matrix_ibz_resident_matches_full_bz_reference(auto):
 
     assert np.allclose(lam_ibz, lam_reference, atol=1e-5 if auto else 1e-10)
     assert np.allclose(lam_ibz, lambda_star, atol=1e-4)
+
+
+def _sum_rule_config(monkeypatch) -> MagicMock:
+    """Configures the 4x4x1 irreducible wedge and the beta the sum-rule tests solve on, returning the mocked logger."""
+    config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    config.sys.beta = 12.5
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    return config.logger
+
+
+def _spch_perform_config(monkeypatch) -> MagicMock:
+    """Configures the spch environment of perform (wedge, beta, the folder with the saved local sum-rule targets)."""
+    logger = _sum_rule_config(monkeypatch)
+    config.lambda_correction.type = "spch"
+    config.output.output_path = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/lambda_correction/spch"
+    return logger
+
+
+def _healthy_chi_qw() -> np.ndarray:
+    """An everywhere-positive susceptibility on the 4x4x1 wedge, peaked at w = 0, shape [q, w]."""
+    return (np.linspace(0.13, 0.02, 6)[:, None] * np.array([0.2, 0.5, 1.0, 0.5, 0.2])[None, :]).astype(np.complex64)
+
+
+def _sum_rule_value(chi_r_mat: np.ndarray, lambda_: float) -> complex:
+    """The momentum- and frequency-summed corrected susceptibility, i.e. the left-hand side of the sum rule."""
+    chi_lam = LambdaCorrection.apply_lambda(chi_r_mat.astype(np.complex128), lambda_)
+    return (config.lattice.k_grid.irrk_count[:, None] * chi_lam).sum() / config.sys.beta / config.lattice.k_grid.nk_tot
+
+
+def test_lambda_branch_of_a_positive_susceptibility_is_the_static_bound_and_infinity():
+    """An everywhere-positive susceptibility places no pole above its static bound, so the branch is open upward."""
+    chi = _healthy_chi_qw()
+
+    lambda_lo, lambda_hi = LambdaCorrection.get_lambda_branch(chi)
+
+    assert np.allclose(lambda_lo, LambdaCorrection.get_lambda_start(chi), atol=1e-6)
+    assert np.allclose(lambda_lo, -1.0 / 0.13, atol=1e-5) and lambda_hi == np.inf
+
+
+def test_lambda_branch_closes_at_the_next_pole_above_the_static_bound():
+    """The -3.25 entry at w1 closes the branch, while the near-zero negative tail entries leave it far above."""
+    chi = _healthy_chi_qw()
+    chi[0, 1] = -3.25
+    chi[1:, 0] = -1e-4
+
+    lambda_lo, lambda_hi = LambdaCorrection.get_lambda_branch(chi)
+
+    assert np.allclose(lambda_lo, LambdaCorrection.get_lambda_start(chi), atol=1e-6)
+    assert np.allclose(lambda_hi, 1.0 / 3.25, atol=1e-6)
+
+
+def test_lambda_branch_starts_at_the_pole_of_a_finite_frequency_entry_above_the_static_maximum():
+    """A positive chi(q, w1) above max_q chi(q, 0) lifts the lower end of the branch to its own pole -1/chi."""
+    chi = _healthy_chi_qw()
+    chi[2, [1, 3]] = 0.2
+
+    lambda_lo, lambda_hi = LambdaCorrection.get_lambda_branch(chi)
+
+    assert LambdaCorrection.get_lambda_start(chi) < -6.0
+    assert np.allclose(lambda_lo, -1.0 / 0.2, atol=1e-6) and lambda_hi == np.inf
+
+
+def test_find_lambda_bounded_finds_the_same_root_as_find_lambda_on_a_healthy_susceptibility(monkeypatch):
+    """On an everywhere-positive susceptibility the bracketed search and the Newton search find the same lambda."""
+    _sum_rule_config(monkeypatch)
+    chi = _healthy_chi_qw()
+    target = _sum_rule_value(chi, 2.0)
+
+    lambda_bounded, _ = LambdaCorrection.find_lambda_bounded(chi, target)
+
+    assert np.allclose(lambda_bounded, LambdaCorrection.find_lambda(chi, target), atol=1e-6)
+    assert np.allclose(_sum_rule_value(chi, lambda_bounded), target, atol=1e-7)
+
+
+def test_find_lambda_bounded_reproduces_the_newton_root_on_the_test_susceptibility(monkeypatch):
+    """On the shipped susceptibility the anchored branch carries the Newton root and the bracketed search finds it."""
+    logger = _sum_rule_config(monkeypatch)
+    chi = load_four_point("spch", "chi_phys_q_magn_before_lambda", SpinChannel.MAGN).to_full_niw_range()
+    chi_mat = chi.compress_q_dimension().mat.squeeze()
+    chi_loc = load_local_four_point("spch", "chi_magn_loc", SpinChannel.MAGN).to_full_niw_range()
+    target = chi_loc.mat.sum() / config.sys.beta
+    lambda_newton = LambdaCorrection.find_lambda(chi_mat, target)
+
+    lambda_bounded, is_fallback = LambdaCorrection.find_lambda_bounded(chi_mat, target)
+
+    assert np.allclose(LambdaCorrection.get_lambda_branch(chi_mat), (4.104309, 4.403052), atol=1e-6)
+    assert np.allclose(lambda_bounded, lambda_newton, atol=1e-6) and np.allclose(lambda_bounded, 4.328781, atol=1e-6)
+    assert np.allclose(_sum_rule_value(chi_mat, lambda_bounded), target, atol=1e-7)
+    assert logger.warning.call_count == 0 and not is_fallback
+
+
+def test_find_lambda_bounded_converges_with_a_negative_finite_frequency_entry(monkeypatch):
+    """A negative chi at w1 closes the branch above the static bound and the search recovers the target's lambda."""
+    _sum_rule_config(monkeypatch)
+    chi = _healthy_chi_qw()
+    chi[0, 1] = -3.25
+    chi[1:, 0] = -1e-4
+    target = _sum_rule_value(chi, 0.2)
+    lambda_lo, lambda_hi = LambdaCorrection.get_lambda_branch(chi)
+
+    lambda_bounded, _ = LambdaCorrection.find_lambda_bounded(chi, target)
+
+    assert np.allclose((lambda_lo, lambda_hi), (LambdaCorrection.get_lambda_start(chi), 1.0 / 3.25), atol=1e-6)
+    assert lambda_lo < lambda_bounded < lambda_hi and np.allclose(lambda_bounded, 0.2, atol=1e-6)
+    assert np.allclose(_sum_rule_value(chi, lambda_bounded), target, atol=1e-7)
+
+
+def test_find_lambda_bounded_keeps_chi_positive_when_chi_at_w1_exceeds_the_static_maximum(monkeypatch):
+    """With chi(q, w1) above max_q chi(q, 0) the cold and warm-started searches return the root above its pole."""
+    _sum_rule_config(monkeypatch)
+    chi = _healthy_chi_qw()
+    chi[2, [1, 3]] = 0.2
+    target = _sum_rule_value(chi, -2.0)
+
+    for previous in (None, -6.0, -1.0, 3.0):
+        result, is_fallback = LambdaCorrection.find_lambda_bounded(chi, target, previous)
+        assert np.allclose(result, -2.0, atol=1e-6) and not is_fallback
+        assert LambdaCorrection.apply_lambda(chi.astype(np.complex128), result).real.min() > 0.0
+
+
+def test_find_lambda_bounded_on_the_shipped_density_chi_keeps_its_positive_entries_positive(monkeypatch):
+    """The shipped density chi tops its static maximum at finite w, and the root found keeps those entries positive."""
+    _sum_rule_config(monkeypatch)
+    chi = load_four_point("spch", "chi_phys_q_dens_before_lambda", SpinChannel.DENS).to_full_niw_range()
+    chi_mat = chi.compress_q_dimension().mat.squeeze()
+    chi_loc = load_local_four_point("spch", "chi_dens_loc", SpinChannel.DENS).to_full_niw_range()
+    target = chi_loc.mat.sum() / config.sys.beta
+
+    lambda_bounded, is_fallback = LambdaCorrection.find_lambda_bounded(chi_mat, target)
+
+    corrected = LambdaCorrection.apply_lambda(chi_mat.astype(np.complex128), lambda_bounded)
+    assert np.allclose(LambdaCorrection.get_lambda_branch(chi_mat), (-2.828323, 0.620394), atol=1e-6)
+    assert np.allclose(lambda_bounded, -1.214291, atol=1e-6) and not is_fallback
+    assert np.all(corrected.real[chi_mat.real > 0.0] > 0.0) and config.logger.warning.call_count == 0
+
+
+def test_find_lambda_bounded_warm_start_returns_the_same_root(monkeypatch):
+    """A previous lambda inside or outside the branch halves the bracket without moving the root."""
+    _sum_rule_config(monkeypatch)
+    chi = _healthy_chi_qw()
+    target = _sum_rule_value(chi, 2.0)
+    root, _ = LambdaCorrection.find_lambda_bounded(chi, target)
+
+    for previous in (root + 0.5, root - 0.5, -100.0):
+        result, _ = LambdaCorrection.find_lambda_bounded(chi, target, previous)
+        assert np.allclose(result, root, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "previous, expected, message", [(None, 0.0, "zero (no correction)"), (0.5, 0.5, "previous iteration's lambda")]
+)
+def test_find_lambda_bounded_without_a_sign_change_keeps_a_genuine_previous_lambda_or_zero_inside_the_branch(
+    monkeypatch, previous, expected, message
+):
+    """An unreachable target falls back to a genuine previous lambda inside the branch, else to zero, and warns."""
+    logger = _sum_rule_config(monkeypatch)
+    chi = _healthy_chi_qw()
+
+    result, is_fallback = LambdaCorrection.find_lambda_bounded(chi, 1e12 + 0j, previous)
+
+    assert result == expected and is_fallback
+    assert message in logger.warning.call_args_list[0].args[0]
+
+
+def test_find_lambda_bounded_without_a_sign_change_and_no_previous_keeps_lower_end_plus_delta_above_zero(monkeypatch):
+    """An unreachable target on a branch entirely above zero falls back to the lower end plus delta."""
+    logger = _sum_rule_config(monkeypatch)
+    chi = _healthy_chi_qw()
+    chi[0, 2] = -0.05
+
+    result, is_fallback = LambdaCorrection.find_lambda_bounded(chi, 1e12 + 0j)
+
+    lambda_lo, lambda_hi = LambdaCorrection.get_lambda_branch(chi)
+    assert lambda_lo > 0.0 and lambda_hi == np.inf
+    assert np.isclose(result, lambda_lo + 0.1, atol=1e-6) and is_fallback
+    assert "lower end plus delta" in logger.warning.call_args_list[0].args[0]
+
+
+def test_find_lambda_bounded_gives_up_after_the_bracket_doublings_on_an_open_branch(monkeypatch):
+    """A residual that never turns negative on an open branch exhausts the doublings and takes the no-root fallback."""
+    logger = _sum_rule_config(monkeypatch)
+    chi = _healthy_chi_qw()
+
+    with monkeypatch.context() as mp:
+        mp.setattr(LambdaCorrection, "_MAX_BRACKET_DOUBLINGS", 5)
+        result, is_fallback = LambdaCorrection.find_lambda_bounded(chi, -1.0 + 0.0j)
+
+    assert result == 0.0 and is_fallback
+    warnings = [call.args[0] for call in logger.warning.call_args_list]
+    assert len(warnings) == 2 and "could not bracket the sum-rule root" in warnings[0]
+    assert "keeping zero (no correction)" in warnings[1]
+
+
+def test_perform_single_never_stores_a_fallback_lambda_as_the_previous_one(monkeypatch):
+    """A fallback value returned by the bounded finder is applied but never replaces the channel's stored lambda."""
+    _spch_perform_config(monkeypatch)
+    chi = load_four_point("spch", "chi_phys_q_magn_before_lambda", SpinChannel.MAGN)
+    bounded = MagicMock(return_value=(2.0, True))
+    lambda_previous = {"magn": 0.7}
+
+    with monkeypatch.context() as mp:
+        mp.setattr(LambdaCorrection, "find_lambda_bounded", bounded)
+        _, lambda_r = LambdaCorrection.perform_single(chi, 0.1 + 0.0j, lambda_previous)
+
+    assert lambda_r == 2.0 and bounded.call_args.args[2] == 0.7
+    assert lambda_previous == {"magn": 0.7}
+
+
+def test_find_lambda_bounded_falls_back_to_the_branch_midpoint_when_the_previous_lambda_is_outside_it(monkeypatch):
+    """A previous lambda past the pole on a branch narrower than delta falls back to the branch midpoint."""
+    logger = _sum_rule_config(monkeypatch)
+    chi = np.full((6, 3), 0.3, dtype=np.complex128)
+    chi[:, 1] = 0.5
+    chi[5, 1] = -0.2
+    chi[0, 0] = -1.0 / 5.05
+    lambda_lo, lambda_hi = LambdaCorrection.get_lambda_branch(chi)
+
+    result, is_fallback = LambdaCorrection.find_lambda_bounded(chi, -1e6 + 0j, lambda_previous=100.0)
+
+    assert np.isclose(lambda_hi - lambda_lo, 0.05, atol=1e-6)
+    assert np.isclose(result, 0.5 * (lambda_lo + lambda_hi), atol=1e-4) and is_fallback
+    assert "branch midpoint" in logger.warning.call_args_list[0].args[0]
+
+
+@pytest.mark.parametrize("per_iteration", [False, True], ids=["one_shot", "per_iteration"])
+def test_perform_routes_the_one_shot_to_find_lambda_and_the_per_iteration_path_to_the_bounded_finder(
+    monkeypatch, per_iteration
+):
+    """The one-shot correction keeps the Newton search; a previous-lambda dict routes it to the bracketed search."""
+    _spch_perform_config(monkeypatch)
+    chi = load_four_point("spch", "chi_phys_q_magn_before_lambda", SpinChannel.MAGN)
+    plain, bounded = MagicMock(return_value=1.0), MagicMock(return_value=(2.0, False) if per_iteration else 2.0)
+    kwargs = {"lambda_previous": {}} if per_iteration else {}
+
+    with monkeypatch.context() as mp:
+        mp.setattr(LambdaCorrection, "find_lambda", plain)
+        mp.setattr(LambdaCorrection, "find_lambda_bounded", bounded)
+        LambdaCorrection.perform(chi, quiet=True, **kwargs)
+
+    assert (plain.call_count, bounded.call_count) == ((0, 1) if per_iteration else (1, 0))
+    if per_iteration:
+        assert bounded.call_args.args[2] is None and kwargs["lambda_previous"] == {"magn": 2.0}

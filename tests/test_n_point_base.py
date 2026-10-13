@@ -6,6 +6,7 @@
 
 import os
 import sys
+import threading
 import tracemalloc
 import types
 from unittest.mock import MagicMock
@@ -1727,13 +1728,12 @@ def test_reduce_q_does_not_mutate_self_and_owns_result():
     assert np.allclose(reduced.mat, [mat[1, 1, 1], mat[2, 2, 2]])
 
 
-def test_reduce_q_selects_in_ascending_flat_order_regardless_of_input_order():
-    """reduce_q selects momenta in ascending flat order regardless of input order."""
+def test_reduce_q_keeps_the_momenta_in_the_order_given():
+    """reduce_q returns the momenta in the order of the list, not in ascending flat order."""
     mat = np.arange(64, dtype=complex).reshape((4, 4, 4))
     obj = IAmNonLocal(mat.copy(), (4, 4, 4))
-    reduced = obj.reduce_q(np.array([[2, 2, 2], [1, 1, 1]]))
-    # selection follows ascending flat index, not the order given (matches the previous mask-based behavior)
-    assert np.allclose(reduced.mat, [mat[1, 1, 1], mat[2, 2, 2]])
+    reduced = obj.reduce_q(np.array([[2, 2, 2], [1, 1, 1], [3, 0, 1]]))
+    assert np.array_equal(reduced.mat, [mat[2, 2, 2], mat[1, 1, 1], mat[3, 0, 1]])
 
 
 def test_reduce_q_silently_drops_out_of_range_momenta():
@@ -1828,6 +1828,44 @@ def test_deferred_collection_batches_gc_into_one_sweep(monkeypatch):
     survivor = IHaveMat(np.zeros((2, 2)))
     survivor.free()
     assert len(calls) == 2
+
+
+def test_nested_deferred_collection_collects_once_at_the_outermost_exit(monkeypatch):
+    """A nested deferred_collection() keeps the outer context deferred; only the outermost exit collects."""
+    calls = []
+    monkeypatch.setattr(npb.gc, "collect", lambda: calls.append(1))
+
+    with npb.deferred_collection():
+        with npb.deferred_collection():
+            IHaveMat(np.zeros((2, 2))).free()
+        IHaveMat(np.zeros((2, 2))).free()
+        assert calls == []
+    assert len(calls) == 1
+
+
+def test_deferred_collection_of_another_thread_neither_defers_this_thread_nor_outlives_its_exit(monkeypatch):
+    """Another thread's context leaves this thread's frees collecting, and its exit leaves no deferral behind."""
+    calls = []
+    monkeypatch.setattr(npb.gc, "collect", lambda: calls.append(1))
+    entered, release = threading.Event(), threading.Event()
+
+    def hold_context():
+        with npb.deferred_collection():
+            entered.set()
+            release.wait(5)
+
+    worker = threading.Thread(target=hold_context)
+    worker.start()
+    assert entered.wait(5)
+    first = IHaveMat(np.zeros((2, 2)))
+    first.free()
+    assert len(calls) == 1
+    release.set()
+    worker.join(5)
+    assert len(calls) == 2
+    second = IHaveMat(np.zeros((2, 2)))
+    second.free()
+    assert len(calls) == 3
 
 
 def test_take_q_index_slice_restricts_to_an_index_window_of_the_compressed_axis():

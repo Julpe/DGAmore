@@ -19,6 +19,8 @@ import glob
 import os
 import pickle
 import re
+import zipfile
+from collections.abc import Callable
 
 import mpi4py.MPI as MPI
 import numpy as np
@@ -32,17 +34,37 @@ from dgamore.bubble_gen import BubbleGenerator
 from dgamore.four_point import FourPoint
 from dgamore.greens_function import GreensFunction, update_mu
 from dgamore.interaction import LocalInteraction, Interaction
+from dgamore.jacobian_stabilization import (
+    JACOBIAN_FILE,
+    JacobianTracker,
+    TRACKER_PAIRS,
+    load_spectrum,
+    to_mat,
+    to_vec,
+)
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.lambda_ops import LambdaAnnealer, LambdaCorrection, MultiOrbitalLambdaCorrection
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore import memory_estimator
 from dgamore.memory_estimator import SLICE_CHUNK_BYTES
 from dgamore.mpi_utils import MpiDistributor
-from dgamore.n_point_base import SpinChannel, deferred_collection
+from dgamore.n_point_base import DTYPE, SpinChannel, deferred_collection
 from dgamore.self_energy import SelfEnergy
 
+_JACOBIAN_ROW_WIDTH = TRACKER_PAIRS - 1  # Ritz values per row of the traces: every value an estimate can have
+_FIRST_FREQUENCY_RATIO = 2.0  # w_1 over static compound norm of chi_phys above which the loop warns of a pole
+_RESTRICTION_PIN_FACTOR = 2.0  # pin of a crossed mode, in units of the largest healthy static eigenvalue of the channel
+_RESTRICTION_FALLBACK_FLOOR = 1e-2  # floor of the inverse static eigenvalues when no static block is healthy
+_STALL_FACTOR = 10.0  # map residual, in units of epsilon, above which a converged step that no longer lowers it stalls
 
-def get_hartree_fock(u_loc: LocalInteraction, v_nonloc: Interaction) -> tuple[np.ndarray, np.ndarray]:
+
+def get_hartree_fock(
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    occ: np.ndarray | None = None,
+    occ_k: np.ndarray | None = None,
+    w_r_mat: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     r"""
     Returns the Hartree-Fock term separately for the local and non-local interaction. Since we are always SU(2)-symmetric,
     the sum over the spins of the first term in Eq. (4.55) in Anna Galler's thesis results in a simple factor of 2. This
@@ -64,23 +86,31 @@ def get_hartree_fock(u_loc: LocalInteraction, v_nonloc: Interaction) -> tuple[np
     :math:`O(n_{\mathbf{k}} \log n_{\mathbf{k}})` and materializes only R-space ``[k, o^4]``/``[k, o^2]`` arrays, never
     a ``[q, k]`` occupation block, so the whole full-BZ term is computed on one rank without a q-distribution.
 
+    The term is linear in the occupations, so a change of the occupations gives the change of the term.
+
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` on the full q-grid (see :class:`Interaction`).
+    :param occ: The k-averaged occupation ``[o1, o2]``; None reads ``config.sys.occ``.
+    :param occ_k: The k-resolved occupation ``[kx, ky, kz, o1, o2]``; None reads ``config.sys.occ_k``.
+    :param w_r_mat: The real-space interaction ``(u_loc + v_nonloc).fft()`` as ``[kx, ky, kz, o1, o2, o3, o4]`` when
+        the caller holds it across calls; ``None`` transforms it here.
     :return: The tuple ``(hartree, fock)`` of self-energy contributions, broadcastable to ``[k, o1, o2, v]``.
     """
+    occ = config.sys.occ if occ is None else occ
+    occ_k = config.sys.occ_k if occ_k is None else occ_k
     v_q0 = v_nonloc.find_q((0, 0, 0))
     # equation layout: Hartree 2 U_{12ab} n_{ba} with the external orbitals on the first two slots; the Fock term
     # below is -U_{1ba2} n_{ba} with them on the outer slots, like local_sde.get_local_hartree_fock
-    hartree = 2 * (u_loc + v_q0).times("qabcd,dc->ab", config.sys.occ)
+    hartree = 2 * (u_loc + v_q0).times("qabcd,dc->ab", occ)
 
     nb = config.sys.n_bands
     nk_tot = np.prod(config.lattice.nk)
 
     # Fourier the interaction and the occupation to R-space, contract the summed orbitals pointwise per R and
     # transform back: convolution theorem for the n^{k-q} sum.
-    w_r = (u_loc + v_nonloc).fft(copy=False)
-    w_r_mat = w_r.decompress_q_dimension().mat  # [kx, ky, kz, a, b, c, d]
-    occ_r = sp.fft.fftn(config.sys.occ_k.astype(w_r_mat.dtype, copy=False), axes=(0, 1, 2))  # [kx, ky, kz, d, c]
+    if w_r_mat is None:
+        w_r_mat = (u_loc + v_nonloc).fft(copy=False).decompress_q_dimension().mat  # [kx, ky, kz, a, b, c, d]
+    occ_r = sp.fft.fftn(occ_k.astype(w_r_mat.dtype, copy=False), axes=(0, 1, 2))  # [kx, ky, kz, d, c]
 
     fock_r = np.einsum("xyzadcb,xyzdc->xyzab", w_r_mat, occ_r, optimize=True)
     fock = sp.fft.ifftn(fock_r, axes=(0, 1, 2), overwrite_x=True).reshape(nk_tot, nb, nb)
@@ -173,7 +203,8 @@ def create_auxiliary_chi_r_q_sum(
     chunk_bytes: int | None = None,
     rhs: list[FourPoint] | None = None,
     inactive: np.ndarray | None = None,
-) -> FourPoint | list[FourPoint]:
+    slice_rhs: Callable[[int, int, FourPoint], list[FourPoint]] | None = None,
+) -> FourPoint | list[FourPoint] | tuple[FourPoint, list[FourPoint]]:
     r"""
     Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis,
 
@@ -200,8 +231,13 @@ def create_auxiliary_chi_r_q_sum(
     :param inactive: The orbital pairs without vertex of ``gamma_r`` (see
         :meth:`~dgamore.local_four_point.LocalFourPoint.orbital_pairs_without_vertex`) when the caller holds them;
         ``None`` finds them here and logs their count.
+    :param slice_rhs: The callable ``(i, w, total) -> list[FourPoint]`` that returns the right-hand sides of the
+        slice of momentum ``i`` and bosonic index ``w`` of ``gchi0_q_inv`` from that slice's summed auxiliary
+        susceptibility ``total``; every slice then also solves them against the factorization of its sum, and the
+        result is the tuple of the sum and the solutions (``rhs`` None). None sums only.
     :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` as a
-        :class:`FourPoint` (half niw range, one fermionic dimension), or the solutions for ``rhs`` as a list.
+        :class:`FourPoint` (half niw range, one fermionic dimension), the solutions for ``rhs`` as a list, or with
+        ``slice_rhs`` the tuple ``(sum, solutions)``.
     """
     u_r = u_loc.as_channel(gamma_r.channel)
     gamma_half = gamma_r.copy().to_half_niw_range() if gamma_r.full_niw_range else gamma_r
@@ -209,11 +245,11 @@ def create_auxiliary_chi_r_q_sum(
         inactive = _inactive_orbital_pairs(gamma_half, u_r)
     beta = config.sys.beta
     return gchi0_q_inv.invert_with_local_kernel_and_sum_over_last_vn(
-        gamma_half, u_r, 1.0 / beta**2, beta, inactive, rhs
+        gamma_half, u_r, 1.0 / beta**2, beta, inactive, rhs, slice_rhs
     )
 
 
-def create_vrg_r_q(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint) -> FourPoint:
+def create_vrg_r_q(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint, copy: bool = True) -> FourPoint:
     r"""
     Returns the momentum-dependent three-leg vertex, see Eq. (3.63) in my master's thesis,
     :math:`\gamma^{\mathrm{q}\nu}_{r;1234} = \beta \sum_{ab} \sum_{\nu'} (\chi^{\mathrm{q}\nu}_{0;12ab})^{-1}
@@ -222,9 +258,11 @@ def create_vrg_r_q(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint) -> FourP
     :param gchi_aux_q_r_sum: The frequency-summed auxiliary susceptibility
         :math:`\sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r}`.
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
+    :param copy: If True, return the vertex as a new object; if False, write it over ``gchi_aux_q_r_sum`` in place and
+        return that object.
     :return: The three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}` (``vrg``) as a :class:`FourPoint`.
     """
-    return (gchi0_q_inv @ gchi_aux_q_r_sum).scale(config.sys.beta)
+    return gchi_aux_q_r_sum.matmul(gchi0_q_inv, left_hand_side=False, copy=copy).scale(config.sys.beta)
 
 
 def create_generalized_chi_q_with_shell_correction(
@@ -252,33 +290,71 @@ def create_generalized_chi_q_with_shell_correction(
     ).invert()
 
 
-def restrict_chi_phys_to_positive_eigenvalues(chi_phys_q_r: FourPoint, floor: float = 1e-4) -> tuple[FourPoint, int]:
+def restrict_chi_phys_to_positive_eigenvalues(
+    chi_phys_q_r: FourPoint, comm: MPI.Comm | None = None, floor: float | None = None
+) -> tuple[FourPoint, int]:
     r"""
-    Regularizes the physical susceptibility: for every momentum and bosonic frequency the eigenvalues of the Hermitian
-    part of the inverse compound matrix :math:`(\chi^{\mathrm{q}}_{r;1234})^{-1}` are floored at :math:`+\text{floor}`
-    (the skew-Hermitian part is kept), and the result is inverted back. A negative eigenvalue of the inverse marks a
-    crossed pole of the Bethe-Salpeter equation (an unphysical branch of the ladder, e.g. the high-temperature
-    charge-channel instability); flooring it pins the corresponding susceptibility eigenvalue at :math:`1/\text{floor}`
-    while all healthy eigenpairs - including legitimately negative off-diagonal matrix elements - pass through
-    unchanged. For a single band the compound block is a scalar and this reduces to the plain clamp of negative inverse
-    values.
+    Regularizes the physical susceptibility per momentum with the two bounds of a bosonic susceptibility, positive
+    semi-definite and decreasing in :math:`|\omega|`, touching only the compound blocks that violate them.
+
+    - Static slice: the eigenvalues of the Hermitian part of :math:`(\chi^{(\mathbf{q},\omega=0)}_{r;1234})^{-1}`
+      are floored at :math:`+\text{floor}` (the skew-Hermitian part is kept) and the block is inverted back; a
+      negative one marks a crossed pole of the Bethe-Salpeter equation. Without an explicit floor it is the smallest
+      inverse eigenvalue of the healthy static blocks over all ranks divided by ``_RESTRICTION_PIN_FACTOR``, or
+      ``_RESTRICTION_FALLBACK_FLOOR`` when no block is healthy.
+    - Finite frequencies: the eigenvalues of the Hermitian part of :math:`\chi^{(\mathbf{q},\omega_n)}_{r;1234}` and
+      of its skew-Hermitian part (:math:`i` times a Hermitian matrix) are clipped into
+      :math:`[-c_{\mathbf{q}}, c_{\mathbf{q}}]`, :math:`c_{\mathbf{q}}` the largest eigenvalue of the (restricted)
+      static block.
+
+    Blocks within both bounds are returned bit for bit, so a healthy susceptibility gives a zero count.
 
     :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r;1234}` (no fermionic frequency
         dimensions).
-    :param floor: Lower bound imposed on the eigenvalues of the inverse susceptibility.
-    :return: The tuple ``(chi_restricted, n_floored)`` of the restricted susceptibility as a :class:`FourPoint`
-        and the number of floored eigenvalues (a per-iteration diagnostic: if it decays to zero during the
-        restricted phase of the self-consistency, releasing the restriction is safe).
+    :param comm: The MPI communicator (reduces the healthy static maximum over the ranks); ``None`` on one rank.
+    :param floor: Lower bound imposed on the eigenvalues of the inverse static susceptibility; ``None`` derives it
+        from the healthy static blocks as described above.
+    :return: The tuple ``(chi_restricted, n_restricted)`` of the restricted susceptibility as a :class:`FourPoint` in
+        the half bosonic frequency range and the number of floored or clipped eigenvalues (a per-iteration
+        diagnostic: if it decays to zero during the restricted phase of the self-consistency, releasing the
+        restriction is safe).
     """
-    chi_inv = chi_phys_q_r.invert().to_compound_indices()
-    herm = 0.5 * (chi_inv.mat + np.conj(np.swapaxes(chi_inv.mat, -1, -2)))
-    chi_inv.mat -= herm
+    chi = chi_phys_q_r.copy().to_half_niw_range().to_compound_indices()
+    mat = chi.mat  # [q, w, x1, x2], w = 0 the static slice
+
+    def hermitian_split(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Returns the Hermitian part of a stack of square blocks and the rest."""
+        herm = 0.5 * (blocks + np.conj(np.swapaxes(blocks, -1, -2)))
+        return herm, blocks - herm
+
+    herm, skew = hermitian_split(np.linalg.inv(mat[:, 0]))
     eigs, vecs = np.linalg.eigh(herm)
-    n_floored = int((eigs < floor).sum())
-    chi_inv.mat += np.einsum(
-        "...ab,...b,...cb->...ac", vecs, np.maximum(eigs, floor).astype(eigs.dtype), np.conj(vecs), optimize=True
+    if floor is None:
+        healthy = (eigs > 0.0).all(axis=-1)
+        smallest = float(eigs[healthy].min()) if healthy.any() else np.inf
+        if comm is not None and comm.size > 1:
+            smallest = comm.allreduce(smallest, op=MPI.MIN)
+        floor = smallest / _RESTRICTION_PIN_FACTOR if np.isfinite(smallest) else _RESTRICTION_FALLBACK_FLOOR
+    low = (eigs < floor).any(axis=-1)
+    n_restricted = int((eigs < floor).sum())
+    floored = np.einsum("qab,qb,qcb->qac", vecs[low], np.maximum(eigs[low], floor), np.conj(vecs[low]))
+    mat[low, 0] = np.linalg.inv(skew[low] + floored)
+
+    bound = np.linalg.eigvalsh(hermitian_split(mat[:, 0])[0])[:, -1][:, None, None]
+    herm, skew = hermitian_split(mat[:, 1:])
+    # the skew-Hermitian part is i times a Hermitian matrix, bounded the same way
+    parts = [np.linalg.eigh(herm), np.linalg.eigh(-1j * skew)]
+    clipped = [np.clip(eigs, -bound, bound) for eigs, _ in parts]
+    changed = [clip != eigs for clip, (eigs, _) in zip(clipped, parts)]
+    outside = changed[0].any(axis=-1) | changed[1].any(axis=-1)
+    n_restricted += int(changed[0].sum() + changed[1].sum())
+    herm_new, skew_new = (
+        np.einsum("kab,kb,kcb->kac", vecs[outside], clip[outside], np.conj(vecs[outside]))
+        for clip, (_, vecs) in zip(clipped, parts)
     )
-    return chi_inv.invert(copy=False), n_floored
+    finite = mat[:, 1:]
+    finite[outside] = herm_new + 1j * skew_new
+    return chi.to_full_indices(), n_restricted
 
 
 def _effective_epsilon(annealer: "LambdaAnnealer | None" = None) -> float:
@@ -303,17 +379,125 @@ def _effective_epsilon(annealer: "LambdaAnnealer | None" = None) -> float:
 def min_static_compound_eigenvalue(chi_phys_q_r: FourPoint) -> float:
     r"""
     Returns the smallest eigenvalue of the Hermitian part of the static compound blocks
-    :math:`\chi^{(\mathbf{q},\omega=0)}_{r;1234}` over all rank-local momenta. A physical static susceptibility is
-    positive semi-definite per momentum, so a significantly negative value flags that the ladder sits on an unphysical
-    (past-pole) branch. Expects the object with a compressed momentum dimension and no fermionic frequency dimensions.
+    :math:`\chi^{(\mathbf{q},\omega=0)}_{r;1234}` over all rank-local momenta. It is logged without a verdict: a
+    negative value can be physical, e.g. for the charge susceptibility of a genuinely charge-ordered material. Expects
+    the object with a compressed momentum dimension and no fermionic frequency dimensions.
 
     :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r;1234}`.
-    :return: The minimum eigenvalue as a float.
+    :return: The minimum eigenvalue as a float, ``inf`` when the object stores no momentum.
     """
     w0 = chi_phys_q_r.niw if chi_phys_q_r.full_niw_range else 0
     n = chi_phys_q_r.n_bands**2
     static = chi_phys_q_r.mat[..., w0].transpose(0, 1, 2, 4, 3).reshape(-1, n, n)
+    if static.shape[0] == 0:
+        return np.inf
     return float(np.linalg.eigvalsh(0.5 * (static + np.conj(np.swapaxes(static, -1, -2)))).min())
+
+
+def max_compound_norm(chi_phys_q_r: FourPoint, w_offset: int) -> float:
+    r"""
+    Returns the largest spectral norm of the compound blocks :math:`\chi^{(\mathbf{q},\omega_n)}_{r;1234}` at the
+    bosonic frequency :math:`\omega_n` with :math:`n` = ``w_offset`` (0 is the static slice) over all rank-local
+    momenta. Expects the object with a compressed momentum dimension and no fermionic frequency dimensions.
+
+    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r;1234}`.
+    :param w_offset: The non-negative bosonic frequency index.
+    :return: The largest norm, or 0.0 when the object stores no such frequency or no momentum.
+    """
+    w = (chi_phys_q_r.niw if chi_phys_q_r.full_niw_range else 0) + w_offset
+    if w >= chi_phys_q_r.mat.shape[-1] or chi_phys_q_r.mat.shape[0] == 0:
+        return 0.0
+    n = chi_phys_q_r.n_bands**2
+    blocks = chi_phys_q_r.mat[..., w].transpose(0, 1, 2, 4, 3).reshape(-1, n, n)
+    return float(np.linalg.norm(blocks, ord=2, axis=(-2, -1)).max())
+
+
+def _monitor_chi_phys(chi_phys_q_r: FourPoint, mpi_dist_irrq: MpiDistributor) -> None:
+    r"""
+    Logs the lowest eigenvalue of the static susceptibility (:func:`min_static_compound_eigenvalue`) and of the
+    Hermitian part of its inverse (:meth:`~dgamore.lambda_ops.LambdaAnnealer._static_gap`) as information only, and
+    the largest compound norm at the first bosonic frequency against the static one (:func:`max_compound_norm`),
+    the only monitor that warns, above ``_FIRST_FREQUENCY_RATIO`` times it. All are reduced over the ranks.
+
+    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r;1234}` (rank-local momenta).
+    :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :return: None.
+    """
+    channel = chi_phys_q_r.channel.value
+    comm = mpi_dist_irrq.comm
+    min_eig = min_static_compound_eigenvalue(chi_phys_q_r)
+    min_inverse_eig = LambdaAnnealer._static_gap(chi_phys_q_r, mpi_dist_irrq)
+    norm_w0, norm_w1 = max_compound_norm(chi_phys_q_r, 0), max_compound_norm(chi_phys_q_r, 1)
+    if comm.size > 1:
+        min_eig = comm.allreduce(min_eig, op=MPI.MIN)
+        norm_w0, norm_w1 = comm.allreduce(norm_w0, op=MPI.MAX), comm.allreduce(norm_w1, op=MPI.MAX)
+    config.logger.info(
+        f"Lowest eigenvalue of the static susceptibility ({channel}): {min_eig:.6f}, and of its inverse: "
+        f"{min_inverse_eig:.6f}."
+    )
+    config.logger.info(f"Largest compound norm of chi_phys ({channel}) at w_1: {norm_w1:.6f} (static {norm_w0:.6f}).")
+    if norm_w1 > _FIRST_FREQUENCY_RATIO * norm_w0:
+        config.logger.warning(
+            f"The physical susceptibility ({channel}) at the first bosonic frequency exceeds its static value "
+            f"(largest compound norm {norm_w1:.3f} against {norm_w0:.3f}): a bosonic susceptibility decreases with "
+            "|w|, so the ladder has a pole at w_1 the static monitor cannot see, and the iteration may be heading "
+            "to an unphysical fixed point."
+        )
+
+
+def first_frequency_local_vertex() -> float | None:
+    r"""
+    Returns the local density vertex that sets the first-frequency pole of the density ladder,
+
+    .. math:: \gamma_{\mathrm{loc}} = 1/\chi^{\omega_1\nu_0\nu_0}_{\mathrm{d,loc}}
+        - 1/\chi^{\omega_1\nu_0}_{0,\mathrm{loc}}, \qquad
+        \chi^{\omega_1\nu_0}_{0,\mathrm{loc}} = -\beta G(\nu_0) G(\nu_0 - \omega_1),
+
+    at :math:`\nu_0 = \pi T`, from the impurity generalized susceptibility and Green's function the local part saves
+    before the loop (``gchi_dens_loc.npy`` on the half bosonic range, ``g_dmft.npy``). See
+    :func:`first_frequency_pole_ratio` for its use.
+
+    :return: :math:`\mathrm{Re}\,\gamma_{\mathrm{loc}}`, or ``None`` for more than one band or without the local
+        files (the monitor is a diagnostic and never stops a run).
+    """
+    gchi_path = os.path.join(config.output.output_path, "gchi_dens_loc.npy")
+    g_path = os.path.join(config.output.output_path, "g_dmft.npy")
+    if not (os.path.exists(gchi_path) and os.path.exists(g_path)):
+        return None
+    # one band only; several bands need the orbital-compound block at nu0 and its leading eigenvalue
+    gchi = np.load(gchi_path, mmap_mode="r")
+    if gchi.shape[0] > 1:
+        return None
+    g = np.load(g_path, mmap_mode="r").reshape(-1)
+    beta, niv, niv_g = config.sys.beta, gchi.shape[-1] // 2, g.shape[-1] // 2
+    w1 = 1 if gchi.shape[-3] == config.box.niw_core + 1 else config.box.niw_core + 1
+    chi0_loc = -beta * g[niv_g] * g[niv_g - 1]
+    return float((1.0 / gchi[0, 0, 0, 0, w1, niv, niv] - 1.0 / chi0_loc).real)
+
+
+def first_frequency_pole_ratio(sigma: SelfEnergy, mu: float, gamma_loc: float) -> float:
+    r"""
+    Returns the first-frequency pole ratio of the density ladder,
+    :math:`R = \gamma_{\mathrm{loc}}\,\beta\,\mathrm{Re}\langle G^{(\mathbf{k},\nu_0)} G^{(\mathbf{k},\nu_0 -
+    \omega_1)}\rangle_{\mathbf{k}}` with :math:`\nu_0 = \pi T`. At :math:`\omega_1` the density Bethe-Salpeter matrix is
+    dominated by the bubble element of the pair :math:`(\nu_0, \nu_0 - \omega_1) = (\pi T, -\pi T)`; its 1x1 Schur
+    complement :math:`\gamma_{\mathrm{loc}} - 1/(\beta C(\mathbf{q}))`, :math:`C(\mathbf{q}) = \mathrm{Re}\langle
+    G^{(\mathbf{k},\nu_0)} G^{(\mathbf{k}+\mathbf{q},\nu_0 - \omega_1)}\rangle_{\mathbf{k}}`, is largest at
+    :math:`\mathbf{q} = 0`, so a pole ring lies inside the Brillouin zone exactly when :math:`R \geq 1`. A lattice
+    Green's function that has lost local scattering at :math:`\pi T` pushes :math:`R` across it.
+
+    :param sigma: The iterate :class:`SelfEnergy` (one band; full-BZ or momentum-local, either momentum layout).
+    :param mu: Chemical potential :math:`\mu` of ``sigma``.
+    :param gamma_loc: The local vertex of :func:`first_frequency_local_vertex`.
+    :return: The ratio :math:`R`.
+    """
+    beta, niv = config.sys.beta, sigma.niv
+    ek = config.lattice.hamiltonian.get_ek().reshape(-1)
+    s = sigma.mat.reshape(-1, 2 * niv)
+    nu0 = np.pi / beta
+    g_nu0 = 1.0 / (1j * nu0 + mu - ek - s[:, niv])
+    g_minus_nu0 = 1.0 / (-1j * nu0 + mu - ek - s[:, niv - 1])
+    return float(gamma_loc * beta * np.mean(g_nu0 * g_minus_nu0).real)
 
 
 def calculate_sigma_dc_kernel(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, u_loc: LocalInteraction) -> FourPoint:
@@ -343,16 +527,47 @@ def calculate_sigma_dc_kernel(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, u_lo
     :param u_loc: The bare local interaction :math:`U`.
     :return: The double-counting kernel (contraction layout) as a :class:`FourPoint`, cut to the core fermionic box.
     """
+    return _attach_dc_interaction(_contract_dc_vertex(f_dc_loc, gchi0_q), u_loc)
+
+
+def _contract_dc_vertex(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint) -> FourPoint:
+    r"""
+    Returns the vertex contraction of the double-counting kernel (see :func:`calculate_sigma_dc_kernel`): the bubble
+    summed with the local vertex over its stored full-box first frequency (see
+    :meth:`~dgamore.four_point.FourPoint.contract_first_pair_with_local_vertex`), kept on the core fermionic box;
+    the bubble is only read.
+
+    :param f_dc_loc: The local double-counting vertex :math:`F_{\mathrm{dc}}` (see
+        :func:`~dgamore.local_sde.double_counting_vertex`).
+    :param gchi0_q: The momentum-dependent bare bubble :math:`\chi^{\mathrm{q}\nu}_{0}` (full fermionic box).
+    :return: The contraction as a :class:`FourPoint` on the core fermionic box.
+    """
     # the stored full-box first index supplies the summed v' via F_{1dfe}(v,v') = F_{efd1}(v',v): the stored slots
     # (e,f,d,1) then pair directly with chi0's row pair (e,f) - the standard-product reversal F_{..fe} chi0_{ef..}
-    t = gchi0_q.contract_first_pair_with_local_vertex(f_dc_loc, min(f_dc_loc.niv_second, config.box.niv_core))
+    return gchi0_q.contract_first_pair_with_local_vertex(f_dc_loc, min(f_dc_loc.niv_second, config.box.niv_core))
+
+
+def _attach_dc_interaction(contraction: FourPoint, u_loc: LocalInteraction, per_wn: bool = False) -> FourPoint:
+    r"""
+    Returns the double-counting kernel from its vertex contraction (see :func:`_contract_dc_vertex`): the transversal
+    attachment of the interaction, the contraction layout and the prefactor of :func:`calculate_sigma_dc_kernel`.
+
+    :param contraction: The vertex contraction on the core fermionic box (only read).
+    :param u_loc: The bare local interaction :math:`U`.
+    :param per_wn: Whether the attachment takes the bosonic frequency as a batch index (see
+        :meth:`~dgamore.four_point.FourPoint.matmul`), so a bosonic window's kernel does not depend on the frequencies
+        outside it.
+    :return: The double-counting kernel (contraction layout) as a :class:`FourPoint`.
+    """
     # transversal attachment U_{acb2} = -U_magn;a2bc: [T @ U_magn]_{1da2}, then into the contraction layout
-    kernel = (t @ u_loc.as_channel(SpinChannel.MAGN)).permute_orbitals("abcd->badc", copy=False)
+    kernel = contraction.matmul(u_loc.as_channel(SpinChannel.MAGN), per_wn=per_wn).permute_orbitals(
+        "abcd->badc", copy=False
+    )
     return kernel.scale(2.0 / config.sys.beta**2, copy=False)
 
 
 def calculate_kernel_r_q(
-    vrg_q_r: FourPoint, chi_phys_q_r: FourPoint, v_nonloc: Interaction, u_loc: LocalInteraction
+    vrg_q_r: FourPoint, chi_phys_q_r: FourPoint, v_nonloc: Interaction, u_loc: LocalInteraction, per_wn: bool = False
 ) -> FourPoint:
     r"""
     Returns the kernel for the self-energy calculation minus the identity (which carries the constant
@@ -373,18 +588,21 @@ def calculate_kernel_r_q(
     :param chi_phys_q_r: The (shell-corrected) physical susceptibility :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param u_loc: The bare local interaction :math:`U`.
+    :param per_wn: Whether the products with the channel interaction take the bosonic frequency as a batch index
+        (see :meth:`~dgamore.four_point.FourPoint.matmul`), so a bosonic window's kernel does not depend on the
+        frequencies outside it.
     :return: The self-energy kernel :math:`[(K-\mathbb{1})\,\mathcal{U}_r]` (contraction layout) as a
         :class:`FourPoint`.
     """
     u_r = v_nonloc.as_channel(vrg_q_r.channel) + u_loc.as_channel(vrg_q_r.channel)
-    kernel = vrg_q_r - vrg_q_r @ u_r @ chi_phys_q_r
+    kernel = vrg_q_r - vrg_q_r.matmul(u_r, per_wn=per_wn) @ chi_phys_q_r
 
     # subtract the identity directly on the compound-identity positions (o1 == o4, o2 == o3, every frequency) instead
     # of materializing an identity block; the channel weights (1x dens, 3x magn) turn this into -U_d - 3U_m
     orb = np.arange(kernel.n_bands)
     kernel.mat[:, orb[:, None], orb[None, :], orb[None, :], orb[:, None], ...] -= 1.0
 
-    return (kernel @ u_r).permute_orbitals("abcd->badc", copy=False)
+    return kernel.matmul(u_r, per_wn=per_wn).permute_orbitals("abcd->badc", copy=False)
 
 
 def perform_ornstein_zernike_fit(chi_phys_q_r: FourPoint) -> None:
@@ -490,7 +708,7 @@ def calculate_and_save_chi_q_r_rpa(
     gchi0_q_sum_inv.free()
 
 
-def _select_and_apply_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
+def _select_and_apply_lambda_correction(chi_phys_q_r: FourPoint, lambda_previous: dict | None = None) -> FourPoint:
     r"""
     Applies the configured lambda correction to the (rank-0 gathered) physical susceptibility and returns it. The
     correction runs when either the one-shot ``config.lambda_correction.perform_lambda_correction`` or the
@@ -500,11 +718,14 @@ def _select_and_apply_lambda_correction(chi_phys_q_r: FourPoint) -> FourPoint:
 
     :param chi_phys_q_r: The rank-0 gathered physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` in the irreducible
         BZ.
+    :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, kept by the
+        self-consistency loop across its iterations; ``None`` for the one-shot correction (see
+        :meth:`~dgamore.lambda_ops.LambdaCorrection.perform`).
     :return: The (possibly corrected) physical susceptibility.
     """
     if config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction:
         if config.sys.n_bands == 1:
-            return LambdaCorrection.perform(chi_phys_q_r)
+            return LambdaCorrection.perform(chi_phys_q_r, lambda_previous=lambda_previous)
         return MultiOrbitalLambdaCorrection.perform(chi_phys_q_r)
     return chi_phys_q_r
 
@@ -519,13 +740,23 @@ def calculate_sigma_kernel_r_q(
     mpi_dist_irrq: MpiDistributor,
     annealer: "LambdaAnnealer | None" = None,
     save_eliashberg: bool = False,
-) -> FourPoint:
+    lambda_previous: dict | None = None,
+    kernel: FourPoint | None = None,
+    weight: float = 1.0,
+) -> FourPoint | None:
     r"""
-    Returns the kernel for the self-energy calculation in a specific spin channel. Calculates the auxiliary
-    susceptibility, the three-leg vertex and the physical susceptibility with shell correction. Also performs a
-    :math:`\lambda`-correction on the physical susceptibility if specified in the config (dispatched by the band
-    count). Saves the physical susceptibility (and, with ``save_eliashberg``, the per-rank Eliashberg intermediates)
-    to file.
+    Adds the kernel for the self-energy calculation in a specific spin channel, times ``weight``, to ``kernel`` in
+    place. Calculates the auxiliary susceptibility, the three-leg vertex and the physical susceptibility with shell
+    correction. Also performs a :math:`\lambda`-correction on the physical susceptibility if specified in the config
+    (dispatched by the band count). Saves the physical susceptibility (and, with ``save_eliashberg``, the per-rank
+    Eliashberg intermediates) to file.
+
+    The three-leg vertex and the channel kernel are built in momentum groups of
+    :func:`~dgamore.memory_estimator.kernel_momentum_group` on views of the rank's arrays: each group of the summed
+    auxiliary susceptibility is overwritten with its three-leg vertex, and each group's kernel is added to its window
+    of ``kernel``. Beside ``kernel`` and the inverse bubble the step holds a single one-fermion block (the summed
+    susceptibility, then the vertex) and one group's temporaries, and every momentum gets the bits of the ungrouped
+    products.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
@@ -538,7 +769,12 @@ def calculate_sigma_kernel_r_q(
         or ``None`` when annealing is off.
     :param save_eliashberg: Whether to write this rank's three-leg vertex and physical susceptibility for the
         Eliashberg step (the self-consistency loop asks for it once per run).
-    :return: The self-energy kernel for this channel as a :class:`FourPoint`.
+    :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, kept by the
+        self-consistency loop across its iterations; ``None`` for the one-shot correction.
+    :param kernel: The self-energy kernel accumulated over the channels (contraction layout), or ``None`` to skip the
+        channel kernel (the Eliashberg-only pass).
+    :param weight: The channel's weight in the sum of the kernels.
+    :return: ``kernel``.
     """
     logger = config.logger
 
@@ -555,7 +791,21 @@ def calculate_sigma_kernel_r_q(
     )
     logger.info(f"Non-Local auxiliary susceptibility ({gchi_aux_q_r_sum.channel.value}) calculated.")
 
-    vrg_q_r = create_vrg_r_q(gchi_aux_q_r_sum, gchi0_q_inv)
+    chi_phys_q_r = gchi_aux_q_r_sum.sum_over_all_vn(config.sys.beta)
+
+    n_q = gchi0_q_inv.current_shape[0]
+    step = memory_estimator.kernel_momentum_group(n_q)
+    windows = [(start, min(n_q, start + step)) for start in range(0, n_q, step)]
+    with deferred_collection():
+        # each window of the summed auxiliary susceptibility becomes its three-leg vertex in place (views, same bits)
+        for start, stop in windows:
+            create_vrg_r_q(
+                gchi_aux_q_r_sum.take_q_index_slice(start, stop, copy=False),
+                gchi0_q_inv.take_q_index_slice(start, stop, copy=False),
+                copy=False,
+            )
+    vrg_q_r = gchi_aux_q_r_sum
+    del gchi_aux_q_r_sum
 
     logger.info(f"Non-local three-leg vertex gamma^wv ({vrg_q_r.channel.value}) done.")
     logger.log_memory_usage(f"Three-leg vertex ({vrg_q_r.channel.value})", vrg_q_r, mpi_dist_irrq.comm.size)
@@ -565,9 +815,6 @@ def calculate_sigma_kernel_r_q(
             name=f"vrg_q_{vrg_q_r.channel.value}_rank_{mpi_dist_irrq.comm.rank}",
             output_dir=config.output.eliashberg_path,
         )
-
-    chi_phys_q_r = gchi_aux_q_r_sum.sum_over_all_vn(config.sys.beta)
-    gchi_aux_q_r_sum.free()
 
     chi_phys_q_r = create_generalized_chi_q_with_shell_correction(
         chi_phys_q_r, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc
@@ -579,12 +826,13 @@ def calculate_sigma_kernel_r_q(
         chi_phys_q_r = annealer.apply(chi_phys_q_r, mpi_dist_irrq)
 
     if config.stabilization.use_chi_phys_restriction:
-        chi_phys_q_r, n_floored = restrict_chi_phys_to_positive_eigenvalues(chi_phys_q_r)
+        chi_phys_q_r, n_restricted = restrict_chi_phys_to_positive_eigenvalues(chi_phys_q_r, mpi_dist_irrq.comm)
         if mpi_dist_irrq.comm.size > 1:
-            n_floored = mpi_dist_irrq.comm.allreduce(n_floored)
+            n_restricted = mpi_dist_irrq.comm.allreduce(n_restricted)
         logger.warning(
-            f"Restricted physical susceptibility ({chi_phys_q_r.channel.value}): floored {n_floored} eigenvalues "
-            "of the inverse. Releasing the restriction is only safe once this count decays to zero."
+            f"Restricted physical susceptibility ({chi_phys_q_r.channel.value}): {n_restricted} eigenvalues "
+            "restricted (static inverse floored, finite-frequency values clipped to the static maximum). Releasing "
+            "the restriction is only safe once this count decays to zero."
         )
 
     logger.log_memory_usage(
@@ -593,7 +841,7 @@ def calculate_sigma_kernel_r_q(
 
     chi_phys_q_r.mat = mpi_dist_irrq.gather(chi_phys_q_r.mat)
     if mpi_dist_irrq.comm.rank == 0:
-        chi_phys_q_r = _select_and_apply_lambda_correction(chi_phys_q_r)
+        chi_phys_q_r = _select_and_apply_lambda_correction(chi_phys_q_r, lambda_previous)
         chi_phys_q_r.save(name=f"chi_phys_q_{chi_phys_q_r.channel.value}", output_dir=config.output.output_path)
 
         # perform Ornstein-Zernike fit
@@ -603,16 +851,7 @@ def calculate_sigma_kernel_r_q(
     chi_phys_q_r.mat = mpi_dist_irrq.scatter(chi_phys_q_r.mat)
     logger.info(f"Saved physical susceptibility ({chi_phys_q_r.channel.value}) to file.")
 
-    min_eig = min_static_compound_eigenvalue(chi_phys_q_r)
-    if mpi_dist_irrq.comm.size > 1:
-        min_eig = mpi_dist_irrq.comm.allreduce(min_eig, op=MPI.MIN)
-    logger.info(f"Minimum static compound eigenvalue of chi_phys ({chi_phys_q_r.channel.value}): {min_eig:.6f}.")
-    if min_eig < -5e-2:
-        logger.warning(
-            f"The static physical susceptibility ({chi_phys_q_r.channel.value}) is not positive semi-definite "
-            f"(minimum eigenvalue {min_eig:.3f}): the ladder sits on an unphysical (past-pole) branch and derived "
-            "quantities (self-energy, Eliashberg eigenvalues) might be unreliable."
-        )
+    _monitor_chi_phys(chi_phys_q_r, mpi_dist_irrq)
 
     if save_eliashberg:
         chi_phys_q_r.save(
@@ -620,7 +859,21 @@ def calculate_sigma_kernel_r_q(
             output_dir=config.output.eliashberg_path,
         )
 
-    return calculate_kernel_r_q(vrg_q_r, chi_phys_q_r, v_nonloc, u_loc)
+    if kernel is None:
+        return None
+    # one statement per group, so its objects are released inside the deferred collection
+    with deferred_collection():
+        for start, stop in windows:
+            kernel.take_q_index_slice(start, stop, copy=False).add(
+                calculate_kernel_r_q(
+                    vrg_q_r.take_q_index_slice(start, stop, copy=False),
+                    chi_phys_q_r.take_q_index_slice(start, stop, copy=False),
+                    v_nonloc.take_q_index_slice(start, stop, copy=False),
+                    u_loc,
+                ).scale(weight),
+                copy=False,
+            )
+    return kernel
 
 
 def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full_q_list: np.ndarray) -> SelfEnergy:
@@ -713,25 +966,270 @@ def calculate_sigma_from_kernel_loop(
     )
 
 
-def _build_rspace_giwk_window(giwk: GreensFunction, node_comm) -> tuple[np.ndarray, MPI.Win | None]:
+def _build_rspace_giwk_window(
+    giwk: GreensFunction, node_comm, niv_window: int | None = None
+) -> tuple[np.ndarray, MPI.Win | None]:
     r"""
     Builds the real-space Green's function :math:`F[G](R)` of the self-energy contraction once per node, in one
     shared-memory window in frequency-first layout ``[2 niv, n_R, o1, o2]``, so every frequency slab the
     contraction reads is contiguous. The node root transforms :math:`G(\mathbf{k}) \to F[G](R)` (see
     :meth:`GreensFunction.fft`) into the window, every other rank maps it read-only; a single-rank node holds a
-    private array.
+    private array. With ``niv_window`` the window holds the fermionic frequencies ``[-niv_window, niv_window)`` of
+    ``giwk``: the node root copies them into the window and transforms it there in place, so neither a cut nor a
+    transformed copy of ``giwk`` is allocated, and every frequency slab holds the bits of the window of the cut
+    Green's function.
 
-    :param giwk: The momentum-dependent :class:`GreensFunction` (cut to the self-energy box).
+    :param giwk: The momentum-dependent :class:`GreensFunction` (cut to the self-energy box unless ``niv_window`` is
+        given).
     :param node_comm: The node-local communicator.
+    :param niv_window: Number of positive fermionic frequencies of the window, at most ``giwk.niv``, or ``None`` for
+        all of them.
     :return: The tuple ``(g_r, win)``; release the window once no rank reads it anymore (``win`` is ``None`` on a
         single-rank node).
+    :raises ValueError: If ``niv_window`` exceeds ``giwk.niv``.
     """
+    if niv_window is not None:
+        if niv_window > giwk.niv:
+            raise ValueError(f"A window of {niv_window} positive frequencies exceeds the {giwk.niv} of the function.")
+        nk, nb = giwk.nq, giwk.n_bands
+        n_r = int(np.prod(nk))
+        g_r, win = mpi_utils.allocate_node_shared_array(node_comm, (2 * niv_window, n_r, nb, nb), giwk.mat.dtype)
+        if node_comm.Get_rank() == 0:
+            frequencies = slice(giwk.niv - niv_window, giwk.niv + niv_window)
+            g_r[...] = np.moveaxis(giwk.mat.reshape(n_r, nb, nb, -1)[..., frequencies], -1, 0)
+            # scipy.fft transforms the window in place; numpy.fft would return a complex128 copy
+            view = g_r.reshape(2 * niv_window, *nk, nb, nb)
+            transformed = sp.fft.fftn(view, axes=(1, 2, 3), overwrite_x=True)
+            if not np.shares_memory(transformed, view):
+                view[...] = transformed
+        node_comm.Barrier()
+        return g_r, win
     nb, n_r = giwk.n_bands, config.lattice.k_grid.nk_tot
     g_r, win = mpi_utils.allocate_node_shared_array(node_comm, (2 * giwk.niv, n_r, nb, nb), giwk.mat.dtype)
     if node_comm.Get_rank() == 0:
         g_r[...] = np.moveaxis(giwk.fft().mat.reshape(n_r, nb, nb, -1), -1, 0)
     node_comm.Barrier()
     return g_r, win
+
+
+class _ColumnSdeStream:
+    r"""
+    The column-distributed contraction of self-energy kernels with Green's functions,
+
+    .. math:: \Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{ab}
+        K^{\mathrm{q}\nu}_{a12b} G^{\mathrm{k}-\mathrm{q}}_{ab},
+
+    for :math:`\nu \geq 0` as a real-space product (convolution theorem), distributing the kernels' frequency columns
+    over the ranks instead of their momenta. Output :math:`j` sums the products of its terms, each term pairing one
+    kernel with one Green's function. A column is one bosonic frequency :math:`\omega` of one fermionic frequency
+    :math:`\nu`; a negative :math:`\omega` is read from the stored positive one by time reversal, which for real
+    hoppings is a plain conjugation in real space, :math:`K^{-\omega,\nu}(\mathbf{R}) = (K^{\omega,-\nu}(\mathbf{R}))^*`
+    (in momentum space it maps :math:`\mathbf{q} \to -\mathbf{q}`). The tasks - blocks of consecutive columns of one
+    :math:`\nu` - are laid out by :func:`~dgamore.memory_estimator.column_sde_schedule`. The kernels arrive in groups
+    of stored bosonic frequencies (:meth:`add_group`), and per group every rank:
+
+    1. receives the irreducible-BZ rows of the columns of its tasks in the group, of every kernel, in rounds of whole
+       tasks of at most ``chunk_bytes`` (:func:`~dgamore.mpi_utils.transpose_columns`),
+    2. expands each column of each kernel to the full BZ with :meth:`FourPoint.map_to_full_bz` into one buffer reused
+       for every column, Fourier transforms it in place over the momentum axes in the order z, y, x (a time-reversed
+       column is conjugated afterwards) and contracts it with the frequency slab at :math:`\nu - \omega` of the Green's
+       function of every term of the kernel in bounded real-space row chunks, adding the product to the task's partial
+       sum of the term's output (columns in block order, per column the kernels and their terms in the given order),
+    3. scales the task's partial sum of every output and folds it into the output's running sum of :math:`\nu`, which
+       the rank keeps across the groups.
+
+    :meth:`finish` then reduces one output: the owner of :math:`\nu` (the rank holding its first block) folds the other
+    ranks' sums in rank order, and rank 0 gathers the result. The bosonic sum is associated in the fixed blocks and in
+    the fixed rank order of the schedule. With ``by_frequency`` every block holds one stored frequency and the groups
+    pass the blocks in the schedule's order whatever their sizes, so an output depends on the box, the rank count and
+    its own terms only, never on the groups, ``chunk_bytes`` or the other outputs; without it the only group is the
+    whole bosonic range. Beyond the read-only kernels and windows a rank holds one round of irreducible columns of
+    every kernel, under two full-BZ columns, and per output its owned results, at most one running sum of a frequency
+    another rank owns and a partial sum.
+    """
+
+    _TRANSPOSE_TAG, _PARTIAL_TAG = 1200, 1300  # base MPI tags of the column transpose and the partial sums
+
+    def __init__(
+        self,
+        mpi_dist_irrk: MpiDistributor,
+        n_out: int,
+        dtype,
+        chunk_bytes: int | None = None,
+        by_frequency: bool = False,
+    ):
+        r"""
+        Lays out the tasks and allocates every output's results of the owned fermionic frequencies.
+
+        :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+        :param n_out: Number of outputs.
+        :param dtype: Element type of the kernels, the Green's functions and the outputs.
+        :param chunk_bytes: Byte budget of one round of transposed irreducible columns of all kernels (``None`` uses
+            the floor).
+        :param by_frequency: Whether every block holds one stored frequency, so the kernels can arrive in groups of
+            any size (see :func:`~dgamore.memory_estimator.column_sde_schedule`).
+        """
+        niw, niv = config.box.niw_core, config.box.niv_core
+        n_r, nb = config.lattice.k_grid.nk_tot, config.sys.n_bands
+        self._dist, self._dtype, self._by_frequency = mpi_dist_irrk, np.dtype(dtype), by_frequency
+        self._chunk = SLICE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
+        self._blocks, self._bounds, self._owner = memory_estimator.column_sde_schedule(
+            niw, niv, mpi_dist_irrk.mpi_size, by_frequency
+        )
+        self._my_v = np.flatnonzero(self._owner == mpi_dist_irrk.my_rank)
+        self._results = [np.empty((self._my_v.size, n_r, nb, nb), dtype=dtype) for _ in range(n_out)]
+        self._sums = [{} for _ in range(n_out)]
+        self._w_next = 0
+
+    def add_group(
+        self, w_window: tuple[int, int], kernels: list[FourPoint], terms: list[tuple[int, int, np.ndarray, int]]
+    ) -> None:
+        r"""
+        Contracts the columns of the group's tasks into the running sums (collective; every rank passes the same
+        window, the same number of kernels and the same terms).
+
+        :param w_window: The stored bosonic frequency indices ``(w0, w1)`` of the group; ``w0`` is the previous
+            group's ``w1`` (0 for the first group).
+        :param kernels: The rank-local irreducible-BZ kernels of the group ``[q, o1, o2, o3, o4, w1 - w0, v]`` (half
+            bosonic, full fermionic range, compressed momentum axis); only read.
+        :param terms: The terms as ``(kernel index, output index, g_r, giwk_niv)``: the frequency-first real-space
+            Green's function (see :func:`_build_rspace_giwk_window`) and its central fermionic-frequency index; only
+            read.
+        :return: None.
+        :raises ValueError: If the window does not continue the previous group inside the bosonic range (without
+            ``by_frequency``: is not the whole range), or a kernel does not hold the window's frequencies.
+        """
+        rank, size = self._dist.my_rank, self._dist.mpi_size
+        k_grid = config.lattice.k_grid
+        n_r, nb = k_grid.nk_tot, config.sys.n_bands
+        niw, niv = config.box.niw_core, config.box.niv_core
+        w0, w1 = w_window
+        whole = w0 == 0 and w1 == niw + 1
+        if w0 != self._w_next or not w0 < w1 <= niw + 1 or not (self._by_frequency or whole):
+            raise ValueError(f"The bosonic group ({w0}, {w1}) does not continue the groups at {self._w_next}.")
+        if any(kernel.mat.shape[-2] != w1 - w0 for kernel in kernels):
+            raise ValueError(f"A kernel does not hold the {w1 - w0} bosonic frequencies of the group ({w0}, {w1}).")
+        self._w_next = w1
+        blocks, bounds, n_b = self._blocks, self._bounds, len(self._blocks)
+        in_group = np.array([w0 <= ws[0] < w1 for _, ws in blocks])
+        tasks_of = [np.flatnonzero(in_group[np.arange(lo, hi) % n_b]) + lo for lo, hi in zip(bounds[:-1], bounds[1:])]
+
+        def columns(tasks: np.ndarray) -> np.ndarray:
+            """The (bosonic, fermionic) kernel index rows ``[2, n_cols]`` of tasks, in task and block order."""
+            pairs = []
+            for t in tasks:
+                v, (negative, ws) = t // n_b, blocks[t % n_b]
+                pairs += [(w - w0, niv - 1 - v if negative else niv + v) for w in ws]
+            return np.array(pairs, dtype=int).reshape(-1, 2).T
+
+        width = 1 if self._by_frequency else memory_estimator.SDE_W_BLOCK
+        task_bytes = len(kernels) * k_grid.nk_irr * nb**4 * width * self._dtype.itemsize
+        per_round = max(1, int(self._chunk // task_bytes))
+        n_rounds = -(-max(tasks.size for tasks in tasks_of) // per_round)
+        rows = max(1, memory_estimator.SDE_CONTRACTION_CHUNK_BYTES // (nb**4 * self._dtype.itemsize))
+        path = ["einsum_path", (0, 1)]
+        scale = -0.5 / config.sys.beta / n_r
+
+        partials = [np.empty((n_r, nb, nb), dtype=self._dtype) for _ in self._sums]
+        acc = np.empty((n_r, nb, nb), dtype=self._dtype)
+        column = np.empty((n_r, nb, nb, nb, nb, 1), dtype=self._dtype)  # every column is unfolded into this one buffer
+        report_at = {-(-n_rounds // 2), n_rounds} if whole else set()
+        # deferred_collection batches the gc pass of the per-column object releases into one collection at the end
+        with deferred_collection():
+            for k in range(n_rounds):
+                round_of = [tasks[k * per_round : (k + 1) * per_round] for tasks in tasks_of]
+                index_of = [columns(tasks) for tasks in round_of]
+                received = [
+                    mpi_utils.transpose_columns(kernel.mat, self._dist, index_of, self._TRANSPOSE_TAG)
+                    for kernel in kernels
+                ]
+                c = 0
+                for t in round_of[rank]:
+                    v, (negative, ws) = t // n_b, blocks[t % n_b]
+                    for partial in partials:
+                        partial[...] = 0
+                    for w in ws:
+                        for i, block in enumerate(received):
+                            col = FourPoint(
+                                block[..., c : c + 1], SpinChannel.NONE, config.lattice.nk, 1, 0, False, True, True
+                            )
+                            col = col.map_to_full_bz(k_grid, out=column).fft(copy=False, axes=(2, 1, 0))
+                            # time reversal of real hoppings conjugates at fixed R: K^{-w,v}(R) = conj(K^{w,-v}(R))
+                            if negative:
+                                col = col.conj(copy=False)
+                            k_mat = col.mat[..., 0]
+                            for _, out, g_r, giwk_niv in (term for term in terms if term[0] == i):
+                                g_slab = g_r[giwk_niv + (w if negative else -w) + v]
+                                for r0 in range(0, n_r, rows):
+                                    np.einsum(
+                                        "Rad,Raijd->Rij",
+                                        g_slab[r0 : r0 + rows],
+                                        k_mat[r0 : r0 + rows],
+                                        out=acc[r0 : r0 + rows],
+                                        optimize=path,
+                                    )
+                                np.add(partials[out], acc, out=partials[out])
+                            col.free()
+                        c += 1
+                    for out, partial in enumerate(partials):
+                        partial *= scale
+                        sums = self._sums[out]
+                        if v not in sums:
+                            mine = self._owner[v] == rank
+                            sums[v] = self._results[out][v - self._my_v[0]] if mine else np.empty_like(partial)
+                            np.copyto(sums[v], partial)
+                        else:
+                            sums[v] += partial
+                del received
+                if k + 1 in report_at:
+                    config.logger.info(f"Self-energy contraction: {k + 1} of {n_rounds} column rounds done.")
+
+    def finish(self, out: int) -> SelfEnergy | None:
+        r"""
+        Reduces output ``out`` after the last group (collective): the owner of :math:`\nu` folds the other ranks' sums
+        in rank order, rank 0 gathers the result, and the output's slabs are released.
+
+        :param out: The output index.
+        :return: The real-space self-energy :class:`SelfEnergy` of the output for :math:`\nu \geq 0` (compressed
+            momentum axis, moments not fitted) on rank 0; ``None`` elsewhere. Transform it back with
+            :meth:`SelfEnergy.ifft` and complete it with :meth:`SelfEnergy.to_full_niv_range`.
+        :raises ValueError: If the groups have not reached the last bosonic frequency.
+        """
+        if self._w_next != config.box.niw_core + 1:
+            raise ValueError(f"The bosonic groups end at {self._w_next}, before {config.box.niw_core + 1}.")
+        comm, rank, size = self._dist.comm, self._dist.my_rank, self._dist.mpi_size
+        n_r, nb = config.lattice.k_grid.nk_tot, config.sys.n_bands
+        n_b, bounds, owner, my_v = len(self._blocks), self._bounds, self._owner, self._my_v
+        sums, result = self._sums[out], self._results[out]
+        self._sums[out] = self._results[out] = None
+
+        # every rank's run starts inside at most one foreign frequency; its owner folds the sums in rank order
+        def ranks_of(v: int) -> list[int]:
+            """The ranks holding blocks of frequency ``v`` (a nonempty overlap of task runs), in rank order."""
+            return [r for r in range(size) if max(bounds[r], v * n_b) < min(bounds[r + 1], (v + 1) * n_b)]
+
+        sends = [(int(owner[v]), sums[v]) for v in sums if owner[v] != rank]
+        sources = [r for v in my_v for r in ranks_of(v) if r != rank]
+        received = iter(mpi_utils.exchange_blocks(comm, sends, sources, (n_r, nb, nb), self._dtype, self._PARTIAL_TAG))
+        for i, v in enumerate(my_v):
+            for r in ranks_of(v):
+                if r != rank:
+                    result[i] += next(received)
+        del sends, sums
+
+        full = MpiDistributor(ntasks=config.box.niv_core, comm=comm, sizes=np.bincount(owner, minlength=size)).gather(
+            result
+        )
+        if rank != 0:
+            return None
+        return SelfEnergy(
+            np.ascontiguousarray(np.moveaxis(full, 0, -1)),
+            config.lattice.nk,
+            full_niv_range=False,
+            has_compressed_q_dimension=True,
+            calc_smom=False,
+            beta=config.sys.beta,
+        )
 
 
 def _run_column_sde(
@@ -747,26 +1245,10 @@ def _run_column_sde(
     .. math:: \Sigma^{\mathrm{k}}_{12} = -\frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{ab}
         K^{\mathrm{q}\nu}_{a12b} G^{\mathrm{k}-\mathrm{q}}_{ab},
 
-    for :math:`\nu \geq 0` as a real-space product (convolution theorem), distributing the kernel's frequency columns
-    over the ranks instead of its momenta. A column is one bosonic frequency :math:`\omega` of one fermionic frequency
-    :math:`\nu`; a negative :math:`\omega` is read from the stored positive one by time reversal, which for real
-    hoppings is a plain conjugation in real space, :math:`K^{-\omega,\nu}(\mathbf{R}) = (K^{\omega,-\nu}(\mathbf{R}))^*`
-    (in momentum space it maps :math:`\mathbf{q} \to -\mathbf{q}`). The tasks - runs of
-    :data:`~dgamore.memory_estimator.SDE_W_BLOCK` consecutive columns of one :math:`\nu` - are laid out by
-    :func:`~dgamore.memory_estimator.column_sde_schedule`, and every rank:
-
-    1. receives the irreducible-BZ rows of its tasks' columns in rounds of at most ``chunk_bytes``
-       (:func:`~dgamore.mpi_utils.transpose_columns`),
-    2. expands each column to the full BZ with :meth:`FourPoint.map_to_full_bz` into one buffer reused for every
-       column, Fourier transforms it in place over the momentum axes in the order z, y, x (a time-reversed column is
-       conjugated afterwards) and contracts it with the frequency slab of ``g_r`` at :math:`\nu - \omega` in bounded
-       real-space row chunks,
-    3. folds its tasks' partial sums of each :math:`\nu` in block order; the owner of :math:`\nu` (the rank holding
-       its first block) folds the other ranks' sums in rank order, and rank 0 gathers the result.
-
-    The bosonic sum is associated in the fixed blocks and in the fixed rank order of the schedule, so the result
-    depends on the box and the rank count only, never on ``chunk_bytes``. Beyond the read-only kernel and window a
-    rank holds one round of irreducible columns, under two full-BZ columns and a few real-space slabs.
+    for :math:`\nu \geq 0`: one :class:`_ColumnSdeStream` of one output, fed the whole bosonic range at once, its
+    blocks the runs of :data:`~dgamore.memory_estimator.SDE_W_BLOCK` consecutive frequencies of
+    :func:`~dgamore.memory_estimator.column_sde_schedule` (all positive, then all negative frequencies). The result
+    depends on the box and the rank count only, never on ``chunk_bytes``.
 
     :param kernel_irr: The rank-local irreducible-BZ kernel ``[q, o1, o2, o3, o4, w, v]`` (half bosonic, full
         fermionic range, compressed momentum axis); only read.
@@ -778,106 +1260,9 @@ def _run_column_sde(
         not fitted) on rank 0; ``None`` elsewhere. Transform it back with :meth:`SelfEnergy.ifft` and complete it
         with :meth:`SelfEnergy.to_full_niv_range`.
     """
-    comm, rank, size = mpi_dist_irrk.comm, mpi_dist_irrk.my_rank, mpi_dist_irrk.mpi_size
-    k_grid = config.lattice.k_grid
-    n_r, nb = k_grid.nk_tot, config.sys.n_bands
-    niw, niv = config.box.niw_core, config.box.niv_core
-    dtype = kernel_irr.mat.dtype
-    scale = -0.5 / config.sys.beta / n_r
-
-    blocks, bounds, owner = memory_estimator.column_sde_schedule(niw, niv, size)
-    n_b = len(blocks)
-
-    def columns(tasks: range) -> np.ndarray:
-        """The (bosonic, fermionic) kernel index rows ``[2, n_cols]`` of consecutive tasks, in task and block order."""
-        pairs = []
-        for t in tasks:
-            v, (negative, ws) = t // n_b, blocks[t % n_b]
-            pairs += [(w, niv - 1 - v if negative else niv + v) for w in ws]
-        return np.array(pairs, dtype=int).reshape(-1, 2).T
-
-    task_bytes = k_grid.nk_irr * nb**4 * memory_estimator.SDE_W_BLOCK * np.dtype(dtype).itemsize
-    per_round = max(1, int((SLICE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes) // task_bytes))
-    n_rounds = -(-int(np.max(np.diff(bounds))) // per_round)
-    rows = max(1, memory_estimator.SDE_CONTRACTION_CHUNK_BYTES // (nb**4 * np.dtype(dtype).itemsize))
-    path = ["einsum_path", (0, 1)]
-    transpose_tag, partial_tag = 1200, 1300  # base MPI tags of the column transpose and the partial sums
-
-    my_v = np.flatnonzero(owner == rank)
-    result = np.empty((my_v.size, n_r, nb, nb), dtype=dtype)
-    sums = {}
-    partial = np.empty((n_r, nb, nb), dtype=dtype)
-    acc = np.empty_like(partial)
-    column = np.empty((n_r, nb, nb, nb, nb, 1), dtype=dtype)  # every column is unfolded into this one buffer
-    report_at = {-(-n_rounds // 2), n_rounds}
-    # deferred_collection batches the gc pass of the per-column object releases into one collection at the end
-    with deferred_collection():
-        for k in range(n_rounds):
-            round_of = [
-                range(bounds[r] + k * per_round, min(bounds[r + 1], bounds[r] + (k + 1) * per_round))
-                for r in range(size)
-            ]
-            block = mpi_utils.transpose_columns(
-                kernel_irr.mat, mpi_dist_irrk, [columns(tasks) for tasks in round_of], transpose_tag
-            )
-            c = 0
-            for t in round_of[rank]:
-                v, (negative, ws) = t // n_b, blocks[t % n_b]
-                partial[...] = 0
-                for w in ws:
-                    col = FourPoint(block[..., c : c + 1], SpinChannel.NONE, config.lattice.nk, 1, 0, False, True, True)
-                    c += 1
-                    col = col.map_to_full_bz(k_grid, out=column).fft(copy=False, axes=(2, 1, 0))
-                    # time reversal of real hoppings conjugates at fixed R: K^{-w,v}(R) = conj(K^{w,-v}(R))
-                    if negative:
-                        col = col.conj(copy=False)
-                    g_slab = g_r[giwk_niv + (w if negative else -w) + v]
-                    k_mat = col.mat[..., 0]
-                    for r0 in range(0, n_r, rows):
-                        np.einsum(
-                            "Rad,Raijd->Rij",
-                            g_slab[r0 : r0 + rows],
-                            k_mat[r0 : r0 + rows],
-                            out=acc[r0 : r0 + rows],
-                            optimize=path,
-                        )
-                    np.add(partial, acc, out=partial)
-                    col.free()
-                partial *= scale
-                if v not in sums:
-                    sums[v] = result[v - my_v[0]] if owner[v] == rank else np.empty_like(partial)
-                    np.copyto(sums[v], partial)
-                else:
-                    sums[v] += partial
-            del block
-            if k + 1 in report_at:
-                config.logger.info(f"Self-energy contraction: {k + 1} of {n_rounds} column rounds done.")
-
-    # every rank's run starts inside at most one foreign frequency; its owner folds the sums in rank order
-    def ranks_of(v: int) -> list[int]:
-        """The ranks holding blocks of frequency ``v`` (a nonempty overlap of task runs), in rank order."""
-        return [r for r in range(size) if max(bounds[r], v * n_b) < min(bounds[r + 1], (v + 1) * n_b)]
-
-    sends = [(int(owner[v]), sums[v]) for v in sums if owner[v] != rank]
-    sources = [r for v in my_v for r in ranks_of(v) if r != rank]
-    received = iter(mpi_utils.exchange_blocks(comm, sends, sources, (n_r, nb, nb), dtype, partial_tag))
-    for i, v in enumerate(my_v):
-        for r in ranks_of(v):
-            if r != rank:
-                result[i] += next(received)
-    del sends, sums
-
-    full = MpiDistributor(ntasks=niv, comm=comm, sizes=np.bincount(owner, minlength=size)).gather(result)
-    if rank != 0:
-        return None
-    return SelfEnergy(
-        np.ascontiguousarray(np.moveaxis(full, 0, -1)),
-        config.lattice.nk,
-        full_niv_range=False,
-        has_compressed_q_dimension=True,
-        calc_smom=False,
-        beta=config.sys.beta,
-    )
+    stream = _ColumnSdeStream(mpi_dist_irrk, 1, kernel_irr.mat.dtype, chunk_bytes)
+    stream.add_group((0, config.box.niw_core + 1), [kernel_irr], [(0, 0, g_r, giwk_niv)])
+    return stream.finish(0)
 
 
 def _sde_chunk_budget(comm: MPI.Comm, shared_node_comm) -> int:
@@ -903,7 +1288,9 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
     ``use_interpolated_sigma`` this is the predecessor's final self-energy re-gridded to this temperature,
     ``sigma_dga_interpolated_beta<b>_niv<n>.npy`` (the file with ``<b>`` closest to the current :math:`\beta` if
     several exist); otherwise it is the raw iterate ``sigma_dga_iteration_<i>.npy`` with the highest ``<i>``. The
-    iteration count comes from the raw iterates in both cases. Without a usable file the DMFT self-energy is returned.
+    iteration count comes from the raw iterates in both cases, read from the run's ``Sigma_Iterates`` subfolder or,
+    for a run written before that subfolder existed, from the run folder itself. Without a usable file the DMFT
+    self-energy is returned.
 
     :param default_sigma: The fallback (DMFT) :class:`SelfEnergy` used when no previous result is found.
     :return: A tuple of the starting :class:`SelfEnergy` (cut to the core box and interpolated onto the k-grid) and
@@ -918,12 +1305,15 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
             )
         return default_sigma, 0
 
-    iteration_regex = re.compile(r"sigma_dga_iteration_(\d+)\.npy$")
-    iterates = glob.glob(os.path.join(previous_sc_path, "sigma_dga_iteration_*.npy"))
-    iterations = [(int(match.group(1)), f) for f in iterates if (match := iteration_regex.search(f))]
-    if not iterations:
+    pattern = "sigma_dga_iteration_*.npy"
+    iterates = glob.glob(
+        os.path.join(previous_sc_path, config.self_consistency.sigma_iterates_subfolder_name, pattern)
+    ) or glob.glob(os.path.join(previous_sc_path, pattern))
+    files = {int(match.group(1)): f for f in iterates if (match := re.search(r"iteration_(\d+)\.npy$", f))}
+    if not files:
         return default_sigma, 0
-    max_iter, max_file = max(iterations, key=lambda x: x[0])
+    max_iter = max(files)
+    max_file = files[max_iter]
 
     if config.self_consistency.use_interpolated_sigma:
         beta_regex = re.compile(r"sigma_dga_interpolated_beta([0-9.eE+-]+)_niv\d+\.npy$")
@@ -936,14 +1326,9 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
             return default_sigma, 0
         max_file = min(betas, key=lambda x: x[0])[1]
     config.logger.info(f"Starting the self-consistency from {max_file} (iteration {max_iter}).")
-
     mat = np.load(max_file)
-    return (
-        SelfEnergy(mat, mat.shape[:3], True, False, beta=config.sys.beta)
-        .cut_niv(config.box.niv_core)
-        .interpolate_q_grid(config.lattice.k_grid.nk, False),
-        max_iter,
-    )
+    sigma = SelfEnergy(mat, mat.shape[:3], True, False, beta=config.sys.beta).cut_niv(config.box.niv_core)
+    return sigma.interpolate_q_grid(config.lattice.k_grid.nk, False), max_iter
 
 
 def _init_mu_history(starting_iter: int) -> list[float]:
@@ -968,8 +1353,29 @@ def _init_mu_history(starting_iter: int) -> list[float]:
     return [previous_mu]
 
 
+def _save_sigma_iteration(sigma: SelfEnergy, base_name: str, current_iter: int) -> None:
+    """
+    Saves a self-energy of the current iteration into the run's ``Sigma_Iterates`` subfolder as
+    ``<base_name>_iteration_<i>``.
+
+    :param sigma: The :class:`SelfEnergy` to save (the mixed iterate or the raw proposal).
+    :param base_name: File-name prefix.
+    :param current_iter: The current self-consistency iteration number.
+    :return: None.
+    """
+    sigma.decompress_q_dimension().save(
+        name=f"{base_name}_iteration_{current_iter}", output_dir=config.output.sigma_iterates_path
+    )
+    config.logger.info(f"Saved {base_name} for iteration {current_iter}.")
+
+
 def _load_node_shared_local_vertex(
-    node_comm, path: str, channel: SpinChannel, transform=None, axes: tuple[int, ...] | None = None
+    node_comm,
+    path: str,
+    channel: SpinChannel,
+    transform=None,
+    axes: tuple[int, ...] | None = None,
+    w_window: tuple[int, int] | None = None,
 ) -> tuple:
     r"""
     Loads a local four-point vertex from file **once per node** into an MPI shared-memory window (see
@@ -977,6 +1383,9 @@ def _load_node_shared_local_vertex(
     every other rank maps the same physical buffer read-only. Without a node communicator each rank loads
     privately (the previous behavior). At production box sizes these local vertices are multi-GB and were held
     once **per rank** before - the largest replicated objects of the kernel section after ``giwk_full``.
+    Without a transform the root streams the file straight into the window (see :func:`_stream_file_into_node_window`).
+    With ``w_window`` only that window of the stored bosonic indices is loaded; without a transform it is streamed on a
+    single-rank node too, so only the window is read from the file.
 
     :param node_comm: The node-local communicator (or ``None`` for a private per-rank load).
     :param path: Path to the ``.npy`` file.
@@ -987,12 +1396,16 @@ def _load_node_shared_local_vertex(
         exposes the unchanged logical layout as a strided view of that storage, so a consumer whose contraction
         reads the stored order (e.g. :meth:`FourPoint.contract_first_pair_with_local_vertex`) works without a
         copy.
+    :param w_window: The window ``(start, stop)`` of stored bosonic indices (half niw range) to load, or ``None`` for
+        the whole vertex.
     :return: The tuple ``(vertex, win)``; free the window via :func:`_free_shared_window` once every rank is done
         reading (``win`` is ``None`` on the private path, then ``vertex.free()`` applies as before).
     """
 
     def _load() -> np.ndarray:
         obj = LocalFourPoint.load(path, channel)
+        if w_window is not None:
+            obj = obj.take_wn_slice(*w_window)
         if transform is not None:
             obj = transform(obj)
         # ascontiguousarray since a pure orbital-permute transform returns a strided view of the loaded array
@@ -1000,11 +1413,44 @@ def _load_node_shared_local_vertex(
 
     if node_comm is None:
         mat, win = _load(), None
+    elif transform is None and (node_comm.Get_size() > 1 or w_window is not None):
+        mat, win = _stream_file_into_node_window(node_comm, path, axes, w_window)
     else:
         mat, win = mpi_utils.build_node_shared_array(node_comm, _load)
     if axes is not None:
         mat = mat.transpose(np.argsort(axes))
     return LocalFourPoint(mat, channel, 1, 2, False, True), win
+
+
+def _stream_file_into_node_window(
+    node_comm, path: str, axes: tuple[int, ...] | None, w_window: tuple[int, int] | None = None
+) -> tuple:
+    """
+    Copies the array of a ``.npy`` file into a node's shared-memory window without a private copy: the node root maps
+    the file read-only and writes it, in the storage order ``axes``, straight into the window, one slab of the file's
+    last three axes at a time; only the scatter into the reordered window is strided, since a copy in window order
+    would read the file in runs of one fermionic axis. With ``w_window`` only that window of the file's bosonic axis,
+    the third from the end, is copied, and only it is read. Collective over ``node_comm``.
+
+    :param node_comm: The node-local communicator.
+    :param path: Path to the ``.npy`` file.
+    :param axes: The axis order the window stores, ``None`` for the file's own.
+    :param w_window: The window ``(start, stop)`` of the file's third axis from the end, or ``None`` for all of it.
+    :return: The tuple ``(array, win)`` of the window in the storage order.
+    """
+    root = node_comm.Get_rank() == 0
+    source = np.load(path, mmap_mode="r") if root else None
+    if root and w_window is not None:
+        source = source[..., w_window[0] : w_window[1], :, :]
+    shape, dtype = node_comm.bcast((source.transpose(axes or range(source.ndim)).shape, source.dtype) if root else None)
+    shared, win = mpi_utils.allocate_node_shared_array(node_comm, shape, dtype)
+    if root:
+        logical = shared if axes is None else shared.transpose(np.argsort(axes))
+        for index in np.ndindex(source.shape[:-3]):
+            logical[index] = source[index]
+    del source
+    node_comm.Barrier()
+    return shared, win
 
 
 def _build_giwk_full(comm: MPI.Comm, sigma: SelfEnergy, mu: float, ek: np.ndarray, beta: float) -> tuple:
@@ -1104,6 +1550,26 @@ def _free_shared_window(win, node_comm) -> None:
     win.Free()
 
 
+def scatter_irreducible_interaction(v_nonloc: Interaction | None, mpi_dist_irrk: MpiDistributor) -> Interaction:
+    r"""
+    Returns this rank's irreducible momenta of the non-local interaction :math:`V^{\mathbf{q}}`, which only rank 0
+    holds on the full q-grid: rank 0 reduces it to the irreducible q-points in the order of their index list
+    (:meth:`~dgamore.n_point_base.IAmNonLocal.reduce_q`) and scatters the rows, so every rank receives its momenta in
+    the distributor's order, the order of every other irreducible object, and no other rank ever holds the full grid.
+    Collective over the communicator of ``mpi_dist_irrk``.
+
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` on the full q-grid; only read on rank 0.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :return: The interaction on this rank's irreducible q-points (compressed momentum axis).
+    """
+    rows = channel = None
+    if mpi_dist_irrk.my_rank == 0:
+        rows = v_nonloc.reduce_q(config.lattice.k_grid.get_irrq_list()).mat
+        channel = v_nonloc.channel
+    channel = mpi_dist_irrk.bcast(channel)
+    return Interaction(mpi_dist_irrk.scatter(rows), channel, config.lattice.k_grid.nk, has_compressed_q_dimension=True)
+
+
 def _share_sigma_per_node(
     sigma: SelfEnergy | None, comm: MPI.Comm, node_comm, roots_comm
 ) -> tuple[SelfEnergy, MPI.Win | None]:
@@ -1136,6 +1602,67 @@ def _share_sigma_per_node(
     return sigma, win
 
 
+def _occupation_self_energy(
+    sigma_new: SelfEnergy, sigma_dmft_full: SelfEnergy, mpi_dist_fullbz: MpiDistributor
+) -> SelfEnergy:
+    r"""
+    Returns this rank's momentum slice of the self-energy the occupation is evaluated with: ``sigma_new`` on its own
+    frequency box and the DMFT self-energy beyond it, shifted by the momentum-dependent shell offset ``sigma_new``
+    carries (see :meth:`SelfEnergy.shell_offset_from`), with the high-frequency moments of the whole concatenation
+    fitted on rank 0 and broadcast.
+
+    :param sigma_new: The mixed :class:`SelfEnergy` (full BZ, identical on every rank; compressed in place).
+    :param sigma_dmft_full: The DMFT :class:`SelfEnergy` supplying the shell frequencies (momentum-local).
+    :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
+    :return: The concatenated :class:`SelfEnergy` of this rank's momenta (compressed momentum axis, moments set).
+    """
+    sigma_slice = SelfEnergy(
+        sigma_new.compress_q_dimension().mat[mpi_dist_fullbz.my_slice],
+        (mpi_dist_fullbz.my_size, 1, 1),
+        has_compressed_q_dimension=True,
+        calc_smom=False,
+        beta=config.sys.beta,
+    )
+    shell_offset = sigma_new.shell_offset_from(sigma_dmft_full)
+    sigma_occ = sigma_slice.concatenate_self_energies(
+        sigma_dmft_full, shell_offset=shell_offset[mpi_dist_fullbz.my_slice]
+    )
+
+    # the full-box moments come from the k-mean fit window of the replicated sigma_new, so rank 0 fits them once
+    # (the fit window is a full-BZ array) and broadcasts; the fit equals the momentum-resolved concatenation's fit
+    moments = (
+        sigma_new.fit_smom_concatenated(sigma_dmft_full, shell_offset=shell_offset)
+        if mpi_dist_fullbz.my_rank == 0
+        else None
+    )
+    sigma_occ._smom0, sigma_occ._smom1 = mpi_dist_fullbz.bcast(moments)
+    return sigma_occ
+
+
+def _slice_occupation_and_energies(
+    sigma_occ: SelfEnergy, mu: float, mpi_dist_fullbz: MpiDistributor
+) -> tuple[np.ndarray, float, float]:
+    r"""
+    Returns the k-resolved occupation and the kinetic and potential energies of this rank's momentum slice, which
+    must hold at least one momentum. The real-or-complex arithmetic of the occupation is decided on the whole
+    dispersion, so every rank's slice takes the same.
+
+    :param sigma_occ: This rank's concatenated self-energy slice (see :func:`_occupation_self_energy`).
+    :param mu: Chemical potential :math:`\mu`.
+    :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
+    :return: The tuple ``(occ_k_slice, ekin, epot)`` of this rank's k-resolved occupation ``[k, 1, 1, o1, o2]`` and
+        its momentum-averaged kinetic and potential energies.
+    """
+    nk_tot, n_bands, n_my = config.lattice.k_grid.nk_tot, config.sys.n_bands, mpi_dist_fullbz.my_size
+    ek = config.lattice.hamiltonian.get_ek()
+    ek_slice = ek.reshape(nk_tot, n_bands, n_bands)[mpi_dist_fullbz.my_slice].reshape(n_my, 1, 1, n_bands, n_bands)
+    giwk_occ = GreensFunction.get_g_full(sigma_occ, mu, ek_slice, config.sys.beta)
+    _, _, occ_k_slice = giwk_occ.get_fill_nonlocal(real_dispersion=np.isrealobj(np.real_if_close(ek)))
+    ekin, epot = giwk_occ.get_ekin(), giwk_occ.get_epot()
+    giwk_occ.free()
+    return occ_k_slice, ekin, epot
+
+
 def _update_occ_and_energies_distributed(
     sigma_new: SelfEnergy, sigma_dmft_full: SelfEnergy, mpi_dist_fullbz: MpiDistributor, mu: float
 ) -> tuple[float, np.ndarray, np.ndarray, float, float]:
@@ -1163,33 +1690,12 @@ def _update_occ_and_energies_distributed(
     n_bands = config.sys.n_bands
     n_my = mpi_dist_fullbz.my_size
 
-    sigma_slice = SelfEnergy(
-        sigma_new.compress_q_dimension().mat[mpi_dist_fullbz.my_slice],
-        (n_my, 1, 1),
-        has_compressed_q_dimension=True,
-        calc_smom=False,
-        beta=config.sys.beta,
-    )
-    shell_offset = sigma_new.shell_offset_from(sigma_dmft_full)
-    sigma_occ = sigma_slice.concatenate_self_energies(
-        sigma_dmft_full, shell_offset=shell_offset[mpi_dist_fullbz.my_slice]
-    )
+    sigma_occ = _occupation_self_energy(sigma_new, sigma_dmft_full, mpi_dist_fullbz)
 
-    # the full-box moments come from the k-mean fit window of the replicated sigma_new, so rank 0 fits them once
-    # (the fit window is a full-BZ array) and broadcasts; the fit equals the momentum-resolved concatenation's fit
-    moments = (
-        sigma_new.fit_smom_concatenated(sigma_dmft_full, shell_offset=shell_offset)
-        if mpi_dist_fullbz.my_rank == 0
-        else None
-    )
-    sigma_occ._smom0, sigma_occ._smom1 = mpi_dist_fullbz.bcast(moments)
-
-    ek = config.lattice.hamiltonian.get_ek()
-    ek_slice = ek.reshape(nk_tot, n_bands, n_bands)[mpi_dist_fullbz.my_slice].reshape(n_my, 1, 1, n_bands, n_bands)
-    giwk_occ = GreensFunction.get_g_full(sigma_occ, mu, ek_slice, config.sys.beta)
-    _, _, occ_k_slice = giwk_occ.get_fill_nonlocal(real_dispersion=np.isrealobj(np.real_if_close(ek)))
-    ekin, epot = giwk_occ.get_ekin(), giwk_occ.get_epot()
-    giwk_occ.free()
+    # a rank without momenta (more ranks than momenta) adds nothing to the reductions below
+    occ_k_slice, ekin, epot = np.zeros((0, 1, 1, n_bands, n_bands)), 0.0, 0.0
+    if n_my:
+        occ_k_slice, ekin, epot = _slice_occupation_and_energies(sigma_occ, mu, mpi_dist_fullbz)
     sigma_occ.free()
 
     n_el, occ, occ_k = _assemble_occupation(occ_k_slice, mpi_dist_fullbz)
@@ -1256,6 +1762,7 @@ def calculate_sigma_proposal(
     chunk_budgets: memory_estimator.ChunkBudgets | None = None,
     save_eliashberg: bool = False,
     eliashberg_only: bool = False,
+    lambda_previous: dict | None = None,
 ) -> SelfEnergy | None:
     r"""
     Returns the raw (un-mixed) DGA self-energy proposal :math:`S(\Sigma_{\mathrm{in}})` at chemical potential
@@ -1296,6 +1803,8 @@ def calculate_sigma_proposal(
     :param eliashberg_only: Whether to stop after the two channel kernels: the double-counting kernel and the SDE are
         skipped and ``None`` is returned on every rank (the pass after a loop that converged before its last
         iteration).
+    :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, kept by the
+        self-consistency loop across its iterations; ``None`` for the one-shot correction.
     :return: The raw full-BZ proposal :class:`SelfEnergy` (DMFT tail attached) on rank 0; ``None`` on every other rank,
         since only rank 0 mixes it, and on every rank with ``eliashberg_only``.
     """
@@ -1329,7 +1838,7 @@ def calculate_sigma_proposal(
 
     # the local vertices are identical on every rank, so they are loaded once per node into shared windows; the
     # double-counting kernel only enters the SDE, which the Eliashberg-only pass skips
-    kernel = None
+    dc_contraction = None
     if not eliashberg_only:
         f_dc_loc, f_dc_win = _load_node_shared_local_vertex(
             shared_node_comm,
@@ -1337,17 +1846,23 @@ def calculate_sigma_proposal(
             SpinChannel.MAGN,
             axes=(4, 0, 1, 5, 2, 3, 6),  # the order contract_first_pair_with_local_vertex reads as a view
         )
-        kernel = calculate_sigma_dc_kernel(f_dc_loc, gchi0_q, u_loc)
+        dc_contraction = _contract_dc_vertex(f_dc_loc, gchi0_q)
         f_dc_loc.mat = None
         if f_dc_win is None:
             f_dc_loc.free()
         _free_shared_window(f_dc_win, shared_node_comm)
-        logger.info("Calculated double-counting kernel.")
 
     gchi0_q_full_sum = gchi0_q.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
     gchi0_q_core = gchi0_q.cut_niv(config.box.niv_core)
     gchi0_q.free()
     logger.log_memory_usage("Gchi0_q_core", gchi0_q_core, comm.size)
+
+    # the interaction is attached once the full-box bubble is freed, so its operand copy never sits beside the bubble
+    kernel = None
+    if dc_contraction is not None:
+        kernel = _attach_dc_interaction(dc_contraction, u_loc)
+        dc_contraction.free()
+        logger.info("Calculated double-counting kernel.")
 
     gchi0_q_core_sum = gchi0_q_core.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
     gchi0_q_core_inv = gchi0_q_core.invert(copy=False)
@@ -1365,7 +1880,7 @@ def calculate_sigma_proposal(
     gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
         shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
     )
-    channel_kernel = calculate_sigma_kernel_r_q(
+    calculate_sigma_kernel_r_q(
         gamma_dens,
         gchi0_q_core_inv,
         gchi0_q_full_sum,
@@ -1375,10 +1890,9 @@ def calculate_sigma_proposal(
         mpi_dist_irrk,
         annealer,
         save_eliashberg=save_eliashberg,
+        lambda_previous=lambda_previous,
+        kernel=kernel,
     )
-    if kernel is not None:
-        kernel.add(channel_kernel, copy=False)
-    channel_kernel.free()
     gamma_dens.mat = None
     if gamma_dens_win is None:
         gamma_dens.free()
@@ -1389,7 +1903,7 @@ def calculate_sigma_proposal(
     gamma_magn, gamma_magn_win = _load_node_shared_local_vertex(
         shared_node_comm, os.path.join(config.output.output_path, "gamma_magn_loc.npy"), SpinChannel.MAGN
     )
-    channel_kernel = calculate_sigma_kernel_r_q(
+    calculate_sigma_kernel_r_q(
         gamma_magn,
         gchi0_q_core_inv,
         gchi0_q_full_sum,
@@ -1399,10 +1913,10 @@ def calculate_sigma_proposal(
         mpi_dist_irrk,
         annealer,
         save_eliashberg=save_eliashberg,
-    ).scale(3.0)
-    if kernel is not None:
-        kernel.add(channel_kernel, copy=False)
-    channel_kernel.free()
+        lambda_previous=lambda_previous,
+        kernel=kernel,
+        weight=3.0,
+    )
     gchi0_q_core_inv.free()
     gchi0_q_full_sum.free()
     gchi0_q_core_sum.free()
@@ -1492,7 +2006,7 @@ def interpolate_sigma(sigma: SelfEnergy, beta_target: float, niv_target: int, co
     flagged = comm.bcast(flagged, root=0)
     if flagged.size > 0:
         dist = MpiDistributor.create_distributor(ntasks=flagged.size, comm=comm, name="PoleFit")
-        # every rank re-grids only the momenta it fits; reduce_q keeps the ascending irreducible order
+        # every rank re-grids only the momenta it fits; reduce_q keeps the order of the irreducible list
         mine = sigma.reduce_q(irrq_list[flagged[dist.my_slice]])
         reference = mine.interpolate(beta_target, niv_target) if dist.my_size else mine
         values, accepted = mine.pole_extrapolate(beta_target, niv_target, np.arange(dist.my_size), reference)
@@ -1534,29 +2048,330 @@ def _relative_sigma_residual(sigma_new: SelfEnergy, sigma_old: SelfEnergy) -> fl
     return float(np.linalg.norm(new_core - old_core) / np.linalg.norm(old_core))
 
 
+def _jacobian_expander(state: dict) -> Callable[[np.ndarray], np.ndarray] | None:
+    r"""
+    Builds the mapping of one stored column of a predecessor's spectrum file to the real vector in this run's tracker
+    coordinates: the column, a real vector on the predecessor's weighted symmetry sector (see
+    :func:`~dgamore.sigma_jacobian.tracker_sector_maps`), is taken back to the complex self-energy on the irreducible
+    momenta, completed to the negative frequencies by the Matsubara Hermiticity, re-gridded on the frequency axis by
+    :meth:`SelfEnergy.interpolate` (the hand-over's PCHIP, row by row, so the irreducible rows re-grid exactly as on
+    the whole grid), zeroed on every target frequency beyond the predecessor's highest source frequency (an eigenvector
+    is not extrapolated) and weighted back into this run's sector. Identical frequency grids skip the re-gridding.
+    Refused, with a warning, for another orbital count. For another momentum grid or symmetry reduction, whose sector
+    the columns do not live in, every column maps to an empty vector, so the eigenvalues and their damping bound are
+    carried without vectors, with a warning. Re-gridding a Ritz vector this way is an approximation.
+
+    :param state: The carried spectrum (``shape``, ``beta``, ``irrk_ind`` and ``irrk_count`` are read).
+    :return: The callable, or ``None`` when the carry-over is refused.
+    """
+    shape_src = tuple(int(n) for n in state["shape"])
+    beta_src = float(state["beta"])
+    nb, k_grid = config.sys.n_bands, config.lattice.k_grid
+    if shape_src[3:5] != (nb, nb):
+        config.logger.warning("The carried Jacobian spectrum belongs to another orbital count; nothing carried.")
+        return None
+    same_sector = (
+        shape_src[:3] == tuple(int(n) for n in k_grid.nk)
+        and np.array_equal(state["irrk_ind"], k_grid.irrk_ind)
+        and np.array_equal(state["irrk_count"], k_grid.irrk_count)
+    )
+    if not same_sector:
+        config.logger.warning(
+            "The carried Jacobian spectrum belongs to another momentum grid or symmetry reduction; its eigenvalues "
+            "are carried without vectors."
+        )
+        return lambda column: np.zeros(0)
+    niv_tgt, beta_tgt, niv_src = config.box.niv_core, config.sys.beta, shape_src[-1] // 2
+    if niv_src == niv_tgt and beta_src == beta_tgt:
+        return lambda column: np.asarray(column, dtype=np.float64)
+    weight = np.sqrt(2.0 * k_grid.irrk_count)[:, None, None, None]
+    inside = np.abs(MFHelper.vn(niv_tgt, beta_tgt)) <= np.abs(MFHelper.vn(niv_src, beta_src)).max()
+
+    def expand(column: np.ndarray) -> np.ndarray:
+        half = to_mat(np.asarray(column, dtype=np.float64), (k_grid.nk_irr, nb, nb, niv_src)) / weight
+        sigma = SelfEnergy(half, k_grid.nk, False, True, calc_smom=False, beta=beta_src).to_full_niv_range()
+        window = sigma.interpolate(beta_tgt, niv_tgt).mat * inside
+        return to_vec(window[..., niv_tgt:] * weight)
+
+    return expand
+
+
+def _carry_jacobian_spectrum(tracker: JacobianTracker, annealer: LambdaAnnealer | None) -> None:
+    r"""
+    Hands the predecessor's certified Jacobian spectrum in ``jacobian.npz`` of ``previous_sc_path`` (see
+    :meth:`JacobianTracker.save_spectrum`) to the tracker before the first iteration of a resumed run, with this run's
+    :math:`\beta` for the cross-rung prediction (see :meth:`JacobianTracker.carry_in`). A predecessor short of the pure
+    fixed point is carried with a warning; nothing is carried when the expander refuses (see
+    :func:`_jacobian_expander`), when the file holds the traces alone, or, with a warning, when it cannot be read or
+    lacks a key. Flips stay pending while a susceptibility-reshaping scaffold is on.
+
+    :param tracker: The rank-0 tracker of this run.
+    :param annealer: The :class:`~dgamore.lambda_ops.LambdaAnnealer`, or ``None`` while annealing is off.
+    :return: None.
+    """
+    folder = config.self_consistency.previous_sc_path
+    path = os.path.join(folder, JACOBIAN_FILE)
+    if not os.path.isfile(path):
+        config.logger.info(f"No {JACOBIAN_FILE} in {folder}; nothing carried.")
+        return
+    try:
+        state = load_spectrum(path)
+    except (OSError, EOFError, ValueError, KeyError, zipfile.BadZipFile) as error:
+        config.logger.warning(f"{path} could not be read ({error}); nothing carried.")
+        return
+    if "lam_pi" not in state:
+        config.logger.info(f"{path} holds no certified spectrum (the run did not end its loop); nothing carried.")
+        return
+    allow_flip = not (
+        config.stabilization.use_chi_phys_restriction
+        or config.stabilization.use_lambda_correction
+        or (annealer is not None and annealer.mass_present)
+    )
+    try:
+        if not bool(state["converged"]):
+            config.logger.warning(
+                f"The predecessor's Jacobian spectrum in {path} belongs to a run that did not reach the pure fixed "
+                "point."
+            )
+        expand = _jacobian_expander(state)
+        if expand is not None:
+            tracker.carry_in(state, expand, allow_flip=allow_flip, beta=config.sys.beta)
+    except KeyError as error:
+        config.logger.warning(f"{path} lacks the key {error} of the spectrum layout; nothing carried.")
+
+
+def _jacobian_traces(rows_lam: list, rows_res: list, rows_damping: list) -> dict[str, np.ndarray]:
+    """
+    Stacks the per-iteration rows the loop collected into the trace arrays of ``jacobian.npz``.
+
+    :param rows_lam: The leading Ritz value rows, oldest first.
+    :param rows_res: The matching Ritz residual rows, oldest first.
+    :param rows_damping: The matching effective dampings, oldest first.
+    :return: The arrays keyed ``eigenvalues`` (``[n, TRACKER_PAIRS - 1]`` complex), ``eigenvalue_residuals``
+        (``[n, TRACKER_PAIRS - 1]``) and ``damping`` (``[n]``).
+    """
+    return {
+        "eigenvalues": np.array(rows_lam, dtype=np.complex128).reshape(len(rows_lam), _JACOBIAN_ROW_WIDTH),
+        "eigenvalue_residuals": np.array(rows_res, dtype=np.float64).reshape(len(rows_res), _JACOBIAN_ROW_WIDTH),
+        "damping": np.array(rows_damping, dtype=np.float64),
+    }
+
+
+def _save_jacobian_spectrum(
+    tracker: JacobianTracker, converged: bool, rows_lam: list, rows_res: list, rows_damping: list
+) -> None:
+    """
+    Writes the tracker's certified spectrum with the per-iteration traces and the grid's ``irrk_ind`` and
+    ``irrk_count``, which define its sector coordinates, to ``jacobian.npz`` in the output folder for a successor run
+    (see :meth:`JacobianTracker.save_spectrum`), replacing the trace-only file of :func:`_append_jacobian_eigenvalues`.
+
+    :param tracker: The rank-0 tracker of this run.
+    :param converged: Whether the run reached the pure fixed point (a scaffolded phase that ended on the last
+        iteration does not count).
+    :param rows_lam: The leading Ritz value rows collected over the run, oldest first.
+    :param rows_res: The matching Ritz residual rows, oldest first.
+    :param rows_damping: The matching effective dampings, oldest first.
+    :return: None.
+    """
+    nb, k_grid = config.sys.n_bands, config.lattice.k_grid
+    shape = (*(int(n) for n in k_grid.nk), nb, nb, 2 * config.box.niv_core)
+    grid = {"irrk_ind": np.asarray(k_grid.irrk_ind), "irrk_count": np.asarray(k_grid.irrk_count)}
+    tracker.save_spectrum(
+        os.path.join(config.output.output_path, JACOBIAN_FILE),
+        shape,
+        config.sys.beta,
+        converged,
+        DTYPE,
+        traces={**_jacobian_traces(rows_lam, rows_res, rows_damping), **grid},
+    )
+
+
+def _append_jacobian_eigenvalues(tracker: JacobianTracker, rows_lam: list, rows_res: list, rows_damping: list) -> None:
+    """
+    Appends this iteration's leading Jacobian Ritz values, residuals and damping to the running rows and rewrites
+    ``jacobian.npz`` in the output folder with the three traces (``eigenvalues``, ``eigenvalue_residuals``,
+    ``damping``) through a temporary file renamed onto it, so a killed run keeps the previous file; the certified
+    spectrum joins the file when the loop ends (see :func:`_save_jacobian_spectrum`). An iteration without an estimate
+    (see :attr:`JacobianTracker.estimated`) appends ``nan`` rows to the first two traces.
+
+    :param tracker: The rank-0 tracker owning the last update.
+    :param rows_lam: The Ritz value rows collected so far, oldest first, extended in place.
+    :param rows_res: The matching Ritz residual rows collected so far, oldest first, extended in place.
+    :param rows_damping: The matching effective dampings collected so far, oldest first, extended in place.
+    :return: None.
+    """
+    lam_pi, res = (
+        tracker.leading(_JACOBIAN_ROW_WIDTH) if tracker.estimated else (np.full(_JACOBIAN_ROW_WIDTH, np.nan),) * 2
+    )
+    rows_lam.append(lam_pi)
+    rows_res.append(res)
+    rows_damping.append(tracker.p_eff)
+    path = os.path.join(config.output.output_path, JACOBIAN_FILE)
+    partial = f"{path}.tmp"
+    with open(partial, "wb") as handle:
+        np.savez(handle, **_jacobian_traces(rows_lam, rows_res, rows_damping))
+    os.replace(partial, path)
+
+
 def _mixing_history_cap(
-    current_iter: int, release_iter: int | None, anneal_reset_iter: int | None = None
+    current_iter: int,
+    release_iter: int | None,
+    anneal_reset_iter: int | None = None,
+    extra_event_iter: int | None = None,
 ) -> int | None:
     """
-    Returns the accelerated-mixing history cap for this iteration: the number of iterations since the most recent
-    map-switching event - the susceptibility-restriction release or a change of the lambda-annealing mass.
-    Anderson/Pulay must not extrapolate across any of these discontinuities, so their usable history is capped to
-    the post-event iterations (``None`` when no event has occurred).
+    Returns the history cap for this iteration: the number of iterations since the most recent map-switching event
+    (the susceptibility-restriction release, a change of the lambda-annealing mass, or the caller's own event, e.g. a
+    switch of the Jacobian tracker's reflected map). Nothing may extrapolate across such a discontinuity, so the
+    usable history is capped to the post-event iterations (``None`` when no event has occurred).
 
     :param current_iter: The current self-consistency iteration number.
     :param release_iter: The iteration the susceptibility restriction was released on (``None`` if never).
     :param anneal_reset_iter: The iteration the annealing mass last changed on (``None`` if never).
+    :param extra_event_iter: The iteration of the caller's own map-switching event (``None`` if never).
     :return: The history cap, or ``None`` for no cap.
     """
-    events = (release_iter, anneal_reset_iter)
+    events = (release_iter, anneal_reset_iter, extra_event_iter)
     last_reset_iter = max((it for it in events if it is not None), default=None)
     return None if last_reset_iter is None else max(0, current_iter - last_reset_iter - 1)
+
+
+def _update_jacobian_tracker(
+    tracker: JacobianTracker,
+    window: list,
+    current_iter: int,
+    release_iter: int | None,
+    anneal_reset_iter: int | None,
+    annealer: LambdaAnnealer | None,
+) -> bool:
+    r"""
+    Runs one monitoring step of the Jacobian tracker on the raw :math:`(x, S(x))` pairs recorded up to this
+    iteration's. The window restarts only on a scaffold event (the restriction or lambda-correction release, a change
+    of the annealing mass), dropping the pair recorded at it, never on the tracker's own events; flips are paused
+    while a scaffold is active.
+
+    :param tracker: The tracker owning the flipped subspace and the effective damping.
+    :param window: The pairs :meth:`JacobianTracker.record` recorded, oldest first, this iteration's last.
+    :param current_iter: The current self-consistency iteration number.
+    :param release_iter: The iteration a susceptibility-reshaping scaffold was released on (``None`` if never).
+    :param anneal_reset_iter: The iteration the annealing mass last changed on (``None`` if never).
+    :param annealer: The :class:`~dgamore.lambda_ops.LambdaAnnealer`, or ``None`` while annealing is off.
+    :return: Whether the tracked subspace changed, i.e. the reflected map the accelerated mixing sees switched.
+    """
+    raw_cap = _mixing_history_cap(current_iter, release_iter, anneal_reset_iter)
+    n_entries = len(window) if raw_cap is None else min(len(window), raw_cap + 1)
+    allow_flip = not (
+        config.stabilization.use_chi_phys_restriction
+        or config.stabilization.use_lambda_correction
+        or (annealer is not None and annealer.mass_present)
+    )
+    return tracker.update_recorded(window[len(window) - n_entries :], allow_flip=allow_flip)
+
+
+def _install_exact_jacobian(
+    tracker: JacobianTracker,
+    sigma: SelfEnergy,
+    mu: float,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    v_nonloc_full: Interaction | None,
+    sigma_dmft_full: SelfEnergy,
+    mpi_dist_irrk: MpiDistributor,
+    mpi_dist_fullbz: MpiDistributor,
+    comm: MPI.Comm,
+    chunk_budgets: memory_estimator.ChunkBudgets | None = None,
+) -> None:
+    r"""
+    Evaluates the leading eigenpairs of the exact Jacobian of the self-energy map at the converged self-energy
+    (see :class:`~dgamore.sigma_jacobian.ExactJacobian` and :func:`~dgamore.sigma_jacobian.leading_eigenpairs`),
+    started from the least stable and the stiffest certified direction of rank 0's tracker (see
+    :meth:`JacobianTracker.start_directions`), and makes them the spectrum the tracker writes to ``jacobian.npz``
+    (see :meth:`JacobianTracker.install_exact_spectrum`). Collective over ``comm``.
+
+    :param tracker: The rank-0 tracker of this run.
+    :param sigma: The converged :class:`SelfEnergy` on the loop's box (full BZ, identical on every rank).
+    :param mu: Chemical potential :math:`\mu` of ``sigma``.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`, reduced to this rank's irreducible q-points.
+    :param v_nonloc_full: The non-local interaction on the full q-grid (for the Hartree/Fock term); only read on
+        rank 0.
+    :param sigma_dmft_full: The DMFT :class:`SelfEnergy` supplying the shell frequencies (momentum-local).
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
+    :param comm: The MPI communicator.
+    :param chunk_budgets: Chunk byte budget, block width and vertex residency of the products (see
+        :class:`~dgamore.memory_estimator.ChunkBudgets`); ``None`` gives the job-wide fair-share budget of
+        :func:`_sde_chunk_budget`, one-column products and held vertices.
+    :return: None.
+    """
+    from dgamore.sigma_jacobian import ExactJacobian, leading_eigenpairs
+
+    config.logger.info("Evaluating the leading eigenpairs of the exact Jacobian at the converged self-energy.")
+    jac = ExactJacobian(
+        sigma, mu, u_loc, v_nonloc, v_nonloc_full, sigma_dmft_full, mpi_dist_irrk, mpi_dist_fullbz, comm, chunk_budgets
+    )
+    starts = tracker.start_directions() if comm.rank == 0 else (None, None)
+    spectrum = leading_eigenpairs(jac, comm, *starts)
+    jac.free()  # on the normal path only: an exception aborts the job instead of meeting another collective
+    if comm.rank == 0:
+        tracker.install_exact_spectrum(*spectrum)
+
+
+def _run_exact_check(
+    tracker: JacobianTracker,
+    start: np.ndarray | None,
+    sigma: SelfEnergy,
+    mu: float,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    v_nonloc_full: Interaction | None,
+    sigma_dmft_full: SelfEnergy,
+    mpi_dist_irrk: MpiDistributor,
+    mpi_dist_fullbz: MpiDistributor,
+    comm: MPI.Comm,
+    chunk_budgets: memory_estimator.ChunkBudgets | None = None,
+) -> bool:
+    r"""
+    Runs the exact check the tracker requested before this iteration's step: builds the exact Jacobian at the iterate
+    (see :class:`~dgamore.sigma_jacobian.ExactJacobian`), certifies the Ritz pairs next to the requested directions
+    (see :func:`~dgamore.sigma_jacobian.certify_subspace`), frees the operator, and hands the pairs to rank 0's
+    tracker (see :meth:`JacobianTracker.install_exact_check`). Collective over ``comm``.
+
+    :param tracker: The tracker of this run; only rank 0's installs the pairs.
+    :param start: The requested real start columns on rank 0 (see :meth:`JacobianTracker.exact_check_request`);
+        ``None`` elsewhere.
+    :param sigma: The iterate of this iteration's proposal on the loop's box (full BZ, identical on every rank).
+    :param mu: Chemical potential :math:`\mu` of ``sigma``.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`, reduced to this rank's irreducible q-points.
+    :param v_nonloc_full: The non-local interaction on the full q-grid (for the Hartree/Fock term); only read on
+        rank 0.
+    :param sigma_dmft_full: The DMFT :class:`SelfEnergy` supplying the shell frequencies (momentum-local).
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
+    :param comm: The MPI communicator.
+    :param chunk_budgets: Chunk byte budget, block width and vertex residency of the products (see
+        :class:`~dgamore.memory_estimator.ChunkBudgets`); ``None`` gives the job-wide fair-share budget of
+        :func:`_sde_chunk_budget`, one-column products and held vertices.
+    :return: On rank 0 whether the reflected map switched; ``False`` elsewhere.
+    """
+    from dgamore.sigma_jacobian import ExactJacobian, certify_subspace
+
+    jac = ExactJacobian(
+        sigma, mu, u_loc, v_nonloc, v_nonloc_full, sigma_dmft_full, mpi_dist_irrk, mpi_dist_fullbz, comm, chunk_budgets
+    )
+    pairs = certify_subspace(jac, start, comm)
+    jac.free()  # on the normal path only: an exception aborts the job instead of meeting another collective
+    if comm.rank != 0:
+        return False
+    lam_pi, res, u, _, kappa = pairs
+    return tracker.install_exact_check(lam_pi, res, u, kappa)
 
 
 def calculate_self_energy_q(
     comm: MPI.Comm,
     u_loc: LocalInteraction,
-    v_nonloc: Interaction,
+    v_nonloc: Interaction | None,
     sigma_dmft: SelfEnergy,
     sigma_local: SelfEnergy,
     chunk_budgets: memory_estimator.ChunkBudgets | None = None,
@@ -1567,9 +2382,25 @@ def calculate_self_energy_q(
     non-local self-energy from the kernel and the Green's function. Also takes care of the self-consistency loop and
     the chemical potential adjustment as well as the self-energy mixing, etc.
 
+    With ``config.stabilization.use_jacobian_stabilization`` a :class:`~dgamore.jacobian_stabilization.JacobianTracker`
+    updates on each iteration's raw (iterate, proposal) pair before that iteration's step; the mixing reflects the
+    proposal residual on its certified unstable directions, a damped step moves at its bound
+    :attr:`~dgamore.jacobian_stabilization.JacobianTracker.p_eff`, and a change of the reflected map restarts the
+    accelerated-mixing history. With ``config.stabilization.use_exact_jacobian`` a requested exact check
+    (:func:`_run_exact_check`) runs before the step, and a pure fixed point gets the exact leading eigenpairs
+    (:func:`_install_exact_jacobian`). A non-zero :math:`V^{\mathbf{q}}` is warned about once, since its Hartree-Fock
+    shell offset lies outside the tracked window.
+
+    Convergence is declared on the post-mixing step residual, scaled by :math:`p / p_{\mathrm{eff}}` for a damped
+    step of a tracked run, together with a settled chemical potential. With the tracker the pure fixed point waits for
+    :meth:`~dgamore.jacobian_stabilization.JacobianTracker.minimum_iterations` (capped by ``max_iter``), and a
+    convergence below the count of the whole certified spectrum (in-band modes counted with the band) is warned about.
+    The map residual :math:`\lVert S(\Sigma) - \Sigma\rVert / \lVert\Sigma\rVert` is logged, and a convergence whose
+    map residual lies above ``_STALL_FACTOR`` times epsilon and did not fall is warned about as a stall.
+
     :param comm: The MPI communicator.
     :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` on the full q-grid; only read on rank 0.
     :param sigma_dmft: The DMFT self-energy (used as the starting point and for the shell/tail correction).
     :param sigma_local: The locally recomputed self-energy (used for smoothing out the DGA :class:`SelfEnergy`).
     :param chunk_budgets: Chunk byte budgets, of which the self-energy contraction reads its own (sized by the driver
@@ -1614,6 +2445,19 @@ def calculate_self_energy_q(
     mixing_history = None
     if comm.rank == 0 and config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson"):
         mixing_history = []
+
+    # the tracker is built on every rank (a few floats) but only rank 0, which holds the proposal, ever feeds it; it
+    # keeps its vectors, the recorded pair window included, on the weighted symmetry sector of the core window
+    tracker = tracker_window = rows_lam = rows_res = rows_damping = stab_event_iter = map_residual = None
+    if config.stabilization.use_jacobian_stabilization:
+        from dgamore.sigma_jacobian import tracker_sector_maps
+
+        maps = tracker_sector_maps(config.lattice.k_grid, config.box.niv_core, config.sys.n_bands, config.sys.beta)
+        tracker = JacobianTracker(
+            config.self_consistency.mixing, logger, *maps, exact_checks=config.stabilization.use_exact_jacobian
+        )
+        rows_lam, rows_res, rows_damping = [], [], []
+        tracker_window = [] if comm.rank == 0 else None
 
     niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
     sigma_dmft_full = sigma_dmft.copy()
@@ -1660,6 +2504,8 @@ def calculate_self_energy_q(
                 f"Warm start holds the DMFT lattice filling {n_dmft:.6f}: mu re-solved from {mu_previous} to "
                 f"{mu_history[-1]}."
             )
+            # only the occupations are needed here: sum the Dyson chunks directly instead of holding a second full-k
+            # Green's function on the full DMFT frequency box (tens of GB at production scale)
             _, config.sys.occ, config.sys.occ_k = GreensFunction.get_occupation(
                 sigma_old, mu_history[-1], ek, config.sys.beta
             )
@@ -1685,16 +2531,47 @@ def calculate_self_energy_q(
 
     # only rank 0 finishes the proposal with the Hartree-Fock term, which reads the full q-grid interaction
     v_nonloc_full = v_nonloc if comm.rank == 0 else None
-    v_nonloc = v_nonloc.reduce_q(my_irr_q_list)
+    if config.stabilization.use_jacobian_stabilization and comm.rank == 0 and np.any(v_nonloc.mat):
+        held = " and the exact Jacobian holds the offset fixed" if config.stabilization.use_exact_jacobian else ""
+        logger.warning(
+            "Jacobian stabilization with a non-zero V^q: the loop recomputes the V^q Hartree-Fock offset of the shell "
+            f"from every iterate's occupations, while the tracker records the core window alone{held}, so the "
+            "measured spectrum and the one in jacobian.npz leave out its feedback."
+        )
+    v_nonloc = scatter_irreducible_interaction(v_nonloc, mpi_dist_irrk)
+    # the operator arguments of both exact-Jacobian helpers after the iterate and its mu
+    exact_args = (u_loc, v_nonloc, v_nonloc_full, sigma_dmft_full, mpi_dist_irrk, mpi_dist_fullbz, comm, chunk_budgets)
 
     annealer = LambdaAnnealer() if config.stabilization.use_lambda_annealing else None
+    pole_vertex = first_frequency_local_vertex() if comm.rank == 0 else None
+    # one dict for the whole run warm-starts every channel's search from the previous iteration's lambda
+    lambda_previous = None
+    if config.stabilization.use_lambda_correction and not config.lambda_correction.perform_lambda_correction:
+        lambda_previous = {}
+    if tracker is not None and comm.rank == 0 and starting_iter > 0:
+        _carry_jacobian_spectrum(tracker, annealer)
     anneal_reset_iter = None
     release_iter = None
+    pure_converged = False
     last_iter = starting_iter + config.self_consistency.max_iter
     for current_iter in range(starting_iter + 1, last_iter + 1):
         logger.info("----------------------------------------")
         logger.info(f"Starting iteration {current_iter}.")
         logger.info("----------------------------------------")
+
+        if pole_vertex is not None:
+            ratio = first_frequency_pole_ratio(sigma_old, mu_history[-1], pole_vertex)
+            config.logger.info(
+                f"First-frequency density pole ratio R = {ratio:.4f} (a pole ring of the density ladder at w_1 lies "
+                "inside the Brillouin zone once R >= 1)."
+            )
+            if ratio >= 1.0:
+                config.logger.warning(
+                    f"First-frequency density pole ratio R = {ratio:.4f} >= 1: the density ladder at the first bosonic "
+                    "frequency has a pole ring inside the Brillouin zone, so chi_dens(q, w_1) is unphysical near it. "
+                    "The iterate has lost too much local scattering at pi T for the DMFT vertex; mixing and damping "
+                    "do not move this threshold."
+                )
 
         sigma_new = calculate_sigma_proposal(
             sigma_old,
@@ -1711,8 +2588,32 @@ def calculate_self_energy_q(
             annealer=annealer,
             chunk_budgets=chunk_budgets,
             save_eliashberg=config.eliashberg.perform_eliashberg and current_iter == last_iter,
+            lambda_previous=lambda_previous,
         )
         # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
+        # the map's own distance from a fixed point, read before the mixing overwrites the proposal
+        previous_map_residual = map_residual
+        map_residual = _relative_sigma_residual(sigma_new, sigma_old) if comm.rank == 0 else None
+
+        # the tracker decides on this iteration's pair before its step, while every rank still holds the iterate; it
+        # records sector vectors, so the core windows are read in place
+        if tracker is not None:
+            request = None
+            if comm.rank == 0:
+                tracker_window.append(tracker.record(*_core_pair(sigma_new, sigma_old, copy=False)))
+                del tracker_window[:-TRACKER_PAIRS]
+                if _update_jacobian_tracker(
+                    tracker, tracker_window, current_iter, release_iter, anneal_reset_iter, annealer
+                ):
+                    stab_event_iter = current_iter - 1
+                request = tracker.exact_check_request() if config.stabilization.use_exact_jacobian else None
+            if comm.bcast(request is not None, root=0) and _run_exact_check(
+                tracker, request, sigma_old, mu_history[-1], *exact_args
+            ):
+                stab_event_iter = current_iter - 1
+            request = None  # the start columns are not kept through the next proposal
+            if comm.rank == 0:
+                _append_jacobian_eigenvalues(tracker, rows_lam, rows_res, rows_damping)
 
         # only rank 0 mixes and measures the residual, so only rank 0 keeps a private copy of the previous iterate
         # (the cut copies everything still needed from the previous iteration's shared sigma buffer)
@@ -1722,12 +2623,19 @@ def calculate_self_energy_q(
         sigma_win = None
 
         logger.info("Applying mixing strategy to the self-energy.")
-        history_cap = _mixing_history_cap(current_iter, release_iter, anneal_reset_iter)
+        history_cap = _mixing_history_cap(current_iter, release_iter, anneal_reset_iter, stab_event_iter)
         # mixing runs on rank 0 only, the only rank holding the proposal; the mixed Sigma then reaches the other
         # ranks once per node through a shared window instead of once per rank
+        damped_step = False
         if comm.rank == 0:
             sigma_old = sigma_old.concatenate_self_energies(sigma_dmft, shell_offset=shell_offset)
-            sigma_new = apply_mixing_strategy(sigma_new, sigma_old, history_cap, mixing_history)
+            if config.stabilization.use_jacobian_stabilization:
+                # the record of the pairs the tracker reads: the core window, the rest is the DMFT tail and its offset
+                _save_sigma_iteration(sigma_new.cut_niv(config.box.niv_core), "sigma_dga_proposal", current_iter)
+
+            mixed = apply_mixing_strategy(sigma_new, sigma_old, history_cap, mixing_history, tracker)
+            # an accelerated step returns the proposal's object, a damped step a new one
+            damped_step, sigma_new, mixed = mixed is not sigma_new, mixed, None
         if sc_node_comm is not None:
             sigma_new, sigma_win = _share_sigma_per_node(sigma_new, comm, sc_node_comm, sc_roots_comm)
 
@@ -1767,26 +2675,34 @@ def calculate_self_energy_q(
             logger.info("Updated occupation matrix from new Green's function.")
 
         if comm.rank == 0:
-            sigma_new.decompress_q_dimension().save(
-                name=f"sigma_dga_iteration_{current_iter}", output_dir=config.output.output_path
-            )
-            logger.info(f"Saved sigma for iteration {current_iter}.")
+            _save_sigma_iteration(sigma_new, "sigma_dga", current_iter)
 
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
             # Convergence is declared on the post-mixing step residual (the returned iterate). The un-mixed proposal
             # residual is deliberately not used: it can plateau above epsilon and would block convergence forever.
             eps = _effective_epsilon(annealer)
-            sigma_converged = abs(relative_residual) < eps
+            # a damped step moves at p_eff, so its residual is read at the configured mixing, as without the tracker
+            step_scale = tracker.p_config / tracker.p_eff if damped_step and tracker is not None else 1.0
+            step_residual = abs(relative_residual) * step_scale
+            sigma_converged = step_residual < eps
+            scaled = f", {step_residual:.3e} at the configured mixing" if step_scale != 1.0 else ""
             logger.info(
-                f"Self-energy convergence: {sigma_converged} "
-                f"(relative step residual={relative_residual:.3e}, epsilon={eps:.3e})."
+                f"Self-energy convergence: {sigma_converged} (relative step residual={relative_residual:.3e}{scaled}, "
+                f"map residual={map_residual:.3e}, epsilon={eps:.3e})."
             )
 
             mu_converged = abs(mu_history[-1] - mu_history[-2]) < np.pi / (10 * config.sys.beta)
             logger.info(f"Chemical potential convergence: {mu_converged}.")
 
             converged = mu_converged and sigma_converged
+            if converged and map_residual > _STALL_FACTOR * eps and map_residual >= previous_map_residual:
+                logger.warning(
+                    f"Converged on the step residual {relative_residual:.3e}, but the map residual "
+                    f"|S(Sigma) - Sigma| / |Sigma| is still {map_residual:.3e} ({map_residual / eps:.0f} epsilon) and "
+                    "no lower than in the previous iteration: the steps have stalled, e.g. an accelerated mixing "
+                    "stagnating on an unstable direction, rather than reached a fixed point."
+                )
         else:
             converged = False
         converged = comm.bcast(converged)
@@ -1836,10 +2752,42 @@ def calculate_self_energy_q(
                         "self-consistency."
                     )
             else:
-                logger.info(f"Self-consistency of sigma and mu reached at iteration {current_iter}.")
-                break
+                # the iterate is driven the minimum count of the modes outside their band away from the start (capped)
+                n_min, n_resolved = comm.bcast(
+                    (tracker.minimum_iterations(), tracker.minimum_iterations(outside_band=True))
+                    if tracker is not None and comm.rank == 0
+                    else (0, 0)
+                )
+                done = current_iter - starting_iter
+                if done < min(n_resolved, config.self_consistency.max_iter):
+                    logger.info(
+                        f"Self-consistency of sigma and mu reached at iteration {current_iter}, {done} iterations "
+                        f"after the start, below the minimum {n_resolved} the certified modes outside their "
+                        f"undecidable band ask for (p_eff = {tracker.p_eff:.4f}): continuing, so that a flat "
+                        "direction can settle."
+                    )
+                else:
+                    pure_converged = True
+                    logger.info(f"Self-consistency of sigma and mu reached at iteration {current_iter}.")
+                    if tracker is not None and comm.rank == 0:
+                        logger.info(
+                            f"Jacobian tracker at convergence: {0 if tracker.q is None else tracker.q.shape[1]} "
+                            f"flipped directions, p_eff={tracker.p_eff:.4f}, rho={tracker.predicted_rate():.4f}."
+                        )
+                    if done < n_min:
+                        logger.warning(
+                            f"Jacobian tracker: converged after {done} iterations, below the minimum {n_min} the "
+                            f"certified spectrum suggests at the damping each certified direction takes (eps = "
+                            f"{tracker.certified_margin:.3e}, p_eff = {tracker.p_eff:.4f} on the directions the "
+                            "installed map leaves to the scalar step); a flat direction may not have settled."
+                        )
+                    break
         else:
             logger.info("Self-consistency not reached.")
+
+    mixing_history = tracker_window = None  # nothing after the loop reads them
+    if tracker is not None and comm.rank == 0:
+        tracker.release_after_loop()
 
     # the Eliashberg step reads the intermediates of the final iterate, which the loop writes only in its last scheduled
     # iteration; a loop that converged earlier builds them once from the converged sigma, still shared per node here
@@ -1861,9 +2809,14 @@ def calculate_self_energy_q(
             chunk_budgets=chunk_budgets,
             save_eliashberg=True,
             eliashberg_only=True,
+            lambda_previous=lambda_previous,
         )
 
-    # the interpolation reads the final sigma on every rank, so it runs while the shared window still holds it
+    # the exact Jacobian and the interpolation read the final sigma on every rank, so they run while the shared window
+    # still holds it
+    if pure_converged and tracker is not None and config.stabilization.use_exact_jacobian:
+        _install_exact_jacobian(tracker, sigma_old, mu_history[-1], *exact_args)
+
     if config.self_energy_interpolation.do_interpolation:
         beta_target = config.self_energy_interpolation.beta_target
         niv_target = config.self_energy_interpolation.niv_target
@@ -1889,7 +2842,66 @@ def calculate_self_energy_q(
     np.save(os.path.join(config.output.output_path, "mu_history.npy"), mu_history)
     logger.info("Saved mu history as numpy array.")
 
+    if tracker is not None and comm.rank == 0:
+        _save_jacobian_spectrum(tracker, pure_converged, rows_lam, rows_res, rows_damping)
+
     return sigma_old if comm.rank == 0 else None
+
+
+def _core_pair(sigma_new: SelfEnergy, sigma_old: SelfEnergy, copy: bool = True) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns this iteration's (iterate, raw proposal) pair: both core windows in the decompressed momentum layout, a
+    momentum-local iterate (the fresh-run starting self-energy) broadcast over the proposal's momentum grid. Both
+    self-energies keep the momentum layout they came with.
+
+    :param sigma_new: The freshly computed self-energy proposal.
+    :param sigma_old: The previous iteration's self-energy.
+    :param copy: Whether the pair is a copy, which outlives both self-energies and the in-place core-window update of
+        ``sigma_new`` the mixing makes (the mixing history's entries), or views of the two windows, for a caller that
+        reads them while both self-energies stay unchanged.
+    :return: The iterate and the raw proposal, cut to the core window.
+    """
+    niv_core = config.box.niv_core
+    compressed = [sigma.has_compressed_q_dimension for sigma in (sigma_new, sigma_old)]
+    sigma_old.decompress_q_dimension()
+    sigma_new.decompress_q_dimension()
+    proposal = sigma_new.mat[..., sigma_new.niv - niv_core : sigma_new.niv + niv_core]
+    iterate = np.broadcast_to(sigma_old.mat[..., sigma_old.niv - niv_core : sigma_old.niv + niv_core], proposal.shape)
+    if copy:
+        iterate, proposal = iterate.copy(), proposal.copy()
+    for sigma, was_compressed in zip((sigma_new, sigma_old), compressed):
+        if was_compressed:
+            sigma.compress_q_dimension()
+    return iterate, proposal
+
+
+def _real_rows(values: np.ndarray) -> list[tuple[slice, np.ndarray]]:
+    """
+    Splits a flat history vector into the row blocks of the real least-squares problem of the accelerated mixing: the
+    real part over the imaginary part of a complex core window, a real vector in the tracker's coordinates as it is.
+
+    :param values: The flat vector.
+    :return: The ``(rows, part)`` blocks.
+    """
+    if np.iscomplexobj(values):
+        return [(slice(0, values.size), values.real), (slice(values.size, 2 * values.size), values.imag)]
+    return [(slice(0, values.size), values)]
+
+
+def _step_core_window(core: np.ndarray, iterate: np.ndarray, p_config: float, correction: np.ndarray) -> None:
+    r"""
+    Overwrites a core window that holds the proposal :math:`S(x)` with :math:`x + p\,(S(x) - x) + c` in place.
+
+    :param core: The core window, holding the proposal on entry.
+    :param iterate: The iterate :math:`x` on the same window.
+    :param p_config: The mixing parameter :math:`p`.
+    :param correction: The correction :math:`c` on the same window.
+    :return: None.
+    """
+    core -= iterate
+    core *= p_config
+    core += iterate
+    core += correction
 
 
 def apply_mixing_strategy(
@@ -1897,20 +2909,36 @@ def apply_mixing_strategy(
     sigma_old: SelfEnergy,
     history_cap: int | None = None,
     mixing_history: list | None = None,
+    tracker: JacobianTracker | None = None,
 ) -> SelfEnergy:
-    """
+    r"""
     Applies the self-energy mixing strategy for the self-consistency loop. Supports linear mixing as well as the
     accelerated Pulay (DIIS) and Anderson schemes; the accelerated schemes fall back to linear mixing when their
-    least-squares problem is ill-conditioned or the history is too short. The mixing strategy and parameters are
-    taken from the config.
+    least-squares problem is ill-conditioned or the history is too short. The mixing strategy is taken from the
+    config. So is the mixing parameter, unless ``tracker`` is given: its bound :attr:`JacobianTracker.p_eff` then
+    damps every damped Picard step below (linear mixing, the warm-up and the fallbacks of the accelerated schemes),
+    while an accelerated step keeps the configured parameter, since a whole-spectrum bound describes the damped
+    iteration and not a quasi-Newton step.
 
     The accelerated schemes build their secant history from genuine (iterate, proposal) pairs: each history entry
     holds an iterate :math:`x` together with the un-mixed proposal :math:`S(x)` the self-energy map produced from
     it. The post-mixing iterates alone (the per-iteration sigma files) cannot serve as proposals - at mixing
     parameters below one, ``mix(S(x), x, history) != S(x)``, so pairing consecutive iterates would feed the secant
-    model inconsistent data. This function therefore records the current pair ``(sigma_old, sigma_new)`` (cut to
-    the core window, before mixing overwrites ``sigma_new`` in place) into ``mixing_history`` itself. A
-    momentum-local iterate (the fresh-run starting self-energy) is broadcast over the proposal's momentum grid.
+    model inconsistent data. This function therefore records the current pair (cut to the core window, before
+    mixing overwrites ``sigma_new`` in place) into ``mixing_history`` itself. A momentum-local iterate (the fresh-run
+    starting self-energy) is broadcast over the proposal's momentum grid. Without a tracker the history copies the
+    pair's core windows; with one it holds their real sector vectors (:meth:`JacobianTracker.record`), and an
+    accelerated step is the linear step :math:`p\,(S(x) - x)` on the whole core window plus the history's
+    correction unfolded from the sector (:meth:`JacobianTracker.unfold`).
+
+    While the tracker has a flipped subspace installed, the proposal residual is reflected on it
+    (:meth:`JacobianTracker.reflect`) before any strategy acts, and the reflected proposal is what the history
+    records. A damped step (linear mixing, the warm-up and the fallbacks of the accelerated schemes) is then corrected
+    on the certified span by :meth:`JacobianTracker.stabilize_step`. An accelerated step keeps its own step and is
+    replaced by the stabilized damped step, with a warning, when :meth:`JacobianTracker.opposes_flip` reports that it
+    opposes the flipped damped step; once the estimates have certified the flipped direction itself over two secant
+    windows (:meth:`JacobianTracker.reflection_is_settled`), only the step's component on the reflected subspace is
+    replaced (:meth:`JacobianTracker.replace_flipped_component`), with a warning, and the rest of the step stands.
 
     :param sigma_new: The freshly computed self-energy proposal.
     :param sigma_old: The previous iteration's self-energy.
@@ -1918,44 +2946,76 @@ def apply_mixing_strategy(
         (``None`` for no bound). Used to reset the mixing history after the susceptibility-restriction release, so
         the accelerated schemes never extrapolate across the restricted-to-unrestricted discontinuity. Pairs keep
         being recorded while capped, so the history re-arms from genuine post-release pairs.
-    :param mixing_history: Mutable list of (iterate, proposal) pairs of core-cut decompressed arrays, oldest
-        first, maintained across iterations by the caller (rank 0 of the self-consistency loop). This function
-        appends the current pair and trims the list to the configured history length plus one. ``None`` disables
-        the accelerated schemes (linear mixing).
-    :return: The mixed :class:`SelfEnergy` for the next iteration.
+    :param mixing_history: Mutable list of (iterate, proposal) pairs of core-cut decompressed arrays, or with a
+        tracker of their real vectors in its coordinates, the proposal the reflected one while a reflector is
+        installed, oldest first, maintained across iterations by the caller (rank 0 of the self-consistency loop).
+        This function appends the current pair and trims the list to the configured history length plus one. ``None``
+        disables both the recording and the accelerated schemes.
+    :param tracker: The :class:`JacobianTracker` owning the flipped subspace and the damping bound, or ``None`` to
+        mix the raw proposal with the configured mixing parameter.
+    :return: The mixed :class:`SelfEnergy` for the next iteration: ``sigma_new`` itself, its core window
+        overwritten, after an accelerated step, and a new object after a damped step.
     """
     logger = config.logger
     n_hist = config.self_consistency.mixing_history_length
     if history_cap is not None:
         n_hist = min(n_hist, history_cap)
-    alpha = config.self_consistency.mixing
+    p_config = config.self_consistency.mixing
 
-    last_results, last_proposals = [], []
-    if config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson") and mixing_history is not None:
+    def stabilize(mixed: SelfEnergy) -> SelfEnergy:
+        """
+        Overwrites the certified span of a damped step with the tracker's stabilized step.
+
+        :param mixed: The self-energy of whichever damped step produced it.
+        :return: The same object, its core window corrected where a per-direction damping is installed.
+        """
+        if not tracker_active:
+            return mixed
+        niv_mixed = mixed.niv
+        mixed_window = slice(niv_mixed - config.box.niv_core, niv_mixed + config.box.niv_core)
+        mixed.mat[..., mixed_window] = tracker.stabilize_step(mixed.mat[..., mixed_window], iterate, residual)
+        return mixed
+
+    last_results, last_proposals, residual = [], [], None
+    if tracker is not None or mixing_history is not None:
         niv_core = config.box.niv_core
+        # only a history of windows copies the pair; a tracker's history holds its sector vectors
+        iterate, proposal_raw = _core_pair(sigma_new, sigma_old, copy=mixing_history is not None and tracker is None)
         sigma_old.decompress_q_dimension()
         sigma_new.decompress_q_dimension()
-        niv_o, niv_n = sigma_old.niv, sigma_new.niv
-        proposal = sigma_new.mat[..., niv_n - niv_core : niv_n + niv_core].copy()
-        # broadcast_to expands a momentum-local iterate (the fresh-run starting sigma) over the proposal's
-        # k-grid; the copies must survive the in-place core-window update of sigma_new below
-        iterate = np.broadcast_to(sigma_old.mat[..., niv_o - niv_core : niv_o + niv_core], proposal.shape).copy()
-        mixing_history.append((iterate, proposal))
-        del mixing_history[: -(config.self_consistency.mixing_history_length + 1)]
+        core_window = slice(sigma_new.niv - niv_core, sigma_new.niv + niv_core)
+        proposal_used = proposal_raw
+        if tracker is not None and tracker.active:
+            # the raw proposal is a view of the core window the reflected one overwrites
+            residual = proposal_raw - iterate
+            proposal_used = tracker.reflect(proposal_raw, iterate)
+            sigma_new.mat[..., core_window] = proposal_used
+        if mixing_history is not None:
+            mixing_history.append(
+                (iterate, proposal_used) if tracker is None else tracker.record(iterate, proposal_used)[:2]
+            )
+            del mixing_history[: -(config.self_consistency.mixing_history_length + 1)]
 
-        if n_hist > 0:
+        if (
+            mixing_history is not None
+            and config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson")
+            and n_hist > 0
+        ):
             pairs = mixing_history[-(n_hist + 1) :]
             last_proposals = [iterate for iterate, _ in pairs]  # [x_{n-m}, ..., x_n]
             last_results = [proposal for _, proposal in pairs]  # [S(x_{n-m}), ..., S(x_n)]
             logger.info(f"Using the last {len(pairs)} (iterate, proposal) pairs of the mixing history.")
 
+    alpha = tracker.p_eff if tracker is not None else p_config
+    tracker_active = tracker is not None and tracker.active
     accelerated_mixing_condition = len(last_results) > n_hist
 
     if config.self_consistency.mixing_strategy.lower() == "pulay" and accelerated_mixing_condition:
         shape = last_results[-1].shape
         n_total = int(np.prod(shape))
-        f_matrix = np.zeros((2 * n_total, n_hist), dtype=np.float64)
-        f_i = np.zeros((2 * n_total), dtype=np.float64)
+        n_rows = 2 * n_total if tracker is None else n_total
+        f_matrix = np.zeros((n_rows, n_hist), dtype=np.float64)
+        f_i = np.zeros(n_rows, dtype=np.float64)
 
         def get_proposal(idx: int):
             """
@@ -1978,20 +3038,16 @@ def apply_mixing_strategy(
         # F[:,i] = (S(x_{n-i}) - S(x_{n-i-1})) - R[:,i] with the proposal differences R[:,i] = x_{n-i} - x_{n-i-1};
         # R is not stored, it is added back into F once the solve no longer needs F
         for i in range(n_hist):
-            result_diff = get_result(-1 - i) - get_result(-2 - i)
-            f_matrix[:n_total, i] = result_diff.real
-            f_matrix[n_total:, i] = result_diff.imag
+            for rows, part in _real_rows(get_result(-1 - i) - get_result(-2 - i)):
+                f_matrix[rows, i] = part
+            for rows, part in _real_rows(get_proposal(-1 - i) - get_proposal(-2 - i)):
+                f_matrix[rows, i] -= part
+        del part
 
-            proposal_diff = get_proposal(-1 - i) - get_proposal(-2 - i)
-            f_matrix[:n_total, i] -= proposal_diff.real
-            f_matrix[n_total:, i] -= proposal_diff.imag
-        del result_diff, proposal_diff
-
-        # Residual: F(x_n) - x_n, where x_n = last_proposals[-1] = sigma_old (core window)
-        iter_diff = get_result(-1) - get_proposal(-1)
-        f_i[:n_total] = iter_diff.real
-        f_i[n_total:] = iter_diff.imag
-        del iter_diff
+        # Residual: F(x_n) - x_n, where x_n = last_proposals[-1] is the history's newest iterate
+        for rows, part in _real_rows(get_result(-1) - get_proposal(-1)):
+            f_i[rows] = part
+        del part
         norm_f = np.linalg.norm(f_i)
 
         # Solve min||F @ c - f_i|| via truncated-SVD pseudoinverse (drops collinear directions)
@@ -2000,30 +3056,50 @@ def apply_mixing_strategy(
         mask = s > cutoff
         if not np.any(mask):
             logger.warning("Pulay SVD ill-conditioned - falling back to linear mixing.")
-            return alpha * sigma_new + (1 - alpha) * sigma_old
+            return stabilize(alpha * sigma_new + (1 - alpha) * sigma_old)
         coeffs = vh[mask].T @ ((u[:, mask].T @ f_i) / s[mask])
 
-        # Pulay update: x_{n+1} = x_n + alpha*f_i - (R + alpha*F) @ c, with R + alpha*F formed in place of F
+        # Pulay update at the configured parameter p: x_{n+1} = x_n + p*f_i - (R + p*F) @ c, with R + p*F formed in
+        # place of F
         del u
-        f_matrix *= alpha
+        f_matrix *= p_config
         for i in range(n_hist):
-            proposal_diff = get_proposal(-1 - i) - get_proposal(-2 - i)
-            f_matrix[:n_total, i] += proposal_diff.real
-            f_matrix[n_total:, i] += proposal_diff.imag
-        del proposal_diff
-        update = alpha * f_i - f_matrix @ coeffs
+            for rows, part in _real_rows(get_proposal(-1 - i) - get_proposal(-2 - i)):
+                f_matrix[rows, i] += part
+        del part
+        update = p_config * f_i - f_matrix @ coeffs
         norm_u = np.linalg.norm(update)
         if norm_f > 0 and norm_u > 10.0 * norm_f:
             update *= 10.0 * norm_f / norm_u
             logger.warning(f"Pulay step clamped (norm_u={norm_u:.3e}, norm_f={norm_f:.3e}).")
-        update = update[:n_total] + 1j * update[n_total:]
+        if tracker is None:
+            update = update[:n_total] + 1j * update[n_total:]
+        elif tracker.opposes_flip(update, residual):
+            if not tracker.reflection_is_settled():
+                del f_matrix, update
+                logger.warning(
+                    "Pulay step opposes the flipped damped step on the reflected subspace - taking the stabilized "
+                    "damped step instead."
+                )
+                return stabilize(alpha * sigma_new + (1 - alpha) * sigma_old)
+            update = tracker.replace_flipped_component(update, residual, alpha)
+            logger.warning(
+                "Pulay step opposes the flipped damped step on the settled reflected subspace - taking the stabilized "
+                "damped step there."
+            )
 
-        # Update the new self energy
+        # Update the new self energy; with a tracker the core window takes the linear step and the history's
+        # correction to it, unfolded once from the tracker's coordinates
         niv = sigma_new.niv
         niv_core = config.box.niv_core
-        sigma_new.mat[..., niv - niv_core : niv + niv_core] = get_proposal(-1).reshape(shape) + update.reshape(shape)
+        if tracker is None:
+            sigma_new.mat[..., niv - niv_core : niv + niv_core] = iterate + update.reshape(shape)
+        else:
+            update -= p_config * f_i
+            correction = tracker.unfold(update, iterate.shape)
+            _step_core_window(sigma_new.mat[..., niv - niv_core : niv + niv_core], iterate, p_config, correction)
 
-        logger.info(f"Pulay mixing applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}).")
+        logger.info(f"Pulay mixing applied (m={n_hist}, alpha={p_config:.3f}, norm_f={norm_f:.3e}).")
 
         return sigma_new
     if config.self_consistency.mixing_strategy.lower() == "anderson" and accelerated_mixing_condition:
@@ -2033,18 +3109,19 @@ def apply_mixing_strategy(
 
         # Current residual f_n = F(x_n) - x_n
         f_curr = flat(last_results[-1]) - flat(last_proposals[-1])
-        f_vec = np.concatenate([f_curr.real, f_curr.imag])
+        f_vec = np.concatenate([part for _, part in _real_rows(f_curr)])
         del f_curr
         norm_f = np.linalg.norm(f_vec)
 
-        # dF (n_hist columns, real parts over imaginary parts): dF[:,i] = f_{n-i} - f_{n-i-1} (residual differences)
-        df_matrix = np.empty((2 * n_total, n_hist), dtype=f_vec.dtype)
+        # dF (n_hist columns, the row blocks of _real_rows): dF[:,i] = f_{n-i} - f_{n-i-1} (residual differences)
+        df_matrix = np.empty((f_vec.size, n_hist), dtype=f_vec.dtype)
         for i in range(n_hist):
             df = (flat(last_results[-1 - i]) - flat(last_proposals[-1 - i])) - (
                 flat(last_results[-2 - i]) - flat(last_proposals[-2 - i])
             )
-            df_matrix[:n_total, i], df_matrix[n_total:, i] = df.real, df.imag
-        del df
+            for rows, part in _real_rows(df):
+                df_matrix[rows, i] = part
+        del df, part
 
         # Anderson: solve min ||f_n - dF @ c||
         try:
@@ -2062,40 +3139,60 @@ def apply_mixing_strategy(
 
         except np.linalg.LinAlgError:
             logger.warning("Anderson SVD failed - falling back to linear mixing.")
-            return alpha * sigma_new + (1 - alpha) * sigma_old
+            return stabilize(alpha * sigma_new + (1 - alpha) * sigma_old)
 
         # Undamped Anderson proposal: x_n + f_n - (dX + dF) @ c; the proposal differences
         # dX[:,i] = x_{n-i} - x_{n-i-1} are added into dF's columns once the solve no longer needs dF
         del u
         for i in range(n_hist):
             dx = flat(last_proposals[-1 - i]) - flat(last_proposals[-2 - i])
-            df_matrix[:n_total, i] += dx.real
-            df_matrix[n_total:, i] += dx.imag
-        del dx
+            for rows, part in _real_rows(dx):
+                df_matrix[rows, i] += part
+        del dx, part
         x_n = flat(last_proposals[-1])
-        x_anderson = np.concatenate([x_n.real, x_n.imag]) + f_vec - df_matrix @ coeffs
-        x_anderson = x_anderson[:n_total] + 1j * x_anderson[n_total:]
+        x_anderson = np.concatenate([part for _, part in _real_rows(x_n)]) + f_vec - df_matrix @ coeffs
+        if tracker is None:
+            x_anderson = x_anderson[:n_total] + 1j * x_anderson[n_total:]
 
         # Damp between old proposal and Anderson proposal
-        x_n_complex = x_n
-        candidate = (1 - alpha) * x_n_complex + alpha * x_anderson.reshape(-1)
+        candidate = (1 - p_config) * x_n + p_config * x_anderson.reshape(-1)
 
         # Safety clamp
-        update = candidate - x_n_complex
+        update = candidate - x_n
         norm_u = np.linalg.norm(update)
         if norm_f > 0 and norm_u > 3.0 * norm_f:
-            candidate = x_n_complex + update * (3.0 * norm_f / norm_u)
+            update = update * (3.0 * norm_f / norm_u)
+            candidate = x_n + update
             logger.warning(f"Anderson step clamped (norm_u={norm_u:.3e}, norm_f={norm_f:.3e}).")
+        if tracker is not None and tracker.opposes_flip(update, residual):
+            if not tracker.reflection_is_settled():
+                del df_matrix, x_anderson, candidate, update
+                logger.warning(
+                    "Anderson step opposes the flipped damped step on the reflected subspace - taking the stabilized "
+                    "damped step instead."
+                )
+                return stabilize(alpha * sigma_new + (1 - alpha) * sigma_old)
+            update = tracker.replace_flipped_component(update, residual, alpha)
+            logger.warning(
+                "Anderson step opposes the flipped damped step on the settled reflected subspace - taking the "
+                "stabilized damped step there."
+            )
 
-        # Update the new self energy
+        # Update the new self energy; with a tracker the core window takes the linear step and the history's
+        # correction to it, unfolded once from the tracker's coordinates
         niv = sigma_new.niv
         niv_core = config.box.niv_core
-        sigma_new.mat[..., niv - niv_core : niv + niv_core] = candidate.reshape(shape)
+        if tracker is None:
+            sigma_new.mat[..., niv - niv_core : niv + niv_core] = candidate.reshape(shape)
+        else:
+            update -= p_config * f_vec
+            correction = tracker.unfold(update, iterate.shape)
+            _step_core_window(sigma_new.mat[..., niv - niv_core : niv + niv_core], iterate, p_config, correction)
 
-        logger.info(f"Anderson acceleration applied (m={n_hist}, alpha={alpha:.3f}, norm_f={norm_f:.3e}).")
+        logger.info(f"Anderson acceleration applied (m={n_hist}, alpha={p_config:.3f}, norm_f={norm_f:.3e}).")
 
         return sigma_new
 
     sigma_new = alpha * sigma_new + (1 - alpha) * sigma_old
     logger.info(f"Sigma linearly mixed (m=1, alpha={alpha}).")
-    return sigma_new
+    return stabilize(sigma_new)

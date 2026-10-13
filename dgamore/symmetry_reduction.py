@@ -750,6 +750,25 @@ def point_group_orbits(group, nk: tuple) -> tuple[np.ndarray, np.ndarray]:
     return idx_maps.min(axis=0), us
 
 
+def stabilizer_unitaries(group, nk: tuple, points: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    r"""
+    Returns, for every unitary, sign-free element of a closed symmetry group, the positions among ``points`` that the
+    element leaves fixed on the grid, together with its orbital unitary. Averaging :math:`U T U^\dagger` over the
+    elements that fix a momentum projects a two-index tensor there onto the ones the group leaves invariant.
+
+    :param group: The closed symmetry group (iterable of group elements).
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+    :param points: Flat grid indices, e.g. the irreducible representatives.
+    :return: One ``(positions, U)`` pair per element, the identity first.
+    """
+    points = np.asarray(points)
+    return [
+        (np.flatnonzero(_g_action_on_kgrid(g, nk)[points] == points), g.U)
+        for g in _ordered(group, nk)
+        if not g.conj and g.sigma == 1
+    ]
+
+
 def forced_multiplicity(group, nk: tuple, parity: int | None = None) -> int:
     r"""
     Returns the largest dimension of the irreducible representations of a closed symmetry group, i.e. the largest

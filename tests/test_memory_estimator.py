@@ -2,14 +2,28 @@
 # SPDX-License-Identifier: MIT
 """Unit tests for the pure peak-memory estimator (no MPI, no psutil)."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
+import dgamore.bubble_gen as bubble_gen
+import dgamore.config as config
 import dgamore.memory_estimator as memory_estimator
+import dgamore.nonlocal_sde as nonlocal_sde
+from dgamore.four_point import FourPoint
+from dgamore.interaction import LocalInteraction
+from dgamore.jacobian_stabilization import TRACKER_PAIRS
+from dgamore.local_four_point import LocalFourPoint
 from dgamore.memory_estimator import (
     ARPACK_EXTRA_VECTORS,
     CHI0Q_IFFTN_TRANSIENT_FACTOR,
     DTYPE_BYTES,
+    EXACT_CHECK_BASIS,
+    EXACT_JACOBIAN_MODES,
+    EXACT_JACOBIAN_NCV,
+    KERNEL_GROUP_TRANSIENT,
+    KERNEL_MOMENTUM_GROUPS,
     LANCZOS_VERTEX_FACTOR,
     MAX_CHUNK_BUDGET_BYTES,
     MAX_SLICE_CHUNK_BYTES,
@@ -21,13 +35,23 @@ from dgamore.memory_estimator import (
     SLICE_CHUNK_BYTES,
     BranchPeak,
     ChunkBudgets,
+    _giwk_rspace,
     column_sde_schedule,
     column_sde_slabs,
+    column_sde_stream_bytes,
     dynamic_chunk_budget,
     estimate_peaks,
+    exact_jacobian_budgets,
+    exact_window_stages,
+    interaction_bytes,
+    jacobian_tracker_bytes,
     max_chunk_budget,
+    node_total,
+    rank_tasks,
 )
-from dgamore.n_point_base import DTYPE
+from dgamore.mpi_utils import MpiDistributor
+from dgamore.n_point_base import DTYPE, SpinChannel
+from tests.conftest import FAKE_MPI, traced_peak
 
 BASE = dict(
     n_bands=1,
@@ -64,11 +88,11 @@ def _peaks(**overrides):
     return estimate_peaks(**{**BASE, **overrides})
 
 
-def _rank_base(params):
-    return RANK_BASELINE_BYTES + SCALE * params["nk_tot"] * params["n_bands"] ** 4
+def _v_single(params):
+    return SCALE * params["nk_tot"] * params["n_bands"] ** 4
 
 
-# the node total used by the driver: every rank holds the branch baseline + the distributed transient, plus one single
+# the node total of r equal ranks on rank 0's node: each holds the baseline + the distributed transient, plus one single
 def _off_node_total(bp: BranchPeak, r):
     return r * (bp.baseline + bp.off_distributed) + bp.off_single
 
@@ -99,7 +123,7 @@ def test_every_branch_has_positive_baseline_and_off_transient():
     peaks = _peaks(with_eliashberg=True)
     for key, bp in peaks.items():
         assert isinstance(bp, BranchPeak)
-        base = _rank_base(BASE)  # every rank's footprint and full-grid interaction sit in every baseline
+        base = RANK_BASELINE_BYTES  # every rank's footprint sits in every baseline, the interaction in rank 0's slots
         assert bp.baseline > base if key in ("chi0q", "chiq_aux", "sde", "fq") else bp.baseline == base
         assert bp.off_distributed + bp.off_single > 0
 
@@ -107,17 +131,17 @@ def test_every_branch_has_positive_baseline_and_off_transient():
 def test_chi0q_fast_path_is_distributed_on_multi_rank_runs():
     """The chi0q fast path is column-distributed on multi-rank runs; only single-rank uses the rank-0 build."""
     multi = _peaks()["chi0q"]
-    assert multi.off_distributed > 0.0 and multi.off_single == 0.0
+    assert multi.off_distributed > 0.0 and multi.off_single == _v_single(BASE)
     single = _peaks(n_ranks=1)["chi0q"]
-    assert single.off_distributed == 0.0 and single.off_single > 0.0
-    assert multi.on_distributed > 0.0 and multi.on_single == 0.0
+    assert single.off_distributed == 0.0 and single.off_single > _v_single(BASE)
+    assert multi.on_distributed > 0.0 and multi.on_single == _v_single(BASE)
 
 
 def test_chiq_aux_off_has_distributed_block_and_no_single_rank_gather():
-    """The chiq_aux fast path holds a per-rank block; the irr->full-BZ map is p2p, so no single-rank gather remains."""
+    """The chiq_aux fast path holds a per-rank block; its single-rank slot is rank 0's full-grid interaction alone."""
     bp = _peaks()["chiq_aux"]
     assert bp.off_distributed > 0.0  # per-rank two-fermion block
-    assert bp.off_single == 0.0
+    assert bp.off_single == _v_single(BASE)
 
 
 def test_chi0q_distributed_peak_shrinks_with_more_ranks():
@@ -180,7 +204,7 @@ def test_bubble_baseline_is_giwk_plus_sigma_old_at_niv_cut():
     """The chi0q baseline is giwk plus sigma_old at niv_cut, plus (multi-rank) the two node-shareable R-space Gs."""
     two_point = SCALE * 2 * (TINY["nk_tot"] * TINY["n_bands"] ** 2 * (2 * TINY["niv_cut"]))
     g_r_windows = SCALE * 2 * TINY["nk_tot"] * TINY["n_bands"] ** 2 * (2 * (TINY["niv_full"] + TINY["niw_core"]))
-    base = _rank_base(TINY)
+    base = RANK_BASELINE_BYTES
     assert estimate_peaks(**TINY)["chi0q"].baseline == pytest.approx(two_point + g_r_windows + base)
     assert estimate_peaks(**{**TINY, "n_ranks": 1})["chi0q"].baseline == pytest.approx(two_point + base)
 
@@ -193,7 +217,7 @@ def test_sde_section_baseline_uses_post_bubble_windows():
     peaks = estimate_peaks(**TINY)
     vf, vc = 2 * TINY["niv_full"], 2 * TINY["niv_core"]
     local_vertex = TINY["n_bands"] ** 4 * (TINY["niw_core"] + 1) * max(vf * vc, vc * vc)
-    base = _rank_base(TINY)
+    base = RANK_BASELINE_BYTES
     assert peaks["chiq_aux"].baseline == pytest.approx(SCALE * (giwk + sigma + local_vertex) + base)
     assert peaks["sde"].baseline == pytest.approx(SCALE * (2 * giwk + sigma) + base)
     assert peaks["chiq_aux"].giwk_shareable == pytest.approx(SCALE * (giwk + sigma + local_vertex))
@@ -204,16 +228,17 @@ def test_giwk_shareable_is_every_array_of_each_sde_section_baseline():
     """The loop Sigma is node-shared like the Green's functions, so only the per-rank footprint stays unshared."""
     peaks = _peaks(with_eliashberg=True)
     for key in ("chi0q", "chiq_aux", "sde"):
-        assert peaks[key].giwk_shareable == pytest.approx(peaks[key].baseline - _rank_base(BASE))
+        assert peaks[key].giwk_shareable == pytest.approx(peaks[key].baseline - RANK_BASELINE_BYTES)
 
 
 def test_mixing_history_sits_in_the_rank0_slot_of_every_proposal_branch():
-    """Each of rank 0's mixing pairs adds two core-box Sigma copies to the single slot of every proposal branch."""
+    """Each mixing pair adds two core-box Sigma copies to every proposal branch's single slot, none after the loop."""
     pairs = 2 * BASE["nk_tot"] * BASE["n_bands"] ** 2 * 2 * BASE["niv_core"]
-    linear, anderson = _peaks(), _peaks(mixing_pairs=4)
+    linear, anderson = _peaks(niv_interp=40), _peaks(mixing_pairs=4, niv_interp=40)
     for key in ("chi0q", "chiq_aux", "sde"):
         assert anderson[key].off_single - linear[key].off_single == pytest.approx(SCALE * 4 * pairs)
         assert anderson[key].off_distributed == linear[key].off_distributed
+    assert anderson["sigma_interp"].off_single == linear["sigma_interp"].off_single
 
 
 def test_eliashberg_branches_share_only_the_local_vertex_of_the_pairing_vertex_build():
@@ -223,7 +248,7 @@ def test_eliashberg_branches_share_only_the_local_vertex_of_the_pairing_vertex_b
     local_vertex = SCALE * BASE["n_bands"] ** 4 * (BASE["niw_core"] + 1) * (2 * BASE["niv_core"]) ** 2
     for key, shared in (("fq", local_vertex), ("lanczos", 0.0)):
         assert peaks[key].giwk_shareable == pytest.approx(shared)
-        assert peaks[key].baseline == pytest.approx(_rank_base(BASE) + shared)
+        assert peaks[key].baseline == pytest.approx(RANK_BASELINE_BYTES + shared)
         assert peaks[key].off_single >= giwk_dga
         assert peaks[key].on_single >= giwk_dga
 
@@ -257,11 +282,17 @@ def _fq_branch(budget, streaming=False):
     return residents + OVERHEAD_FACTOR * (3 * chunk + 6 * (chunk * vc // nv**2) + slices), window_slice, qi * nw
 
 
-def test_chiq_aux_block_is_the_resident_one_fermion_blocks_plus_two_compound_slices():
-    """The chiq_aux transient is three one-fermion blocks (sum, kernel, inverse bubble) plus the per-slice buffers."""
-    nb, wp, vc = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"]
+def test_chiq_aux_block_is_the_largest_kernel_section_stage():
+    """The chiq_aux transient is the largest of the cut, the attachment, the aux-sum solve and the grouped stages."""
+    nb, wp, vc, vf = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"], 2 * TINY["niv_full"]
     qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
-    expected = SCALE * 3 * qi * nb**4 * wp * vc + OVERHEAD_FACTOR * _chiq_aux_transient()
+    core, group = qi * nb**4 * wp * vc, -(-qi // KERNEL_MOMENTUM_GROUPS) * nb**4 * wp * vc
+    expected = max(
+        SCALE * (qi * nb**4 * wp * vf + 2 * core),
+        SCALE * 4 * core,
+        SCALE * 3 * core + OVERHEAD_FACTOR * _chiq_aux_transient(),
+        SCALE * (3 * core + KERNEL_GROUP_TRANSIENT * group),
+    )
     bp = estimate_peaks(**TINY)["chiq_aux"]
     assert bp.off_distributed == pytest.approx(expected)
     assert bp.on_distributed == bp.off_distributed
@@ -314,7 +345,7 @@ def test_chi0q_fast_single_counts_buffer_ifftn_transient_and_g_copies():
     fft_buffers = (1 + CHI0Q_IFFTN_TRANSIENT_FACTOR) * TINY["nk_tot"] * nb**4 * vf
     gf_copies = 2 * TINY["nk_tot"] * nb**2 * (2 * (TINY["niv_full"] + TINY["niw_core"]))
     g_center = TINY["nk_tot"] * nb**2 * vf
-    expected = SCALE * (bubble_irr + fft_buffers + gf_copies + g_center)
+    expected = SCALE * (bubble_irr + fft_buffers + gf_copies + g_center) + _v_single(TINY)
     assert estimate_peaks(**{**TINY, "n_ranks": 1})["chi0q"].off_single == pytest.approx(expected)
 
 
@@ -343,6 +374,35 @@ def test_column_sde_slabs_counts_owned_results_a_foreign_sum_its_receive_buffer_
     """Rank 0 holds its owned sum, two task buffers and a receive for the middle rank's sum; one rank receives none."""
     assert column_sde_slabs(niw=2, niv=2, n_ranks=3) == 1 + 2 + 1
     assert column_sde_slabs(niw=2, niv=2, n_ranks=1) == 2 + 2
+
+
+def test_column_sde_schedule_by_frequency_runs_single_frequency_blocks_in_ascending_order():
+    """Blocks hold one w each, w before -w and none for -0; the split and the owners follow the task count."""
+    blocks, bounds, owner = column_sde_schedule(niw=3, niv=2, n_ranks=3, by_frequency=True)
+    singles = [(False, (0,))] + [(negative, (w,)) for w in (1, 2, 3) for negative in (False, True)]
+    assert blocks == singles
+    assert np.array_equal(bounds, [0, 4, 9, 14]) and np.array_equal(owner, [0, 1])
+    assert column_sde_schedule(niw=0, niv=1, n_ranks=2, by_frequency=True)[0] == [(False, (0,))]
+
+
+def test_column_sde_slabs_counts_every_output_and_the_carried_slabs():
+    """Two outputs double the results and running sums and add a partial; carried slabs leave out the work buffers."""
+    assert column_sde_slabs(niw=2, niv=2, n_ranks=3, n_out=2, by_frequency=True) == 2 * 2 + 3 + 1
+    assert column_sde_slabs(niw=2, niv=2, n_ranks=3, n_out=2, by_frequency=True, carried=True) == 2 * 2
+    assert column_sde_slabs(niw=2, niv=2, n_ranks=1, n_out=3, by_frequency=True) == 3 * 2 + 4
+
+
+def test_column_sde_stream_bytes_are_the_carried_slabs_and_one_round_of_every_kernel_beside_the_column_work():
+    """Carried slabs; a budget-sized round of all kernels' columns with one send copy, the column work and slabs."""
+    nb = 2
+    slab, column, full = DTYPE_BYTES * 80 * nb**2, DTYPE_BYTES * 20 * nb**4, DTYPE_BYTES * 80 * nb**4
+    carried, transient = column_sde_stream_bytes(20, 80, nb, 9, 3, 4, 5, 3, 2, 2 * 3 * column)
+    assert carried == column_sde_slabs(9, 3, 4, 2, by_frequency=True, carried=True) * slab
+    work = column_sde_slabs(9, 3, 4, 2, by_frequency=True) * slab - carried
+    columns = SDE_COLUMN_FACTOR * full + min(SDE_CONTRACTION_CHUNK_BYTES, full)
+    assert np.allclose(transient, 2 * column * (3 + 5 / 20) + columns + work, rtol=0, atol=1e-6)
+    floor = column_sde_stream_bytes(20, 80, nb, 9, 3, 4, 5, 3, 2, 0)[1]
+    assert np.allclose(floor, column * (3 + 5 / 20) + columns + work, rtol=0, atol=1e-6)
 
 
 def test_sde_transient_is_the_irr_kernel_one_round_the_column_work_and_the_slabs():
@@ -381,7 +441,7 @@ def test_sde_single_holds_the_finalize_buffers_whatever_the_dmft_box():
     small = estimate_peaks(**{**TINY, "niv_dmft": TINY["niv_core"]})["sde"].off_single
     big = estimate_peaks(**{**TINY, "niv_dmft": 100 * TINY["niv_core"]})["sde"].off_single
     nb = TINY["n_bands"]
-    assert small == big == pytest.approx(SCALE * 2 * TINY["nk_tot"] * nb**2 * 2 * TINY["niv_core"])
+    assert small == big == pytest.approx(SCALE * 2 * TINY["nk_tot"] * nb**2 * 2 * TINY["niv_core"] + _v_single(TINY))
 
 
 def test_energies_branch_holds_each_ranks_share_pair_and_its_largest_green_function_transient():
@@ -396,7 +456,7 @@ def test_energies_branch_holds_each_ranks_share_pair_and_its_largest_green_funct
     assert bp.off_distributed == pytest.approx(SCALE * 2 * share_k * nb**2 * box + max(transients))
     fit_window = SCALE * params["nk_tot"] * nb**2 * int(0.2 * params["niv_dmft"])
     assert bp.off_single == pytest.approx(peaks["mu_update"].off_single + fit_window)
-    assert bp.baseline == pytest.approx(_rank_base(params)) and bp.giwk_shareable == 0.0
+    assert bp.baseline == pytest.approx(RANK_BASELINE_BYTES) and bp.giwk_shareable == 0.0
     assert (bp.on_distributed, bp.on_single) == (bp.off_distributed, bp.off_single)
 
 
@@ -417,11 +477,11 @@ def test_occupation_branch_adds_the_dmft_lattice_green_function_on_rank0_only_wi
     share_k = -(-nk // TINY["n_ranks"])
     plain = estimate_peaks(**TINY)["occupation"]
     assert plain.off_distributed == memory_estimator._green_function_transients(share_k, nb, box)[1]
-    assert plain.off_single == 0.0 and plain.baseline == pytest.approx(_rank_base(TINY))
+    assert plain.off_single == _v_single(TINY) and plain.baseline == pytest.approx(RANK_BASELINE_BYTES)
     spectrum = estimate_peaks(**TINY, do_spectrum_dmft=True)["occupation"]
     dyson = memory_estimator._green_function_transients(nk, nb, box)[0]
     reload = SCALE * nk * nb**2 * (box + 2 * 2 * TINY["niv_cut"] + 2 * TINY["niv_core"])
-    assert spectrum.off_single == pytest.approx(max(SCALE * nk * nb**2 * box + dyson, reload))
+    assert spectrum.off_single == pytest.approx(max(SCALE * nk * nb**2 * box + dyson, reload) + _v_single(TINY))
     assert spectrum.off_distributed == plain.off_distributed
 
 
@@ -433,9 +493,9 @@ def test_occupation_branch_holds_the_warm_start_on_rank0_and_its_mu_search_on_ev
     warm = peaks["occupation"]
     occupation = memory_estimator._green_function_transients(nk, nb, box)[1]
     sigma_full = nk * nb**2 * 2 * TINY["niv_cut"]
-    assert warm.off_single == pytest.approx(SCALE * (nk * nb**2 * box + sigma_full) + occupation)
+    assert warm.off_single == pytest.approx(SCALE * (nk * nb**2 * box + sigma_full) + occupation + _v_single(TINY))
     assert warm.off_distributed >= peaks["mu_update"].off_distributed
-    assert estimate_peaks(**TINY)["occupation"].off_single == 0.0
+    assert estimate_peaks(**TINY)["occupation"].off_single == _v_single(TINY)
 
 
 def test_sigma_loop_is_rank0_only_with_the_linear_mix_copies_or_the_accelerated_solve():
@@ -443,13 +503,13 @@ def test_sigma_loop_is_rank0_only_with_the_linear_mix_copies_or_the_accelerated_
     nk, nb = TINY["nk_tot"], TINY["n_bands"]
     core = nk * nb**2 * 2 * TINY["niv_core"]
     full = nk * nb**2 * 2 * TINY["niv_cut"]
-    linear = SCALE * 2 * full + SCALE * 3 * full
+    linear = SCALE * 2 * full + SCALE * 3 * full + _v_single(TINY)
     bp = estimate_peaks(**TINY)["sigma_loop"]
-    assert bp.baseline == pytest.approx(_rank_base(TINY)) and bp.giwk_shareable == 0.0
+    assert bp.baseline == pytest.approx(RANK_BASELINE_BYTES) and bp.giwk_shareable == 0.0
     assert bp.off_distributed == 0.0 and bp.off_single == pytest.approx(linear)
     assert (bp.on_distributed, bp.on_single) == (bp.off_distributed, bp.off_single)
     solve = estimate_peaks(**TINY, mixing_pairs=4)["sigma_loop"].off_single
-    assert solve == pytest.approx(SCALE * (8 * core + 2 * full) + 8 * core * (9 * 3 + 10))
+    assert solve == pytest.approx(SCALE * (8 * core + 2 * full) + 8 * core * (9 * 3 + 10) + _v_single(TINY))
     one_pair = estimate_peaks(**TINY, mixing_pairs=1)["sigma_loop"].off_single
     assert one_pair == pytest.approx(SCALE * 2 * core + linear)
 
@@ -459,9 +519,9 @@ def test_mu_update_holds_two_complex128_green_function_slices_per_rank_next_to_r
     nk, nb, ranks = TINY["nk_tot"], TINY["n_bands"], TINY["n_ranks"]
     per_k = nb**2 * 2 * TINY["niv_cut"]
     bp = estimate_peaks(**TINY)["mu_update"]
-    assert bp.baseline == pytest.approx(_rank_base(TINY)) and bp.giwk_shareable == 0.0
+    assert bp.baseline == pytest.approx(RANK_BASELINE_BYTES) and bp.giwk_shareable == 0.0
     assert bp.off_distributed == pytest.approx(16 * 2 * -(-nk // ranks) * per_k)
-    assert bp.off_single == pytest.approx(SCALE * 2 * nk * per_k)
+    assert bp.off_single == pytest.approx(SCALE * 2 * nk * per_k + _v_single(TINY))
     assert (bp.on_distributed, bp.on_single) == (bp.off_distributed, bp.off_single)
     history = estimate_peaks(**TINY, mixing_pairs=4)["mu_update"].off_single - bp.off_single
     assert history == pytest.approx(SCALE * 8 * nk * nb**2 * 2 * TINY["niv_core"])
@@ -480,7 +540,8 @@ def test_sigma_interp_branch_models_rank0_interpolating_the_irreducible_sigma():
     assert bp.off_distributed == pytest.approx(
         share * (SCALE * per_q_source + 16 * (10 * per_q_source + 4 * per_q_target))
     )
-    assert bp.off_single == pytest.approx(SCALE * (full + source) + max(16 * (10 * source + 4 * target), unfold))
+    rank0 = SCALE * (full + source) + max(16 * (10 * source + 4 * target), unfold) + _v_single(TINY)
+    assert bp.off_single == pytest.approx(rank0)
     assert (bp.on_distributed, bp.on_single) == (bp.off_distributed, bp.off_single)
 
 
@@ -506,7 +567,7 @@ def test_lanczos_fast_counts_layout_build_vertices_bubble_and_arpack_basis():
     chi0 = p["nk_tot"] * nb**4 * vpp
     arpack = (memory_estimator.lanczos_ncv(1) + ARPACK_EXTRA_VECTORS) * p["nk_tot"] * nb**2 * vpp
     giwk_dga = p["nk_tot"] * nb**2 * 2 * p["niv_cut"]
-    expected = SCALE * (LANCZOS_VERTEX_FACTOR * vertex + chi0 + arpack + giwk_dga)
+    expected = SCALE * (LANCZOS_VERTEX_FACTOR * vertex + chi0 + arpack + giwk_dga) + _v_single(p)
     assert estimate_peaks(**p)["lanczos"].off_single == pytest.approx(expected)
 
 
@@ -596,14 +657,14 @@ def test_save_pairing_vertex_enters_the_single_rank_gather_peak():
 def test_local_step_is_flagless_single_rank_and_band_heavy(niv_full, symmetrize):
     """The local branch is verify-only, rank-independent and nb^4-heavy: the larger of the inversion and F phases."""
     bp = _peaks(niv_full=niv_full, symmetrize_orbitals=symmetrize)["local"]
-    assert bp.baseline == pytest.approx(_rank_base(BASE)) and bp.giwk_shareable == 0.0 and bp.off_distributed == 0.0
+    assert bp.baseline == pytest.approx(RANK_BASELINE_BYTES) and bp.giwk_shareable == 0.0 and bp.off_distributed == 0.0
     assert bp.off_single == bp.on_single > 0.0
     assert _peaks(n_ranks=16, niv_full=niv_full, symmetrize_orbitals=symmetrize)["local"].off_single == bp.off_single
     two_bands = _peaks(n_bands=2, niv_full=niv_full, symmetrize_orbitals=symmetrize)["local"].off_single
     assert two_bands == pytest.approx(16 * bp.off_single)
     wp, vc, vf = BASE["niw_core"] + 1, 2 * BASE["niv_core"], 2 * niv_full
     l_core, f_full = wp * vc * vc, wp * vf * vc
-    expected = SCALE * max(4 * l_core + (3 if symmetrize else 2) * f_full, 6 * l_core + f_full)
+    expected = SCALE * max(4 * l_core + (3 if symmetrize else 2) * f_full, 6 * l_core + f_full) + _v_single(BASE)
     assert bp.off_single == pytest.approx(expected)
 
 
@@ -615,3 +676,397 @@ def test_dynamic_chunk_budget_scales_floors_and_caps():
     assert floor < mid < cap
     assert dynamic_chunk_budget(total_bytes=4000 * 2**30, node_ranks=2) == cap
     assert dynamic_chunk_budget(total_bytes=600 * 2**30, node_ranks=48) == 2 * mid
+
+
+def test_jacobian_tracker_residents_and_sector_history_join_the_loop_slots_and_its_transient_the_mixing_step():
+    """With the tracker its residents and a sector-sized history fill the rank-0 slots, the solve has sector rows."""
+    kw = dict(overhead=1.0, niv_interp=2 * BASE["niv_core"])
+    core = DTYPE_BYTES * BASE["nk_tot"] * BASE["n_bands"] ** 2 * (2 * BASE["niv_core"])
+    sector, k = BASE["nk_irr"] * BASE["n_bands"] ** 2 * (2 * BASE["niv_core"]), TRACKER_PAIRS - 1
+    # window, predecessor, estimate, snapshot and held flips in the storage precision, the binding and the waiting pair
+    # in complex64; four tall float64 arrays
+    resident = (TRACKER_PAIRS * DTYPE_BYTES + DTYPE_BYTES * k + DTYPE_BYTES * 3 * k + 8 * 4 + 4 * 8 * k) * sector
+    transient = 7 * np.dtype(np.float64).itemsize * sector * k
+    assert jacobian_tracker_bytes(BASE["nk_irr"], BASE["n_bands"], 2 * BASE["niv_core"]) == (resident, transient)
+    sigma_full = _giwk_rspace(BASE["nk_tot"], BASE["n_bands"], 2 * BASE["niv_cut"])
+    for pairs in (0, 4, 40):
+        off = _peaks(**kw, mixing_pairs=pairs)
+        on = _peaks(**kw, mixing_pairs=pairs, with_jacobian_tracker=True)
+        window, history = 2 * pairs * core, 2 * pairs * (DTYPE_BYTES // 2) * sector
+        for key in ("chi0q", "chiq_aux", "sde", "mu_update"):
+            assert on[key].off_single == pytest.approx(off[key].off_single - window + history + resident), key
+            assert on[key].on_single == pytest.approx(off[key].on_single - window + history + resident), key
+            assert on[key].off_distributed == pytest.approx(off[key].off_distributed), key
+        assert on["sigma_interp"].off_single == pytest.approx(off["sigma_interp"].off_single + resident)
+        solve = 4 * sector * (9 * (pairs - 1) + 10) if pairs > 1 else 0
+        step = max(DTYPE_BYTES * 3 * sigma_full, solve, transient)
+        expected = history + resident + 2 * core + DTYPE_BYTES * 2 * sigma_full + step + _v_single(BASE)
+        assert on["sigma_loop"].off_single == pytest.approx(expected)
+        assert (step == solve) == (pairs == 40)
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+def test_jacobian_tracker_residents_count_101_sector_columns_with_exact_checks_and_59_without_in_complex64(
+    dtype, monkeypatch
+):
+    """With exact checks the tracker holds 101 float64 sector columns in complex64, 59 without, more in complex128."""
+    monkeypatch.setattr(memory_estimator, "DTYPE_BYTES", np.dtype(dtype).itemsize)
+    nk_irr, nb, nv = BASE["nk_irr"], BASE["n_bands"], 2 * BASE["niv_core"]
+    column, storage = 8 * nk_irr * nb**2 * nv, np.dtype(dtype).itemsize / np.dtype(np.complex64).itemsize
+    # the window, the predecessor file, the Ritz sets but the binding and the waiting pair, and the check candidate
+    # double in a complex128 run
+    exact = (101 + (7 + 12 + 38 + 2) * (storage - 1)) * column
+    secant = (59 + (7 + 6 + 18) * (storage - 1)) * column
+    assert jacobian_tracker_bytes(nk_irr, nb, nv, with_exact_jacobian=True) == (exact, 42 * column)
+    assert jacobian_tracker_bytes(nk_irr, nb, nv) == (secant, 42 * column)
+    both = _peaks(with_jacobian_tracker=True, with_exact_jacobian=True, overhead=1.0)
+    tracker = _peaks(with_jacobian_tracker=True, overhead=1.0)
+    for key in ("chi0q", "chiq_aux", "sde", "sigma_loop"):
+        assert both[key].off_single == pytest.approx(tracker[key].off_single + exact - secant), key
+
+
+# a grid whose core blocks dwarf the per-slice Bethe-Salpeter solve's fixed transient, so the solve's phase stays small
+LARGE_GRID = dict(nk_tot=128 * 128, nk_irr=2145)
+
+
+def test_bubble_round_bytes_is_the_bubble_generators_round_buffer():
+    """The estimator's round of full-grid columns is the window bubble's round buffer."""
+    assert memory_estimator.BUBBLE_ROUND_BYTES == bubble_gen.ROUND_BUFFER_BYTES
+
+
+@pytest.mark.parametrize(
+    "budgets",
+    [ChunkBudgets(exact=0), ChunkBudgets(exact=0, exact_block=3, exact_window=2), ChunkBudgets(exact_window=1)],
+)
+@pytest.mark.parametrize("grid", [{}, LARGE_GRID, {**LARGE_GRID, "n_ranks": 1}])
+def test_exact_jacobian_branch_is_its_residents_beside_the_largest_stage_of_a_window(budgets, grid):
+    """Per rank: residents and carried slabs beside a window's bubbles, dc split, Bethe-Salpeter pass or contraction."""
+    params = {**BASE, **grid}
+    bp = _peaks(with_exact_jacobian=True, overhead=1.0, chunk_budgets=budgets, **grid)["exact_jacobian"]
+    nb, nk_tot, nk_irr, niw, niv, nivf = (
+        params[k] for k in ("n_bands", "nk_tot", "nk_irr", "niw_core", "niv_core", "niv_full")
+    )
+    qi, wp, m = -(-nk_irr // params["n_ranks"]), niw + 1, budgets.exact_block
+    n_w = wp if budgets.exact_window is None else budgets.exact_window
+    window_core, window_full = DTYPE_BYTES * qi * nb**4 * n_w * 2 * niv, DTYPE_BYTES * qi * nb**4 * n_w * 2 * nivf
+    residents = DTYPE_BYTES * (4 * qi * nb**4 * wp * 2 * niv + 2 * qi * nb**4 * wp)
+    carried, contraction = column_sde_stream_bytes(
+        nk_irr, nk_tot, nb, niw, niv, params["n_ranks"], qi, m + 1, m, budgets.exact
+    )
+    column, round_bytes = DTYPE_BYTES * nk_tot * nb**4, memory_estimator.BUBBLE_ROUND_BYTES
+    rounds = max(column, round_bytes) * (1 + (m + 1) * (2 * nk_irr + qi) / nk_tot)
+    rounds += 4 * DTYPE_BYTES * nk_tot * nb**2 + round_bytes
+    if params["n_ranks"] == 1:
+        rounds = column * 2 * nivf + 2 * DTYPE_BYTES * nk_tot * nb**2 * 2 * nivf
+        rounds += max(round_bytes, DTYPE_BYTES * nb**4 * 2 * nivf)
+    bubble = (m + 1) * window_full + max(rounds, (DTYPE_BYTES + 3) * window_full / DTYPE_BYTES)
+    dc, bse = exact_window_stages(qi, nb, n_w, niv, nivf, m, False)
+    stages = (bubble, dc, bse, m * window_core + contraction)
+    assert bp.off_distributed == pytest.approx(residents + carried + max(stages))
+
+
+def test_jacobian_tracker_keeps_44_sector_columns_after_the_loop_with_exact_checks_in_complex64():
+    """After the loop the tracker keeps snapshot, held flips, predecessor and reflector basis: 44 F in complex64."""
+    nk_irr, nb, nv = BASE["nk_irr"], BASE["n_bands"], 2 * BASE["niv_core"]
+    column, storage = 8 * nk_irr * nb**2 * nv, DTYPE_BYTES / np.dtype(np.complex64).itemsize
+    after = jacobian_tracker_bytes(nk_irr, nb, nv, with_exact_jacobian=True, after_loop=True)
+    assert after == ((44 + (12 + 16) * (storage - 1)) * column, 0)
+
+
+@pytest.mark.parametrize("mixing_pairs, ncv", [(0, 40), (4, 40), (0, 400)])
+def test_exact_jacobian_rank_0_slot_is_the_larger_of_an_in_loop_check_and_the_end_of_rung_solve(
+    mixing_pairs, ncv, monkeypatch
+):
+    """Rank 0 holds a product beside the check, history, tracker and proposal, or ARPACK and the released tracker."""
+    monkeypatch.setattr(memory_estimator, "EXACT_JACOBIAN_NCV", ncv)
+    kw = dict(with_exact_jacobian=True, with_jacobian_tracker=True, mixing_pairs=mixing_pairs, overhead=1.0)
+    bp = _peaks(**kw)["exact_jacobian"]
+    nk_irr, nb, nv = BASE["nk_irr"], BASE["n_bands"], 2 * BASE["niv_core"]
+    vector = 8 * nk_irr * nb**2 * nv
+    sigma_core = DTYPE_BYTES * _giwk_rspace(BASE["nk_tot"], nb, nv)
+    sigma_full = DTYPE_BYTES * _giwk_rspace(BASE["nk_tot"], nb, 2 * BASE["niv_cut"])
+    product = 2 * sigma_core + DTYPE_BYTES * BASE["nk_tot"] * nb**4
+    history = 2 * mixing_pairs * (DTYPE_BYTES // 2) * nk_irr * nb**2 * nv
+    in_loop = history + jacobian_tracker_bytes(nk_irr, nb, nv, True)[0] + sigma_full
+    in_loop += (4 * EXACT_CHECK_BASIS + 4) * vector
+    end_of_rung = jacobian_tracker_bytes(nk_irr, nb, nv, True, after_loop=True)[0]
+    end_of_rung += (2 * (ncv + 1) + 3 * EXACT_JACOBIAN_MODES + 11) * vector
+    assert bp.off_single == pytest.approx(product + _v_single(BASE) + max(in_loop, end_of_rung))
+    assert (end_of_rung > in_loop) == (ncv > 100)
+
+
+@pytest.mark.parametrize("width_cost, width, window", [(1 / 16, 4, 31), (1 / 8, 4, 25), (1 / 3, 2, 8), (1.0, None, 1)])
+def test_exact_jacobian_budgets_take_the_widest_block_the_widest_window_and_the_budget_they_leave(
+    width_cost, width, window
+):
+    """The exact products take the widest block, then the widest window that fits, then the budget left."""
+    line, loop = 3 * 1024**3, ChunkBudgets(sde=2, fq=3)
+
+    def fits(trial: ChunkBudgets) -> bool:
+        """Whether the trial's block, window and budget fit the line."""
+        return 3 * trial.exact + (width_cost * trial.exact_block + 0.01 * trial.exact_window) * line <= line
+
+    budgets = exact_jacobian_budgets(fits, loop, 31)
+    assert (budgets.sde, budgets.fq) == (2, 3)
+    if width is None:
+        assert budgets == ChunkBudgets(2, 3, SLICE_CHUNK_BYTES, 1, 1, True, True)
+    else:
+        left = (line - (width_cost * width + 0.01 * window) * line) / 3
+        assert (budgets.exact_block, budgets.exact_window) == (width, window) and not budgets.exact_vertices_per_window
+        assert left - 2**20 <= budgets.exact <= left
+
+
+@pytest.mark.parametrize(
+    "local, vrg, residency, width",
+    [
+        (0.1, 0.1, (False, False), 4),
+        (0.45, 0.1, (True, False), 4),
+        (0.7, 0.1, (True, False), 4),
+        (0.4, 0.4, (True, True), 4),
+        (0.05, 0.42, (False, True), 4),
+        (0.1, 0.7, (False, True), 4),
+        (0.7, 0.7, (True, True), 4),
+        (0.1, 0.0, (False, False), 4),
+        (0.6, 0.0, (True, False), 4),
+    ],
+)
+def test_exact_jacobian_budgets_take_the_cheapest_in_loop_check_that_fits(local, vrg, residency, width):
+    """Fewest pieces per check first, recomputed three-leg vertices 2 % dearer, held local vertices on a tie."""
+    line = 3 * 1024**3
+
+    def fits(trial: ChunkBudgets) -> bool:
+        """Whether the trial fits the line, each vertex set held unless loaded or recomputed per window."""
+        held = (0.0 if trial.exact_vertices_per_window else local) + (0.0 if trial.exact_vrg_per_window else vrg)
+        return 3 * trial.exact + (0.1 * trial.exact_block + 0.001 * (trial.exact_window - 1) + held) * line <= line
+
+    budgets = exact_jacobian_budgets(fits, ChunkBudgets(), 31)
+    assert (budgets.exact_vertices_per_window, budgets.exact_vrg_per_window) == residency
+    assert budgets.exact_block == width and 1 <= budgets.exact_window <= 31 and fits(budgets)
+
+
+@pytest.mark.parametrize("dtype_bytes, nodes, picked", [(8, 2, (4, False, False)), (16, 3, (4, True, True))])
+def test_exact_jacobian_budgets_give_a_production_box_four_columns_per_piece(dtype_bytes, nodes, picked, monkeypatch):
+    """At 50^3 momenta, 4 bands and 150 frequencies on 1 TiB nodes of 96 ranks a piece takes the widest block."""
+    monkeypatch.setattr(memory_estimator, "DTYPE_BYTES", dtype_bytes)
+    params = dict(BASE, n_bands=4, nk_tot=50**3, nk_irr=3276, niw_core=150, niv_core=150, niv_full=300, niv_cut=460)
+    params.update(niv_dmft=1000, niv_pp=75, n_ranks=96 * nodes, with_jacobian_tracker=True, with_exact_jacobian=True)
+
+    def fits(trial: ChunkBudgets) -> bool:
+        """Whether rank 0's node of busiest ranks holds the exact branch within 95 % of 1 TiB."""
+        bp = estimate_peaks(**params, chunk_budgets=trial)["exact_jacobian"]
+        return node_total([(96, bp)], holds_rank_zero=True) <= 0.95 * 1024**4
+
+    budgets = exact_jacobian_budgets(fits, ChunkBudgets(), 151)
+    assert (budgets.exact_block, budgets.exact_vertices_per_window, budgets.exact_vrg_per_window) == picked
+    assert fits(budgets) and not fits(replace(budgets, exact_window=budgets.exact_window + 1))
+
+
+@pytest.mark.parametrize("window", [1, 4])
+def test_exact_jacobian_branch_recomputing_the_three_leg_vertices_holds_two_core_blocks_fewer(window):
+    """Three-leg vertices recomputed per window hold two core blocks fewer and add one window block to the pass."""
+    held = ChunkBudgets(exact=0, exact_window=window)
+    held_bp = _peaks(with_exact_jacobian=True, overhead=1.0, chunk_budgets=held, **LARGE_GRID)["exact_jacobian"]
+    per_window = replace(held, exact_vrg_per_window=True)
+    window_bp = _peaks(with_exact_jacobian=True, overhead=1.0, chunk_budgets=per_window, **LARGE_GRID)["exact_jacobian"]
+    qi, nb, vc = -(-LARGE_GRID["nk_irr"] // BASE["n_ranks"]), BASE["n_bands"], 2 * BASE["niv_core"]
+    core = DTYPE_BYTES * qi * nb**4 * (BASE["niw_core"] + 1) * vc
+    window_block = DTYPE_BYTES * qi * nb**4 * window * vc
+    bse = [
+        exact_window_stages(qi, nb, window, BASE["niv_core"], BASE["niv_full"], 1, flag)[1] for flag in (False, True)
+    ]
+    assert bse[1] - bse[0] == pytest.approx(window_block)
+    assert 2 * core - window_block <= held_bp.off_distributed - window_bp.off_distributed <= 2 * core
+    assert (held_bp.baseline, held_bp.off_single) == (window_bp.baseline, window_bp.off_single)
+
+
+@pytest.mark.parametrize("width, window, per_window", [(1, 1, False), (2, 4, False), (3, 31, True)])
+def test_exact_window_stages_are_the_worst_response_of_the_split_and_the_pass_beside_the_solve(
+    width, window, per_window
+):
+    """The split: a response in work beside the earlier ones' parts and the later ones; the pass beside the solve."""
+    qi, nb, nc, nf = 9, 2, 30, 40
+    vc, vf = 2 * nc, 2 * nf
+    core, full = qi * nb**4 * window * vc, qi * nb**4 * window * vf
+    part, one_q = (2 + 2 / vc) * core, nb**4 * window * (vf + 2 * vc)
+    work = max(core + one_q, (2 + 1 / vc) * core)
+    dc = max(
+        max(i * part + (width - i) * full + work, i * part + (width - 1 - i) * full + (4 + 2 / vc) * core)
+        for i in (0, width - 1)
+    )
+    bse = DTYPE_BYTES * (width * part + (6 + 2 * width + per_window) * core)
+    bse += memory_estimator._exact_solve_transient(nb * nb * vc, nb, width)
+    stages = exact_window_stages(qi, nb, window, nc, nf, width, per_window)
+    assert np.allclose(stages, (DTYPE_BYTES * dc, bse), rtol=0, atol=1.0)
+    assert exact_window_stages(0, nb, window, nc, nf, width, per_window) == (0.0, 0.0)
+
+
+@pytest.mark.parametrize("o, niv, n_rhs", [(6, 20, 1), (6, 20, 4), (8, 10, 2), (8, 10, 4)])
+def test_exact_solve_transient_bounds_the_traced_peak_of_the_right_hand_side_solve(o, niv, n_rhs, monkeypatch):
+    """The modeled transient covers the traced per-slice solve of n_rhs systems above its solutions, up to 8 bands."""
+    monkeypatch.setattr(config.sys, "beta", 9.0, raising=False)
+    vn, n, rng = 2 * niv, o * o * 2 * niv, np.random.default_rng(5)
+    gamma = LocalFourPoint(rng.standard_normal((o,) * 4 + (2, vn, vn)) + 0j, SpinChannel.DENS, 1, 2, False, True)
+    # two momenta and two bosonic frequencies: every slice after the first meets its predecessor's right-hand sides
+    shape, meta = (2,) + (o,) * 4 + (2, vn), (SpinChannel.NONE, (2, 1, 1), 1, 1, False, True, True)
+    gchi0_q_inv = FourPoint(rng.standard_normal(shape) + 30.0, *meta)
+    u_loc = LocalInteraction(np.ones((o,) * 4), SpinChannel.NONE)
+    rhs = [FourPoint(rng.standard_normal(shape) + 0j, *meta) for _ in range(n_rhs)]
+    nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=rhs)
+    solved, peak = traced_peak(lambda: nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=rhs))
+    above = peak - sum(x.mat.nbytes for x in solved)
+    assert 2 * n**2 * DTYPE_BYTES < above <= memory_estimator._exact_solve_transient(n, o, n_rhs)
+
+
+def test_exact_jacobian_branch_grows_with_its_window_up_to_the_whole_range():
+    """The exact branch grows with its window, monotone as the budget search needs, the whole range at the top."""
+    peaks = [
+        _peaks(with_exact_jacobian=True, chunk_budgets=ChunkBudgets(exact_window=w), **LARGE_GRID)["exact_jacobian"]
+        for w in (1, 2, 8, 31, 40)
+    ]
+    totals = [_off_node_total(bp, 4) for bp in peaks]
+    whole = _peaks(with_exact_jacobian=True, **LARGE_GRID)["exact_jacobian"]
+    assert all(a < b for a, b in zip(totals[:3], totals[1:4])) and peaks[3] == peaks[4] == whole
+
+
+def test_exact_jacobian_branch_is_present_only_with_the_flag_and_leaves_the_other_branches_alone():
+    """The converged-point Jacobian adds its own branch, only when it is enabled, and changes no other branch."""
+    off, on = _peaks(), _peaks(with_exact_jacobian=True)
+    assert "exact_jacobian" not in off and set(on) == set(off) | {"exact_jacobian"}
+    assert all(on[key] == off[key] for key in off)
+
+
+def test_exact_jacobian_branch_grows_with_its_block_width_and_leaves_the_other_branches_alone():
+    """A wider block of exact products raises the exact branch's per-rank peak and no other branch."""
+    narrow = _peaks(with_exact_jacobian=True, chunk_budgets=ChunkBudgets(exact_block=1))
+    wide = _peaks(with_exact_jacobian=True, chunk_budgets=ChunkBudgets(exact_block=4))
+    assert wide["exact_jacobian"].off_distributed > narrow["exact_jacobian"].off_distributed
+    assert all(wide[key] == narrow[key] for key in narrow if key != "exact_jacobian")
+
+
+@pytest.mark.parametrize("width", [1, 3])
+def test_exact_jacobian_branch_counts_its_node_windows_and_rank_0s_check_exactly(width):
+    """Node: loop Sigma, G and change windows, the real-space windows of G and a piece, three vertices, the block."""
+    budgets = ChunkBudgets(exact_block=width)
+    bp = _peaks(with_exact_jacobian=True, overhead=1.0, chunk_budgets=budgets)["exact_jacobian"]
+    nk, niv, niw, nivf, cut = BASE["nk_tot"], BASE["niv_core"], BASE["niw_core"], BASE["niv_full"], BASE["niv_cut"]
+    sigma_full, sigma_core, sector = nk * 2 * cut, nk * 2 * niv, 2 * BASE["nk_irr"] * niv
+    vertices = (niw + 1) * 2 * nivf * 2 * niv + 2 * (niw + 1) * (2 * niv) ** 2
+    rspace = nk * 2 * (nivf + niw)
+    windows = DTYPE_BYTES * (3 * sigma_full + (width + 1) * rspace + vertices) + 8 * EXACT_CHECK_BASIS * sector
+    assert bp.giwk_shareable == pytest.approx(windows)
+    assert bp.baseline == pytest.approx(windows + RANK_BASELINE_BYTES)
+    arpack = 8 * (2 * (EXACT_JACOBIAN_NCV + 1) + 3 * EXACT_JACOBIAN_MODES + 11) * sector
+    check = 8 * (4 * EXACT_CHECK_BASIS + 4) * sector
+    product = DTYPE_BYTES * (2 * sigma_core + nk * BASE["n_bands"] ** 4)
+    assert bp.off_single == pytest.approx(product + _v_single(BASE) + max(DTYPE_BYTES * sigma_full + check, arpack))
+
+
+@pytest.mark.parametrize("window", [None, 4])
+def test_exact_jacobian_branch_holds_one_local_vertex_window_when_they_load_per_window(window):
+    """Vertices loaded per window leave the larger one's window on the node instead of all three, nothing else."""
+    held = _peaks(with_exact_jacobian=True, chunk_budgets=ChunkBudgets(exact_window=window))["exact_jacobian"]
+    budgets = ChunkBudgets(exact_window=window, exact_vertices_per_window=True)
+    per_window = _peaks(with_exact_jacobian=True, chunk_budgets=budgets)["exact_jacobian"]
+    wp, vc, vf = BASE["niw_core"] + 1, 2 * BASE["niv_core"], 2 * BASE["niv_full"]
+    f_dc, gamma, n_w = wp * vf * vc, wp * vc * vc, window or wp
+    saved = DTYPE_BYTES * (f_dc + 2 * gamma - f_dc * n_w / wp)
+    assert f_dc > gamma and held.giwk_shareable - per_window.giwk_shareable == pytest.approx(saved)
+    assert held.baseline - per_window.baseline == pytest.approx(saved)
+    assert (per_window.off_distributed, per_window.off_single) == (held.off_distributed, held.off_single)
+
+
+def test_exact_jacobian_branch_is_sized_by_its_own_budget_and_not_the_loops():
+    """The exact products' contraction rounds follow ChunkBudgets.exact, not the loop's sde and fq budgets."""
+
+    def exact(**budgets):
+        budgets = ChunkBudgets(exact_window=1, **budgets)
+        return _peaks(with_exact_jacobian=True, chunk_budgets=budgets, **LARGE_GRID)["exact_jacobian"].off_distributed
+
+    small = exact(exact=0)
+    assert exact(exact=MAX_CHUNK_BUDGET_BYTES) > small
+    assert exact(exact=0, sde=MAX_CHUNK_BUDGET_BYTES, fq=MAX_CHUNK_BUDGET_BYTES) == small
+
+
+def test_exact_jacobian_branch_grows_with_the_box_and_holds_the_eigenvectors_on_rank_0():
+    """The branch grows with the momentum grid and the core box; rank 0 holds the Arnoldi basis and the eigenvectors."""
+    small = _peaks(with_exact_jacobian=True)["exact_jacobian"]
+    for bigger in (dict(nk_tot=2 * BASE["nk_tot"], nk_irr=2 * BASE["nk_irr"]), dict(niv_core=BASE["niv_core"] + 5)):
+        big = _peaks(with_exact_jacobian=True, **bigger)["exact_jacobian"]
+        assert _off_node_total(big, 4) > _off_node_total(small, 4), bigger
+    sector = 2 * BASE["nk_irr"] * BASE["n_bands"] ** 2 * BASE["niv_core"]
+    arnoldi = np.dtype(np.float64).itemsize * (4 * EXACT_CHECK_BASIS + 4) * sector
+    assert small.off_single > arnoldi and small.giwk_shareable < small.baseline
+
+
+def test_rank_0_alone_holds_the_full_grid_interaction_in_every_branch(monkeypatch):
+    """The full-grid interaction sits in every branch's single-rank slots and in no baseline or distributed term."""
+    kw = dict(with_eliashberg=True, with_jacobian_tracker=True, with_exact_jacobian=True, niv_interp=40)
+    held = _peaks(**kw)
+    assert interaction_bytes(BASE["n_bands"], BASE["nk_tot"]) == _v_single(BASE)
+    monkeypatch.setattr(memory_estimator, "interaction_bytes", lambda *args, **kwargs: 0.0)
+    none = _peaks(**kw)
+    for key, bp in held.items():
+        assert (bp.baseline, bp.off_distributed, bp.on_distributed) == (
+            none[key].baseline,
+            none[key].off_distributed,
+            none[key].on_distributed,
+        ), key
+        assert bp.off_single - none[key].off_single == pytest.approx(_v_single(BASE)), key
+        assert bp.on_single - none[key].on_single == pytest.approx(_v_single(BASE)), key
+
+
+@pytest.mark.parametrize("n_tasks, n_ranks", [(7, 3), (6, 3), (1, 3), (0, 2), (45, 4), (3276, 192)])
+def test_rank_tasks_are_the_counts_the_distributor_gives_each_rank(n_tasks, n_ranks):
+    """rank_tasks reproduces MpiDistributor's split, the excess on the highest ranks, ranks without tasks included."""
+    sizes = MpiDistributor(ntasks=n_tasks, comm=FAKE_MPI.Comm(n_ranks)).sizes
+    assert [rank_tasks(n_tasks, n_ranks, rank) for rank in range(n_ranks)] == list(sizes)
+
+
+def test_a_rank_with_fewer_momenta_holds_smaller_distributed_terms():
+    """A rank's own irreducible and full-BZ counts drive its distributed terms; the busiest rank is the default."""
+    params = dict(nk_tot=258, with_eliashberg=True, niv_interp=40)  # irreducible 11, 11, 11, 12; full BZ 64, 64, 65, 65
+    default, low, high = _peaks(**params), _peaks(**params, rank=0), _peaks(**params, rank=3)
+    assert high == default
+    for key in ("chi0q", "chiq_aux", "sde", "fq", "sigma_interp", "mu_update", "energies", "occupation"):
+        assert low[key].off_distributed < high[key].off_distributed, key
+        assert (low[key].baseline, low[key].off_single) == (high[key].baseline, high[key].off_single), key
+
+
+def test_nodes_without_rank_0_hold_only_their_node_roots_share_of_the_single_slots():
+    """A node without rank 0 holds the loop Sigma its root receives and shares, nothing of rank 0's own arrays."""
+    kw = dict(with_eliashberg=True, with_jacobian_tracker=True, with_exact_jacobian=True, mixing_pairs=4, niv_interp=40)
+    peaks = _peaks(**kw)
+    sigma_full = SCALE * _giwk_rspace(BASE["nk_tot"], BASE["n_bands"], 2 * BASE["niv_cut"])
+    assert peaks["sigma_loop"].remote_single == pytest.approx(2 * sigma_full)
+    for key in ("mu_update", "energies", "sigma_interp"):
+        assert peaks[key].remote_single == pytest.approx(sigma_full), key
+    for key in ("chi0q", "chiq_aux", "sde", "occupation", "local", "fq", "lanczos"):
+        assert peaks[key].remote_single == 0.0, key
+
+
+@pytest.mark.parametrize(
+    "grid", [{}, dict(n_bands=4, nk_tot=50**3, nk_irr=3276, niv_core=150, niv_full=300, niv_cut=460, niv_dmft=1000)]
+)
+def test_exact_jacobian_branch_holds_a_roots_unfolding_or_its_change_and_one_dg_chunk_off_rank_0s_node(grid):
+    """Off rank 0's node the exact branch holds a root's two-window unfolding or its change beside a dG chunk."""
+    params = {**BASE, **grid}
+    bp = _peaks(**params, with_jacobian_tracker=True, with_exact_jacobian=True)["exact_jacobian"]
+    sigma_core, sigma_full = (
+        SCALE * _giwk_rspace(params["nk_tot"], params["n_bands"], 2 * params[k]) for k in ("niv_core", "niv_cut")
+    )
+    expected = sigma_core + max(sigma_core, min(SLICE_CHUNK_BYTES, sigma_full))
+    assert expected >= 2 * sigma_core and np.allclose(bp.remote_single, expected, rtol=0, atol=1.0)
+    rank_0s, other = node_total([(4, bp)], holds_rank_zero=True), node_total([(4, bp)], holds_rank_zero=False)
+    assert bp.off_single > bp.remote_single
+    assert np.allclose(rank_0s - other, bp.off_single - bp.remote_single, rtol=0, atol=1.0)
+
+
+def test_node_total_sums_each_ranks_own_peak_and_counts_rank_0s_single_only_on_its_node():
+    """Each rank adds its own baseline and transient, the node one single (remote off rank 0's node), shared once."""
+    a = BranchPeak(1.0, 0.5, 2.0, 10.0, 4.0, 20.0, remote_single=3.0)
+    b = replace(a, off_distributed=5.0, on_distributed=7.0)
+    assert node_total([(2, a), (1, b)], holds_rank_zero=True) == 2 * 3.0 + 6.0 + 10.0 - 2 * 0.5
+    assert node_total([(2, a), (1, b)], holds_rank_zero=False) == 2 * 3.0 + 6.0 + 3.0 - 2 * 0.5
+    assert node_total([(2, a), (1, b)], holds_rank_zero=True, grid=True) == 2 * 5.0 + 8.0 + 20.0 - 2 * 0.5
+    anywhere = replace(a, remote_single=None)
+    assert node_total([(3, anywhere)], holds_rank_zero=False) == node_total([(3, anywhere)], holds_rank_zero=True)

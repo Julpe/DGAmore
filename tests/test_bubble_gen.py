@@ -9,15 +9,22 @@ independent, explicit hand-rolled reference of the documented formula (small ran
 which both validates correctness and locks the behavior of the memory-optimized methods.
 """
 
+import types
+
 import numpy as np
 import pytest
 
 import dgamore.config as config
+import dgamore.mpi_utils as mpi_utils
+import dgamore.n_point_base as n_point_base
 from dgamore import brillouin_zone as bz
+from dgamore import nonlocal_sde
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.greens_function import GreensFunction
 from dgamore.matsubara_frequencies import MFHelper
+from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import FrequencyNotation
+from tests.conftest import FAKE_MPI, create_comm_mock, run_parallel, traced_peak
 
 
 def _make_local_g(nb: int, niv: int, seed: int = 0) -> GreensFunction:
@@ -351,3 +358,274 @@ def test_fft_bubble_distributed_with_fewer_columns_than_ranks(monkeypatch):
     _, res = run_parallel(5, fn)
     assembled = np.concatenate(res, axis=0)
     assert np.allclose(assembled, ref.mat, atol=1e-5)
+
+
+@pytest.mark.parametrize("size", [1, 2])
+def test_fft_bubble_subtracted_in_place_has_the_bits_of_the_difference_of_both_bubbles(size, monkeypatch):
+    """A bubble subtracted from another as its blocks arrive equals a.sub(b) of the two built bubbles bit for bit."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 2, 2, 2.5
+    greens = [_make_momentum_g(nk, nb, niv + niw + 2, seed=seed) for seed in (14, 15)]
+    for g in greens:
+        g.mat[..., 1, 0, :] *= 1e-7  # bubble entries below the filter threshold
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+        a, b, target = (
+            BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, beta) for g in (*greens, greens[0])
+        )
+        out = BubbleGenerator.create_generalized_chi0_q_fft(dist, greens[1], niw, niv, q_grid, beta, subtract_from=a)
+        return out is a, a.mat, target.sub(b, copy=False).mat
+
+    _, results = run_parallel(size, fn)
+    assert all(same and np.array_equal(out, ref) for same, out, ref in results)
+    assert np.any(np.concatenate([ref for *_, ref in results]) == 0)
+
+
+def test_distributed_fft_bubble_subtracted_in_place_never_allocates_its_own_array():
+    """The column path subtracting into a bubble peaks below the bubble it would otherwise build, on one rank."""
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 6, 6, 2.5
+    g = _make_momentum_g(nk, nb, niv + niw + 2, seed=16)
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock(), name="Q")
+    peaks = []
+    for subtract in (False, True):
+        target = BubbleGenerator._create_generalized_chi0_q_fft_distributed(dist, g, niw, niv, q_grid, beta)
+        _, peak = traced_peak(
+            lambda: BubbleGenerator._create_generalized_chi0_q_fft_distributed(
+                dist, g, niw, niv, q_grid, beta, subtract_from=target if subtract else None
+            )
+        )
+        peaks.append(peak)
+    assert peaks[0] - peaks[1] >= 0.95 * target.mat.nbytes
+
+
+def test_distributed_fft_bubble_subtracts_received_blocks_in_the_precision_they_were_sent_in(monkeypatch):
+    """On 2 ranks a complex64 bubble subtracted into a complex128 target keeps its own rounding in every block."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 2, 2, 2.5
+    greens = [_make_momentum_g(nk, nb, niv + niw + 2, seed=seed) for seed in (17, 18)]
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+        a, b = (BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, beta) for g in greens)
+        target = types.SimpleNamespace(mat=a.mat.astype(np.complex128))
+        BubbleGenerator.create_generalized_chi0_q_fft(dist, greens[1], niw, niv, q_grid, beta, subtract_from=target)
+        return b.mat.dtype, target.mat, a.mat.astype(np.complex128) - b.mat
+
+    _, results = run_parallel(2, fn)
+    assert all(dtype == np.complex64 and np.array_equal(out, ref) for dtype, out, ref in results)
+
+
+def _on_ranks(ranks: int, fn, hostnames=None) -> list:
+    """Runs fn(comm, rank) on the single-rank mock communicator for one rank, else on threaded fake ranks."""
+    return [fn(create_comm_mock(), 0)] if ranks == 1 else run_parallel(ranks, fn, hostnames=hostnames)[1]
+
+
+def _window_bubbles(comm, greens, niv, niw, q_grid, beta, bounds) -> list:
+    """Builds the windows of G and the changes, runs the window bubble per bosonic window and frees the windows."""
+    node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+    dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+    built = [nonlocal_sde._build_rspace_giwk_window(g, node_comm, niv_window=niv + niw) for g in greens]
+    groups = [
+        BubbleGenerator.create_generalized_chi0_q_fft_window(
+            dist, built[0][0], niv, q_grid, beta, (w0, w1), [g_r for g_r, _ in built[1:]]
+        )
+        for w0, w1 in zip(bounds[:-1], bounds[1:])
+    ]
+    wins = [win for _, win in built]
+    built = None
+    for win in wins:
+        nonlocal_sde._free_shared_window(win, node_comm)
+    return [np.concatenate([group[i].mat for group in groups], axis=-2) for i in range(len(greens))]
+
+
+@pytest.mark.parametrize("bounds", [(0, 4), (0, 3, 4), (0, 1, 2, 3, 4)])
+@pytest.mark.parametrize(
+    "nb, ranks, hostnames, compressed",
+    [(1, 1, None, False), (2, 1, None, True), (2, 3, ["n0", "n0", "n1"], True), (3, 2, None, False)],
+)
+def test_window_bubble_columns_have_the_bits_of_the_whole_bubble(bounds, nb, ranks, hostnames, compressed, monkeypatch):
+    """Every bosonic window of the window bubble holds the bits of the rank-0 bubble's columns at any rank count."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, niv, niw, beta = (4, 4, 1), 3, 3, 2.5
+    g = _make_momentum_g(nk, nb, niv + niw + 2, seed=30 + nb)
+    g = g.compress_q_dimension() if compressed else g
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    ref = _fft_bubble_reference(g, niw, niv, q_grid, beta).mat
+
+    def fn(comm, rank):
+        return _window_bubbles(comm, [g], niv, niw, q_grid, beta, bounds)[0]
+
+    assert np.array_equal(np.concatenate(_on_ranks(ranks, fn, hostnames), axis=0), ref)
+
+
+@pytest.mark.parametrize("one_column_budget", [False, True])
+@pytest.mark.parametrize("nb, ranks, hostnames", [(1, 1, None), (2, 1, None), (2, 3, ["n0", "n0", "n1"])])
+def test_window_bubble_responses_are_window_invariant_and_match_the_polarization_pair(
+    nb, ranks, hostnames, one_column_budget, monkeypatch
+):
+    """Each change's bilinear bubble keeps its bits in any bosonic window and equals the c128 polarization pair."""
+    import dgamore.bubble_gen as bubble_gen
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(n_point_base, "DTYPE", np.complex128)
+    nk, niv, niw, beta = (4, 4, 1), 3, 3, 2.5
+    if one_column_budget:
+        monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", int(np.prod(nk)) * nb**4 * 16)
+    g, *dgs = (_make_momentum_g(nk, nb, niv + niw + 2, seed=seed) for seed in (40, 41, 42))
+    for x in (g, *dgs):
+        x.mat[..., nb - 1, 0, :] *= 1e-7 if nb > 1 else 1.0  # entries of the shifted bubbles below the filter threshold
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    polarizations = []
+    for dg in dgs:
+        s = float(np.linalg.norm(g.mat) / np.linalg.norm(dg.mat))
+        shifted = (
+            GreensFunction(g.mat + sign * s * dg.mat, has_compressed_q_dimension=False, nk=nk) for sign in (1, -1)
+        )
+        plus, minus = (_fft_bubble_reference(x, niw, niv, q_grid, beta).mat for x in shifted)
+        polarizations.append((plus - minus) * (0.5 / s))
+
+    def fn(comm, rank):
+        whole = _window_bubbles(comm, [g, *dgs], niv, niw, q_grid, beta, (0, niw + 1))
+        return whole, _window_bubbles(comm, [g, *dgs], niv, niw, q_grid, beta, (0, 1, 3, 4))
+
+    results = _on_ranks(ranks, fn, hostnames)
+    assert all(np.array_equal(w, s) for whole, split in results for w, s in zip(whole, split))
+    for i, polarization in enumerate(polarizations):
+        assert np.allclose(np.concatenate([whole[i + 1] for whole, _ in results]), polarization, rtol=0, atol=1e-12)
+
+
+def test_window_bubble_response_in_complex64_stays_within_ten_times_the_floor_of_the_polarization_pair(monkeypatch):
+    """The c64 bilinear bubble differs from the c64 polarization pair by at most 10x that pair's distance to c128."""
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 3, 3, 2.5
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    results = {}
+    for dtype in (np.complex128, np.complex64):
+        monkeypatch.setattr(n_point_base, "DTYPE", dtype)
+        g, dg = (_make_momentum_g(nk, nb, niv + niw + 2, seed=seed) for seed in (52, 53))
+        s = float(np.linalg.norm(g.mat) / np.linalg.norm(dg.mat))
+        shifted = (
+            GreensFunction(g.mat + sign * s * dg.mat, has_compressed_q_dimension=False, nk=nk) for sign in (1, -1)
+        )
+        plus, minus = (_fft_bubble_reference(x, niw, niv, q_grid, beta).mat for x in shifted)
+        response = _window_bubbles(create_comm_mock(), [g, dg], niv, niw, q_grid, beta, (0, 2, niw + 1))[1]
+        results[dtype] = ((plus - minus) * (0.5 / s), response)
+    (polarization128, _), (polarization64, response64) = results[np.complex128], results[np.complex64]
+    floor = np.abs(polarization64 - polarization128).max()
+    assert np.allclose(response64, polarization64, rtol=0, atol=10 * floor)
+
+
+def test_window_bubble_gives_a_rank_without_momenta_empty_bubbles(monkeypatch):
+    """With more ranks than irreducible momenta the empty rank gets empty bubbles and the others the rank-0 bits."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (2, 2, 1), 2, 2, 1, 2.0
+    g, dg = (_make_momentum_g(nk, nb, niv + niw + 1, seed=seed) for seed in (43, 44))
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    ref = _fft_bubble_reference(g, niw, niv, q_grid, beta).mat
+
+    def fn(comm, rank):
+        forward, response = _window_bubbles(comm, [g, dg], niv, niw, q_grid, beta, (0, 1, 2))
+        return forward, response.shape
+
+    results = run_parallel(4, fn)[1]
+    assert results[0][0].shape == (0, nb, nb, nb, nb, niw + 1, 2 * niv) == results[0][1]
+    assert np.array_equal(np.concatenate([forward for forward, _ in results], axis=0), ref)
+
+
+@pytest.mark.parametrize("w_window", [(0, 3), (1, 1)])
+def test_window_bubble_refuses_an_empty_window_or_one_beyond_the_rspace_frequencies(w_window):
+    """A bosonic window that is empty or whose shifts leave the real-space window raises instead of wrapping around."""
+    nk, nb, niv, niw, beta = (2, 2, 1), 1, 2, 1, 2.0
+    g = _make_momentum_g(nk, nb, niv + niw + 1, seed=45)
+    q_grid = bz.KGrid(nk, symmetries=[])
+    dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock(), name="Q")
+    g_r, _ = nonlocal_sde._build_rspace_giwk_window(g, create_comm_mock(), niv_window=niv + niw)
+    with pytest.raises(ValueError):
+        BubbleGenerator.create_generalized_chi0_q_fft_window(dist, g_r, niv, q_grid, beta, w_window)
+
+
+def test_window_bubble_peaks_at_its_bubbles_and_one_column_round_without_copying_a_window():
+    """On one rank the window bubble peaks at its bubbles and one round of columns, far below a window."""
+    nk, nb, niv, niw, beta = (8, 8, 1), 2, 4, 3, 2.5
+    g, dg = (_make_momentum_g(nk, nb, 402, seed=seed) for seed in (46, 47))
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock(), name="Q")
+    g_r, dg_r = (nonlocal_sde._build_rspace_giwk_window(x, create_comm_mock(), niv_window=400)[0] for x in (g, dg))
+
+    def run():
+        return BubbleGenerator.create_generalized_chi0_q_fft_window(dist, g_r, niv, q_grid, beta, (0, niw + 1), [dg_r])
+
+    run()
+    bubbles, peak = traced_peak(run)
+    column, ufunc_buffers = q_grid.nk_tot * nb**4 * g_r.itemsize, 3 * np.getbufsize() * g_r.itemsize
+    model = sum(bubble.mat.nbytes for bubble in bubbles) + 2 * niv * column * (1 + 4 * q_grid.nk_irr / q_grid.nk_tot)
+    assert peak <= model + ufunc_buffers + 4 * q_grid.nk_tot * nb**2 * g_r.itemsize < g_r.nbytes / 2
+
+
+@pytest.mark.parametrize("ranks, hostnames", [(1, None), (3, ["n0", "n0", "n1"])])
+def test_window_bubble_without_the_bubble_of_g_returns_the_bits_of_its_responses(ranks, hostnames, monkeypatch):
+    """Without the bubble of G the pass returns only the bilinear bubbles, with the bits they have beside it."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 3, 3, 2.5
+    greens = [_make_momentum_g(nk, nb, niv + niw + 2, seed=seed) for seed in (60, 61, 62)]
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+        built = [nonlocal_sde._build_rspace_giwk_window(g, node_comm, niv_window=niv + niw) for g in greens]
+        g_r, dg_rs = built[0][0], [g for g, _ in built[1:]]
+        window = BubbleGenerator.create_generalized_chi0_q_fft_window
+        both = [b.mat.copy() for b in window(dist, g_r, niv, q_grid, beta, (1, 4), dg_rs)[1:]]
+        alone = [b.mat.copy() for b in window(dist, g_r, niv, q_grid, beta, (1, 4), dg_rs, with_forward=False)]
+        wins = [win for _, win in built]
+        built = g_r = dg_rs = None
+        for win in wins:
+            nonlocal_sde._free_shared_window(win, node_comm)
+        return both, alone
+
+    results = _on_ranks(ranks, fn, hostnames)
+    assert all(len(alone) == 2 and all(np.array_equal(a, b) for a, b in zip(both, alone)) for both, alone in results)
+
+
+@pytest.mark.parametrize("ranks", [1, 2])
+def test_window_bubble_adds_the_second_product_of_a_change_in_blocks_of_momenta_with_the_same_bits(ranks, monkeypatch):
+    """The bilinear bubble written in blocks of a few momenta has the bits of the bubble written in one block."""
+    import dgamore.bubble_gen as bubble_gen
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 3, 3, 2.5
+    greens = [_make_momentum_g(nk, nb, niv + niw + 2, seed=seed) for seed in (63, 64)]
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+
+    def fn(comm, rank):
+        return _window_bubbles(comm, greens, niv, niw, q_grid, beta, (0, niw + 1))[1]
+
+    whole = _on_ranks(ranks, fn)
+    monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", 3 * nb**4 * np.dtype(n_point_base.DTYPE).itemsize)
+    assert all(np.array_equal(a, b) for a, b in zip(_on_ranks(ranks, fn), whole))
+
+
+def test_window_bubble_on_one_rank_transforms_all_fermionic_columns_of_a_frequency_at_once(monkeypatch):
+    """A single rank skips the column pass and runs one transform per bosonic frequency and bubble."""
+    import scipy as sp
+
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 3, 3, 2.5
+    g, dg = (_make_momentum_g(nk, nb, niv + niw + 2, seed=seed) for seed in (65, 66))
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock(), name="Q")
+    g_r, dg_r = (
+        nonlocal_sde._build_rspace_giwk_window(x, create_comm_mock(), niv_window=niv + niw)[0] for x in (g, dg)
+    )
+    shapes, real = [], sp.fft.ifftn
+
+    def column_pass(*args):
+        raise AssertionError("the column pass runs on one rank")
+
+    monkeypatch.setattr(BubbleGenerator, "_run_columns", staticmethod(column_pass))
+    monkeypatch.setattr(sp.fft, "ifftn", lambda x, **kwargs: shapes.append(x.shape) or real(x, **kwargs))
+    BubbleGenerator.create_generalized_chi0_q_fft_window(dist, g_r, niv, q_grid, beta, (0, niw + 1), [dg_r])
+    assert shapes == [(*nk, nb, nb, nb, nb, 2 * niv)] * 2 * (niw + 1)
