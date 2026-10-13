@@ -190,7 +190,7 @@ class AnalyticContinuationProblem:
         self.solver = None
         self.update_data(im_data)
 
-    def update_data(self, im_data: np.ndarray):
+    def update_data(self, im_data: np.ndarray, model: np.ndarray | None = None):
         if self.kernel_mode == "time_bosonic":
             im_data = im_data * self.beta
         elif self.kernel_mode == "freq_fermionic_phsym":
@@ -206,6 +206,8 @@ class AnalyticContinuationProblem:
         self.im_data = im_data
         if self.solver is not None:
             self.solver.set_data(self.im_data)
+            if model is not None:
+                self.solver.set_offdiag_model(model)
 
     def solve(self, **kwargs):
         # the keyword arguments (model, stdev, ...) configure the solver on its first build only
@@ -352,6 +354,12 @@ class MaxentSolverSVD:
             im_data = np.concatenate((im_data.real, im_data.imag))
         self.im_data = im_data
         self.Evi = np.einsum("m,km,k,k->m", self.Xi_svd, self.U_svd, self.E, self.im_data, optimize=True)
+
+    def set_offdiag_model(self, model):
+        # M2 and M3 hold no model (unlike W2 of the positive solver), so it can change between solves
+        assert self.offdiag, "Only the off-diagonal solver can swap its default model."
+        self.model_plus = model
+        self.model_minus = model
 
     def compute_f_J_diag(self, u, alpha):
         v = np.dot(self.V_svd, u)

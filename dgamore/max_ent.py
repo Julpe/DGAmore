@@ -6,13 +6,15 @@
 r"""
 Analytic continuation of imaginary-frequency quantities to the real axis via the maximum-entropy method. This module
 wraps the (vendored) :mod:`dgamore.ana_cont` solver to continue the momentum-dependent DGA Green's function and the
-local DMFT Green's function to real frequencies, yielding the spectral function :math:`A(\mathbf{k}, \omega)`. The
-momentum-resolved continuation is distributed over MPI ranks across the irreducible BZ.
+local DMFT Green's function to real frequencies, yielding the spectral function :math:`A(\mathbf{k}, \omega)`, band
+resolved and as the full orbital matrix. The momentum-resolved continuation is distributed over MPI ranks across the
+irreducible BZ.
 """
 
 import contextlib
 import gc
 import io
+import itertools
 import os
 import warnings
 
@@ -29,54 +31,122 @@ from dgamore.n_point_base import DTYPE
 from dgamore.self_energy import SelfEnergy
 
 
-def orbital_to_band_basis(hk: np.ndarray, data: np.ndarray) -> np.ndarray:
+def orbital_to_band_basis(hk: np.ndarray, data: np.ndarray, inverse: bool = False) -> np.ndarray:
     r"""
     Rotates a momentum-dependent quantity from the orbital basis into the band (eigen) basis of the Hamiltonian, per
     k-point: :math:`O^{\mathrm{band}}(\mathbf{k}) = U(\mathbf{k})^\dagger O(\mathbf{k}) U(\mathbf{k})`, where the
-    columns of :math:`U(\mathbf{k})` are the (energy-ascending) eigenvectors of :math:`H(\mathbf{k})`. The Hamiltonian
-    is diagonalized only once per k-point; if a trailing fermionic-frequency axis is present, the same
-    :math:`U(\mathbf{k})` is reused for every frequency.
+    columns of :math:`U(\mathbf{k})` are the (energy-ascending) eigenvectors of :math:`H(\mathbf{k})`, or with
+    ``inverse`` back into the orbital basis, :math:`O(\mathbf{k}) = U(\mathbf{k}) O^{\mathrm{band}}(\mathbf{k})
+    U(\mathbf{k})^\dagger`. The Hamiltonian is diagonalized only once per k-point; if a trailing frequency axis is
+    present, the same :math:`U(\mathbf{k})` is reused for every frequency. The same :math:`H(\mathbf{k})` yields the
+    same :math:`U(\mathbf{k})` in both directions, so the inverse undoes the forward rotation exactly, off-diagonal
+    band components included.
 
     Note that the band basis is defined by :math:`H(\mathbf{k})` alone, so for an interacting quantity whose self-energy
     is not simultaneously diagonal with :math:`H(\mathbf{k})` the rotated object is not exactly diagonal -- the
-    off-diagonal band components are kept here and only discarded later when the band-diagonal is taken. Within a
-    degenerate eigenspace of :math:`H(\mathbf{k})` the individual band assignment is basis-dependent (the subspace trace
-    is not).
+    off-diagonal band components are kept here. Within a degenerate eigenspace of :math:`H(\mathbf{k})` the individual
+    band assignment is basis-dependent (the subspace trace is not).
 
-    :param hk: The Hamiltonian :math:`H(\mathbf{k})` of shape ``[kx, ky, kz, n_orb, n_orb]``.
-    :param data: The quantity to rotate, of shape ``[kx, ky, kz, n_orb, n_orb]`` or, with a trailing fermionic
-        frequency axis, ``[kx, ky, kz, n_orb, n_orb, n_v]`` (rotated in place and returned).
-    :return: The quantity in the band basis (same shape as ``data``).
+    :param hk: The Hamiltonian :math:`H(\mathbf{k})` of shape ``[..., n_orb, n_orb]``, with any momentum layout in front
+        of the orbital axes (e.g. ``[kx, ky, kz, n_orb, n_orb]`` or ``[k, n_orb, n_orb]``).
+    :param data: The quantity to rotate, of the shape of ``hk`` or, with a trailing frequency axis,
+        ``[..., n_orb, n_orb, n_v]`` (rotated in place and returned).
+    :param inverse: If True, rotates from the band basis back into the orbital basis.
+    :return: The rotated quantity (same shape as ``data``).
     :raises AssertionError: If the momentum/orbital axes of ``hk`` and ``data`` do not match.
     """
     has_frequency_axis = data.ndim == hk.ndim + 1
     assert data.shape[: hk.ndim] == hk.shape and (has_frequency_axis or data.shape == hk.shape), "Shape mismatch!"
 
-    nkx, nky, nkz, n_orb, _ = hk.shape
-    for ix in range(nkx):
-        for iy in range(nky):
-            for iz in range(nkz):
-                w, v = np.linalg.eigh(hk[ix, iy, iz])
-                if has_frequency_axis:
-                    data[ix, iy, iz] = np.einsum("ai,abv,bj->ijv", v.conj(), data[ix, iy, iz], v, optimize=True)
-                else:
-                    data[ix, iy, iz] = v.conj().T @ data[ix, iy, iz] @ v
+    for k in np.ndindex(hk.shape[:-2]):
+        v = np.linalg.eigh(hk[k])[1]
+        if inverse:
+            v = v.conj().T
+        if has_frequency_axis:
+            data[k] = np.einsum("ai,abv,bj->ijv", v.conj(), data[k], v, optimize=True)
+        else:
+            data[k] = v.conj().T @ data[k] @ v
     return data
+
+
+def _continue(
+    problem: AnalyticContinuationProblem | None,
+    data: np.ndarray,
+    wn: np.ndarray,
+    w: np.ndarray,
+    model: np.ndarray,
+    stdev: np.ndarray,
+    offdiag: bool = False,
+) -> tuple[AnalyticContinuationProblem | None, np.ndarray | None]:
+    r"""
+    Runs one maximum-entropy continuation of ``data``, given on the positive Matsubara frequencies ``wn``, onto the
+    real frequencies ``w``. The continuation problem is built on the first call and reused afterwards, where only the
+    data and, for the off-diagonal solver, the default model change. The solver's printed diagnostics are re-logged
+    with the prefix ``ana_cont:``, and a numpy/scipy RuntimeWarning counts as a failure.
+
+    :param problem: The :class:`AnalyticContinuationProblem` to reuse, or None to build one.
+    :param data: The Green's function data on ``wn``.
+    :param wn: The positive Matsubara frequencies.
+    :param w: The real-frequency grid.
+    :param model: The default model on ``w``.
+    :param stdev: The assumed standard deviation of ``data`` per frequency.
+    :param offdiag: Whether to continue with the positive-negative entropy (an off-diagonal element) instead of the
+        positive one.
+    :return: The problem to reuse and the spectrum on ``w`` as ``float32``, or None in its place if the continuation
+        failed.
+    """
+    captured_output = io.StringIO()
+    try:
+        with warnings.catch_warnings(), contextlib.redirect_stdout(captured_output):
+            # Escalate numpy/scipy RuntimeWarnings (divide/invalid/overflow) to exceptions so a numerically broken
+            # continuation counts as failed; the alpha-fit curve_fit harmlessly fails to estimate its covariance.
+            warnings.simplefilter("error", RuntimeWarning)
+            warnings.simplefilter("ignore", OptimizeWarning)
+            if problem is None:
+                problem = AnalyticContinuationProblem(im_axis=wn, re_axis=w, im_data=data, beta=config.sys.beta)
+            elif offdiag:
+                problem.update_data(data, model=model)
+            else:
+                problem.update_data(data)
+            spectrum = problem.solve(model=model, stdev=stdev, offdiag=offdiag)[0].A_opt.astype(np.float32)
+        gc.collect()
+    except Exception:
+        spectrum = None
+    finally:
+        for message in captured_output.getvalue().splitlines():
+            if message.strip():
+                config.logger.info(f"ana_cont: {message}")
+    return problem, spectrum
 
 
 def perform_maxent_giwk(giwk: GreensFunction | None, name: str, comm: MPI.Comm):
     r"""
     Analytically continues the momentum-dependent Green's function to the real axis via maximum entropy, per
-    band and per irreducible-BZ k-point, and assembles the spectral function over the full BZ on rank 0. The
-    k-points are distributed across MPI ranks; failed continuations are set to zero. The continuation problem
-    (kernel, its SVD and the preblur convolution) is set up once per rank and reused for every k-point and band.
+    irreducible-BZ k-point in the band (:math:`H(\mathbf{k})`-eigen) basis. Every band-diagonal element is continued
+    with the positive entropy. Every band pair continues the Hermitian part :math:`(G_{12} + G_{21})/2` and the
+    anti-Hermitian part :math:`(G_{12} - G_{21})/(2i)` with the positive-negative entropy and the default model
+    :math:`\sqrt{A_{11} A_{22}}` (floored at :math:`10^{-6}` of its maximum): their real spectra are
+    :math:`\mathrm{Re}\, A_{12}` and :math:`\mathrm{Im}\, A_{12}`. A part whose data stay within the assumed noise at
+    every frequency (zero by a symmetry of the little group of :math:`\mathbf{k}`, or the anti-Hermitian part of a
+    symmetric :math:`G`) is zero without a fit, as is every pair of a band whose continuation failed. The k-points are
+    distributed across MPI ranks; failed continuations are set to zero. The continuation problems (kernel, its SVD and
+    the preblur convolution) are set up once per rank, one for the diagonal and one for the off-diagonal elements, and
+    reused for every k-point and band.
+
+    Rank 0 writes the band-resolved spectral function over the full BZ to ``spectral_function_<name>.npy`` and the
+    Hermitian spectral matrix, rotated back into the orbital basis, on the irreducible BZ to
+    ``spectral_function_matrix_<name>.npy`` (rows in the order of ``KGrid.irrk_ind``;
+    :meth:`TwoPoint.map_to_full_bz` unfolds it with the orbital rotations of the lattice symmetries). The
+    element-wise continuation does not enforce positive semidefiniteness, so the saved matrix keeps only the
+    non-negative eigenvalues per k-point and frequency, rescaled to the trace of the continued matrix (the
+    band-resolved sum), so the cut adds no spectral weight; the eigenvalue range before the cut is logged.
 
     :param giwk: The momentum-dependent :class:`GreensFunction` to continue, read on rank 0 only (``None`` elsewhere).
     :param name: Label of the continued quantity (e.g. ``"DGA"``), used in the log messages and, lowercased, in the
-        output file name ``spectral_function_<name>.npy``.
+        output file names ``spectral_function_<name>.npy`` and ``spectral_function_matrix_<name>.npy``.
     :param comm: The MPI communicator.
-    :return: The spectral function :math:`A(\mathbf{k}, \omega)` of shape ``[kx, ky, kz, n_bands, w]`` (full BZ on
-        rank 0), i.e. with a decompressed momentum dimension, like :func:`perform_maxent_dmft`.
+    :return: The band-resolved spectral function :math:`A(\mathbf{k}, \omega)` of shape ``[kx, ky, kz, n_bands, w]``
+        (full BZ on rank 0), i.e. with a decompressed momentum dimension, like :func:`perform_maxent_dmft`.
     """
     logger = config.logger
 
@@ -110,50 +180,62 @@ def perform_maxent_giwk(giwk: GreensFunction | None, name: str, comm: MPI.Comm):
     model /= np.trapezoid(model)
     stdev = np.array([0.0001 for _ in range(config.box.niv_core)])
 
-    spectral_function = np.zeros((len(mpi_dist.my_tasks), config.sys.n_bands, len(w)), dtype=np.float32)
+    n_bands, n_tasks = config.sys.n_bands, len(mpi_dist.my_tasks)
+    spectral_function = np.zeros((n_tasks, n_bands, len(w)), dtype=np.float32)
+    spectral_matrix = np.zeros((n_tasks, n_bands, n_bands, len(w)), dtype=np.complex64)
+    n_continued = np.zeros(n_tasks, dtype=int)
 
-    # One continuation problem per rank: kernel, SVD and preblur convolution are data independent, so only the
-    # Green's function data are swapped per (k, band). BLAS stays single threaded: the solver's matrices are small.
-    probl_maxent = None
+    # One continuation problem per rank and entropy: kernel, SVD and preblur convolution are data independent, so
+    # only the data (and the off-diagonal default model) change per fit. BLAS stays single threaded: small matrices.
+    probl_maxent = probl_offdiag = None
     with threadpool_limits(limits=1):
-        for band in range(config.sys.n_bands):
+        for band in range(n_bands):
             logger.info(f"Processing analytic continuation of band {band+1}.")
-            for k in range(g_irr_slice.shape[0]):
-                # Capture the vendored solver's stdout so its print() diagnostics go through the logger instead of
-                # leaking to the output; re-logged (prefixed) below whether the continuation succeeds or fails.
-                captured_output = io.StringIO()
-                try:
-                    with warnings.catch_warnings(), contextlib.redirect_stdout(captured_output):
-                        # Escalate numpy/scipy RuntimeWarnings (divide/invalid/overflow) to exceptions so a numerically
-                        # broken continuation falls through to the A(k, w) = 0 fallback below (own errors caught too).
-                        warnings.simplefilter("error", RuntimeWarning)
-                        # The alpha-fit curve_fit inside the solver harmlessly fails to estimate its covariance; mute.
-                        warnings.simplefilter("ignore", OptimizeWarning)
-                        if probl_maxent is None:
-                            probl_maxent = AnalyticContinuationProblem(
-                                im_axis=wn, re_axis=w, im_data=g_irr_slice[k, band, band], beta=config.sys.beta
-                            )
-                        else:
-                            probl_maxent.update_data(g_irr_slice[k, band, band])
-                        result = probl_maxent.solve(model=model, stdev=stdev)[0]
-                        spectral_function[k, band] = result.A_opt.astype(np.float32)
-
-                    del result
-                    gc.collect()
-                except Exception:
+            for k in range(n_tasks):
+                probl_maxent, spectrum = _continue(probl_maxent, g_irr_slice[k, band, band], wn, w, model, stdev)
+                if spectrum is None:
                     kpt = tuple(int(c) for c in irrq_list[mpi_dist.my_tasks[k]])
                     logger.info(
                         f"Failed to determine analytic continuation of k={kpt} (band {band + 1}), "
                         f"setting A(k={kpt}, w) = 0.0."
                     )
-                    spectral_function[k, band] = 0.0
-                finally:
-                    for message in captured_output.getvalue().splitlines():
-                        if message.strip():
-                            logger.info(f"ana_cont: {message}")
+                else:
+                    spectral_function[k, band] = spectrum
             mpi_dist.comm.barrier()
             logger.info(f"Completed analytic continuation of band {band+1}.")
+
+        bands = np.arange(n_bands)
+        spectral_matrix[:, bands, bands] = spectral_function
+        for b1, b2 in itertools.combinations(range(n_bands), 2):
+            logger.info(f"Processing analytic continuation of bands ({b1 + 1}, {b2 + 1}).")
+            for k in range(n_tasks):
+                a1, a2 = (np.clip(spectral_function[k, b], 0.0, None).astype(np.float64) for b in (b1, b2))
+                default_model = np.sqrt(a1 * a2)
+                if not default_model.any():
+                    continue
+                # the spline-blurred spectra touch zero (or dip a hair below) in their tails, where the
+                # positive-negative entropy still needs a positive model
+                default_model = np.maximum(default_model, 1e-6 * default_model.max())
+                g12, g21 = g_irr_slice[k, b1, b2], g_irr_slice[k, b2, b1]
+                for part, unit, data in (("real", 1.0, (g12 + g21) / 2), ("imaginary", 1j, (g12 - g21) / 2j)):
+                    if np.all(np.abs(data) <= stdev):
+                        continue
+                    probl_offdiag, spectrum = _continue(probl_offdiag, data, wn, w, default_model, stdev, offdiag=True)
+                    if spectrum is None:
+                        kpt = tuple(int(c) for c in irrq_list[mpi_dist.my_tasks[k]])
+                        logger.info(
+                            f"Failed to determine analytic continuation of the {part} part of bands "
+                            f"({b1 + 1}, {b2 + 1}) at k={kpt}, setting it to 0.0."
+                        )
+                    else:
+                        spectral_matrix[k, b1, b2] += unit * spectrum
+                        n_continued[k] += 1
+            spectral_matrix[:, b2, b1] = spectral_matrix[:, b1, b2].conj()
+            mpi_dist.comm.barrier()
+            logger.info(f"Completed analytic continuation of bands ({b1 + 1}, {b2 + 1}).")
     spectral_function = mpi_dist.gather(spectral_function)
+    spectral_matrix = mpi_dist.gather(spectral_matrix)
+    n_continued = mpi_dist.gather(n_continued)
     logger.info("Analytic continuation of Green's function finished.")
 
     if mpi_dist.comm.rank == 0:
@@ -165,6 +247,28 @@ def perform_maxent_giwk(giwk: GreensFunction | None, name: str, comm: MPI.Comm):
         # the file carries the label, so continuing several quantities in one run does not overwrite the earlier ones
         np.save(os.path.join(config.output.output_path, f"spectral_function_{name.lower()}.npy"), spectral_function)
         logger.info(f"Saved {name} spectral function for the full BZ to file.")
+
+        # back into the orbital basis with the U(k) of the forward rotation (the same H(k) rows, irrk_ind order)
+        hk_irr = hk.reshape(-1, n_bands, n_bands)[config.lattice.k_grid.irrk_ind]
+        orbital_to_band_basis(hk_irr, spectral_matrix, inverse=True)
+
+        # the element-wise continuation does not keep A(k, w) positive semidefinite: cut the negative eigenvalues and
+        # rescale the rest to the trace (the band-resolved sum), so no spectral weight is added
+        eigenvalues, vectors = np.linalg.eigh(np.moveaxis(spectral_matrix, -1, 1))
+        del spectral_matrix
+        kept = np.clip(eigenvalues, 0.0, None)
+        trace = np.clip(eigenvalues.sum(axis=-1), 0.0, None)
+        kept *= (trace / np.maximum(kept.sum(axis=-1), np.finfo(kept.dtype).tiny))[..., None]
+        spectral_matrix = np.einsum("kwai,kwi,kwbi->kabw", vectors, kept, vectors.conj())
+        np.save(
+            os.path.join(config.output.output_path, f"spectral_function_matrix_{name.lower()}.npy"), spectral_matrix
+        )
+        logger.info(
+            f"Saved {name} orbital spectral matrix for the irreducible BZ to file: {n_continued.sum()} of "
+            f"{n_continued.size * n_bands * (n_bands - 1)} off-diagonal band parts continued (the rest lie within the "
+            f"noise or failed), eigenvalues from {eigenvalues.min():.2e} to {eigenvalues.max():.2e} before the "
+            f"negative ones were cut and the rest rescaled to the trace."
+        )
 
     mpi_dist.delete_file()
     return spectral_function

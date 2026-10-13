@@ -470,7 +470,14 @@ through the ``ana_cont`` package.
 
 The flags ``do_spectrum_dga`` and ``do_spectrum_dmft`` toggle the continuation of the DΓA and DMFT
 Green's functions, respectively. The procedure yields the spectral function over a symmetric interval of ``w_count``
-real-frequency points. When ``plot_spectrum`` is enabled, the spectral function is plotted along the path given in
+real-frequency points, both band-resolved and as the full orbital matrix with its off-diagonal elements. The
+continuation runs in the eigenbasis of :math:`H(\mathbf{k})`, where the Green's function is closest to diagonal: the
+band off-diagonals are continued with a positive-negative entropy and the matrix is rotated back into the orbital
+basis. Off-diagonal parts whose Matsubara data stay within the assumed noise, such as those a symmetry forces to
+zero, are set to zero without a fit. As the elements are continued one by one, the matrix can come out with negative
+eigenvalues; per momentum and frequency these are cut and the rest rescaled to the band-resolved trace, so no
+spectral weight is added, and the log reports the eigenvalue range before the cut. When
+``plot_spectrum`` is enabled, the spectral function is plotted along the path given in
 ``k_path``, a list of tuples whose first three elements are the coordinates of a high-symmetry point in the
 primitive reciprocal lattice and whose fourth element is its label (the example above is truncated relative to the
 default path). The ``energy_window`` parameter sets the bounds of the frequency axis in the resulting spectral
