@@ -33,8 +33,10 @@ from dgamore.sigma_jacobian import (
     _F_DC,
     _INVERSE_ORDER,
     ExactJacobian,
+    _block_extension,
     _merge_modes,
     _squared_box_sum,
+    _thick_restart,
     certify_subspace,
     leading_eigenpairs,
     sector_projector,
@@ -560,7 +562,8 @@ def test_exact_jacobian_acts_on_the_sector_the_loop_reaches(monkeypatch):
     assert np.allclose(jac.project(jy), jy, atol=1e-12 * np.abs(jy).max())
 
 
-def test_leading_eigenpairs_reports_only_modes_of_the_projected_sector(quiet_logger):
+@pytest.mark.parametrize("block", [1, 2])
+def test_leading_eigenpairs_reports_only_modes_of_the_projected_sector(quiet_logger, block):
     """Eigenpairs outside the projected sector never reach the result, although theta = 0 there tops a negative bulk."""
     rng = np.random.default_rng(2)
     inner = np.diag(np.concatenate(([2.0, -3.0], rng.uniform(-0.9, -0.4, 26))))
@@ -571,9 +574,13 @@ def test_leading_eigenpairs_reports_only_modes_of_the_projected_sector(quiet_log
     keep = np.arange(40) < 28
     comm = conftest.create_comm_mock()
     operator = types.SimpleNamespace(
-        n_real=40, matvec=lambda y: keep * (a @ (keep * y)), expand=lambda y: y, project=lambda y: keep * y
+        n_real=40,
+        matvec=lambda y: keep * (a @ (keep * y)),
+        matvec_block=lambda ys: keep[:, None] * (a @ (keep[:, None] * ys)),
+        expand=lambda y: y,
+        project=lambda y: keep * y,
     )
-    lam_pi, _, u = leading_eigenpairs(operator, comm)
+    lam_pi, _, u = leading_eigenpairs(operator, comm, block=block)
     assert np.allclose(u[~keep], 0.0, atol=1e-12)
     assert not np.any(np.isclose(lam_pi, 1.0, atol=1e-6))
     assert np.min(np.abs(lam_pi - (1.0 - 2.0))) < 1e-6
@@ -693,6 +700,104 @@ def test_leading_eigenpairs_keeps_the_converged_pairs_of_a_target_that_gives_up(
     assert lam_pi.size >= 2 and comm.bcast.call_args_list[-1].args[0] is False
 
 
+@pytest.mark.parametrize("block", [2, 4])
+def test_leading_eigenpairs_block_search_serves_every_rank_and_finds_both_targets(quiet_logger, block):
+    """Every rank serves each product of at most block columns, and rank 0 gets the leading and the stiff pairs."""
+    a = _normal_matrix(40, seed=1)
+    operators = {}
+
+    def fn(comm, rank):
+        operators[rank] = _make_matrix_operator(a, comm)
+        return leading_eigenpairs(operators[rank], comm, block=block)
+
+    _, results = conftest.run_parallel(2, fn)
+
+    widths = [c.args[0].shape[1] for c in operators[0].matvec_block.call_args_list]
+    assert results[1] is None and operators[0].matvec.call_count == operators[1].matvec.call_count == 0
+    assert operators[1].matvec_block.call_count == len(widths) > 0 and max(widths) <= block
+    lam_pi, res, u = results[0]
+    expected = 1.0 - np.array([2.0, 1.2 + 0.4j, 1.2 - 0.4j, -3.0])
+    assert np.allclose([np.min(np.abs(lam_pi - value)) for value in expected], 0.0, atol=1e-4)
+    assert np.all(np.diff(lam_pi.real) >= 0) and np.allclose(np.linalg.norm(u, axis=0), 1.0, atol=1e-12)
+    assert np.all(np.linalg.norm(a @ u - u * (1.0 - lam_pi), axis=0) <= res)
+
+
+def test_leading_eigenpairs_block_search_starts_with_the_given_directions_as_columns(quiet_logger):
+    """The first block spans the least-stable and the stiff direction beside the shared random start vector."""
+    comm = conftest.create_comm_mock()
+    a = _normal_matrix(100, seed=3)
+    theta, vectors = np.linalg.eig(a)
+    lead, stiff = (vectors[:, np.argmax(f(theta))].real for f in (np.real, np.abs))
+    operator, blocks = _make_matrix_operator(a, comm), []
+    product = operator.matvec_block.side_effect
+    operator.matvec_block.side_effect = lambda ys: blocks.append(np.array(ys)) or product(ys)
+    lam_pi, _, _ = leading_eigenpairs(operator, comm, lead, stiff, block=4)
+    first = blocks[0]
+    assert first.shape[1] == 4 and np.allclose(first.T @ first, np.eye(4), atol=1e-12)
+    assert all(np.linalg.norm(first.T @ v) > (1 - 1e-12) * np.linalg.norm(v) for v in (lead, stiff))
+    assert np.min(np.abs(lam_pi - (1.0 - 2.0))) < 1e-6 and np.min(np.abs(lam_pi - 4.0)) < 1e-6
+
+
+def test_leading_eigenpairs_block_search_keeps_its_converged_pairs_when_the_passes_run_out(monkeypatch):
+    """A block search out of passes warns, returns only its converged pairs and releases the serving ranks."""
+    logger = MagicMock()
+    monkeypatch.setattr(config, "logger", logger, raising=False)
+    monkeypatch.setattr("dgamore.sigma_jacobian._MAX_MATVECS", 8)
+    comm = conftest.create_comm_mock()
+    a = _normal_matrix(200, seed=3)
+    lam_pi, res, u = leading_eigenpairs(_make_matrix_operator(a, comm), comm, block=2)
+    assert any("the block search converged" in str(c.args[0]) for c in logger.warning.call_args_list)
+    assert lam_pi.size > 0 and np.all(np.linalg.norm(a @ u - u * (1.0 - lam_pi), axis=0) <= res)
+    assert comm.bcast.call_args_list[-1].args[0] is False
+
+
+def test_leading_eigenpairs_block_search_stays_inside_rank_0s_modeled_eigensolver_vectors(monkeypatch):
+    """Rank 0's traced peak of a block search of four columns stays inside the estimator's float64 sector vectors."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    monkeypatch.setattr("dgamore.sigma_jacobian._SWEEP_ROWS", 2048)
+    n, rng = 50_000, np.random.default_rng(0)
+    diagonal = np.concatenate(([2.0, -3.0, 1.5], rng.uniform(-0.3, 0.3, n - 3)))[:, None]
+    low = rng.standard_normal((2, n, 3)) / np.sqrt(n)
+    operator = types.SimpleNamespace(
+        n_real=n, matvec_block=lambda ys: diagonal * ys + low[0] @ (low[1].T @ ys), project=lambda y: y.copy()
+    )
+    starts = rng.standard_normal((2, n))
+    tracemalloc.start()
+    lam_pi, _, _ = leading_eigenpairs(operator, conftest.create_comm_mock(), *starts, block=4)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    modeled = 2 * (memory_estimator.EXACT_JACOBIAN_NCV + 1) + 3 * memory_estimator.EXACT_JACOBIAN_MODES + 11
+    assert lam_pi.size > 0 and peak <= modeled * 8 * n
+
+
+def test_block_extension_redoes_a_cancelling_column_against_the_whole_basis():
+    """A block column nearly parallel to the one before it keeps the basis orthonormal to rounding."""
+    rng = np.random.default_rng(4)
+    basis = np.empty((500, 12), order="F")
+    basis[:, :8] = np.linalg.qr(rng.standard_normal((500, 8)))[0]
+    fresh = rng.standard_normal(500)
+    near = fresh + 1e-7 * rng.standard_normal(500) + 1e-3 * basis[:, :8] @ rng.standard_normal(8)
+    block = np.asfortranarray(np.column_stack([fresh, near]))
+    size = _block_extension(basis, 8, block, np.linalg.norm(block, axis=0))
+    assert size == 10 and np.allclose(basis[:, :size].T @ basis[:, :size], np.eye(size), rtol=0, atol=1e-13)
+
+
+def test_thick_restart_keeps_the_leading_ritz_values_with_the_images_and_the_map_of_the_kept_basis():
+    """The compacted basis holds the 2k leading Ritz values of both targets, J times it and its projected map."""
+    a = _normal_matrix(60, seed=5)
+    basis = np.asfortranarray(np.linalg.qr(np.random.default_rng(6).standard_normal((60, 30)))[0])
+    images = np.asfortranarray(a @ basis)
+    h = basis.T @ images
+    theta = np.linalg.eigvals(h)
+    kept = _thick_restart(basis, images, h, 30, theta, 3)
+    leading = [*np.argsort(-theta.real)[:6], *np.argsort(-np.abs(theta))[:6]]
+    kept_theta = np.linalg.eigvals(h[:kept, :kept])
+    assert kept < 30 and all(np.min(np.abs(kept_theta - theta[i])) < 1e-10 for i in leading)
+    q, w = basis[:, :kept], images[:, :kept]
+    assert np.allclose(q.T @ q, np.eye(kept), rtol=0, atol=1e-12) and np.allclose(w, a @ q, rtol=0, atol=1e-12)
+    assert np.allclose(q.T @ w, h[:kept, :kept], rtol=0, atol=1e-12)
+
+
 def test_merge_modes_keeps_both_partners_of_a_degenerate_value():
     """Two eigenpairs of one value with orthogonal vectors are two modes; a repeated pair is one."""
     theta = np.array([2.0 + 0j, 2.0 + 0j, 2.0 + 0j])
@@ -755,14 +860,19 @@ def test_exact_product_allocates_between_half_and_all_of_the_estimated_per_rank_
     assert 0.5 * bp.off_distributed < peak <= bp.off_distributed
 
 
+@pytest.mark.parametrize("block", [1, 3])
 @pytest.mark.parametrize("dtype, tol", [(np.complex64, 100 * np.finfo(np.float32).eps), (np.complex128, 1e-10)])
-def test_leading_eigenpairs_bounds_the_residual_by_the_tolerance_of_the_storage_precision(dtype, tol, monkeypatch):
+def test_leading_eigenpairs_bounds_the_residual_by_the_tolerance_of_the_storage_precision(
+    dtype, tol, block, monkeypatch
+):
     """The residual bound of every pair is max(100 eps, 1e-10) max(1, |theta|), eps of the storage precision."""
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
     monkeypatch.setattr(npb, "DTYPE", dtype)
     comm = conftest.create_comm_mock()
-    lam_pi, res, _ = leading_eigenpairs(_make_matrix_operator(_normal_matrix(40, seed=1), comm), comm)
+    a = _normal_matrix(40, seed=1)
+    lam_pi, res, u = leading_eigenpairs(_make_matrix_operator(a, comm), comm, block=block)
     assert np.allclose(res, tol * np.maximum(1.0, np.abs(1.0 - lam_pi)), atol=1e-20)
+    assert np.all(np.linalg.norm(a @ u - u * (1.0 - lam_pi), axis=0) <= res)
 
 
 def _sector_grid(auto: bool) -> bz.KGrid:
@@ -1125,13 +1235,14 @@ def test_exact_jacobian_keeps_the_reference_operators_eigenpairs_within_twice_th
 
 
 @pytest.mark.slow
-def test_exact_jacobian_leading_eigenpairs_are_the_reference_operators(loop_state, monkeypatch):
-    """ARPACK on the windowed operator finds the reference operator's leading eigenvalues to its tolerance."""
+@pytest.mark.parametrize("block", [1, 4])
+def test_exact_jacobian_leading_eigenpairs_are_the_reference_operators(loop_state, monkeypatch, block):
+    """ARPACK and the block search on the windowed operator find the reference's leading eigenvalues to tolerance."""
     reference = np.load(_REFERENCE)
     base, mu0 = _reference_start(loop_state, reference, "fixture")
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
     jac = _jacobian(loop_state, base, mu0, memory_estimator.ChunkBudgets(exact_window=4, exact_vrg_per_window=True))
-    lam_pi, res, _ = leading_eigenpairs(jac, loop_state.comm)
+    lam_pi, res, _ = leading_eigenpairs(jac, loop_state.comm, block=block)
     jac.free()
     expected = reference["fixture_c128_lam_pi"]
     assert lam_pi.size == expected.size and np.allclose(lam_pi, expected, rtol=0, atol=10 * res.max())

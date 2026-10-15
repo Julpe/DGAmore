@@ -31,7 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.linalg import qr, schur, solve_sylvester, solve_triangular
+from scipy.linalg import orth, qr, schur, solve_sylvester, solve_triangular
 from scipy.linalg.lapack import dtrsen
 
 from dgamore.local_n_point import _flush_and_drop
@@ -41,7 +41,8 @@ _DAMPING_C = 0.5  # safety factor c in (0, 1) of the damping bound, at the verte
 _MIXING_FLOOR = 0.01  # the effective damping is never lowered below this
 _RITZ_GATE = 3e-2  # Ritz residual gate, relative to max(1, |theta|)
 _FLIP_PERSIST = 1  # updates carrying a certified unstable mode before the flip is acted on
-_PERSIST = 3  # updates of the calm and growth releases, and of the hold a growth release leaves behind
+_PERSIST = 3  # updates of the calm and (at least) the growth release, and of the hold a growth release leaves behind
+_MAX_GROWTH_PATIENCE = 64  # most consecutive residual growths a held flipped pair defers the growth release to
 _MIN_PAIRS = 3  # fewer pairs than this carry no estimate
 _SUBSPACE_ANGLE = 0.1  # rad; largest principal angle above which the flipped basis is replaced
 _COLLINEAR_CUTOFF = 1e-8  # relative cutoff below which a secant column counts as collinear
@@ -1033,8 +1034,8 @@ class JacobianTracker:
             window's entries in their order, ``None`` for the inverse of :func:`to_vec` onto a flat array.
         :param exact_checks: Whether the caller runs the exact checks the tracker requests (see
             :meth:`exact_check_request`); without them no request is formed, no start column is kept and a secant
-            value past ``_POLE_MODULUS`` flips only on a pole jump, a prediction or once reproduced (see
-            :meth:`update_recorded`).
+            value past ``_POLE_MODULUS`` flips only on a pole jump, a prediction, once reproduced or while the installed
+            reflector holds it (see :meth:`update_recorded`).
         """
         self._to_sector = to_vec if to_sector is None else to_sector
         self._from_sector = (lambda vector: to_mat(vector, (-1,))) if from_sector is None else from_sector
@@ -1064,7 +1065,8 @@ class JacobianTracker:
         self._frozen_run = 0  # consecutive frozen updates since the last informative one (see _note_frozen)
         self._last_certified = None  # (lam_pi, res, gated, flip, u, predicted) of the last update that certified a mode
         self._snapshot_kind = None  # what made that snapshot: "estimate", "carried" or "exact"
-        self._held_flips = None  # (lam_pi, res, u, predicted) of reflected flips the current snapshot lacks
+        self._held_flips = None  # (lam_pi, res, u, predicted, again) of reflected flips the current snapshot lacks
+        self._again = None  # which flips of the snapshot match a reflected flip, i.e. were certified a second time
         # (lam_pi, res, u, first, last) of the modes whose bound set p_eff and the updates that certified them first
         # and last; u is None for values carried from a predecessor
         self._binding = None
@@ -1129,7 +1131,7 @@ class JacobianTracker:
             flip, u, predicted = flip[gated].astype(bool), u[:, gated], predicted[gated].astype(bool)
             if self._held_flips is not None:
                 held = self._held_flipped(self._held_flips[2])
-                lam_h, res_h, u_h, predicted_h = (part[..., held] for part in self._held_flips)
+                lam_h, res_h, u_h, predicted_h = (part[..., held] for part in self._held_flips[:4])
                 lam_pi, res, u = np.concatenate([lam_pi, lam_h]), np.concatenate([res, res_h]), np.hstack([u, u_h])
                 flip = np.concatenate([flip, np.ones(lam_h.size, dtype=bool)])
                 predicted = np.concatenate([predicted, predicted_h])
@@ -1290,14 +1292,14 @@ class JacobianTracker:
         self._replace_snapshot((lam_pi, res, certified, flip, u, np.zeros(lam_pi.size, dtype=bool)), "exact")
         return switched
 
-    def _reflected_flips(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    def _reflected_flips(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
         r"""
         Collects the certified flipped modes of the snapshot together with the ones kept beside it (see
         :meth:`_replace_snapshot`) that the installed reflector holds (see :meth:`_held_flipped`).
 
         :return: Their eigenvalues :math:`\lambda_\Pi`, error bounds, Ritz vectors as columns (in the precision of
-            :meth:`_stored`, also for a snapshot carried from a file of higher precision) and prediction flags;
-            ``None`` without a reflector or without such a mode.
+            :meth:`_stored`, also for a snapshot carried from a file of higher precision), prediction flags and
+            whether each was certified as a flip a second time; ``None`` without a reflector or without such a mode.
         """
         if self.q is None:
             return None
@@ -1305,19 +1307,52 @@ class JacobianTracker:
         if self._last_certified is not None:
             lam_pi, res, gated, flip, u, predicted = self._last_certified
             take = gated & flip
-            parts.append((lam_pi[take], res[take], u[:, take], predicted[take]))
+            parts.append((lam_pi[take], res[take], u[:, take], predicted[take], self._again[take]))
         if not parts:
             return None
-        lam_pi, res, u, predicted = (np.concatenate(group, axis=-1) for group in zip(*parts))
+        lam_pi, res, u, predicted, again = (np.concatenate(group, axis=-1) for group in zip(*parts))
         held = self._held_flipped(u)
-        return (lam_pi[held], res[held], self._stored(u[:, held]), predicted[held]) if held.any() else None
+        if not held.any():
+            return None
+        return lam_pi[held], res[held], self._stored(u[:, held]), predicted[held], again[held]
+
+    def _with_held_flips(
+        self, reflector: tuple[np.ndarray, np.ndarray], lam_pi: np.ndarray, u: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        r"""
+        Extends the reflector of an estimate's flips by the reflected flips certified as flips a second time (see
+        :meth:`_reflected_flips`) that no certified mode of the estimate matches (:func:`_match_modes`) and whose
+        cosine with the new flipped span is at most ``_FLIP_OVERLAP``: a flipped direction that has contracted out of
+        the secant window keeps its reflection until an estimate certifies it again and decides its flip anew, while
+        one certified on a single update, possibly by one inconsistent secant window, is dropped. The extended
+        reflector is the orthogonal reflection :math:`\mathbb{1} - 2 Q Q^{T}` of the new flipped span together with
+        the real columns of the kept flips (see :func:`_real_columns`).
+
+        :param reflector: The orthonormal basis and the dual rows of the reflector of the estimate's flips.
+        :param lam_pi: The certified eigenvalues :math:`\lambda_\Pi` of the estimate.
+        :param u: Their Ritz vectors as columns.
+        :return: The orthonormal basis of the union, directions below ``1 / _COND_CAP`` of its largest singular value
+            dropped, and its transpose; ``reflector`` itself when no flip is kept.
+        """
+        held = self._reflected_flips()
+        if held is None:
+            return reflector
+        lam_h, _, u_h, _, again = held
+        u_c = np.asarray(u_h, dtype=np.complex128)
+        inside = np.linalg.norm(reflector[0].T @ u_c, axis=0) > _FLIP_OVERLAP * np.linalg.norm(u_c, axis=0)
+        columns = _real_columns(1.0 - lam_h, u_h, again & (_match_modes(lam_h, u_h, lam_pi, u) < 0) & ~inside)[0]
+        if not columns.shape[1]:
+            return reflector
+        q_mat = np.ascontiguousarray(orth(np.hstack([reflector[0], columns]), rcond=1.0 / _COND_CAP))
+        return q_mat, q_mat.T
 
     def _replace_snapshot(self, snapshot: tuple, kind: str) -> None:
         """
         Makes ``snapshot`` the one :meth:`spectrum_state` writes, and keeps beside it the certified flips the
         installed reflector holds (:meth:`_reflected_flips`, read before the replacement) that the new snapshot does
         not match (:func:`_match_modes`), with the value, error bound, vector and prediction flag of the snapshot that
-        certified them, since a flipped direction contracts out of the secant window.
+        certified them, since a flipped direction contracts out of the secant window. A flip of the new snapshot that
+        matches one of those reflected flips is marked as certified a second time.
 
         :param snapshot: The ``(lam_pi, res, gated, flip, u, predicted)`` of the new snapshot.
         :param kind: What made it, ``"estimate"``, ``"carried"`` or ``"exact"``.
@@ -1325,12 +1360,14 @@ class JacobianTracker:
         """
         held = self._reflected_flips()
         self._last_certified, self._snapshot_kind, self._held_flips = snapshot, kind, None
+        lam_pi, _, gated, flip, u, _ = snapshot
+        self._again = np.zeros(lam_pi.size, dtype=bool)
         if held is None:
             return
-        lam_pi, _, gated, _, u, _ = snapshot
+        self._again[gated] = flip[gated] & (_match_modes(lam_pi[gated], u[:, gated], held[0], held[2]) >= 0)
         new = _match_modes(held[0], held[2], lam_pi[gated], u[:, gated]) < 0
         if new.any():
-            self._held_flips = (held[0][new], held[1][new], held[2][:, new], held[3][new])
+            self._held_flips = tuple(part[..., new] for part in held)
 
     def _switched(self, q_before: np.ndarray | None) -> bool:
         """
@@ -1614,22 +1651,25 @@ class JacobianTracker:
         the dominant mode. Each Ritz value is certified by its residual and read with its error bound, the residual
         times its condition number (see :func:`_ritz_from_increments`). A certified unstable mode on
         ``_FLIP_PERSIST`` consecutive updates, or one whose chained estimates predict a crossing or show a pole jump
-        (see :meth:`_predict`), installs the reflector of :meth:`_flipped_reflector`; it replaces a carried set and
+        (see :meth:`_predict`), installs the reflector of :meth:`_flipped_reflector`, extended by the reflected flips
+        certified twice that the estimate no longer sees (see :meth:`_with_held_flips`); it replaces a carried set and
         extends an exact-check set (see :func:`_extended_set`). The per-direction map is rebuilt on every certifying
         update and left in force by one that certifies nothing; a flipped mode enters it with the reversed sign only
         once a reflector holds it and stays out of it until then, and a mode of undecidable negative sign takes the
         damping of the damped step. A reflector, the tracker's own or a carried one, is released with its map once a
         certified STABLE mode lies inside it on ``_PERSIST`` consecutive updates without a flip candidate. Everything
-        installed is released once the raw residual grows on ``_PERSIST`` consecutive updates, which outranks an
-        install on that update, holds the estimate's map and new reflectors off for ``_PERSIST`` informative updates
-        and, where a reflector was released, clears the persistence streak. A pending carried set is installed on the
+        installed is released once the raw residual grows on ``_PERSIST`` consecutive updates, on more while the
+        reflector holds a flipped complex pair (see :meth:`_growth_patience`), which outranks an install on that
+        update, holds the estimate's map and new reflectors off for ``_PERSIST`` informative updates and, where a
+        reflector was released, clears the persistence streak. A pending carried set is installed on the
         first update that allows flips while nothing is installed, and the columns of an exact carried set become a
         check request there (see :meth:`carry_in`). A certifying update with flips allowed becomes the snapshot of
         :meth:`_replace_snapshot`, and every informative update notes its least-stable mode for an exact check (see
         :meth:`_note_check_candidate`). The damping bound of the certified spectrum lowers :attr:`p_eff` once a second
         certification confirms it (see :meth:`_lower_reproduced`). Without exact checks a certified value past
-        ``_POLE_MODULUS`` is no flip unless it shows a pole jump or is reproduced (see :meth:`_reproduced`): it binds
-        the damping and, like a mode of undecidable sign, takes the damping of the damped step in the map.
+        ``_POLE_MODULUS`` is no flip unless it shows a pole jump, is reproduced (see :meth:`_reproduced`) or lies in the
+        installed reflector (see :meth:`_held_flipped`): it binds the damping and, like a mode of undecidable sign,
+        takes the damping of the damped step in the map.
 
         :param entries: The recorded pairs (see :meth:`record`), oldest first; the newest ``TRACKER_PAIRS`` are read.
         :param allow_flip: Whether the measured spectrum may be acted on. Without it the spectrum is still measured
@@ -1699,10 +1739,10 @@ class JacobianTracker:
         flip, p_new = classify(self.last_lam_pi, self.last_gated, self.p_config, res)
         predicted, jump = self._predict(self.last_lam_pi, res, u, gated, allow_flip)
         if not self._exact_checks:
-            # a secant value past the pole modulus spans a near-singular map: it flips on a pole jump, a prediction or
-            # once a secant window without a common increment reproduces it
+            # a secant value past the pole modulus spans a near-singular map: it flips on a pole jump, a prediction,
+            # once a secant window without a common increment reproduces it, or while the installed reflector holds it
             past = np.abs(self.last_lam_pi) > _POLE_MODULUS
-            flip &= ~past | jump | self._reproduced(self.last_lam_pi, res, flip & past)
+            flip &= ~past | jump | self._reproduced(self.last_lam_pi, res, flip & past) | self._held_flipped(u)
         flip = flip | predicted
         self._predicted = predicted
         forced = bool(predicted.any() or jump.any())
@@ -1735,9 +1775,11 @@ class JacobianTracker:
             # a set installed on this update restarts the growth count, as the tracker's own install below does
             grew = self.active and not installed and residual_norm > self._last_residual_norm
             self._grow = self._grow + 1 if grew else 0
-            if self.active and (self._grow >= _PERSIST or self._calm >= _PERSIST):
+            # the patience is never below _PERSIST, so it is read only once the count reaches that
+            grown = self._grow >= _PERSIST and self._grow >= self._growth_patience()
+            if self.active and (grown or self._calm >= _PERSIST):
                 event = event or self.q is not None
-                if self._grow >= _PERSIST:
+                if grown:
                     what = "tracked basis" if event else "per-direction damping"
                     released = f"residual grew on consecutive updates, {what} released"
                     # a growth release outranks a persisting flip, so a re-install needs _PERSIST fresh certifications
@@ -1765,6 +1807,8 @@ class JacobianTracker:
                     )
                 else:
                     reflected = True
+                    # a reflected flip certified twice that the estimate no longer sees keeps its reflection
+                    reflector = self._with_held_flips(reflector, self.last_lam_pi[gated], u[:, gated])
                     if self._carried_set is not None or self._switched(reflector[0]):
                         self.q, self.w = reflector
                         self._carried_set = None
@@ -2201,6 +2245,29 @@ class JacobianTracker:
             return np.zeros(u.shape[1], dtype=bool)
         u = np.asarray(u, dtype=np.complex128)
         return np.linalg.norm(self.q.T @ u, axis=0) / np.linalg.norm(u, axis=0) > _FLIP_OVERLAP
+
+    def _growth_patience(self) -> int:
+        r"""
+        Returns the number of consecutive residual growths that release what is installed. A flipped conjugate pair
+        damped with its own :math:`p_\alpha` (see :func:`_direction_damping`) steps with
+        :math:`z = 1 + p_\alpha \lambda_\Pi`, which contracts and turns by :math:`\arg z` per step,
+        :math:`\arctan(|\mathrm{Re}\,\lambda_\Pi| / |\mathrm{Im}\,\lambda_\Pi|)` where :math:`p_\alpha < 1`. On
+        non-normal eigenvectors that rotation can raise the residual for a quarter turn, on at most
+        :math:`\lceil (\pi/2) / \arg z \rceil` consecutive steps. While the installed reflector holds certified
+        flipped pairs whose real part lies below ``-_MARGIN`` (see :meth:`_reflected_flips`), the count is therefore
+        one more than that number for the slowest of them, at least ``_PERSIST`` and at most
+        ``_MAX_GROWTH_PATIENCE``; otherwise it is ``_PERSIST``.
+
+        :return: The number of consecutive residual growths that release.
+        """
+        held = self._reflected_flips()
+        lam_pi = np.zeros(0, dtype=np.complex128) if held is None else held[0]
+        rotating = (np.abs(lam_pi.imag) > _REAL_CUTOFF * np.maximum(1.0, np.abs(lam_pi))) & (lam_pi.real < -_MARGIN)
+        if not rotating.any():
+            return _PERSIST
+        lam_pi = lam_pi[rotating]
+        turn = np.abs(np.angle(1.0 - _direction_damping(lam_pi, np.ones(lam_pi.size, dtype=bool)) * lam_pi))
+        return max(_PERSIST, int(min(_MAX_GROWTH_PATIENCE, np.ceil(0.5 * np.pi / turn.min()) + 1)))
 
     def _certified_damping(self) -> tuple[np.ndarray, np.ndarray]:
         r"""

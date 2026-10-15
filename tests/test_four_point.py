@@ -15,6 +15,7 @@ import scipy as sp
 
 import dgamore.config as config
 import dgamore.four_point as four_point
+import dgamore.memory_estimator as memory_estimator
 import dgamore.n_point_base as npb
 from dgamore import brillouin_zone as bz
 from dgamore import nonlocal_sde
@@ -1325,6 +1326,171 @@ def test_invert_with_local_kernel_and_sum_holds_two_compound_slices_beyond_its_o
     peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
     assert 2 * slice_bytes < peak - out.mat.nbytes < 2.5 * slice_bytes
+
+
+_LAYER_SWAP = np.array([2, 3, 0, 1])
+
+
+def _layer_swap_inputs(rng, niv, two_atoms=True, noise=0.0, nq=2, nw=2):
+    """(kernel, frequency-diagonal part, shift, inactive pairs) of two layers of two bands, whose slices obey the layer
+    swap M_1234^vv' = M_pi4pi3pi2pi1^v'v but are not complex-symmetric; noise times eps32 breaks the swap."""
+    o, vn = 4, 2 * niv
+
+    def swap(a, axes):
+        """``a`` with its orbital axes ``axes`` relabeled by the layer swap."""
+        for ax in axes:
+            a = np.take(a, _LAYER_SWAP, axis=ax)
+        return a
+
+    gamma = rng.standard_normal((o,) * 4 + (nw, vn, vn)) + 1j * rng.standard_normal((o,) * 4 + (nw, vn, vn))
+    gamma = 0.5 * (gamma + gamma.transpose(3, 2, 1, 0, 4, 6, 5))
+    gamma = 0.5 * (gamma + swap(gamma, range(4)))
+    chi0_inv = rng.standard_normal((nq,) + (o,) * 4 + (nw, vn)) + 1j * rng.standard_normal((nq,) + (o,) * 4 + (nw, vn))
+    chi0_inv = 0.5 * (chi0_inv + swap(chi0_inv, range(1, 5)).transpose(0, 4, 3, 2, 1, 5, 6))
+    for a in range(o):
+        for b in range(o):
+            chi0_inv[:, a, b, b, a] += 30.0
+    u = rng.standard_normal((o,) * 4)
+    u = sum(u.transpose(p) for p in itertools.permutations(range(4))) / 24
+    u = 0.5 * (u + swap(u, range(4)))
+    if two_atoms:
+        atom = np.arange(o) // 2
+        same = atom[:, None, None, None] == atom[None, :, None, None]
+        per_atom = same & same.transpose(0, 2, 1, 3) & same.transpose(0, 2, 3, 1)
+        gamma[~per_atom], u[~per_atom] = 0.0, 0.0
+    chi0_inv *= 1.0 + noise * np.finfo(np.float32).eps * rng.standard_normal(chi0_inv.shape)
+    gamma_r = LocalFourPoint(gamma, SpinChannel.DENS, 1, 2, False, True)
+    u_r = LocalInteraction(u, SpinChannel.DENS)
+    chi0 = FourPoint(chi0_inv, SpinChannel.NONE, (nq, 1, 1), 1, 1, False, True, True)
+    return gamma_r, chi0, u_r, gamma_r.orbital_pairs_without_vertex(u_r)
+
+
+def _spy_refined_solves(monkeypatch) -> list[int]:
+    """Records every slice that takes the permuted factorization."""
+    calls, real = [], four_point._refined_solve
+    monkeypatch.setattr(four_point, "_refined_solve", lambda *a: calls.append(1) or real(*a))
+    return calls
+
+
+@pytest.mark.parametrize("noise", [0.0, 8.0])
+def test_invert_with_local_kernel_and_sum_solves_layer_swapped_slices_with_the_permuted_factorization(
+    rng, monkeypatch, noise
+):
+    """Slices symmetric only up to the layer swap (or eps32 noise) take ?sytrf on M P and solve to the c64 floor."""
+    monkeypatch.setattr(four_point, "_PERMUTED_ROWS_PER_PAIR", 0)
+    beta = config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _layer_swap_inputs(rng, 4, noise=noise)
+    flags, permuted = _spy_factorizations(monkeypatch), _spy_refined_solves(monkeypatch)
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(
+        gamma, u_r, 1.0 / beta**2, beta, inactive, orbital_involution=_LAYER_SWAP
+    )
+    taken = (len(permuted), len(flags))
+    assembled = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r)
+    monkeypatch.setattr(npb, "DTYPE", np.complex128)
+    assembled.mat = assembled.mat  # the same complex64 slices, solved in complex128
+    ref = assembled.invert_and_sum_over_last_vn_v2(beta, inactive).mat
+    assert inactive.size == 8 and taken == (4, 0) and out.mat.dtype == np.complex64
+    assert np.allclose(out.mat, ref, rtol=0, atol=ten_times_the_floor(ref, np.complex64))
+
+
+def test_invert_with_local_kernel_and_sum_falls_back_to_the_lu_bits_when_a_refinement_does_not_converge(
+    rng, monkeypatch
+):
+    """A permuted slice whose refinement stops short is refilled and solved with the LU, bit for bit."""
+    monkeypatch.setattr(four_point, "_PERMUTED_ROWS_PER_PAIR", 0)
+    monkeypatch.setattr(four_point, "_REFINEMENT_CORRECTIONS", 0)
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _layer_swap_inputs(rng, 4, noise=8.0)
+    ref = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / 64.0, 8.0, inactive)
+    permuted = _spy_refined_solves(monkeypatch)
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(
+        gamma, u_r, 1.0 / 64.0, 8.0, inactive, orbital_involution=_LAYER_SWAP
+    )
+    assert len(permuted) == 4 and np.array_equal(out.mat, ref.mat)
+
+
+@pytest.mark.parametrize("o, two_atoms", [(2, False), (4, True)])
+def test_invert_with_local_kernel_and_sum_keeps_the_bits_of_slices_an_involution_does_not_make_symmetric(
+    rng, monkeypatch, o, two_atoms
+):
+    """Symmetric slices keep ?sytrf on M and slices far from the swapped symmetry the LU, both bit for bit."""
+    monkeypatch.setattr(four_point, "_PERMUTED_ROWS_PER_PAIR", 0)
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, o, two_atoms=two_atoms)
+    ref = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / 64.0, 8.0, inactive)
+    flags, permuted = _spy_factorizations(monkeypatch), _spy_refined_solves(monkeypatch)
+    involution = _LAYER_SWAP if o == 4 else np.array([1, 0])
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(
+        gamma, u_r, 1.0 / 64.0, 8.0, inactive, orbital_involution=involution
+    )
+    assert set(flags) == {True, False} and permuted == [] and np.array_equal(out.mat, ref.mat)
+
+
+@pytest.mark.parametrize("case", ["small", "complex128", "eliminated"])
+def test_invert_with_local_kernel_and_sum_ignores_the_involution_on_small_complex128_or_pair_mixing_slices(
+    rng, monkeypatch, case
+):
+    """Below the size gate, in complex128, or mapping a solved pair onto an eliminated one, no bit changes."""
+    if case != "small":
+        monkeypatch.setattr(four_point, "_PERMUTED_ROWS_PER_PAIR", 0)
+    if case == "complex128":
+        monkeypatch.setattr(npb, "DTYPE", np.complex128)
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _layer_swap_inputs(rng, 4)
+    involution = np.array([2, 1, 0, 3]) if case == "eliminated" else _LAYER_SWAP
+    ref = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / 64.0, 8.0, inactive)
+    permuted = _spy_refined_solves(monkeypatch)
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(
+        gamma, u_r, 1.0 / 64.0, 8.0, inactive, orbital_involution=involution
+    )
+    assert permuted == [] and np.array_equal(out.mat, ref.mat)
+
+
+def test_refined_solve_reaches_a_stable_backward_error_the_permuted_factorization_alone_misses(rng, monkeypatch):
+    """One complex128 residual brings the solve of M P to a stable c64 backward error; a stalled one takes the LU."""
+    n_p, vn, perm = 4, 8, np.array([1, 0, 3, 2])
+    n, v, rows = n_p * vn, np.arange(vn), (perm[:, None] * vn + np.arange(vn)).reshape(-1)
+    b0 = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+    m = np.empty_like(b0)
+    m[:, rows] = b0 + b0.T + 8 * n * np.eye(n)  # M P is complex-symmetric
+    m = np.asfortranarray(m + 1e-5 * np.abs(m).max() * rng.standard_normal((n, n)), dtype=np.complex64)
+    blocks = four_point._pair_view(m, n_p)[:, v, :, v]
+    off = m.copy(order="F")
+    four_point._pair_view(off, n_p)[:, v, :, v] = 0
+    rhs = (rng.standard_normal((n, 3)) + 1j * rng.standard_normal((n, 3))).astype(np.complex64)
+
+    def backward_error(x: np.ndarray) -> np.ndarray:
+        """Per right-hand side, the complex128 residual over eps32 times the row-sum norm of M and max|x|."""
+        r = rhs - m.astype(np.complex128) @ x.astype(np.complex128)
+        scale = np.finfo(np.float32).eps * np.abs(m).sum(axis=1).max() * np.abs(x).max(axis=0)
+        return np.abs(r).max(axis=0) / scale
+
+    x = four_point._refined_solve(np.asfortranarray(m[:, rows]), perm, off, blocks, np.abs(m).max())(rhs)
+    sytrf, sytrs = sp.linalg.get_lapack_funcs(("sytrf", "sytrs"), dtype=np.complex64)
+    ldu, ipiv, _ = sytrf(np.asfortranarray(m[:, rows]), lower=1)
+    x0 = np.empty_like(rhs)
+    x0[rows] = sytrs(ldu, ipiv, rhs, lower=1)[0]
+    monkeypatch.setattr(four_point, "_REFINEMENT_CORRECTIONS", 0)
+    stalled = four_point._refined_solve(np.asfortranarray(m[:, rows]), perm, off, blocks, np.abs(m).max())
+    lu = sp.linalg.lu_solve(sp.linalg.lu_factor(m), rhs)
+    assert np.all(backward_error(x) <= 2.0) and np.any(backward_error(x0) > 2.0)
+    assert np.array_equal(stalled(rhs), lu) and np.array_equal(stalled(rhs), lu)
+
+
+def test_invert_with_local_kernel_and_sum_permuted_solve_stays_within_the_modeled_transient(rng, monkeypatch):
+    """With every pair solved, the refinement of a permuted slice stays inside the estimator's aux-sum transient."""
+    monkeypatch.setattr(four_point, "_PERMUTED_ROWS_PER_PAIR", 0)
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _layer_swap_inputs(rng, 32, two_atoms=False, nq=1, nw=1)
+    permuted = _spy_refined_solves(monkeypatch)
+    tracemalloc.start()
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(
+        gamma, u_r, 1.0 / 64.0, 8.0, inactive, orbital_involution=_LAYER_SWAP
+    )
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert inactive.size == 0 and permuted == [1]
+    assert peak - out.mat.nbytes <= memory_estimator._chiq_aux_transient(16 * 64, 4)
 
 
 def _band_and_first_sum_reference(fp: FourPoint, niv_band: int, beta: float) -> tuple[np.ndarray, np.ndarray]:

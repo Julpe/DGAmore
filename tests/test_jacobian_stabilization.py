@@ -1044,6 +1044,43 @@ def test_a_certified_flip_waits_out_the_hold_a_growth_release_left_behind():
     assert tracker._flip.any() and installs == [False] * _PERSIST + [True]
 
 
+def test_a_held_flipped_pair_whose_residual_keeps_growing_is_released_after_its_quarter_turn():
+    """A held flip of lambda_Pi = -0.1 -+ 0.5j defers the growth release past its quarter turn, but never cancels it."""
+    tracker, logger = _logged_tracker()
+    patience, active = [], []
+    for k in range(10):
+        # each window restarts further out, so the raw residual grows on every update after the install
+        tracker.update(*linear_pairs(_pair_drift(-0.1, 0.5), np.zeros(2), 0.3, 3, [10.0 * (k + 1)] * 2))
+        patience.append(tracker._growth_patience())
+        active.append(tracker.active)
+    # a quarter turn of (pi/2) / atan(0.1 / 0.5) = 7.96 steps can raise the residual on at most 8 updates in a row
+    assert tracker._flip.all() and patience == [9] * 9 + [_PERSIST] and active == [True] * 9 + [False]
+    assert "residual grew" in logger.info.call_args[0][0]
+
+
+@pytest.mark.parametrize(
+    "lam_pi, patience",
+    [
+        (-0.5 + 0.0j, _PERSIST),
+        (-0.1 + 0.5j, 9),
+        (-0.5 + 0.3j, 4),
+        (-0.005 + 1.0j, _PERSIST),
+        # a quarter turn of -0.05 -+ 5j at its own damping spans 157 steps, far past the cap
+        (-0.05 + 5.0j, jacobian_stabilization._MAX_GROWTH_PATIENCE),
+    ],
+    ids=["real", "quarter-turn", "damping-capped-at-one", "inside-the-margin", "capped"],
+)
+def test_the_growth_patience_spans_a_quarter_turn_of_a_held_flipped_pair(lam_pi, patience):
+    """The release waits one growth past a held pair's quarter turn, up to _MAX_GROWTH_PATIENCE; else _PERSIST."""
+    tracker = JacobianTracker(0.4)
+    tracker.q = np.eye(4)[:, :2]
+    pair = np.array([lam_pi, np.conj(lam_pi)])
+    u = np.column_stack([[1.0, 1.0j, 0.0, 0.0], [1.0, -1.0j, 0.0, 0.0]]) / np.sqrt(2.0)
+    flags = np.ones(2, dtype=bool)
+    tracker._replace_snapshot((pair, np.full(2, 1e-6), flags, flags, u, np.zeros(2, dtype=bool)), "estimate")
+    assert tracker._growth_patience() == patience
+
+
 def test_tracker_warns_once_at_floor():
     """The floor warning fires once although the damping stays pinned, naming the bound and the per-direction map."""
     tracker, logger = _logged_tracker()
@@ -1294,6 +1331,22 @@ def test_tracker_flips_a_complex_pair_end_to_end():
     plain = tracked_run(step, x0, 0.5, 80, None)
     assert tracker.active and tracker.q.shape[1] == 2 and np.allclose(tracked, 0.0, atol=1e-6)
     assert np.linalg.norm(plain) > 1e3
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_a_rotating_flipped_pair_converges_where_a_release_after_persist_growths_does_not(monkeypatch, seed):
+    """A flipped pair whose rotation raises the residual for most of a quarter turn converges unless released early."""
+    rng = np.random.default_rng(seed)
+    # lambda_Pi = -0.4 -+ 1.2j on a plane skewed by 3, beside six stable modes, all on non-normal eigenvectors
+    block = block_diag(np.array([[1.4, 3.6], [-0.4, 1.4]]), np.diag(1.0 - np.linspace(0.3, 1.2, 6)))
+    vec = np.eye(8) + 0.3 * rng.standard_normal((8, 8))
+    mat, shift = vec @ block @ np.linalg.inv(vec), rng.standard_normal(8)
+    fixed = np.linalg.solve(np.eye(8) - mat, shift)
+    step = lambda x: (mat @ x.real + shift).astype(np.complex128)
+    x0 = list(fixed + 0.1 * rng.standard_normal(8))
+    assert np.allclose(tracked_run(step, x0, 0.5, 500, JacobianTracker(0.5)), fixed, atol=1e-8)
+    monkeypatch.setattr(JacobianTracker, "_growth_patience", lambda self: _PERSIST)
+    assert not np.allclose(tracked_run(step, x0, 0.5, 500, JacobianTracker(0.5)), fixed, atol=1e-2)
 
 
 def test_spectrum_state_stores_every_vector_below_the_storage_band_but_flips_by_the_flip_band():
@@ -2051,6 +2104,18 @@ def test_without_exact_checks_a_value_past_the_pole_modulus_flips_once_a_disjoin
     assert _first_install(tracker, [_real_drift(value) for value in values]) == expected
 
 
+def test_without_exact_checks_a_reflected_flip_past_the_pole_modulus_keeps_its_reversed_damping_on_its_return():
+    """A reflected mode past the pole modulus that one estimate missed keeps its reversed damping on its return."""
+    tracker = JacobianTracker(0.4, exact_checks=False)
+    for k in range(TRACKER_PAIRS):
+        _drift_update(tracker, _real_drift(-8.0), k)
+    # a window that never excites the reflected direction restarts the reproduction of its value
+    tracker.update(*linear_pairs(_real_drift(-8.0), np.zeros(2), 0.07, 3, [0.0, 1.0]))
+    _drift_update(tracker, _real_drift(-8.0), TRACKER_PAIRS + 1)
+    assert tracker.q is not None
+    assert np.isclose(_step_factor(tracker, _real_drift(-8.0), 0), 0.0, atol=1e-8)
+
+
 def test_a_pole_type_approach_is_logged_and_not_predicted():
     """A pair heading for a pole with a growing modulus is left alone although its real part falls monotonically."""
     tracker, logger = _logged_tracker()
@@ -2420,6 +2485,59 @@ def test_the_exact_spectrum_keeps_a_reflected_flip_no_exact_mode_matches():
     state = tracker.spectrum_state((1, 1, 1, 1, 1, 4), 10.0, True, np.complex128)
     assert bool(state["exact"]) and state["flip"].tolist() == [False, True]
     assert np.isclose(state["lam_pi"][1], -0.5, atol=1e-8)
+
+
+@pytest.mark.parametrize(
+    "gain, start, certifications, kept",
+    [(1.5, 0.0, 2, True), (1.5, 0.0, 1, False), (0.5, 1.0, 2, False)],
+    ids=["left-the-window", "certified-once", "certified-stable"],
+)
+def test_a_new_flip_keeps_a_reflected_flip_certified_twice_that_the_estimate_no_longer_sees(
+    gain, start, certifications, kept
+):
+    """A new flip keeps a held flip certified twice outside the window, not one certified once or certified stable."""
+    tracker, own = _own_flip_of_the_first_axis()
+    if certifications == 2:
+        tracker.update(own[0][:6], own[1][:6])
+    pairs = linear_pairs(np.diag([gain, 1.4, 0.2, -0.3]), np.zeros(4), 0.3, 5, [start, 1.0, 1.0, 1.0])
+    assert tracker.update(*pairs) is True
+    held = [np.linalg.norm(tracker.q.T @ _real_column(axis, 4)) > 0.99 for axis in (0, 1)]
+    assert held == [kept, True] and tracker.q.shape[1] == 1 + kept
+
+
+def _planted_run(unstable: list[float]) -> tuple[Callable[[np.ndarray], np.ndarray], np.ndarray, np.ndarray]:
+    """A map with the given unstable lambda_J beside a stable bulk, its fixed point and a start close to it."""
+    rng = np.random.default_rng(0)
+    mat = planted_jacobian(8, unstable, [], rng)
+    shift = rng.standard_normal(8)
+    x_star = np.linalg.solve(np.eye(8) - mat, shift)
+    return (lambda x: (mat @ x.real + shift).astype(np.complex128)), x_star, x_star + 1e-2 * rng.standard_normal(8)
+
+
+def test_two_unstable_directions_share_one_reflector_instead_of_toggling(monkeypatch):
+    """Two unstable directions end in one reflector holding both, switched at most twice instead of every few steps."""
+    step, x_star, x0 = _planted_run([1.5, 1.2])
+    tracker, events = JacobianTracker(0.4), []
+    update = tracker.update
+    monkeypatch.setattr(tracker, "update", lambda *args: events.append(update(*args)) or events[-1])
+    assert np.allclose(tracked_run(step, x0, 0.4, 120, tracker), x_star, atol=1e-9)
+    assert sum(events) <= 2 and tracker.q.shape[1] == 2
+
+
+def test_one_unstable_direction_runs_as_if_held_flips_were_never_kept(monkeypatch):
+    """With one unstable direction every rebuild keeps nothing, so the run equals one that never extends a reflector."""
+    step, _, x0 = _planted_run([1.5])
+    calls, extend = [], JacobianTracker._with_held_flips
+
+    def spy(self, reflector, lam_pi, u):
+        calls.append((self._reflected_flips() is not None, extend(self, reflector, lam_pi, u) is reflector))
+        return reflector
+
+    monkeypatch.setattr(JacobianTracker, "_with_held_flips", spy)
+    never_extended = tracked_run(step, x0, 0.4, 120, JacobianTracker(0.4))
+    monkeypatch.undo()
+    assert any(held for held, _ in calls) and all(same for _, same in calls)
+    assert np.array_equal(tracked_run(step, x0, 0.4, 120, JacobianTracker(0.4)), never_extended)
 
 
 def test_a_carried_mode_inside_the_band_takes_the_scalar_damping_on_the_carried_map():

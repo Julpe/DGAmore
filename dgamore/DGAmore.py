@@ -15,6 +15,7 @@ configuration and the assembled local quantities are broadcast to the other MPI 
 
 import dataclasses
 import functools
+import gc
 import itertools as it
 import logging
 import os
@@ -60,11 +61,15 @@ def main():
     """
     Console-script entry point. Runs :func:`run_dga_routine` on every rank and exits with its status; when any rank
     leaves it through an exception, that rank logs its traceback, flushes the log and aborts the whole MPI job, so the
-    other ranks cannot block forever in a collective the failed rank never joins.
+    other ranks cannot block forever in a collective the failed rank never joins. The objects alive at entry (the
+    imported libraries) are frozen out of the garbage collector's sweeps first, so the ``gc.collect()`` of every
+    n-point release (see :meth:`~dgamore.n_point_base.IHaveMat.free`) walks only the objects the run creates.
 
     :return: None.
     """
     comm = MPI.COMM_WORLD
+    gc.collect()
+    gc.freeze()
     try:
         status = run_dga_routine(comm)
     except BaseException:

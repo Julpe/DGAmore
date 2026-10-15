@@ -521,11 +521,16 @@ predictions, the log line and ``jacobian.npz``. Two things follow from the estim
 direction certified with a negative real part is *flipped* on the iteration that certifies it: the tracker updates on
 that iteration's pair before the mixing acts, so that iteration's proposal residual is already reflected on it, which
 turns the sign of the damping on that direction and makes the physical fixed point attractive there, the modified
-iteration of arXiv:2606.04936, whose stabilization acts from the first step. Without ``use_exact_jacobian`` a value
+iteration of arXiv:2606.04936, whose stabilization acts from the first step. A direction flipped later joins the
+reflection instead of replacing it: a direction certified as a flip on two iterations stays reflected after it
+contracts out of the secant window, until a later estimate certifies it and decides its flip anew or a release below
+drops the whole reflection, while a flip certified on a single iteration, possibly by one inconsistent secant window,
+is dropped once another flip rebuilds the reflection. Without ``use_exact_jacobian`` a value
 whose modulus exceeds 5 is the exception: a secant across a near-singular stretch of the map, it binds the damping
-but is flipped only when it jumps through a pole (below) or once it is reproduced, certified unstable on seven
+but is flipped only when it jumps through a pole (below), once it is reproduced, certified unstable on seven
 consecutive informative iterations with the values of the first and the last, whose secant windows share no increment,
-within their summed undecidable bands; until then the log tags it ``unstable, suppressed``. The flip also
+within their summed undecidable bands, or while the reflection in force holds it; until then the log tags it
+``unstable, suppressed``. The flip also
 lands ahead of the crossing:
 the certified directions of consecutive estimates are identified by the overlap of their eigenvectors (a complex pair
 by its real plane), and a direction whose real part fell monotonically over three consecutive matched estimates is
@@ -592,7 +597,8 @@ here is a hypothesis for the ladder to confirm and not a settled result. That pe
 first iteration that certifies a direction, with or without a flip, so a run that never flips is still accelerated on
 its certified flat directions, and once installed it stays in force until the next iteration that certifies something
 rebuilds it (an iteration that certifies nothing leaves it in place), until the residual grows on three consecutive
-iterations, which releases it and holds it off for three further informative iterations (an iteration frozen below the
+iterations (more while the reflection beside it holds a flipped complex pair, see below), which releases it and holds
+it off for three further informative iterations (an iteration frozen below the
 noise floor does not count) before the estimate may install it again, until the calm release of the reflection beside it
 drops it until the next certifying iteration, or until a scaffold pauses the flips. The projector that takes the
 certified span out of the damped step is the oblique one along the uncertified subspace, so an uncertified direction
@@ -619,8 +625,8 @@ The log carries one line per iteration once three pairs exist,
 listing every flipped mode and the least-stable certified mode, the one with the smallest real part that approaches
 the boundary first, and filling the remaining places up to four by descending modulus, each with its error bound and
 verdict (``certified`` with ``stable``, ``flip``, ``predicted flip``, ``marginal`` or, for a clearly unstable mode while
-a scaffold pauses flips or, without ``use_exact_jacobian``, past the modulus 5 before a pole jump or a reproduction,
-``unstable, suppressed``, or ``uncertified``), then the number of modes this estimate flips,
+a scaffold pauses flips or, without ``use_exact_jacobian``, past the modulus 5 outside the reflection before a pole
+jump or a reproduction, ``unstable, suppressed``, or ``uncertified``), then the number of modes this estimate flips,
 the damping ``p_eff`` the whole spectrum allows and the convergence rate ``rho`` the certified directions predict under
 the damping each of them actually takes. The flip count is the decision of that update's estimate, not the size of
 the reflection in force: a carried or held reflection whose direction the estimate no longer sees logs ``0 flipped``
@@ -685,24 +691,26 @@ evaluated exactly (the converged-point Jacobian of arXiv:2609.11405 App. G4), an
 parts of :math:`\lambda_\Pi` and with the largest moduli replace the certified spectrum in ``jacobian.npz`` (marked
 ``exact``), restricted to the self-energies the loop keeps: the lattice symmetry, including what it does to the orbitals
 at a momentum it leaves fixed, the Matsubara Hermiticity, and the orbital pairs the converged self-energy populates. The
-log says ``Exact Jacobian: <n> eigenpairs from <m> products, lambda_Pi ...``; a search that does not converge within
-about 150 products contributes its converged pairs, with a warning. Both searches start from one vector that holds the
-least-stable and the stiffest certified direction of the tracker beside a fixed random one, so the second search
-repeats the opening Arnoldi factorization of the first and is served those 41 products from memory instead of
-recomputing them. When every pair the search for the smallest real part of :math:`\lambda_\Pi` returns is unstable,
-the log warns ``Exact Jacobian: all <n> eigenpairs of the largest real part are unstable (...); the Jacobian may have
-more unstable directions than these.``, since the search then holds no stable mode to show that it reached past the
-unstable ones.
-An exact mode past the flip margin that the reflection in force does not hold is unstable for the damped iteration at
-the converged point, which the run then reached by another route; it is warned about (``Jacobian tracker: the exact
-spectrum at the converged point has unstable modes the installed reflector does not hold, lambda_Pi <v>: ...``) and the
-next rung carries it as a flip. A reflected flip no exact mode matches stays in the file beside the exact spectrum with
-the value it was flipped at, so a search that misses it does not drop it. The derivative holds the fitted
-high-frequency moment :math:`\Sigma_\infty` of the loop box and of the DMFT box fixed, which is exact while their fit
-windows, the top fifth of each box and at least four frequencies, lie beyond the core window; the operator warns
-(``Exact Jacobian: the moment-fit window of the loop box ... reaches into the core window ...``) when one does not.
-The next rung's carried flips, cross-rung extrapolation and damping bound then rest on eigenvalues without a secant
-residual and without the freeze above.
+log says ``Exact Jacobian: <n> eigenpairs from <m> products in <p> passes, lambda_Pi ...``, a pass being one block
+of products and one Bethe-Salpeter pass per channel. With blocks of several products one block search finds both sets
+at once from a first block that holds the least-stable and the stiffest certified direction of the tracker beside a
+fixed random one, and keeps the pairs it converged, with a warning, when 150 blocks do not reach every wanted pair.
+With one-column products ARPACK runs one search per set, each contributing its converged pairs, with a warning, when it
+does not converge within about 150 products; both start from one vector that holds those directions beside the random
+one, so the second search repeats the opening Arnoldi factorization of the first and is served those 41 products from
+memory instead of recomputing them. When every pair the search for the smallest real part of :math:`\lambda_\Pi` returns
+is unstable, the log warns ``Exact Jacobian: all <n> eigenpairs of the largest real part are unstable (...); the
+Jacobian may have more unstable directions than these.``, since the search then holds no stable mode to show that it
+reached past the unstable ones. An exact mode past the flip margin that the reflection in force does not hold is
+unstable for the damped iteration at the converged point, which the run then reached by another route; it is warned
+about (``Jacobian tracker: the exact spectrum at the converged point has unstable modes the installed reflector does not
+hold, lambda_Pi <v>: ...``) and the next rung carries it as a flip. A reflected flip no exact mode matches stays in the
+file beside the exact spectrum with the value it was flipped at, so a search that misses it does not drop it. The
+derivative holds the fitted high-frequency moment :math:`\Sigma_\infty` of the loop box and of the DMFT box fixed, which
+is exact while their fit windows, the top fifth of each box and at least four frequencies, lie beyond the core window;
+the operator warns (``Exact Jacobian: the moment-fit window of the loop box ... reaches into the core window ...``) when
+one does not. The next rung's carried flips, cross-rung extrapolation and damping bound then rest on eigenvalues without
+a secant residual and without the freeze above.
 
 The same flag acts inside the loop where the estimate alone cannot certify a mode. A window of Anderson steps mixes
 many modes, so the least-stable Ritz vector can keep its direction for many iterations while its value wanders and its
@@ -807,7 +815,8 @@ the value it forced; where the predecessor's tracker ended well below the config
 the next rung is a deliberate choice, not an automatic one. An accelerated step keeps the configured ``mixing``
 whether or not a reflection is installed. A carried reflection, like the tracker's own, is held until a certified
 stable mode lies inside it on three consecutive updates without a flip candidate, until the residual grows on three
-consecutive updates, until the tracker's own certified flip replaces it, until a scaffold pauses the flips, or until the
+consecutive updates (more where it holds a flipped complex pair, see below), until the tracker's own certified flip
+replaces it, until a scaffold pauses the flips, or until the
 run converges and the loop ends; the carried direction is the one the first iterations cannot yet certify, and its
 absence from the estimate releases nothing. A scaffold pauses a carried flip rather than discarding
 it: a reflection carried in while a scaffold is already on waits and is installed on the first update after the release,
@@ -884,7 +893,12 @@ flipped direction is dropped again once the estimate certifies a stable mode ins
 consecutive updates without a flip candidate (``Jacobian tracker: a certified stable mode lies in the tracked basis,
 tracked basis released``, or the carried or exact-check basis), the mark of a wrong flip, since a stable direction
 flipped by a noisy estimate grows under the reflection and is then measured stable inside it, or when the residual
-keeps growing with the flip in force. A correct flip is not dropped when its direction has contracted out of the
+keeps growing with the flip in force. A flipped complex pair at its own damping contracts while it turns by a fixed
+angle per iteration, :math:`\arctan(|\mathrm{Re}\,\lambda_\Pi| / |\mathrm{Im}\,\lambda_\Pi|)` where that damping is
+below one, and on non-normal eigenvectors that rotation alone can raise the residual on every iteration of a quarter
+turn, so while the reflection holds such pairs the release waits for one growth more than a quarter turn of the slowest
+of them takes, for at least three and at most 64 updates. A correct flip is not dropped when its direction has
+contracted out of the
 secant window: its absence from the estimate says nothing, and the reflection stays, as the papers keep a flip in place
 once it is made. The growth release can still cycle: it resets the persistence streak and holds re-installs off for
 three more updates, after which a mode that certifies again is flipped anew, at a cost in iterations. Such a cycle also

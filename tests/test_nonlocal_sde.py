@@ -1096,7 +1096,8 @@ def test_kernel_step_writes_the_eliashberg_intermediates_only_when_asked(monkeyp
     vrg, chi = MagicMock(), MagicMock()
     vrg.channel.value = "dens"
     chi.channel = SpinChannel.DENS
-    monkeypatch.setattr(nonlocal_sde, "create_auxiliary_chi_r_q_sum", lambda *a, **k: vrg)
+    aux_kwargs = []
+    monkeypatch.setattr(nonlocal_sde, "create_auxiliary_chi_r_q_sum", lambda *a, **k: aux_kwargs.append(k) or vrg)
     monkeypatch.setattr(nonlocal_sde, "create_vrg_r_q", lambda *a, **k: vrg)
     monkeypatch.setattr(nonlocal_sde, "create_generalized_chi_q_with_shell_correction", lambda *a: chi)
     monkeypatch.setattr(nonlocal_sde, "_select_and_apply_lambda_correction", lambda c: c)
@@ -1110,25 +1111,31 @@ def test_kernel_step_writes_the_eliashberg_intermediates_only_when_asked(monkeyp
     args = [MagicMock() for _ in range(6)]
     args[1].current_shape = (1,)
 
-    assert nonlocal_sde.calculate_sigma_kernel_r_q(*args, dist, None, save_eliashberg=save) is None
+    involution = np.array([1, 0])
+    assert (
+        nonlocal_sde.calculate_sigma_kernel_r_q(*args, dist, None, save_eliashberg=save, involution=involution) is None
+    )
 
-    assert vrg.save.called == save
+    assert vrg.save.called == save and aux_kwargs == [{"involution": involution}]
     names = [c.kwargs["name"] for c in chi.save.call_args_list]
     assert names == ["chi_phys_q_dens"] + (["chi_phys_q_dens_rank_0"] if save else [])
 
 
-def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_sde(monkeypatch, tmp_path):
-    """The post-loop pass writes the dumps of both channels, skips the double-counting kernel and the SDE, returns None."""
+@pytest.mark.parametrize("ek, involution", [(np.zeros((1, 1, 1, 1, 1)), None), (np.ones((1, 1, 1, 2, 2)), [1, 0])])
+def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_sde(
+    monkeypatch, tmp_path, ek, involution
+):
+    """The post-loop pass hands each channel the dump flag and involution, skips the dc kernel and SDE, returns None."""
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
     config.output.output_path = str(tmp_path)
     config.sys.beta = 10.0
-    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: ek)
     bubble = MagicMock()
     monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, None))
     monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
     monkeypatch.setattr(nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: bubble)
     monkeypatch.setattr(nonlocal_sde, "_cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
-    loaded, saves = [], []
+    loaded, saves, involutions = [], [], []
 
     def load_vertex(node_comm, path, *a, **k):
         loaded.append(os.path.basename(path))
@@ -1137,8 +1144,9 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
     def forbidden(*a, **k):
         raise AssertionError("the Eliashberg-only pass must not reach the double-counting kernel or the SDE")
 
-    def kernel_step(*a, save_eliashberg=False, **k):
+    def kernel_step(*a, save_eliashberg=False, involution=None, **k):
         saves.append(save_eliashberg)
+        involutions.append(None if involution is None else involution.tolist())
         return MagicMock()
 
     monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", load_vertex)
@@ -1160,6 +1168,7 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
 
     assert result is None
     assert loaded == ["gamma_dens_loc.npy", "gamma_magn_loc.npy"] and saves == [True, True]
+    assert involutions == [involution, involution]
     assert bubble.cut_niv.return_value.invert.return_value.save.call_args.kwargs["name"] == "gchi0_q_inv_rank_0"
 
 
@@ -1684,8 +1693,8 @@ def test_install_exact_jacobian_frees_the_operator_and_installs_rank_0s_spectrum
     """The helper builds the operator, solves from rank 0's tracker directions, frees it, and installs on rank 0."""
     spectrum = (np.array([0.5 + 0.0j]), np.array([1e-10]), np.ones((4, 1), dtype=np.complex128))
 
-    def solve_before_free(jac, comm, *starts):
-        assert not jac.free.called
+    def solve_before_free(jac, comm, *starts, block):
+        assert not jac.free.called and block is jac.block
         return spectrum
 
     operator, solve, tracker = MagicMock(), MagicMock(side_effect=solve_before_free), MagicMock()
@@ -2729,6 +2738,21 @@ def test_has_time_reversal_accepts_real_hoppings_and_rejects_a_complex_one():
     assert not nonlocal_sde._has_time_reversal(ek)
 
 
+def test_orbital_involution_finds_the_layer_swap_that_transposes_a_bilayer_dispersion():
+    """eps^T = P eps P for the layer swap P gives (2, 3, 0, 1) despite file noise; one band, ties or a break: None."""
+    rng, pi = np.random.default_rng(3), np.array([2, 3, 0, 1])
+    ek = rng.standard_normal((4, 2, 1, 4, 4)) + 1j * rng.standard_normal((4, 2, 1, 4, 4))
+    ek = 0.5 * (ek + np.swapaxes(ek, -1, -2)[..., pi, :][..., pi])
+    assert np.array_equal(nonlocal_sde._orbital_involution(ek), pi)
+    assert np.array_equal(nonlocal_sde._orbital_involution(ek + 1e-6 * rng.standard_normal(ek.shape)), pi)
+    broken = ek.copy()
+    broken[..., 0, 1] += 0.1
+    tied = ek.copy()
+    tied[..., [0, 1, 2, 3], [0, 1, 2, 3]] = ek[..., :1, 0]
+    for ek_none in (ek[..., :1, :1], np.real(ek[..., :2, :2]), broken, tied):
+        assert nonlocal_sde._orbital_involution(ek_none) is None
+
+
 @pytest.mark.parametrize("auto", [False, True])
 @pytest.mark.parametrize("size", [1, 3])
 def test_column_sde_matches_the_qloop_reference(auto, size, monkeypatch):
@@ -2744,8 +2768,9 @@ def test_column_sde_matches_the_qloop_reference(auto, size, monkeypatch):
 
 @pytest.mark.parametrize("auto", [False, True])
 def test_column_sde_is_bit_invariant_under_the_round_budget_and_the_contraction_chunk(auto, monkeypatch):
-    """Single-task rounds, one-row contraction chunks and the whole block give the same bits; rank counts agree."""
+    """With one-column unfold batches, single-task rounds, one-row chunks and the whole block give the same bits."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(memory_estimator, "SDE_UNFOLD_BATCH_BYTES", 1)
     kernel, giwk = _column_sde_setup(auto)
     whole = _run_column_sde_parallel(3, kernel, giwk, chunk_bytes=2**40, hostnames=["n0", "n0", "n1"])
     rounds = _run_column_sde_parallel(3, kernel, giwk, chunk_bytes=1)
@@ -2773,16 +2798,25 @@ def test_column_sde_with_monomial_rotations_keeps_the_bits_of_the_einsum_unfold(
     assert np.array_equal(gathered, einsum)
 
 
-def test_column_sde_unfolds_every_column_of_a_rank_into_one_buffer(monkeypatch):
-    """Each rank allocates one full-BZ column and unfolds every column of its tasks into it."""
+def test_column_sde_unfolds_batches_of_columns_into_one_buffer_with_the_values_of_one_column_batches(monkeypatch):
+    """A rank unfolds its columns in budget-sized batches into one buffer, within 10x the floor of one-column ones."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     kernel, giwk = _column_sde_setup(True)
+    n_r, nb, n_cols = (
+        config.lattice.k_grid.nk_tot,
+        config.sys.n_bands,
+        config.box.niv_core * (2 * config.box.niw_core + 1),
+    )
+    monkeypatch.setattr(memory_estimator, "SDE_UNFOLD_BATCH_BYTES", 1)
+    single = _run_column_sde_parallel(1, kernel, giwk)
+    monkeypatch.setattr(memory_estimator, "SDE_UNFOLD_BATCH_BYTES", 3 * n_r * (nb**4 + nb**2) * kernel.itemsize)
     spy = create_autospec(FourPoint.map_to_full_bz, side_effect=FourPoint.map_to_full_bz)
     monkeypatch.setattr(FourPoint, "map_to_full_bz", spy)
-    _run_column_sde_parallel(1, kernel, giwk)
+    batched = _run_column_sde_parallel(1, kernel, giwk)
     buffers = [c.kwargs["out"] for c in spy.call_args_list]
-    assert len(buffers) == config.box.niv_core * (2 * config.box.niw_core + 1)
-    assert all(b is buffers[0] for b in buffers)
+    assert [b.shape[-1] for b in buffers] == [3] * (n_cols // 3) + [n_cols % 3] * (n_cols % 3 > 0)
+    assert all(np.shares_memory(b, buffers[0]) for b in buffers)
+    assert np.allclose(batched, single, rtol=0, atol=ten_times_the_floor(single))
 
 
 def test_column_sde_single_rank_mock_path_equals_the_fake_mpi_run(monkeypatch):
@@ -2926,6 +2960,7 @@ def _hand_folded_column_sde(kernels, g_mats, terms, blocks):
 def test_column_sde_fold_matches_the_hand_folded_blocks_of_its_schedule(by_frequency, auto, monkeypatch):
     """One rank folds every v's block sums in schedule order: the loop's blocks of four, the stream's single w."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(memory_estimator, "SDE_UNFOLD_BATCH_BYTES", 1)
     kernels, g_mats = _stream_setup(auto)
     blocks = memory_estimator.column_sde_schedule(config.box.niw_core, config.box.niv_core, 1, by_frequency)[0]
     if by_frequency:
@@ -2943,8 +2978,9 @@ def test_column_sde_fold_matches_the_hand_folded_blocks_of_its_schedule(by_frequ
 def test_column_sde_stream_is_bit_invariant_under_the_group_size_the_round_budget_and_the_output_count(
     size, o, symmetric, monkeypatch
 ):
-    """Groups of one, three (ragged) or all w, one-task rounds and an output computed alone give the same bits."""
+    """With one-column unfold batches, groups of one, three or all w, one-task rounds and one output agree bitwise."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(memory_estimator, "SDE_UNFOLD_BATCH_BYTES", 1)
     kernels, g_mats = _stream_setup(auto=symmetric, o=o, symmetric=symmetric)
     whole = _stream_parallel(size, kernels, g_mats, _windows(config.box.niw_core + 1), chunk_bytes=2**40)
     for width, chunk_bytes in ((1, 1), (3, None), (1, 2**40)):
@@ -2952,6 +2988,17 @@ def test_column_sde_stream_is_bit_invariant_under_the_group_size_the_round_budge
         assert all(np.array_equal(a, b) for a, b in zip(got, whole))
     alone = _stream_parallel(size, kernels[:2], g_mats[:2], _windows(3), terms=[(0, 0, 1), (1, 0, 0)])
     assert np.array_equal(alone[0], whole[0])
+
+
+@pytest.mark.parametrize("size", [1, 2])
+def test_column_sde_stream_batches_agree_with_one_column_unfold_batches_within_ten_times_the_floor(size, monkeypatch):
+    """The stream's batched unfold agrees with one-column batches to ten times the floating-point floor."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernels, g_mats = _stream_setup(True)
+    batched = _stream_parallel(size, kernels, g_mats, _windows(3))
+    monkeypatch.setattr(memory_estimator, "SDE_UNFOLD_BATCH_BYTES", 1)
+    single = _stream_parallel(size, kernels, g_mats, _windows(3))
+    assert all(np.allclose(a, b, rtol=0, atol=ten_times_the_floor(b)) for a, b in zip(batched, single))
 
 
 @pytest.mark.parametrize("size", [1, 3])
