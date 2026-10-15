@@ -272,10 +272,10 @@ acted on, held off for three updates after a growth release or with its reflecti
 keeps the mixing's step, and a certified direction whose negative real part lies inside its
 undecidable band, whose sign is not resolved, takes the damping of the damped step in the map, in the map of a carried
 or exact-check set as well. Without ``use_exact_jacobian`` a certified value whose modulus exceeds 5, a secant across a
-near-singular stretch of the map, is no flip unless it jumps through a pole or is reproduced, certified unstable on
+near-singular stretch of the map, is no flip unless it jumps through a pole, is reproduced, certified unstable on
 seven consecutive informative iterations with the values of the first and the last, whose secant windows share no
-increment, within their summed undecidable bands; until then it binds the damping and takes the damping of the damped
-step in the map. Where two certified
+increment, within their summed undecidable bands, or lies in the reflection in force; until then it binds the damping
+and takes the damping of the damped step in the map. Where two certified
 directions of opposite sign lie too close for any bounded map to reverse one and fix the other, no per-direction damping
 is built at all and the log says so. The per-direction damping is rebuilt on every iteration that certifies a direction,
 with or without a flip, keeping a stiff mode whose damping bound waits for its second certification in it while the
@@ -331,21 +331,25 @@ least-stable mode below the storage band without certifying it (at most five tim
 that certify their lead pair and find every certified pair above its undecidable band,
 :math:`\mathrm{Re}\,\lambda_\Pi > \max(10^{-2}, \mathrm{res})`), and before the first step
 of a run started from an exact spectrum, on the near-unstable modes that spectrum carries; the pairs it certifies act at
-once, as a carried set does. Once the run reaches the pure fixed point, ARPACK computes the six eigenpairs with the
-smallest real part of :math:`\lambda_\Pi` (the largest real part of the Jacobian's eigenvalues) and the six with the
-largest modulus, which replace the tracker's certified spectrum in ``jacobian.npz`` for the next run of a ladder, with
-the vectors of every mode whose real part lies below one; a reflected flip none of them matches stays in the file beside
-them. That evaluation costs up to about 300 Jacobian-vector products of one to two proposals each. Both searches start
-from one vector that holds the run's least-stable and stiffest certified directions, so the second search reuses the
-products of the first one's opening Arnoldi factorization (41 products) instead of recomputing them. A warning flags
-the case where every pair the search for the smallest real part of :math:`\lambda_\Pi` returns is unstable, since the
-Jacobian may then have more unstable directions, and an unstable exact mode the reflection in force does not hold,
-which the run reached by another route than the damped iteration. Both uses are exact for :math:`V = 0` (the
-:math:`V^{\mathbf{q}}` Hartree-Fock offset of the self-energy's shell is held; the loop's warning about a non-zero
-:math:`V^{\mathbf{q}}` then names the exact Jacobian too) and while the fit windows of the high-frequency moment
-:math:`\Sigma_\infty`, which is held as well, lie beyond the core window, which the operator checks with a warning.
-The flag is disabled with a warning without ``use_jacobian_stabilization`` or when its memory estimate does not fit
-the job; a run that stops at ``max_iter`` or in a scaffolded phase skips the end-of-run evaluation.
+once, as a carried set does. Once the run reaches the pure fixed point, the six eigenpairs with the smallest real part
+of :math:`\lambda_\Pi` (the largest real part of the Jacobian's eigenvalues) and the six with the largest modulus are
+computed, which replace the tracker's certified spectrum in ``jacobian.npz`` for the next run of a ladder, with the
+vectors of every mode whose real part lies below one; a reflected flip none of them matches stays in the file beside
+them. With the blocks of products the memory autodetection allows (``blocks of <b>`` in its log line), one block
+search finds both sets at once on block products, each block costing about one Bethe-Salpeter pass per channel, and
+gives up after 150 blocks; its first block holds the run's least-stable and stiffest certified directions beside a fixed
+random vector. With one-column products ARPACK runs the two searches one after the other, up to about 300
+Jacobian-vector products of one to two proposals each; both start from one vector that holds those directions, so the
+second search reuses the products of the first one's opening Arnoldi factorization (41 products) instead of
+recomputing them. A warning flags the case where every pair the search for the smallest real part of :math:`\lambda_\Pi`
+returns is unstable, since the Jacobian may then have more unstable directions, and an unstable exact mode the
+reflection in force does not hold, which the run reached by another route than the damped iteration. Both uses are exact
+for :math:`V = 0` (the :math:`V^{\mathbf{q}}` Hartree-Fock offset of the self-energy's shell is held; the loop's warning
+about a non-zero :math:`V^{\mathbf{q}}` then names the exact Jacobian too) and while the fit windows of the
+high-frequency moment :math:`\Sigma_\infty`, which is held as well, lie beyond the core window, which the operator
+checks with a warning. The flag is disabled with a warning without ``use_jacobian_stabilization`` or when its memory
+estimate does not fit the job; a run that stops at ``max_iter`` or in a scaffolded phase skips the end-of-run
+evaluation.
 
 .. _lambda-correction:
 

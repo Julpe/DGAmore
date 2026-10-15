@@ -48,6 +48,7 @@ from dgamore.memory_estimator import (
     max_chunk_budget,
     node_total,
     rank_tasks,
+    sde_unfold_batch,
 )
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import DTYPE, SpinChannel
@@ -171,8 +172,8 @@ def test_lanczos_single_rank_run_adds_waiting_channel_vertex():
 
 
 def test_two_fermion_branches_dominate_node_total():
-    """The two-fermion branches (chiq_aux, fq) dominate the per-node memory total."""
-    peaks = _peaks(with_eliashberg=True)
+    """At two bands the two-fermion branches (chiq_aux, fq) dominate the per-node memory total."""
+    peaks = _peaks(with_eliashberg=True, n_bands=2)
     r = BASE["n_ranks"]
     totals = {k: _off_node_total(bp, r) for k, bp in peaks.items()}
     assert totals["chiq_aux"] > totals["chi0q"]
@@ -393,36 +394,48 @@ def test_column_sde_slabs_counts_every_output_and_the_carried_slabs():
 
 
 def test_column_sde_stream_bytes_are_the_carried_slabs_and_one_round_of_every_kernel_beside_the_column_work():
-    """Carried slabs; a budget-sized round of all kernels' columns with one send copy, the column work and slabs."""
+    """Carried slabs; a budget-sized round of all kernels' columns with one send copy, one unfold batch and slabs."""
     nb = 2
     slab, column, full = DTYPE_BYTES * 80 * nb**2, DTYPE_BYTES * 20 * nb**4, DTYPE_BYTES * 80 * nb**4
-    carried, transient = column_sde_stream_bytes(20, 80, nb, 9, 3, 4, 5, 3, 2, 2 * 3 * column)
+    carried = column_sde_stream_bytes(20, 80, nb, 9, 3, 4, 5, 3, 2, 0)[0]
     assert carried == column_sde_slabs(9, 3, 4, 2, by_frequency=True, carried=True) * slab
     work = column_sde_slabs(9, 3, 4, 2, by_frequency=True) * slab - carried
-    columns = SDE_COLUMN_FACTOR * full + min(SDE_CONTRACTION_CHUNK_BYTES, full)
-    assert np.allclose(transient, 2 * column * (3 + 5 / 20) + columns + work, rtol=0, atol=1e-6)
-    floor = column_sde_stream_bytes(20, 80, nb, 9, 3, 4, 5, 3, 2, 0)[1]
-    assert np.allclose(floor, column * (3 + 5 / 20) + columns + work, rtol=0, atol=1e-6)
+    for budget, per_round in ((2 * 3 * column, 2), (0, 1)):
+        batch = sde_unfold_batch(full, 2 * slab, per_round)
+        columns = SDE_COLUMN_FACTOR * batch * full + min(SDE_CONTRACTION_CHUNK_BYTES, full) + (batch - 1) * 2 * slab
+        transient = column_sde_stream_bytes(20, 80, nb, 9, 3, 4, 5, 3, 2, budget)[1]
+        assert np.allclose(transient, per_round * column * (3 + 5 / 20) + columns + work, rtol=0, atol=1e-6)
+
+
+def test_sde_unfold_batch_fits_the_budget_with_the_partials_between_one_column_and_the_rounds_columns():
+    """The unfold batch takes as many columns as fit the budget with their partial sums, at least one, at most all."""
+    budget = memory_estimator.SDE_UNFOLD_BATCH_BYTES
+    assert sde_unfold_batch(budget // 4 - 100, 100, 50) == 4
+    assert sde_unfold_batch(2 * budget, 0, 50) == 1
+    assert sde_unfold_batch(1, 0, 7) == 7
+    assert sde_unfold_batch(1, 0, 0) == 1
 
 
 def test_sde_transient_is_the_irr_kernel_one_round_the_column_work_and_the_slabs():
-    """The sde transient is the irr kernel, one round of irr columns with its send copy, the column work and slabs."""
+    """The sde transient is the irr kernel, one round of irr columns with its send copy, one unfold batch and slabs."""
     nb, wp, vc = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"]
     qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
     task = DTYPE_BYTES * TINY["nk_irr"] * nb**4 * SDE_W_BLOCK
     _, bounds, _ = column_sde_schedule(TINY["niw_core"], TINY["niv_core"], TINY["n_ranks"])
     per_round = min(max(1, SLICE_CHUNK_BYTES // task), int(np.diff(bounds).max()))
-    column = DTYPE_BYTES * TINY["nk_tot"] * nb**4
-    columns = SDE_COLUMN_FACTOR * column + min(SDE_CONTRACTION_CHUNK_BYTES, column)
-    slabs = column_sde_slabs(TINY["niw_core"], TINY["niv_core"], TINY["n_ranks"]) * DTYPE_BYTES * TINY["nk_tot"] * nb**2
+    column, slab = DTYPE_BYTES * TINY["nk_tot"] * nb**4, DTYPE_BYTES * TINY["nk_tot"] * nb**2
+    batch = sde_unfold_batch(column, slab, per_round * SDE_W_BLOCK)
+    columns = SDE_COLUMN_FACTOR * batch * column + min(SDE_CONTRACTION_CHUNK_BYTES, column)
+    slabs = (column_sde_slabs(TINY["niw_core"], TINY["niv_core"], TINY["n_ranks"]) + batch - 1) * slab
     expected = SCALE * qi * nb**4 * wp * vc + OVERHEAD_FACTOR * (
         per_round * task * (1 + qi / TINY["nk_irr"]) + columns + slabs
     )
     assert estimate_peaks(**TINY)["sde"].off_distributed == pytest.approx(expected)
 
 
-def test_sde_round_follows_the_budget_in_whole_tasks_between_one_task_and_the_ranks_tasks():
-    """The modeled round grows by one task per task-sized budget step, from one task up to the rank's whole run."""
+def test_sde_round_follows_the_budget_in_whole_tasks_between_one_task_and_the_ranks_tasks(monkeypatch):
+    """With one-column unfold batches the modeled round grows by one task per task-sized budget step, up to the run."""
+    monkeypatch.setattr(memory_estimator, "SDE_UNFOLD_BATCH_BYTES", 1)
     nb, qi = TINY["n_bands"], -(-TINY["nk_irr"] // TINY["n_ranks"])
     task = DTYPE_BYTES * TINY["nk_irr"] * nb**4 * SDE_W_BLOCK
     _, bounds, _ = column_sde_schedule(TINY["niw_core"], TINY["niv_core"], TINY["n_ranks"])

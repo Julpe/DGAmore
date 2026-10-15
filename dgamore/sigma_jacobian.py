@@ -13,9 +13,10 @@ with :math:`x` the self-energy on the core window, :math:`S` the proposal of
 holds and :math:`n` the occupations its Hartree-Fock term reads. :class:`ExactJacobian` evaluates the product
 :math:`J\,\delta x` analytically at one self-energy by running the loop's own functions on the linearized objects, so
 the product is the derivative of the code's map, not of an idealized one. :func:`leading_eigenpairs` computes the
-leading eigenpairs of :math:`J` with ARPACK, the converged-point Jacobian of Gievers et al., arXiv:2609.11405, App. G4,
-and :func:`certify_subspace` certifies the eigenpairs next to a few given directions with a short block Arnoldi, the
-exact check the Jacobian tracker runs inside the loop.
+leading eigenpairs of :math:`J`, the converged-point Jacobian of Gievers et al., arXiv:2609.11405, App. G4, with ARPACK
+on one-column products or with a block search on blocks of products, and :func:`certify_subspace` certifies the
+eigenpairs next to a few given directions with a short block Arnoldi, the exact check the Jacobian tracker runs inside
+the loop.
 
 The Jacobian is evaluated at the pure map: no lambda correction, susceptibility restriction or annealing mass, and the
 momentum-dependent :math:`V^{\mathbf{q}}` Hartree-Fock offset of the shell held at its value (exact for :math:`V = 0`),
@@ -30,6 +31,7 @@ from collections.abc import Callable
 import mpi4py.MPI as MPI
 import numpy as np
 import scipy.sparse.linalg as spla
+from scipy.linalg import schur
 
 import dgamore.brillouin_zone as bz
 import dgamore.config as config
@@ -48,7 +50,8 @@ from dgamore.self_energy import SelfEnergy
 _CHANNELS = ((SpinChannel.DENS, 1.0), (SpinChannel.MAGN, 3.0))  # ladder channels and their weights in the kernel
 _F_DC = ("f_dc_loc.npy", SpinChannel.MAGN, (4, 0, 1, 5, 2, 3, 6))  # the dc vertex, stored in its contraction order
 _INVERSE_ORDER = (0, 5, 6, 1, 2, 4, 3)  # storage order of a one-fermion object after FourPoint.invert
-_MAX_MATVECS = 150  # rough bound on the Jacobian-vector products of one ARPACK target
+_MAX_MATVECS = 150  # rough bound on the products of one ARPACK target and on the block search's passes
+_SWEEP_ROWS = 1 << 15  # rows of the block eigen-solve's basis and images read per chunk of a sweep
 _CHECK_BASIS = memory_estimator.EXACT_CHECK_BASIS  # basis vectors, i.e. products, of one exact check
 _DUPLICATE_OVERLAP = 0.9  # norm share of an eigenvector in the span of the kept ones of its value that repeats them
 # compound slice size n_bands^2 * 2 niv_core from which recomputed three-leg vertices share the responses' factorization
@@ -292,7 +295,7 @@ class ExactJacobian:
             self._sde_chunk = (
                 nonlocal_sde._sde_chunk_budget(comm, self._node_comm) if chunk_budgets is None else budgets.exact
             )
-            self._block = max(1, budgets.exact_block)
+            self.block = max(1, budgets.exact_block)
             self._vertices_per_window = budgets.exact_vertices_per_window
             n_w = box.niw_core + 1
             width = n_w if budgets.exact_window is None else max(1, min(n_w, budgets.exact_window))
@@ -756,8 +759,8 @@ class ExactJacobian:
             if self._node_comm.rank == 0:
                 columns = list(mpi_utils.bcast_rows(self._roots_comm, projected, root=0).T)
             products = []
-            for start in range(0, width, self._block):
-                products += self._piece_products(columns[start : start + self._block])
+            for start in range(0, width, self.block):
+                products += self._piece_products(columns[start : start + self.block])
             return np.column_stack(products) if comm.rank == 0 else None
 
     def _piece_products(self, columns: list) -> list:
@@ -867,39 +870,26 @@ def _merge_modes(theta: np.ndarray, vectors: np.ndarray, tol: float) -> tuple[np
     return values[order], out
 
 
-def leading_eigenpairs(
-    jac: ExactJacobian, comm: MPI.Comm, lr_start: np.ndarray | None = None, lm_start: np.ndarray | None = None
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+def _arpack_eigenpairs(
+    jac: ExactJacobian, comm: MPI.Comm, v0: np.ndarray, k: int, ncv: int, tol: float
+) -> tuple[np.ndarray, np.ndarray, int]:
     r"""
-    Computes leading eigenpairs of the Jacobian with ARPACK (``scipy.sparse.linalg.eigs``) on rank 0, while every
-    other rank serves the collective products of :meth:`ExactJacobian.matvec` until rank 0 signals the end. Two
-    targets of :data:`~dgamore.memory_estimator.EXACT_JACOBIAN_MODES` pairs each are searched, the largest real parts
-    of the eigenvalues :math:`\theta` of :math:`J` (the least stable :math:`\lambda_\Pi = 1 - \theta`) and the largest
-    moduli (the stiff modes). A target that does not converge within about ``_MAX_MATVECS`` products keeps its
-    converged pairs, and a largest-real-part target whose pairs are all unstable is flagged, both with a warning. The
-    residual bound of a pair is :math:`\max(100\,\epsilon, 10^{-10})\max(1, |\theta|)`, :math:`\epsilon` of the
-    storage precision. Both targets start from the projection of a fixed random vector plus the given directions, so
-    the second one repeats the first one's first ``ncv + 1`` vectors, whose kept products it takes without a product.
+    Searches the two targets of :func:`leading_eigenpairs` with ARPACK (``scipy.sparse.linalg.eigs``) on rank 0, one
+    after the other on one-column products (:meth:`ExactJacobian.matvec`), both from ``v0``: the second target repeats
+    the first one's first ``ncv + 1`` vectors, whose kept products it takes without a product. A target that does not
+    converge within about ``_MAX_MATVECS`` products keeps its converged pairs, and a largest-real-part target whose
+    pairs are all unstable is flagged, both with a warning.
 
-    :param jac: The operator (``n_real``, ``matvec``, ``project``).
+    :param jac: The operator (``n_real``, ``matvec``).
     :param comm: The MPI communicator.
-    :param lr_start: A nonzero real direction in the operator's sector coordinates on rank 0, folded into the start
-        vector both targets share, e.g. the least-stable certified direction, or ``None``.
-    :param lm_start: A nonzero real direction folded into the same shared start vector, e.g. the stiffest certified
-        direction, or ``None``.
-    :return: On rank 0 the tuple ``(lam_pi, res, u)`` sorted by the real part of :math:`\lambda_\Pi`, ``u`` the
-        normalized complex eigenvectors as columns in the operator's sector coordinates; ``None`` elsewhere.
+    :param v0: The real start vector in the operator's sector.
+    :param k: Number of eigenpairs per target.
+    :param ncv: Size of the Arnoldi basis.
+    :param tol: The ARPACK tolerance.
+    :return: The tuple ``(theta, vectors, products)``: the eigenvalues of both targets, their eigenvectors as columns
+        and the number of products.
     """
-    if comm.rank != 0:
-        while comm.bcast(None, root=0):
-            jac.matvec(None)
-        return None
-
-    logger = config.logger
-    n = jac.n_real
-    ncv = min(memory_estimator.EXACT_JACOBIAN_NCV, n)
-    k = min(memory_estimator.EXACT_JACOBIAN_MODES, ncv - 2)
-    tol = max(100 * np.finfo(n_point_base.DTYPE).eps, 1e-10)
+    logger, n = config.logger, jac.n_real
     count, products = [0], {}
 
     def apply(y: np.ndarray) -> np.ndarray:
@@ -915,12 +905,6 @@ def leading_eigenpairs(
         return product
 
     operator = spla.LinearOperator((n, n), matvec=apply, dtype=np.float64)
-    v0 = np.random.default_rng(0).standard_normal(n)
-    v0_norm = np.linalg.norm(v0)
-    for direction in (lr_start, lm_start):
-        if direction is not None:
-            v0 += v0_norm / np.linalg.norm(direction) * direction
-    v0 = jac.project(v0)
     found_theta, found_vectors = [], []
     for which in ("LR", "LM"):
         start = count[0]
@@ -934,22 +918,285 @@ def leading_eigenpairs(
                 f"Exact Jacobian: ARPACK ({which}) converged {theta.size} of {k} eigenpairs within "
                 f"{count[0] - start} products."
             )
-        bound = np.maximum(1e-2, tol * np.maximum(1.0, np.abs(theta)))
-        if which == "LR" and theta.size and np.all((1.0 - theta).real < -bound):
-            logger.warning(
-                f"Exact Jacobian: all {theta.size} eigenpairs of the largest real part are unstable (Re lambda_Pi "
-                f"below -max(0.01, res)); the Jacobian may have more unstable directions than these."
-            )
+        if which == "LR":
+            _warn_if_all_unstable(theta, tol)
         found_theta.append(theta)
         found_vectors.append(vectors)
     products.clear()
-    # released on the normal path only: an exception aborts the job instead of meeting another collective
-    comm.bcast(False, root=0)
-
     theta = np.concatenate(found_theta)
     vectors = np.empty((n, theta.size), dtype=np.complex128, order="F")
     np.concatenate(found_vectors, axis=1, out=vectors)
-    found_vectors.clear()
+    return theta, vectors, count[0]
+
+
+def _warn_if_all_unstable(theta: np.ndarray, tol: float) -> None:
+    r"""
+    Warns when every one of the eigenvalues :math:`\theta` of largest real part a search returned is unstable,
+    :math:`\mathrm{Re}\,\lambda_\Pi < -\max(10^{-2}, \mathrm{res})`: the Jacobian may then have more unstable
+    directions than the search could hold.
+
+    :param theta: The eigenvalues of the largest-real-part target.
+    :param tol: The tolerance the residual bounds derive from.
+    :return: None.
+    """
+    bound = np.maximum(1e-2, tol * np.maximum(1.0, np.abs(theta)))
+    if theta.size and np.all((1.0 - theta).real < -bound):
+        config.logger.warning(
+            f"Exact Jacobian: all {theta.size} eigenpairs of the largest real part are unstable (Re lambda_Pi "
+            f"below -max(0.01, res)); the Jacobian may have more unstable directions than these."
+        )
+
+
+def _wanted_pairs(theta: np.ndarray, k: int) -> np.ndarray:
+    r"""
+    Returns the positions of the Ritz values the two targets of :func:`leading_eigenpairs` want, the ``k`` of largest
+    real part and the ``k`` of largest modulus, each with the conjugate partner of every complex value, the largest
+    real parts first and every position once.
+
+    :param theta: The Ritz values of a real map, closed under conjugation.
+    :param k: Number of values per target.
+    :return: The positions.
+    """
+    out = []
+    for i in [*np.argsort(-theta.real, kind="stable")[:k], *np.argsort(-np.abs(theta), kind="stable")[:k]]:
+        for j in (i, int(np.argmin(np.abs(theta - theta[i].conj()))) if theta[i].imag else i):
+            if j not in out:
+                out.append(j)
+    return np.array(out, dtype=int)
+
+
+def _ritz_sweep(
+    basis: np.ndarray,
+    images: np.ndarray,
+    size: int,
+    y: np.ndarray,
+    theta: np.ndarray,
+    parts: list[tuple[int, bool]] | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    r"""
+    Returns the residuals :math:`W y - \theta\, Q y` of the Ritz pairs ``(theta, y)`` (columns of ``y``) over the
+    first ``size`` columns of the orthonormal basis :math:`Q` and of its images :math:`W = J Q`, from one sweep over
+    row chunks of ``_SWEEP_ROWS`` rows: their norms over :math:`\lVert Q y \rVert`, and with ``parts`` the real
+    columns ``(j, imaginary)`` of them, the real or the imaginary part of the residual of pair ``j``.
+
+    :param basis: The orthonormal basis :math:`Q`, shape ``[n, m]``.
+    :param images: Its images :math:`W`, shape ``[n, m]``.
+    :param size: Number of columns of both that are in use.
+    :param y: The Ritz vectors' coordinates in the basis as columns.
+    :param theta: The Ritz values.
+    :param parts: The residual parts to return, or None.
+    :return: The tuple ``(norms, columns)``, ``columns`` ``[n, len(parts)]`` in Fortran order or None.
+    """
+    squares = np.zeros(y.shape[1])
+    out = None if parts is None else np.empty((basis.shape[0], len(parts)), order="F")
+    for a in range(0, basis.shape[0], _SWEEP_ROWS):
+        rows = slice(a, a + _SWEEP_ROWS)
+        r = images[rows, :size] @ y - (basis[rows, :size] @ y) * theta
+        squares += (r.real**2 + r.imag**2).sum(axis=0)
+        for c, (j, imaginary) in enumerate(parts or []):
+            out[rows, c] = r[:, j].imag if imaginary else r[:, j].real
+    return np.sqrt(squares) / np.linalg.norm(y, axis=0), out
+
+
+def _block_extension(basis: np.ndarray, size: int, block: np.ndarray, norms: np.ndarray) -> int:
+    """
+    Writes the part of every column of ``block`` orthogonal to the first ``size`` columns of ``basis`` and to the
+    columns written before into the next free column of ``basis``, normalized, until ``basis`` is full, like
+    :func:`_orthonormal_extension`, but with the whole block orthogonalized against the old columns at once (twice),
+    which streams them four times per block instead of per column. A column is then orthogonalized against the
+    columns this block wrote, and if that removes more than half of it, once more against the whole basis: the
+    rounding left by the first step, small beside the column before, is not small beside what remains. A column
+    whose remainder is below ``1e-8`` of its reference norm adds nothing. ``block`` is overwritten.
+
+    :param basis: The preallocated basis, shape ``[n, m]``, whose first ``size`` columns are orthonormal (written
+        in place).
+    :param size: Number of orthonormal columns ``basis`` holds.
+    :param block: The columns to append, shape ``[n, c]``.
+    :param norms: The reference norm of every column.
+    :return: The number of orthonormal columns ``basis`` holds afterwards.
+    """
+    kept, start = basis[:, :size], size
+    for _ in range(2):
+        block -= kept @ (kept.T @ block)
+    for column, reference in zip(block.T, norms):
+        if size == basis.shape[1]:
+            break
+        norm, others = np.linalg.norm(column), basis[:, start:size]
+        for _ in range(2):
+            column -= others @ (others.T @ column)
+            before, norm = norm, np.linalg.norm(column)
+            if norm > 0.5 * before:
+                break
+            # a column that mostly cancels is redone against the whole basis, its rounding no longer below its norm
+            others = basis[:, :size]
+        if norm > 1e-8 * reference:
+            basis[:, size] = column / norm
+            size += 1
+    return size
+
+
+def _thick_restart(basis: np.ndarray, images: np.ndarray, h: np.ndarray, size: int, theta: np.ndarray, k: int) -> int:
+    r"""
+    Compacts the basis, in place and without a product, to the Schur vectors of its ``2 k`` Ritz values of largest
+    real part and its ``2 k`` of largest modulus (both members of a complex pair): the real Schur form of the
+    projected map :math:`H = Z T Z^{T}`, ordered with those values first, gives the new basis :math:`Q Z`, its images
+    :math:`W Z` and the projected map :math:`T`, one row chunk at a time.
+
+    :param basis: The orthonormal basis :math:`Q`, shape ``[n, m]``.
+    :param images: Its images :math:`W = J Q`.
+    :param h: The projected map :math:`H = Q^{T} W` in its leading ``size`` rows and columns.
+    :param size: Number of columns in use.
+    :param theta: The Ritz values of :math:`H`.
+    :param k: Number of values per target of the search.
+    :return: The number of columns kept.
+    """
+    n_keep = min(2 * k, theta.size)
+    re_cut, mod_cut = np.sort(theta.real)[::-1][n_keep - 1], np.sort(np.abs(theta))[::-1][n_keep - 1]
+    slack = 1e-10 * max(1.0, float(np.abs(theta).max()))
+    t_mat, z_mat, kept = schur(
+        h[:size, :size], output="real", sort=lambda x, y: x >= re_cut - slack or np.hypot(x, y) >= mod_cut - slack
+    )
+    for vectors in (basis, images):
+        for a in range(0, vectors.shape[0], _SWEEP_ROWS):
+            vectors[a : a + _SWEEP_ROWS, :kept] = vectors[a : a + _SWEEP_ROWS, :size] @ z_mat[:, :kept]
+    h[:kept, :kept] = t_mat[:kept, :kept]
+    return kept
+
+
+def _block_eigenpairs(
+    jac: ExactJacobian, comm: MPI.Comm, columns: list[np.ndarray], k: int, tol: float
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    r"""
+    Searches both targets of :func:`leading_eigenpairs` at once on rank 0 with blocks of products
+    (:meth:`ExactJacobian.matvec_block`), as many columns per block as ``columns`` has. The basis :math:`Q` of at most
+    ``EXACT_JACOBIAN_NCV + 1`` orthonormal vectors is kept together with its images :math:`W = J Q`, so the
+    Rayleigh-Ritz of :math:`H = Q^{T} W` gives the Ritz pairs :math:`(\theta, y)` and their exact residuals
+    :math:`\lVert W y - \theta\, Q y\rVert / \lVert Q y \rVert` without a further product. The wanted pairs are
+    the ``k`` Ritz values of largest real part and the ``k`` of largest modulus with their conjugate partners (see
+    :func:`_wanted_pairs`); a pair has converged when its residual is at most ``tol`` times :math:`\max(1,
+    |\theta|)`. Until every wanted pair has converged, the residuals of the unconverged ones, the real and the
+    imaginary part of a complex pair, the largest real parts first, form the next block (the next Krylov directions of
+    their Ritz vectors). A block that no longer fits compacts the basis to the leading Schur vectors first (see
+    :func:`_thick_restart`), and the search stops after ``_MAX_MATVECS`` blocks or when the basis can no longer
+    grow, keeping the converged pairs with a warning. The start columns are projected onto the operator's sector and
+    orthonormalized first, each one dropped when it keeps less than ``1e-8`` of its norm before the projection, and
+    none of them is held beyond that.
+
+    Rank 0 holds the basis and its images, the residuals of one block and the eigenvectors, as ARPACK holds its basis
+    and the kept products.
+
+    :param jac: The operator (``n_real``, ``project``, ``matvec_block``).
+    :param comm: The MPI communicator.
+    :param columns: The real start columns, as many as a block has (emptied).
+    :param k: Number of eigenpairs per target.
+    :param tol: The relative residual tolerance.
+    :return: The tuple ``(theta, vectors, products, passes)``: the converged wanted eigenvalues, their unit
+        eigenvectors as columns, the number of products and the number of block products.
+    """
+    n, width = jac.n_real, len(columns)
+    m = min(memory_estimator.EXACT_JACOBIAN_NCV + 1, n)
+    basis, images, h = np.empty((n, m), order="F"), np.empty((n, m), order="F"), np.zeros((m, m))
+    norms = np.array([np.linalg.norm(column) for column in columns])
+    start = np.column_stack([jac.project(column) for column in columns])
+    columns.clear()
+    size, done, count, passes, stuck = _block_extension(basis, 0, start, norms), 0, 0, 0, False
+    del start
+    while True:
+        if size > done:
+            comm.bcast(True, root=0)
+            images[:, done:size] = jac.matvec_block(basis[:, done:size])
+            passes += 1
+            h[:size, done:size] = basis[:, :size].T @ images[:, done:size]
+            h[done:size, :done] = basis[:, done:size].T @ images[:, :done]
+            count, done = count + size - done, size
+        theta, y, _ = _schur_ritz(h[:done, :done])
+        wanted = _wanted_pairs(theta, k)
+        res, _ = _ritz_sweep(basis, images, done, y[:, wanted], theta[wanted])
+        converged = res <= tol * np.maximum(1.0, np.abs(theta[wanted]))
+        if converged.all() or passes >= _MAX_MATVECS or stuck:
+            break
+        # a real pair's residual is real: only a complex pair adds its imaginary part
+        picks = [i for i, ok in zip(wanted, converged) if not ok and theta[i].imag >= 0]
+        parts = [(j, part) for j, i in enumerate(picks) for part in (False, True)[: 1 + bool(theta[i].imag)]][:width]
+        _, block = _ritz_sweep(basis, images, done, y[:, picks], theta[picks], parts)
+        if done + block.shape[1] > m:
+            done = size = _thick_restart(basis, images, h, done, theta, k)
+        size = _block_extension(basis, done, block, np.linalg.norm(block, axis=0))
+        stuck, block = size == done, None
+    if not converged.all():
+        config.logger.warning(
+            f"Exact Jacobian: the block search converged {int(converged.sum())} of {converged.size} wanted eigenpairs "
+            f"within {count} products."
+        )
+    largest = set(np.argsort(-theta.real, kind="stable")[:k])
+    _warn_if_all_unstable(theta[[i for i, ok in zip(wanted, converged) if ok and i in largest]], tol)
+    keep, images = wanted[converged], None
+    vectors = np.empty((n, keep.size), dtype=np.complex128, order="F")
+    for a in range(0, n, _SWEEP_ROWS):
+        vectors[a : a + _SWEEP_ROWS] = basis[a : a + _SWEEP_ROWS, :done] @ y[:, keep]
+    for column in vectors.T:
+        column /= np.linalg.norm(column)
+    return theta[keep], vectors, count, passes
+
+
+def leading_eigenpairs(
+    jac: ExactJacobian,
+    comm: MPI.Comm,
+    lr_start: np.ndarray | None = None,
+    lm_start: np.ndarray | None = None,
+    block: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    r"""
+    Computes leading eigenpairs of the Jacobian on rank 0, while every other rank serves the collective products until
+    rank 0 signals the end. Two targets of :data:`~dgamore.memory_estimator.EXACT_JACOBIAN_MODES` pairs each are
+    searched, the largest real parts of the eigenvalues :math:`\theta` of :math:`J` (the least stable
+    :math:`\lambda_\Pi = 1 - \theta`) and the largest moduli (the stiff modes): with one-column products (``block``
+    1) by ARPACK, one target after the other (:func:`_arpack_eigenpairs`), with blocks of ``block`` products, each one
+    Bethe-Salpeter pass per channel (:meth:`ExactJacobian.matvec_block`), both at once (:func:`_block_eigenpairs`).
+    Pairs a search could not converge are dropped with a warning, and a largest-real-part set whose pairs are all
+    unstable is flagged. The residual bound of a pair is :math:`\max(100\,\epsilon, 10^{-10})\max(1, |\theta|)`,
+    :math:`\epsilon` of the storage precision. ARPACK starts from the projection of a fixed random vector plus the
+    given directions; the block search starts from that vector, the given directions and further random vectors as
+    the columns of its first block, each projected.
+
+    :param jac: The operator (``n_real``, ``matvec``, ``matvec_block``, ``project``).
+    :param comm: The MPI communicator.
+    :param lr_start: A nonzero real direction in the operator's sector coordinates on rank 0, e.g. the least-stable
+        certified direction, or ``None``.
+    :param lm_start: A nonzero real direction, e.g. the stiffest certified direction, or ``None``.
+    :param block: Number of columns per product, the operator's block width (``ExactJacobian.block``); the same on
+        every rank.
+    :return: On rank 0 the tuple ``(lam_pi, res, u)`` sorted by the real part of :math:`\lambda_\Pi`, ``u`` the
+        normalized complex eigenvectors as columns in the operator's sector coordinates; ``None`` elsewhere.
+    """
+    if comm.rank != 0:
+        serve = jac.matvec if block == 1 else jac.matvec_block
+        while comm.bcast(None, root=0):
+            serve(None)
+        return None
+
+    logger = config.logger
+    n = jac.n_real
+    ncv = min(memory_estimator.EXACT_JACOBIAN_NCV, n)
+    k = min(memory_estimator.EXACT_JACOBIAN_MODES, ncv - 2)
+    tol = max(100 * np.finfo(n_point_base.DTYPE).eps, 1e-10)
+    rng = np.random.default_rng(0)
+    v0 = rng.standard_normal(n)
+    v0_norm = np.linalg.norm(v0)
+    for direction in (lr_start, lm_start):
+        if direction is not None:
+            v0 += v0_norm / np.linalg.norm(direction) * direction
+    if block == 1:
+        theta, vectors, count = _arpack_eigenpairs(jac, comm, jac.project(v0), k, ncv, tol)
+        passes = count
+    else:
+        columns = [v0, *(d for d in (lr_start, lm_start) if d is not None)][:block]
+        columns += [rng.standard_normal(n) for _ in range(block - len(columns))]
+        del v0
+        theta, vectors, count, passes = _block_eigenpairs(jac, comm, columns, k, tol)
+    # released on the normal path only: an exception aborts the job instead of meeting another collective
+    comm.bcast(False, root=0)
+
     theta, vectors = _merge_modes(theta, vectors, tol)
     # a restart can leave the projected sector, where the operator vanishes; such a zero mode is no loop direction
     inside = [
@@ -961,7 +1208,7 @@ def leading_eigenpairs(
         column /= np.linalg.norm(column)
     lam_pi = 1.0 - theta
     logger.info(
-        f"Exact Jacobian: {lam_pi.size} eigenpairs from {count[0]} products, lambda_Pi "
+        f"Exact Jacobian: {lam_pi.size} eigenpairs from {count} products in {passes} passes, lambda_Pi "
         f"{', '.join(f'{lam.real:+.4f}{lam.imag:+.4f}j' for lam in lam_pi)}."
     )
     return lam_pi, tol * np.maximum(1.0, np.abs(theta)), vectors

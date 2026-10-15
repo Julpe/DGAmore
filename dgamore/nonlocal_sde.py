@@ -204,6 +204,7 @@ def create_auxiliary_chi_r_q_sum(
     rhs: list[FourPoint] | None = None,
     inactive: np.ndarray | None = None,
     slice_rhs: Callable[[int, int, FourPoint], list[FourPoint]] | None = None,
+    involution: np.ndarray | None = None,
 ) -> FourPoint | list[FourPoint] | tuple[FourPoint, list[FourPoint]]:
     r"""
     Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis,
@@ -235,6 +236,10 @@ def create_auxiliary_chi_r_q_sum(
         slice of momentum ``i`` and bosonic index ``w`` of ``gchi0_q_inv`` from that slice's summed auxiliary
         susceptibility ``total``; every slice then also solves them against the factorization of its sum, and the
         result is the tuple of the sum and the solutions (``rhs`` None). None sums only.
+    :param involution: The orbital permutation that transposes the dispersion (see :func:`_orbital_involution`),
+        with which slices that are complex-symmetric only with their orbital pairs permuted take the permuted
+        factorization (see
+        :meth:`~dgamore.four_point.FourPoint.invert_with_local_kernel_and_sum_over_last_vn`), or None.
     :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` as a
         :class:`FourPoint` (half niw range, one fermionic dimension), the solutions for ``rhs`` as a list, or with
         ``slice_rhs`` the tuple ``(sum, solutions)``.
@@ -245,7 +250,7 @@ def create_auxiliary_chi_r_q_sum(
         inactive = _inactive_orbital_pairs(gamma_half, u_r)
     beta = config.sys.beta
     return gchi0_q_inv.invert_with_local_kernel_and_sum_over_last_vn(
-        gamma_half, u_r, 1.0 / beta**2, beta, inactive, rhs, slice_rhs
+        gamma_half, u_r, 1.0 / beta**2, beta, inactive, rhs, slice_rhs, involution
     )
 
 
@@ -743,6 +748,7 @@ def calculate_sigma_kernel_r_q(
     lambda_previous: dict | None = None,
     kernel: FourPoint | None = None,
     weight: float = 1.0,
+    involution: np.ndarray | None = None,
 ) -> FourPoint | None:
     r"""
     Adds the kernel for the self-energy calculation in a specific spin channel, times ``weight``, to ``kernel`` in
@@ -774,11 +780,13 @@ def calculate_sigma_kernel_r_q(
     :param kernel: The self-energy kernel accumulated over the channels (contraction layout), or ``None`` to skip the
         channel kernel (the Eliashberg-only pass).
     :param weight: The channel's weight in the sum of the kernels.
+    :param involution: The orbital permutation that transposes the dispersion (see :func:`_orbital_involution`), or
+        None; passed to :func:`create_auxiliary_chi_r_q_sum`.
     :return: ``kernel``.
     """
     logger = config.logger
 
-    gchi_aux_q_r_sum = create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc)
+    gchi_aux_q_r_sum = create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc, involution=involution)
 
     mpi_dist_irrq.barrier()
 
@@ -1030,22 +1038,26 @@ class _ColumnSdeStream:
 
     1. receives the irreducible-BZ rows of the columns of its tasks in the group, of every kernel, in rounds of whole
        tasks of at most ``chunk_bytes`` (:func:`~dgamore.mpi_utils.transpose_columns`),
-    2. expands each column of each kernel to the full BZ with :meth:`FourPoint.map_to_full_bz` into one buffer reused
-       for every column, Fourier transforms it in place over the momentum axes in the order z, y, x (a time-reversed
-       column is conjugated afterwards) and contracts it with the frequency slab at :math:`\nu - \omega` of the Green's
-       function of every term of the kernel in bounded real-space row chunks, adding the product to the task's partial
-       sum of the term's output (columns in block order, per column the kernels and their terms in the given order),
-    3. scales the task's partial sum of every output and folds it into the output's running sum of :math:`\nu`, which
-       the rank keeps across the groups.
+    2. expands its columns of each kernel to the full BZ with :meth:`FourPoint.map_to_full_bz`, in batches of
+       consecutive columns of at most :data:`~dgamore.memory_estimator.SDE_UNFOLD_BATCH_BYTES` with their tasks' partial
+       sums (one column when a column is larger, see :func:`~dgamore.memory_estimator.sde_unfold_batch`) into one
+       buffer reused for every batch, Fourier transforms them in place over the momentum axes in the order z, y, x (a
+       time-reversed column is conjugated afterwards) and contracts each column with the frequency slab at
+       :math:`\nu - \omega` of the Green's function of every term of the kernel in bounded real-space row chunks,
+       adding the product to the task's partial sum of the term's output (per batch the kernels in the given order,
+       per kernel the columns in block order and their terms in the given order),
+    3. scales a finished task's partial sum of every output and folds it into the output's running sum of
+       :math:`\nu`, which the rank keeps across the groups.
 
     :meth:`finish` then reduces one output: the owner of :math:`\nu` (the rank holding its first block) folds the other
     ranks' sums in rank order, and rank 0 gathers the result. The bosonic sum is associated in the fixed blocks and in
     the fixed rank order of the schedule. With ``by_frequency`` every block holds one stored frequency and the groups
     pass the blocks in the schedule's order whatever their sizes, so an output depends on the box, the rank count and
-    its own terms only, never on the groups, ``chunk_bytes`` or the other outputs; without it the only group is the
-    whole bosonic range. Beyond the read-only kernels and windows a rank holds one round of irreducible columns of
-    every kernel, under two full-BZ columns, and per output its owned results, at most one running sum of a frequency
-    another rank owns and a partial sum.
+    its own terms only, never on the groups, ``chunk_bytes`` or the other outputs beyond the rounding of the batched
+    unfold, whose batch widths they set; without it the only group is the whole bosonic range. Beyond the read-only
+    kernels and windows a rank holds one round of irreducible columns of every kernel, under two batches of full-BZ
+    columns, and per output its owned results, at most one running sum of a frequency another rank owns and the partial
+    sums of the tasks of a batch.
     """
 
     _TRANSPOSE_TAG, _PARTIAL_TAG = 1200, 1300  # base MPI tags of the column transpose and the partial sums
@@ -1130,11 +1142,34 @@ class _ColumnSdeStream:
         path = ["einsum_path", (0, 1)]
         scale = -0.5 / config.sys.beta / n_r
 
-        partials = [np.empty((n_r, nb, nb), dtype=self._dtype) for _ in self._sums]
+        n_column = n_r * nb**4
+        n_mine = [
+            sum(len(blocks[t % n_b][1]) for t in tasks_of[rank][k * per_round : (k + 1) * per_round])
+            for k in range(n_rounds)
+        ]
+        batch = memory_estimator.sde_unfold_batch(
+            n_column * self._dtype.itemsize,
+            len(self._sums) * n_r * nb**2 * self._dtype.itemsize,
+            max(n_mine, default=0),
+        )
         acc = np.empty((n_r, nb, nb), dtype=self._dtype)
-        column = np.empty((n_r, nb, nb, nb, nb, 1), dtype=self._dtype)  # every column is unfolded into this one buffer
+        buffer = np.empty(batch * n_column, dtype=self._dtype)  # every batch of columns is unfolded into this buffer
         report_at = {-(-n_rounds // 2), n_rounds} if whole else set()
-        # deferred_collection batches the gc pass of the per-column object releases into one collection at the end
+
+        def fold(t: int, partials: list[np.ndarray]) -> None:
+            """Scales a finished task's partial sums and folds them into the running sums of its frequency."""
+            v = t // n_b
+            for out, partial in enumerate(partials):
+                partial *= scale
+                sums = self._sums[out]
+                if v not in sums:
+                    mine = self._owner[v] == rank
+                    sums[v] = self._results[out][v - self._my_v[0]] if mine else np.empty_like(partial)
+                    np.copyto(sums[v], partial)
+                else:
+                    sums[v] += partial
+
+        # deferred_collection batches the gc pass of the per-batch object releases into one collection at the end
         with deferred_collection():
             for k in range(n_rounds):
                 round_of = [tasks[k * per_round : (k + 1) * per_round] for tasks in tasks_of]
@@ -1143,17 +1178,24 @@ class _ColumnSdeStream:
                     mpi_utils.transpose_columns(kernel.mat, self._dist, index_of, self._TRANSPOSE_TAG)
                     for kernel in kernels
                 ]
-                c = 0
-                for t in round_of[rank]:
-                    v, (negative, ws) = t // n_b, blocks[t % n_b]
-                    for partial in partials:
-                        partial[...] = 0
-                    for w in ws:
-                        for i, block in enumerate(received):
+                # this rank's columns as (task, bosonic frequency), in the order of its received blocks
+                mine = [(t, w) for t in round_of[rank] for w in blocks[t % n_b][1]]
+                partials = {}
+                for c0 in range(0, len(mine), batch):
+                    chunk = mine[c0 : c0 + batch]
+                    for t, _ in chunk:
+                        if t not in partials:
+                            partials[t] = [np.zeros((n_r, nb, nb), dtype=self._dtype) for _ in self._sums]
+                    out_buf = buffer[: len(chunk) * n_column].reshape(n_r, nb, nb, nb, nb, len(chunk))
+                    for i, block in enumerate(received):
+                        src = block[..., c0 : c0 + len(chunk)]
+                        cols = FourPoint(src, SpinChannel.NONE, config.lattice.nk, 1, 0, False, True, True)
+                        cols = cols.map_to_full_bz(k_grid, out=out_buf).fft(copy=False, axes=(2, 1, 0))
+                        for j, (t, w) in enumerate(chunk):
+                            v, negative = t // n_b, blocks[t % n_b][0]
                             col = FourPoint(
-                                block[..., c : c + 1], SpinChannel.NONE, config.lattice.nk, 1, 0, False, True, True
+                                cols[..., j : j + 1], SpinChannel.NONE, config.lattice.nk, 1, 0, False, True, True
                             )
-                            col = col.map_to_full_bz(k_grid, out=column).fft(copy=False, axes=(2, 1, 0))
                             # time reversal of real hoppings conjugates at fixed R: K^{-w,v}(R) = conj(K^{w,-v}(R))
                             if negative:
                                 col = col.conj(copy=False)
@@ -1168,18 +1210,12 @@ class _ColumnSdeStream:
                                         out=acc[r0 : r0 + rows],
                                         optimize=path,
                                     )
-                                np.add(partials[out], acc, out=partials[out])
-                            col.free()
-                        c += 1
-                    for out, partial in enumerate(partials):
-                        partial *= scale
-                        sums = self._sums[out]
-                        if v not in sums:
-                            mine = self._owner[v] == rank
-                            sums[v] = self._results[out][v - self._my_v[0]] if mine else np.empty_like(partial)
-                            np.copyto(sums[v], partial)
-                        else:
-                            sums[v] += partial
+                                np.add(partials[t][out], acc, out=partials[t][out])
+                        cols.free()
+                    # every task except one continuing into the next batch is complete
+                    following = mine[c0 + len(chunk)][0] if c0 + len(chunk) < len(mine) else None
+                    for t in [t for t in partials if t != following]:
+                        fold(t, partials.pop(t))
                 del received
                 if k + 1 in report_at:
                     config.logger.info(f"Self-energy contraction: {k + 1} of {n_rounds} column rounds done.")
@@ -1248,7 +1284,8 @@ def _run_column_sde(
     for :math:`\nu \geq 0`: one :class:`_ColumnSdeStream` of one output, fed the whole bosonic range at once, its
     blocks the runs of :data:`~dgamore.memory_estimator.SDE_W_BLOCK` consecutive frequencies of
     :func:`~dgamore.memory_estimator.column_sde_schedule` (all positive, then all negative frequencies). The result
-    depends on the box and the rank count only, never on ``chunk_bytes``.
+    depends on the box and the rank count only, never on ``chunk_bytes`` beyond the rounding of the batched unfold (see
+    :class:`_ColumnSdeStream`).
 
     :param kernel_irr: The rank-local irreducible-BZ kernel ``[q, o1, o2, o3, o4, w, v]`` (half bosonic, full
         fermionic range, compressed momentum axis); only read.
@@ -1746,6 +1783,35 @@ def _has_time_reversal(ek: np.ndarray) -> bool:
     return bool(np.allclose(flipped, np.swapaxes(ek, -1, -2), rtol=0.0, atol=1e-4 * np.abs(ek).max()))
 
 
+def _orbital_involution(ek: np.ndarray) -> np.ndarray | None:
+    r"""
+    Returns the orbital permutation :math:`\pi`, its own inverse and not the identity, under which the dispersion is
+    transposed, :math:`\varepsilon_{21}(\mathbf{k}) = \varepsilon_{\pi(1)\pi(2)}(\mathbf{k})` at every momentum
+    to 1e-4 of its largest element (the tolerance of :func:`_has_time_reversal`), or None. Real hoppings and an
+    inversion that permutes the orbitals, such as the layer swap of a bilayer, give it, and the ladder's
+    Bethe-Salpeter slices inherit it on their orbital pairs to the precision of the self-energy; whether a slice
+    uses it is decided per slice (see
+    :meth:`~dgamore.four_point.FourPoint.invert_with_local_kernel_and_sum_over_last_vn`). The candidate pairs every
+    orbital with the one other orbital whose diagonal dispersion matches its own; an orbital with several such
+    partners gives None.
+
+    :param ek: The band dispersion ``[kx, ky, kz, o1, o2]``.
+    :return: The permutation as an index array, or None.
+    """
+    n_bands = ek.shape[-1]
+    atol = 1e-4 * np.abs(ek).max()
+    diagonal = np.diagonal(ek, axis1=-2, axis2=-1).reshape(-1, n_bands)
+    pi = np.arange(n_bands)
+    for i in range(n_bands):
+        matches = [np.allclose(diagonal[:, j], diagonal[:, i], rtol=0.0, atol=atol) for j in range(n_bands)]
+        partners = [j for j in range(n_bands) if j != i and matches[j]]
+        if len(partners) > 1:
+            return None
+        pi[i] = partners[0] if partners else i
+    transposed = np.allclose(np.swapaxes(ek, -1, -2), ek[..., pi, :][..., pi], rtol=0.0, atol=atol)
+    return pi if transposed and np.any(pi != np.arange(n_bands)) else None
+
+
 def calculate_sigma_proposal(
     sigma_in: SelfEnergy,
     mu: float,
@@ -1774,7 +1840,8 @@ def calculate_sigma_proposal(
     :meth:`~dgamore.self_energy.SelfEnergy.symmetrize_time_reversal`): the Schwinger-Dyson equation is one-sided,
     with the three-leg vertex on the first external orbital and the interaction on the second, time reversal maps it
     onto the mirrored form, and the average is the two-sided equation. One band needs no average, its one-sided
-    equation already obeys time reversal.
+    equation already obeys time reversal. An orbital permutation that transposes the dispersion (see
+    :func:`_orbital_involution`) reaches the Bethe-Salpeter slices of both channels.
 
     Single source of truth for the proposal map: it is called once per self-consistency iteration by
     :func:`calculate_self_energy_q`, plus once with ``eliashberg_only`` after a loop that converged before its last
@@ -1793,7 +1860,8 @@ def calculate_sigma_proposal(
     :param my_irr_q_list: This rank's irreducible q-point list.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param comm: The MPI communicator.
-    :param current_iter: The current iteration number (the RPA susceptibility is saved only on iteration 1).
+    :param current_iter: The current iteration number (the RPA susceptibility is saved and the orbital involution
+        logged only on iteration 1).
     :param annealer: The active :class:`LambdaAnnealer` threaded into the kernel step, or ``None`` when annealing
         is off.
     :param chunk_budgets: Chunk byte budgets, of which the self-energy contraction reads its own (sized by the driver
@@ -1876,6 +1944,12 @@ def calculate_sigma_proposal(
         gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
 
     chunk_bytes = _sde_chunk_budget(comm, shared_node_comm) if chunk_budgets is None else chunk_budgets.sde
+    involution = _orbital_involution(config.lattice.hamiltonian.get_ek())
+    if involution is not None and current_iter == 1:
+        logger.info(
+            f"The orbital permutation {involution.tolist()} transposes the dispersion: Bethe-Salpeter slices that are "
+            f"complex-symmetric only with their orbital pairs permuted take the permuted factorization."
+        )
 
     gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
         shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
@@ -1892,6 +1966,7 @@ def calculate_sigma_proposal(
         save_eliashberg=save_eliashberg,
         lambda_previous=lambda_previous,
         kernel=kernel,
+        involution=involution,
     )
     gamma_dens.mat = None
     if gamma_dens_win is None:
@@ -1916,6 +1991,7 @@ def calculate_sigma_proposal(
         lambda_previous=lambda_previous,
         kernel=kernel,
         weight=3.0,
+        involution=involution,
     )
     gchi0_q_core_inv.free()
     gchi0_q_full_sum.free()
@@ -2283,8 +2359,9 @@ def _install_exact_jacobian(
 ) -> None:
     r"""
     Evaluates the leading eigenpairs of the exact Jacobian of the self-energy map at the converged self-energy
-    (see :class:`~dgamore.sigma_jacobian.ExactJacobian` and :func:`~dgamore.sigma_jacobian.leading_eigenpairs`),
-    started from the least stable and the stiffest certified direction of rank 0's tracker (see
+    (see :class:`~dgamore.sigma_jacobian.ExactJacobian` and :func:`~dgamore.sigma_jacobian.leading_eigenpairs`) on
+    blocks of the operator's block width, started from the least stable and the stiffest certified direction of rank
+    0's tracker (see
     :meth:`JacobianTracker.start_directions`), and makes them the spectrum the tracker writes to ``jacobian.npz``
     (see :meth:`JacobianTracker.install_exact_spectrum`). Collective over ``comm``.
 
@@ -2311,7 +2388,7 @@ def _install_exact_jacobian(
         sigma, mu, u_loc, v_nonloc, v_nonloc_full, sigma_dmft_full, mpi_dist_irrk, mpi_dist_fullbz, comm, chunk_budgets
     )
     starts = tracker.start_directions() if comm.rank == 0 else (None, None)
-    spectrum = leading_eigenpairs(jac, comm, *starts)
+    spectrum = leading_eigenpairs(jac, comm, *starts, block=jac.block)
     jac.free()  # on the normal path only: an exception aborts the job instead of meeting another collective
     if comm.rank == 0:
         tracker.install_exact_spectrum(*spectrum)

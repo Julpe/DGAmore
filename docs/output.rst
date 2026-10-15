@@ -342,7 +342,7 @@ separate momentum axes.
        eigenvalue, error bound and inverse temperature of the predecessor mode it matched (``lam_prev``, ``res_prev``,
        ``beta_prev``, ``nan`` without a match or a predecessor), plus the window ``shape``, ``beta``, ``p_eff``, whether
        the run ``converged`` and whether the spectrum is ``exact``, i.e. comes from the exact Jacobian
-       (``use_exact_jacobian``): the leading eigenpairs at the pure fixed point, residual bounds at the ARPACK
+       (``use_exact_jacobian``): the leading eigenpairs at the pure fixed point, residual bounds at the eigen-solve's
        tolerance, or, in a run that stopped short of it (``converged`` false), the last in-loop exact check, whose
        Arnoldi residuals reach up to the certification gate at a non-converged iterate. A run that never ends its
        loop leaves the traces alone, which a successor does not carry. Read by a successor run started from this folder,

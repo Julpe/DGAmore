@@ -62,6 +62,10 @@ SDE_COLUMN_FACTOR: float = 1.75
 # size, so the contraction runs over the real-space rows in pieces of it (per-row results do not depend on it).
 SDE_CONTRACTION_CHUNK_BYTES: int = 32 * 1024**2
 
+# Bytes of full-BZ kernel columns, with their tasks' partial sums, the self-energy contraction unfolds and transforms
+# in one call (about one rank's L3 share, so a batch adds at most a few MiB); a column above it runs alone.
+SDE_UNFOLD_BATCH_BYTES: int = 4 * 1024**2
+
 # The chunk element budgets of dgamore.greens_function (_MOMENTUM_CHUNK_ELEMENTS of the occupation and in-box
 # potential-energy sums, _MODEL_EPOT_CHUNK_ELEMENTS of the Dyson build and the analytic potential-energy tail) and the
 # tail's default frequency count (GreensFunction.get_epot's niv_asympt); test-locked to those values.
@@ -349,6 +353,20 @@ def column_sde_schedule(
     return blocks, bounds, owner
 
 
+def sde_unfold_batch(column_bytes: int, partial_bytes: int, n_columns: int) -> int:
+    r"""
+    Returns the number of full-BZ kernel columns the column-distributed self-energy contraction
+    (:class:`dgamore.nonlocal_sde._ColumnSdeStream`) unfolds and transforms in one call: as many as fit
+    :data:`SDE_UNFOLD_BATCH_BYTES` with the partial sums of their tasks, at least one and at most ``n_columns``.
+
+    :param column_bytes: Bytes of one full-BZ kernel column.
+    :param partial_bytes: Bytes of the partial sums of every output of one task.
+    :param n_columns: Number of columns a rank contracts in one round.
+    :return: The batch size in columns.
+    """
+    return max(1, min(n_columns, SDE_UNFOLD_BATCH_BYTES // (column_bytes + partial_bytes)))
+
+
 def column_sde_slabs(
     niw: int, niv: int, n_ranks: int, n_out: int = 1, by_frequency: bool = False, carried: bool = False
 ) -> int:
@@ -399,8 +417,8 @@ def column_sde_stream_bytes(
     (:class:`dgamore.nonlocal_sde._ColumnSdeStream` with ``by_frequency``) beside the kernels of a group: the slabs
     held from its first group to its end (see :func:`column_sde_slabs`), and the transient of a group or of the
     reduction beside them: one round of one-column tasks of every kernel with one kernel's ring send copy, the full-BZ
-    column work with the contraction's operand chunk, every output's partial, the contraction buffer and one output's
-    receive buffers.
+    column work of one batch (see :func:`sde_unfold_batch`) with the contraction's operand chunk, every output's
+    partial of every task of the batch, the contraction buffer and one output's receive buffers.
 
     :param nk_irr: Number of momentum points in the irreducible BZ.
     :param nk_tot: Total number of momentum points (full BZ).
@@ -420,8 +438,9 @@ def column_sde_stream_bytes(
     full_column = DTYPE_BYTES * _bubble_block(nk_tot, n_bands, 1, 1)
     slab = DTYPE_BYTES * _giwk_rspace(nk_tot, n_bands, 1)
     carried = column_sde_slabs(niw, niv, n_ranks, n_out, by_frequency=True, carried=True)
-    work = column_sde_slabs(niw, niv, n_ranks, n_out, by_frequency=True) - carried
-    columns = SDE_COLUMN_FACTOR * full_column + min(SDE_CONTRACTION_CHUNK_BYTES, full_column)
+    batch = sde_unfold_batch(full_column, n_out * slab, per_round)
+    work = column_sde_slabs(niw, niv, n_ranks, n_out, by_frequency=True) - carried + (batch - 1) * n_out
+    columns = SDE_COLUMN_FACTOR * batch * full_column + min(SDE_CONTRACTION_CHUNK_BYTES, full_column)
     return carried * slab, per_round * column * (n_kernels + q_rank / nk_irr) + columns + work * slab
 
 
@@ -1037,13 +1056,16 @@ def estimate_peaks(
     )
 
     # Column-distributed contraction: the irr kernel, one round of irr columns (whole tasks) with the ring's send
-    # copy, the full-BZ column work with the contraction's operand chunk, and the busiest rank's real-space slabs.
+    # copy, an unfold batch of full-BZ columns with the operand chunk and partials, the busiest rank's real-space slabs.
     _, sde_bounds, _ = column_sde_schedule(niw_core, niv_core, n_ranks)
     sde_task = DTYPE_BYTES * _bubble_block(nk_irr, nb, 1, SDE_W_BLOCK)
-    sde_round = min(max(1, chunk_budgets.sde // sde_task), int(np.max(np.diff(sde_bounds)))) * sde_task
+    sde_tasks = min(max(1, chunk_budgets.sde // sde_task), int(np.max(np.diff(sde_bounds))))
+    sde_round = sde_tasks * sde_task
     sde_column = DTYPE_BYTES * _bubble_block(nk_tot, nb, 1, 1)
-    sde_columns = SDE_COLUMN_FACTOR * sde_column + min(SDE_CONTRACTION_CHUNK_BYTES, sde_column)
-    sde_slabs = column_sde_slabs(niw_core, niv_core, n_ranks) * DTYPE_BYTES * _giwk_rspace(nk_tot, nb, 1)
+    sde_slab = DTYPE_BYTES * _giwk_rspace(nk_tot, nb, 1)
+    sde_batch = sde_unfold_batch(sde_column, sde_slab, sde_tasks * SDE_W_BLOCK)
+    sde_columns = SDE_COLUMN_FACTOR * sde_batch * sde_column + min(SDE_CONTRACTION_CHUNK_BYTES, sde_column)
+    sde_slabs = (column_sde_slabs(niw_core, niv_core, n_ranks) + sde_batch - 1) * sde_slab
     sde_distributed = scale * _bubble_block(qi, nb, wp, vc) + overhead * (
         sde_round * (1 + qi / nk_irr) + sde_columns + sde_slabs
     )
@@ -1211,8 +1233,8 @@ def estimate_peaks(
         # the loop Sigma, the loop-box G and change windows, and the real-space windows of G and of a piece's changes
         rspace = scale * _giwk_rspace(nk_tot, nb, gf_window_bubble)
         windows = sigma_shared + 2 * giwk_bubble + vertices + overhead * block_vectors + (m + 1) * rspace
-        # rank 0's solvers in float64 sector vectors (measured): the in-loop check's basis, products, complex
-        # eigenvectors and four temporaries; ARPACK's basis, kept products, eigenvectors and the two start directions
+        # rank 0's solvers in float64 sector vectors (measured): the in-loop check's basis, products, eigenvectors and
+        # four temporaries; the end-of-rung basis with kept products or images, eigenvectors and two start vectors
         check = (4 * EXACT_CHECK_BASIS + 4) * vector
         arpack = (2 * (EXACT_JACOBIAN_NCV + 1) + 3 * EXACT_JACOBIAN_MODES + 11) * vector
         # a product's unfolded window change or its finalize (two core windows each), the real-space u_loc + V(q)

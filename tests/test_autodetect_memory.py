@@ -440,9 +440,9 @@ def test_dgamore_excludes_osc_ucx_before_mpi_init():
 
 def test_local_step_overflow_raises_before_the_flag_loop(fake_system, monkeypatch):
     """A budget below the flag-less local single peak raises MemoryError naming the local Schwinger-Dyson step."""
-    # the energy step's analytic tail (EPOT_NIV_ASYMPT frequencies) outgrows this small box's other branches; shrink
-    # it so the branch under test stays the largest
+    # the energy tail and the SDE unfold batch outgrow this small box's branches; shrink both
     monkeypatch.setattr(dgamore_main.memory_estimator, "EPOT_NIV_ASYMPT", 1)
+    monkeypatch.setattr(dgamore_main.memory_estimator, "SDE_UNFOLD_BATCH_BYTES", 1)
     monkeypatch.setattr(config.box, "niv_core", 40)
     monkeypatch.setattr(config.box, "niv_full", 100)
     params = {**FIXTURE_PARAMS, "niv_core": 40, "niv_full": 100, "niv_cut": 50}  # niv_cut = min(10 + 100 + 10, 50)
