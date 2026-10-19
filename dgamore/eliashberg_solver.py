@@ -1472,17 +1472,28 @@ def _gap_orbital_mirrors(n_bands: int) -> dict:
     reduces to momentum-only mirrors and falls back to the Loewdin basis wherever those do not resolve a multiplet.
 
     :param n_bands: Number of orbitals of the gap.
-    :return: A dict ``{axis: U}`` (empty when there is nothing to apply or the mirrors cannot be determined).
+    :return: A dict ``{axis: U}`` (empty when there is nothing to apply or the mirrors cannot be determined; with
+        uncorrelated orbitals an axis whose mirror is no symmetry of the correlated block maps to ``None``, with a
+        warning).
     """
     if n_bands < 2:
         return {}
 
+    orbitals = config.sys.correlated_orbitals
     try:
         ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
-        return find_coordinate_mirror_orbital_unitaries(np.asarray(ek, dtype=np.complex128))
+        mirrors = find_coordinate_mirror_orbital_unitaries(np.asarray(ek, dtype=np.complex128), orbitals=orbitals)
     except Exception as exc:  # never let a symmetry probe abort a solve; momentum-only mirrors still work
-        config.logger.debug(f"Could not determine the orbital mirror matrices for the gap symmetrization: {exc}")
+        log = config.logger.debug if orbitals is None else config.logger.warning
+        log(f"Could not determine the orbital mirror matrices for the gap symmetrization: {exc}")
         return {}
+    dropped = sorted(axis for axis, u in mirrors.items() if u is None)
+    if dropped:
+        config.logger.warning(
+            f"The orbital mirrors of axes {dropped} are no symmetry of the correlated block; the gap symmetrization "
+            f"reflects only the momenta there."
+        )
+    return mirrors
 
 
 def _mirror_acts_on_orbitals(u: np.ndarray | None) -> bool:

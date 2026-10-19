@@ -59,6 +59,35 @@ class DMFTInterface(ABC):
         """
         raise NotImplementedError()
 
+    def get_np(self, ineq: int = 1) -> int:
+        """
+        Returns the number of uncorrelated (p) orbitals of an inequivalent atom from the DMFT calculation.
+
+        :param ineq: The index of the inequivalent atom (for multi-site DMFT).
+        :return: The number of p orbitals.
+        :raises NotImplementedError: In the abstract base class.
+        """
+        raise NotImplementedError()
+
+    def get_p_interaction(self, ineq: int = 1) -> dict[str, float]:
+        """
+        Returns the interactions that involve the p orbitals of an inequivalent atom.
+
+        :param ineq: The index of the inequivalent atom (for multi-site DMFT).
+        :return: The interaction values by name.
+        :raises NotImplementedError: In the abstract base class.
+        """
+        raise NotImplementedError()
+
+    def get_dc_lattice(self) -> np.ndarray:
+        """
+        Returns the double counting on every orbital of the lattice Hamiltonian.
+
+        :return: The double counting ``[o1, o2]``.
+        :raises NotImplementedError: In the abstract base class.
+        """
+        raise NotImplementedError()
+
     def get_totdens(self) -> float:
         """
         Returns the total electron density from the DMFT calculation.
@@ -193,6 +222,36 @@ class W2dynInterface(DMFTInterface):
         :return: The number of interacting d-orbitals.
         """
         return self._from_ineq_config("nd", ineq=ineq)
+
+    def get_np(self, ineq: int = 1) -> int:
+        """
+        Reads the number of uncorrelated (p) orbitals of an inequivalent atom from the w2dynamics config.
+
+        :param ineq: The index of the inequivalent atom (for multi-site DMFT).
+        :return: The number of p orbitals (0 when the config has none).
+        """
+        return int(self.file_1p[".config"].attrs.get(f"atoms.{ineq:1}.np", 0))
+
+    def get_p_interaction(self, ineq: int = 1) -> dict[str, float]:
+        """
+        Reads the interactions that involve p orbitals from the w2dynamics config.
+
+        :param ineq: The index of the inequivalent atom (for multi-site DMFT).
+        :return: The values of ``udp``, ``upp``, ``jdp``, ``jpp``, ``vpp``, ``uppod`` and ``jppod`` (0 when absent).
+        """
+        attrs = self.file_1p[".config"].attrs
+        keys = ("udp", "upp", "jdp", "jpp", "vpp", "uppod", "jppod")
+        return {key: float(attrs.get(f"atoms.{ineq:1}.{key}", 0.0)) for key in keys}
+
+    def get_dc_lattice(self, dmft_iter: str = "dmft-last") -> np.ndarray:
+        """
+        Reads the double counting on every orbital of the lattice and averages it over spin.
+
+        :param dmft_iter: The DMFT iteration to read from.
+        :return: The double counting ``[o1, o2]``.
+        """
+        dc = self.file_1p[dmft_iter + "/dc-latt/value"][()]  # [band1, spin1, band2, spin2]
+        return 0.5 * (dc[:, 0, :, 0] + dc[:, 1, :, 1])
 
     def get_totdens(self, dmft_iter: str = "dmft-last") -> float:
         """

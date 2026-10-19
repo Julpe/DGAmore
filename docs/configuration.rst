@@ -103,6 +103,14 @@ only and do not describe a real material; they serve to show the file layout and
 .. literalinclude:: u_matrix.dat
    :caption: ``u_matrix.dat``
 
+With uncorrelated orbitals in the Hamiltonian (see :ref:`uncorrelated-orbitals`), the interaction file describes the
+correlated orbitals alone. Its orbital indices count only the correlated orbitals, 1, 2, ..., atom by atom in the
+order of ``ineq_ordering`` and within an atom in the order of the Hamiltonian, skipping every uncorrelated orbital, and
+its first line gives the number of correlated orbitals. The uncorrelated orbitals take no entry, local or non-local.
+For example, with ``ineq_ordering: [1, 2]``, one correlated and two uncorrelated orbitals on atom 1 and three
+correlated and one uncorrelated orbital on atom 2, the Hamiltonian orbitals are ordered d p p d d d p; its correlated
+orbitals 1, 4, 5 and 6 are the interaction indices 1, 2, 3 and 4, and the file starts with ``4``.
+
 Finally, ``nk`` sets the size of the momentum grid, which is shared by the one-particle quantities and the
 ladder (the q-grid always equals the k-grid).
 
@@ -413,8 +421,36 @@ full four-band orbital-diagonal space. The ``n_ineq`` field gives the number of 
 (one for :math:`\mathrm{La}_3\mathrm{Ni}_2\mathrm{O}_7`), and ``ineq_ordering`` specifies how these are distributed
 across the orbital-diagonal entries of the Hamiltonian; setting it to ``[1, 1]`` correctly populates the four-orbital
 space by repeating the first atom's data. The entries may be ordered arbitrarily or repeated to suit different
-layered geometries, as long as the total number of orbitals they represent matches the number of bands in the
-Hamiltonian input.
+layered geometries, as long as the total number of orbitals they represent (correlated and uncorrelated ones
+together, see below) matches the number of bands in the Hamiltonian input.
+
+.. _uncorrelated-orbitals:
+
+Uncorrelated orbitals
+^^^^^^^^^^^^^^^^^^^^^
+
+A Hamiltonian may hold non-interacting orbitals next to the correlated ones, for example the two oxygen
+:math:`p` orbitals of the three-band Emery model beside its copper :math:`d_{x^2-y^2}` orbital. Nothing has to be
+configured: the number of such orbitals of every inequivalent atom is read from the w2dynamics input
+(``atoms.<i>.np``), and the Hamiltonian is expected in the w2dynamics layout, every atom of ``ineq_ordering``
+holding its correlated (:math:`d`) orbitals followed by its uncorrelated (:math:`p`) ones. A Hamiltonian whose
+orbital count differs from that of its atoms is refused at startup.
+
+Because the interaction acts on the correlated orbitals only, the local vertex and the full vertex have correlated
+legs only, so the Bethe-Salpeter and Schwinger-Dyson equations, the lambda correction and the Eliashberg equation
+are solved for the correlated orbitals alone, exactly. The uncorrelated orbitals enter the lattice Dyson equation,
+whose correlated block of the inverse over every orbital is the Green's function the ladder uses, the filling and
+chemical potential (which count every electron), the occupation and the kinetic energy. Orbitals with an interaction
+(``Udp``, ``Upp``, ``Jdp``, ``Jpp``, ``Vpp``, ``Uppod``, ``Jppod`` non-zero) and a double counting outside the
+correlated orbitals are not supported and refused at startup.
+
+With ``symmetries: "auto"`` the operations are discovered on the correlated block of the powers of the Hamiltonian,
+so the full point group is found even where the uncorrelated orbitals sit off the unit-cell origin (in the
+cell-periodic Wannier gauge the mirrors of the Emery model act on its :math:`p` orbitals with momentum-dependent
+phases), and every discovered operation is checked exactly against the Hamiltonian before it is used. The predefined
+and individual symmetries act on the correlated orbitals. All written quantities, the Green's functions and the
+spectral functions included, hold the correlated orbitals; the spectral functions are continued in the eigenbasis of
+the correlated block of the Hamiltonian.
 
 Eliashberg equation
 -------------------

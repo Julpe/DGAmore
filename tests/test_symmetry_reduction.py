@@ -15,7 +15,7 @@ import pytest
 from unittest.mock import MagicMock
 
 import dgamore.symmetry_reduction as sr
-from tests.conftest import p_orbital_hk
+from tests.conftest import emery_hk, p_orbital_hk
 
 
 def test_enumerate_integer_matrices_returns_only_gl3z_matrices():
@@ -1674,3 +1674,55 @@ def test_stabilizer_unitaries_list_each_element_with_the_points_it_fixes():
     for (positions, _), g in zip(stabilizers, sr._ordered(group, nk)):
         action = sr._g_action_on_kgrid(g, nk)
         assert np.array_equal(positions, np.flatnonzero(action == points)) and 0 in positions
+
+
+def test_correlated_block_proxy_finds_the_square_group_that_the_cell_gauge_hides():
+    """The Emery H(k) admits 2 constant-U operations, its correlated-block proxy all 8 of the square lattice."""
+    nk = (8, 8, 1)
+    hk = emery_hk(nk)
+    assert len(sr.get_symmetry_reduction(hk)["group"]) == 2
+    proxy = sr.correlated_block_proxy(hk, np.array([0]))
+    res = sr.get_symmetry_reduction(proxy)
+    assert proxy.shape == (*nk, 1, 1) and len(res["group"]) == 8 and res["n_ibz"] == 15
+    sr.check_correlated_group(res["group"], hk, np.array([0]))
+
+
+def test_check_correlated_group_refuses_an_operation_that_the_hybridization_breaks():
+    """The x-y swap is a symmetry of the isotropic Emery model only; an anisotropic t_pd makes the check raise."""
+    nk = (4, 4, 1)
+    swap_matrix = np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]])
+    swap = sr._GroupElement(swap_matrix, np.zeros(3, dtype=np.int64), np.eye(1), 1, False, nk)
+    sr.check_correlated_group([swap], emery_hk(nk), np.array([0]))
+    anisotropic = emery_hk(nk)
+    anisotropic[..., 0, 2] *= 0.7
+    anisotropic[..., 2, 0] *= 0.7
+    with pytest.raises(ValueError, match="correlated"):
+        sr.check_correlated_group([swap], anisotropic, np.array([0]))
+
+
+def test_coordinate_mirrors_of_a_hybridized_dispersion_act_on_the_correlated_orbitals():
+    """Mirrors solved on the correlated p_x/p_y pair of a three-orbital lattice equal the pair's own up to phases."""
+    nk = (4, 4, 1)
+    pair = p_orbital_hk(nk, equal_orbitals=False)
+    kx = 2 * np.pi * np.arange(nk[0]) / nk[0]
+    wide = np.zeros((*nk, 3, 3), dtype=complex)
+    wide[..., :2, :2] = pair
+    wide[..., 2, 2] = 3.0
+    wide[..., 0, 2] = wide[..., 2, 0] = 0.4 * np.sin(kx)[:, None, None]  # odd in k_x like p_x: keeps both mirrors
+    mirrors = sr.find_coordinate_mirror_orbital_unitaries(wide, orbitals=np.array([0, 1]))
+    reference = sr.find_coordinate_mirror_orbital_unitaries(pair)
+    assert mirrors and mirrors.keys() == reference.keys()
+    for axis, u in mirrors.items():
+        assert u.shape == (2, 2) and np.allclose(np.abs(u), np.abs(reference[axis]), atol=1e-8)
+
+
+def test_check_correlated_group_refuses_an_anti_symmetry():
+    """The anti-symmetry H = -S H S of a chiral d-p chain is no symmetry of the d resolvent at a fixed z."""
+    nk = (4, 1, 1)
+    kx = 2 * np.pi * np.arange(nk[0]) / nk[0]
+    hk = np.zeros((*nk, 2, 2), dtype=complex)
+    hk[..., 0, 1] = (1 - np.exp(-1j * kx))[:, None, None]
+    hk[..., 1, 0] = np.conj(hk[..., 0, 1])
+    anti = sr._GroupElement(np.eye(3, dtype=np.int64), np.zeros(3, dtype=np.int64), np.eye(1), -1, False, nk)
+    with pytest.raises(ValueError, match="correlated"):
+        sr.check_correlated_group([anti], hk, np.array([0]))

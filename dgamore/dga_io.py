@@ -92,6 +92,7 @@ def load_from_dmft_file_and_update_config() -> (
     sigma_per_ineq, g_per_ineq, g2_dens_per_ineq, g2_magn_per_ineq = [], [], [], []
     for ineq in range(1, config.dmft.n_ineq + 1):
         config.dmft.n_bands_per_ineq.append(dmft_interface.get_nd(ineq))
+        config.dmft.n_p_bands_per_ineq.append(dmft_interface.get_np(ineq))
         config.sys.occ_dmft_per_ineq.append(dmft_interface.get_occ(ineq))
         config.lattice.interaction.udd_per_ineq.append(dmft_interface.get_udd(ineq))
         config.lattice.interaction.jdd_per_ineq.append(dmft_interface.get_jdd(ineq))
@@ -112,10 +113,30 @@ def load_from_dmft_file_and_update_config() -> (
         sigma_per_ineq.append(sigma_dmft)
 
     config.sys.n_bands = sum(config.dmft.n_bands_per_ineq[ineq - 1] for ineq in config.dmft.ineq_ordering)
+    n_orbitals = config.sys.n_bands + sum(
+        config.dmft.n_p_bands_per_ineq[ineq - 1] for ineq in config.dmft.ineq_ordering
+    )
 
+    # the kinetic part holds every orbital, the interaction the correlated (d) orbitals only
     config.lattice.hamiltonian = set_hamiltonian(
-        config.lattice.type, config.lattice.er_input, config.lattice.interaction_type, config.lattice.interaction_input
-    )  # Hamiltonian always has config.sys.n_bands orbitals
+        config.lattice.type,
+        config.lattice.er_input,
+        config.lattice.interaction_type,
+        config.lattice.interaction_input,
+        n_orbitals=n_orbitals,
+    )
+    config.sys.correlated_orbitals = correlated_orbital_layout(
+        config.dmft.ineq_ordering,
+        config.dmft.n_bands_per_ineq,
+        config.dmft.n_p_bands_per_ineq,
+        config.lattice.hamiltonian.get_ek(config.lattice.k_grid).shape[-1],
+    )
+    if config.sys.correlated_orbitals is not None:
+        dc_lattice = dmft_interface.get_dc_lattice()
+        for ineq in sorted(set(config.dmft.ineq_ordering)):
+            check_p_orbitals_are_uncorrelated(
+                dmft_interface.get_p_interaction(ineq), dc_lattice, config.sys.correlated_orbitals
+            )
 
     output_format = "LDGA_Nk{}_Nq{}_wc{}_vc{}_vs{}".format(
         config.lattice.k_grid.nk_tot,
@@ -206,7 +227,54 @@ def update_frequency_boxes(niw: int, niv: int, niv_dmft: int) -> None:
     config.box.niv_full = config.box.niv_core + config.box.niv_shell
 
 
-def set_hamiltonian(er_type: str, er_input: str | list, int_type: str, int_input: str | list) -> Hamiltonian:
+def correlated_orbital_layout(
+    ineq_ordering: list[int], n_d_per_ineq: list[int], n_p_per_ineq: list[int], n_orbitals: int
+) -> np.ndarray | None:
+    """
+    Returns the indices of the correlated orbitals among the orbitals of the lattice Hamiltonian, which holds every
+    atom of ``ineq_ordering`` as its d orbitals followed by its p orbitals (the w2dynamics layout).
+
+    :param ineq_ordering: The inequivalent atom (1-based) of every atom of the Hamiltonian, in orbital order.
+    :param n_d_per_ineq: Number of correlated (d) orbitals per inequivalent atom.
+    :param n_p_per_ineq: Number of uncorrelated (p) orbitals per inequivalent atom.
+    :param n_orbitals: Number of orbitals of the Hamiltonian.
+    :return: The ascending index array, or None when no atom has p orbitals.
+    :raises ValueError: If the orbitals of the atoms do not add up to ``n_orbitals``.
+    """
+    is_d = np.concatenate([[True] * n_d_per_ineq[i - 1] + [False] * n_p_per_ineq[i - 1] for i in ineq_ordering])
+    if is_d.size != n_orbitals:
+        raise ValueError(
+            f"The Hamiltonian has {n_orbitals} orbitals, the atoms of ineq_ordering {ineq_ordering} hold "
+            f"{is_d.size} orbitals (d + p)."
+        )
+    return None if is_d.all() else np.flatnonzero(is_d)
+
+
+def check_p_orbitals_are_uncorrelated(
+    p_interaction: dict[str, float], dc_lattice: np.ndarray, orbitals: np.ndarray
+) -> None:
+    """
+    Checks that the uncorrelated orbitals carry neither an interaction nor a double counting, since the run treats
+    them as non-interacting.
+
+    :param p_interaction: The interactions that involve p orbitals, by name.
+    :param dc_lattice: The double counting ``[o1, o2]`` on every orbital of the Hamiltonian.
+    :param orbitals: Indices of the correlated orbitals.
+    :return: None.
+    :raises NotImplementedError: If a p interaction or a double counting outside the correlated block is non-zero.
+    """
+    nonzero = [key for key, value in p_interaction.items() if value != 0.0]
+    if nonzero:
+        raise NotImplementedError(f"Interacting p orbitals are not supported (non-zero {', '.join(nonzero)}).")
+    outside = np.array(dc_lattice, copy=True)
+    outside[np.ix_(orbitals, orbitals)] = 0.0
+    if np.any(outside != 0.0):
+        raise NotImplementedError("A double counting outside the correlated orbitals is not supported.")
+
+
+def set_hamiltonian(
+    er_type: str, er_input: str | list, int_type: str, int_input: str | list, n_orbitals: int | None = None
+) -> Hamiltonian:
     """
     Sets the Hamiltonian based on the input from the config file. \n
     The kinetic part can be set in two ways: \n
@@ -223,6 +291,7 @@ def set_hamiltonian(er_type: str, er_input: str | list, int_type: str, int_input
     :param er_input: The kinetic input: the ``[t, tp, tpp]`` list, or a path to the hopping file.
     :param int_type: The interaction type: ``"custom"``, or ``"from_dmft"`` for anything else.
     :param int_input: The interaction input (path to the U-matrix file for the ``"custom"`` type).
+    :param n_orbitals: Number of orbitals of the ``wannier.hk`` file; None takes ``config.sys.n_bands``.
     :return: The constructed :class:`Hamiltonian` with kinetic and interaction terms.
     :raises ValueError: If a kinetic/interaction input has the wrong type.
     :raises NotImplementedError: If the kinetic type is unsupported.
@@ -245,7 +314,8 @@ def set_hamiltonian(er_type: str, er_input: str | list, int_type: str, int_input
             config.logger.info("Using k-grid from wannier.hk file.")
             config.lattice.nk = (int(np.sqrt(k_points[:, 0].size)), int(np.sqrt(k_points[:, 0].size)), 1)
             config.lattice.k_grid = bz.KGrid(config.lattice.nk, config.lattice.symmetries)
-        ham = ham.set_ek(ham.get_ek().reshape(*config.lattice.nk, config.sys.n_bands, config.sys.n_bands))
+        n_orbitals = config.sys.n_bands if n_orbitals is None else n_orbitals
+        ham = ham.set_ek(ham.get_ek().reshape(*config.lattice.nk, n_orbitals, n_orbitals))
     else:
         raise NotImplementedError(f"Hamiltonian type {er_type} not supported.")
 

@@ -206,6 +206,12 @@ def test_kanamori_interaction_per_atom_couples_no_two_atoms():
     assert not np.isclose(Hamiltonian().kanamori_interaction_d(3, 4.0, 0.6, 2.8)._ur_local[0, 0, 1, 1], 0.0)
 
 
+def test_kanamori_interaction_per_atom_takes_the_band_counts_as_the_dmft_file_stores_them():
+    """Numpy integer band counts, as h5py reads them from the DMFT file, build the block of every atom."""
+    h = Hamiltonian().kanamori_interaction_per_atom([(np.int64(2), 8.0, 0.0, 0.0), (np.int64(1), 5.0, 0.0, 0.0)])
+    assert np.allclose(np.einsum("iiii->i", h._ur_local), [8.0, 8.0, 5.0])
+
+
 def test_kanamori_interaction_with_vdd_2_band():
     """kanamori_interaction_d for two bands puts V on aabb and J on abba (Hund) and abab (pair hopping)."""
     params = {

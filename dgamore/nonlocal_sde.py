@@ -32,7 +32,7 @@ import dgamore.mpi_utils as mpi_utils
 from dgamore.brillouin_zone import KGrid
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.four_point import FourPoint
-from dgamore.greens_function import GreensFunction, update_mu
+from dgamore.greens_function import GreensFunction, orbital_block, update_mu
 from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.jacobian_stabilization import (
     JACOBIAN_FILE,
@@ -489,19 +489,31 @@ def first_frequency_pole_ratio(sigma: SelfEnergy, mu: float, gamma_loc: float) -
     complement :math:`\gamma_{\mathrm{loc}} - 1/(\beta C(\mathbf{q}))`, :math:`C(\mathbf{q}) = \mathrm{Re}\langle
     G^{(\mathbf{k},\nu_0)} G^{(\mathbf{k}+\mathbf{q},\nu_0 - \omega_1)}\rangle_{\mathbf{k}}`, is largest at
     :math:`\mathbf{q} = 0`, so a pole ring lies inside the Brillouin zone exactly when :math:`R \geq 1`. A lattice
-    Green's function that has lost local scattering at :math:`\pi T` pushes :math:`R` across it.
+    Green's function that has lost local scattering at :math:`\pi T` pushes :math:`R` across it. With uncorrelated
+    orbitals :math:`G` is the correlated orbital's element of the inverse Dyson matrix over every orbital.
 
-    :param sigma: The iterate :class:`SelfEnergy` (one band; full-BZ or momentum-local, either momentum layout).
+    :param sigma: The iterate :class:`SelfEnergy` (one correlated band; full-BZ or momentum-local, either momentum
+        layout).
     :param mu: Chemical potential :math:`\mu` of ``sigma``.
     :param gamma_loc: The local vertex of :func:`first_frequency_local_vertex`.
     :return: The ratio :math:`R`.
     """
-    beta, niv = config.sys.beta, sigma.niv
-    ek = config.lattice.hamiltonian.get_ek().reshape(-1)
+    beta, niv, orbitals = config.sys.beta, sigma.niv, config.sys.correlated_orbitals
+    ek = config.lattice.hamiltonian.get_ek()
     s = sigma.mat.reshape(-1, 2 * niv)
     nu0 = np.pi / beta
-    g_nu0 = 1.0 / (1j * nu0 + mu - ek - s[:, niv])
-    g_minus_nu0 = 1.0 / (-1j * nu0 + mu - ek - s[:, niv - 1])
+    if orbitals is None:
+        ek = ek.reshape(-1)
+        g_nu0 = 1.0 / (1j * nu0 + mu - ek - s[:, niv])
+        g_minus_nu0 = 1.0 / (-1j * nu0 + mu - ek - s[:, niv - 1])
+    else:
+        n, d = ek.shape[-1], orbitals[0]
+        g = []
+        for iv, s_v in ((1j * nu0, s[:, niv]), (-1j * nu0, s[:, niv - 1])):
+            dyson = (iv + mu) * np.eye(n) - ek.reshape(-1, n, n)
+            dyson[:, d, d] -= s_v
+            g.append(np.linalg.inv(dyson)[:, d, d])
+        g_nu0, g_minus_nu0 = g
     return float(gamma_loc * beta * np.mean(g_nu0 * g_minus_nu0).real)
 
 
@@ -1511,11 +1523,12 @@ def _build_giwk_full(comm: MPI.Comm, sigma: SelfEnergy, mu: float, ek: np.ndarra
         core box (the shared buffer is read-only and must not be freed while any rank still reads it).
     """
     node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+    orbitals = config.sys.correlated_orbitals
     giwk_mat, win = mpi_utils.build_node_shared_array(
-        node_comm, lambda: GreensFunction.get_g_full(sigma, mu, ek, beta).mat
+        node_comm, lambda: GreensFunction.get_g_full(sigma, mu, ek, beta, orbitals=orbitals).mat
     )
     giwk_full = GreensFunction(
-        giwk_mat, None, ek, sigma.full_niv_range, False, False, nk=ek.shape[:3], beta=beta, mu=mu
+        giwk_mat, None, ek, sigma.full_niv_range, False, False, nk=ek.shape[:3], beta=beta, mu=mu, orbitals=orbitals
     )
     return giwk_full, win, node_comm
 
@@ -1567,6 +1580,7 @@ def _cut_and_reshare_giwk(giwk_full: GreensFunction, win, node_comm, niv: int) -
         nk=giwk_full._ek.shape[:3],
         beta=giwk_full._beta,
         mu=giwk_full._mu,
+        orbitals=giwk_full._orbitals,
     )
     return giwk_cut, cut_win
 
@@ -1687,13 +1701,17 @@ def _slice_occupation_and_energies(
     :param sigma_occ: This rank's concatenated self-energy slice (see :func:`_occupation_self_energy`).
     :param mu: Chemical potential :math:`\mu`.
     :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
-    :return: The tuple ``(occ_k_slice, ekin, epot)`` of this rank's k-resolved occupation ``[k, 1, 1, o1, o2]`` and
-        its momentum-averaged kinetic and potential energies.
+    :return: The tuple ``(occ_k_slice, ekin, epot)`` of this rank's k-resolved occupation ``[k, 1, 1, o1, o2]`` on
+        every orbital of H(k) and its momentum-averaged kinetic and potential energies.
     """
-    nk_tot, n_bands, n_my = config.lattice.k_grid.nk_tot, config.sys.n_bands, mpi_dist_fullbz.my_size
+    nk_tot, n_my = config.lattice.k_grid.nk_tot, mpi_dist_fullbz.my_size
     ek = config.lattice.hamiltonian.get_ek()
-    ek_slice = ek.reshape(nk_tot, n_bands, n_bands)[mpi_dist_fullbz.my_slice].reshape(n_my, 1, 1, n_bands, n_bands)
-    giwk_occ = GreensFunction.get_g_full(sigma_occ, mu, ek_slice, config.sys.beta)
+    n_orbitals = ek.shape[-1]
+    ek_slice = ek.reshape(nk_tot, n_orbitals, n_orbitals)[mpi_dist_fullbz.my_slice]
+    ek_slice = ek_slice.reshape(n_my, 1, 1, n_orbitals, n_orbitals)
+    giwk_occ = GreensFunction.get_g_full(
+        sigma_occ, mu, ek_slice, config.sys.beta, orbitals=config.sys.correlated_orbitals
+    )
     _, _, occ_k_slice = giwk_occ.get_fill_nonlocal(real_dispersion=np.isrealobj(np.real_if_close(ek)))
     ekin, epot = giwk_occ.get_ekin(), giwk_occ.get_epot()
     giwk_occ.free()
@@ -1720,22 +1738,23 @@ def _update_occ_and_energies_distributed(
     :param sigma_dmft_full: The DMFT :class:`SelfEnergy` supplying the shell frequencies (momentum-local).
     :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
     :param mu: Chemical potential :math:`\mu`.
-    :return: The tuple ``(n, occ, occ_k, ekin, epot)``: total filling, k-averaged occupation ``[o1, o2]``,
-        k-resolved occupation ``[kx, ky, kz, o1, o2]``, and the kinetic and potential energies per site.
+    :return: The tuple ``(n, occ, occ_k, ekin, epot)``: total filling over every orbital, k-averaged ``[o1, o2]``
+        and k-resolved ``[kx, ky, kz, o1, o2]`` occupation of the correlated orbitals, and the kinetic and potential
+        energies per site.
     """
     nk_tot = config.lattice.k_grid.nk_tot
-    n_bands = config.sys.n_bands
+    n_orbitals = config.lattice.hamiltonian.get_ek().shape[-1]
     n_my = mpi_dist_fullbz.my_size
 
     sigma_occ = _occupation_self_energy(sigma_new, sigma_dmft_full, mpi_dist_fullbz)
 
     # a rank without momenta (more ranks than momenta) adds nothing to the reductions below
-    occ_k_slice, ekin, epot = np.zeros((0, 1, 1, n_bands, n_bands)), 0.0, 0.0
+    occ_k_slice, ekin, epot = np.zeros((0, 1, 1, n_orbitals, n_orbitals)), 0.0, 0.0
     if n_my:
         occ_k_slice, ekin, epot = _slice_occupation_and_energies(sigma_occ, mu, mpi_dist_fullbz)
     sigma_occ.free()
 
-    n_el, occ, occ_k = _assemble_occupation(occ_k_slice, mpi_dist_fullbz)
+    n_el, occ, occ_k = _assemble_occupation(occ_k_slice, mpi_dist_fullbz, config.sys.correlated_orbitals)
     scalars = np.array([ekin, epot]) * n_my
     if mpi_dist_fullbz.mpi_size > 1:
         scalars = mpi_dist_fullbz.comm.allreduce(scalars)
@@ -1744,7 +1763,7 @@ def _update_occ_and_energies_distributed(
 
 
 def _assemble_occupation(
-    occ_k_slice: np.ndarray, mpi_dist_fullbz: MpiDistributor
+    occ_k_slice: np.ndarray, mpi_dist_fullbz: MpiDistributor, orbitals: np.ndarray | None = None
 ) -> tuple[float, np.ndarray, np.ndarray]:
     r"""
     Assembles the k-resolved occupation from the momentum slices the ranks evaluated and derives the k-averaged
@@ -1756,8 +1775,10 @@ def _assemble_occupation(
 
     :param occ_k_slice: This rank's k-resolved occupation ``[kx, ky, kz, o1, o2]`` on its momentum slice.
     :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
-    :return: A tuple of the total filling :math:`n`, the k-averaged occupation ``[o1, o2]`` and the k-resolved
-        occupation ``[kx, ky, kz, o1, o2]`` on the full grid.
+    :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
+        when it acts on every orbital.
+    :return: A tuple of the total filling :math:`n` over every orbital, and the k-averaged ``[o1, o2]`` and the
+        k-resolved ``[kx, ky, kz, o1, o2]`` occupation of the correlated orbitals on the full grid.
     """
     nk_tot, n_bands, n_my = config.lattice.k_grid.nk_tot, occ_k_slice.shape[-1], mpi_dist_fullbz.my_size
     occ_k = np.zeros((nk_tot, n_bands, n_bands), dtype=np.complex128)
@@ -1767,7 +1788,7 @@ def _assemble_occupation(
     occ_k = occ_k.reshape(*config.lattice.k_grid.nk, n_bands, n_bands)
     occ = np.mean(occ_k, axis=(0, 1, 2))
     occ.real[np.abs(occ) < 1e-12] = 0.0
-    return 2.0 * np.trace(occ).real, occ, occ_k
+    return 2.0 * np.trace(occ).real, orbital_block(occ, orbitals), orbital_block(occ_k, orbitals)
 
 
 def _has_time_reversal(ek: np.ndarray) -> bool:
@@ -1783,7 +1804,7 @@ def _has_time_reversal(ek: np.ndarray) -> bool:
     return bool(np.allclose(flipped, np.swapaxes(ek, -1, -2), rtol=0.0, atol=1e-4 * np.abs(ek).max()))
 
 
-def _orbital_involution(ek: np.ndarray) -> np.ndarray | None:
+def _orbital_involution(ek: np.ndarray, orbitals: np.ndarray | None = None) -> np.ndarray | None:
     r"""
     Returns the orbital permutation :math:`\pi`, its own inverse and not the identity, under which the dispersion is
     transposed, :math:`\varepsilon_{21}(\mathbf{k}) = \varepsilon_{\pi(1)\pi(2)}(\mathbf{k})` at every momentum
@@ -1793,9 +1814,12 @@ def _orbital_involution(ek: np.ndarray) -> np.ndarray | None:
     uses it is decided per slice (see
     :meth:`~dgamore.four_point.FourPoint.invert_with_local_kernel_and_sum_over_last_vn`). The candidate pairs every
     orbital with the one other orbital whose diagonal dispersion matches its own; an orbital with several such
-    partners gives None.
+    partners gives None. With ``orbitals`` the correlated Green's function inherits the permutation only if it maps
+    the correlated orbitals onto themselves, and it is returned in their own numbering.
 
     :param ek: The band dispersion ``[kx, ky, kz, o1, o2]``.
+    :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
+        when it acts on every orbital.
     :return: The permutation as an index array, or None.
     """
     n_bands = ek.shape[-1]
@@ -1809,7 +1833,17 @@ def _orbital_involution(ek: np.ndarray) -> np.ndarray | None:
             return None
         pi[i] = partners[0] if partners else i
     transposed = np.allclose(np.swapaxes(ek, -1, -2), ek[..., pi, :][..., pi], rtol=0.0, atol=atol)
-    return pi if transposed and np.any(pi != np.arange(n_bands)) else None
+    if not transposed or not np.any(pi != np.arange(n_bands)):
+        return None
+    if orbitals is None:
+        return pi
+    # ponytail: pairs on the full H(k), so degenerate p levels hide an involution of the d block (a speedup lost, no
+    # error); pair on the correlated moments of symmetry_reduction if a d-p cell needs it
+    mapped = pi[orbitals]
+    if not np.array_equal(np.sort(mapped), orbitals):
+        return None
+    restricted = np.searchsorted(orbitals, mapped)
+    return restricted if np.any(restricted != np.arange(len(orbitals))) else None
 
 
 def calculate_sigma_proposal(
@@ -1944,7 +1978,7 @@ def calculate_sigma_proposal(
         gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
 
     chunk_bytes = _sde_chunk_budget(comm, shared_node_comm) if chunk_budgets is None else chunk_budgets.sde
-    involution = _orbital_involution(config.lattice.hamiltonian.get_ek())
+    involution = _orbital_involution(config.lattice.hamiltonian.get_ek(), config.sys.correlated_orbitals)
     if involution is not None and current_iter == 1:
         logger.info(
             f"The orbital permutation {involution.tolist()} transposes the dispersion: Bethe-Salpeter slices that are "
@@ -2540,14 +2574,19 @@ def calculate_self_energy_q(
     sigma_dmft_full = sigma_dmft.copy()
 
     ek = config.lattice.hamiltonian.get_ek()
+    orbitals = config.sys.correlated_orbitals
     # the DMFT lattice Green's function on the whole DMFT box is built only for the DMFT spectrum continuation; a warm
     # start holds its filling, which is summed without building it
     if comm.rank == 0 and config.ana_cont.do_spectrum_dmft:
-        giwk_full_dmft = GreensFunction.get_g_full(sigma_dmft_full, config.sys.mu_dmft, ek, config.sys.beta)
+        giwk_full_dmft = GreensFunction.get_g_full(
+            sigma_dmft_full, config.sys.mu_dmft, ek, config.sys.beta, orbitals=orbitals
+        )
         giwk_full_dmft.save(output_dir=config.output.output_path, name="g_latt_dmft")
         giwk_full_dmft.free()
     if comm.rank == 0 and starting_iter > 0:
-        n_dmft = GreensFunction.get_occupation(sigma_dmft_full, config.sys.mu_dmft, ek, config.sys.beta)[0]
+        n_dmft = GreensFunction.get_occupation(
+            sigma_dmft_full, config.sys.mu_dmft, ek, config.sys.beta, orbitals=orbitals
+        )[0]
 
     if comm.rank == 0 or starting_iter == 0:
         sigma_old = sigma_old.concatenate_self_energies(sigma_dmft_full)
@@ -2559,11 +2598,13 @@ def calculate_self_energy_q(
         ek_my = ek.reshape(-1, nb, nb)[mpi_dist_fullbz.my_slice].reshape(n_my, 1, 1, nb, nb)
         real_ek = np.isrealobj(np.real_if_close(ek))
         occ_k_my = (
-            GreensFunction.get_occupation(sigma_old, mu_history[-1], ek_my, config.sys.beta, real_ek)[2]
+            GreensFunction.get_occupation(
+                sigma_old, mu_history[-1], ek_my, config.sys.beta, real_ek, orbitals=orbitals
+            )[2]
             if n_my
             else np.zeros((0, 1, 1, nb, nb))
         )
-        config.sys.n, config.sys.occ, config.sys.occ_k = _assemble_occupation(occ_k_my, mpi_dist_fullbz)
+        config.sys.n, config.sys.occ, config.sys.occ_k = _assemble_occupation(occ_k_my, mpi_dist_fullbz, orbitals)
     else:
         # a warm start's own filling drifts along a chain of rungs, so mu is re-solved for the DMFT lattice filling on
         # the loop's frequency box, every rank on its momenta of rank 0's starting iterate
@@ -2573,7 +2614,15 @@ def calculate_self_energy_q(
         del sigma_cut
         mu_previous = mu_history[-1]
         mu_history[-1] = update_mu(
-            mu_previous, n_dmft, ek, sigma_my, config.sys.beta, smom0, logger=logger, mpi_dist=mpi_dist_fullbz
+            mu_previous,
+            n_dmft,
+            ek,
+            sigma_my,
+            config.sys.beta,
+            smom0,
+            logger=logger,
+            mpi_dist=mpi_dist_fullbz,
+            orbitals=orbitals,
         )
         del sigma_my
         if comm.rank == 0:
@@ -2583,9 +2632,10 @@ def calculate_self_energy_q(
             )
             # only the occupations are needed here: sum the Dyson chunks directly instead of holding a second full-k
             # Green's function on the full DMFT frequency box (tens of GB at production scale)
-            _, config.sys.occ, config.sys.occ_k = GreensFunction.get_occupation(
-                sigma_old, mu_history[-1], ek, config.sys.beta
+            _, occ, occ_k = GreensFunction.get_occupation(
+                sigma_old, mu_history[-1], ek, config.sys.beta, orbitals=orbitals
             )
+            config.sys.occ, config.sys.occ_k = orbital_block(occ, orbitals), orbital_block(occ_k, orbitals)
             config.sys.n = n_dmft
         config.sys.n, config.sys.occ, config.sys.occ_k = comm.bcast(
             (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
@@ -2734,6 +2784,7 @@ def calculate_self_energy_q(
             comm.bcast(sigma_new.fit_smom()[0] if comm.rank == 0 else None, root=0),
             logger=logger,
             mpi_dist=mpi_dist_fullbz,
+            orbitals=config.sys.correlated_orbitals,
         )
         mu_history.append(config.sys.mu)
         logger.info(f"Updated mu from {old_mu} to {config.sys.mu}.")

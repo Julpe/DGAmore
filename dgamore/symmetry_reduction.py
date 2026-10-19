@@ -993,7 +993,91 @@ def _coordinate_mirror_matrix(axis: int) -> np.ndarray:
     return M
 
 
-def find_coordinate_mirror_orbital_unitaries(H, atol=1e-8) -> dict:
+def _correlated_moments(H, orbitals: np.ndarray) -> tuple[list[np.ndarray], np.ndarray]:
+    r"""
+    Returns the correlated blocks :math:`[h(\mathbf{k})^n]_{oo}`, :math:`n = 1, \dots, N`, of the powers of the
+    normalized Hamiltonian :math:`h = H / \max|H|` (:math:`N` the number of orbitals of ``H``), and the spectrum of
+    :math:`h`. By the Cayley-Hamilton theorem the blocks with :math:`n < N` and the spectrum fix the correlated block
+    of the resolvent :math:`[(z - H(\mathbf{k}))^{-1}]_{oo}` at every :math:`z`.
+
+    :param H: The Hamiltonian field of shape ``(nx, ny, nz, norb, norb)``.
+    :param orbitals: Indices of the correlated orbitals.
+    :return: The tuple ``(blocks, spectrum)`` of the ``N`` blocks ``(nx, ny, nz, o, o)`` and the eigenvalues
+        ``(nx * ny * nz, norb)``.
+    """
+    # ponytail: max|H| scaling keeps h^n within the 1e-8 checks up to about 15 orbitals; scale by the spectral radius
+    # and take Chebyshev blocks T_n(h) (same span) for larger cells
+    h = np.asarray(H, dtype=complex) / max(np.abs(H).max(), np.finfo(float).tiny)
+    blocks, power = [], h
+    for _ in range(h.shape[-1]):
+        blocks.append(power[..., orbitals[:, None], orbitals])
+        power = power @ h
+    return blocks, np.linalg.eigvalsh(h).reshape(-1, h.shape[-1])
+
+
+def correlated_block_proxy(H, orbitals: np.ndarray) -> np.ndarray:
+    r"""
+    Returns a Hermitian field on the correlated orbitals with the symmetries of the correlated block of the resolvent
+    :math:`[(z - H(\mathbf{k}))^{-1}]_{oo}`: a fixed generic combination :math:`\sum_n a_n [h(\mathbf{k})^n]_{oo}` of
+    the blocks of :func:`_correlated_moments`. Every symmetry of :math:`H` that maps the correlated orbitals onto
+    themselves leaves it covariant, also one whose action on the other orbitals depends on the momentum (an orbital
+    off the unit-cell origin), so the discovery run on it finds the operations of the correlated Green's function.
+
+    :param H: The Hamiltonian field of shape ``(nx, ny, nz, norb, norb)``.
+    :param orbitals: Indices of the correlated orbitals.
+    :return: The proxy field of shape ``(nx, ny, nz, o, o)``.
+    """
+    blocks, _ = _correlated_moments(H, orbitals)
+    weights = np.random.default_rng(0).uniform(0.5, 1.5, len(blocks))
+    return sum(w * block for w, block in zip(weights, blocks))
+
+
+def _maps_correlated_moments(g, blocks: list[np.ndarray], spectrum: np.ndarray, atol: float) -> bool:
+    r"""
+    Whether a group element maps every block covariantly, :math:`X(g\mathbf{k}) = U X(\mathbf{k})^{(*)} U^\dagger`,
+    and carries the spectrum of :math:`h(\mathbf{k})` onto that of :math:`h(g\mathbf{k})`. An anti-symmetry
+    (``sigma = -1``) is no symmetry of the resolvent at a fixed :math:`z` and fails.
+
+    :param g: The group element.
+    :param blocks: The correlated blocks of :func:`_correlated_moments` to check.
+    :param spectrum: The spectrum of :func:`_correlated_moments`.
+    :param atol: Absolute tolerance of the comparisons.
+    :return: True if the element passes every comparison.
+    """
+    if g.sigma != 1:
+        return False
+    idx = _g_action_on_kgrid(g, g.nk)
+    for block in blocks:
+        flat = block.reshape(-1, *block.shape[-2:])
+        rotated = g.U @ (flat.conj() if g.conj else flat) @ g.U.conj().T
+        if not np.allclose(flat[idx], rotated, rtol=0.0, atol=atol):
+            return False
+    return np.allclose(spectrum, spectrum[idx], rtol=0.0, atol=atol)
+
+
+def check_correlated_group(group, H, orbitals: np.ndarray, atol: float = 1e-8) -> None:
+    r"""
+    Checks that every element of a group discovered on :func:`correlated_block_proxy` is a symmetry of the correlated
+    block of the resolvent of ``H``: it maps the blocks :math:`[h^n]_{oo}` with :math:`n` below the number of orbitals
+    covariantly and keeps the spectrum of :math:`h(\mathbf{k})` (see :func:`_correlated_moments`).
+
+    :param group: The group elements.
+    :param H: The Hamiltonian field of shape ``(nx, ny, nz, norb, norb)``.
+    :param orbitals: Indices of the correlated orbitals.
+    :param atol: Absolute tolerance of the comparisons.
+    :return: None.
+    :raises ValueError: If an element is not a symmetry of the correlated block.
+    """
+    blocks, spectrum = _correlated_moments(H, orbitals)
+    for g in group:
+        if not _maps_correlated_moments(g, blocks[:-1], spectrum, atol):
+            raise ValueError(
+                f"The operation M = {g.M.tolist()}, q = {g.q.tolist()} found on the correlated-block proxy is not a "
+                f"symmetry of the correlated block of the resolvent; use explicit lattice symmetries."
+            )
+
+
+def find_coordinate_mirror_orbital_unitaries(H, atol=1e-8, orbitals: np.ndarray | None = None) -> dict:
     r"""
     Solves for the orbital part of the single-axis coordinate mirrors of ``H``, i.e. for each axis :math:`i` a
     unitary :math:`U_i` with
@@ -1014,10 +1098,33 @@ def find_coordinate_mirror_orbital_unitaries(H, atol=1e-8) -> dict:
     there is no orbital information to recover there either. In both cases the mirror degenerates to the
     momentum-only reflection, which is what ``H`` alone justifies.
 
+    With ``orbitals`` the mirrors are solved on :func:`correlated_block_proxy` and checked like
+    :func:`check_correlated_group`, so they act on the correlated orbitals alone; a mirror that fails the check maps
+    to ``None``.
+
     :param H: The Hamiltonian field of shape ``(nx, ny, nz, norb, norb)`` in the primitive reciprocal-lattice basis.
     :param atol: Absolute tolerance for validating the mirror relation.
-    :return: A dict ``{axis: U}`` holding one orbital unitary per axis whose mirror is a symmetry of ``H``.
+    :param orbitals: Indices of the correlated orbitals; None solves on every orbital of ``H``.
+    :return: A dict ``{axis: U}`` holding one orbital unitary per axis whose mirror is a symmetry of ``H`` (of its
+        correlated block with ``orbitals``, ``None`` where the proxy's mirror fails the check).
     """
+    if orbitals is not None:
+        mirrors = find_coordinate_mirror_orbital_unitaries(correlated_block_proxy(H, orbitals), atol)
+        blocks, spectrum = _correlated_moments(H, orbitals)
+        zero = np.zeros(3, dtype=np.int64)
+        return {
+            axis: (
+                u
+                if _maps_correlated_moments(
+                    _GroupElement(_coordinate_mirror_matrix(axis), zero, u, 1, False, H.shape[:3]),
+                    blocks[:-1],
+                    spectrum,
+                    atol,
+                )
+                else None
+            )
+            for axis, u in mirrors.items()
+        }
     nx, ny, nz, norb, _ = H.shape
     nk = (nx, ny, nz)
     H = np.asarray(H, dtype=complex)

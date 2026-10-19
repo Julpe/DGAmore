@@ -1083,3 +1083,17 @@ def test_node_total_sums_each_ranks_own_peak_and_counts_rank_0s_single_only_on_i
     assert node_total([(2, a), (1, b)], holds_rank_zero=True, grid=True) == 2 * 5.0 + 8.0 + 20.0 - 2 * 0.5
     anywhere = replace(a, remote_single=None)
     assert node_total([(3, anywhere)], holds_rank_zero=False) == node_total([(3, anywhere)], holds_rank_zero=True)
+
+
+def test_uncorrelated_orbitals_enlarge_only_the_dyson_steps():
+    """More orbitals than bands widen the mu-search and occupation steps and leave the four-point branches alone."""
+    wider = BASE["n_bands"] + 2
+    plain, wide = _peaks(), _peaks(n_orbitals=wider)
+    for key in ("mu_update", "occupation"):
+        assert wide[key].off_distributed > plain[key].off_distributed
+    assert wide["energies"].off_distributed >= plain["energies"].off_distributed
+    for key in ("chi0q", "chiq_aux", "sde"):
+        assert wide[key] == plain[key]
+    assert _peaks(n_orbitals=BASE["n_bands"]) == plain
+    exact_plain = _peaks(with_exact_jacobian=True)["exact_jacobian"]
+    assert _peaks(with_exact_jacobian=True, n_orbitals=wider)["exact_jacobian"].baseline > exact_plain.baseline

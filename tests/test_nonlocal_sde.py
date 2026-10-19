@@ -30,7 +30,7 @@ from dgamore.jacobian_stabilization import JACOBIAN_FILE, JacobianTracker, load_
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.local_sde import get_local_hartree_fock
 from dgamore.n_point_base import DTYPE, SpinChannel
-from tests.conftest import FAKE_MPI, run_parallel
+from tests.conftest import FAKE_MPI, emery_hk, run_parallel
 from dgamore.nonlocal_sde import (
     _build_giwk_full,
     _cut_and_reshare_giwk,
@@ -1392,7 +1392,7 @@ def test_warm_start_holds_the_dmft_filling_and_resolves_mu(monkeypatch, tmp_path
 
     built = []
 
-    def g_full(siw, mu, ek, beta):
+    def g_full(siw, mu, ek, beta, orbitals=None):
         n = 0.85 if np.isclose(siw.mat.reshape(-1)[0], 1.0 + 0.1j) and mu == 0.5 else 0.8621
         fill = (n, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1)))
         return SimpleNamespace(get_fill_nonlocal=lambda: fill, save=lambda *a, **k: None, free=lambda: None)
@@ -1401,8 +1401,8 @@ def test_warm_start_holds_the_dmft_filling_and_resolves_mu(monkeypatch, tmp_path
         nonlocal_sde,
         "GreensFunction",
         SimpleNamespace(
-            get_g_full=lambda *a: built.append(a) or g_full(*a),
-            get_occupation=lambda *a: g_full(*a).get_fill_nonlocal(),
+            get_g_full=lambda *a, **k: built.append(a) or g_full(*a, **k),
+            get_occupation=lambda *a, **k: g_full(*a, **k).get_fill_nonlocal(),
         ),
     )
     solves = []
@@ -1438,11 +1438,11 @@ def test_dmft_spectrum_builds_and_saves_the_lattice_green_function_once_next_to_
     fill = (0.85, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1)))
     built, saved, occupations = [], [], []
 
-    def g_full(siw, mu, ek, beta):
+    def g_full(siw, mu, ek, beta, orbitals=None):
         built.append(mu)
         return SimpleNamespace(save=lambda **k: saved.append(k["name"]), free=lambda: None)
 
-    def occupation(siw, mu, ek, beta):
+    def occupation(siw, mu, ek, beta, orbitals=None):
         occupations.append(mu)
         return fill
 
@@ -1463,7 +1463,7 @@ def test_fresh_start_occupies_a_real_reading_slice_of_a_complex_dispersion_as_co
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: ek)
     occupied, fill = [], (1.0, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1)))
     greens = vars(nonlocal_sde.GreensFunction) | {
-        "get_occupation": lambda *a: occupied.append((threading.current_thread().name, *a[2:])) or fill
+        "get_occupation": lambda *a, **k: occupied.append((threading.current_thread().name, *a[2:])) or fill
     }
     monkeypatch.setattr(nonlocal_sde, "GreensFunction", SimpleNamespace(**greens))
     run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
@@ -1491,7 +1491,7 @@ def test_warm_start_and_loop_solve_mu_on_every_rank_with_its_momenta(monkeypatch
         mixed.append(out.mat.reshape(3, 1, 1, -1).copy())
         return out
 
-    def solve(mu0, n, ek, sigma_mat, beta, smom0, logger=None, mpi_dist=None):
+    def solve(mu0, n, ek, sigma_mat, beta, smom0, logger=None, mpi_dist=None, orbitals=None):
         seen.append((threading.current_thread().name, mpi_dist, sigma_mat.copy(), smom0))
         return 0.42
 
@@ -2388,7 +2388,8 @@ def test_update_occ_and_energies_distributed_carries_the_shell_offset_of_the_mix
         assert np.allclose([ekin, epot], [ekin_ref, epot_ref], atol=1e-5)
 
 
-def test_energies_estimate_bounds_the_traced_peak_of_the_occupation_and_energy_step(monkeypatch):
+@pytest.mark.parametrize("nb, n_orbitals", [(2, 2), (1, 3)])
+def test_energies_estimate_bounds_the_traced_peak_of_the_occupation_and_energy_step(monkeypatch, nb, n_orbitals):
     """One rank's occupation and energy step holds its share's self-energy and Green's function on the DMFT box and the
     largest chunked transient, within the estimator's energies branch (chunk sizes shrunk alike in code and model)."""
     import dgamore.greens_function as gf_module
@@ -2400,12 +2401,13 @@ def test_energies_estimate_bounds_the_traced_peak_of_the_occupation_and_energy_s
         (memory_estimator, "GF_FREQUENCY_CHUNK_ELEMENTS", 2**17),
     ):
         monkeypatch.setattr(module, name, value)
-    n_k, nb, niv_cut, niv_dmft, beta, mu = 64, 2, 20, 300, 9.0, 0.4
+    n_k, niv_cut, niv_dmft, beta, mu = 64, 20, 300, 9.0, 0.4
     rng = np.random.default_rng(12)
     config.sys.beta, config.sys.n_bands, config.sys.mu = beta, nb, mu
+    config.sys.correlated_orbitals = None if n_orbitals == nb else np.arange(nb)
     config.lattice.nk = (n_k, 1, 1)
     config.lattice.k_grid = SimpleNamespace(nk_tot=n_k, nk=(n_k, 1, 1))
-    h = rng.standard_normal((n_k, nb, nb)) + 1j * rng.standard_normal((n_k, nb, nb))
+    h = rng.standard_normal((n_k, n_orbitals, n_orbitals)) + 1j * rng.standard_normal((n_k, n_orbitals, n_orbitals))
     config.lattice.hamiltonian = MagicMock(get_ek=MagicMock(return_value=0.5 * (h + h.conj().swapaxes(-1, -2))))
     dmft = (rng.standard_normal((1, 1, 1, nb, nb, 2 * niv_dmft)) * 0.1 - 0.4j).astype(np.complex64)
     sigma_dmft_full = SelfEnergy(dmft, (1, 1, 1), beta=beta)
@@ -2429,12 +2431,13 @@ def test_energies_estimate_bounds_the_traced_peak_of_the_occupation_and_energy_s
         niv_pp=2,
         n_ranks=1,
         with_eliashberg=False,
+        n_orbitals=n_orbitals,
     )["energies"].off_distributed
     # beyond the model: the energy tail's complex128 frequency grid (2 niv_asympt frequencies, alive through its sum;
     # negligible beside a rank's baseline), the momentum-sized arrays and the frequency grids on the bands. The tail
     # chunks dominate here, so one chunk more or less than modeled leaves the window on either side.
     grid = 16 * 2 * memory_estimator.EPOT_NIV_ASYMPT
-    small = 8 * n_k * nb**2 * 16 + 4 * nb**2 * 2 * niv_dmft * 16
+    small = 8 * n_k * n_orbitals**2 * 16 + 4 * n_orbitals**2 * 2 * niv_dmft * 16
     # (5 % for numpy's casting buffers, which another numpy version may size differently)
     assert modeled < peak <= 1.05 * modeled + grid + small
 
@@ -2483,7 +2486,7 @@ def test_update_occ_and_energies_distributed_pins_the_occupation_dtype_across_ra
         (rng.standard_normal((1, 1, 1, o, o, 2 * niv_dmft)) * 0.1 + 0.2j).astype(np.complex64), (1, 1, 1), beta=beta
     )
 
-    def fake_get_g_full(sigma_occ, mu_in, ek_slice, beta_in):
+    def fake_get_g_full(sigma_occ, mu_in, ek_slice, beta_in, orbitals=None):
         # the first slice (rows starting at ek row 0) plays the all-real-eigenvalue rank and returns a float fill
         n_my = ek_slice.shape[0]
         is_first = np.allclose(ek_slice[0, 0, 0], config.lattice.hamiltonian.get_ek().reshape(nk_tot, o, o)[0])
@@ -3783,8 +3786,8 @@ def test_warm_start_reads_the_dmft_filling_without_building_the_dmft_box_greens_
     built, fillings = [], []
     fill = (0.85, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1)))
     greens = SimpleNamespace(
-        get_g_full=lambda *a: built.append(a) or SimpleNamespace(save=lambda *a, **k: None, free=lambda: None),
-        get_occupation=lambda *a: fillings.append(a) or fill,
+        get_g_full=lambda *a, **k: built.append(a) or SimpleNamespace(save=lambda *a, **k: None, free=lambda: None),
+        get_occupation=lambda *a, **k: fillings.append(a) or fill,
     )
     monkeypatch.setattr(nonlocal_sde, "GreensFunction", greens)
     run()
@@ -4077,3 +4080,54 @@ def test_auxiliary_sum_with_slice_rhs_returns_the_sum_and_the_solutions_of_its_r
 
     assert np.array_equal(fused.mat, total.mat) and len(fused_solved) == 1
     assert np.array_equal(fused_solved[0].mat, solved.mat)
+
+
+def test_assemble_occupation_traces_every_orbital_and_hands_on_the_correlated_block(monkeypatch):
+    """The filling counts the uncorrelated orbitals; occ and occ_k for Hartree-Fock are the correlated block."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, beta, mu, o = (4, 2, 1), 9.0, 0.4, np.array([0])
+    nk_tot = int(np.prod(nk))
+    config.lattice.nk = nk
+    config.lattice.k_grid = SimpleNamespace(nk_tot=nk_tot, nk=nk)
+    ek = emery_hk(nk)
+    sigma = SelfEnergy(np.full((1, 1, 1, 1, 1, 12), 0.3 - 0.2j, dtype=np.complex64), beta=beta)
+    n_ref, occ_ref, occ_k_ref = GreensFunction.get_occupation(sigma, mu, ek, beta, orbitals=o)
+
+    def fn(comm, rank):
+        d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
+        ek_my = ek.reshape(-1, 3, 3)[d_full.my_slice].reshape(d_full.my_size, 1, 1, 3, 3)
+        occ_k_my = GreensFunction.get_occupation(sigma, mu, ek_my, beta, real_dispersion=False, orbitals=o)[2]
+        return nonlocal_sde._assemble_occupation(occ_k_my, d_full, orbitals=o)
+
+    _, res = run_parallel(3, fn)
+    for n_el, occ, occ_k in res:
+        assert np.isclose(n_el, n_ref, rtol=0, atol=1e-12)
+        assert occ.shape == (1, 1) and np.allclose(occ, occ_ref[:1, :1], rtol=0, atol=1e-12)
+        assert np.allclose(occ_k, occ_k_ref[..., :1, :1], rtol=0, atol=1e-12)
+
+
+def test_first_frequency_pole_ratio_uses_the_correlated_block_of_the_hybridized_greens_function():
+    """With uncorrelated orbitals G(k, +-pi T) is the d block of the full inverse, not 1/(iv + mu - e - s)."""
+    beta, mu, gamma_loc = 10.0, 0.4, 0.07
+    sigma, _ = _single_band_sigma((4, 4, 1), 8, beta, seed=5)
+    ek = emery_hk((4, 4, 1))
+    config.sys.beta, config.lattice.hamiltonian = beta, SimpleNamespace(get_ek=lambda: ek)
+    config.sys.correlated_orbitals = np.array([0])
+    nu0, s = np.pi / beta, sigma.mat[:, 0, 0]
+
+    def g_dd(iv, s_v):
+        dyson = (iv + mu) * np.eye(3) - ek.reshape(-1, 3, 3)
+        dyson[:, 0, 0] -= s_v
+        return np.linalg.inv(dyson)[:, 0, 0]
+
+    expected = gamma_loc * beta * np.mean(g_dd(1j * nu0, s[:, 8]) * g_dd(-1j * nu0, s[:, 7])).real
+    assert np.isclose(nonlocal_sde.first_frequency_pole_ratio(sigma, mu, gamma_loc), expected, atol=1e-12)
+
+
+def test_orbital_involution_is_restricted_to_the_correlated_orbitals():
+    """A swap of two correlated orbitals is kept in subspace indices; one that maps a d onto a p orbital is dropped."""
+    rng, pi = np.random.default_rng(3), np.array([2, 3, 0, 1])
+    ek = rng.standard_normal((4, 2, 1, 4, 4)) + 1j * rng.standard_normal((4, 2, 1, 4, 4))
+    ek = 0.5 * (ek + np.swapaxes(ek, -1, -2)[..., pi, :][..., pi])
+    assert np.array_equal(nonlocal_sde._orbital_involution(ek, orbitals=np.array([0, 2])), [1, 0])
+    assert nonlocal_sde._orbital_involution(ek, orbitals=np.array([0, 1])) is None

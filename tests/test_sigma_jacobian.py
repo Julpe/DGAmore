@@ -21,6 +21,7 @@ from dgamore import config, dga_io, four_point, memory_estimator, mpi_utils, non
 from dgamore.dga_logger import DgaLogger
 from dgamore.four_point import FourPoint
 from dgamore.local_four_point import LocalFourPoint
+from dgamore.matsubara_frequencies import MFHelper
 from dgamore.n_point_base import SpinChannel, deferred_collection
 from dgamore.greens_function import GreensFunction, update_mu
 from dgamore.interaction import Interaction, LocalInteraction
@@ -98,8 +99,9 @@ def _first_orbital(s_dmft: SelfEnergy, u_loc: LocalInteraction, folder) -> tuple
 
 def _loop_state(monkeypatch, lattice: str = "fixture", tmp_path=None) -> types.SimpleNamespace:
     """
-    The end_2_end fixture's fresh-start loop state on its own, the p_x/p_y, complex-hopping or one-band lattice; the
-    one-band lattice writes its vertices to ``tmp_path``.
+    The end_2_end fixture's fresh-start loop state on its own, the p_x/p_y, complex-hopping or one-band lattice, or
+    the one band as the correlated orbital of the Emery dispersion; the one-band lattices write their vertices to
+    ``tmp_path``.
     """
     monkeypatch.setattr(npb, "DTYPE", np.complex128)
     monkeypatch.setattr(gc, "collect", lambda *args, **kwargs: 0)
@@ -115,8 +117,13 @@ def _loop_state(monkeypatch, lattice: str = "fixture", tmp_path=None) -> types.S
     config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
     config.output.output_path = folder
     u_loc = config.lattice.hamiltonian.get_local_u()
-    if lattice == "one_band":
+    if lattice in ("one_band", "one_band_hybridized"):
         s_dmft, u_loc = _first_orbital(s_dmft, u_loc, tmp_path)
+    if lattice == "one_band_hybridized":
+        config.lattice.hamiltonian.set_ek(conftest.emery_hk(config.lattice.nk))
+        config.sys.correlated_orbitals = np.array([0])
+        config.lattice.k_grid = bz.KGrid(config.lattice.nk, symmetries=[bz.KnownSymmetries.AUTO])
+        config.lattice.k_grid.specify_auto_symmetries(config.lattice.hamiltonian.get_ek(), orbitals=np.array([0]))
     if lattice == "p_orbitals":
         # the stored vertices keep the sign of either orbital exactly but not the swap of the two, so no swap here
         config.lattice.hamiltonian.set_ek(conftest.p_orbital_hk(config.lattice.nk, equal_orbitals=False))
@@ -131,16 +138,16 @@ def _loop_state(monkeypatch, lattice: str = "fixture", tmp_path=None) -> types.S
     niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
     ek = config.lattice.hamiltonian.get_ek()
     start = s_dmft.concatenate_self_energies(s_dmft)
-    nb = ek.shape[-1]
-    occ_k = GreensFunction.get_g_full(start, config.sys.mu, ek.reshape(-1, 1, 1, nb, nb), config.sys.beta)
+    nb, o = ek.shape[-1], config.sys.correlated_orbitals
+    occ_k = GreensFunction.get_g_full(start, config.sys.mu, ek.reshape(-1, 1, 1, nb, nb), config.sys.beta, o)
     config.sys.n, config.sys.occ, config.sys.occ_k = nonlocal_sde._assemble_occupation(
-        occ_k.get_fill_nonlocal()[2], dist_fullbz
+        occ_k.get_fill_nonlocal()[2], dist_fullbz, o
     )
     sigma_dmft = s_dmft.cut_niv(niv_cut)
     v_nonloc = config.lattice.hamiltonian.get_vq(k_grid)
     if lattice == "complex_hopping":
         v_nonloc = _nearest_neighbor_v(k_grid.nk, 0.3)
-    elif lattice == "one_band":
+    elif lattice in ("one_band", "one_band_hybridized"):
         v_nonloc = Interaction(v_nonloc.mat[..., :1, :1, :1, :1].copy(), SpinChannel.NONE, k_grid.nk)
     return types.SimpleNamespace(
         comm=comm,
@@ -179,7 +186,8 @@ def _mu_and_occupations(state, sigma, mu_start: float, fixed: bool = False) -> f
     s = sigma.copy().compress_q_dimension()
     mu = mu_start
     if not fixed:
-        mu = update_mu(mu_start, config.sys.n, state.ek, s.mat, config.sys.beta, s.fit_smom()[0], tol=1e-14)
+        smom0, orbitals = s.fit_smom()[0], config.sys.correlated_orbitals
+        mu = update_mu(mu_start, config.sys.n, state.ek, s.mat, config.sys.beta, smom0, tol=1e-14, orbitals=orbitals)
     _, config.sys.occ, config.sys.occ_k, _, _ = nonlocal_sde._update_occ_and_energies_distributed(
         s, state.sigma_dmft_full, state.dist_fullbz, mu
     )
@@ -243,13 +251,13 @@ def quiet_logger(monkeypatch):
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
 
 
-@pytest.mark.parametrize("lattice", ["fixture", "p_orbitals", "complex_hopping", "one_band"])
+@pytest.mark.parametrize("lattice", ["fixture", "p_orbitals", "complex_hopping", "one_band", "one_band_hybridized"])
 def test_exact_jacobian_matches_central_differences_of_the_loop_map(lattice, monkeypatch, tmp_path):
     """J y equals the central difference of the loop's map along a reachable direction, mu and occupations included."""
     state = _loop_state(monkeypatch, lattice, tmp_path)
     base, mu0 = _start(state)
     jac = _jacobian(state, base, mu0)
-    assert jac._tr_average == (lattice != "one_band")
+    assert jac._tr_average == (lattice not in ("one_band", "one_band_hybridized"))
     x0 = _core(base).copy()
     y = jac.project(np.random.default_rng(3).standard_normal(jac.n_real))
     dx = np.reshape(_window(y), x0.shape)
@@ -1456,3 +1464,14 @@ def test_unfolding_a_sector_vector_peaks_at_two_core_windows(loop_state):
     y = np.random.default_rng(16).standard_normal(2 * k_grid.nk_irr * nb**2 * niv)
     window, peak = conftest.traced_peak(lambda: _window(y))
     assert window.nbytes < peak <= 2 * window.nbytes + 2**16
+
+
+def test_squared_box_sum_embeds_the_self_energy_of_the_correlated_orbitals():
+    """The squared box sum with orbitals equals the plain one of the embedded self-energy (Emery, n_d = 1)."""
+    ek = conftest.emery_hk((2, 2, 1)).reshape(-1, 3, 3)
+    rows = (0.3 - 0.4j / (1j * MFHelper.vn(6, 7.0)))[None, None, None, :] * np.ones((4, 1, 1, 1))
+    embedded = np.zeros((4, 3, 3, 12), dtype=complex)
+    embedded[:, :1, :1] = rows
+    expected = _squared_box_sum(embedded, 0.2, ek, 7.0, True)
+    got = _squared_box_sum(rows, 0.2, ek, 7.0, True, orbitals=np.array([0]))
+    assert got.shape == (4, 3, 3) and np.allclose(got, expected, rtol=0, atol=1e-13)

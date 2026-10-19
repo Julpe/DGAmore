@@ -182,7 +182,7 @@ class Hamiltonian:
                 elif (a == d and b == c) or (a == c and b == d):  # U_{lmml} Hund's exchange, U_{lmlm} pair hopping
                     interaction_elements.append(InteractionElement(r_loc, bands, j))
 
-            offset += n_bands
+            offset += int(n_bands)
 
         return self._add_interaction_term(interaction_elements)
 

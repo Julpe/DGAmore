@@ -18,7 +18,7 @@ import dgamore.config as config
 import dgamore.mpi_utils as mu
 import dgamore.n_point_base as n_point_base
 from dgamore import eliashberg_solver as es
-from dgamore import memory_estimator, nonlocal_sde
+from dgamore import memory_estimator, nonlocal_sde, symmetry_reduction
 from dgamore.dga_logger import DgaLogger
 from dgamore.interaction import Interaction, LocalInteraction
 from dgamore import brillouin_zone as bz
@@ -3198,3 +3198,41 @@ def test_even_sectors_degenerate_flags_equal_leading_even_eigenvalues():
     assert not es.even_sectors_degenerate(results(0.21, 0.011))
     unprojected = {(SpinChannel.SING, "none"): (np.array([0.5]), []), (SpinChannel.TRIP, "none"): (np.array([0.5]), [])}
     assert not es.even_sectors_degenerate(unprojected)
+
+
+def _set_hybridized_mirror_lattice(monkeypatch) -> None:
+    """Configures the p_x/p_y pair as the correlated orbitals beside a third orbital that keeps both mirrors."""
+    nk = (4, 4, 1)
+    kx = 2 * np.pi * np.arange(nk[0]) / nk[0]
+    wide = np.zeros((*nk, 3, 3), dtype=complex)
+    wide[..., :2, :2] = conftest.p_orbital_hk(nk, equal_orbitals=False)
+    wide[..., 2, 2] = 3.0
+    wide[..., 0, 2] = wide[..., 2, 0] = 0.4 * np.sin(kx)[:, None, None]
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda k_grid=None: wide)
+    config.sys.correlated_orbitals = np.array([0, 1])
+
+
+def test_gap_orbital_mirrors_of_a_hybridized_dispersion_act_on_the_correlated_orbitals(monkeypatch):
+    """With uncorrelated orbitals the gap mirrors are solved on the correlated block, sized like the gap."""
+    _set_hybridized_mirror_lattice(monkeypatch)
+    mirrors = es._gap_orbital_mirrors(2)
+    assert mirrors and all(np.shape(u) == (2, 2) for u in mirrors.values())
+    assert config.logger.warning.call_count == 0
+
+
+def test_gap_orbital_mirrors_warn_about_a_mirror_the_correlated_check_drops(monkeypatch):
+    """A proxy mirror that fails the exact check of the correlated block is dropped with a warning."""
+    _set_hybridized_mirror_lattice(monkeypatch)
+    monkeypatch.setattr(symmetry_reduction, "_maps_correlated_moments", lambda *args: False)
+    mirrors = es._gap_orbital_mirrors(2)
+    assert mirrors and all(u is None for u in mirrors.values())
+    assert config.logger.warning.call_count == 1
+
+
+def test_gap_orbital_mirrors_warn_when_the_correlated_probe_fails(monkeypatch):
+    """With uncorrelated orbitals a failing mirror probe is logged as a warning, not at debug level."""
+    _set_hybridized_mirror_lattice(monkeypatch)
+    monkeypatch.setattr(es, "find_coordinate_mirror_orbital_unitaries", MagicMock(side_effect=ValueError("probe")))
+    assert es._gap_orbital_mirrors(2) == {}
+    assert config.logger.warning.call_count == 1 and config.logger.debug.call_count == 0
