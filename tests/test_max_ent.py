@@ -715,3 +715,24 @@ def test_perform_maxent_giwk_saves_the_positive_part_of_the_spectral_matrix_at_i
     # stand-in band matrix [[0.5, 2], [2, 0.5]]: -1.5 on (1, -1)/sqrt(2) is cut, 2.5 on (1, 1)/sqrt(2) scaled to trace 1
     expected = _band_to_orbital_giwk(hk, np.full((*nk, n_bands, n_bands, 1), 0.5 + 0j))[0, 0, 0]
     assert np.allclose(_saved_arrays(saver)["spectral_function_matrix_test.npy"][0], expected, atol=1e-5)
+
+
+def test_perform_maxent_giwk_rotates_with_the_correlated_block_of_the_hamiltonian(tmp_path, patch_maxent_mpi):
+    """With uncorrelated orbitals the band basis is the eigenbasis of H_dd(k), the block the Green's function holds."""
+    nk, n_bands, niv_core, w_count = (4, 4, 1), 2, 3, 7
+    hk_dd = _setup_maxent_config(tmp_path, nk, n_bands, niv_core, w_count, seed=7)
+    o = np.array([0, 2])
+    wide = np.zeros((*nk, 4, 4), dtype=complex)
+    wide[..., o[:, None], o] = hk_dd
+    wide[..., [1, 3], [1, 3]] = 5.0
+    wide[..., 0, 1] = wide[..., 1, 0] = 0.3  # d-p hybridization, outside the block
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda k_grid=None: wide)
+    config.sys.correlated_orbitals = o
+    mat = _build_giwk_mat(nk, n_bands, niv=4, seed=11)
+
+    def fn(comm, rank):
+        return max_ent.perform_maxent_giwk(GreensFunction(mat.copy(), nk=config.lattice.nk), "TEST", comm)
+
+    _, results = run_parallel(1, fn)
+    expected = _expected_band_spectrum(mat, hk_dd, nk, n_bands, niv_core, config.lattice.k_grid)
+    assert np.allclose(results[0].reshape(-1, n_bands, w_count), expected[:, :, None], atol=1e-5)

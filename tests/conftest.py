@@ -88,6 +88,11 @@ def reset_config_singletons():
     # Restore the global config singletons to fresh defaults after every test: config.py is module-level mutable state
     # that e2e tests reconfigure, so without this reset mutations would leak into later tests. Runs on teardown.
     yield
+    reset_config()
+
+
+def reset_config():
+    """Restores every config singleton to fresh defaults."""
     config.box = config.BoxConfig()
     config.lattice = config.LatticeConfig()
     config.lambda_correction = config.LambdaCorrectionConfig()
@@ -500,6 +505,28 @@ def traced_peak(fn):
     finally:
         tracemalloc.stop()
     return result, peak
+
+
+def write_hk(path, ek: np.ndarray, kpoints: np.ndarray) -> None:
+    """Writes ek [k, o, o] at the k-points [k, 3] as a wannier90 .hk file (the autouse fixture mutes np.savetxt)."""
+    n = ek.shape[-1]
+    with open(path, "w", encoding="utf-8") as file:
+        file.write(f"{ek.shape[0]} {n} {n}\n")
+        for k, block in zip(kpoints, ek):
+            file.write(" ".join(f"{x:.12f}" for x in k) + "\n")
+            for row in block:
+                file.write(" ".join(f"{z.real:.12f} {z.imag:.12f}" for z in row) + "\n")
+
+
+def emery_hk(nk: tuple[int, int, int], e_p: float = -2.5, t_pd: float = 1.0, t_pp: float = 0.4) -> np.ndarray:
+    """The three-orbital Emery dispersion (d, p_x, p_y) in the cell-periodic gauge, with the d level at zero."""
+    kx, ky, _ = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nk), indexing="ij")
+    hk = np.zeros((*nk, 3, 3), dtype=complex)
+    hk[..., 1, 1] = hk[..., 2, 2] = e_p
+    hk[..., 0, 1] = t_pd * (1 - np.exp(-1j * kx))
+    hk[..., 0, 2] = t_pd * (1 - np.exp(-1j * ky))
+    hk[..., 1, 2] = t_pp * (1 - np.exp(1j * kx)) * (1 - np.exp(-1j * ky))
+    return hk + np.conj(np.triu(hk, 1).swapaxes(-1, -2))
 
 
 def p_orbital_hk(nk: tuple[int, int, int], equal_orbitals: bool = True) -> np.ndarray:

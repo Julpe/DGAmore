@@ -39,7 +39,7 @@ import dgamore.mpi_utils as mpi_utils
 from dgamore import memory_estimator, n_point_base, nonlocal_sde, symmetry_reduction
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.four_point import FourPoint
-from dgamore.greens_function import _MODEL_EPOT_CHUNK_ELEMENTS, GreensFunction, _fermi_dirac_density
+from dgamore.greens_function import _MODEL_EPOT_CHUNK_ELEMENTS, GreensFunction, _fermi_dirac_density, embed_orbitals
 from dgamore.interaction import Interaction, LocalInteraction
 from dgamore.jacobian_stabilization import _RITZ_GATE, _condition_numbers, _schur_ritz, to_mat, to_vec
 from dgamore.matsubara_frequencies import MFHelper
@@ -58,7 +58,9 @@ _DUPLICATE_OVERLAP = 0.9  # norm share of an eigenvector in the span of the kept
 _FUSED_SOLVE_MIN_COMPOUND = 320
 
 
-def _squared_box_sum(sigma_mat: np.ndarray, mu: float, ek: np.ndarray, beta: float, complex_ek: bool) -> np.ndarray:
+def _squared_box_sum(
+    sigma_mat: np.ndarray, mu: float, ek: np.ndarray, beta: float, complex_ek: bool, orbitals: np.ndarray | None = None
+) -> np.ndarray:
     r"""
     Returns :math:`\sum_{\nu}(G^{\mathrm{k}})^2` per momentum over the frequency box of ``sigma_mat``,
     :math:`G^{\mathrm{k}} = [(\imath\nu + \mu) - \varepsilon(\mathbf{k}) - \Sigma^{\mathrm{k}}]^{-1}`, i.e. minus
@@ -72,7 +74,10 @@ def _squared_box_sum(sigma_mat: np.ndarray, mu: float, ek: np.ndarray, beta: flo
     :param beta: Inverse temperature :math:`\beta`.
     :param complex_ek: Whether the sums keep their imaginary part: the decision of the whole dispersion, so a real
         momentum slice of a complex dispersion keeps it as the occupation does; False returns the real part.
-    :return: The sums ``[k, o1, o2]`` (complex128 for a complex dispersion, float64 otherwise).
+    :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
+        when it acts on every orbital.
+    :return: The sums ``[k, o1, o2]`` on every orbital of ``ek`` (complex128 for a complex dispersion, float64
+        otherwise).
     """
     nk, nb = ek.shape[0], ek.shape[-1]
     iv = 1j * MFHelper.vn(sigma_mat.shape[-1] // 2, beta)
@@ -80,7 +85,12 @@ def _squared_box_sum(sigma_mat: np.ndarray, mu: float, ek: np.ndarray, beta: flo
     out = np.empty((nk, nb, nb), dtype=np.complex128 if complex_ek else np.float64)
     for start, stop in mpi_utils.row_chunks(nk, 1, nb * nb * iv.size, _MODEL_EPOT_CHUNK_ELEMENTS):
         rows = sigma_mat if sigma_mat.shape[0] == 1 else sigma_mat[start:stop]
-        g = np.linalg.inv(static[None] - ek[start:stop, None] - np.moveaxis(rows, -1, 1))
+        dyson = static[None] - ek[start:stop, None]
+        if orbitals is None:
+            dyson = dyson - np.moveaxis(rows, -1, 1)
+        else:
+            dyson[..., orbitals[:, None], orbitals] -= np.moveaxis(rows, -1, 1)
+        g = np.linalg.inv(dyson)
         squared = np.einsum("kvab,kvbc->kac", g, g, optimize=True)
         out[start:stop] = squared if complex_ek else squared.real
     return out
@@ -284,6 +294,15 @@ class ExactJacobian:
 
         with deferred_collection():
             self._giwk, self._giwk_win, self._node_comm = nonlocal_sde._build_giwk_full(comm, sigma, mu, self._ek, beta)
+            # with uncorrelated orbitals the mu response needs (G G)_dd, which is not G_dd G_dd
+            self._g2, self._g2_win = None, None
+            if config.sys.correlated_orbitals is not None:
+                self._g2, self._g2_win = mpi_utils.build_node_shared_array(
+                    self._node_comm,
+                    lambda: GreensFunction.get_g_squared_block(
+                        sigma, mu, self._ek, beta, config.sys.correlated_orbitals
+                    ),
+                )
             # the sector vectors of a product reach the node roots only, the ranks that unfold them
             self._roots_comm = comm.Split(0 if self._node_comm.rank == 0 else MPI.UNDEFINED)
             # the Hartree-Fock term of every product reads the same real-space interaction
@@ -423,7 +442,8 @@ class ExactJacobian:
         DMFT box, :math:`\kappa^{\mathbf{k}} = \beta\rho^{\mathbf{k}}(1 - \rho^{\mathbf{k}}) + \frac{1}{\beta}
         \sum_{\nu}\big((G^{\mathrm{k}}_{\mathrm{mod}})^2 - (G^{\mathrm{k}})^2\big)` (complex Hermitian for a complex
         dispersion, its real part for a real one, as the occupation), both summed over the momentum slices of the
-        ranks.
+        ranks. With uncorrelated orbitals both run over every orbital of the dispersion, the filling traces all of
+        them and :math:`\kappa` keeps the correlated block.
 
         :param sigma: The loop's :class:`SelfEnergy` (compressed momentum axis).
         :param sigma_dmft_full: The DMFT :class:`SelfEnergy` supplying the shell frequencies (momentum-local).
@@ -431,29 +451,30 @@ class ExactJacobian:
         :return: :math:`\partial_\mu N` and :math:`\kappa^{\mathbf{k}}` ``[kx, ky, kz, o1, o2]`` on rank 0; ``None``
             for both elsewhere.
         """
-        beta, mu, nb, complex_ek = self._beta, self._mu, config.sys.n_bands, self._complex_ek
+        beta, mu, complex_ek = self._beta, self._mu, self._complex_ek
+        orbitals, nb = config.sys.correlated_orbitals, self._ek.shape[-1]
         eye = np.eye(nb)
         ek = self._ek.reshape(-1, nb, nb)
         ek_my = ek[mpi_dist_fullbz.my_slice]
 
         sigma_occ = nonlocal_sde._occupation_self_energy(sigma, sigma_dmft_full, mpi_dist_fullbz)
-        smom0 = sigma_occ.smom[0]
+        smom0 = embed_orbitals(sigma_occ.smom[0], orbitals, nb)
         rho = _fermi_dirac_density((ek_my if complex_ek else ek_my.real) + smom0 - mu * eye, beta)
         model = np.broadcast_to(smom0[None, :, :, None], (1, nb, nb, sigma_occ.mat.shape[-1]))
         box_sum = _squared_box_sum(model, mu, ek_my, beta, complex_ek) - _squared_box_sum(
-            sigma_occ.mat, mu, ek_my, beta, complex_ek
+            sigma_occ.mat, mu, ek_my, beta, complex_ek, orbitals
         )
         kappa_my = beta * rho @ (eye - rho) + box_sum / beta
         sigma_occ.free()
-        kappa = nonlocal_sde._assemble_occupation(kappa_my.reshape(-1, 1, 1, nb, nb), mpi_dist_fullbz)[2]
+        kappa = nonlocal_sde._assemble_occupation(kappa_my.reshape(-1, 1, 1, nb, nb), mpi_dist_fullbz, orbitals)[2]
 
         # only the real part of the trace enters the filling, so these sums stay real on every slice
-        g2_sum = _squared_box_sum(sigma.mat[mpi_dist_fullbz.my_slice], mu, ek_my, beta, False).sum(axis=0)
+        g2_sum = _squared_box_sum(sigma.mat[mpi_dist_fullbz.my_slice], mu, ek_my, beta, False, orbitals).sum(axis=0)
         if mpi_dist_fullbz.mpi_size > 1:
             g2_sum = mpi_dist_fullbz.allreduce(g2_sum)
         if self._comm.rank != 0:
             return None, None
-        smom0 = sigma.fit_smom()[0]
+        smom0 = embed_orbitals(sigma.fit_smom()[0], orbitals, nb)
         hloc = np.mean(self._ek, axis=(0, 1, 2))
         rho = _fermi_dirac_density(hloc.real + smom0 - mu * eye, beta)
         model = np.broadcast_to(smom0[None, :, :, None], (1, nb, nb, sigma.mat.shape[-1]))
@@ -546,7 +567,16 @@ class ExactJacobian:
         :return: The :class:`GreensFunction` viewing ``mat``.
         """
         return GreensFunction(
-            mat, None, self._ek, True, False, False, nk=self._ek.shape[:3], beta=self._beta, mu=self._mu
+            mat,
+            None,
+            self._ek,
+            True,
+            False,
+            False,
+            nk=self._ek.shape[:3],
+            beta=self._beta,
+            mu=self._mu,
+            orbitals=config.sys.correlated_orbitals,
         )
 
     def _occupation_change(self, dx: np.ndarray) -> np.ndarray:
@@ -566,21 +596,43 @@ class ExactJacobian:
             out[start:stop] = np.sum(change if self._complex_ek else change.real, axis=-1)
         return out / self._beta
 
+    def _filling_change(self, dx: np.ndarray) -> float:
+        r"""
+        Returns :math:`\frac{1}{\beta n_{\mathbf{k}}} \sum_{\mathrm{k}} \mathrm{Re}\,\mathrm{Tr}[\delta
+        x^{\mathrm{k}} ((G^{\mathrm{k}})^2)_{dd}]` over the core window (rank 0): the change of the trace of
+        the k-averaged occupation of every orbital at fixed :math:`\mu` when only the correlated block of
+        :math:`\Sigma` changes.
+
+        :param dx: The window change ``[k, o1, o2, 2 niv_core]``.
+        :return: The change of the trace.
+        """
+        g2 = self._g2.reshape(-1, *self._g2.shape[-3:])
+        core = slice(self._giwk.niv - config.box.niv_core, self._giwk.niv + config.box.niv_core)
+        total = 0.0
+        for start, stop in mpi_utils.row_chunks(
+            g2.shape[0], g2.itemsize, g2[0].size, memory_estimator.SLICE_CHUNK_BYTES
+        ):
+            total += np.einsum("kabv,kbav->", dx[start:stop], g2[start:stop, ..., core]).real
+        return total / (self._beta * g2.shape[0])
+
     def _build_dg(self, dx: np.ndarray, dmu: float) -> None:
         r"""
         Writes :math:`\delta G^{\mathrm{k}} = G^{\mathrm{k}}(\theta_{\mathrm{core}}\,\delta x^{\mathrm{k}} -
         \delta\mu)\,G^{\mathrm{k}}` of the loop box into the node's window, in momentum chunks (node roots only).
+        With uncorrelated orbitals the :math:`\delta\mu` term is the correlated block of :math:`(G^{\mathrm{k}})^2`
+        over every orbital.
 
         :param dx: The window change ``[k, o1, o2, 2 niv_core]``.
         :param dmu: The chemical-potential change.
         :return: None.
         """
         g = self._giwk.mat.reshape(-1, *self._giwk.mat.shape[-3:])
+        g2 = None if self._g2 is None else self._g2.reshape(g.shape)
         core = slice(self._giwk.niv - config.box.niv_core, self._giwk.niv + config.box.niv_core)
         dg = self._dg.reshape(g.shape)
         for start, stop in mpi_utils.row_chunks(g.shape[0], g.itemsize, g[0].size, memory_estimator.SLICE_CHUNK_BYTES):
             rows = slice(start, stop)
-            dg[rows] = _sandwich(g[rows])
+            dg[rows] = _sandwich(g[rows]) if g2 is None else g2[rows]
             dg[rows] *= -dmu
             dg[rows, ..., core] += _sandwich(g[rows, ..., core], dx[rows])
 
@@ -697,7 +749,8 @@ class ExactJacobian:
         dmu, docc, docc_k = None, None, None
         if comm.rank == 0:
             dn_x = self._occupation_change(dx)
-            dmu = -2.0 * np.trace(dn_x.mean(axis=0)).real / self._dn_dmu
+            dn = np.trace(dn_x.mean(axis=0)).real if self._g2 is None else self._filling_change(dx)
+            dmu = -2.0 * dn / self._dn_dmu
             docc_k = dn_x.reshape(self._kappa.shape) + self._kappa * dmu
             docc = docc_k.mean(axis=(0, 1, 2))
         dmu = comm.bcast(dmu, root=0)
@@ -825,6 +878,8 @@ class ExactJacobian:
             nonlocal_sde._free_shared_window(win, node_comm)
         if self._roots_comm != MPI.COMM_NULL:
             self._roots_comm.Free()
+        self._g2 = None
+        nonlocal_sde._free_shared_window(self._g2_win, node_comm)
         self._giwk.mat = None
         nonlocal_sde._release_shared_giwk(self._giwk_win, node_comm)
 

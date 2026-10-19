@@ -860,6 +860,7 @@ def estimate_peaks(
     with_exact_jacobian: bool = False,
     overhead: float = OVERHEAD_FACTOR,
     chunk_budgets: ChunkBudgets = ChunkBudgets(),
+    n_orbitals: int | None = None,
 ) -> dict[str, BranchPeak]:
     r"""
     Estimates the per-rank peak host-memory (in bytes) of the fast and lean code path of each memory-sensitive
@@ -962,9 +963,13 @@ def estimate_peaks(
         and at most the build's rank block. A zero budget yields that branch's residents plus a single slice's
         transient.
         The ``"exact_jacobian"`` branch reads the exact Jacobian's own budgets (see :func:`exact_jacobian_budgets`).
+    :param n_orbitals: Number of orbitals of H(k), the size of the Dyson matrix in the chemical-potential search, the
+        occupation and the energies (uncorrelated orbitals included); None takes ``n_bands``. With more orbitals than
+        bands the exact Jacobian also holds the window of :math:`(G G)_{dd}`.
     :return: A dict mapping each branch key to its :class:`BranchPeak`.
     """
     nb = n_bands
+    n_orb = nb if n_orbitals is None else n_orbitals  # the Dyson matrix of the occupation, filling and energy steps
     wp = niw_core + 1  # half bosonic range, as the heavy objects are constructed
     vc = 2 * niv_core
     vf = 2 * niv_full
@@ -1140,7 +1145,7 @@ def estimate_peaks(
 
     # Chemical-potential update (verify-only): every rank's two complex128 Green's-function arrays on its share of the
     # full-BZ momenta, next to rank 0's history, previous iterate and the node's window.
-    mu_update_distributed = overhead * 16 * 2 * _giwk_rspace(share_k, nb, 2 * niv_cut)
+    mu_update_distributed = overhead * 16 * 2 * _giwk_rspace(share_k, n_orb, 2 * niv_cut)
     mu_update_single = mixing_history + scale * 2 * sigma_full
     peaks["mu_update"] = BranchPeak(
         baseline=rank_base,
@@ -1157,7 +1162,7 @@ def estimate_peaks(
     # history, previous iterate and the node's window and its whole-grid moment-fit window (top fifth of the box).
     dmft_box = 2 * niv_dmft
     energies_distributed = scale * 2 * _giwk_rspace(share_k, nb, dmft_box) + overhead * max(
-        _green_function_transients(share_k, nb, dmft_box)
+        _green_function_transients(share_k, n_orb, dmft_box)
     )
     energies_single = mu_update_single + scale * _giwk_rspace(nk_tot, nb, max(int(0.2 * niv_dmft), 4))
     peaks["energies"] = BranchPeak(
@@ -1175,16 +1180,16 @@ def estimate_peaks(
     # DMFT lattice Green's function of the whole grid on the DMFT box with its Dyson transient, and on a warm start
     # the starting iterate extended onto the DMFT box on the whole grid next to its niv_cut copy and the occupation.
     whole_box = _giwk_rspace(nk_tot, nb, dmft_box)
-    occupation_distributed = overhead * _green_function_transients(share_k, nb, dmft_box)[1]
+    occupation_distributed = overhead * _green_function_transients(share_k, n_orb, dmft_box)[1]
     if warm_start:
         occupation_distributed = max(occupation_distributed, mu_update_distributed)
     # with do_spectrum_dmft rank 0 also reloads that Green's function after the loop, cut to the core box, next to
     # giwk_dga and sigma_dga
     spectrum_single = max(
-        scale * whole_box + overhead * _green_function_transients(nk_tot, nb, dmft_box)[0],
+        scale * whole_box + overhead * _green_function_transients(nk_tot, n_orb, dmft_box)[0],
         scale * (whole_box + 2 * sigma_full + _giwk_rspace(nk_tot, nb, vc)),
     )
-    warm_single = scale * (whole_box + sigma_full) + overhead * _green_function_transients(nk_tot, nb, dmft_box)[1]
+    warm_single = scale * (whole_box + sigma_full) + overhead * _green_function_transients(nk_tot, n_orb, dmft_box)[1]
     occupation_single = max(spectrum_single if do_spectrum_dmft else 0.0, warm_single if warm_start else 0.0)
     peaks["occupation"] = BranchPeak(
         baseline=rank_base,
@@ -1233,6 +1238,8 @@ def estimate_peaks(
         # the loop Sigma, the loop-box G and change windows, and the real-space windows of G and of a piece's changes
         rspace = scale * _giwk_rspace(nk_tot, nb, gf_window_bubble)
         windows = sigma_shared + 2 * giwk_bubble + vertices + overhead * block_vectors + (m + 1) * rspace
+        if n_orb != nb:
+            windows += giwk_bubble  # the (G G)_dd window of the mu response with uncorrelated orbitals
         # rank 0's solvers in float64 sector vectors (measured): the in-loop check's basis, products, eigenvectors and
         # four temporaries; the end-of-rung basis with kept products or images, eigenvectors and two start vectors
         check = (4 * EXACT_CHECK_BASIS + 4) * vector

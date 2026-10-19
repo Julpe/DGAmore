@@ -107,7 +107,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         # them to every rank
         ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
         if is_auto_symmetries(config.lattice.k_grid.symmetries):
-            config.lattice.k_grid.specify_auto_symmetries(ek)
+            config.lattice.k_grid.specify_auto_symmetries(ek, orbitals=config.sys.correlated_orbitals)
     else:
         g_dmft_per_ineq, sigma_dmft_per_ineq, g2_dens_per_ineq, g2_magn_per_ineq = None, None, None, None
 
@@ -171,6 +171,11 @@ def run_dga_routine(comm: MPI.Comm) -> int:
     logger.info("Preprocessing done.")
 
     ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
+    if config.sys.correlated_orbitals is not None:
+        logger.info(
+            f"H(k) holds {ek.shape[-1]} orbitals; the correlated ones are {config.sys.correlated_orbitals.tolist()}, "
+            f"the others are uncorrelated and enter only the Dyson equation, the filling and the kinetic energy."
+        )
 
     if is_auto_symmetries(config.lattice.k_grid.symmetries):
         logger.info(
@@ -243,7 +248,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
                 g2.to_half_niw_range()
             g2_full = save_full_4pt_quantity(g2_per_ineq, f"g2_{channel}_loc")
             if config.output.do_plotting:
-                for omega in [0, -10, 10] if config.box.niw_core > 10 else [0]:
+                for omega in [0, -10, 10] if g2_full.niw >= 10 else [0]:
                     plotting.plot_nu_nup(
                         g2_full, omega=omega, name=f"G2_{channel}", output_dir=config.output.plotting_path
                     )
@@ -368,7 +373,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
             gamma_per_ineq.clear()
             if config.output.do_plotting:
                 gamma_plot = gamma_full.cut_niv(min(config.box.niv_core, 2 * int(config.sys.beta)))
-                for omega in [0, 10, -10]:
+                for omega in [0, 10, -10] if gamma_plot.niw >= 10 else [0]:
                     plotting.plot_nu_nup(
                         gamma_plot, omega=omega, name=f"Gamma_{channel}", output_dir=config.output.plotting_path
                     )
@@ -442,7 +447,11 @@ def run_dga_routine(comm: MPI.Comm) -> int:
     logger.info("Non-local ladder-DGA routine finished.")
 
     # only rank 0 reads the DGA self-energy and Green's function after the loop (files, plots, MaxEnt, pp bubble)
-    giwk_dga = GreensFunction.get_g_full(sigma_dga, config.sys.mu, ek, config.sys.beta) if comm.rank == 0 else None
+    giwk_dga = (
+        GreensFunction.get_g_full(sigma_dga, config.sys.mu, ek, config.sys.beta, config.sys.correlated_orbitals)
+        if comm.rank == 0
+        else None
+    )
 
     if config.ana_cont.do_spectrum_dga:
         spectrum = max_ent.perform_maxent_giwk(giwk_dga, "DGA", comm)
@@ -673,6 +682,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     estimate = functools.partial(
         memory_estimator.estimate_peaks,
         n_bands=config.sys.n_bands,
+        n_orbitals=(None if config.sys.correlated_orbitals is None else config.lattice.hamiltonian.get_ek().shape[-1]),
         nk_tot=nk_tot,
         nk_irr=nk_irr,
         niw_core=config.box.niw_core,

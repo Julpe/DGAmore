@@ -252,6 +252,7 @@ class DmftConfig:
     :ivar int n_ineq: Number of inequivalent atoms.
     :ivar list ineq_ordering: Ordering of the inequivalent atoms.
     :ivar list n_bands_per_ineq: Number of bands per inequivalent atom.
+    :ivar list n_p_bands_per_ineq: Number of uncorrelated (p) orbitals per inequivalent atom.
     """
 
     def __init__(self):
@@ -263,6 +264,7 @@ class DmftConfig:
         self.n_ineq: int = 1
         self.ineq_ordering: list[int] = [1]
         self.n_bands_per_ineq = []
+        self.n_p_bands_per_ineq: list[int] = []
 
 
 class SystemConfig:
@@ -272,10 +274,12 @@ class SystemConfig:
     :ivar float beta: Inverse temperature :math:`\beta`.
     :ivar float mu: Chemical potential :math:`\mu` (updated during self-consistency).
     :ivar float mu_dmft: Chemical potential of the DMFT input.
-    :ivar float n: Total filling :math:`n`.
-    :ivar int n_bands: Number of bands.
-    :ivar numpy.ndarray occ: Local (k-averaged) occupation matrix.
-    :ivar numpy.ndarray occ_k: Full (k-resolved) occupation matrix.
+    :ivar float n: Total filling :math:`n`, over every orbital of H(k).
+    :ivar int n_bands: Number of correlated bands (the orbitals the self-energy and the vertices act on).
+    :ivar numpy.ndarray correlated_orbitals: Indices of the correlated orbitals among the orbitals of H(k); None when
+        every orbital is correlated.
+    :ivar numpy.ndarray occ: Local (k-averaged) occupation matrix of the correlated orbitals.
+    :ivar numpy.ndarray occ_k: Full (k-resolved) occupation matrix of the correlated orbitals.
     :ivar numpy.ndarray occ_dmft: Local occupation matrix from the DMFT input.
     :ivar list occ_dmft_per_ineq: DMFT occupation matrices per inequivalent atom.
     """
@@ -286,6 +290,7 @@ class SystemConfig:
         self.mu_dmft: float = 0.0
         self.n: float = 0.0
         self.n_bands: int = 0
+        self.correlated_orbitals: np.ndarray | None = None
         self.occ: np.ndarray = np.ndarray(0)
         self.occ_k: np.ndarray = np.ndarray(0)
         self.occ_dmft: np.ndarray = np.ndarray(0)

@@ -24,7 +24,8 @@ Storage conventions
 The following symbols are used throughout this page:
 
 * :math:`n_{\mathrm{o}}` (written ``no`` in the tables) is the number of bands (orbitals) of the full multi-band
-  problem,
+  problem; with uncorrelated orbitals in the Hamiltonian it counts the correlated ones only, which every written
+  quantity holds,
 * ``(nkx, nky, nkz)`` is the momentum grid ``nk``, :math:`n_{\mathbf{q}}^{\mathrm{irr}}` (written ``nq_irr``, or
   :math:`n_{\mathbf{k}}^{\mathrm{irr}}` and ``nk_irr`` for the same irreducible momenta of a single-particle
   quantity) the number of momenta in the irreducible Brillouin zone and ``nq_rank`` the number of them held by one MPI
@@ -176,9 +177,10 @@ rediscover it from the same ``wannier_hr.dat``:
    # KnownSymmetries.AUTO defers the reduction; until it is resolved the grid behaves as if the zone were unreduced
    k_grid = KGrid(nk, [KnownSymmetries.AUTO])
 
-   # evaluate H(k) of the run's hopping file on that grid and let the grid discover its symmetry group
+   # evaluate H(k) of the run's hopping file on that grid and let the grid discover its symmetry group on the
+   # correlated orbitals the run logged (None: every orbital is correlated; np.array([0]) for the Emery model)
    ek = Hamiltonian().read_hr_w2k(f"{run}/wannier_hr.dat").get_ek(k_grid)
-   k_grid.specify_auto_symmetries(ek)
+   k_grid.specify_auto_symmetries(ek, orbitals=None)
 
    # restore the signed bosonic axis and unfold to the full zone
    chi_phys_dens = chi_phys_dens.to_full_niw_range().map_to_full_bz(k_grid)
@@ -186,7 +188,10 @@ rediscover it from the same ``wannier_hr.dat``:
 The discovery has to happen before the unfold: on an auto grid the symmetry-related momenta of a star carry an orbital
 rotation, and :meth:`~dgamore.n_point_base.IAmNonLocal.map_to_full_bz` applies it from the data
 ``specify_auto_symmetries`` stores on the grid. Unfolding against a grid whose group was never resolved silently
-replicates the irreducible values instead.
+replicates the irreducible values instead. A run whose Hamiltonian holds uncorrelated orbitals discovered its group on
+the correlated block (see :ref:`uncorrelated-orbitals`), so the grid needs the same ``orbitals``: discovered on the
+whole Hamiltonian, the group can be smaller (two of the eight operations of the Emery model in the cell-periodic gauge),
+and the grid then no longer matches the stored zone.
 
 The per-rank intermediates are read the same way, but their momentum axis holds only the momenta of the writing
 rank instead of the whole irreducible zone. They are therefore loaded with the default grid, and their leading axis

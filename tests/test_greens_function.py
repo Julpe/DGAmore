@@ -11,10 +11,12 @@ import pytest
 
 import dgamore.config as config
 import dgamore.greens_function as gf_module
+import dgamore.n_point_base as npb
 from dgamore.greens_function import GreensFunction, get_total_fill, update_mu
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.self_energy import SelfEnergy
+from tests.conftest import emery_hk
 from tests.conftest import run_parallel
 from tests.conftest import traced_peak
 
@@ -536,7 +538,8 @@ def test_get_occupation_refuses_a_self_energy_on_other_momenta():
         GreensFunction.get_occupation(sigma, 0.3, ek.reshape(3, 2, 1, *ek.shape[3:]), 7.3)
 
 
-def test_get_occupation_holds_the_modeled_momentum_chunks_not_the_whole_box(monkeypatch):
+@pytest.mark.parametrize("nb, n_orbitals", [(2, 2), (1, 3)])
+def test_get_occupation_holds_the_modeled_momentum_chunks_not_the_whole_box(monkeypatch, nb, n_orbitals):
     """Beyond the momentum-sized arrays the occupation holds about three chunk-sized arrays, within the estimator's
     occupation transient, a small fraction of one Green's function on the whole box."""
     import tracemalloc
@@ -546,20 +549,22 @@ def test_get_occupation_holds_the_modeled_momentum_chunks_not_the_whole_box(monk
 
     monkeypatch.setattr(gf_module, "_MOMENTUM_CHUNK_ELEMENTS", 2**12)
     monkeypatch.setattr(memory_estimator, "GF_MOMENTUM_CHUNK_ELEMENTS", 2**12)
-    n_k, nb, niv, beta = 64, 2, 400, 9.0
+    n_k, niv, beta = 64, 400, 9.0
+    orbitals = None if n_orbitals == nb else np.arange(nb)
     rng = np.random.default_rng(4)
     mat = (rng.standard_normal((1, 1, 1, nb, nb, 2 * niv)) * 0.1 - 0.4j).astype(np.complex64)
     sigma = SelfEnergy(mat, (1, 1, 1), beta=beta)
-    h = rng.standard_normal((n_k, nb, nb)) + 1j * rng.standard_normal((n_k, nb, nb))
-    ek = (0.5 * (h + h.conj().swapaxes(-1, -2))).reshape(n_k, 1, 1, nb, nb)
+    h = rng.standard_normal((n_k, n_orbitals, n_orbitals)) + 1j * rng.standard_normal((n_k, n_orbitals, n_orbitals))
+    ek = (0.5 * (h + h.conj().swapaxes(-1, -2))).reshape(n_k, 1, 1, n_orbitals, n_orbitals)
     tracemalloc.start()
-    GreensFunction.get_occupation(sigma, 0.4, ek, beta)
+    GreensFunction.get_occupation(sigma, 0.4, ek, beta, orbitals=orbitals)
     peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
-    whole_box = n_k * nb**2 * 2 * niv * 16
+    whole_box = n_k * n_orbitals**2 * 2 * niv * 16
     # the momentum-sized arrays (density matrix, frequency sums, occupation) and the frequency grid on the bands
-    small = 6 * n_k * nb**2 * 16 + 2 * nb**2 * 2 * niv * 16
-    assert peak <= memory_estimator._green_function_transients(n_k, nb, 2 * niv)[1] + small < 0.2 * whole_box
+    small = 6 * n_k * n_orbitals**2 * 16 + 2 * n_orbitals**2 * 2 * niv * 16
+    transient = memory_estimator._green_function_transients(n_k, n_orbitals, 2 * niv)[1]
+    assert peak <= transient + small < 0.2 * whole_box
 
 
 def test_chunk_constants_are_mirrored_by_the_memory_estimator():
@@ -736,3 +741,117 @@ def test_momentum_slices_given_the_complex_decision_assemble_the_full_grid(monke
             g_my = GreensFunction.get_g_full(sig_my, mu, rows[idx], beta)
             parts.append(g_my.get_fill_nonlocal(real_dispersion=False)[2])
         assert np.array_equal(np.concatenate(parts).reshape(8, 2, 2), occ_k)
+
+
+def _correlated_inputs(orbitals=(0, 2), n_orbitals=4, nk=(3, 2, 1), niv=16, beta=6.0, mu=0.2, seed=5):
+    """Real symmetric dispersion on n_orbitals orbitals and a causal self-energy on the correlated ones."""
+    rng = np.random.default_rng(seed)
+    h = rng.standard_normal((*nk, n_orbitals, n_orbitals))
+    ek = h + h.swapaxes(-1, -2)
+    n_d = len(orbitals)
+    b = rng.standard_normal((int(np.prod(nk)), n_d, n_d))
+    s0 = np.diag(rng.uniform(0.5, 1.0, n_d))
+    sig_mat = s0[..., None] + 0.2 * (b @ b.swapaxes(-1, -2))[..., None] / (1j * MFHelper.vn(niv, beta))
+    sig = SelfEnergy(sig_mat.astype(np.complex128), nk=nk, has_compressed_q_dimension=True, beta=beta)
+    return np.array(orbitals), ek, sig, beta, mu
+
+
+def _embedded(sig: SelfEnergy, orbitals: np.ndarray, n_orbitals: int, beta: float) -> SelfEnergy:
+    """The self-energy placed on the correlated rows and columns of an otherwise zero n_orbitals matrix."""
+    src = sig.copy().compress_q_dimension().mat  # [k, o1, o2, v] whatever layout sig is in
+    mat = np.moveaxis(gf_module.embed_orbitals(np.moveaxis(src, -1, 1), orbitals, n_orbitals), 1, -1)
+    return SelfEnergy(mat, nk=sig.nq, has_compressed_q_dimension=True, beta=beta)
+
+
+@pytest.fixture
+def complex128(monkeypatch):
+    """N-point arrays in complex128, so the comparisons below hold at 1e-12."""
+    monkeypatch.setattr(npb, "DTYPE", np.complex128)
+
+
+def test_correlated_greens_function_is_the_schur_complement_of_the_uncorrelated_orbitals(complex128):
+    """G_dd = [iv + mu - H_dd - Sigma - H_dp (iv + mu - H_pp)^-1 H_pd]^-1 for d orbitals 0 and 2 of 4."""
+    o, ek, sig, beta, mu = _correlated_inputs()
+    p = np.setdiff1d(np.arange(ek.shape[-1]), o)
+    z = (1j * MFHelper.vn(sig.niv, beta) + mu)[None, :, None, None]
+    h = ek.reshape(-1, 1, *ek.shape[-2:])
+    h_pp_inv = np.linalg.inv(z * np.eye(len(p)) - h[..., p[:, None], p])
+    hybridization = h[..., o[:, None], p] @ h_pp_inv @ h[..., p[:, None], o]
+    expected = np.linalg.inv(z * np.eye(len(o)) - h[..., o[:, None], o] - np.moveaxis(sig.mat, -1, 1) - hybridization)
+
+    g = GreensFunction.get_g_full(sig, mu, ek, beta, orbitals=o)
+
+    assert np.allclose(np.moveaxis(g.mat.reshape(-1, 2, 2, 2 * sig.niv), -1, 1), expected, rtol=0, atol=1e-12)
+
+
+def test_filling_and_occupation_of_a_correlated_self_energy_count_every_orbital(complex128):
+    """n, occ and occ_k equal those of the self-energy embedded with zeros on the uncorrelated orbitals."""
+    o, ek, sig, beta, mu = _correlated_inputs()
+    n_ref, occ_ref, occ_k_ref = _reference_fill_nonlocal(_embedded(sig, o, 4, beta), mu, ek, beta)
+
+    n, occ, occ_k = GreensFunction.get_occupation(sig, mu, ek, beta, orbitals=o)
+
+    assert occ.shape == (4, 4) and occ_k.shape == (*ek.shape[:3], 4, 4)
+    assert np.isclose(n, n_ref, rtol=0, atol=1e-12)
+    assert np.allclose(occ_k, occ_k_ref, rtol=0, atol=1e-12)
+
+
+def test_mu_search_of_a_correlated_self_energy_matches_the_embedded_search(complex128):
+    """get_total_fill and update_mu with orbitals equal the plain evaluation of the embedded self-energy."""
+    o, ek, sig, beta, mu = _correlated_inputs()  # sig.mat is [k, o1, o2, v], as the mu search takes it
+    full = _embedded(sig, o, 4, beta)
+    smom0 = sig.smom[0]
+    fill = get_total_fill(mu, ek, sig.mat, beta, smom0, orbitals=o)
+    assert np.isclose(fill, get_total_fill(mu, ek, full.mat, beta, full.smom[0]), rtol=0, atol=1e-12)
+    target = fill + 0.1
+    mu_o = update_mu(mu, target, ek, sig.mat, beta, smom0, orbitals=o)
+    assert np.isclose(mu_o, update_mu(mu, target, ek, full.mat, beta, full.smom[0]), rtol=0, atol=1e-9)
+
+
+def test_energies_of_a_correlated_self_energy_match_the_embedded_ones(complex128):
+    """E_kin traces every orbital, E_pot the correlated block; both equal the embedded evaluation."""
+    o, ek, sig, beta, mu = _correlated_inputs()
+    full = _embedded(sig, o, 4, beta)  # before get_g_full decompresses sig in place
+    g = GreensFunction.get_g_full(sig, mu, ek, beta, orbitals=o)
+    g.get_fill_nonlocal()
+    g_ref = GreensFunction.get_g_full(full, mu, ek, beta)
+    g_ref.get_fill_nonlocal()
+    assert np.isclose(g.get_ekin(), g_ref.get_ekin(), rtol=0, atol=1e-10)
+    assert np.isclose(g.get_epot(niv_asympt=2000), g_ref.get_epot(niv_asympt=2000), rtol=0, atol=1e-10)
+
+
+def test_every_orbital_listed_is_the_plain_dyson_equation(complex128):
+    """orbitals = arange(n) reproduces orbitals = None for the filling and the Green's function."""
+    _, ek, sig, beta, mu = _correlated_inputs(orbitals=(0, 1, 2, 3))
+    every = np.arange(4)
+    assert np.isclose(
+        get_total_fill(mu, ek, sig.mat, beta, sig.smom[0], orbitals=every),
+        get_total_fill(mu, ek, sig.mat, beta, sig.smom[0]),
+        rtol=0,
+        atol=1e-14,
+    )
+    assert np.allclose(
+        GreensFunction.get_g_full(sig.copy(), mu, ek, beta, orbitals=every).mat,
+        GreensFunction.get_g_full(sig.copy(), mu, ek, beta).mat,
+        rtol=0,
+        atol=1e-14,
+    )
+
+
+def test_squared_block_is_the_correlated_block_of_the_squared_greens_function(complex128):
+    """get_g_squared_block = ((G_full)^2)_dd on every momentum and frequency (Emery, n_d = 1)."""
+    ek = emery_hk((4, 4, 1))
+    o, beta, mu = np.array([0]), 8.0, 0.3
+    values = 0.4 - 0.3j * np.sign(MFHelper.vn(10, beta))
+    sig_mat = np.broadcast_to(values[None, None, None, :], (16, 1, 1, 20)).astype(np.complex128)
+    sig = SelfEnergy(sig_mat, nk=(4, 4, 1), has_compressed_q_dimension=True, beta=beta)
+    g_full = GreensFunction.get_g_full(_embedded(sig, o, 3, beta), mu, ek, beta).mat
+    expected = np.einsum("...abv,...bcv->...acv", g_full, g_full)[..., :1, :1, :]
+    assert np.allclose(GreensFunction.get_g_squared_block(sig, mu, ek, beta, o), expected, rtol=0, atol=1e-12)
+
+
+def test_a_self_energy_on_fewer_orbitals_than_the_dispersion_needs_the_orbitals(complex128):
+    """Without orbitals a one-orbital self-energy is refused by a three-orbital dispersion instead of broadcast."""
+    _, ek, sig, beta, mu = _correlated_inputs(orbitals=(0,), n_orbitals=3)
+    with pytest.raises(ValueError, match="orbitals"):
+        get_total_fill(mu, ek, sig.mat, beta, sig.smom[0])

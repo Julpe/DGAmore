@@ -12,6 +12,7 @@ import pytest
 import dgamore.brillouin_zone as bz
 from dgamore.brillouin_zone import KPath, KnownKPoints, Labels
 from dgamore.hamiltonian import Hamiltonian
+from tests.conftest import emery_hk
 
 
 def test_applies_inversion_symmetry_along_x_axis():
@@ -886,3 +887,14 @@ def test_specify_auto_symmetries_keeps_the_square_zone_for_nearest_neighbor_hopp
     explicit = bz.KGrid(nk=nk, symmetries=bz.two_dimensional_square_symmetries())
     assert grid.nk_irr == explicit.nk_irr == 15
     assert np.array_equal(grid.fbz2irrk, explicit.fbz2irrk)
+
+
+def test_auto_symmetries_with_uncorrelated_orbitals_reduce_the_zone_of_the_correlated_greens_function():
+    """The Emery auto grid keeps 15 of 64 momenta with 1x1 rotations, and G_dd(nu_0) is equal on every orbit."""
+    nk = (8, 8, 1)
+    hk = emery_hk(nk)
+    grid = bz.KGrid(nk, symmetries=[bz.KnownSymmetries.AUTO])
+    grid.specify_auto_symmetries(hk, orbitals=np.array([0]))
+    assert grid.nk_irr == 15 and grid._auto_us.shape == (*nk, 1, 1)
+    g = np.linalg.inv((1j * np.pi / 10 + 0.3) * np.eye(3) - hk)[..., 0, 0].reshape(-1)
+    assert np.allclose(g, g[grid.irrk_ind][grid.irrk_inv.reshape(-1)], rtol=0, atol=1e-12)

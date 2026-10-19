@@ -12,6 +12,8 @@ The module-level helpers adjust :math:`\mu` to a target filling via a Newton roo
 sums are used so the finite Matsubara box does not bias the energies/filling.
 """
 
+from collections.abc import Iterator
+
 import numpy as np
 from scipy import optimize as opt
 
@@ -55,6 +57,64 @@ def _fermi_dirac_density(h: np.ndarray, beta: float) -> np.ndarray:
     return (eigenvecs * rho_diag[..., None, :]) @ np.linalg.inv(eigenvecs)
 
 
+def embed_orbitals(block: np.ndarray, orbitals: np.ndarray | None, n_orbitals: int) -> np.ndarray:
+    r"""
+    Returns the orbital matrix ``block`` (shape ``[..., o1, o2]``) placed on the rows and columns ``orbitals`` of an
+    otherwise zero ``[..., n, n]`` matrix, ``n = n_orbitals``.
+
+    :param block: The matrix on the selected orbitals.
+    :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
+        when it acts on every orbital.
+    :param n_orbitals: Number of orbitals of the dispersion.
+    :return: The embedded matrix, or ``block`` itself when ``orbitals`` is None.
+    """
+    if orbitals is None:
+        return block
+    out = np.zeros(block.shape[:-2] + (n_orbitals, n_orbitals), dtype=block.dtype)
+    out[..., orbitals[:, None], orbitals] = block
+    return out
+
+
+def orbital_block(mat: np.ndarray, orbitals: np.ndarray | None, frequency_last: bool = False) -> np.ndarray:
+    r"""
+    Returns the rows and columns ``orbitals`` of the orbital pair of ``mat``: its two trailing axes, or the two
+    before a trailing frequency axis.
+
+    :param mat: The array ``[..., n, n]`` or, with ``frequency_last``, ``[..., n, n, v]``.
+    :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
+        when it acts on every orbital.
+    :param frequency_last: Whether a frequency axis follows the orbital pair.
+    :return: The block (a copy), or ``mat`` itself when ``orbitals`` is None.
+    """
+    if orbitals is None:
+        return mat
+    return mat[..., orbitals[:, None], orbitals, :] if frequency_last else mat[..., orbitals[:, None], orbitals]
+
+
+def _subtract_self_energy(dyson: np.ndarray, sigma: np.ndarray, orbitals: np.ndarray | None) -> np.ndarray:
+    r"""
+    Subtracts the self-energy (``[..., o1, o2, v]``) from the Dyson matrix (``[..., n, n, v]``) in place, on the rows
+    and columns ``orbitals`` only.
+
+    :param dyson: The matrix :math:`(\imath\nu + \mu) - \varepsilon(\mathbf{k})`; overwritten.
+    :param sigma: The self-energy array, broadcastable onto the selected block.
+    :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
+        when it acts on every orbital.
+    :return: ``dyson``.
+    :raises ValueError: If ``orbitals`` is None and the self-energy holds fewer orbitals than the dispersion.
+    """
+    if orbitals is None:
+        if sigma.shape[-3:-1] != dyson.shape[-3:-1]:
+            raise ValueError(
+                f"The self-energy holds {sigma.shape[-2]} orbitals and H(k) {dyson.shape[-2]}; pass the orbitals it "
+                f"acts on."
+            )
+        dyson -= sigma
+    else:
+        dyson[..., orbitals[:, None], orbitals, :] -= sigma
+    return dyson
+
+
 def get_total_fill(
     mu: float,
     ek: np.ndarray,
@@ -62,6 +122,7 @@ def get_total_fill(
     beta: float,
     smom0: np.ndarray,
     mpi_dist: MpiDistributor | None = None,
+    orbitals: np.ndarray | None = None,
 ) -> float:
     r"""
     Returns the total filling for a given :math:`\mu`, self-energy and kinetic Hamiltonian. A local model Green's
@@ -81,9 +142,12 @@ def get_total_fill(
     :param smom0: Zeroth moment :math:`\Sigma_\infty` of the self-energy, shape ``[o1, o2]``.
     :param mpi_dist: MPI distributor over the full-BZ momenta (see :class:`MpiDistributor`), or ``None`` for the
         whole grid on this process.
-    :return: The total filling (electron number) :math:`n`.
+    :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
+        when it acts on every orbital.
+    :return: The total filling (electron number) :math:`n`, over every orbital of the dispersion.
     """
-    n_bands = sigma_mat.shape[-2]
+    n_bands = ek.shape[-1]
+    smom0 = embed_orbitals(smom0, orbitals, n_bands)
     eye_bands = np.eye(n_bands, n_bands)
     iv = 1j * MFHelper.vn(sigma_mat.shape[-1] // 2, beta)
     iv_bands = iv[None, None, :] * eye_bands[..., None]
@@ -97,7 +161,7 @@ def get_total_fill(
     if mpi_dist is not None:
         ek = ek[mpi_dist.my_slice]
     mat = iv_bands[None, ...] + mu_bands[None, ..., None] - ek[..., None]
-    g_full_mat = GreensFunction._invert_last_orbital_block(np.subtract(mat, sigma_mat, out=mat))
+    g_full_mat = GreensFunction._invert_last_orbital_block(_subtract_self_energy(mat, sigma_mat, orbitals))
     g_loc_mat = np.mean(g_full_mat, axis=0) if mpi_dist is None else mpi_dist.ordered_sum(g_full_mat) / mpi_dist.ntasks
 
     rho_loc = _fermi_dirac_density(hloc.real + smom0 - mu_bands, beta)
@@ -114,6 +178,7 @@ def root_fun(
     beta: float,
     smom0: np.ndarray,
     mpi_dist: MpiDistributor | None = None,
+    orbitals: np.ndarray | None = None,
 ) -> float:
     r"""
     Residual function used to find a new chemical potential :math:`\mu` via Newton's method: the difference between
@@ -127,9 +192,11 @@ def root_fun(
     :param smom0: Zeroth moment :math:`\Sigma_\infty` of the self-energy.
     :param mpi_dist: MPI distributor over the full-BZ momenta (see :class:`MpiDistributor`), or ``None`` for the
         whole grid on this process.
+    :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
+        when it acts on every orbital.
     :return: The signed filling residual ``filling(mu) - target_filling``.
     """
-    return get_total_fill(mu, ek, sigma_mat, beta, smom0, mpi_dist) - target_filling
+    return get_total_fill(mu, ek, sigma_mat, beta, smom0, mpi_dist, orbitals) - target_filling
 
 
 # Largest filling residual accepted from a "converged" Newton result; genuine roots sit orders of magnitude below
@@ -147,7 +214,7 @@ def _find_mu_bracket(
 
     :param mu0: Center of the search interval.
     :param args: The :func:`root_fun` arguments after ``mu`` (target filling, dispersion, self-energy, beta, moment,
-        distributor).
+        distributor, correlated orbitals).
     :param initial_width: Half-width of the first interval.
     :param max_width: Half-width beyond which the search gives up.
     :return: A bracketing interval ``(lo, hi)``, or ``None`` if no sign change was found.
@@ -171,6 +238,7 @@ def update_mu(
     logger=None,
     tol: float = 1e-6,
     mpi_dist: MpiDistributor | None = None,
+    orbitals: np.ndarray | None = None,
 ) -> float:
     r"""
     Updates the chemical potential to match the target filling by using Newton's method to find the optimal
@@ -193,11 +261,13 @@ def update_mu(
     :param tol: Root search tolerance for the chemical potential.
     :param mpi_dist: MPI distributor over the full-BZ momenta (see :class:`MpiDistributor`), or ``None`` for the
         whole grid on this process.
+    :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
+        when it acts on every orbital.
     :return: The updated (real) chemical potential, or ``mu0`` if no root was found.
     :raises ValueError: If the converged chemical potential has a non-negligible imaginary part.
     """
     mu = mu0
-    args = (target_filling, ek, sigma_mat, beta, smom0, mpi_dist)
+    args = (target_filling, ek, sigma_mat, beta, smom0, mpi_dist, orbitals)
     try:
         mu = opt.newton(root_fun, mu, args=args, tol=tol)
         # the secant step criterion can also "converge" inside a flat filling region far from any root, so the
@@ -242,6 +312,7 @@ class GreensFunction(TwoPoint):
         nk: tuple = (1, 1, 1),
         beta: float = None,
         mu: float = None,
+        orbitals: np.ndarray | None = None,
     ):
         r"""
         Initializes the Green's function; if a self-energy and dispersion are given (and ``calc_filling`` is True),
@@ -259,12 +330,15 @@ class GreensFunction(TwoPoint):
         :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
         :param beta: Inverse temperature :math:`\beta`.
         :param mu: Chemical potential :math:`\mu`.
+        :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals);
+            None when it acts on every orbital. The array then holds these orbitals only.
         """
         TwoPoint.__init__(self, mat, nk, full_niv_range, has_compressed_q_dimension)
         self._sigma = sigma
         self._ek = ek
         self._beta = beta
         self._mu = mu
+        self._orbitals = orbitals
         self._n = None
         self._occ = None
         self._occ_k = None
@@ -285,7 +359,7 @@ class GreensFunction(TwoPoint):
     @property
     def n(self) -> float:
         r"""
-        The total filling computed for this Green's function.
+        The total filling computed for this Green's function, over every orbital of the dispersion.
 
         :return: The total filling :math:`n`, or None if the filling has not been computed.
         """
@@ -294,7 +368,7 @@ class GreensFunction(TwoPoint):
     @property
     def occ(self) -> np.ndarray:
         """
-        The k-averaged occupation matrix.
+        The k-averaged occupation matrix on every orbital of the dispersion.
 
         :return: The k-averaged occupation (shape ``[o1, o2]``), or None if it has not been computed.
         """
@@ -303,40 +377,92 @@ class GreensFunction(TwoPoint):
     @property
     def occ_k(self) -> np.ndarray:
         """
-        The k-resolved occupation matrix.
+        The k-resolved occupation matrix on every orbital of the dispersion.
 
         :return: The k-resolved occupation (shape ``[kx, ky, kz, o1, o2]``), or None if it has not been computed.
         """
         return self._occ_k
 
     @staticmethod
-    def get_g_full(siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float):
+    def get_g_full(siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float, orbitals: np.ndarray | None = None):
         r"""
         Builds the full momentum-dependent Green's function :math:`G^{\mathrm{k}} = [(\imath\nu + \mu) -
         \varepsilon(\mathbf{k}) - \Sigma^{\mathrm{k}}]^{-1}`. The Dyson matrix is assembled and inverted in bounded
         fermionic-frequency chunks, so beyond the result only one chunk-sized transient is alive at a time (large
-        boxes such as the full DMFT one would otherwise triple the peak).
+        boxes such as the full DMFT one would otherwise triple the peak). With ``orbitals`` the self-energy acts on
+        those orbitals of the dispersion only, the inversion runs over every orbital and the result holds the rows and
+        columns ``orbitals``.
 
         :param siw: The :class:`SelfEnergy` :math:`\Sigma`.
         :param mu: Chemical potential :math:`\mu`.
         :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
         :param beta: Inverse temperature :math:`\beta`.
+        :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals);
+            None when it acts on every orbital.
         :return: The momentum-dependent :class:`GreensFunction` (filling not recomputed).
         """
-        eye_bands = np.eye(siw.n_bands, siw.n_bands)
-        iv = 1j * MFHelper.vn(siw.niv, beta)
-        static_bands = (mu * eye_bands)[None, None, None, :, :, None] - ek[..., None]
         sigma_mat = siw.decompress_q_dimension().mat
-
         # a momentum-local sigma ([1, 1, 1, ...]) broadcasts against the dispersion, so the result is always full-k
         mat = np.empty((*ek.shape[:3], siw.n_bands, siw.n_bands, 2 * siw.niv), dtype=sigma_mat.dtype)
-        step = max(1, _MODEL_EPOT_CHUNK_ELEMENTS // (int(np.prod(ek.shape[:3])) * siw.n_bands**2))
-        for start in range(0, 2 * siw.niv, step):
-            stop = min(2 * siw.niv, start + step)
+        for start, stop, inverse in GreensFunction._dyson_chunks(sigma_mat, siw.niv, mu, ek, beta, orbitals):
+            mat[..., start:stop] = orbital_block(inverse, orbitals, frequency_last=True)
+        return GreensFunction(
+            mat, siw, ek, siw.full_niv_range, False, False, nk=ek.shape[:3], beta=beta, mu=mu, orbitals=orbitals
+        )
+
+    @staticmethod
+    def get_g_squared_block(
+        siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float, orbitals: np.ndarray | None
+    ) -> np.ndarray:
+        r"""
+        Returns the rows and columns ``orbitals`` of the square of the Green's function :math:`[(G^{\mathrm{k}})^2]
+        _{12}`, with :math:`G^{\mathrm{k}}` inverted over every orbital of the dispersion, in the frequency chunks of
+        :meth:`get_g_full`. Its frequency sum is minus the derivative of the occupation with respect to :math:`\mu`.
+
+        :param siw: The :class:`SelfEnergy` :math:`\Sigma`.
+        :param mu: Chemical potential :math:`\mu`.
+        :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
+        :param beta: Inverse temperature :math:`\beta`.
+        :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals);
+            None when it acts on every orbital.
+        :return: The array ``[kx, ky, kz, o1, o2, 2 niv]``.
+        """
+        sigma_mat = siw.decompress_q_dimension().mat
+        out = np.empty((*ek.shape[:3], siw.n_bands, siw.n_bands, 2 * siw.niv), dtype=sigma_mat.dtype)
+        for start, stop, inverse in GreensFunction._dyson_chunks(sigma_mat, siw.niv, mu, ek, beta, orbitals):
+            square = np.einsum("...abv,...bcv->...acv", inverse, inverse, optimize=True)
+            out[..., start:stop] = orbital_block(square, orbitals, frequency_last=True)
+        return out
+
+    @staticmethod
+    def _dyson_chunks(
+        sigma_mat: np.ndarray, niv: int, mu: float, ek: np.ndarray, beta: float, orbitals: np.ndarray | None
+    ) -> Iterator[tuple[int, int, np.ndarray]]:
+        r"""
+        Yields the inverse Dyson matrix :math:`[(\imath\nu + \mu) - \varepsilon(\mathbf{k}) -
+        \Sigma^{\mathrm{k}}]^{-1}` on every orbital of ``ek``, one fermionic-frequency chunk of
+        :data:`_MODEL_EPOT_CHUNK_ELEMENTS` entries per momentum and orbital pair at a time.
+
+        :param sigma_mat: The uncompressed self-energy array ``[kx, ky, kz, o1, o2, 2 niv]`` (or momentum-local).
+        :param niv: Number of positive fermionic frequencies.
+        :param mu: Chemical potential :math:`\mu`.
+        :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`.
+        :param beta: Inverse temperature :math:`\beta`.
+        :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals);
+            None when it acts on every orbital.
+        :return: An iterator of ``(start, stop, inverse)`` with ``inverse`` of shape ``[kx, ky, kz, n, n, stop -
+            start]``.
+        """
+        n_orbitals = ek.shape[-1]
+        eye_bands = np.eye(n_orbitals, n_orbitals)
+        iv = 1j * MFHelper.vn(niv, beta)
+        static_bands = (mu * eye_bands)[None, None, None, :, :, None] - ek[..., None]
+        step = max(1, _MODEL_EPOT_CHUNK_ELEMENTS // (int(np.prod(ek.shape[:3])) * n_orbitals**2))
+        for start in range(0, 2 * niv, step):
+            stop = min(2 * niv, start + step)
             dyson = (iv[start:stop][None, None, :] * eye_bands[..., None])[None, None, None, ...] + static_bands
-            dyson -= sigma_mat[..., start:stop]
-            mat[..., start:stop] = GreensFunction._invert_last_orbital_block(dyson)
-        return GreensFunction(mat, siw, ek, siw.full_niv_range, False, False, nk=ek.shape[:3], beta=beta, mu=mu)
+            _subtract_self_energy(dyson, sigma_mat[..., start:stop], orbitals)
+            yield start, stop, GreensFunction._invert_last_orbital_block(dyson)
 
     @staticmethod
     def create_g_loc(
@@ -393,15 +519,24 @@ class GreensFunction(TwoPoint):
         :param real_dispersion: Whether the dispersion is real, so the occupation takes the real-part arithmetic
             (see :meth:`_occupation_k`); None decides on this object's dispersion.
         :return: A tuple of (i) the total filling :math:`n`, (ii) the k-averaged occupation (shape ``[o1, o2]``),
-            and (iii) the k-resolved occupation (shape ``[kx, ky, kz, o1, o2]``).
+            and (iii) the k-resolved occupation (shape ``[kx, ky, kz, o1, o2]``), all over every orbital of the
+            dispersion.
         """
-        occ_k = self._occupation_k(self._sigma, self._mu, self._ek, self._beta, self.niv, self.n_bands, real_dispersion)
+        n_orbitals = self.n_bands if self._orbitals is None else self._ek.shape[-1]
+        occ_k = self._occupation_k(
+            self._sigma, self._mu, self._ek, self._beta, self.niv, n_orbitals, real_dispersion, self._orbitals
+        )
         self._n, self._occ, self._occ_k = self._fill_from_occupation(occ_k)
         return self._n, self._occ, self._occ_k
 
     @staticmethod
     def get_occupation(
-        siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float, real_dispersion: bool | None = None
+        siw: SelfEnergy,
+        mu: float,
+        ek: np.ndarray,
+        beta: float,
+        real_dispersion: bool | None = None,
+        orbitals: np.ndarray | None = None,
     ) -> tuple[float, np.ndarray, np.ndarray]:
         r"""
         Returns the filling and occupation of the Green's function :meth:`get_g_full` builds from the same arguments,
@@ -418,12 +553,15 @@ class GreensFunction(TwoPoint):
         :param beta: Inverse temperature :math:`\beta`.
         :param real_dispersion: Whether the dispersion is real, so the occupation takes the real-part arithmetic
             (see :meth:`_occupation_k`); None decides on ``ek``.
+        :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals);
+            None when it acts on every orbital.
         :return: A tuple of (i) the total filling :math:`n`, (ii) the k-averaged occupation (shape ``[o1, o2]``),
-            and (iii) the k-resolved occupation (shape ``[kx, ky, kz, o1, o2]``).
+            and (iii) the k-resolved occupation (shape ``[kx, ky, kz, o1, o2]``), all over every orbital of ``ek``.
         :raises ValueError: If the self-energy is neither momentum-local nor on the momenta of ``ek``.
         """
         siw.decompress_q_dimension()
-        occ_k = GreensFunction._occupation_k(siw, mu, ek, beta, siw.niv, siw.n_bands, real_dispersion)
+        n_orbitals = siw.n_bands if orbitals is None else ek.shape[-1]
+        occ_k = GreensFunction._occupation_k(siw, mu, ek, beta, siw.niv, n_orbitals, real_dispersion, orbitals)
         return GreensFunction._fill_from_occupation(occ_k)
 
     @staticmethod
@@ -435,6 +573,7 @@ class GreensFunction(TwoPoint):
         niv: int,
         n_bands: int,
         real_dispersion: bool | None = None,
+        orbitals: np.ndarray | None = None,
     ) -> np.ndarray:
         r"""
         Returns the k-resolved occupation :math:`n_{12}(\mathbf{k}) = \rho_{12}(\mathbf{k}) + \frac{1}{\beta}
@@ -452,17 +591,19 @@ class GreensFunction(TwoPoint):
         :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})`, shape ``[kx, ky, kz, o1, o2]``.
         :param beta: Inverse temperature :math:`\beta`.
         :param niv: Number of positive fermionic frequencies of the Green's function.
-        :param n_bands: Number of bands.
+        :param n_bands: Number of orbitals of the dispersion.
         :param real_dispersion: Whether the dispersion is real; None decides on ``ek``.
-        :return: The k-resolved occupation, shape ``[kx, ky, kz, o1, o2]``; entries of magnitude below 1e-12 get a
-            zero real part.
+        :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals);
+            None when it acts on every orbital.
+        :return: The k-resolved occupation on every orbital of ``ek``, shape ``[kx, ky, kz, o1, o2]``; entries of
+            magnitude below 1e-12 get a zero real part.
         :raises ValueError: If the self-energy is neither momentum-local nor on the momenta of ``ek``.
         """
         eye_bands = np.eye(n_bands, n_bands)
         iv = 1j * MFHelper.vn(niv, beta)
         iv_bands = (iv[None, None, :] * eye_bands[..., None])[None]
         mu_v = (mu * eye_bands[:, :, None])[None]
-        smom0 = siw.smom[0]
+        smom0 = embed_orbitals(siw.smom[0], orbitals, n_bands)
 
         if real_dispersion is None:
             real_dispersion = np.isrealobj(np.real_if_close(ek))
@@ -472,7 +613,7 @@ class GreensFunction(TwoPoint):
 
         nk = int(np.prod(ek.shape[:3]))
         ek_flat = ek.reshape(nk, n_bands, n_bands)
-        sigma_flat = siw.mat.reshape(-1, n_bands, n_bands, siw.mat.shape[-1])
+        sigma_flat = siw.mat.reshape(-1, siw.n_bands, siw.n_bands, siw.mat.shape[-1])
         sigma_k = tuple(siw.mat.shape[:3]) if siw.mat.ndim == 6 else (sigma_flat.shape[0],)
         if sigma_flat.shape[0] != 1 and sigma_k not in (tuple(ek.shape[:3]), (nk,)):
             raise ValueError(f"The self-energy holds momenta {sigma_k}, the dispersion {tuple(ek.shape[:3])}.")
@@ -481,7 +622,9 @@ class GreensFunction(TwoPoint):
         for start in range(0, nk, step):
             k = slice(start, min(nk, start + step))
             sigma = sigma_flat if sigma_flat.shape[0] == 1 else sigma_flat[k]
-            g = GreensFunction._invert_last_orbital_block(iv_bands + mu_v - ek_flat[k, ..., None] - sigma)
+            g = GreensFunction._invert_last_orbital_block(
+                _subtract_self_energy(iv_bands + mu_v - ek_flat[k, ..., None], sigma, orbitals)
+            )
             g_model = GreensFunction._invert_last_orbital_block(
                 iv_bands + mu_v - ek_flat[k, ..., None] - smom0[None, ..., None]
             )
@@ -539,7 +682,8 @@ class GreensFunction(TwoPoint):
         smom0, smom1 = self._sigma.smom  # Sigma_inf, first tail coeff; both [o1, o2]
 
         # 1) Hartree: physical (tail-corrected) occupation, convergence factor exact.
-        e_hartree = np.sum(smom0[None, None, None] * self._occ_k.swapaxes(-1, -2)).real
+        occ_k = orbital_block(self._occ_k, self._orbitals)
+        e_hartree = np.sum(smom0[None, None, None] * occ_k.swapaxes(-1, -2)).real
 
         # 2) In-box correlation Tr[(Sigma - Sigma_inf) G] (Sigma_inf counted above): contract the orbital trace with
         # einsum (g orbital-transposed) to avoid the transpose_orbitals deepcopy of _ek/_sigma; per momentum chunk, so
@@ -578,7 +722,9 @@ class GreensFunction(TwoPoint):
         :param beta: Inverse temperature :math:`\beta`.
         :return: The model tail contribution to the potential energy (real scalar, not yet divided by ``nk_tot``).
         """
-        h = (self._ek + smom0[None, None, None]).reshape(self.nq_tot, self.n_bands, self.n_bands)
+        n = self.n_bands if self._orbitals is None else self._ek.shape[-1]
+        smom0, smom1 = embed_orbitals(smom0, self._orbitals, n), embed_orbitals(smom1, self._orbitals, n)
+        h = (self._ek + smom0[None, None, None]).reshape(self.nq_tot, n, n)
         lam, u = np.linalg.eig(h)  # once per k
         u_inv = np.linalg.inv(u)
         smom1_rot = u_inv @ smom1 @ u  # rotate tail coeff into eigenbasis
@@ -586,7 +732,7 @@ class GreensFunction(TwoPoint):
         # the frequency sum is evaluated in bounded v-chunks: the single-pass form materialized several
         # [k, band, 2*niv] complex temporaries, which for the default niv_asympt = 50000 spikes to many GB
         iv_full = 1j * MFHelper.vn(niv, beta)
-        step = max(1, _MODEL_EPOT_CHUNK_ELEMENTS // (self.nq_tot * self.n_bands))
+        step = max(1, _MODEL_EPOT_CHUNK_ELEMENTS // (self.nq_tot * n))
         total = 0.0
         for i in range(0, len(iv_full), step):
             iv = iv_full[i : i + step]
@@ -598,7 +744,7 @@ class GreensFunction(TwoPoint):
     def _get_gfull_mat(self) -> np.ndarray:
         r"""
         Builds the full momentum-dependent Green's function array :math:`[(\imath\nu + \mu) - \varepsilon(\mathbf{k}) -
-        \Sigma^{\mathrm{k}}]^{-1}`.
+        \Sigma^{\mathrm{k}}]^{-1}`, on the correlated orbitals when the self-energy acts on those only.
 
         :return: The Green's function array, shape ``[kx, ky, kz, o1, o2, v]``.
         """
@@ -609,8 +755,8 @@ class GreensFunction(TwoPoint):
         sigma_mat = self._sigma.mat
         if len(self._sigma.mat.shape) == 3:  # (o1,o1,v)
             sigma_mat = sigma_mat[None, None, None, ...]
-        mat = iv_bands + mu_bands - self._ek[..., None] - sigma_mat
-        return self._invert_last_orbital_block(mat)
+        mat = _subtract_self_energy(iv_bands + mu_bands - self._ek[..., None], sigma_mat, self._orbitals)
+        return orbital_block(self._invert_last_orbital_block(mat), self._orbitals, frequency_last=True)
 
     def _get_gloc_mat(self) -> np.ndarray:
         """
@@ -627,7 +773,8 @@ class GreensFunction(TwoPoint):
 
         :return: The tuple ``(iv_bands, mu_bands)`` of diagonal frequency and chemical-potential arrays.
         """
-        eye_bands = np.eye(self.n_bands, self.n_bands)
+        n = self.n_bands if self._orbitals is None else self._ek.shape[-1]
+        eye_bands = np.eye(n, n)
         iv = 1j * MFHelper.vn(self.niv, self._beta)
         iv_bands = iv[None, None, :] * eye_bands[..., None]
         mu_bands = self._mu * eye_bands[:, :, None]

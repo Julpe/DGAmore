@@ -25,7 +25,7 @@ from threadpoolctl import threadpool_limits
 
 import dgamore.config as config
 from dgamore.ana_cont import AnalyticContinuationProblem, RealFreqTwoPoint
-from dgamore.greens_function import GreensFunction
+from dgamore.greens_function import GreensFunction, orbital_block
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import DTYPE
 from dgamore.self_energy import SelfEnergy
@@ -122,9 +122,10 @@ def _continue(
 def perform_maxent_giwk(giwk: GreensFunction | None, name: str, comm: MPI.Comm):
     r"""
     Analytically continues the momentum-dependent Green's function to the real axis via maximum entropy, per
-    irreducible-BZ k-point in the band (:math:`H(\mathbf{k})`-eigen) basis. Every band-diagonal element is continued
-    with the positive entropy. Every band pair continues the Hermitian part :math:`(G_{12} + G_{21})/2` and the
-    anti-Hermitian part :math:`(G_{12} - G_{21})/(2i)` with the positive-negative entropy and the default model
+    irreducible-BZ k-point in the band (:math:`H(\mathbf{k})`-eigen) basis, with uncorrelated orbitals in the eigenbasis
+    of the correlated block :math:`H_{dd}(\mathbf{k})` the Green's function holds. Every band-diagonal element
+    is continued with the positive entropy. Every band pair continues the Hermitian part :math:`(G_{12} + G_{21})/2`
+    and the anti-Hermitian part :math:`(G_{12} - G_{21})/(2i)` with the positive-negative entropy and the default model
     :math:`\sqrt{A_{11} A_{22}}` (floored at :math:`10^{-6}` of its maximum): their real spectra are
     :math:`\mathrm{Re}\, A_{12}` and :math:`\mathrm{Im}\, A_{12}`. A part whose data stay within the assumed noise at
     every frequency (zero by a symmetry of the little group of :math:`\mathbf{k}`, or the anti-Hermitian part of a
@@ -160,9 +161,9 @@ def perform_maxent_giwk(giwk: GreensFunction | None, name: str, comm: MPI.Comm):
     if comm.rank == 0:
         giwk_maxent = giwk.cut_niv(config.box.niv_core).to_half_niv_range()
 
-        # Rotate G into the band (H(k)-eigen) basis first, so the band-diagonal below is the band-resolved spectral
-        # function (invariant under lattice symmetries, so the naive irrk_inv unfold is correct); on the full BZ.
-        hk = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
+        # Rotate G into the band basis of the H(k) block it holds first, so the band-diagonal below is the band-resolved
+        # spectral function (invariant under lattice symmetries, so the naive irrk_inv unfold is correct); full BZ.
+        hk = orbital_block(config.lattice.hamiltonian.get_ek(config.lattice.k_grid), config.sys.correlated_orbitals)
         giwk_maxent = giwk_maxent.decompress_q_dimension()
         orbital_to_band_basis(hk, giwk_maxent.mat)
         g_irr_mat = giwk_maxent.reduce_q(irrq_list).mat

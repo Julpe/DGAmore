@@ -451,6 +451,7 @@ class KGrid:
         atol: float = 1e-8,
         verbose: bool = False,
         include_antiunitary: bool = False,
+        orbitals: np.ndarray | None = None,
     ) -> None:
         r"""
         Auto-detects the symmetry group of the Hamiltonian ``hk`` and replay
@@ -475,6 +476,9 @@ class KGrid:
             that ``_map_to_full_bz`` does not perform. Anti-symmetries (``sigma = -1``) and operations with a
             reciprocal translation are dropped in any case, so with the default the IBZ-to-FBZ expansion is safe for
             any object with the same lattice symmetry as H, at the cost of a possibly larger IBZ.
+        :param orbitals: Indices of the correlated orbitals when ``hk`` also holds uncorrelated ones; the group is then
+            discovered on :func:`~dgamore.symmetry_reduction.correlated_block_proxy`, checked with
+            :func:`~dgamore.symmetry_reduction.check_correlated_group`, and its transformations act on these orbitals.
         :return: None.
         :raises RuntimeError: If the grid was not constructed in auto mode.
         :raises ValueError: If ``hk``'s shape does not match the grid or is not ``(nx, ny, nz, nb, nb)``.
@@ -491,14 +495,16 @@ class KGrid:
 
         # Late import to keep the dependency optional at module load time and
         # to avoid a circular import if symmetry_reduction ever imports from here.
-        from dgamore.symmetry_reduction import get_symmetry_reduction
+        from dgamore.symmetry_reduction import check_correlated_group, correlated_block_proxy, get_symmetry_reduction
 
         res = get_symmetry_reduction(
-            np.asarray(hk, dtype=np.complex128),
+            np.asarray(hk if orbitals is None else correlated_block_proxy(hk, orbitals), dtype=np.complex128),
             atol=atol,
             verbose=verbose,
             include_antiunitary=include_antiunitary,
         )
+        if orbitals is not None:
+            check_correlated_group(res["group"], hk, orbitals, atol)
 
         # Refresh the IBZ maps from the discovered orbits. ``fbz2irrk`` is the (nx,ny,nz) flat-index field; np.unique
         # on it recovers irrk_ind/irrk_inv/irrk_count exactly as the rest of the code expects.
