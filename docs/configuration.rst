@@ -385,6 +385,44 @@ For single-band data the ``type`` field selects the correction scheme: ``spch`` 
 magnetic susceptibility, whereas ``sp`` corrects only the magnetic one; the multi-band scheme always
 corrects both channels.
 
+.. _rpa:
+
+RPA susceptibility
+------------------
+
+This section replaces the ladder susceptibility of the non-local step by the random phase approximation (RPA).
+
+.. code-block:: yaml
+
+   rpa:
+     use_rpa_susceptibility: False # bool
+
+With ``use_rpa_susceptibility`` set to ``True`` the non-local step takes the local irreducible vertex as the bare
+interaction, :math:`\Gamma_{r} = U_{r}`. No auxiliary susceptibility and no three-leg vertex are calculated: the
+three-leg vertex is one, and the physical susceptibility is the RPA susceptibility of each iteration's bubble,
+
+.. math:: \chi^{\mathrm{q}}_{r} = \big((\chi^{\mathrm{q}}_{0})^{-1} + U_{r} + V^{\mathbf{q}}_{r}\big)^{-1}, \qquad
+   \chi^{\mathrm{q}}_{0} = \frac{1}{\beta^2} \sum_{\nu} \chi^{\mathrm{q}\nu}_{0}.
+
+The kernel of each channel reduces to :math:`-\mathcal{U}^{\mathbf{q}}_{r} \chi^{\mathrm{q}}_{r}
+\mathcal{U}^{\mathbf{q}}_{r}`, and the double-counting kernel of the Schwinger-Dyson equation subtracts the bare
+vertex :math:`\tfrac12(U_{\mathrm{d}} + 3U_{\mathrm{m}})` instead of the local one, so the second-order diagram is
+counted once. The noise-removal term :math:`\Sigma_{\mathrm{DMFT}} - \Sigma_{\mathrm{loc}}` keeps the local
+self-energy of the DMFT vertex. Since the local part of the RPA kernels is not the local Schwinger-Dyson equation,
+the local part of the result follows the RPA rather than :math:`\Sigma_{\mathrm{DMFT}}`.
+
+The lambda correction, the restriction and the annealing of the :ref:`stabilization section <stabilization>` act on
+the RPA susceptibility as on the ladder one. At couplings typical of DΓA the magnetic RPA susceptibility can lie
+beyond its Stoner pole, where only a lambda correction makes it physical. ``use_exact_jacobian`` linearizes the
+ladder map and is disabled with a warning.
+
+The Eliashberg equation takes its pairing vertex from the same susceptibility: per channel the vertex is
+:math:`F^{\mathrm{q}}_{r} = \mathcal{U}^{\mathbf{q}}_{r} - \mathcal{U}^{\mathbf{q}}_{r} \chi^{\mathrm{q}}_{r}
+\mathcal{U}^{\mathbf{q}}_{r}`, combined into the singlet and triplet vertex like the ladder vertex, with the bare
+up-down interaction counted once in place of the local diagrams. For one band these are the spin-fluctuation
+interactions :math:`U + \tfrac32 U^2 \chi_{\mathrm{m}} - \tfrac12 U^2 \chi_{\mathrm{d}}` (singlet) and
+:math:`-\tfrac12 U^2 (\chi_{\mathrm{m}} + \chi_{\mathrm{d}})` (triplet).
+
 DMFT input
 ----------
 

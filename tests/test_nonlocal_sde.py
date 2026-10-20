@@ -534,6 +534,26 @@ def test_calculate_kernel_r_q_matches_rewired_reference():
         assert np.allclose(out.mat, ref_mat, atol=1e-10)
 
 
+@pytest.mark.parametrize("channel", [SpinChannel.DENS, SpinChannel.MAGN])
+def test_rpa_kernel_is_the_ladder_kernel_at_unit_three_leg_vertex(channel):
+    """At gamma = 1 the ladder kernel is the RPA kernel -U^q_r chi U^q_r, the same at every fermionic frequency."""
+    rng = np.random.default_rng(31)
+    o, nqi, niw, niv = 2, 3, 2, 2
+    shape = (nqi, o, o, o, o, niw + 1)
+    chi = FourPoint(
+        rng.standard_normal(shape) + 1j * rng.standard_normal(shape), channel, (nqi, 1, 1), 1, 0, False, True, True
+    )
+    u_loc = LocalInteraction(rng.standard_normal((o,) * 4), SpinChannel.NONE)
+    v_nonloc = Interaction(rng.standard_normal((nqi,) + (o,) * 4), SpinChannel.NONE, (nqi, 1, 1), True)
+    unit = FourPoint.identity(o, niw, niv, nqi, (nqi, 1, 1), num_vn_dimensions=1).set_channel(channel)
+    ladder = nonlocal_sde.calculate_kernel_r_q(unit, chi.copy(), v_nonloc, u_loc)
+
+    out = nonlocal_sde.calculate_rpa_kernel_r_q(chi, v_nonloc, u_loc)
+
+    assert out.num_vn_dimensions == 0
+    assert np.allclose(ladder.mat, out.mat[..., None], atol=1e-5 * np.abs(ladder.mat).max())
+
+
 def test_vrg_is_the_inverse_bubble_applied_to_the_last_frequency_sum_of_chi_aux():
     """The three-leg vertex equals the inverse bubble contracted with the last-frequency sum of chi*."""
     o, nqi, nw, n2, beta = 2, 3, 3, 4, 12.5
@@ -1182,6 +1202,53 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
     assert bubble.cut_niv.return_value.invert.return_value.save.call_args.kwargs["name"] == "gchi0_q_inv_rank_0"
 
 
+def test_rpa_eliashberg_only_proposal_dumps_both_channels_without_a_local_vertex(monkeypatch, tmp_path):
+    """The RPA post-loop pass loads no local vertex, writes no inverse bubble, dumps both channels, returns None."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    config.rpa.use_rpa_susceptibility = True
+    config.output.output_path = str(tmp_path)
+    config.sys.beta = 10.0
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
+    bubble = MagicMock()
+    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, None))
+    monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
+    monkeypatch.setattr(nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: bubble)
+    monkeypatch.setattr(nonlocal_sde, "_cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
+    steps = []
+
+    def forbidden(*a, **k):
+        raise AssertionError("the RPA Eliashberg-only pass must not load a local vertex or reach a kernel or the SDE")
+
+    for name in (
+        "_load_node_shared_local_vertex",
+        "calculate_bare_dc_kernel",
+        "calculate_rpa_kernel_r_q",
+        "_run_column_sde",
+    ):
+        monkeypatch.setattr(nonlocal_sde, name, forbidden)
+    monkeypatch.setattr(nonlocal_sde, "create_rpa_susceptibility", lambda *a: SimpleNamespace(channel=a[-1]))
+    monkeypatch.setattr(
+        nonlocal_sde,
+        "_finish_physical_susceptibility",
+        lambda chi, dist, annealer, save, lam: steps.append((chi.channel, save)) or chi,
+    )
+    args = [MagicMock() for _ in range(8)]  # mu, u_loc, v_nonloc, v_nonloc_full, sigma_dmft, delta_sigma, q list, dist
+
+    result = nonlocal_sde.calculate_sigma_proposal(
+        MagicMock(),
+        *args,
+        create_comm_mock(),
+        2,
+        chunk_budgets=memory_estimator.ChunkBudgets(1, 1),
+        save_eliashberg=True,
+        eliashberg_only=True,
+    )
+
+    assert result is None
+    assert steps == [(SpinChannel.DENS, True), (SpinChannel.MAGN, True)]
+    assert "gchi0_q_inv" not in str(bubble.mock_calls)
+
+
 def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, epsilon=1e-3, v=0.0):
     """Minimal single-k single-band environment for calculate_self_energy_q: synthetic map, frozen mu, V^q = v."""
     config.lattice.k_grid = bz.KGrid((1, 1, 1), symmetries=[])
@@ -1239,6 +1306,19 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
         return nonlocal_sde.calculate_self_energy_q(comm, None, v_nonloc, sigma_dmft, sigma_dmft.copy(), **kwargs)
 
     return run, calls, logger
+
+
+@pytest.mark.parametrize("rpa", [False, True])
+def test_loop_reads_the_first_frequency_local_vertex_only_for_the_ladder(monkeypatch, tmp_path, rpa):
+    """The first-frequency pole monitor of the density ladder reads the local vertex, RPA mode never does."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1)
+    config.rpa.use_rpa_susceptibility = rpa
+    reads = []
+    monkeypatch.setattr(nonlocal_sde, "first_frequency_local_vertex", lambda: reads.append(1))
+
+    run()
+
+    assert len(reads) == (0 if rpa else 1)
 
 
 def _run_loop_on_two_node_ranks(monkeypatch, tmp_path, spied_name, spied_owner):
@@ -2158,6 +2238,91 @@ def test_sigma_dc_kernel_sums_the_stored_first_fermionic_index_over_the_full_box
     zeroed = nonlocal_sde.calculate_sigma_dc_kernel(f_shell_zeroed, gchi0_q.copy(), u_loc)
 
     assert not np.allclose(zeroed.mat, full.mat, atol=1e-6)
+
+
+@pytest.mark.parametrize("o", [1, 2])
+def test_bare_dc_kernel_is_the_dc_kernel_of_the_constant_transversal_vertex(o):
+    """The bare dc kernel is the dc kernel of 1/2 (U_d + 3 U_m) = U - 2 U_{1432} held constant on the local box."""
+    nq, niw, niv_core, niv_full = 3, 2, 2, 5
+    _, gchi0_q, _ = _dc_kernel_inputs(o, nq, niw, niv_core, niv_full)
+    beta = config.sys.beta
+    u_mat = np.random.default_rng(8).standard_normal((o,) * 4)
+    u_mat = 0.5 * (u_mat + u_mat.transpose(1, 0, 3, 2))
+    u_mat = 0.5 * (u_mat + u_mat.transpose(2, 3, 0, 1))  # reality (2143) and pair exchange (3412) of physical tensors
+    u_loc = LocalInteraction(u_mat, SpinChannel.NONE)
+    f_dc = u_mat - 2.0 * u_mat.transpose(0, 3, 2, 1)
+    box = (o,) * 4 + (niw + 1, 2 * niv_full, 2 * niv_core)
+    f_dc_loc = LocalFourPoint(np.broadcast_to(f_dc[..., None, None, None], box).copy(), SpinChannel.MAGN, 1, 2, False)
+    reference = nonlocal_sde.calculate_sigma_dc_kernel(f_dc_loc, gchi0_q.copy(), u_loc)
+
+    out = nonlocal_sde.calculate_bare_dc_kernel(gchi0_q.sum_over_all_vn(beta).scale(1.0 / beta), u_loc)
+
+    assert out.num_vn_dimensions == 0
+    assert np.allclose(reference.mat, out.mat[..., None], atol=1e-5 * np.abs(reference.mat).max())
+
+
+def _summed_bubble(mat: np.ndarray, channel: SpinChannel = SpinChannel.NONE) -> FourPoint:
+    """A frequency-summed bubble (or a susceptibility of channel) [q, o1, o2, o3, o4, w] without a fermionic axis."""
+    return FourPoint(mat.copy(), channel, (mat.shape[0], 1, 1), 1, 0, False, True, True)
+
+
+def _rpa_sde_kernel(chi0_sum: np.ndarray, u_loc: LocalInteraction, chi_r: dict) -> np.ndarray:
+    """The SDE kernel of RPA mode as calculate_sigma_proposal sums it at V = 0: the bare dc kernel of the bubble plus
+    1x the density and 3x the magnetic RPA kernel of the susceptibilities chi_r."""
+    nq = chi0_sum.shape[0]
+    v_nonloc = Interaction(np.zeros((nq,) + u_loc.mat.shape), SpinChannel.NONE, (nq, 1, 1), True)
+    kernel = nonlocal_sde.calculate_bare_dc_kernel(_summed_bubble(chi0_sum), u_loc)
+    for channel, weight in ((SpinChannel.DENS, 1.0), (SpinChannel.MAGN, 3.0)):
+        chi = _summed_bubble(chi_r[channel], channel)
+        kernel.add(nonlocal_sde.calculate_rpa_kernel_r_q(chi, v_nonloc, u_loc).scale(weight), copy=False)
+    return kernel.mat
+
+
+def test_rpa_kernels_of_one_band_sum_to_the_flex_interaction():
+    """One band, all orders: the kernels sum to -2 U^2 (chi_d / 2 + 3 chi_m / 2 - chi0), FLEX's interaction (-2 being
+    the kernel's factor against the global -1/2), so the dc kernel takes out the second order both channels carry."""
+    config.sys.beta = 8.0
+    u = 2.0
+    rng = np.random.default_rng(5)
+    chi0 = 0.05 + 0.3 * rng.random((6, 1, 1, 1, 1, 4)) + 0.02j * rng.standard_normal((6, 1, 1, 1, 1, 4))
+    u_loc = LocalInteraction(np.full((1, 1, 1, 1), u), SpinChannel.NONE)
+    v_nonloc = Interaction(np.zeros((6, 1, 1, 1, 1)), SpinChannel.NONE, (6, 1, 1), True)
+    inverse = _summed_bubble(chi0).invert()
+    chi_r = {
+        channel: nonlocal_sde.create_rpa_susceptibility(inverse, u_loc, v_nonloc, channel).mat
+        for channel in (SpinChannel.DENS, SpinChannel.MAGN)
+    }
+
+    kernel = _rpa_sde_kernel(chi0, u_loc, chi_r)
+
+    chi_m, chi_d = chi0 / (1 - u * chi0), chi0 / (1 + u * chi0)
+    flex = -2 * u**2 * (0.5 * chi_d + 1.5 * chi_m - chi0)
+    assert np.allclose(kernel, flex, atol=1e-5 * np.abs(flex).max())
+
+
+@pytest.mark.parametrize("o, u, u_prime, j", [(2, 2.0, 1.3, 0.4), (3, 5.0, 3.5, 0.75)])
+def test_rpa_kernels_count_the_bare_vertex_once_at_second_order(o, u, u_prime, j):
+    """Kanamori orbitals at second order (chi_r -> chi0): the kernels sum to -2 U_d chi0 U = -U_d chi0 (U_d - U_m), the
+    second order of the density-form local equation, i.e. the exact one (P. Worm's PhD thesis, Eq. (3.63)): the dc
+    kernel cancels the second copy of the bare vertex, inter-orbital terms included."""
+    config.sys.beta = 8.0
+    u_mat = np.zeros((o,) * 4)
+    for a in range(o):
+        for b in range(o):
+            u_mat[a, a, b, b] = u if a == b else u_prime  # equation layout: U' on aabb, J on abba and abab
+            if a != b:
+                u_mat[a, b, b, a] = u_mat[a, b, a, b] = j
+    u_loc = LocalInteraction(u_mat, SpinChannel.NONE)
+    rng = np.random.default_rng(7)
+    chi0 = rng.standard_normal((4,) + (o,) * 4 + (3,)) + 1j * rng.standard_normal((4,) + (o,) * 4 + (3,))
+
+    kernel = _rpa_sde_kernel(chi0, u_loc, {SpinChannel.DENS: chi0, SpinChannel.MAGN: chi0})
+
+    u_d, u_m = (u_loc.as_channel(channel) for channel in (SpinChannel.DENS, SpinChannel.MAGN))
+    assert np.allclose(0.5 * (u_d.mat - u_m.mat), u_mat)
+    second_order = (u_d @ _summed_bubble(chi0) @ u_m).mat - (u_d @ _summed_bubble(chi0) @ u_d).mat
+    expected = second_order.transpose(0, 2, 1, 4, 3, 5)  # the contraction layout "abcd->badc"
+    assert np.allclose(kernel, expected, atol=1e-5 * np.abs(expected).max())
 
 
 def test_create_auxiliary_chi_r_q_sum_matches_full_inversion_reference():

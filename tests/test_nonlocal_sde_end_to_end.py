@@ -5,6 +5,8 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
+from copy import deepcopy
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -16,6 +18,7 @@ from dgamore.brillouin_zone import KnownSymmetries
 from dgamore.dga_logger import DgaLogger
 from dgamore.dmft_interface import W2dynInterface
 from dgamore.hamiltonian import Hamiltonian
+from dgamore.local_four_point import LocalFourPoint
 from tests import conftest
 
 
@@ -174,6 +177,64 @@ def test_decoupled_uncorrelated_orbitals_leave_the_self_energy_unchanged(setup, 
     assert config.sys.correlated_orbitals.tolist() == [0, 1]
     assert np.isclose(config.sys.n - 2 * np.trace(config.sys.occ).real, 4.0 if e_p < 0 else 0.0, atol=1e-2)
     assert np.allclose(sigma_dga_mat, sigma_dga_ref, atol=3e-5)
+
+
+def _rpa_and_bare_vertex_ladder(comm_mock, monkeypatch, s_dmft) -> tuple[np.ndarray, np.ndarray]:
+    """Returns the RPA-mode self-energy and the ladder self-energy of Gamma_r = U_r and the dc vertex
+    1/2 (U_d + 3 U_m) = U - 2 U_{1432} of the loaded run, both with Sigma_loc = Sigma_DMFT."""
+    u_loc = config.lattice.hamiltonian.get_local_u()
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
+    niw, niv, niv_full = config.box.niw_core, config.box.niv_core, config.box.niv_full
+
+    def bare_vertex(node_comm, path, channel, transform=None, axes=None, w_window=None):
+        if os.path.basename(path) == "f_dc_loc.npy":
+            mat, niv_first = u_loc.mat - 2.0 * u_loc.mat.transpose(0, 3, 2, 1), niv_full
+        else:
+            mat, niv_first = u_loc.as_channel(channel).mat, niv
+        box = mat.shape + (niw + 1, 2 * niv_first, 2 * niv)
+        return LocalFourPoint(np.broadcast_to(mat[..., None, None, None], box).copy(), channel, 1, 2, False), None
+
+    sys_state = deepcopy(config.sys)
+    monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", bare_vertex)
+    ladder = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), s_dmft.copy())
+
+    config.sys = sys_state
+    config.rpa.use_rpa_susceptibility = True
+    monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", MagicMock(side_effect=AssertionError))
+    rpa = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), s_dmft.copy())
+    return rpa.mat, ladder.mat
+
+
+def test_rpa_mode_is_the_ladder_with_the_bare_interaction_as_local_vertex(setup, monkeypatch):
+    """RPA mode gives the ladder self-energy of Gamma_r = U_r and the dc vertex 1/2 (U_d + 3 U_m) = U - 2 U_{1432}."""
+    folder, comm_mock = setup
+    config.box.niw_core, config.box.niv_core, config.box.niv_shell = 6, 6, 4
+    config.dmft.symmetrize_orbitals = []
+    _, s_dmft, _, _ = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
+    config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
+    config.output.output_path = folder
+
+    rpa, ladder = _rpa_and_bare_vertex_ladder(comm_mock, monkeypatch, s_dmft)
+
+    assert np.allclose(rpa, ladder, atol=1e-4 * np.abs(ladder).max())
+
+
+def test_rpa_mode_is_the_bare_vertex_ladder_for_kanamori_orbitals(setup_srvo3_cubic, monkeypatch, tmp_path):
+    """Three Kanamori orbitals (U = 5, U' = 3.5, J = 0.75), whose inter-orbital terms the two-band fixture lacks: RPA
+    mode is still the ladder of Gamma_r = U_r and the dc vertex U - 2 U_{1432}."""
+    folder, comm_mock = setup_srvo3_cubic
+    _srvo3_on_hk(folder, tmp_path / "t2g.hk", (4, 4, 4))
+    config.box.niw_core, config.box.niv_core, config.box.niv_shell = 6, 6, 4
+    _, s_dmft, _, _ = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
+    config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
+    config.output.output_path = str(tmp_path)
+    config.lattice.k_grid.specify_auto_symmetries(config.lattice.hamiltonian.get_ek(config.lattice.k_grid))
+
+    rpa, ladder = _rpa_and_bare_vertex_ladder(comm_mock, monkeypatch, s_dmft)
+
+    u = config.lattice.hamiltonian.get_local_u().mat
+    assert np.isclose(u[0, 0, 1, 1], 3.5) and np.isclose(u[0, 1, 1, 0], 0.75)
+    assert np.allclose(rpa, ladder, atol=1e-4 * np.abs(ladder).max())
 
 
 def test_calculates_srvo3_correctly(setup_srvo3_cubic):

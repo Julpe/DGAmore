@@ -287,7 +287,8 @@ separate momentum axes.
      - Quantity
      - Array layout
    * - ``chi_phys_q_dens.npy``, ``chi_phys_q_magn.npy``
-     - Physical ladder susceptibility :math:`\chi^{\mathrm{q}}_{\mathrm{r}}` after the lambda correction
+     - Physical ladder susceptibility :math:`\chi^{\mathrm{q}}_{\mathrm{r}}` after the lambda correction (the RPA
+       susceptibility with ``rpa.use_rpa_susceptibility``)
      - ``[nq_irr, no, no, no, no, niw_core + 1]``
    * - ``chi_rpa_q_dens.npy``, ``chi_rpa_q_magn.npy``
      - RPA susceptibility, written once in the first iteration
@@ -396,10 +397,11 @@ at :math:`\omega = 0`, which is why they have no bosonic axis (or a single-entry
      - ``[nq_irr, no, no, no, no, 2 niv_pp, 2 niv_pp]``
    * - ``gamma_ud_loc_pp_w0.npy``
      - Local up-down irreducible vertex in pp notation; its bosonic axis holds the single entry
-       :math:`\omega = 0`
+       :math:`\omega = 0` (not written with ``rpa.use_rpa_susceptibility``)
      - ``[no, no, no, no, 1, 2 niv_pp, 2 niv_pp]``
    * - ``f_ud_loc_pp_w0.npy``, ``phi_ud_loc_pp_w0.npy``
-     - Local up-down full vertex and pp-reducible diagrams, always written by the Eliashberg step
+     - Local up-down full vertex and pp-reducible diagrams, written by the Eliashberg step except with
+       ``rpa.use_rpa_susceptibility``
      - ``[no, no, no, no, 2 niv_pp, 2 niv_pp]``
 
 Per-rank intermediates
@@ -410,7 +412,7 @@ vertex to ``eliashberg_path``, one file per MPI rank, so that the vertex can be 
 written once: in the last scheduled iteration or, when the loop converges earlier, by one more kernel pass on the
 converged self-energy, whose Green's function the particle-particle bubble of the Eliashberg step uses as well. Their
 leading axis holds only the irreducible momenta of the writing rank, and they are deleted once the vertex has been
-built.
+built. With ``rpa.use_rpa_susceptibility`` only the physical susceptibilities are written.
 
 .. list-table::
    :header-rows: 1

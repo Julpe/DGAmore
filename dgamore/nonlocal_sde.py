@@ -582,6 +582,28 @@ def _attach_dc_interaction(contraction: FourPoint, u_loc: LocalInteraction, per_
     return kernel.scale(2.0 / config.sys.beta**2, copy=False)
 
 
+def calculate_bare_dc_kernel(gchi0_q_full_sum: FourPoint, u_loc: LocalInteraction) -> FourPoint:
+    r"""
+    Returns the double-counting kernel of :func:`calculate_sigma_dc_kernel` for the bare transversal vertex
+    :math:`F_{\mathrm{dc}} = \tfrac12(U_{\mathrm{d}} + 3U_{\mathrm{m}})`, the lowest order of the local vertex that
+    kernel subtracts: ladders built on the bare interaction start with it in both bracket terms, and the kernel leaves
+    it counted once. The vertex does not depend on frequency, so the sum over :math:`\nu'` acts on the bubble alone and
+    the kernel carries no fermionic frequency. The exchange of the stored and the summed frequency in
+    :func:`calculate_sigma_dc_kernel` holds for it, since :math:`F_{\mathrm{dc};1234} = F_{\mathrm{dc};4321}` for an
+    interaction with the reality and pair-exchange symmetry.
+
+    :param gchi0_q_full_sum: The frequency-summed bare bubble over the full box,
+        :math:`\frac{1}{\beta^2}\sum_{\nu}\chi^{\mathrm{q}\nu}_{0}`.
+    :param u_loc: The bare local interaction :math:`U`.
+    :return: The double-counting kernel (contraction layout) as a :class:`FourPoint` without fermionic frequency.
+    """
+    # beta^2 turns the normalized bubble sum into the plain frequency sum the attachment expects
+    f_dc = (u_loc.as_channel(SpinChannel.MAGN).scale(3.0) + u_loc.as_channel(SpinChannel.DENS)).scale(
+        0.5 * config.sys.beta**2
+    )
+    return _attach_dc_interaction(f_dc @ gchi0_q_full_sum, u_loc)
+
+
 def calculate_kernel_r_q(
     vrg_q_r: FourPoint, chi_phys_q_r: FourPoint, v_nonloc: Interaction, u_loc: LocalInteraction, per_wn: bool = False
 ) -> FourPoint:
@@ -619,6 +641,26 @@ def calculate_kernel_r_q(
     kernel.mat[:, orb[:, None], orb[None, :], orb[None, :], orb[:, None], ...] -= 1.0
 
     return kernel.matmul(u_r, per_wn=per_wn).permute_orbitals("abcd->badc", copy=False)
+
+
+def calculate_rpa_kernel_r_q(chi_q_r: FourPoint, v_nonloc: Interaction, u_loc: LocalInteraction) -> FourPoint:
+    r"""
+    Returns the self-energy kernel of :func:`calculate_kernel_r_q` at a unit three-leg vertex, the value it takes when
+    the local irreducible vertex is the bare interaction, :math:`\Gamma_{r} = U_{r}`,
+
+    .. math:: [(K - \mathbb{1})\,\mathcal{U}^{\mathbf{q}}_{r}]_{1234} = -\sum_{abcd} \mathcal{U}^{\mathbf{q}}_{r;12ab}\,
+        \chi^{\mathrm{q}}_{r;bacd}\, \mathcal{U}^{\mathbf{q}}_{r;dc34},
+
+    stored in the layout of the sigma contraction. It does not depend on the fermionic frequency and carries no
+    fermionic axis.
+
+    :param chi_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` (see :func:`create_rpa_susceptibility`).
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :param u_loc: The bare local interaction :math:`U`.
+    :return: The self-energy kernel (contraction layout) as a :class:`FourPoint` without fermionic frequency.
+    """
+    u_r = v_nonloc.as_channel(chi_q_r.channel) + u_loc.as_channel(chi_q_r.channel)
+    return (u_r @ chi_q_r @ u_r).scale(-1.0).permute_orbitals("abcd->badc", copy=False)
 
 
 def perform_ornstein_zernike_fit(chi_phys_q_r: FourPoint) -> None:
@@ -694,6 +736,25 @@ def perform_ornstein_zernike_fit(chi_phys_q_r: FourPoint) -> None:
     np.savetxt(path, data_to_save, delimiter=",", fmt="%d %d %d %d %.9f %.9f", header="o1 o2 o3 o4 A xi")
 
 
+def create_rpa_susceptibility(
+    gchi0_q_sum_inv: FourPoint, u_loc: LocalInteraction, v_nonloc: Interaction, channel: SpinChannel
+) -> FourPoint:
+    r"""
+    Returns the RPA susceptibility :math:`\chi^{\mathrm{q}}_{r;\mathrm{RPA}} = ((\chi^{\mathrm{q}}_{0})^{-1} + U_{r} +
+    V^{\mathbf{q}}_{r})^{-1}` of a channel from the inverse of the frequency-summed bubble :math:`\chi^{\mathrm{q}}_{0}
+    = \frac{1}{\beta^2} \sum_{\nu} \chi^{\mathrm{q}\nu}_{0}`, the form the shell-corrected physical susceptibility takes
+    (see :func:`create_generalized_chi_q_with_shell_correction`).
+
+    :param gchi0_q_sum_inv: The inverse of the frequency-summed bare bubble over the full box.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :param channel: Spin channel of the susceptibility, i.e. density or magnetic.
+    :return: The RPA susceptibility as a :class:`FourPoint` in ``channel``.
+    """
+    u_r = u_loc.as_channel(channel) + v_nonloc.as_channel(channel)
+    return (gchi0_q_sum_inv + u_r).invert(False).set_channel(channel)
+
+
 def calculate_and_save_chi_q_r_rpa(
     gchi0_q_full_sum: FourPoint, u_loc: LocalInteraction, v_nonloc: Interaction, mpi_dist_irrk: MpiDistributor
 ):
@@ -712,8 +773,7 @@ def calculate_and_save_chi_q_r_rpa(
     """
     gchi0_q_sum_inv = gchi0_q_full_sum.invert()
     for channel in [SpinChannel.DENS, SpinChannel.MAGN]:
-        u_r = u_loc.as_channel(channel) + v_nonloc.as_channel(channel)
-        chi_rpa_q_r = (gchi0_q_sum_inv + u_r).invert(False)
+        chi_rpa_q_r = create_rpa_susceptibility(gchi0_q_sum_inv, u_loc, v_nonloc, channel)
         chi_rpa_q_r.mat = mpi_dist_irrk.gather(chi_rpa_q_r.mat)
 
         if mpi_dist_irrk.my_rank == 0:
@@ -743,6 +803,69 @@ def _select_and_apply_lambda_correction(chi_phys_q_r: FourPoint, lambda_previous
         if config.sys.n_bands == 1:
             return LambdaCorrection.perform(chi_phys_q_r, lambda_previous=lambda_previous)
         return MultiOrbitalLambdaCorrection.perform(chi_phys_q_r)
+    return chi_phys_q_r
+
+
+def _finish_physical_susceptibility(
+    chi_phys_q_r: FourPoint,
+    mpi_dist_irrq: MpiDistributor,
+    annealer: "LambdaAnnealer | None" = None,
+    save_eliashberg: bool = False,
+    lambda_previous: dict | None = None,
+) -> FourPoint:
+    r"""
+    Returns the physical susceptibility the self-energy kernel reads: the annealer's boson mass and the restriction are
+    applied on every rank, the rank-0 gathered susceptibility gets the configured lambda correction, is written to file
+    (with the Ornstein-Zernike fit of the magnetic channel) and scattered back, the pole monitor reads it and, with
+    ``save_eliashberg``, every rank writes its momenta for the Eliashberg step.
+
+    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` (rank-local momenta).
+    :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :param annealer: The active :class:`LambdaAnnealer` (its boson mass is applied to the physical susceptibility),
+        or ``None`` when annealing is off.
+    :param save_eliashberg: Whether to write this rank's physical susceptibility for the Eliashberg step.
+    :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, kept by the
+        self-consistency loop across its iterations; ``None`` for the one-shot correction.
+    :return: The treated physical susceptibility (rank-local momenta).
+    """
+    logger = config.logger
+
+    if annealer is not None:
+        chi_phys_q_r = annealer.apply(chi_phys_q_r, mpi_dist_irrq)
+
+    if config.stabilization.use_chi_phys_restriction:
+        chi_phys_q_r, n_restricted = restrict_chi_phys_to_positive_eigenvalues(chi_phys_q_r, mpi_dist_irrq.comm)
+        if mpi_dist_irrq.comm.size > 1:
+            n_restricted = mpi_dist_irrq.comm.allreduce(n_restricted)
+        logger.warning(
+            f"Restricted physical susceptibility ({chi_phys_q_r.channel.value}): {n_restricted} eigenvalues "
+            "restricted (static inverse floored, finite-frequency values clipped to the static maximum). Releasing "
+            "the restriction is only safe once this count decays to zero."
+        )
+
+    logger.log_memory_usage(
+        f"Physical susceptibility ({chi_phys_q_r.channel.value})", chi_phys_q_r, mpi_dist_irrq.comm.size
+    )
+
+    chi_phys_q_r.mat = mpi_dist_irrq.gather(chi_phys_q_r.mat)
+    if mpi_dist_irrq.comm.rank == 0:
+        chi_phys_q_r = _select_and_apply_lambda_correction(chi_phys_q_r, lambda_previous)
+        chi_phys_q_r.save(name=f"chi_phys_q_{chi_phys_q_r.channel.value}", output_dir=config.output.output_path)
+
+        # perform Ornstein-Zernike fit
+        if chi_phys_q_r.channel == SpinChannel.MAGN:
+            perform_ornstein_zernike_fit(chi_phys_q_r)
+
+    chi_phys_q_r.mat = mpi_dist_irrq.scatter(chi_phys_q_r.mat)
+    logger.info(f"Saved physical susceptibility ({chi_phys_q_r.channel.value}) to file.")
+
+    _monitor_chi_phys(chi_phys_q_r, mpi_dist_irrq)
+
+    if save_eliashberg:
+        chi_phys_q_r.save(
+            name=f"chi_phys_q_{chi_phys_q_r.channel.value}_rank_{mpi_dist_irrq.comm.rank}",
+            output_dir=config.output.eliashberg_path,
+        )
     return chi_phys_q_r
 
 
@@ -841,42 +964,9 @@ def calculate_sigma_kernel_r_q(
 
     logger.info(f"Updated non-local susceptibility chi^q ({chi_phys_q_r.channel.value}) with asymptotic correction.")
 
-    if annealer is not None:
-        chi_phys_q_r = annealer.apply(chi_phys_q_r, mpi_dist_irrq)
-
-    if config.stabilization.use_chi_phys_restriction:
-        chi_phys_q_r, n_restricted = restrict_chi_phys_to_positive_eigenvalues(chi_phys_q_r, mpi_dist_irrq.comm)
-        if mpi_dist_irrq.comm.size > 1:
-            n_restricted = mpi_dist_irrq.comm.allreduce(n_restricted)
-        logger.warning(
-            f"Restricted physical susceptibility ({chi_phys_q_r.channel.value}): {n_restricted} eigenvalues "
-            "restricted (static inverse floored, finite-frequency values clipped to the static maximum). Releasing "
-            "the restriction is only safe once this count decays to zero."
-        )
-
-    logger.log_memory_usage(
-        f"Physical susceptibility ({chi_phys_q_r.channel.value})", chi_phys_q_r, mpi_dist_irrq.comm.size
+    chi_phys_q_r = _finish_physical_susceptibility(
+        chi_phys_q_r, mpi_dist_irrq, annealer, save_eliashberg, lambda_previous
     )
-
-    chi_phys_q_r.mat = mpi_dist_irrq.gather(chi_phys_q_r.mat)
-    if mpi_dist_irrq.comm.rank == 0:
-        chi_phys_q_r = _select_and_apply_lambda_correction(chi_phys_q_r, lambda_previous)
-        chi_phys_q_r.save(name=f"chi_phys_q_{chi_phys_q_r.channel.value}", output_dir=config.output.output_path)
-
-        # perform Ornstein-Zernike fit
-        if chi_phys_q_r.channel == SpinChannel.MAGN:
-            perform_ornstein_zernike_fit(chi_phys_q_r)
-
-    chi_phys_q_r.mat = mpi_dist_irrq.scatter(chi_phys_q_r.mat)
-    logger.info(f"Saved physical susceptibility ({chi_phys_q_r.channel.value}) to file.")
-
-    _monitor_chi_phys(chi_phys_q_r, mpi_dist_irrq)
-
-    if save_eliashberg:
-        chi_phys_q_r.save(
-            name=f"chi_phys_q_{chi_phys_q_r.channel.value}_rank_{mpi_dist_irrq.comm.rank}",
-            output_dir=config.output.eliashberg_path,
-        )
 
     if kernel is None:
         return None
@@ -1874,7 +1964,11 @@ def calculate_sigma_proposal(
     with the three-leg vertex on the first external orbital and the interaction on the second, time reversal maps it
     onto the mirrored form, and the average is the two-sided equation. One band needs no average, its one-sided
     equation already obeys time reversal. An orbital permutation that transposes the dispersion (see
-    :func:`_orbital_involution`) reaches the Bethe-Salpeter slices of both channels.
+    :func:`_orbital_involution`) reaches the Bethe-Salpeter slices of both channels. With
+    ``config.rpa.use_rpa_susceptibility`` no local vertex is loaded and no Bethe-Salpeter slice is solved: the
+    double-counting kernel takes the bare vertex (see :func:`calculate_bare_dc_kernel`) and each channel the RPA
+    kernel of its RPA susceptibility (see :func:`calculate_rpa_kernel_r_q`), treated like the ladder's (see
+    :func:`_finish_physical_susceptibility`); both carry no fermionic frequency until the contraction.
 
     Single source of truth for the proposal map: it is called once per self-consistency iteration by
     :func:`calculate_self_energy_q`, plus once with ``eliashberg_only`` after a loop that converged before its last
@@ -1900,7 +1994,8 @@ def calculate_sigma_proposal(
     :param chunk_budgets: Chunk byte budgets, of which the self-energy contraction reads its own (sized by the driver
         from the memory estimate); ``None`` gives it the job-wide fair-share budget of :func:`_sde_chunk_budget`.
     :param save_eliashberg: Whether to write this rank's Eliashberg intermediates (inverse bubble, three-leg vertices,
-        physical susceptibilities); the loop asks for it in its last scheduled iteration.
+        physical susceptibilities; in RPA mode the physical susceptibilities only); the loop asks for it in its last
+        scheduled iteration.
     :param eliashberg_only: Whether to stop after the two channel kernels: the double-counting kernel and the SDE are
         skipped and ``None`` is returned on every rank (the pass after a loop that converged before its last
         iteration).
@@ -1939,8 +2034,9 @@ def calculate_sigma_proposal(
 
     # the local vertices are identical on every rank, so they are loaded once per node into shared windows; the
     # double-counting kernel only enters the SDE, which the Eliashberg-only pass skips
+    rpa = config.rpa.use_rpa_susceptibility
     dc_contraction = None
-    if not eliashberg_only:
+    if not eliashberg_only and not rpa:
         f_dc_loc, f_dc_win = _load_node_shared_local_vertex(
             shared_node_comm,
             os.path.join(config.output.output_path, "f_dc_loc.npy"),
@@ -1954,86 +2050,107 @@ def calculate_sigma_proposal(
         _free_shared_window(f_dc_win, shared_node_comm)
 
     gchi0_q_full_sum = gchi0_q.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
-    gchi0_q_core = gchi0_q.cut_niv(config.box.niv_core)
-    gchi0_q.free()
-    logger.log_memory_usage("Gchi0_q_core", gchi0_q_core, comm.size)
-
-    # the interaction is attached once the full-box bubble is freed, so its operand copy never sits beside the bubble
-    kernel = None
-    if dc_contraction is not None:
-        kernel = _attach_dc_interaction(dc_contraction, u_loc)
-        dc_contraction.free()
-        logger.info("Calculated double-counting kernel.")
-
-    gchi0_q_core_sum = gchi0_q_core.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
-    gchi0_q_core_inv = gchi0_q_core.invert(copy=False)
-    del gchi0_q_core
-    logger.log_memory_usage("Gchi0_q_inv", gchi0_q_core_inv, comm.size)
-
-    if current_iter == 1:
-        calculate_and_save_chi_q_r_rpa(gchi0_q_full_sum, u_loc, v_nonloc, mpi_dist_irrk)
-
-    if save_eliashberg:
-        gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
-
     chunk_bytes = _sde_chunk_budget(comm, shared_node_comm) if chunk_budgets is None else chunk_budgets.sde
-    involution = _orbital_involution(config.lattice.hamiltonian.get_ek(), config.sys.correlated_orbitals)
-    if involution is not None and current_iter == 1:
-        logger.info(
-            f"The orbital permutation {involution.tolist()} transposes the dispersion: Bethe-Salpeter slices that are "
-            f"complex-symmetric only with their orbital pairs permuted take the permuted factorization."
+    if rpa:
+        gchi0_q.free()
+        # the bare-vertex kernels do not depend on the fermionic frequency, so they get its axis only for the SDE
+        kernel = None if eliashberg_only else calculate_bare_dc_kernel(gchi0_q_full_sum, u_loc)
+        if current_iter == 1:
+            calculate_and_save_chi_q_r_rpa(gchi0_q_full_sum, u_loc, v_nonloc, mpi_dist_irrk)
+        gchi0_q_sum_inv = gchi0_q_full_sum.invert()
+        gchi0_q_full_sum.free()
+        for channel, weight in ((SpinChannel.DENS, 1.0), (SpinChannel.MAGN, 3.0)):
+            chi_q_r = create_rpa_susceptibility(gchi0_q_sum_inv, u_loc, v_nonloc, channel)
+            chi_q_r = _finish_physical_susceptibility(
+                chi_q_r, mpi_dist_irrk, annealer, save_eliashberg, lambda_previous
+            )
+            if kernel is not None:
+                kernel.add(calculate_rpa_kernel_r_q(chi_q_r, v_nonloc, u_loc).scale(weight), copy=False)
+            logger.info(f"Calculated RPA kernel for {channel.value} channel.")
+        gchi0_q_sum_inv.free()
+        if kernel is not None:
+            kernel = kernel.repeat_over_vn(config.box.niv_core, 1)
+    else:
+        gchi0_q_core = gchi0_q.cut_niv(config.box.niv_core)
+        gchi0_q.free()
+        logger.log_memory_usage("Gchi0_q_core", gchi0_q_core, comm.size)
+
+        # the interaction is attached once the full-box bubble is freed, so its operand copy never sits beside the
+        # bubble
+        kernel = None
+        if dc_contraction is not None:
+            kernel = _attach_dc_interaction(dc_contraction, u_loc)
+            dc_contraction.free()
+            logger.info("Calculated double-counting kernel.")
+
+        gchi0_q_core_sum = gchi0_q_core.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
+        gchi0_q_core_inv = gchi0_q_core.invert(copy=False)
+        del gchi0_q_core
+        logger.log_memory_usage("Gchi0_q_inv", gchi0_q_core_inv, comm.size)
+
+        if current_iter == 1:
+            calculate_and_save_chi_q_r_rpa(gchi0_q_full_sum, u_loc, v_nonloc, mpi_dist_irrk)
+
+        if save_eliashberg:
+            gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
+
+        involution = _orbital_involution(config.lattice.hamiltonian.get_ek(), config.sys.correlated_orbitals)
+        if involution is not None and current_iter == 1:
+            logger.info(
+                f"The orbital permutation {involution.tolist()} transposes the dispersion: Bethe-Salpeter slices that "
+                f"are complex-symmetric only with their orbital pairs permuted take the permuted factorization."
+            )
+
+        gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
+            shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
         )
+        calculate_sigma_kernel_r_q(
+            gamma_dens,
+            gchi0_q_core_inv,
+            gchi0_q_full_sum,
+            gchi0_q_core_sum,
+            u_loc,
+            v_nonloc,
+            mpi_dist_irrk,
+            annealer,
+            save_eliashberg=save_eliashberg,
+            lambda_previous=lambda_previous,
+            kernel=kernel,
+            involution=involution,
+        )
+        gamma_dens.mat = None
+        if gamma_dens_win is None:
+            gamma_dens.free()
+        _free_shared_window(gamma_dens_win, shared_node_comm)
+        mpi_dist_irrk.barrier()
+        logger.info("Calculated kernel for density channel.")
 
-    gamma_dens, gamma_dens_win = _load_node_shared_local_vertex(
-        shared_node_comm, os.path.join(config.output.output_path, "gamma_dens_loc.npy"), SpinChannel.DENS
-    )
-    calculate_sigma_kernel_r_q(
-        gamma_dens,
-        gchi0_q_core_inv,
-        gchi0_q_full_sum,
-        gchi0_q_core_sum,
-        u_loc,
-        v_nonloc,
-        mpi_dist_irrk,
-        annealer,
-        save_eliashberg=save_eliashberg,
-        lambda_previous=lambda_previous,
-        kernel=kernel,
-        involution=involution,
-    )
-    gamma_dens.mat = None
-    if gamma_dens_win is None:
-        gamma_dens.free()
-    _free_shared_window(gamma_dens_win, shared_node_comm)
-    mpi_dist_irrk.barrier()
-    logger.info("Calculated kernel for density channel.")
-
-    gamma_magn, gamma_magn_win = _load_node_shared_local_vertex(
-        shared_node_comm, os.path.join(config.output.output_path, "gamma_magn_loc.npy"), SpinChannel.MAGN
-    )
-    calculate_sigma_kernel_r_q(
-        gamma_magn,
-        gchi0_q_core_inv,
-        gchi0_q_full_sum,
-        gchi0_q_core_sum,
-        u_loc,
-        v_nonloc,
-        mpi_dist_irrk,
-        annealer,
-        save_eliashberg=save_eliashberg,
-        lambda_previous=lambda_previous,
-        kernel=kernel,
-        weight=3.0,
-        involution=involution,
-    )
-    gchi0_q_core_inv.free()
-    gchi0_q_full_sum.free()
-    gchi0_q_core_sum.free()
-    gamma_magn.mat = None
-    if gamma_magn_win is None:
-        gamma_magn.free()
-    _free_shared_window(gamma_magn_win, shared_node_comm)
-    logger.info("Calculated kernel for magnetic channel.")
+        gamma_magn, gamma_magn_win = _load_node_shared_local_vertex(
+            shared_node_comm, os.path.join(config.output.output_path, "gamma_magn_loc.npy"), SpinChannel.MAGN
+        )
+        calculate_sigma_kernel_r_q(
+            gamma_magn,
+            gchi0_q_core_inv,
+            gchi0_q_full_sum,
+            gchi0_q_core_sum,
+            u_loc,
+            v_nonloc,
+            mpi_dist_irrk,
+            annealer,
+            save_eliashberg=save_eliashberg,
+            lambda_previous=lambda_previous,
+            kernel=kernel,
+            weight=3.0,
+            involution=involution,
+        )
+        gchi0_q_core_inv.free()
+        gchi0_q_full_sum.free()
+        gchi0_q_core_sum.free()
+        gamma_magn.mat = None
+        if gamma_magn_win is None:
+            gamma_magn.free()
+        _free_shared_window(gamma_magn_win, shared_node_comm)
+        logger.info("Calculated kernel for magnetic channel.")
 
     if eliashberg_only:
         if giwk_win is not None:
@@ -2701,7 +2818,8 @@ def calculate_self_energy_q(
     exact_args = (u_loc, v_nonloc, v_nonloc_full, sigma_dmft_full, mpi_dist_irrk, mpi_dist_fullbz, comm, chunk_budgets)
 
     annealer = LambdaAnnealer() if config.stabilization.use_lambda_annealing else None
-    pole_vertex = first_frequency_local_vertex() if comm.rank == 0 else None
+    # the pole ratio watches the density Bethe-Salpeter slices, which RPA mode does not solve
+    pole_vertex = first_frequency_local_vertex() if comm.rank == 0 and not config.rpa.use_rpa_susceptibility else None
     # one dict for the whole run warm-starts every channel's search from the previous iteration's lambda
     lambda_previous = None
     if config.stabilization.use_lambda_correction and not config.lambda_correction.perform_lambda_correction:
