@@ -55,7 +55,6 @@ _JACOBIAN_ROW_WIDTH = TRACKER_PAIRS - 1  # Ritz values per row of the traces: ev
 _FIRST_FREQUENCY_RATIO = 2.0  # w_1 over static compound norm of chi_phys above which the loop warns of a pole
 _RESTRICTION_PIN_FACTOR = 2.0  # pin of a crossed mode, in units of the largest healthy static eigenvalue of the channel
 _RESTRICTION_FALLBACK_FLOOR = 1e-2  # floor of the inverse static eigenvalues when no static block is healthy
-_STALL_FACTOR = 10.0  # map residual, in units of epsilon, above which a converged step that no longer lowers it stalls
 
 
 def get_hartree_fock(
@@ -2133,29 +2132,58 @@ def interpolate_sigma(sigma: SelfEnergy, beta_target: float, niv_target: int, co
     return interpolated.map_to_full_bz(k_grid).decompress_q_dimension()
 
 
+def _positive_core(sigma: SelfEnergy) -> np.ndarray:
+    """
+    Returns the positive fermionic core frequencies of a self-energy in the compressed ``[q, o1, o2, v]`` layout,
+    whichever momentum layout the self-energy holds (a view of its array wherever the layout allows one).
+
+    :param sigma: The self-energy.
+    :return: Its positive core window.
+    """
+    core = sigma.mat[..., sigma.niv : sigma.niv + config.box.niv_core]
+    return core.reshape(-1, *core.shape[-3:])
+
+
+def _relative_core_residual(new_core: np.ndarray, old_core: np.ndarray) -> float:
+    r"""
+    Returns the larger of the relative L2 residuals of the real and the imaginary part of two positive core windows
+    (:func:`_positive_core`), :math:`\max\big(\lVert\mathrm{Re}\,(\Sigma_{\mathrm{new}} - \Sigma_{\mathrm{old}})\rVert
+    / \lVert\mathrm{Re}\,\Sigma_{\mathrm{old}}\rVert,\ \lVert\mathrm{Im}\,(\Sigma_{\mathrm{new}} -
+    \Sigma_{\mathrm{old}})\rVert / \lVert\mathrm{Im}\,\Sigma_{\mathrm{old}}\rVert\big)` over all momenta, orbitals and
+    frequencies of the window. Each part is measured against its own norm, so a change in the smaller part is not
+    hidden by the larger one; a part whose norm vanishes is measured against :math:`\lVert\Sigma_{\mathrm{old}}\rVert`
+    instead. A local (single-k) old window is broadcast against a full-BZ new one.
+
+    :param new_core: The positive core window of the new self-energy.
+    :param old_core: The positive core window the residual is measured against.
+    :return: The larger of the two relative residuals as a float.
+    """
+    if old_core.shape[0] != new_core.shape[0]:
+        old_core = np.broadcast_to(old_core, new_core.shape)
+    diff = new_core - old_core
+    old_re, old_im = np.linalg.norm(old_core.real), np.linalg.norm(old_core.imag)
+    old_full = np.hypot(old_re, old_im)
+    return float(
+        max(np.linalg.norm(diff.real) / (old_re or old_full), np.linalg.norm(diff.imag) / (old_im or old_full))
+    )
+
+
 def _relative_sigma_residual(sigma_new: SelfEnergy, sigma_old: SelfEnergy) -> float:
     r"""
-    Returns the relative L2 residual :math:`\lVert\Sigma_{\mathrm{new}} - \Sigma_{\mathrm{old}}\rVert /
-    \lVert\Sigma_{\mathrm{old}}\rVert` over the positive fermionic core frequencies (all momenta and orbitals,
-    real and imaginary parts stacked). Evaluated on the raw proposal it measures the mixing-independent distance
-    to the fixed point, :math:`\lVert S(\Sigma)-\Sigma\rVert/\lVert\Sigma\rVert`; evaluated on the mixed iterate
-    it measures the per-iteration step size (which shrinks with the mixing parameter). A local (single-k)
-    self-energy is broadcast against a full-BZ one. Layout-safe: the two iterates may arrive with different
-    momentum layouts (compressed vs decompressed) and are normalized before comparing.
+    Returns the relative residual of :func:`_relative_core_residual` between the positive fermionic core frequencies
+    of two self-energies. Evaluated on the raw proposal it measures the mixing-independent distance to the fixed
+    point, :math:`\lVert S(\Sigma)-\Sigma\rVert/\lVert\Sigma\rVert` per part; evaluated on the mixed iterate it
+    measures the per-iteration step size (which shrinks with the mixing parameter). Layout-safe: the two iterates may
+    arrive with different momentum layouts (compressed vs decompressed) and are normalized before comparing, and a
+    local (single-k) self-energy is broadcast against a full-BZ one.
 
     :param sigma_new: The new self-energy (raw proposal or mixed iterate).
     :param sigma_old: The previous iterate the residual is measured against.
-    :return: The relative residual as a float.
+    :return: The larger of the real-part and the imaginary-part relative residual as a float.
     """
-    new_core = sigma_new.mat[..., sigma_new.niv : sigma_new.niv + config.box.niv_core]
-    old_core = sigma_old.mat[..., sigma_old.niv : sigma_old.niv + config.box.niv_core]
-    # Normalize both to the compressed [q, o1, o2, v] layout before comparing: mismatched layouts (rank 0's iterate is
-    # left decompressed by the save path) would pair wrong momenta; a local iterate is broadcast to the full BZ.
-    new_core = new_core.reshape(-1, *new_core.shape[-3:])
-    old_core = old_core.reshape(-1, *old_core.shape[-3:])
-    if old_core.shape[0] != new_core.shape[0]:
-        old_core = np.broadcast_to(old_core, new_core.shape)
-    return float(np.linalg.norm(new_core - old_core) / np.linalg.norm(old_core))
+    # both windows come in the compressed layout: mismatched layouts (rank 0's iterate is left decompressed by the
+    # save path) would pair wrong momenta
+    return _relative_core_residual(_positive_core(sigma_new), _positive_core(sigma_old))
 
 
 def _jacobian_expander(state: dict) -> Callable[[np.ndarray], np.ndarray] | None:
@@ -2502,12 +2530,13 @@ def calculate_self_energy_q(
     (:func:`_install_exact_jacobian`). A non-zero :math:`V^{\mathbf{q}}` is warned about once, since its Hartree-Fock
     shell offset lies outside the tracked window.
 
-    Convergence is declared on the post-mixing step residual, scaled by :math:`p / p_{\mathrm{eff}}` for a damped
-    step of a tracked run, together with a settled chemical potential. With the tracker the pure fixed point waits for
+    Convergence is declared once three residuals lie below epsilon, together with a settled chemical potential: the
+    post-mixing step residual (scaled by :math:`p / p_{\mathrm{eff}}` for a damped step of a tracked run), the
+    proposal step residual between the proposals of two consecutive iterations, and the map residual
+    :math:`\lVert S(\Sigma) - \Sigma\rVert / \lVert\Sigma\rVert` of the proposal against the iterate it was computed
+    from. With the tracker the pure fixed point waits for
     :meth:`~dgamore.jacobian_stabilization.JacobianTracker.minimum_iterations` (capped by ``max_iter``), and a
     convergence below the count of the whole certified spectrum (in-band modes counted with the band) is warned about.
-    The map residual :math:`\lVert S(\Sigma) - \Sigma\rVert / \lVert\Sigma\rVert` is logged, and a convergence whose
-    map residual lies above ``_STALL_FACTOR`` times epsilon and did not fall is warned about as a stall.
 
     :param comm: The MPI communicator.
     :param u_loc: The bare local interaction :math:`U`.
@@ -2559,7 +2588,9 @@ def calculate_self_energy_q(
 
     # the tracker is built on every rank (a few floats) but only rank 0, which holds the proposal, ever feeds it; it
     # keeps its vectors, the recorded pair window included, on the weighted symmetry sector of the core window
-    tracker = tracker_window = rows_lam = rows_res = rows_damping = stab_event_iter = map_residual = None
+    tracker = tracker_window = rows_lam = rows_res = rows_damping = stab_event_iter = None
+    # rank 0's positive core window of the previous proposal, refilled in place every iteration
+    previous_proposal = None
     if config.stabilization.use_jacobian_stabilization:
         from dgamore.sigma_jacobian import tracker_sector_maps
 
@@ -2718,9 +2749,15 @@ def calculate_self_energy_q(
             lambda_previous=lambda_previous,
         )
         # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
-        # the map's own distance from a fixed point, read before the mixing overwrites the proposal
-        previous_map_residual = map_residual
-        map_residual = _relative_sigma_residual(sigma_new, sigma_old) if comm.rank == 0 else None
+        # the map's own distance from a fixed point and the change of the proposal, read before the mixing overwrites it
+        map_residual = proposal_residual = None
+        if comm.rank == 0:
+            map_residual = _relative_sigma_residual(sigma_new, sigma_old)
+            if previous_proposal is not None:
+                proposal_residual = _relative_core_residual(_positive_core(sigma_new), previous_proposal)
+                previous_proposal[...] = _positive_core(sigma_new)
+            elif current_iter < last_iter:
+                previous_proposal = _positive_core(sigma_new).copy()
 
         # the tracker decides on this iteration's pair before its step, while every rank still holds the iterate; it
         # records sector vectors, so the core windows are read in place
@@ -2807,30 +2844,23 @@ def calculate_self_energy_q(
 
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
-            # Convergence is declared on the post-mixing step residual (the returned iterate). The un-mixed proposal
-            # residual is deliberately not used: it can plateau above epsilon and would block convergence forever.
+            # the returned iterate, the proposal and the proposal's distance from its iterate must all have settled
             eps = _effective_epsilon(annealer)
             # a damped step moves at p_eff, so its residual is read at the configured mixing, as without the tracker
             step_scale = tracker.p_config / tracker.p_eff if damped_step and tracker is not None else 1.0
             step_residual = abs(relative_residual) * step_scale
-            sigma_converged = step_residual < eps
+            sigma_converged = max(step_residual, proposal_residual, map_residual) < eps
             scaled = f", {step_residual:.3e} at the configured mixing" if step_scale != 1.0 else ""
             logger.info(
                 f"Self-energy convergence: {sigma_converged} (relative step residual={relative_residual:.3e}{scaled}, "
-                f"map residual={map_residual:.3e}, epsilon={eps:.3e})."
+                f"proposal step residual={proposal_residual:.3e}, map residual={map_residual:.3e}, "
+                f"epsilon={eps:.3e})."
             )
 
             mu_converged = abs(mu_history[-1] - mu_history[-2]) < np.pi / (10 * config.sys.beta)
             logger.info(f"Chemical potential convergence: {mu_converged}.")
 
             converged = mu_converged and sigma_converged
-            if converged and map_residual > _STALL_FACTOR * eps and map_residual >= previous_map_residual:
-                logger.warning(
-                    f"Converged on the step residual {relative_residual:.3e}, but the map residual "
-                    f"|S(Sigma) - Sigma| / |Sigma| is still {map_residual:.3e} ({map_residual / eps:.0f} epsilon) and "
-                    "no lower than in the previous iteration: the steps have stalled, e.g. an accelerated mixing "
-                    "stagnating on an unstable direction, rather than reached a fixed point."
-                )
         else:
             converged = False
         converged = comm.bcast(converged)
@@ -2913,7 +2943,7 @@ def calculate_self_energy_q(
         else:
             logger.info("Self-consistency not reached.")
 
-    mixing_history = tracker_window = None  # nothing after the loop reads them
+    mixing_history = tracker_window = previous_proposal = None  # nothing after the loop reads them
     if tracker is not None and comm.rank == 0:
         tracker.release_after_loop()
 

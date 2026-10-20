@@ -867,18 +867,28 @@ def test_relative_sigma_residual_zero_for_identical_input():
 
 
 def test_relative_sigma_residual_matches_explicit_core_window_formula():
-    """The helper equals the explicit [Re; Im]-stacked L2 quotient over the positive core frequencies."""
+    """The helper equals the larger of the Re and Im L2 quotients over the positive core frequencies."""
     config.box.niv_core = 3
     rng = np.random.default_rng(1)
     a = (rng.standard_normal((4, 1, 1, 10)) + 1j * rng.standard_normal((4, 1, 1, 10))).astype(np.complex64)
     b = (rng.standard_normal((4, 1, 1, 10)) + 1j * rng.standard_normal((4, 1, 1, 10))).astype(np.complex64)
     new_c, old_c = a[..., 5:8], b[..., 5:8]
     diff = (new_c - old_c).ravel()
-    ref = np.linalg.norm(np.concatenate([diff.real, diff.imag])) / np.linalg.norm(
-        np.concatenate([old_c.real.ravel(), old_c.imag.ravel()])
+    ref = max(
+        np.linalg.norm(diff.real) / np.linalg.norm(old_c.real), np.linalg.norm(diff.imag) / np.linalg.norm(old_c.imag)
     )
     out = nonlocal_sde._relative_sigma_residual(_make_resid_sigma(a), _make_resid_sigma(b))
     assert np.allclose(out, ref, atol=1e-12)
+
+
+def test_relative_sigma_residual_measures_each_part_against_its_own_norm():
+    """A change of the small real part shows at its own scale, not at the scale of the large imaginary part."""
+    config.box.niv_core = 3
+    old = np.full((4, 1, 1, 10), 1e-2 + 1.0j, dtype=np.complex128)
+    new = old + 1e-4
+    out = nonlocal_sde._relative_sigma_residual(_make_resid_sigma(new), _make_resid_sigma(old))
+    assert np.allclose(out, 1e-2, atol=1e-12)
+    assert np.linalg.norm(new - old) / np.linalg.norm(old) < 0.02 * out
 
 
 def test_relative_sigma_residual_broadcasts_local_old_against_full_bz():
@@ -1511,10 +1521,10 @@ def test_loop_concatenates_the_previous_iterate_on_rank0_only(monkeypatch, tmp_p
     assert seen == ["rank0"] * 3
 
 
-def test_loop_measures_the_step_and_map_residuals_on_rank0_only(monkeypatch, tmp_path):
-    """The step and map residuals only matter on rank 0, so no other rank evaluates them, two per iteration."""
-    seen = _run_loop_on_two_node_ranks(monkeypatch, tmp_path, "_relative_sigma_residual", nonlocal_sde)
-    assert seen == ["rank0"] * 6
+def test_loop_measures_the_step_proposal_and_map_residuals_on_rank0_only(monkeypatch, tmp_path):
+    """The residuals only matter on rank 0: step and map every iteration, the proposal's from the second on."""
+    seen = _run_loop_on_two_node_ranks(monkeypatch, tmp_path, "_relative_core_residual", nonlocal_sde)
+    assert seen == ["rank0"] * 8
 
 
 _FIXED_POINT = 0.3 - 0.2j
@@ -1616,24 +1626,42 @@ def test_loop_flag_off_never_builds_tracker_or_history(monkeypatch, tmp_path):
     assert all(call.args[3] is None and call.args[4] is None for call in spy.call_args_list)
 
 
-def test_loop_warns_when_the_step_converges_but_the_map_residual_does_not(monkeypatch, tmp_path):
-    """Steps that stop while the map residual stays put far above epsilon converge with a stalled-step warning."""
-    run, _, logger = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=10, epsilon=1e-3, tracked=False)
+def test_loop_does_not_converge_while_the_map_residual_stays_above_epsilon(monkeypatch, tmp_path):
+    """Steps that stop while the map residual stays put above epsilon never reach the verdict."""
+    run, calls, logger = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=10, epsilon=1e-3, tracked=False)
     monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", lambda new, old, *a, **k: old.copy())
     run()
-    assert any("stalled" in call[0][0] for call in logger.warning.call_args_list)
+    assert len(calls) == 10
+    assert not any("Self-consistency of sigma and mu reached" in str(c.args[0]) for c in logger.info.call_args_list)
 
 
-@pytest.mark.parametrize(
-    "mixing, epsilon", [(0.08, 1e-3), (0.5, 5e-4)], ids=["slowly_damped_still_falling", "map_residual_follows_step"]
-)
-def test_loop_gives_no_stall_warning_while_the_map_residual_still_falls(monkeypatch, tmp_path, mixing, epsilon):
-    """A slowly damped map (residual above ten epsilon, still falling) or a plainly contracting one is not flagged."""
-    run, calls, logger = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=80, epsilon=epsilon, tracked=False)
+@pytest.mark.parametrize("alternating, iterations", [(False, 2), (True, 10)], ids=["settled", "alternating"])
+def test_loop_waits_for_the_proposal_to_settle(monkeypatch, tmp_path, alternating, iterations):
+    """Proposals alternating around a fixed iterate block the verdict, though step and map residual lie below eps."""
+
+    def step(sigma_in, n_call, annealer):
+        proposal = sigma_in.copy()
+        proposal.mat *= 1 + (-1) ** (n_call if alternating else 0) * 9e-4
+        return proposal
+
+    run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, step, max_iter=10, epsilon=1e-3)
+    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", lambda new, old, *a, **k: old.copy())
+    run()
+    assert len(calls) == iterations
+
+
+@pytest.mark.parametrize("mixing, epsilon", [(0.08, 1e-3), (0.5, 5e-4)], ids=["slowly_damped", "contracting"])
+def test_loop_converges_with_every_residual_below_epsilon(monkeypatch, tmp_path, mixing, epsilon):
+    """A slowly damped map and a plainly contracting one converge with all three residuals below epsilon."""
+    run, calls, logger = _affine_loop(
+        monkeypatch, tmp_path, _STABLE_GAINS, max_iter=200, epsilon=epsilon, tracked=False
+    )
     config.self_consistency.mixing = mixing
     run()
-    assert len(calls) < 80
-    assert not any("stalled" in call[0][0] for call in logger.warning.call_args_list)
+    verdict = [str(c.args[0]) for c in logger.info.call_args_list if "Self-energy convergence: True" in str(c.args[0])]
+    assert len(calls) < 200 and len(verdict) == 1
+    names = ("relative step residual", "proposal step residual", "map residual")
+    assert max(float(verdict[0].split(f"{name}=")[1].split(",")[0]) for name in names) < epsilon
 
 
 @pytest.mark.parametrize("use_exact_jacobian, max_iter, expected", [(True, 80, 1), (False, 80, 0), (True, 3, 0)])

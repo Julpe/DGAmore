@@ -242,6 +242,16 @@ def test_mixing_history_sits_in_the_rank0_slot_of_every_proposal_branch():
     assert anderson["sigma_interp"].off_single == linear["sigma_interp"].off_single
 
 
+def test_previous_proposal_sits_in_the_rank0_slot_of_every_loop_branch():
+    """A loop past one iteration adds the previous proposal's positive core window wherever the history sits."""
+    window = BASE["nk_tot"] * BASE["n_bands"] ** 2 * BASE["niv_core"]
+    one_shot, loop = _peaks(niv_interp=40), _peaks(previous_proposal=True, niv_interp=40)
+    for key in ("chi0q", "chiq_aux", "sde", "sigma_loop", "mu_update"):
+        assert loop[key].off_single - one_shot[key].off_single == pytest.approx(SCALE * window), key
+        assert loop[key].off_distributed == one_shot[key].off_distributed, key
+    assert loop["sigma_interp"].off_single == one_shot["sigma_interp"].off_single
+
+
 def test_eliashberg_branches_share_only_the_local_vertex_of_the_pairing_vertex_build():
     """Only fq's local vertex is node-shared in the Eliashberg branches (sigma_dga freed, giwk_dga on rank 0)."""
     peaks = _peaks(with_eliashberg=True)

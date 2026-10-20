@@ -707,6 +707,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         symmetrize_orbitals=bool(config.dmft.symmetrize_orbitals),
         do_spectrum_dmft=config.ana_cont.do_spectrum_dmft,
         warm_start=bool(config.self_consistency.previous_sc_path),
+        previous_proposal=config.self_consistency.max_iter > 1,
         with_jacobian_tracker=config.stabilization.use_jacobian_stabilization,
     )
     # the estimates of this call, keyed by the counts, the budgets and the exact-Jacobian flag, which can be disabled
