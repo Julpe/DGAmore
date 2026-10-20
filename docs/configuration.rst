@@ -407,9 +407,12 @@ three-leg vertex is one, and the physical susceptibility is the RPA susceptibili
 The kernel of each channel reduces to :math:`-\mathcal{U}^{\mathbf{q}}_{r} \chi^{\mathrm{q}}_{r}
 \mathcal{U}^{\mathbf{q}}_{r}`, and the double-counting kernel of the Schwinger-Dyson equation subtracts the bare
 vertex :math:`\tfrac12(U_{\mathrm{d}} + 3U_{\mathrm{m}})` instead of the local one, so the second-order diagram is
-counted once. The noise-removal term :math:`\Sigma_{\mathrm{DMFT}} - \Sigma_{\mathrm{loc}}` keeps the local
-self-energy of the DMFT vertex. Since the local part of the RPA kernels is not the local Schwinger-Dyson equation,
-the local part of the result follows the RPA rather than :math:`\Sigma_{\mathrm{DMFT}}`.
+counted once. With it, the density and magnetic kernels form the particle-hole fluctuation-exchange (FLEX)
+self-energy, without the particle-particle T-matrix, and no noise-removal term
+:math:`\Sigma_{\mathrm{DMFT}} - \Sigma_{\mathrm{loc}}` is added; since the self-consistent loop rebuilds the bubble from
+the dressed Green's function, a self-consistent run is particle-hole FLEX started from DMFT.
+The local Schwinger-Dyson step still runs: the lambda correction reads its local susceptibilities, and its local
+self-energy is written as a diagnostic.
 
 The lambda correction, the restriction and the annealing of the :ref:`stabilization section <stabilization>` act on
 the RPA susceptibility as on the ladder one. At couplings typical of DΓA the magnetic RPA susceptibility can lie

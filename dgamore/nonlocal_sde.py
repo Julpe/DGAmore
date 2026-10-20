@@ -1983,7 +1983,8 @@ def calculate_sigma_proposal(
     :param v_nonloc_full: The non-local interaction on the full q-grid (for the Hartree/Fock term); only read on
         rank 0.
     :param sigma_dmft: The DMFT self-energy (cut to the loop's niv), providing the high-frequency tail.
-    :param delta_sigma: The DMFT-minus-local noise-removal term on the core box.
+    :param delta_sigma: The DMFT-minus-local noise-removal term on the core box (zero with
+        ``config.rpa.use_rpa_susceptibility``).
     :param my_irr_q_list: This rank's irreducible q-point list.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param comm: The MPI communicator.
@@ -2659,7 +2660,8 @@ def calculate_self_energy_q(
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` on the full q-grid; only read on rank 0.
     :param sigma_dmft: The DMFT self-energy (used as the starting point and for the shell/tail correction).
-    :param sigma_local: The locally recomputed self-energy (used for smoothing out the DGA :class:`SelfEnergy`).
+    :param sigma_local: The locally recomputed self-energy (used for smoothing out the DGA :class:`SelfEnergy`; not
+        read with ``config.rpa.use_rpa_susceptibility``).
     :param chunk_budgets: Chunk byte budgets, of which the self-energy contraction reads its own (sized by the driver
         from the memory estimate); ``None`` gives it the job-wide fair-share budget of :func:`_sde_chunk_budget`.
     :return: The converged (or last-iteration) momentum-dependent DGA :class:`SelfEnergy` on rank 0; ``None`` on every
@@ -2802,7 +2804,9 @@ def calculate_self_energy_q(
     if starting_iter > 0 and sc_node_comm is not None:
         sigma_old, sigma_win = _share_sigma_per_node(sigma_old, comm, sc_node_comm, sc_roots_comm)
 
-    delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_local.cut_niv(config.box.niv_core)
+    # RPA mode adds no noise-removal term: its self-energy is the particle-hole FLEX one of the RPA kernels alone
+    reference = sigma_dmft if config.rpa.use_rpa_susceptibility else sigma_local
+    delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - reference.cut_niv(config.box.niv_core)
 
     # only rank 0 finishes the proposal with the Hartree-Fock term, which reads the full q-grid interaction
     v_nonloc_full = v_nonloc if comm.rank == 0 else None
