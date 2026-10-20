@@ -2907,6 +2907,112 @@ def test_dispatch_loads_the_vertex_node_shared_and_frees_its_window(setup, monke
     free_mock.assert_called_once_with(win, node_comm)
 
 
+@pytest.mark.parametrize("no", [1, 2])
+def test_rpa_vertex_chunk_is_the_ladder_vertex_chunk_at_the_bare_local_vertex(monkeypatch, no):
+    """With Gamma_r = U_r and unit three-leg vertices the ladder vertex is U^q_r - U^q_r chi U^q_r on the whole box."""
+    monkeypatch.setattr(n_point_base, "DTYPE", np.complex128)
+    config.sys.beta = 7.3
+    channel = SpinChannel.DENS
+    rng = np.random.default_rng(13)
+    chi0_mat, _, u_mat = _toy_arrays(no, rng)
+    u_loc = LocalInteraction(u_mat)
+    v_mat = rng.standard_normal((N_Q,) + (no,) * 4)
+    v_nonloc = Interaction(0.5 * (v_mat + v_mat.transpose(0, 2, 1, 4, 3)), SpinChannel.NONE, (N_Q, 1, 1), True)
+    u_r = u_loc.as_channel(channel) + v_nonloc.as_channel(channel)
+    box = (no,) * 4 + (N_W, 2 * NIV, 2 * NIV)
+    u_r_mat = u_loc.as_channel(channel).mat[..., None, None, None]
+    gamma_r = LocalFourPoint(np.broadcast_to(u_r_mat, box).copy(), channel, 1, 2, False, True)
+    gchi0_q_inv = FourPoint(chi0_mat, SpinChannel.NONE, (N_Q, 1, 1), 1, 1, False, True, True).invert()
+    unit = FourPoint.identity(no, N_W - 1, NIV, N_Q, (N_Q, 1, 1), num_vn_dimensions=1).set_channel(channel)
+    chi_mat = rng.standard_normal((N_Q,) + (no,) * 4 + (N_W,)) + 1j * rng.standard_normal((N_Q,) + (no,) * 4 + (N_W,))
+    chi = FourPoint(chi_mat, channel, (N_Q, 1, 1), 1, 0, False, True, True)
+    ladder = es._build_ladder_vertex_chunk(gamma_r, gchi0_q_inv, unit, chi, u_loc, u_r, 0, N_W, None)
+
+    out = es._build_rpa_vertex_chunk(chi, u_r, 0, N_W, NIV)
+
+    assert np.allclose(out.mat, ladder.mat, atol=1e-9 * np.abs(ladder.mat).max())
+
+
+def _rpa_solve_capturing_vertices(monkeypatch, u_loc: LocalInteraction, no: int) -> tuple[np.ndarray, np.ndarray]:
+    """Runs solve in RPA mode on the rank files in place and returns the singlet and triplet vertex the solver gets."""
+    config.rpa.use_rpa_susceptibility = True
+    config.sys.n_bands = no
+    captured = {}
+    monkeypatch.setattr(
+        es,
+        "_solve_sectors_in_memory",
+        lambda dist, sing, trip, *a: captured.update(sing=sing.mat.copy(), trip=trip.mat.copy()) or {},
+    )
+    v_nonloc = Interaction(np.zeros((N_Q, 1, 1) + (no,) * 4), SpinChannel.NONE, (N_Q, 1, 1))
+    es.solve(None, None, u_loc, v_nonloc, conftest.create_comm_mock())
+    return captured["sing"], captured["trip"]
+
+
+def test_rpa_pairing_vertices_of_one_band_are_the_spin_fluctuation_vertices(setup, monkeypatch):
+    """One band: singlet -(U + 3/2 U^2 chi_m - 1/2 U^2 chi_d), triplet U + 1/2 U^2 (chi_d + chi_m) at w = v - v'."""
+    u, rank_path = 1.7, config.output.eliashberg_path
+    u_loc = LocalInteraction(np.full((1, 1, 1, 1), u))
+    chi0_mat, _, _ = _toy_arrays(1, np.random.default_rng(6))
+    gchi0_q = FourPoint(chi0_mat, SpinChannel.NONE, (N_Q, 1, 1), 1, 1, False, True, True)
+    sum_inv = gchi0_q.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta).invert()
+    v_q = Interaction(np.zeros((N_Q, 1, 1, 1, 1)), SpinChannel.NONE, (N_Q, 1, 1), True)
+    chi = {}
+    for channel in (SpinChannel.DENS, SpinChannel.MAGN):
+        chi_q_r = nonlocal_sde.create_rpa_susceptibility(sum_inv, u_loc, v_q, channel)
+        nonlocal_sde._finish_physical_susceptibility(chi_q_r, _make_single_rank_distributor(), save_eliashberg=True)
+        chi[channel] = np.load(os.path.join(rank_path, f"chi_phys_q_{channel.value}_rank_0.npy")).reshape(N_Q, N_W)
+
+    sing, trip = _rpa_solve_capturing_vertices(monkeypatch, u_loc, 1)
+
+    niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
+    w = np.arange(-niv_pp, niv_pp)[:, None] - np.arange(-niv_pp, niv_pp)[None, :]
+    chi_d, chi_m = (np.where(w >= 0, c[:, abs(w)], np.conj(c[:, abs(w)])) for c in chi.values())
+    sing_expected = -(u + 1.5 * u**2 * chi_m - 0.5 * u**2 * chi_d)
+    trip_expected = u + 0.5 * u**2 * (chi_d + chi_m)
+    assert np.allclose(sing.reshape(sing_expected.shape), sing_expected, atol=1e-5 * np.abs(sing_expected).max())
+    assert np.allclose(trip.reshape(trip_expected.shape), trip_expected, atol=1e-5 * np.abs(trip_expected).max())
+
+
+@pytest.mark.parametrize("save_fq", [False, True])
+def test_rpa_pairing_vertices_without_susceptibility_are_the_bare_interaction(setup, monkeypatch, save_fq):
+    """With chi = 0 the RPA singlet and triplet vertices are -U_{1234} and +U_{1234}: the bare U counted once."""
+    no = 2
+    config.eliashberg.save_fq = save_fq
+    _, _, u_mat = _toy_arrays(no, np.random.default_rng(9))
+    zero = FourPoint(np.zeros((N_Q,) + (no,) * 4 + (N_W,)), SpinChannel.NONE, (N_Q, 1, 1), 1, 0, False, True, True)
+    for channel in ("dens", "magn"):
+        zero.save(name=f"chi_phys_q_{channel}_rank_0", output_dir=config.output.eliashberg_path)
+
+    sing, trip = _rpa_solve_capturing_vertices(monkeypatch, LocalInteraction(u_mat), no)
+
+    bare = np.broadcast_to(u_mat[None, ..., None, None], sing.shape)
+    assert np.allclose(sing, -bare, atol=1e-6)
+    assert np.allclose(trip, bare, atol=1e-6)
+
+
+@pytest.mark.parametrize("no", [1, 2])
+def test_rpa_local_pairing_term_is_the_ladder_one_at_the_bare_local_vertex(monkeypatch, no):
+    """The +U_{1432} that solve adds in RPA mode is the ladder's local term Phi_loc - F_loc at the RPA local vertices:
+    no pp-reducible diagrams, and the bare vertex (F_d = U_d, F_m = U_m at every frequency) as local full vertex."""
+    u_mat = np.random.default_rng(4).standard_normal((no,) * 4)
+    u_mat = 0.5 * (u_mat + u_mat.transpose(1, 0, 3, 2))
+    u_mat = 0.5 * (u_mat + u_mat.transpose(2, 3, 0, 1))  # reality (2143) and pair exchange (3412) of physical tensors
+    u_loc = LocalInteraction(u_mat)
+    box = (no,) * 4 + (5, 8, 8)
+    stored = {}
+    for channel in (SpinChannel.DENS, SpinChannel.MAGN):
+        mat = np.broadcast_to(u_loc.as_channel(channel).mat[..., None, None, None], box).copy()
+        stored[channel] = LocalFourPoint(mat, channel, 1, 2, False, True)
+    monkeypatch.setattr(
+        LocalFourPoint, "load", staticmethod(lambda filename, channel=SpinChannel.NONE: stored[channel].copy())
+    )
+
+    ladder_term = -create_local_f_ud_transformed_w0(2).mat
+
+    rpa_term = np.broadcast_to(u_loc.permute_orbitals("abcd->adcb").mat[..., None, None], ladder_term.shape)
+    assert np.allclose(ladder_term, rpa_term, atol=1e-6)
+
+
 def test_solver_grid_shape_degenerates_and_caps():
     """The solver grid uses row-only splitting up to the frequency count, then widens by divisor columns."""
     assert es.solver_grid_shape(1, 80) == (1, 1)

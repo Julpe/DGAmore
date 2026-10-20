@@ -357,6 +357,26 @@ class LocalNPoint(IHaveMat):
         self.update_original_shape()
         return self
 
+    def repeat_over_vn(self, niv: int, num_vn_dimensions: int):
+        """
+        Returns a copy of an object without fermionic frequency axes that holds it constant on ``num_vn_dimensions``
+        appended full-range fermionic axes of ``2 niv`` frequencies each, i.e. [...,w] -> [...,w,v] or [...,w,v,v'].
+
+        :param niv: Number of positive fermionic frequencies.
+        :param num_vn_dimensions: Number of fermionic frequency axes (1 or 2).
+        :return: The repeated copy (full niv range).
+        :raises ValueError: If the object already has a fermionic frequency dimension.
+        """
+        if self.num_vn_dimensions != 0:
+            raise ValueError("The object already has fermionic frequency dimensions.")
+        copy = self._clone_without_mat()
+        shape = self.mat.shape + (2 * niv,) * num_vn_dimensions
+        copy.mat = np.broadcast_to(self.mat.reshape(self.mat.shape + (1,) * num_vn_dimensions), shape).copy()
+        copy._num_vn_dimensions = num_vn_dimensions
+        copy._full_niv_range = True
+        copy.update_original_shape()
+        return copy
+
     def to_full_niw_range(self):
         """
         Converts the object to the full bosonic frequency range and returns the original object. For details, we refer

@@ -123,6 +123,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
             config.stabilization,
             config.eliashberg,
             config.lambda_correction,
+            config.rpa,
             config.self_energy_interpolation,
             config.ana_cont,
         )
@@ -139,6 +140,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
                 config.stabilization,
                 config.eliashberg,
                 config.lambda_correction,
+                config.rpa,
                 config.self_energy_interpolation,
                 config.ana_cont,
             ) = pickle.loads(blob)
@@ -154,6 +156,11 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         return 1
 
     setup_lambda_correction_settings()
+    if config.rpa.use_rpa_susceptibility:
+        logger.info(
+            "RPA mode: the non-local step and the Eliashberg vertex use the RPA susceptibility; no three-leg vertex is "
+            "calculated."
+        )
 
     config_parser.save_config_file(path=config.output.output_path, name="dga_config.yaml")
 
@@ -874,7 +881,8 @@ def _resolve_option_exclusivity() -> None:
     with a warning. Separately, ``use_jacobian_stabilization`` cannot run in a one-shot run, i.e. with the one-shot
     ``perform_lambda_correction`` or with ``max_iter`` 1 (a single iteration has no history), and is disabled with a
     warning there, and ``use_exact_jacobian`` needs ``use_jacobian_stabilization`` (the exact spectrum is written
-    through the tracker) and is disabled with a warning without it.
+    through the tracker) and is disabled with a warning without it, as well as with ``rpa.use_rpa_susceptibility``,
+    whose map it does not linearize.
 
     :return: None.
     """
@@ -899,6 +907,13 @@ def _resolve_option_exclusivity() -> None:
         disable_option("use_jacobian_stabilization", "the one-shot lambda correction")
     if config.self_consistency.max_iter == 1:
         disable_option("use_jacobian_stabilization", "a one-shot run (max_iter 1)")
+
+    if config.rpa.use_rpa_susceptibility and config.stabilization.use_exact_jacobian:
+        config.stabilization.use_exact_jacobian = False
+        config.logger.warning(
+            "'use_exact_jacobian' linearizes the ladder map, which RPA mode does not run; the exact Jacobian is "
+            "disabled."
+        )
 
     if config.stabilization.use_exact_jacobian and not config.stabilization.use_jacobian_stabilization:
         config.stabilization.use_exact_jacobian = False

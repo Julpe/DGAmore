@@ -85,6 +85,7 @@ class ConfigParser:
         config.stabilization = self._build_stabilization_config(config_file)
         config.eliashberg = self._build_eliashberg_config(config_file)
         config.lambda_correction = self._build_lambda_correction_config(config_file)
+        config.rpa = self._build_rpa_config(config_file)
         config.box = self._build_box_config(config_file)
         config.lattice = self._build_lattice_config(config_file)
         config.self_energy_interpolation = self._build_self_energy_interpolation_config(config_file)
@@ -304,6 +305,24 @@ class ConfigParser:
             section, "perform_lambda_correction", conf.perform_lambda_correction
         )
         conf.type = self._try_parse(section, "type", conf.type)
+
+        return conf
+
+    def _build_rpa_config(self, config_file) -> RpaConfig:
+        """
+        Builds the RPA config from the ``rpa`` section (defaults if absent).
+
+        :param config_file: The parsed YAML mapping.
+        :return: The populated :class:`RpaConfig`.
+        """
+        conf = RpaConfig()
+        try:
+            section = config_file["rpa"]
+        except KeyError:
+            config.logger.info(f"'rpa' section not found. Using default values.")
+            return conf
+
+        conf.use_rpa_susceptibility = self._try_parse(section, "use_rpa_susceptibility", conf.use_rpa_susceptibility)
 
         return conf
 

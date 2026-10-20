@@ -840,6 +840,25 @@ def test_extend_vn_to_diagonal_stays_native_dtype_without_c128_temporary(monkeyp
     assert seen["c128"] is False
 
 
+def test_repeat_over_vn_holds_the_object_constant_on_new_full_range_fermionic_axes():
+    """repeat_over_vn appends two constant full-range fermionic axes of 2 niv frequencies and keeps the source."""
+    mat = (np.arange(12).reshape(2, 2, 3) * (1 - 2j)).astype(np.complex64)  # [o1, o2, w]
+    obj = LocalNPoint(mat.copy(), 2, 1, 0, full_niw_range=False, full_niv_range=False)
+
+    out = obj.repeat_over_vn(2, 2)
+
+    assert out.num_vn_dimensions == 2 and out.full_niv_range and out.current_shape == (2, 2, 3, 4, 4)
+    assert all(np.array_equal(out.mat[..., i, j], mat) for i, j in itertools.product(range(4), repeat=2))
+    assert obj.num_vn_dimensions == 0 and np.array_equal(obj.mat, mat)
+
+
+def test_repeat_over_vn_rejects_an_object_with_fermionic_axes():
+    """repeat_over_vn refuses an object that already carries a fermionic frequency axis."""
+    obj = LocalNPoint(np.ones((1, 1, 3, 4)), 2, 1, 1)
+    with pytest.raises(ValueError):
+        obj.repeat_over_vn(2, 1)
+
+
 def test_cut_niv_copy_false_mutates_self_in_place():
     """cut_niv(copy=False) mutates and returns self."""
     obj = LocalNPoint(np.arange(2 * 2 * 4).reshape(2, 2, 4).astype(complex), 2, 0, 1)  # [o1,o2,v], niv=2

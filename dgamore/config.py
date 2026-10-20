@@ -6,7 +6,7 @@
 """
 Global configuration singleton. This module holds the process-wide mutable state of a DGAmore run as module-level
 instances of the ``*Config`` classes (``box``, ``lattice``, ``sys``, ``dmft``, ``eliashberg``,
-``lambda_correction``, ``self_consistency``, ``stabilization``, ``self_energy_interpolation``, ``output``,
+``lambda_correction``, ``rpa``, ``self_consistency``, ``stabilization``, ``self_energy_interpolation``, ``output``,
 ``ana_cont``, and the ``logger``). :class:`ConfigParser` populates these from a YAML file on rank 0, after which they are
 broadcast to all MPI ranks; most modules read their parameters directly off this module rather than receiving them
 as arguments, so mutating a field changes behavior everywhere. Each ``*Config`` class documents its fields; the
@@ -239,6 +239,25 @@ class LambdaCorrectionConfig:
         self.type: str = "spch"
 
 
+class RpaConfig:
+    r"""
+    Stores the RPA configuration. With ``use_rpa_susceptibility`` the non-local step takes the local irreducible vertex
+    as the bare interaction, :math:`\Gamma_{r} = U_{r}`: no auxiliary susceptibility or three-leg vertex is calculated
+    (the three-leg vertex is one), the physical susceptibility is the RPA susceptibility
+    :math:`((\chi^{\mathrm{q}}_{0})^{-1} + U_{r} + V^{\mathbf{q}}_{r})^{-1}` of the frequency-summed bubble, and the
+    double-counting kernel takes the bare vertex :math:`\tfrac12(U_{\mathrm{d}} + 3U_{\mathrm{m}})`. The local
+    self-energy of the DMFT vertex still enters the noise-removal term :math:`\Sigma_{\mathrm{DMFT}} -
+    \Sigma_{\mathrm{loc}}`. The Eliashberg pairing vertex is built from the same susceptibility, with the bare up-down
+    interaction counted once in place of the local diagrams.
+
+    :ivar bool use_rpa_susceptibility: Whether the Schwinger-Dyson and the Eliashberg equation use the RPA
+        susceptibility.
+    """
+
+    def __init__(self):
+        self.use_rpa_susceptibility: bool = False
+
+
 class DmftConfig:
     r"""
     Stores the DMFT input-file parameters: the input path, the 1- and 2-particle data filenames, symmetrization
@@ -364,6 +383,7 @@ logger: DgaLogger
 box: BoxConfig = BoxConfig()
 lattice: LatticeConfig = LatticeConfig()
 lambda_correction: LambdaCorrectionConfig = LambdaCorrectionConfig()
+rpa: RpaConfig = RpaConfig()
 dmft: DmftConfig = DmftConfig()
 sys: SystemConfig = SystemConfig()
 output: OutputConfig = OutputConfig()

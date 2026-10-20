@@ -729,6 +729,19 @@ def test_matmul_in_place_refuses_a_product_of_another_shape(rng):
         two_fermion.matmul(deepcopy(two_fermion), copy=False)
 
 
+def test_repeat_over_vn_keeps_the_momentum_layout_and_holds_every_momentum(rng):
+    """A FourPoint repeated over a fermionic axis keeps its class, channel and compressed momentum axis."""
+    shape = (3, 2, 2, 2, 2, 4)
+    mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    fp = FourPoint(mat, SpinChannel.MAGN, (3, 1, 1), 1, 0, False, True, True)
+
+    out = fp.repeat_over_vn(5, 1)
+
+    assert isinstance(out, FourPoint) and out.channel == SpinChannel.MAGN
+    assert out.nq == (3, 1, 1) and out.has_compressed_q_dimension and out.current_shape == shape + (10,)
+    assert np.array_equal(out.mat, np.repeat(fp.mat[..., None], 10, axis=-1))
+
+
 def test_identity_shapes_and_like(rng):
     """identity and identity_like build a FourPoint matching the requested or target metadata."""
     n_bands = 2

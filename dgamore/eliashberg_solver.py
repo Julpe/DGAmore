@@ -245,6 +245,26 @@ def _build_ladder_vertex_chunk(
     return f_chunk.add((vrg_left_w @ u_r - vrg_left_w @ (u_r @ chi_phys_w @ u_r)) * vrg_right_w, copy=False)
 
 
+def _build_rpa_vertex_chunk(chi_q_r: FourPoint, u_r: Interaction, w_start: int, w_stop: int, niv: int) -> FourPoint:
+    r"""
+    Builds the full vertex of the RPA ladder, :math:`F^{\mathrm{q}}_{r;1234} = \mathcal{U}^{\mathbf{q}}_{r;1234} -
+    \sum_{abcd} \mathcal{U}^{\mathbf{q}}_{r;12ab}\,\chi^{\mathrm{q}}_{r;bacd}\,\mathcal{U}^{\mathbf{q}}_{r;dc34}`, for
+    the momenta of the inputs and the bosonic window ``[w_start, w_stop)``: the vertex of
+    :func:`_build_ladder_vertex_chunk` for :math:`\Gamma_{r} = U_{r}`, where the auxiliary susceptibility is the
+    bubble, the bubble term vanishes and both three-leg vertices are one. It does not depend on the fermionic
+    frequencies and is held constant on the box of ``niv`` positive frequencies.
+
+    :param chi_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` of the momenta.
+    :param u_r: The channel-projected total interaction :math:`\mathcal{U}^{\mathbf{q}}_{r}`.
+    :param w_start: First bosonic index of the window.
+    :param w_stop: One past the last bosonic index of the window.
+    :param niv: Number of positive fermionic frequencies of the box.
+    :return: The vertex over that window as a :class:`FourPoint` (half niw range, two fermionic dimensions).
+    """
+    chi_w = chi_q_r.take_wn_slice(w_start, w_stop)
+    return (u_r @ chi_w @ u_r).scale(-1.0).add(u_r, copy=False).repeat_over_vn(niv, 2)
+
+
 def _write_pp_band(out: np.ndarray, f_chunk: FourPoint, niv_pp: int, omega: np.ndarray, w_start: int) -> None:
     r"""
     Writes the :math:`\omega' = 0` pp band of one ladder-vertex window into the pp accumulator of its momenta.
@@ -284,51 +304,56 @@ def _write_pp_band(out: np.ndarray, f_chunk: FourPoint, niv_pp: int, omega: np.n
 def _build_pairing_vertex_pp(
     u_loc: LocalInteraction,
     v_nonloc: Interaction,
-    gamma_r: LocalFourPoint,
+    gamma_r: LocalFourPoint | None,
     niv_pp: int,
     mpi_dist_irrk: MpiDistributor,
     chunk_writer=None,
     chunk_bytes: int | None = None,
+    channel: SpinChannel | None = None,
 ) -> FourPoint:
     r"""
     Shared loop of the slice-direct pairing-vertex construction: walks the rank-local momenta and, per momentum, the
     bosonic axis in byte-bounded chunks, building each ladder-vertex chunk once and reading its :math:`\omega' = 0`
     pp band (see :func:`_pp_w0_band`). When ``chunk_writer`` is given, every ph-notation chunk is handed to it before
-    being released, so a caller can stream the full vertex to disk in the same pass.
+    being released, so a caller can stream the full vertex to disk in the same pass. Without a local vertex the
+    chunks are the RPA vertex of the saved physical susceptibility (see :func:`_build_rpa_vertex_chunk`), the only
+    intermediate read then.
 
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel, or ``None`` for the RPA vertex.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param chunk_writer: Optional callable ``(q_start, w_start, chunk_mat)`` receiving each ph-notation chunk (the
         momenta of the group as the leading axis).
     :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
+    :param channel: Spin channel of the RPA vertex, i.e. density or magnetic; only read when ``gamma_r`` is ``None``.
     :return: The pairing vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
     """
     logger = config.logger
-    channel = gamma_r.channel
+    channel = channel if gamma_r is None else gamma_r.channel
     path, rank = config.output.eliashberg_path, mpi_dist_irrk.my_rank
 
-    gchi0_q_inv = FourPoint.load(os.path.join(path, f"gchi0_q_inv_rank_{rank}.npy"), num_vn_dimensions=1)
-    vrg_q_r_left = FourPoint.load(
-        os.path.join(path, f"vrg_q_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=1
-    )
+    if gamma_r is not None:
+        gchi0_q_inv = FourPoint.load(os.path.join(path, f"gchi0_q_inv_rank_{rank}.npy"), num_vn_dimensions=1)
+        vrg_q_r_left = FourPoint.load(
+            os.path.join(path, f"vrg_q_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=1
+        )
     chi_phys_q_r = FourPoint.load(
         os.path.join(path, f"chi_phys_q_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=0
     )
     logger.info(f"Loaded the intermediates for the {channel.value} pairing vertex.")
 
     my_irr_q_list = config.lattice.k_grid.get_irrq_list()[mpi_dist_irrk.my_slice]
-    niw_stored = gchi0_q_inv.current_shape[-2] - 1
+    niw_stored = chi_phys_q_r.current_shape[-1] - 1
     _, omega = _pp_w0_band(niv_pp, niw_stored)
     # the pp band only reads |w| <= 2 niv_pp - 1, but a streamed full vertex must cover the whole stored box
     niw_build = niw_stored if chunk_writer is not None else int(np.max(omega))
 
     n_bands = config.sys.n_bands
     # orbital pairs without vertex are eliminated from every slice, as in the kernel step's auxiliary susceptibility
-    inactive = gamma_r.orbital_pairs_without_vertex(u_loc.as_channel(channel))
-    f_pp_mat = np.zeros((len(my_irr_q_list),) + (n_bands,) * 4 + (2 * niv_pp,) * 2, dtype=gamma_r.mat.dtype)
+    inactive = None if gamma_r is None else gamma_r.orbital_pairs_without_vertex(u_loc.as_channel(channel))
+    f_pp_mat = np.zeros((len(my_irr_q_list),) + (n_bands,) * 4 + (2 * niv_pp,) * 2, dtype=chi_phys_q_r.mat.dtype)
 
     # the budget bounds a chunk's two-fermion window on the box its chain runs on (pp box for the band, core box for a
     # streamed full vertex): as many whole momenta as fit, else one momentum's bosonic axis is chunked
@@ -341,36 +366,43 @@ def _build_pairing_vertex_pp(
     with deferred_collection():
         for q_start in range(0, len(my_irr_q_list), q_group):
             q_stop = min(q_start + q_group, len(my_irr_q_list))
-            gchi0_grp = gchi0_q_inv.take_q_index_slice(q_start, q_stop)
-            vrg_left_grp = vrg_q_r_left.take_q_index_slice(q_start, q_stop)
+            if gamma_r is not None:
+                gchi0_grp = gchi0_q_inv.take_q_index_slice(q_start, q_stop)
+                vrg_left_grp = vrg_q_r_left.take_q_index_slice(q_start, q_stop)
             chi_phys_grp = chi_phys_q_r.take_q_index_slice(q_start, q_stop)
             v_nonloc_grp = v_nonloc.take_q_index_slice(q_start, q_stop)
             u_r = u_loc.as_channel(channel) + v_nonloc_grp.as_channel(channel)
 
             for w_start in range(0, niw_build + 1, w_chunk):
-                f_chunk = _build_ladder_vertex_chunk(
-                    gamma_r,
-                    gchi0_grp,
-                    vrg_left_grp,
-                    chi_phys_grp,
-                    u_loc,
-                    u_r,
-                    w_start,
-                    min(w_start + w_chunk, niw_build + 1),
-                    None if chunk_writer is not None else niv_pp,
-                    inactive,
-                )
+                w_stop = min(w_start + w_chunk, niw_build + 1)
+                if gamma_r is None:
+                    f_chunk = _build_rpa_vertex_chunk(chi_phys_grp, u_r, w_start, w_stop, niv_window)
+                else:
+                    f_chunk = _build_ladder_vertex_chunk(
+                        gamma_r,
+                        gchi0_grp,
+                        vrg_left_grp,
+                        chi_phys_grp,
+                        u_loc,
+                        u_r,
+                        w_start,
+                        w_stop,
+                        None if chunk_writer is not None else niv_pp,
+                        inactive,
+                    )
                 if chunk_writer is not None:
                     chunk_writer(q_start, w_start, f_chunk.mat)
                 _write_pp_band(f_pp_mat[q_start:q_stop], f_chunk, niv_pp, omega, w_start)
                 f_chunk.free()
 
-            gchi0_grp.free()
-            vrg_left_grp.free()
+            if gamma_r is not None:
+                gchi0_grp.free()
+                vrg_left_grp.free()
             chi_phys_grp.free()
 
-    gchi0_q_inv.free()
-    vrg_q_r_left.free()
+    if gamma_r is not None:
+        gchi0_q_inv.free()
+        vrg_q_r_left.free()
     chi_phys_q_r.free()
 
     delete_files(
@@ -385,10 +417,11 @@ def _build_pairing_vertex_pp(
 def create_pairing_vertex_slice_q_r(
     u_loc: LocalInteraction,
     v_nonloc: Interaction,
-    gamma_r: LocalFourPoint,
+    gamma_r: LocalFourPoint | None,
     niv_pp: int,
     mpi_dist_irrk: MpiDistributor,
     chunk_bytes: int | None = None,
+    channel: SpinChannel | None = None,
 ) -> FourPoint:
     r"""
     Builds the pp pairing vertex at :math:`\omega' = 0` directly, without ever materializing the full
@@ -398,22 +431,26 @@ def create_pairing_vertex_slice_q_r(
 
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel, or ``None`` for the RPA vertex.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
+    :param channel: Spin channel of the RPA vertex, i.e. density or magnetic; only read when ``gamma_r`` is ``None``.
     :return: The pairing vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
     """
-    return _build_pairing_vertex_pp(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk, chunk_bytes=chunk_bytes)
+    return _build_pairing_vertex_pp(
+        u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk, chunk_bytes=chunk_bytes, channel=channel
+    )
 
 
 def create_pairing_vertex_streaming_fq(
     u_loc: LocalInteraction,
     v_nonloc: Interaction,
-    gamma_r: LocalFourPoint,
+    gamma_r: LocalFourPoint | None,
     niv_pp: int,
     mpi_dist_irrk: MpiDistributor,
     chunk_bytes: int | None = None,
+    channel: SpinChannel | None = None,
 ) -> FourPoint:
     r"""
     Builds the pp pairing vertex like :func:`create_pairing_vertex_slice_q_r` while streaming the full ladder vertex
@@ -423,13 +460,14 @@ def create_pairing_vertex_streaming_fq(
 
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel.
+    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel, or ``None`` for the RPA vertex.
     :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
+    :param channel: Spin channel of the RPA vertex, i.e. density or magnetic; only read when ``gamma_r`` is ``None``.
     :return: The pairing vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
     """
-    channel = gamma_r.channel
+    channel = channel if gamma_r is None else gamma_r.channel
     n_bands = config.sys.n_bands
     nk_irr = config.lattice.k_grid.nk_irr
     file_path = os.path.join(config.output.output_path, f"f_irrq_{channel.value}.npy")
@@ -449,7 +487,9 @@ def create_pairing_vertex_streaming_fq(
         w_stop = w_start + chunk_mat.shape[-3]
         file_mat[q_offset + q_start : q_offset + q_start + chunk_mat.shape[0], ..., w_start:w_stop, :, :] = chunk_mat
 
-    f_pp = _build_pairing_vertex_pp(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk, chunk_writer, chunk_bytes)
+    f_pp = _build_pairing_vertex_pp(
+        u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk, chunk_writer, chunk_bytes, channel=channel
+    )
     file_mat.flush()
     del file_mat
     mpi_dist_irrk.barrier()
@@ -2683,7 +2723,10 @@ def dispatch_full_vertex_calculation(
     :math:`\frac{1}{\beta^2}\sum_{\nu\nu'}\chi^{\mathrm{q}\nu\nu'}_{r}`, and the three-leg vertices carry the net
     normalization :math:`\gamma^{\mathrm{q}\nu}_{r} = (\chi^{\mathrm{q}\nu}_{0})^{-1}\sum_{\nu'}
     \chi^{*;\mathrm{q}\nu\nu'}_{r}` (the explicit :math:`\beta` in their construction cancels the :math:`1/\beta` of the
-    fused frequency sum), such that :math:`\gamma^{\mathrm{q}\nu}_{r} \to \mathbb{1}` for :math:`\nu \to \infty`.
+    fused frequency sum), such that :math:`\gamma^{\mathrm{q}\nu}_{r} \to \mathbb{1}` for :math:`\nu \to \infty`. With
+    ``config.rpa.use_rpa_susceptibility`` no local vertex is loaded and the vertex is the RPA one,
+    :math:`F^{\mathrm{q}}_{r} = \mathcal{U}^{\mathbf{q}}_{r} - \mathcal{U}^{\mathbf{q}}_{r}\chi^{\mathrm{q}}_{r}
+    \mathcal{U}^{\mathbf{q}}_{r}` (see :func:`_build_rpa_vertex_chunk`).
 
     :param channel: The spin channel (density or magnetic).
     :param u_loc: The bare local interaction :math:`U`.
@@ -2695,6 +2738,11 @@ def dispatch_full_vertex_calculation(
         node into an MPI shared-memory window instead of once per rank (the build only reads it).
     :return: The full ladder pp vertex :math:`F^{\mathrm{q}}_{r}` as a :class:`FourPoint`.
     """
+    if config.rpa.use_rpa_susceptibility:
+        build = create_pairing_vertex_streaming_fq if config.eliashberg.save_fq else create_pairing_vertex_slice_q_r
+        f_q_r = build(u_loc, v_nonloc, None, niv_pp, mpi_dist, chunk_bytes, channel=channel)
+        mpi_dist.barrier()
+        return f_q_r
     gamma_r, gamma_win = nonlocal_sde._load_node_shared_local_vertex(
         node_comm, os.path.join(config.output.output_path, f"gamma_{channel.value}_loc.npy"), channel
     )
@@ -2752,11 +2800,13 @@ def solve(
 ):
     r"""
     Drives the Eliashberg step: assembles the singlet and triplet pairing vertices from the saved
-    ladder-DGA full vertices (optionally adding the local reducible diagrams), then solves the linearized gap equation
-    for each channel and returns the leading eigenvalues and gap functions. A single rank solves in memory, sector
-    after sector; a multi-rank job solves in memory as concurrent (channel x parity) sector teams that share one
-    vertex window per channel and node when a node holds such a window (see :func:`plan_lanczos_teams`, decided
-    from the available node memory), and on the block-distributed solver grid otherwise.
+    ladder-DGA full vertices (optionally adding the local reducible diagrams; with
+    ``config.rpa.use_rpa_susceptibility`` from the RPA vertices, counting the bare up-down interaction once instead),
+    then solves the linearized gap equation for each channel and returns the leading eigenvalues and gap functions. A
+    single rank solves in memory, sector after sector; a multi-rank job solves in memory as concurrent (channel x
+    parity) sector teams that share one vertex window per channel and node when a node holds such a window (see
+    :func:`plan_lanczos_teams`, decided from the available node memory), and on the block-distributed solver grid
+    otherwise.
 
     :param giwk_dga: The converged momentum-dependent DGA :class:`GreensFunction` on rank 0 (the pp-bubble build
         there is its only reader); ``None`` on every other rank.
@@ -2871,31 +2921,40 @@ def solve(
     f_magn_pp.free()
     logger.info("Calculated full ladder-vertex (triplet) in pp notation.")
 
-    # the local diagrams are reduced from local vertices on the full asymptotic fermionic box; one rank per node
-    # reads and reduces them and broadcasts the pp-box-sized results, so that transient exists once per node
-    f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0 = _compute_once_per_node(
-        node_comm, lambda: create_local_ud_diagrams_pp_w0(g_dmft, niv_pp)
-    )
+    if config.rpa.use_rpa_susceptibility:
+        # Eqs. (4.49)-(4.52) with the bare up-down vertex U as the local full vertex and no pp-reducible diagrams:
+        # its minus in crossed-slot form, -(-U_{1432}), keeps one copy of U, which both RPA ladders start with
+        u_crossed = u_loc.permute_orbitals("abcd->adcb")
+        gamma_sing_pp.add(u_crossed, copy=False)
+        gamma_trip_pp.add(u_crossed, copy=False)
+    else:
+        # the local diagrams are reduced from local vertices on the full asymptotic fermionic box; one rank per node
+        # reads and reduces them and broadcasts the pp-box-sized results, so that transient exists once per node
+        f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0 = _compute_once_per_node(
+            node_comm, lambda: create_local_ud_diagrams_pp_w0(g_dmft, niv_pp)
+        )
 
-    if mpi_dist_irrk.my_rank == 0:
-        f_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="f_ud_loc_pp_w0")
-        phi_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="phi_ud_loc_pp_w0")
-        gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
-        logger.info("Saved local ud diagrams in pp notation to file.")
+        if mpi_dist_irrk.my_rank == 0:
+            f_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="f_ud_loc_pp_w0")
+            phi_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="phi_ud_loc_pp_w0")
+            gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
+            logger.info("Saved local ud diagrams in pp notation to file.")
 
-    del f_ud_loc_pp_w0, gamma_ud_loc_pp_w0
+        del f_ud_loc_pp_w0, gamma_ud_loc_pp_w0
 
-    # special treatment of local full vertex that is subtracted with a different frequency notation and is
-    # different from the regular pp
-    f_ud_loc_transf_w0 = _compute_once_per_node(node_comm, lambda: create_local_f_ud_transformed_w0(niv_pp))
+        # special treatment of local full vertex that is subtracted with a different frequency notation and is
+        # different from the regular pp
+        f_ud_loc_transf_w0 = _compute_once_per_node(node_comm, lambda: create_local_f_ud_transformed_w0(niv_pp))
 
-    # Eqs. (4.49)-(4.52): the assembled vertex holds the negative crossed slot, so the local full vertex enters with
-    # a relative minus and the pp-reducible diagrams phi with a plus, both in crossed-slot form ((v, -v'), 1432).
-    phi_ud_loc_pp_w0 = phi_ud_loc_pp_w0.flip_frequency_axis(-1, copy=False).permute_orbitals("abcd->adcb", copy=False)
-    delta_loc = phi_ud_loc_pp_w0.sub(f_ud_loc_transf_w0)
-    gamma_sing_pp.add(delta_loc, copy=False)
-    gamma_trip_pp.add(delta_loc, copy=False)
-    del phi_ud_loc_pp_w0, f_ud_loc_transf_w0, delta_loc
+        # Eqs. (4.49)-(4.52): the assembled vertex holds the negative crossed slot, so the local full vertex enters
+        # with a relative minus, the pp-reducible diagrams phi with a plus, both in crossed-slot form ((v, -v'), 1432).
+        phi_ud_loc_pp_w0 = phi_ud_loc_pp_w0.flip_frequency_axis(-1, copy=False).permute_orbitals(
+            "abcd->adcb", copy=False
+        )
+        delta_loc = phi_ud_loc_pp_w0.sub(f_ud_loc_transf_w0)
+        gamma_sing_pp.add(delta_loc, copy=False)
+        gamma_trip_pp.add(delta_loc, copy=False)
+        del phi_ud_loc_pp_w0, f_ud_loc_transf_w0, delta_loc
 
     if config.eliashberg.save_pairing_vertex:
         gamma_sing_pp.mat = mpi_dist_irrk.gather(gamma_sing_pp.mat)

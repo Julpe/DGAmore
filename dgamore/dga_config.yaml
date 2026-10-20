@@ -46,6 +46,11 @@ lambda_correction:
   # band count like stabilization.use_lambda_correction above, over which it takes precedence.
   type: "spch" # available types of the single-band scalar lambda correction: 'spch' (both density and magnetic channel) or 'sp' (magnetic channel only)
 
+rpa:
+  use_rpa_susceptibility: False # If True, the non-local step takes the bare interaction as the local irreducible vertex: no three-leg vertex is calculated, the
+  # self-energy kernel and the Eliashberg pairing vertex use the RPA susceptibility ((chi0)^-1 + U_r + V_r)^-1 of the frequency-summed bubble, and the
+  # double-counting kernel subtracts the bare vertex 1/2 (U_d + 3 U_m). Sigma_DMFT - Sigma_loc keeps the local self-energy of the DMFT vertex.
+
 dmft_input:
   type: "w2dyn" # Input format. Currently available is 'w2dyn'
   input_path: "./" # Folder containing the input files
