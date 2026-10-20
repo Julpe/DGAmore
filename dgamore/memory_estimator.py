@@ -856,6 +856,7 @@ def estimate_peaks(
     symmetrize_orbitals: bool = False,
     do_spectrum_dmft: bool = False,
     warm_start: bool = False,
+    previous_proposal: bool = False,
     with_jacobian_tracker: bool = False,
     with_exact_jacobian: bool = False,
     overhead: float = OVERHEAD_FACTOR,
@@ -946,6 +947,9 @@ def estimate_peaks(
     :param warm_start: Whether the loop may start from a previous run's iterate
         (``config.self_consistency.previous_sc_path`` is set), which rank 0 extends onto the DMFT box on the whole
         grid while every rank re-solves mu on its momenta.
+    :param previous_proposal: Whether the loop runs more than one iteration (``config.self_consistency.max_iter`` above
+        one), so rank 0 keeps the positive core window of the previous proposal for the convergence test; it joins
+        the single-rank slots of every branch that holds the mixing history.
     :param with_jacobian_tracker: Whether the tracker runs (``config.stabilization.use_jacobian_stabilization``): its
         residents (:func:`jacobian_tracker_bytes`) join the single-rank slots of the loop's branches (``chi0q``,
         ``chiq_aux``, ``sde``, ``sigma_loop``, ``mu_update``, ``energies``), of ``exact_jacobian`` (its in-loop check)
@@ -1003,6 +1007,9 @@ def estimate_peaks(
     sector_rows = nk_irr * nb**2 * vc
     history_entry = overhead * (DTYPE_BYTES // 2) * sector_rows if with_jacobian_tracker else scale * sigma_core
     mixing_history = 2 * mixing_pairs * history_entry + overhead * tracker_resident
+    if previous_proposal:
+        # the previous proposal's positive core window, which the convergence test compares the next proposal with
+        mixing_history += scale * sigma_core / 2
     # the reflected proposal and the raw residual the stabilized damped step and the guard of an accelerated step read
     tracker_step = scale * 2 * sigma_core if with_jacobian_tracker else 0.0
 

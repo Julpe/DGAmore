@@ -311,8 +311,7 @@ At the start of the cycle, the predecessor's result becomes the rung's starting 
   with ``use_jacobian_stabilization`` on, at the damping bound ``p_eff`` of the tracker, never above ``mixing``, which a
   carried spectrum can lower before the first step; only then do Pulay or Anderson take over. Secant pairs from the
   previous temperature are deliberately left behind. They describe a different map, and an accelerated scheme fed with
-  them explains the new residual through the old map and parks the iteration at the predecessor's solution while the
-  step residual reports convergence.
+  them explains the new residual through the old map and parks the iteration at the predecessor's solution.
 
 The re-gridding treats real and imaginary parts separately on the full signed frequency axis. The innermost
 frequencies, where the grid is sparsest, are interpolated linearly and everything above them with shape-preserving
@@ -356,8 +355,12 @@ nothing cross-validates them, so check the log of every rung.
 Reaching self-consistency
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-A rung counts as converged once the relative step residual of the mixed self-energy on the core box drops below
-``epsilon`` and the chemical potential has settled between two iterations. The cycle then reports
+A rung counts as converged once three residuals on the core box drop below ``epsilon`` and the chemical potential has
+settled between two iterations: the relative step residual of the mixed self-energy, the ``proposal step residual``
+between the proposals of two consecutive iterations, and the ``map residual``
+:math:`\lVert S(\Sigma) - \Sigma\rVert / \lVert\Sigma\rVert` of the proposal against the iterate it was computed from.
+Each residual is taken separately for the real and the imaginary part, each relative to its own norm, and the larger
+of the two is compared with ``epsilon``. The cycle then reports
 
 .. code-block:: text
 
@@ -366,20 +369,16 @@ A rung counts as converged once the relative step residual of the mixed self-ene
 and stops. Otherwise it runs until ``max_iter`` is used up, the last iteration reads ``Self-consistency not reached.``,
 and the returned self-energy is simply the last iterate. Such a rung is *not* converged. It should neither serve as the
 predecessor of the next rung nor be fed to the Eliashberg step, whose eigenvalues on an unconverged iterate mean
-nothing. The step measures how far the mixing moved, not how far the map is from its fixed point: every iteration's
-convergence line also carries the ``map residual`` :math:`\lVert S(\Sigma) - \Sigma\rVert / \lVert\Sigma\rVert`, which
-keeps falling with the step on a healthy rung and ends at a multiple of ``epsilon`` set by the damping. An accelerated
-mixing can stagnate instead, typically next to a direction the map has turned unstable: its steps shrink while the map
-residual stays put or grows, the step test fires, and the cycle warns ``Converged on the step residual ..., but the map
-residual ... is still ... and no lower than in the previous iteration: the steps have stalled`` when the map residual
-lies above ten times ``epsilon`` and has not fallen since the previous iteration. Such a rung has not reached a fixed
-point either. A flip of the unstable direction (see :ref:`cooldown-jacobian`) lets the mixing converge there properly.
-With ``use_jacobian_stabilization`` the damped steps run at the tracker's damping bound ``p_eff`` instead of
-``mixing`` and are shorter by that ratio, so the step residual of a damped step is read at the configured mixing,
-multiplied by ``mixing / p_eff`` before it is compared with ``epsilon``, and the verdict means the same distance from
-the fixed point with and without the flag; the convergence line then adds ``, <x> at the configured mixing``. An
-accelerated step is compared as it is. The tracker can also hold the verdict back for a minimum number of iterations
-(see :ref:`cooldown-jacobian`). A few practices keep a ladder trustworthy.
+nothing. The step measures how far the mixing moved, the map residual how far the map is from its fixed point; on a
+healthy rung both fall together. An accelerated mixing can stagnate instead, typically next to a direction the map has
+turned unstable: its steps shrink while the map residual stays put or grows, so the rung does not converge however small
+its steps get. A flip of the unstable direction (see :ref:`cooldown-jacobian`) lets the mixing converge there properly.
+With ``use_jacobian_stabilization`` the damped steps run at the tracker's damping bound ``p_eff`` instead of ``mixing``
+and are shorter by that ratio, so the step residual of a damped step is read at the configured mixing, multiplied by
+``mixing / p_eff`` before it is compared with ``epsilon``, and the verdict means the same distance from the fixed point
+with and without the flag; the convergence line then adds ``, <x> at the configured mixing``. An accelerated step is
+compared as it is, and so are the proposal step and the map residual. The tracker can also hold the verdict back for a
+minimum number of iterations (see :ref:`cooldown-jacobian`). A few practices keep a ladder trustworthy.
 
 * **Start warm, and chain only from converged rungs.** Begin at a temperature where the cycle still converges cold
   from DMFT, converge that rung fully, and let every further rung inherit a converged predecessor. Nothing helps a
@@ -404,11 +403,11 @@ accelerated step is compared as it is. The tracker can also hold the verdict bac
   rungs, where experiments are cheap. Whether a rung struggles with an overshooting mode, which a smaller
   ``mixing`` cures, or with an expanding one, which it cannot, is what the Jacobian tracking described below reads
   off the cycle's own iterates.
-* **Choose the threshold for the observable.** The step residual says something about the returned iterate, not
-  about the fixed-point equation. A direction along which the map contracts very slowly contributes almost nothing
-  to the step, yet it can still separate states with different low-frequency self-energies, chemical potentials and
-  pairing eigenvalues. Quantities that depend on the lowest Matsubara frequencies, above all the Eliashberg
-  eigenvalues near a transition, need a tighter ``epsilon`` than the self-energy itself.
+* **Choose the threshold for the observable.** A direction along which the map contracts very slowly contributes almost
+  nothing to the step, the proposal step or the map residual, yet it can still separate states with different
+  low-frequency self-energies, chemical potentials and pairing eigenvalues. Quantities that depend on the lowest
+  Matsubara frequencies, above all the Eliashberg eigenvalues near a transition, need a tighter ``epsilon`` than the
+  self-energy itself.
 * **Verify, do not trust the flag.** Three checks certify a converged rung. First, the
   ``Lowest eigenvalue of the static susceptibility`` reported for both channels on the final iteration is non-negative
   up to a small offset from the shell truncation, unless the material genuinely orders in that channel (the charge

@@ -132,13 +132,17 @@ This section controls the self-consistency cycle.
 
 The ``max_iter`` field puts an upper limit on the number of iterations; if the self-energy has not converged by
 then, the loop stops and the program exits. The non-local self-energy is written to the output folder for every
-iteration. Convergence itself is judged by ``epsilon`` through the relative *step* residual of the Schwinger-Dyson
-iteration - the norm of the change of the mixed self-energy between consecutive iterations, divided by the norm of
-the previous one - taken over the full momentum grid, all orbital combinations and the positive fermionic
-frequencies of the core box (reported in the log every iteration). The chemical potential must also settle,
-changing by less than a small temperature-dependent threshold between iterations. With ``use_jacobian_stabilization``
-on, the step residual of a damped step is rescaled to the configured ``mixing`` and the tracker can ask for a minimum
-number of iterations before the verdict (see the :ref:`stabilization section <stabilization>`).
+iteration. Convergence itself is judged by ``epsilon`` through three relative residuals of the Schwinger-Dyson
+iteration, each taken over the full momentum grid, all orbital combinations and the positive fermionic frequencies of
+the core box (reported in the log every iteration): the *step* residual (the norm of the change of the mixed
+self-energy between consecutive iterations, divided by the norm of the previous one), the *proposal step* residual
+(the same between the un-mixed proposals of consecutive iterations) and the *map* residual (the distance of the
+proposal from the iterate it was computed from). The real and the imaginary part are measured separately, each
+against its own norm, and the larger of the two is the residual. All three must fall below ``epsilon``, and the
+chemical potential must also settle, changing by less than a small temperature-dependent threshold between
+iterations. With ``use_jacobian_stabilization`` on, the step residual of a damped step is rescaled to the configured
+``mixing`` and the tracker can ask for a minimum number of iterations before the verdict (see the
+:ref:`stabilization section <stabilization>`).
 
 The ``mixing`` parameter is a floating-point number between zero and one that sets the weight of the new self-energy
 in the update. With ``use_jacobian_stabilization`` on (see the :ref:`stabilization section <stabilization>`) it
