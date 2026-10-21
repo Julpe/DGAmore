@@ -219,6 +219,28 @@ def test_rpa_mode_is_the_ladder_with_the_bare_interaction_as_local_vertex(setup,
     assert np.allclose(rpa, ladder, atol=1e-4 * np.abs(ladder).max())
 
 
+def test_rpa_mode_adds_no_noise_removal_term(setup):
+    """RPA mode is the self-energy of the RPA kernels alone: a shifted local self-energy leaves the result unchanged."""
+    folder, comm_mock = setup
+    config.box.niw_core, config.box.niv_core, config.box.niv_shell = 6, 6, 4
+    config.dmft.symmetrize_orbitals = []
+    _, s_dmft, _, _ = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
+    config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
+    config.output.output_path = folder
+    config.rpa.use_rpa_susceptibility = True
+    u_loc = config.lattice.hamiltonian.get_local_u()
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
+    shifted = s_dmft.copy()
+    shifted.mat = shifted.mat + 0.3j
+    sys_state = deepcopy(config.sys)
+
+    reference = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), s_dmft.copy())
+    config.sys = sys_state
+    out = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), shifted)
+
+    assert np.allclose(out.mat, reference.mat, atol=1e-6 * np.abs(reference.mat).max())
+
+
 def test_rpa_mode_is_the_bare_vertex_ladder_for_kanamori_orbitals(setup_srvo3_cubic, monkeypatch, tmp_path):
     """Three Kanamori orbitals (U = 5, U' = 3.5, J = 0.75), whose inter-orbital terms the two-band fixture lacks: RPA
     mode is still the ladder of Gamma_r = U_r and the dc vertex U - 2 U_{1432}."""

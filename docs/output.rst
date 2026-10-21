@@ -269,7 +269,7 @@ a single momentum point and keep three leading axes of length one.
      - Local DMFT self-energy
      - ``[1, 1, 1, no, no, 2 niv_dmft]``
    * - ``siw_dga_local.npy``
-     - Local self-energy of the local DΓA step
+     - Local self-energy of the local DΓA step (a diagnostic only with ``rpa.use_rpa_susceptibility``)
      - ``[1, 1, 1, no, no, 2 niv_core]``
 
 Momentum-dependent quantities

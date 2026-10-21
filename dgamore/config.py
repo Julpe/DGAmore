@@ -245,9 +245,9 @@ class RpaConfig:
     as the bare interaction, :math:`\Gamma_{r} = U_{r}`: no auxiliary susceptibility or three-leg vertex is calculated
     (the three-leg vertex is one), the physical susceptibility is the RPA susceptibility
     :math:`((\chi^{\mathrm{q}}_{0})^{-1} + U_{r} + V^{\mathbf{q}}_{r})^{-1}` of the frequency-summed bubble, and the
-    double-counting kernel takes the bare vertex :math:`\tfrac12(U_{\mathrm{d}} + 3U_{\mathrm{m}})`. The local
-    self-energy of the DMFT vertex still enters the noise-removal term :math:`\Sigma_{\mathrm{DMFT}} -
-    \Sigma_{\mathrm{loc}}`. The Eliashberg pairing vertex is built from the same susceptibility, with the bare up-down
+    double-counting kernel takes the bare vertex :math:`\tfrac12(U_{\mathrm{d}} + 3U_{\mathrm{m}})`. No noise-removal
+    term :math:`\Sigma_{\mathrm{DMFT}} - \Sigma_{\mathrm{loc}}` is added, so the self-energy is the particle-hole FLEX
+    one of these kernels. The Eliashberg pairing vertex is built from the same susceptibility, with the bare up-down
     interaction counted once in place of the local diagrams.
 
     :ivar bool use_rpa_susceptibility: Whether the Schwinger-Dyson and the Eliashberg equation use the RPA
