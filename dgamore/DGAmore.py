@@ -123,7 +123,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
             config.stabilization,
             config.eliashberg,
             config.lambda_correction,
-            config.rpa,
+            config.misc,
             config.self_energy_interpolation,
             config.ana_cont,
         )
@@ -140,7 +140,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
                 config.stabilization,
                 config.eliashberg,
                 config.lambda_correction,
-                config.rpa,
+                config.misc,
                 config.self_energy_interpolation,
                 config.ana_cont,
             ) = pickle.loads(blob)
@@ -155,12 +155,8 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         )
         return 1
 
+    setup_misc_settings()
     setup_lambda_correction_settings()
-    if config.rpa.use_rpa_susceptibility:
-        logger.info(
-            "RPA mode: the non-local step and the Eliashberg vertex use the RPA susceptibility; no three-leg vertex is "
-            "calculated."
-        )
 
     config_parser.save_config_file(path=config.output.output_path, name="dga_config.yaml")
 
@@ -556,7 +552,22 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         logger.info("Starting with Eliashberg equation.")
         # sigma_dga is already saved to disk and never consumed by the Eliashberg step - drop rank 0's copy before
         # the memory-heavy vertex construction
-        if comm.rank == 0:
+        if comm.rank == 0 and config.misc.do_rpa and config.self_consistency.max_iter == 1:
+            # one-shot RPA pairs on the non-interacting lattice: its self-energy stays out of the pp bubble
+            giwk_dga.free()
+            zero = SelfEnergy(
+                np.zeros_like(sigma_dga.mat),
+                sigma_dga.nq,
+                sigma_dga.full_niv_range,
+                sigma_dga.has_compressed_q_dimension,
+                beta=config.sys.beta,
+            )
+            sigma_dga.free()
+            giwk_dga = GreensFunction.get_g_full(
+                zero, config.sys.mu_non_interacting, ek, config.sys.beta, config.sys.correlated_orbitals
+            )
+            zero.free()
+        elif comm.rank == 0:
             sigma_dga.free()
         results = eliashberg_solver.solve(giwk_dga, g_dmft_full, u_loc, v_nonloc, comm, chunk_budgets)
 
@@ -881,8 +892,8 @@ def _resolve_option_exclusivity() -> None:
     with a warning. Separately, ``use_jacobian_stabilization`` cannot run in a one-shot run, i.e. with the one-shot
     ``perform_lambda_correction`` or with ``max_iter`` 1 (a single iteration has no history), and is disabled with a
     warning there, and ``use_exact_jacobian`` needs ``use_jacobian_stabilization`` (the exact spectrum is written
-    through the tracker) and is disabled with a warning without it, as well as with ``rpa.use_rpa_susceptibility``,
-    whose map it does not linearize.
+    through the tracker) and is disabled with a warning without it, as well as in the bare-vertex modes of
+    ``config.misc``, whose map it does not linearize.
 
     :return: None.
     """
@@ -908,11 +919,11 @@ def _resolve_option_exclusivity() -> None:
     if config.self_consistency.max_iter == 1:
         disable_option("use_jacobian_stabilization", "a one-shot run (max_iter 1)")
 
-    if config.rpa.use_rpa_susceptibility and config.stabilization.use_exact_jacobian:
+    if config.misc.bare_vertex and config.stabilization.use_exact_jacobian:
         config.stabilization.use_exact_jacobian = False
         config.logger.warning(
-            "'use_exact_jacobian' linearizes the ladder map, which RPA mode does not run; the exact Jacobian is "
-            "disabled."
+            "'use_exact_jacobian' linearizes the ladder map, which the bare-vertex modes of 'misc' do not run; the "
+            "exact Jacobian is disabled."
         )
 
     if config.stabilization.use_exact_jacobian and not config.stabilization.use_jacobian_stabilization:
@@ -928,6 +939,48 @@ def _resolve_option_exclusivity() -> None:
 
     if config.stabilization.use_chi_phys_restriction and config.stabilization.use_lambda_annealing:
         disable_option("use_lambda_annealing", "use_chi_phys_restriction")
+
+
+def setup_misc_settings() -> None:
+    """
+    Validates and logs the bare-vertex mode of ``config.misc``; ``do_rpa`` and ``do_flex`` exclude each other.
+    RPA mode (``do_rpa``) starts from the non-interacting lattice, one shot with ``max_iter`` 1 and self-consistent
+    RPA otherwise: it takes no lambda correction, susceptibility restriction or lambda annealing (each reshapes the
+    RPA susceptibility, the lambda corrections with the local DMFT susceptibility) and ignores ``previous_sc_path``.
+
+    :return: None.
+    :raises ValueError: If both modes are set, or ``do_rpa`` is set together with a susceptibility scaffold.
+    """
+    misc, logger = config.misc, config.logger
+    if misc.do_rpa and misc.do_flex:
+        raise ValueError("'misc.do_rpa' and 'misc.do_flex' exclude each other; set at most one of them.")
+    if misc.do_flex:
+        logger.info(
+            "FLEX mode: particle-hole FLEX of the RPA susceptibilities, started from DMFT; no three-leg vertex is "
+            "calculated."
+        )
+    if not misc.do_rpa:
+        return
+
+    scaffolds = {
+        "lambda_correction.perform_lambda_correction": config.lambda_correction.perform_lambda_correction,
+        "stabilization.use_lambda_correction": config.stabilization.use_lambda_correction,
+        "stabilization.use_chi_phys_restriction": config.stabilization.use_chi_phys_restriction,
+        "stabilization.use_lambda_annealing": config.stabilization.use_lambda_annealing,
+    }
+    enabled = [name for name, on in scaffolds.items() if on]
+    if enabled:
+        raise ValueError(
+            f"'misc.do_rpa' is RPA of the non-interacting Green's function and takes no {', '.join(enabled)}."
+        )
+    if config.self_consistency.previous_sc_path:
+        logger.warning("'misc.do_rpa' starts from the non-interacting lattice; 'previous_sc_path' is ignored.")
+        config.self_consistency.previous_sc_path = ""
+    run = "once" if config.self_consistency.max_iter == 1 else "self-consistently from there"
+    logger.info(
+        f"RPA mode: the FLEX kernels and pairing vertex on the non-interacting lattice, evaluated {run}; the "
+        "self-energy carries no DMFT part."
+    )
 
 
 def setup_lambda_correction_settings() -> None:

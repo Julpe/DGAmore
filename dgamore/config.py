@@ -239,23 +239,40 @@ class LambdaCorrectionConfig:
         self.type: str = "spch"
 
 
-class RpaConfig:
+class MiscConfig:
     r"""
-    Stores the RPA configuration. With ``use_rpa_susceptibility`` the non-local step takes the local irreducible vertex
-    as the bare interaction, :math:`\Gamma_{r} = U_{r}`: no auxiliary susceptibility or three-leg vertex is calculated
-    (the three-leg vertex is one), the physical susceptibility is the RPA susceptibility
-    :math:`((\chi^{\mathrm{q}}_{0})^{-1} + U_{r} + V^{\mathbf{q}}_{r})^{-1}` of the frequency-summed bubble, and the
-    double-counting kernel takes the bare vertex :math:`\tfrac12(U_{\mathrm{d}} + 3U_{\mathrm{m}})`. No noise-removal
-    term :math:`\Sigma_{\mathrm{DMFT}} - \Sigma_{\mathrm{loc}}` is added, so the self-energy is the particle-hole FLEX
-    one of these kernels. The Eliashberg pairing vertex is built from the same susceptibility, with the bare up-down
-    interaction counted once in place of the local diagrams.
+    Stores the switches of the two bare-vertex modes. In both the non-local step takes the local irreducible vertex as
+    the bare interaction, :math:`\Gamma_{r} = U_{r}`: no auxiliary susceptibility or three-leg vertex is calculated (the
+    three-leg vertex is one), the physical susceptibility is the RPA susceptibility
+    :math:`((\chi^{\mathrm{q}}_{0})^{-1} + U_{r} + V^{\mathbf{q}}_{r})^{-1}` of the frequency-summed bubble, no
+    noise-removal term :math:`\Sigma_{\mathrm{DMFT}} - \Sigma_{\mathrm{loc}}` is added, and the Eliashberg pairing
+    vertex is built from the same susceptibilities without local diagrams.
 
-    :ivar bool use_rpa_susceptibility: Whether the Schwinger-Dyson and the Eliashberg equation use the RPA
-        susceptibility.
+    ``do_flex`` is particle-hole FLEX: the full channel interactions, the magnetic kernel three times (its longitudinal
+    and both transverse components) next to the double-counting kernel of the bare vertex
+    :math:`\tfrac12(U_{\mathrm{d}} + 3U_{\mathrm{m}})`, the bare up-down interaction counted once in the pairing vertex,
+    and a self-consistent run starts from the DMFT self-energy.
+
+    ``do_rpa`` is the multi-orbital random phase approximation: the channel interactions, kernels and pairing vertex of
+    ``do_flex`` evaluated on the non-interacting lattice (zero self-energy, at the chemical potential at which it holds
+    the DMFT filling), once with ``max_iter`` 1, where the Eliashberg equation reads the non-interacting Green's
+    function, and otherwise iterated from there (self-consistent RPA, the Eliashberg equation reading the converged
+    Green's function). Its self-energy carries no DMFT part: beyond the core box it is the Hartree-Fock term and the
+    :math:`1/\imath\nu` tail of the kernels.
+
+    :ivar bool do_rpa: Whether to run the multi-orbital RPA from the non-interacting (DFT) Green's function (one shot,
+        or self-consistent with ``max_iter`` above 1).
+    :ivar bool do_flex: Whether to run particle-hole FLEX started from DMFT.
     """
 
     def __init__(self):
-        self.use_rpa_susceptibility: bool = False
+        self.do_rpa: bool = False
+        self.do_flex: bool = False
+
+    @property
+    def bare_vertex(self) -> bool:
+        """Whether the non-local step takes the bare interaction as the local irreducible vertex (either mode)."""
+        return self.do_rpa or self.do_flex
 
 
 class DmftConfig:
@@ -293,6 +310,8 @@ class SystemConfig:
     :ivar float beta: Inverse temperature :math:`\beta`.
     :ivar float mu: Chemical potential :math:`\mu` (updated during self-consistency).
     :ivar float mu_dmft: Chemical potential of the DMFT input.
+    :ivar float mu_non_interacting: Chemical potential at which the non-interacting lattice holds the filling :math:`n`
+        (set with ``misc.do_rpa``).
     :ivar float n: Total filling :math:`n`, over every orbital of H(k).
     :ivar int n_bands: Number of correlated bands (the orbitals the self-energy and the vertices act on).
     :ivar numpy.ndarray correlated_orbitals: Indices of the correlated orbitals among the orbitals of H(k); None when
@@ -307,6 +326,7 @@ class SystemConfig:
         self.beta: float = 0.0
         self.mu: float = 0.0
         self.mu_dmft: float = 0.0
+        self.mu_non_interacting: float = 0.0
         self.n: float = 0.0
         self.n_bands: int = 0
         self.correlated_orbitals: np.ndarray | None = None
@@ -383,7 +403,7 @@ logger: DgaLogger
 box: BoxConfig = BoxConfig()
 lattice: LatticeConfig = LatticeConfig()
 lambda_correction: LambdaCorrectionConfig = LambdaCorrectionConfig()
-rpa: RpaConfig = RpaConfig()
+misc: MiscConfig = MiscConfig()
 dmft: DmftConfig = DmftConfig()
 sys: SystemConfig = SystemConfig()
 output: OutputConfig = OutputConfig()

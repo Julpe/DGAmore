@@ -10,6 +10,7 @@ import gc
 import os
 import threading
 import tracemalloc
+import warnings
 from types import SimpleNamespace
 from unittest.mock import MagicMock, create_autospec
 
@@ -911,6 +912,16 @@ def test_relative_sigma_residual_measures_each_part_against_its_own_norm():
     assert np.linalg.norm(new - old) / np.linalg.norm(old) < 0.02 * out
 
 
+def test_relative_sigma_residual_against_a_zero_iterate_is_infinite_without_a_warning():
+    """A zero previous iterate (the start of RPA mode) has no relative residual: inf, and no division warning."""
+    config.box.niv_core = 3
+    new = np.full((4, 1, 1, 10), 0.3 - 0.2j, dtype=np.complex128)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = nonlocal_sde._relative_sigma_residual(_make_resid_sigma(new), _make_resid_sigma(np.zeros_like(new)))
+    assert out == np.inf
+
+
 def test_relative_sigma_residual_broadcasts_local_old_against_full_bz():
     """A local (nq=1) previous iterate is broadcast against a full-BZ proposal without shape errors."""
     config.box.niv_core = 3
@@ -1202,10 +1213,11 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
     assert bubble.cut_niv.return_value.invert.return_value.save.call_args.kwargs["name"] == "gchi0_q_inv_rank_0"
 
 
-def test_rpa_eliashberg_only_proposal_dumps_both_channels_without_a_local_vertex(monkeypatch, tmp_path):
-    """The RPA post-loop pass loads no local vertex, writes no inverse bubble, dumps both channels, returns None."""
+@pytest.mark.parametrize("mode", ["do_flex", "do_rpa"])
+def test_bare_vertex_eliashberg_only_proposal_dumps_both_channels_without_a_local_vertex(monkeypatch, tmp_path, mode):
+    """The bare-vertex post-loop pass loads no local vertex, writes no inverse bubble, dumps both channels."""
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
-    config.rpa.use_rpa_susceptibility = True
+    setattr(config.misc, mode, True)
     config.output.output_path = str(tmp_path)
     config.sys.beta = 10.0
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
@@ -1217,7 +1229,7 @@ def test_rpa_eliashberg_only_proposal_dumps_both_channels_without_a_local_vertex
     steps = []
 
     def forbidden(*a, **k):
-        raise AssertionError("the RPA Eliashberg-only pass must not load a local vertex or reach a kernel or the SDE")
+        raise AssertionError("the Eliashberg-only pass must not load a local vertex or reach a kernel or the SDE")
 
     for name in (
         "_load_node_shared_local_vertex",
@@ -1308,17 +1320,18 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     return run, calls, logger
 
 
-@pytest.mark.parametrize("rpa", [False, True])
-def test_loop_reads_the_first_frequency_local_vertex_only_for_the_ladder(monkeypatch, tmp_path, rpa):
-    """The first-frequency pole monitor of the density ladder reads the local vertex, RPA mode never does."""
+@pytest.mark.parametrize("mode", [None, "do_flex", "do_rpa"])
+def test_loop_reads_the_first_frequency_local_vertex_only_for_the_ladder(monkeypatch, tmp_path, mode):
+    """The first-frequency pole monitor of the density ladder reads the local vertex, the bare-vertex modes never do."""
     run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1)
-    config.rpa.use_rpa_susceptibility = rpa
+    if mode is not None:
+        setattr(config.misc, mode, True)
     reads = []
     monkeypatch.setattr(nonlocal_sde, "first_frequency_local_vertex", lambda: reads.append(1))
 
     run()
 
-    assert len(reads) == (0 if rpa else 1)
+    assert len(reads) == (1 if mode is None else 0)
 
 
 def _run_loop_on_two_node_ranks(monkeypatch, tmp_path, spied_name, spied_owner):
@@ -2267,8 +2280,8 @@ def _summed_bubble(mat: np.ndarray, channel: SpinChannel = SpinChannel.NONE) -> 
 
 
 def _rpa_sde_kernel(chi0_sum: np.ndarray, u_loc: LocalInteraction, chi_r: dict) -> np.ndarray:
-    """The SDE kernel of RPA mode as calculate_sigma_proposal sums it at V = 0: the bare dc kernel of the bubble plus
-    1x the density and 3x the magnetic RPA kernel of the susceptibilities chi_r."""
+    """The SDE kernel of the bare-vertex modes as calculate_sigma_proposal sums it at V = 0: the bare dc kernel of the
+    bubble plus 1x the density and 3x the magnetic RPA kernel of the susceptibilities chi_r."""
     nq = chi0_sum.shape[0]
     v_nonloc = Interaction(np.zeros((nq,) + u_loc.mat.shape), SpinChannel.NONE, (nq, 1, 1), True)
     kernel = nonlocal_sde.calculate_bare_dc_kernel(_summed_bubble(chi0_sum), u_loc)
@@ -2960,6 +2973,29 @@ def test_column_sde_matches_the_qloop_reference(auto, size, monkeypatch):
     mat = _run_column_sde_parallel(size, kernel, giwk, hostnames=["n0"] * size)
     sigma = SelfEnergy(mat, config.lattice.nk, False, True, calc_smom=False, beta=config.sys.beta)
     assert np.allclose(sigma.ifft().to_full_niv_range().mat, ref.mat, atol=1e-5)
+
+
+@pytest.mark.parametrize("auto", [False, True])
+@pytest.mark.parametrize("size", [1, 3])
+def test_sde_tail_moment_is_the_large_frequency_coefficient_of_the_column_contraction(auto, size, monkeypatch):
+    """A kernel without fermionic frequency contracted with G = delta_ab at every k and v gives Sigma = -Sigma_1, the
+    coefficient of -1/iv that the contraction approaches where G falls off as delta_ab / iv."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _column_sde_setup(auto)
+    kernel_w = kernel[..., 0]
+    identity = np.broadcast_to(np.eye(config.sys.n_bands)[..., None], giwk.mat.shape).astype(np.complex64)
+    delta = GreensFunction(identity.copy(), calc_filling=False, nk=config.lattice.nk, beta=config.sys.beta)
+    mat = _run_column_sde_parallel(size, np.repeat(kernel_w[..., None], 2 * config.box.niv_core, axis=-1), delta)
+    sigma = SelfEnergy(mat, config.lattice.nk, False, True, calc_smom=False, beta=config.sys.beta).ifft()
+
+    def fn(comm, rank):
+        d_irr = mpi_utils.MpiDistributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
+        kern = FourPoint(kernel_w[d_irr.my_slice].copy(), SpinChannel.NONE, config.lattice.nk, 1, 0, False, True, True)
+        return nonlocal_sde._sde_tail_moment(kern, d_irr)
+
+    _, moments = run_parallel(size, fn)
+    assert all(m is None for m in moments[1:])
+    assert np.allclose(sigma.mat, -moments[0][None, ..., None], atol=1e-5)
 
 
 @pytest.mark.parametrize("auto", [False, True])
