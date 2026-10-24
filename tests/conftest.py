@@ -96,7 +96,7 @@ def reset_config():
     config.box = config.BoxConfig()
     config.lattice = config.LatticeConfig()
     config.lambda_correction = config.LambdaCorrectionConfig()
-    config.rpa = config.RpaConfig()
+    config.misc = config.MiscConfig()
     config.dmft = config.DmftConfig()
     config.sys = config.SystemConfig()
     config.output = config.OutputConfig()

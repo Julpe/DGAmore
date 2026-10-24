@@ -385,46 +385,63 @@ For single-band data the ``type`` field selects the correction scheme: ``spch`` 
 magnetic susceptibility, whereas ``sp`` corrects only the magnetic one; the multi-band scheme always
 corrects both channels.
 
-.. _rpa:
+.. _misc:
 
-RPA susceptibility
-------------------
+FLEX and RPA
+------------
 
-This section replaces the ladder susceptibility of the non-local step by the random phase approximation (RPA).
+This section replaces the ladder of the non-local step by one of two bare-vertex modes, particle-hole FLEX or the
+multi-orbital random phase approximation (RPA). The two exclude each other.
 
 .. code-block:: yaml
 
-   rpa:
-     use_rpa_susceptibility: False # bool
+   misc:
+     do_flex: False # bool
+     do_rpa: False # bool
 
-With ``use_rpa_susceptibility`` set to ``True`` the non-local step takes the local irreducible vertex as the bare
-interaction, :math:`\Gamma_{r} = U_{r}`. No auxiliary susceptibility and no three-leg vertex are calculated: the
-three-leg vertex is one, and the physical susceptibility is the RPA susceptibility of each iteration's bubble,
+Both take the local irreducible vertex as the bare interaction, :math:`\Gamma_{r} = U_{r}`. No auxiliary
+susceptibility and no three-leg vertex are calculated: the three-leg vertex is one, and the physical susceptibility is
+the RPA susceptibility of the bubble,
 
 .. math:: \chi^{\mathrm{q}}_{r} = \big((\chi^{\mathrm{q}}_{0})^{-1} + U_{r} + V^{\mathbf{q}}_{r}\big)^{-1}, \qquad
    \chi^{\mathrm{q}}_{0} = \frac{1}{\beta^2} \sum_{\nu} \chi^{\mathrm{q}\nu}_{0}.
 
 The kernel of each channel reduces to :math:`-\mathcal{U}^{\mathbf{q}}_{r} \chi^{\mathrm{q}}_{r}
-\mathcal{U}^{\mathbf{q}}_{r}`, and the double-counting kernel of the Schwinger-Dyson equation subtracts the bare
-vertex :math:`\tfrac12(U_{\mathrm{d}} + 3U_{\mathrm{m}})` instead of the local one, so the second-order diagram is
-counted once. With it, the density and magnetic kernels form the particle-hole fluctuation-exchange (FLEX)
-self-energy, without the particle-particle T-matrix, and no noise-removal term
-:math:`\Sigma_{\mathrm{DMFT}} - \Sigma_{\mathrm{loc}}` is added; since the self-consistent loop rebuilds the bubble from
-the dressed Green's function, a self-consistent run is particle-hole FLEX started from DMFT.
-The local Schwinger-Dyson step still runs: the lambda correction reads its local susceptibilities, and its local
-self-energy is written as a diagnostic.
+\mathcal{U}^{\mathbf{q}}_{r}`, no noise-removal term :math:`\Sigma_{\mathrm{DMFT}} - \Sigma_{\mathrm{loc}}` is added,
+and the pairing vertex of each channel is :math:`F^{\mathrm{q}}_{r} = \mathcal{U}^{\mathbf{q}}_{r} -
+\mathcal{U}^{\mathbf{q}}_{r} \chi^{\mathrm{q}}_{r} \mathcal{U}^{\mathbf{q}}_{r}`. The local Schwinger-Dyson step still
+runs and writes its local self-energy as a diagnostic. ``use_exact_jacobian`` linearizes the ladder map and is
+disabled with a warning.
 
-The lambda correction, the restriction and the annealing of the :ref:`stabilization section <stabilization>` act on
-the RPA susceptibility as on the ladder one. At couplings typical of DΓA the magnetic RPA susceptibility can lie
-beyond its Stoner pole, where only a lambda correction makes it physical. ``use_exact_jacobian`` linearizes the
-ladder map and is disabled with a warning.
-
-The Eliashberg equation takes its pairing vertex from the same susceptibility: per channel the vertex is
-:math:`F^{\mathrm{q}}_{r} = \mathcal{U}^{\mathbf{q}}_{r} - \mathcal{U}^{\mathbf{q}}_{r} \chi^{\mathrm{q}}_{r}
-\mathcal{U}^{\mathbf{q}}_{r}`, combined into the singlet and triplet vertex like the ladder vertex, with the bare
-up-down interaction counted once in place of the local diagrams. For one band these are the spin-fluctuation
-interactions :math:`U + \tfrac32 U^2 \chi_{\mathrm{m}} - \tfrac12 U^2 \chi_{\mathrm{d}}` (singlet) and
+**FLEX** (``do_flex``). The magnetic kernel enters three times, its longitudinal and both transverse spin components,
+and the double-counting kernel of the Schwinger-Dyson equation subtracts the bare vertex
+:math:`\tfrac12(U_{\mathrm{d}} + 3U_{\mathrm{m}})` instead of the local one, so the second-order diagram is counted
+once. The density and magnetic kernels then form the particle-hole fluctuation-exchange (FLEX) self-energy, without
+the particle-particle T-matrix; since the self-consistent loop rebuilds the bubble from the dressed Green's function, a
+self-consistent run is particle-hole FLEX started from DMFT. The lambda correction, the restriction and the annealing of
+the :ref:`stabilization section <stabilization>` act on the RPA susceptibility as on the ladder one, the lambda
+correction with the local susceptibilities of the local step. At couplings typical of DΓA the magnetic RPA
+susceptibility can lie beyond its Stoner pole, where only a lambda correction makes it physical. The pairing vertices
+are combined into the singlet and triplet vertex like the ladder vertex, with the bare up-down interaction counted once
+in place of the local diagrams; for one band these are the spin-fluctuation interactions
+:math:`U + \tfrac32 U^2 \chi_{\mathrm{m}} - \tfrac12 U^2 \chi_{\mathrm{d}}` (singlet) and
 :math:`-\tfrac12 U^2 (\chi_{\mathrm{m}} + \chi_{\mathrm{d}})` (triplet).
+
+**RPA** (``do_rpa``). The multi-orbital random phase approximation of spin-fluctuation pairing used for multi-orbital
+materials (e.g. Graser et al., New J. Phys. 11, 025016 (2009)): the channel interactions, the kernels and the pairing
+vertices of FLEX, evaluated on the non-interacting (DFT) lattice. The run starts from a zero self-energy at the
+chemical potential at which the non-interacting lattice holds the DMFT filling, from the Fermi sum of the band
+energies. With ``max_iter`` 1 it is the one-shot RPA: the pairing vertices carry the longitudinal and both transverse
+spin fluctuations of the non-interacting bubble, for one band the singlet and triplet interactions above, the kernels
+give the one-shot FLEX self-energy of the non-interacting Green's function, which is written to ``sigma_dga.npy`` and
+dresses ``giwk_dga.npy``, and the Eliashberg bubble takes the non-interacting Green's function. With ``max_iter`` above
+1 the self-energy is fed back with the configured mixing and the run is self-consistent RPA, particle-hole FLEX from
+the non-interacting lattice; the Eliashberg bubble then takes the converged Green's function. In both the self-energy
+carries no DMFT part: beyond the core box it is the Hartree-Fock term of the current occupations and the
+:math:`1/\imath\nu` tail of the kernels, the coefficient their contraction approaches at large :math:`\nu`.
+``previous_sc_path`` is ignored, and a lambda correction, the restriction or the annealing stop the run with an error,
+since each reshapes the RPA susceptibility (the lambda corrections with the local DMFT susceptibility). At couplings
+typical of DΓA the RPA susceptibility lies beyond its Stoner pole, which is why RPA studies take a smaller interaction.
 
 DMFT input
 ----------

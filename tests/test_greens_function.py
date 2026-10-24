@@ -287,6 +287,20 @@ def test_get_epot_e_corr_einsum_matches_transposed_product_reference():
     assert np.isfinite(g.get_epot())
 
 
+@pytest.mark.parametrize("complex_hopping", [False, True])
+def test_non_interacting_mu_holds_the_filling_in_the_fermi_sum_of_the_bands(complex_hopping):
+    """The non-interacting mu puts the Fermi sum 2 mean_k sum_b f(eps_b(k) - mu) of the band energies on the filling."""
+    rng = np.random.default_rng(11)
+    h = rng.standard_normal((4, 3, 1, 2, 2)) + (1j if complex_hopping else 0.0) * rng.standard_normal((4, 3, 1, 2, 2))
+    ek = h + np.conj(np.swapaxes(h, -1, -2))
+    beta, filling = 7.0, 1.3
+
+    mu = gf_module.non_interacting_mu(ek, filling, beta)
+
+    bands = np.linalg.eigvalsh(ek.reshape(-1, 2, 2))
+    assert np.isclose(2 * np.mean(np.sum(1 / (1 + np.exp(beta * (bands - mu))), axis=-1)), filling, atol=1e-10)
+
+
 def test_update_mu_without_logger_is_silent_on_failure():
     """update_mu with logger=None returns the input mu silently when root-finding fails."""
     nk, ek, sig, beta, mu = _toy_inputs()

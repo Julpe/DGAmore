@@ -2723,10 +2723,10 @@ def dispatch_full_vertex_calculation(
     :math:`\frac{1}{\beta^2}\sum_{\nu\nu'}\chi^{\mathrm{q}\nu\nu'}_{r}`, and the three-leg vertices carry the net
     normalization :math:`\gamma^{\mathrm{q}\nu}_{r} = (\chi^{\mathrm{q}\nu}_{0})^{-1}\sum_{\nu'}
     \chi^{*;\mathrm{q}\nu\nu'}_{r}` (the explicit :math:`\beta` in their construction cancels the :math:`1/\beta` of the
-    fused frequency sum), such that :math:`\gamma^{\mathrm{q}\nu}_{r} \to \mathbb{1}` for :math:`\nu \to \infty`. With
-    ``config.rpa.use_rpa_susceptibility`` no local vertex is loaded and the vertex is the RPA one,
-    :math:`F^{\mathrm{q}}_{r} = \mathcal{U}^{\mathbf{q}}_{r} - \mathcal{U}^{\mathbf{q}}_{r}\chi^{\mathrm{q}}_{r}
-    \mathcal{U}^{\mathbf{q}}_{r}` (see :func:`_build_rpa_vertex_chunk`).
+    fused frequency sum), such that :math:`\gamma^{\mathrm{q}\nu}_{r} \to \mathbb{1}` for :math:`\nu \to \infty`. In the
+    bare-vertex modes (``config.misc.do_flex``, ``config.misc.do_rpa``) no local vertex is loaded and the vertex is the
+    RPA one, :math:`F^{\mathrm{q}}_{r} = \mathcal{U}^{\mathbf{q}}_{r} -
+    \mathcal{U}^{\mathbf{q}}_{r}\chi^{\mathrm{q}}_{r}\mathcal{U}^{\mathbf{q}}_{r}` (see :func:`_build_rpa_vertex_chunk`).
 
     :param channel: The spin channel (density or magnetic).
     :param u_loc: The bare local interaction :math:`U`.
@@ -2738,7 +2738,7 @@ def dispatch_full_vertex_calculation(
         node into an MPI shared-memory window instead of once per rank (the build only reads it).
     :return: The full ladder pp vertex :math:`F^{\mathrm{q}}_{r}` as a :class:`FourPoint`.
     """
-    if config.rpa.use_rpa_susceptibility:
+    if config.misc.bare_vertex:
         build = create_pairing_vertex_streaming_fq if config.eliashberg.save_fq else create_pairing_vertex_slice_q_r
         f_q_r = build(u_loc, v_nonloc, None, niv_pp, mpi_dist, chunk_bytes, channel=channel)
         mpi_dist.barrier()
@@ -2800,9 +2800,10 @@ def solve(
 ):
     r"""
     Drives the Eliashberg step: assembles the singlet and triplet pairing vertices from the saved
-    ladder-DGA full vertices (optionally adding the local reducible diagrams; with
-    ``config.rpa.use_rpa_susceptibility`` from the RPA vertices, counting the bare up-down interaction once instead),
-    then solves the linearized gap equation for each channel and returns the leading eigenvalues and gap functions. A
+    ladder-DGA full vertices (optionally adding the local reducible diagrams; in the bare-vertex modes
+    ``config.misc.do_flex`` and ``config.misc.do_rpa`` from the RPA vertices, counting the bare up-down interaction
+    once instead), then solves the linearized gap equation for each channel and returns the leading eigenvalues and
+    gap functions. A
     single rank solves in memory, sector after sector; a multi-rank job solves in memory as concurrent (channel x
     parity) sector teams that share one vertex window per channel and node when a node holds such a window (see
     :func:`plan_lanczos_teams`, decided from the available node memory), and on the block-distributed solver grid
@@ -2921,7 +2922,7 @@ def solve(
     f_magn_pp.free()
     logger.info("Calculated full ladder-vertex (triplet) in pp notation.")
 
-    if config.rpa.use_rpa_susceptibility:
+    if config.misc.bare_vertex:
         # Eqs. (4.49)-(4.52) with the bare up-down vertex U as the local full vertex and no pp-reducible diagrams:
         # its minus in crossed-slot form, -(-U_{1432}), keeps one copy of U, which both RPA ladders start with
         u_crossed = u_loc.permute_orbitals("abcd->adcb")

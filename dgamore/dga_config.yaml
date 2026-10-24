@@ -46,10 +46,14 @@ lambda_correction:
   # band count like stabilization.use_lambda_correction above, over which it takes precedence.
   type: "spch" # available types of the single-band scalar lambda correction: 'spch' (both density and magnetic channel) or 'sp' (magnetic channel only)
 
-rpa:
-  use_rpa_susceptibility: False # If True, the non-local step takes the bare interaction as the local irreducible vertex: no three-leg vertex is calculated, the
-  # self-energy kernel and the Eliashberg pairing vertex use the RPA susceptibility ((chi0)^-1 + U_r + V_r)^-1 of the frequency-summed bubble, and the
-  # double-counting kernel subtracts the bare vertex 1/2 (U_d + 3 U_m). No Sigma_DMFT - Sigma_loc term is added (particle-hole FLEX).
+misc:
+  do_flex: False # If True, particle-hole FLEX started from DMFT: the bare interaction is the local irreducible vertex, the self-energy kernel and the Eliashberg
+  # pairing vertex use the RPA susceptibility ((chi0)^-1 + U_r + V_r)^-1 of the frequency-summed bubble, the magnetic kernel counts its longitudinal and both transverse
+  # components, the double-counting kernel subtracts the bare vertex 1/2 (U_d + 3 U_m), and no Sigma_DMFT - Sigma_loc term is added.
+  do_rpa: False # If True, multi-orbital RPA from the non-interacting (DFT) Green's function: the channel interactions, kernels and pairing vertex of do_flex
+  # evaluated at Sigma = 0, once with max_iter 1 (G0 in the Eliashberg bubble) or self-consistently from there with max_iter > 1 (the converged G in the
+  # bubble). Beyond the core box the self-energy is its Hartree-Fock term and 1/iv tail, no DMFT part. Takes no lambda correction or susceptibility
+  # scaffold. Excludes do_flex.
 
 dmft_input:
   type: "w2dyn" # Input format. Currently available is 'w2dyn'

@@ -19,6 +19,7 @@ from dgamore.dga_logger import DgaLogger
 from dgamore.dmft_interface import W2dynInterface
 from dgamore.hamiltonian import Hamiltonian
 from dgamore.local_four_point import LocalFourPoint
+from dgamore.matsubara_frequencies import MFHelper
 from tests import conftest
 
 
@@ -179,8 +180,8 @@ def test_decoupled_uncorrelated_orbitals_leave_the_self_energy_unchanged(setup, 
     assert np.allclose(sigma_dga_mat, sigma_dga_ref, atol=3e-5)
 
 
-def _rpa_and_bare_vertex_ladder(comm_mock, monkeypatch, s_dmft) -> tuple[np.ndarray, np.ndarray]:
-    """Returns the RPA-mode self-energy and the ladder self-energy of Gamma_r = U_r and the dc vertex
+def _flex_and_bare_vertex_ladder(comm_mock, monkeypatch, s_dmft) -> tuple[np.ndarray, np.ndarray]:
+    """Returns the FLEX-mode self-energy and the ladder self-energy of Gamma_r = U_r and the dc vertex
     1/2 (U_d + 3 U_m) = U - 2 U_{1432} of the loaded run, both with Sigma_loc = Sigma_DMFT."""
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
@@ -199,14 +200,14 @@ def _rpa_and_bare_vertex_ladder(comm_mock, monkeypatch, s_dmft) -> tuple[np.ndar
     ladder = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), s_dmft.copy())
 
     config.sys = sys_state
-    config.rpa.use_rpa_susceptibility = True
+    config.misc.do_flex = True
     monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", MagicMock(side_effect=AssertionError))
-    rpa = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), s_dmft.copy())
-    return rpa.mat, ladder.mat
+    flex = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), s_dmft.copy())
+    return flex.mat, ladder.mat
 
 
-def test_rpa_mode_is_the_ladder_with_the_bare_interaction_as_local_vertex(setup, monkeypatch):
-    """RPA mode gives the ladder self-energy of Gamma_r = U_r and the dc vertex 1/2 (U_d + 3 U_m) = U - 2 U_{1432}."""
+def test_flex_mode_is_the_ladder_with_the_bare_interaction_as_local_vertex(setup, monkeypatch):
+    """FLEX mode gives the ladder self-energy of Gamma_r = U_r and the dc vertex 1/2 (U_d + 3 U_m) = U - 2 U_{1432}."""
     folder, comm_mock = setup
     config.box.niw_core, config.box.niv_core, config.box.niv_shell = 6, 6, 4
     config.dmft.symmetrize_orbitals = []
@@ -214,20 +215,21 @@ def test_rpa_mode_is_the_ladder_with_the_bare_interaction_as_local_vertex(setup,
     config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
     config.output.output_path = folder
 
-    rpa, ladder = _rpa_and_bare_vertex_ladder(comm_mock, monkeypatch, s_dmft)
+    flex, ladder = _flex_and_bare_vertex_ladder(comm_mock, monkeypatch, s_dmft)
 
-    assert np.allclose(rpa, ladder, atol=1e-4 * np.abs(ladder).max())
+    assert np.allclose(flex, ladder, atol=1e-4 * np.abs(ladder).max())
 
 
-def test_rpa_mode_adds_no_noise_removal_term(setup):
-    """RPA mode is the self-energy of the RPA kernels alone: a shifted local self-energy leaves the result unchanged."""
+@pytest.mark.parametrize("mode", ["do_flex", "do_rpa"])
+def test_bare_vertex_modes_add_no_noise_removal_term(setup, mode):
+    """FLEX and RPA are the self-energy of their kernels alone: a shifted local self-energy changes nothing."""
     folder, comm_mock = setup
     config.box.niw_core, config.box.niv_core, config.box.niv_shell = 6, 6, 4
     config.dmft.symmetrize_orbitals = []
     _, s_dmft, _, _ = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
     config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
     config.output.output_path = folder
-    config.rpa.use_rpa_susceptibility = True
+    setattr(config.misc, mode, True)
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
     shifted = s_dmft.copy()
@@ -241,8 +243,134 @@ def test_rpa_mode_adds_no_noise_removal_term(setup):
     assert np.allclose(out.mat, reference.mat, atol=1e-6 * np.abs(reference.mat).max())
 
 
-def test_rpa_mode_is_the_bare_vertex_ladder_for_kanamori_orbitals(setup_srvo3_cubic, monkeypatch, tmp_path):
-    """Three Kanamori orbitals (U = 5, U' = 3.5, J = 0.75), whose inter-orbital terms the two-band fixture lacks: RPA
+def test_rpa_mode_starts_from_the_non_interacting_lattice_at_the_dmft_filling(setup, monkeypatch):
+    """RPA mode's one proposal sees a zero self-energy at the mu where the bare lattice holds the DMFT filling."""
+    folder, comm_mock = setup
+    config.box.niw_core, config.box.niv_core, config.box.niv_shell = 6, 6, 4
+    config.dmft.symmetrize_orbitals = []
+    _, s_dmft, _, _ = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
+    config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
+    config.output.output_path = folder
+    config.misc.do_rpa = True
+    config.self_consistency.max_iter = 1
+    u_loc = config.lattice.hamiltonian.get_local_u()
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
+    proposal, seen = nonlocal_sde.calculate_sigma_proposal, []
+    monkeypatch.setattr(
+        nonlocal_sde,
+        "calculate_sigma_proposal",
+        lambda sigma_in, mu, *a, **k: seen.append((sigma_in.mat.copy(), mu, config.sys.occ.copy()))
+        or proposal(sigma_in, mu, *a, **k),
+    )
+
+    sigma = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), s_dmft.copy())
+
+    ((sigma_in, mu, occ),) = seen
+    nb = config.sys.n_bands
+    eps = np.linalg.eigvalsh(config.lattice.hamiltonian.get_ek().reshape(-1, nb, nb))
+    n_fermi = 2 * np.mean(np.sum(0.5 * (1 - np.tanh(0.5 * config.sys.beta * (eps - mu))), axis=-1))
+    assert not np.any(sigma_in)
+    assert mu == config.sys.mu_non_interacting and np.isclose(n_fermi, config.sys.n, atol=1e-10)
+    assert np.isclose(2 * np.trace(occ).real, config.sys.n, atol=1e-4)
+    assert np.all(np.isfinite(sigma.mat)) and np.any(sigma.mat)
+
+
+def _rpa_run(folder: str, comm_mock, monkeypatch, max_iter: int, mixing: float) -> tuple[list, object]:
+    """Runs RPA mode on the two-band fixture (box 6/6/4) and returns, per proposal, the iterate it was handed and the
+    occupations it saw, with the returned self-energy."""
+    config.box.niw_core, config.box.niv_core, config.box.niv_shell = 6, 6, 4
+    config.dmft.symmetrize_orbitals = []
+    _, s_dmft, _, _ = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
+    config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
+    config.output.output_path = folder
+    config.misc.do_rpa = True
+    config.self_consistency.max_iter, config.self_consistency.mixing = max_iter, mixing
+    u_loc = config.lattice.hamiltonian.get_local_u()
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
+    proposal, seen = nonlocal_sde.calculate_sigma_proposal, []
+    monkeypatch.setattr(
+        nonlocal_sde,
+        "calculate_sigma_proposal",
+        lambda sigma_in, *a, **k: seen.append(
+            (sigma_in.compress_q_dimension().mat.copy(), config.sys.occ.copy(), config.sys.occ_k.copy())
+        )
+        or proposal(sigma_in, *a, **k),
+    )
+    sigma = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), s_dmft.copy())
+    return seen, sigma
+
+
+def _shell_moment(mat: np.ndarray, niv_core: int) -> np.ndarray:
+    """The coefficient s_1 of a shell c(k) - s_1 / iv, read from every positive shell frequency against the last one,
+    shape [k, o1, o2, v]: a shell of that form gives the same value at every k and v."""
+    niv = mat.shape[-1] // 2
+    iv = 1j * MFHelper.vn(niv, config.sys.beta)[niv + niv_core :]
+    shell = mat[..., niv + niv_core :]
+    return -(shell[..., :-1] - shell[..., -1:]) / (1.0 / iv[:-1] - 1.0 / iv[-1])
+
+
+def test_rpa_mode_pads_its_proposal_with_the_hartree_fock_term_and_its_own_tail(setup, monkeypatch):
+    """RPA mode carries no DMFT self-energy: beyond the core box its proposal is Sigma_HF(k) - Sigma_1 / iv, with the
+    Hartree-Fock term of the occupations the proposal saw and one k-independent Sigma_1."""
+    folder, comm_mock = setup
+    ((_, occ, occ_k),), sigma = _rpa_run(folder, comm_mock, monkeypatch, 1, 1.0)
+
+    hartree, fock = nonlocal_sde.get_hartree_fock(
+        config.lattice.hamiltonian.get_local_u(), config.lattice.hamiltonian.get_vq(config.lattice.k_grid), occ, occ_k
+    )
+    mat, niv, niv_core = sigma.compress_q_dimension().mat, sigma.niv, config.box.niv_core
+    iv = 1j * MFHelper.vn(niv, config.sys.beta)[niv + niv_core :]
+    sigma_1 = ((hartree + fock)[..., 0][..., None] - mat[..., niv + niv_core :]) * iv
+    assert np.abs(sigma_1).max() > 1e-3
+    assert np.allclose(sigma_1, sigma_1[:1, ..., :1], atol=1e-4 * np.abs(sigma_1).max())
+
+
+def test_self_consistent_rpa_mode_keeps_its_own_tail_through_the_mixing(setup, monkeypatch):
+    """The second iteration of a self-consistent RPA run starts from the mixed iterate, whose shell is again
+    c(k) - s_1 / iv with one nonzero s_1: no DMFT self-energy enters through the mixing."""
+    folder, comm_mock = setup
+    ((first, *_), (second, *_)), _ = _rpa_run(folder, comm_mock, monkeypatch, 2, 0.5)
+
+    s_1 = _shell_moment(second, config.box.niv_core)
+    assert not np.any(first)
+    assert np.abs(s_1).max() > 1e-3
+    assert np.allclose(s_1, s_1[:1, ..., :1], atol=1e-4 * np.abs(s_1).max())
+
+
+def test_rpa_mode_is_the_flex_proposal_on_the_non_interacting_lattice(setup_srvo3_cubic, monkeypatch, tmp_path):
+    """Three Kanamori orbitals: RPA mode's one proposal is the FLEX proposal of its own non-interacting start on the
+    core box (beyond it FLEX keeps the DMFT self-energy and RPA its own tail)."""
+    folder, comm_mock = setup_srvo3_cubic
+    _srvo3_on_hk(folder, tmp_path / "t2g.hk", (4, 4, 4))
+    config.box.niw_core, config.box.niv_core, config.box.niv_shell = 6, 6, 4
+    _, s_dmft, _, _ = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
+    config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
+    config.output.output_path = str(tmp_path)
+    config.lattice.k_grid.specify_auto_symmetries(config.lattice.hamiltonian.get_ek(config.lattice.k_grid))
+    config.misc.do_rpa = True
+    config.self_consistency.max_iter = 1
+    u_loc = config.lattice.hamiltonian.get_local_u()
+    v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
+    proposal, seen = nonlocal_sde.calculate_sigma_proposal, []
+
+    def flex_then_rpa(sigma_in, *args, **kwargs):
+        config.misc.do_rpa, config.misc.do_flex = False, True
+        flex = proposal(sigma_in.copy(), *args, **kwargs)
+        config.misc.do_rpa, config.misc.do_flex = True, False
+        rpa = proposal(sigma_in, *args, **kwargs)
+        seen.append((flex.cut_niv(config.box.niv_core).mat, rpa.cut_niv(config.box.niv_core).mat))
+        return rpa
+
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", flex_then_rpa)
+
+    nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), s_dmft.copy())
+
+    ((flex, rpa),) = seen
+    assert np.allclose(rpa, flex, atol=1e-6 * np.abs(flex).max())
+
+
+def test_flex_mode_is_the_bare_vertex_ladder_for_kanamori_orbitals(setup_srvo3_cubic, monkeypatch, tmp_path):
+    """Three Kanamori orbitals (U = 5, U' = 3.5, J = 0.75), whose inter-orbital terms the two-band fixture lacks: FLEX
     mode is still the ladder of Gamma_r = U_r and the dc vertex U - 2 U_{1432}."""
     folder, comm_mock = setup_srvo3_cubic
     _srvo3_on_hk(folder, tmp_path / "t2g.hk", (4, 4, 4))
@@ -252,11 +380,11 @@ def test_rpa_mode_is_the_bare_vertex_ladder_for_kanamori_orbitals(setup_srvo3_cu
     config.output.output_path = str(tmp_path)
     config.lattice.k_grid.specify_auto_symmetries(config.lattice.hamiltonian.get_ek(config.lattice.k_grid))
 
-    rpa, ladder = _rpa_and_bare_vertex_ladder(comm_mock, monkeypatch, s_dmft)
+    flex, ladder = _flex_and_bare_vertex_ladder(comm_mock, monkeypatch, s_dmft)
 
     u = config.lattice.hamiltonian.get_local_u().mat
     assert np.isclose(u[0, 0, 1, 1], 3.5) and np.isclose(u[0, 1, 1, 0], 0.75)
-    assert np.allclose(rpa, ladder, atol=1e-4 * np.abs(ladder).max())
+    assert np.allclose(flex, ladder, atol=1e-4 * np.abs(ladder).max())
 
 
 def test_calculates_srvo3_correctly(setup_srvo3_cubic):

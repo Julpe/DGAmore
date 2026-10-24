@@ -2933,9 +2933,12 @@ def test_rpa_vertex_chunk_is_the_ladder_vertex_chunk_at_the_bare_local_vertex(mo
     assert np.allclose(out.mat, ladder.mat, atol=1e-9 * np.abs(ladder.mat).max())
 
 
-def _rpa_solve_capturing_vertices(monkeypatch, u_loc: LocalInteraction, no: int) -> tuple[np.ndarray, np.ndarray]:
-    """Runs solve in RPA mode on the rank files in place and returns the singlet and triplet vertex the solver gets."""
-    config.rpa.use_rpa_susceptibility = True
+def _rpa_solve_capturing_vertices(
+    monkeypatch, u_loc: LocalInteraction, no: int, mode: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Runs solve in a bare-vertex mode on the rank files in place and returns the singlet and triplet vertex the
+    solver gets."""
+    setattr(config.misc, mode, True)
     config.sys.n_bands = no
     captured = {}
     monkeypatch.setattr(
@@ -2948,7 +2951,8 @@ def _rpa_solve_capturing_vertices(monkeypatch, u_loc: LocalInteraction, no: int)
     return captured["sing"], captured["trip"]
 
 
-def test_rpa_pairing_vertices_of_one_band_are_the_spin_fluctuation_vertices(setup, monkeypatch):
+@pytest.mark.parametrize("mode", ["do_flex", "do_rpa"])
+def test_rpa_pairing_vertices_of_one_band_are_the_spin_fluctuation_vertices(setup, monkeypatch, mode):
     """One band: singlet -(U + 3/2 U^2 chi_m - 1/2 U^2 chi_d), triplet U + 1/2 U^2 (chi_d + chi_m) at w = v - v'."""
     u, rank_path = 1.7, config.output.eliashberg_path
     u_loc = LocalInteraction(np.full((1, 1, 1, 1), u))
@@ -2962,7 +2966,7 @@ def test_rpa_pairing_vertices_of_one_band_are_the_spin_fluctuation_vertices(setu
         nonlocal_sde._finish_physical_susceptibility(chi_q_r, _make_single_rank_distributor(), save_eliashberg=True)
         chi[channel] = np.load(os.path.join(rank_path, f"chi_phys_q_{channel.value}_rank_0.npy")).reshape(N_Q, N_W)
 
-    sing, trip = _rpa_solve_capturing_vertices(monkeypatch, u_loc, 1)
+    sing, trip = _rpa_solve_capturing_vertices(monkeypatch, u_loc, 1, mode)
 
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
     w = np.arange(-niv_pp, niv_pp)[:, None] - np.arange(-niv_pp, niv_pp)[None, :]
@@ -2973,8 +2977,9 @@ def test_rpa_pairing_vertices_of_one_band_are_the_spin_fluctuation_vertices(setu
     assert np.allclose(trip.reshape(trip_expected.shape), trip_expected, atol=1e-5 * np.abs(trip_expected).max())
 
 
+@pytest.mark.parametrize("mode", ["do_flex", "do_rpa"])
 @pytest.mark.parametrize("save_fq", [False, True])
-def test_rpa_pairing_vertices_without_susceptibility_are_the_bare_interaction(setup, monkeypatch, save_fq):
+def test_rpa_pairing_vertices_without_susceptibility_are_the_bare_interaction(setup, monkeypatch, save_fq, mode):
     """With chi = 0 the RPA singlet and triplet vertices are -U_{1234} and +U_{1234}: the bare U counted once."""
     no = 2
     config.eliashberg.save_fq = save_fq
@@ -2983,7 +2988,7 @@ def test_rpa_pairing_vertices_without_susceptibility_are_the_bare_interaction(se
     for channel in ("dens", "magn"):
         zero.save(name=f"chi_phys_q_{channel}_rank_0", output_dir=config.output.eliashberg_path)
 
-    sing, trip = _rpa_solve_capturing_vertices(monkeypatch, LocalInteraction(u_mat), no)
+    sing, trip = _rpa_solve_capturing_vertices(monkeypatch, LocalInteraction(u_mat), no, mode)
 
     bare = np.broadcast_to(u_mat[None, ..., None, None], sing.shape)
     assert np.allclose(sing, -bare, atol=1e-6)
