@@ -241,6 +241,55 @@ def test_find_lambda_matrix_falls_back_to_lstsq_on_singular_hessian(monkeypatch)
     assert np.allclose(lam, lambda_star, atol=1e-4)
 
 
+def test_find_lambda_matrix_on_two_atoms_fits_only_the_on_site_blocks():
+    """Two two-orbital atoms with a single-site target (zero between atoms): the planted on-site mass is recovered,
+    the mass is zero between the atoms and the inter-atom local sums keep their lattice values."""
+    beta, nq, nw, n_bands = 5.0, 4, 5, 4
+    chi_inv_qw = _synthetic_chi_inv_qw(n_bands, nq, nw, seed=11)
+    on_a, on_b = [0, 1, 4, 5], [10, 11, 14, 15]  # compound pairs (12) with 1, 2 on atom a = {0, 1} or b = {2, 3}
+    on_site = np.zeros((16, 16), dtype=bool)
+    on_site[np.ix_(on_a, on_a)] = on_site[np.ix_(on_b, on_b)] = True
+    rng = np.random.default_rng(12)
+    lambda_star = np.zeros((16, 16))
+    for block in (on_a, on_b):
+        a = rng.standard_normal((4, 4))
+        lambda_star[np.ix_(block, block)] = 0.2 * 0.5 * (a + a.T)
+    lattice_sum = np.linalg.inv(chi_inv_qw + lambda_star).sum(axis=(0, 1)).real / (beta * nq)
+    s_r = np.where(on_site, lattice_sum, 0.0)
+
+    lam = MultiOrbitalLambdaCorrection.find_lambda_matrix(
+        _synthetic_chi_qw(n_bands, nq, nw, seed=11), s_r, beta, nq, atoms=[0, 0, 1, 1]
+    )
+
+    assert np.allclose(lam, lambda_star, atol=1e-4)
+    assert np.all(lam[~on_site] == 0.0)
+    corrected_sum = np.linalg.inv(chi_inv_qw + lam).sum(axis=(0, 1)).real / (beta * nq)
+    assert np.abs(lattice_sum[~on_site]).max() > 1e-3
+    assert np.allclose(corrected_sum[~on_site], lattice_sum[~on_site], atol=1e-6)
+
+
+def test_find_lambda_matrix_on_one_atom_is_unchanged_by_the_atom_map():
+    """All orbitals on one atom fit every component: the same mass, bit for bit, as without an atom map."""
+    beta, nq, nw, n_bands = 5.0, 6, 5, 2
+    chi_inv_qw = _synthetic_chi_inv_qw(n_bands, nq, nw)
+    a = np.random.default_rng(1).standard_normal((4, 4))
+    s_r = np.linalg.inv(chi_inv_qw + 0.3 * 0.5 * (a + a.T)).sum(axis=(0, 1)).real / (beta * nq)
+    chi_qw = _synthetic_chi_qw(n_bands, nq, nw)
+
+    lam_one_atom = MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, s_r, beta, nq, atoms=[0, 0])
+
+    assert np.array_equal(lam_one_atom, MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, s_r, beta, nq))
+
+
+def test_find_lambda_matrix_raises_when_no_on_site_mass_lifts_the_static_pole():
+    """A static pole that lives purely between two atoms is out of reach of on-site masses: the solver raises."""
+    chi_inv = np.diag([2.0, -1.0, -1.0, 2.0]).astype(np.complex128)  # pairs (00), (01), (10), (11), atoms {0}, {1}
+    chi_qw = np.linalg.inv(chi_inv)[None, None]
+
+    with pytest.raises(ValueError):
+        MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, np.zeros((4, 4)), 5.0, 1, atoms=[0, 1])
+
+
 def test_multiorbital_perform_single_matches_single_band_for_magn():
     """For the cleanly-converging magnetic channel the No=1 matrix correction equals the scalar LambdaCorrection."""
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
@@ -313,6 +362,27 @@ def test_multiorbital_perform_single_recovers_matrix_mass_and_sum_rule():
         axis=(0, 1)
     ) / (config.sys.beta * q_grid.nk_tot)
     assert np.allclose(lhs, s_r, atol=1e-5)
+
+
+def test_multiorbital_perform_single_takes_the_atoms_from_the_ineq_ordering():
+    """Two one-orbital atoms of one inequivalent type: the planted on-site mass is recovered against a target that is
+    zero between the atoms, and the pairs (01), (10) and the (00)-(11) entries carry no mass."""
+    config.sys.beta = 8.0
+    config.sys.n_bands = 2
+    config.dmft.ineq_ordering, config.dmft.n_bands_per_ineq = [1, 1], [1]
+    chi = _multiorbital_chi_fourpoint(2, (4, 4, 1), 3, seed=7)
+    q_grid = config.lattice.k_grid
+    lambda_star = np.diag([0.15, 0.0, 0.0, -0.1])
+    chi_inv_qw = np.linalg.inv(chi.copy().map_to_full_bz(q_grid).to_compound_indices().mat.astype(np.complex128))
+    lattice_sum = np.linalg.inv(chi_inv_qw + lambda_star).sum(axis=(0, 1)).real / (config.sys.beta * q_grid.nk_tot)
+    s_r = np.zeros((4, 4))
+    s_r[0, 0], s_r[3, 3] = lattice_sum[0, 0], lattice_sum[3, 3]
+
+    _, lambda_found = MultiOrbitalLambdaCorrection.perform_single(chi.copy(), s_r)
+
+    assert np.allclose(lambda_found, lambda_star, atol=1e-4)
+    assert np.all(lambda_found[[1, 2]] == 0.0) and np.all(lambda_found[:, [1, 2]] == 0.0)
+    assert lambda_found[0, 3] == 0.0 and lambda_found[3, 0] == 0.0
 
 
 def test_multiorbital_perform_loads_target_writes_lambda_and_corrects(tmp_path):

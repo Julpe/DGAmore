@@ -964,7 +964,9 @@ correction of
 the lambda correction section selects whether both channels are corrected (``spch``) or only the magnetic one
 (``sp``, with the density sum rule folded into the magnetic target). For several bands the mass is a
 real-symmetric :math:`n_{\mathrm{o}}^2 \times n_{\mathrm{o}}^2`
-matrix :math:`\Lambda_{\mathrm{r}}` per channel that matches the sum rule component by component. It comes from a
+matrix :math:`\Lambda_{\mathrm{r}}` per channel that matches the sum rule component by component on the orbital
+pairs of each atom. Between atoms the mass is zero: the single-site impurity holds no inter-atom correlation, so those
+components follow from the lattice instead of being pinned to the impurity's zero. It comes from a
 damped Newton iteration whose line search keeps the static susceptibility gap positive; both channels are always
 corrected, and the momentum sum runs over the full Brillouin zone because symmetry-related momenta carry orbitally
 rotated susceptibility matrices. The single-band scheme is the derived Moriya correction. The matrix scheme is a
