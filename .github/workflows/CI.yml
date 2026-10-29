@@ -70,6 +70,8 @@ jobs:
         shell: bash
         env:
           PYTHONUNBUFFERED: "1"
+          # coverage's sys.monitoring core, its default from Python 3.14 on, for 3.12 and 3.13 too (faster tracing)
+          COVERAGE_CORE: sysmon
         run: |
           trap 'echo "::warning::Run tests hit SIGTERM (exit 143); see how far pytest collection/tests got above"; exit 143' TERM INT
           echo "pytest starting; collection imports the package and triggers MPI_Init"

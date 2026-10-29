@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import mpi4py.MPI as MPI
 import numpy as np
 import pytest
+from threadpoolctl import threadpool_limits
 
 import dgamore.brillouin_zone as bz
 import dgamore.config as config
@@ -105,6 +106,13 @@ def reset_config():
     config.stabilization = config.StabilizationConfig()
     config.eliashberg = config.EliashbergConfig()
     config.ana_cont = config.AnaContConfig()
+
+
+@pytest.fixture
+def one_blas_thread():
+    """Caps BLAS at one thread for the test: a thread pool slows small products, most of all under run_parallel."""
+    with threadpool_limits(limits=1):
+        yield
 
 
 def create_default_config(config, folder: str):
