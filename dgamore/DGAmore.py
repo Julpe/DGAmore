@@ -45,9 +45,10 @@ import dgamore.plotting as plotting
 from dgamore import max_ent
 from dgamore.brillouin_zone import is_auto_symmetries
 from dgamore.config_parser import ConfigParser
-from dgamore.greens_function import GreensFunction
+from dgamore.greens_function import GreensFunction, non_interacting_mu
 from dgamore.interaction import LocalInteraction
 from dgamore.local_four_point import LocalFourPoint
+from dgamore.n_point_base import SpinChannel
 from dgamore.self_energy import SelfEnergy
 
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
@@ -123,7 +124,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
             config.stabilization,
             config.eliashberg,
             config.lambda_correction,
-            config.rpa,
+            config.misc,
             config.self_energy_interpolation,
             config.ana_cont,
         )
@@ -140,7 +141,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
                 config.stabilization,
                 config.eliashberg,
                 config.lambda_correction,
-                config.rpa,
+                config.misc,
                 config.self_energy_interpolation,
                 config.ana_cont,
             ) = pickle.loads(blob)
@@ -155,12 +156,12 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         )
         return 1
 
+    setup_misc_settings()
     setup_lambda_correction_settings()
-    if config.rpa.use_rpa_susceptibility:
-        logger.info(
-            "RPA mode: the non-local step and the Eliashberg vertex use the RPA susceptibility; no three-leg vertex is "
-            "calculated."
-        )
+    if config.eliashberg.perform_eliashberg:
+        # RPA mode reads no DMFT self-energy, so only the other modes test it
+        sigma_dmft_test = None if config.misc.do_rpa else sigma_dmft_per_ineq
+        eliashberg_solver.check_parity_sectors(comm, sigma_dmft_test, log=False)
 
     config_parser.save_config_file(path=config.output.output_path, name="dga_config.yaml")
 
@@ -557,49 +558,33 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         # sigma_dga is already saved to disk and never consumed by the Eliashberg step - drop rank 0's copy before
         # the memory-heavy vertex construction
         if comm.rank == 0:
-            sigma_dga.free()
-        results = eliashberg_solver.solve(giwk_dga, g_dmft_full, u_loc, v_nonloc, comm, chunk_budgets)
+            giwk_dga = _eliashberg_green_function(giwk_dga, sigma_dga, ek)
+        results, inversion = eliashberg_solver.solve(giwk_dga, g_dmft_full, u_loc, v_nonloc, comm, chunk_budgets)
 
         def gap_stem(channel, parity):
             base = f"gap_{channel.value}"
             return base if parity == "none" else f"{base}_{parity}"
 
-        def readable_label(channel, parity):
-            name = {"sing": "singlet", "trip": "triplet"}.get(channel.value, channel.value)
-            return name if parity == "none" else f"{name} {parity}"
-
         if comm.rank == 0:
             if eliashberg_solver.even_sectors_degenerate(results):
                 logger.warning(
-                    "The leading singlet-even and triplet-even Eliashberg eigenvalues agree to within "
+                    "The leading even-frequency singlet and triplet Eliashberg eigenvalues agree to within "
                     f"{eliashberg_solver.EVEN_SECTOR_DEGENERACY:.0%}. Such a coincidence can mark an unphysical fixed "
                     "point of the self-consistency; it is expected for an SU(2N)-symmetric interaction."
                 )
             with open(os.path.join(config.output.eliashberg_path, "eigenvalues.txt"), "w") as eig_file:
                 for (channel, parity), (lambdas, _gaps) in results.items():
                     eig_file.write(
-                        f"{readable_label(channel, parity)}: "
+                        f"{_readable_label(channel, parity)}: "
                         + ",".join(f"{lam:.9f}" for lam in np.asarray(lambdas).real)
                         + "\n"
                     )
-
-            # one line per saved gap: the wave-symmetry label (s/d/p + frequency parity +/-) followed by the measured
-            # T/P/O/PO parity Rayleigh quotients (<Delta, X Delta>/<Delta, Delta>)
-            with open(os.path.join(config.output.eliashberg_path, "gap_parity.txt"), "w") as parity_file:
-                for (channel, parity), (_lambdas, gaps) in results.items():
-                    for i, gap in enumerate(gaps):
-                        label = eliashberg_solver.classify_gap_symmetry(gap.mat)
-                        diagnostics = eliashberg_solver.gap_parity_diagnostics(gap.mat.flatten(), gap.mat.shape)
-                        parity_file.write(
-                            f"{label} {readable_label(channel, parity)} {i+1}: "
-                            + ", ".join(f"{key}={diagnostics[key].real:+.3f}" for key in ("T", "P", "O", "PO"))
-                            + "\n"
-                        )
 
             for (channel, parity), (_lambdas, gaps) in results.items():
                 for i, gap in enumerate(gaps):
                     gap.save(name=f"{gap_stem(channel, parity)}_{i+1}", output_dir=config.output.eliashberg_path)
             logger.info("Saved singlet and triplet gap functions to files.")
+            _write_gap_parity(results, ek, inversion)
 
         if config.output.do_plotting and comm.rank == 0:
             kx, ky = config.lattice.k_grid.kx_shift_closed, config.lattice.k_grid.ky_shift_closed
@@ -612,6 +597,77 @@ def run_dga_routine(comm: MPI.Comm) -> int:
 
     logger.info("Exiting ...")
     return 0
+
+
+def _eliashberg_green_function(giwk_dga: GreensFunction, sigma_dga: SelfEnergy, ek: np.ndarray) -> GreensFunction:
+    r"""
+    Returns the Green's function the Eliashberg step pairs on and frees the self-energy: one-shot RPA pairs on the
+    non-interacting lattice, at the chemical potential at which it holds the DMFT filling, so its self-energy stays out
+    of the pp bubble; every other run pairs on the DGA Green's function.
+
+    :param giwk_dga: The converged DGA :class:`GreensFunction`.
+    :param sigma_dga: The DGA :class:`SelfEnergy`.
+    :param ek: The band dispersion :math:`\varepsilon(\mathbf{k})`.
+    :return: The Green's function of the pp bubble.
+    """
+    if not (config.misc.do_rpa and config.self_consistency.max_iter == 1):
+        sigma_dga.free()
+        return giwk_dga
+    giwk_dga.free()
+    # a momentum-local zero, which get_g_full broadcasts over the grid
+    zero = SelfEnergy(
+        np.zeros((1, 1, 1) + sigma_dga.mat.shape[-3:], dtype=sigma_dga.mat.dtype),
+        full_niv_range=sigma_dga.full_niv_range,
+        beta=config.sys.beta,
+    )
+    sigma_dga.free()
+    g0 = GreensFunction.get_g_full(
+        zero, config.sys.mu_non_interacting, ek, config.sys.beta, config.sys.correlated_orbitals
+    )
+    zero.free()
+    return g0
+
+
+def _readable_label(channel: SpinChannel, parity: str) -> str:
+    """
+    Returns the label of a solved sector in the output files, e.g. ``singlet even``, or ``singlet`` without sectors.
+
+    :param channel: Pairing channel, i.e. singlet or triplet.
+    :param parity: The parity label of the sector, ``"none"`` without sectors.
+    :return: The label.
+    """
+    name = {"sing": "singlet", "trip": "triplet"}.get(channel.value, channel.value)
+    return name if parity == "none" else f"{name} {parity}"
+
+
+def _write_gap_parity(results: dict, ek: np.ndarray, inversion: np.ndarray | None) -> None:
+    r"""
+    Writes ``gap_parity.txt``, one line per gap: its label (see
+    :func:`~dgamore.eliashberg_solver.classify_gap_symmetry`, whose s+- test reads the bare bands at the run's
+    filling), the parity Rayleigh quotients of T, P, O and PO (see
+    :func:`~dgamore.eliashberg_solver.gap_parity_diagnostics`), led by those of the sector operators TOU and PU where
+    the sectors were solved, and its even-frequency weight.
+
+    :param results: The results of :func:`~dgamore.eliashberg_solver.solve`.
+    :param ek: The band dispersion :math:`\varepsilon(\mathbf{k})`.
+    :param inversion: The orbital action of the inversion the sectors were projected with.
+    :return: None.
+    """
+    mu_bare = (
+        config.sys.mu_non_interacting if config.misc.do_rpa else non_interacting_mu(ek, config.sys.n, config.sys.beta)
+    )
+    bands = eliashberg_solver.fermi_surface_bands(ek, mu_bare, config.sys.correlated_orbitals)
+    keys = ("TOU", "PU", "T", "P", "O", "PO") if config.eliashberg.resolve_parity_sectors else ("T", "P", "O", "PO")
+    with open(os.path.join(config.output.eliashberg_path, "gap_parity.txt"), "w") as parity_file:
+        for (channel, parity), (_lambdas, gaps) in results.items():
+            for i, gap in enumerate(gaps):
+                label = eliashberg_solver.classify_gap_symmetry(gap.mat, bands=bands)
+                diagnostics = eliashberg_solver.gap_parity_diagnostics(gap.mat.flatten(), gap.mat.shape, inversion)
+                parity_file.write(
+                    f"{label} {_readable_label(channel, parity)} {i+1}: "
+                    + ", ".join(f"{key}={diagnostics[key].real:+.3f}" for key in keys)
+                    + f", freq_even={(1 + diagnostics['T'].real) / 2:.3f}\n"
+                )
 
 
 def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
@@ -700,6 +756,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         niv_pp=niv_pp,
         n_ranks=comm.size,
         with_eliashberg=config.eliashberg.perform_eliashberg,
+        bare_vertex=config.misc.bare_vertex,
         save_pairing_vertex=config.eliashberg.save_pairing_vertex,
         save_fq=config.eliashberg.save_fq,
         n_eig=config.eliashberg.n_eig,
@@ -771,7 +828,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     def team_need(n_ranks: int, holds_rank_zero: bool) -> float:
         """Node peak of the team solve's leanest round (one channel's sectors per node), as its planner models it,
         with rank 0's full-grid interaction on rank 0's node."""
-        n_parities = 2 if config.eliashberg.resolve_frequency_parity else 1
+        n_parities = 2 if config.eliashberg.resolve_parity_sectors else 1
         interaction = memory_estimator.interaction_bytes(config.sys.n_bands, nk_tot) if holds_rank_zero else 0.0
         return (
             n_ranks * peaks["lanczos"].baseline
@@ -855,7 +912,8 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         ("lanczos", "Eliashberg solver"),
     )
     for key, label in verify_only:
-        if key not in peaks:
+        # the bare-vertex modes calculate no auxiliary susceptibility
+        if key not in peaks or (key == "chiq_aux" and config.misc.bare_vertex):
             continue
         totals = node_totals(key, budgets)
         if key == "lanczos" and comm.size > 1:
@@ -881,8 +939,8 @@ def _resolve_option_exclusivity() -> None:
     with a warning. Separately, ``use_jacobian_stabilization`` cannot run in a one-shot run, i.e. with the one-shot
     ``perform_lambda_correction`` or with ``max_iter`` 1 (a single iteration has no history), and is disabled with a
     warning there, and ``use_exact_jacobian`` needs ``use_jacobian_stabilization`` (the exact spectrum is written
-    through the tracker) and is disabled with a warning without it, as well as with ``rpa.use_rpa_susceptibility``,
-    whose map it does not linearize.
+    through the tracker) and is disabled with a warning without it, as well as in the bare-vertex modes of
+    ``config.misc``, whose map it does not linearize.
 
     :return: None.
     """
@@ -908,11 +966,11 @@ def _resolve_option_exclusivity() -> None:
     if config.self_consistency.max_iter == 1:
         disable_option("use_jacobian_stabilization", "a one-shot run (max_iter 1)")
 
-    if config.rpa.use_rpa_susceptibility and config.stabilization.use_exact_jacobian:
+    if config.misc.bare_vertex and config.stabilization.use_exact_jacobian:
         config.stabilization.use_exact_jacobian = False
         config.logger.warning(
-            "'use_exact_jacobian' linearizes the ladder map, which RPA mode does not run; the exact Jacobian is "
-            "disabled."
+            "'use_exact_jacobian' linearizes the ladder map, which the bare-vertex modes of 'misc' do not run; the "
+            "exact Jacobian is disabled."
         )
 
     if config.stabilization.use_exact_jacobian and not config.stabilization.use_jacobian_stabilization:
@@ -928,6 +986,48 @@ def _resolve_option_exclusivity() -> None:
 
     if config.stabilization.use_chi_phys_restriction and config.stabilization.use_lambda_annealing:
         disable_option("use_lambda_annealing", "use_chi_phys_restriction")
+
+
+def setup_misc_settings() -> None:
+    """
+    Validates and logs the bare-vertex mode of ``config.misc``; ``do_rpa`` and ``do_flex`` exclude each other.
+    RPA mode (``do_rpa``) starts from the non-interacting lattice, one shot with ``max_iter`` 1 and self-consistent
+    RPA otherwise: it takes no lambda correction, susceptibility restriction or lambda annealing (each reshapes the
+    RPA susceptibility, the lambda corrections with the local DMFT susceptibility) and ignores ``previous_sc_path``.
+
+    :return: None.
+    :raises ValueError: If both modes are set, or ``do_rpa`` is set together with a susceptibility scaffold.
+    """
+    misc, logger = config.misc, config.logger
+    if misc.do_rpa and misc.do_flex:
+        raise ValueError("'misc.do_rpa' and 'misc.do_flex' exclude each other; set at most one of them.")
+    if misc.do_flex:
+        logger.info(
+            "FLEX mode: particle-hole FLEX of the RPA susceptibilities, started from DMFT; no three-leg vertex is "
+            "calculated."
+        )
+    if not misc.do_rpa:
+        return
+
+    scaffolds = {
+        "lambda_correction.perform_lambda_correction": config.lambda_correction.perform_lambda_correction,
+        "stabilization.use_lambda_correction": config.stabilization.use_lambda_correction,
+        "stabilization.use_chi_phys_restriction": config.stabilization.use_chi_phys_restriction,
+        "stabilization.use_lambda_annealing": config.stabilization.use_lambda_annealing,
+    }
+    enabled = [name for name, on in scaffolds.items() if on]
+    if enabled:
+        raise ValueError(
+            f"'misc.do_rpa' is RPA of the non-interacting Green's function and takes no {', '.join(enabled)}."
+        )
+    if config.self_consistency.previous_sc_path:
+        logger.warning("'misc.do_rpa' starts from the non-interacting lattice; 'previous_sc_path' is ignored.")
+        config.self_consistency.previous_sc_path = ""
+    run = "once" if config.self_consistency.max_iter == 1 else "self-consistently from there"
+    logger.info(
+        f"RPA mode: the FLEX kernels and pairing vertex on the non-interacting lattice, evaluated {run}; the "
+        "self-energy carries no DMFT part."
+    )
 
 
 def setup_lambda_correction_settings() -> None:

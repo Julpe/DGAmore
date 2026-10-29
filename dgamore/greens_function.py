@@ -291,6 +291,27 @@ def update_mu(
     return mu
 
 
+def non_interacting_mu(ek: np.ndarray, filling: float, beta: float) -> float:
+    r"""
+    Returns the chemical potential at which the non-interacting lattice holds the filling, the root of
+    :math:`\frac{2}{n_{\mathbf{k}}} \sum_{\mathbf{k}b} f(\varepsilon_{b}(\mathbf{k}) - \mu) = n` with the Fermi function
+    :math:`f` and the band energies :math:`\varepsilon_{b}(\mathbf{k})` of the dispersion. The sum is exact, no
+    Matsubara box is truncated.
+
+    :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})` on the whole grid, shape ``[kx, ky, kz, o1, o2]``.
+    :param filling: Total filling :math:`n` over every orbital of the dispersion.
+    :param beta: Inverse temperature :math:`\beta`.
+    :return: The chemical potential :math:`\mu`.
+    """
+    bands = np.linalg.eigvalsh(ek.reshape((-1,) + ek.shape[-2:]))
+
+    def excess(mu: float) -> float:
+        return 2.0 * np.mean(np.sum(0.5 * (1.0 - np.tanh(0.5 * beta * (bands - mu))), axis=-1)) - filling
+
+    margin = 50.0 / beta  # the Fermi function is e^-50 off the band edges, so the interval brackets the root
+    return float(opt.brentq(excess, bands.min() - margin, bands.max() + margin, xtol=1e-14))
+
+
 class GreensFunction(TwoPoint):
     r"""
     The single-particle Green's function :math:`G^{\mathrm{k}}_{12} = [(\imath\nu + \mu)\delta_{12} -

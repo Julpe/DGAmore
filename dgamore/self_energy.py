@@ -92,19 +92,23 @@ class SelfEnergy(TwoPoint):
         """
         return max(int(0.2 * niv), 4)
 
-    def fit_smom(self):
+    def fit_smom(self, n_freq: int | None = None):
         r"""
         Fits the first two high-frequency moments of the (k-averaged) self-energy from the highest stored Matsubara
         frequencies: the constant Hartree shift :math:`\Sigma_\infty` and the :math:`1/\imath\nu` coefficient
-        :math:`\Sigma_1`, see :meth:`_hermitian_moments`. At least four frequencies are used for the fit.
+        :math:`\Sigma_1`, see :meth:`_hermitian_moments`. At least four frequencies are used for the fit unless
+        ``n_freq`` is given; one frequency gives the exact moments of a self-energy whose outermost frequency lies in
+        a shell :math:`\Sigma_\infty - \Sigma_1/\imath\nu`, however short that shell is.
 
+        :param n_freq: Number of the highest positive frequencies the moments are averaged over; ``None`` for the
+            default window (see :meth:`_n_freq_fit`).
         :return: The tuple ``(mom0, mom1)`` of moments, each of shape ``[o1, o2]``.
         """
         # k-average over whatever momenta are stored (full or irreducible BZ, either momentum layout)
         mat_half_v = np.mean(self.mat[..., self.niv :].reshape(-1, self.n_bands, self.n_bands, self.niv), axis=0)
         iv = 1j * MFHelper.vn(self.niv, self._beta, return_only_positive=True)
 
-        n_freq_fit = self._n_freq_fit(self.niv)
+        n_freq_fit = self._n_freq_fit(self.niv) if n_freq is None else n_freq
 
         iwfit = iv[self.niv - n_freq_fit :][None, None, :]  # * np.eye(self.n_bands)[:, :, None]
         fitdata = mat_half_v[..., self.niv - n_freq_fit :]

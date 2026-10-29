@@ -46,10 +46,14 @@ lambda_correction:
   # band count like stabilization.use_lambda_correction above, over which it takes precedence.
   type: "spch" # available types of the single-band scalar lambda correction: 'spch' (both density and magnetic channel) or 'sp' (magnetic channel only)
 
-rpa:
-  use_rpa_susceptibility: False # If True, the non-local step takes the bare interaction as the local irreducible vertex: no three-leg vertex is calculated, the
-  # self-energy kernel and the Eliashberg pairing vertex use the RPA susceptibility ((chi0)^-1 + U_r + V_r)^-1 of the frequency-summed bubble, and the
-  # double-counting kernel subtracts the bare vertex 1/2 (U_d + 3 U_m). No Sigma_DMFT - Sigma_loc term is added (particle-hole FLEX).
+misc:
+  do_flex: False # If True, particle-hole FLEX started from DMFT: the bare interaction is the local irreducible vertex, the self-energy kernel and the Eliashberg
+  # pairing vertex use the RPA susceptibility chi0 (1 + (U_r + V_r) chi0)^-1 of the bubble summed over all frequencies (the box plus its 1/iv^2 tail), the magnetic kernel counts its longitudinal and both transverse
+  # components, the double-counting kernel subtracts the bare vertex 1/2 (U_d + 3 U_m), and no Sigma_DMFT - Sigma_loc term is added.
+  do_rpa: False # If True, multi-orbital RPA from the non-interacting (DFT) Green's function: the channel interactions, kernels and pairing vertex of do_flex
+  # evaluated at Sigma = 0, once with max_iter 1 (G0 in the Eliashberg bubble) or self-consistently from there with max_iter > 1 (the converged G in the
+  # bubble). Beyond the core box the self-energy is its Hartree-Fock term and 1/iv tail, no DMFT part. Takes no lambda correction or susceptibility
+  # scaffold. Excludes do_flex.
 
 dmft_input:
   type: "w2dyn" # Input format. Currently available is 'w2dyn'
@@ -74,7 +78,7 @@ eliashberg:
   symmetry: "random" # Symmetry of the gap function that will be used as a starting point for the ARNOLDI Lanczos. Available: p-wave-x, p-wave-y, d-wave, random
   symmetrize_degenerate_gaps: True # If True, gap functions within (near-)degenerate eigenvalue clusters are orthogonalized (Loewdin) and rotated to the mirror-adapted basis, using the full point-group mirrors (momentum reflection plus the orbital transformation solved for from H(k)); multiplets the coordinate mirrors cannot split keep the Loewdin basis.
   resolve_degenerate_multiplets: False # If True, sectors in which the lattice symmetry forces degenerate multiplets (p-wave doublets of a square lattice, triplets of a cubic one) are solved with a block Krylov-Schur iteration that finds every partner, at the cost of more operator applications; otherwise a partner can occasionally be missing.
-  resolve_frequency_parity: True # If True, project each channel's gap onto its physical frequency-even and frequency-odd sectors (paired momentum-orbital parity fixed by Pauli) and return both; if False, return the overall leading eigenpairs unprojected.
+  resolve_parity_sectors: True # If True, solve each channel in its two exact parity sectors (inversion parity with the orbital action of inversion; 'even'/'odd' is the frequency parity for one band) and report every gap's even- and odd-frequency weights; switched off with a warning where inversion is no symmetry. If False, return the overall leading eigenpairs unprojected.
   subfolder_name: "Eliashberg" # name for the subfolder where certain outputs are generated
 
 self_energy_interpolation:

@@ -32,7 +32,7 @@ import dgamore.mpi_utils as mpi_utils
 from dgamore.brillouin_zone import KGrid
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.four_point import FourPoint
-from dgamore.greens_function import GreensFunction, orbital_block, update_mu
+from dgamore.greens_function import GreensFunction, non_interacting_mu, orbital_block, update_mu
 from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.jacobian_stabilization import (
     JACOBIAN_FILE,
@@ -50,6 +50,7 @@ from dgamore.memory_estimator import SLICE_CHUNK_BYTES
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import DTYPE, SpinChannel, deferred_collection
 from dgamore.self_energy import SelfEnergy
+from dgamore.two_point import TwoPoint
 
 _JACOBIAN_ROW_WIDTH = TRACKER_PAIRS - 1  # Ritz values per row of the traces: every value an estimate can have
 _FIRST_FREQUENCY_RATIO = 2.0  # w_1 over static compound norm of chi_phys above which the loop warns of a pole
@@ -444,8 +445,69 @@ def _monitor_chi_phys(chi_phys_q_r: FourPoint, mpi_dist_irrq: MpiDistributor) ->
         config.logger.warning(
             f"The physical susceptibility ({channel}) at the first bosonic frequency exceeds its static value "
             f"(largest compound norm {norm_w1:.3f} against {norm_w0:.3f}): a bosonic susceptibility decreases with "
-            "|w|, so the ladder has a pole at w_1 the static monitor cannot see, and the iteration may be heading "
-            "to an unphysical fixed point."
+            "|w|, so it has crossed a pole, the static one where its lowest static eigenvalue is negative, else one at "
+            "w_1 the static monitor cannot see, and the iteration may be heading to an unphysical fixed point."
+        )
+
+
+def static_stoner_factor(
+    gchi0_q_sum: FourPoint, u_loc: LocalInteraction, v_nonloc: Interaction, channel: SpinChannel
+) -> float:
+    r"""
+    Returns the static Stoner factor of a channel, the largest eigenvalue of :math:`-(U_{r} + V^{\mathbf{q}}_{r})
+    \chi^{(\mathbf{q},\omega=0)}_{0}` over the rank-local momenta. The RPA susceptibility (see
+    :func:`create_rpa_susceptibility`) has its static pole where the factor reaches 1.
+
+    :param gchi0_q_sum: The frequency-summed bare bubble in the half bosonic frequency range.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :param channel: Spin channel, i.e. density or magnetic.
+    :return: The largest real part of the eigenvalues, ``-inf`` when the object stores no momentum.
+    """
+    product = (v_nonloc.as_channel(channel) + u_loc.as_channel(channel)) @ gchi0_q_sum.take_wn_slice(0, 1)
+    n = gchi0_q_sum.n_bands**2
+    blocks = product.mat[..., 0].transpose(0, 1, 2, 4, 3).reshape(-1, n, n)
+    if blocks.shape[0] == 0:
+        return -np.inf
+    return float(np.linalg.eigvals(-blocks).real.max())
+
+
+def _monitor_stoner_factor(
+    gchi0_q_sum: FourPoint,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    channel: SpinChannel,
+    mpi_dist_irrq: MpiDistributor,
+    annealer: "LambdaAnnealer | None" = None,
+) -> None:
+    r"""
+    Logs the static Stoner factor of a channel (:func:`static_stoner_factor`), reduced over the ranks, and warns when
+    it reaches 1 while no lambda correction, restriction or annealer moves the pole: the RPA susceptibility is then
+    past its pole, and the self-energy and pairing vertex built from it are unphysical.
+
+    :param gchi0_q_sum: The frequency-summed bare bubble in the half bosonic frequency range (rank-local momenta).
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :param channel: Spin channel, i.e. density or magnetic.
+    :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :param annealer: The active :class:`LambdaAnnealer`, or ``None`` when annealing is off.
+    :return: None.
+    """
+    factor = static_stoner_factor(gchi0_q_sum, u_loc, v_nonloc, channel)
+    if mpi_dist_irrq.comm.size > 1:
+        factor = mpi_dist_irrq.comm.allreduce(factor, op=MPI.MAX)
+    config.logger.info(f"Static Stoner factor ({channel.value}): {factor:.6f}.")
+    moved = (
+        annealer is not None
+        or config.stabilization.use_chi_phys_restriction
+        or config.stabilization.use_lambda_correction
+        or config.lambda_correction.perform_lambda_correction
+    )
+    if factor >= 1 and not moved:
+        config.logger.warning(
+            f"The static Stoner factor ({channel.value}), the largest eigenvalue of -(U_r + V_r(q)) chi_0(q, w=0), "
+            f"is {factor:.3f}: the RPA susceptibility is past its pole, and the self-energy and pairing vertex built "
+            "from it are unphysical."
         )
 
 
@@ -736,34 +798,73 @@ def perform_ornstein_zernike_fit(chi_phys_q_r: FourPoint) -> None:
     np.savetxt(path, data_to_save, delimiter=",", fmt="%d %d %d %d %.9f %.9f", header="o1 o2 o3 o4 A xi")
 
 
+def create_bubble_tail(n_bands: int, niw: int, niv: int, beta: float) -> LocalFourPoint:
+    r"""
+    Returns the part of the frequency-summed bare bubble :math:`\chi^{\mathrm{q}}_{0;1234} = -\frac{1}{\beta}
+    \frac{1}{n_{\mathbf{k}}} \sum_{\mathrm{k}} G^{\mathrm{k}}_{14} G^{\mathrm{k}-\mathrm{q}}_{32}` that the box
+    :math:`\nu \in [-\mathrm{niv}, \mathrm{niv})` of
+    :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_q_fft` leaves out, to the leading order
+    :math:`G^{\mathrm{k}}_{12} \simeq \delta_{12} / i\nu` of the Green's function at large frequency,
+
+    .. math:: \delta_{14} \delta_{23}\, T(\omega), \qquad T(\omega) = \frac{1}{\beta} \sum_{\nu \notin \mathrm{box}}
+        \frac{1}{\nu (\nu - \omega)} = \frac{\beta}{4} \delta_{\omega 0} - \frac{1}{\beta} \sum_{\nu \in \mathrm{box}}
+        \frac{1}{\nu (\nu - \omega)},
+
+    since the sum over all :math:`\nu` is :math:`\beta/4` at :math:`\omega = 0` and vanishes at every other bosonic
+    frequency. This order is momentum independent and the same for every Green's function; for :math:`\omega` well
+    inside the box the next one carries the dispersion and the self-energy and falls off as
+    :math:`(\beta/\mathrm{niv})^3`, while towards the box edge the left-out :math:`\nu` reach
+    :math:`\nu \approx \omega`, where :math:`G^{\mathrm{k}-\mathrm{q}}` is far from its asymptote, and the error stays
+    of first order. Without the tail the box sum is short by about :math:`\beta / (2 \pi^2 \mathrm{niv})` on these
+    elements, which keeps an RPA susceptibility away from its Stoner pole.
+
+    :param n_bands: Number of orbitals of the bubble.
+    :param niw: Number of positive bosonic frequencies.
+    :param niv: Number of positive fermionic frequencies.
+    :param beta: Inverse temperature :math:`\beta`.
+    :return: The tail as a :class:`LocalFourPoint` without fermionic frequency in the half bosonic range, to be added
+        to the box-summed bubble.
+    """
+    nu = MFHelper.vn(niv, float(beta))
+    w = MFHelper.wn(niw, float(beta), return_only_positive=True)
+    tail = np.where(w == 0, beta / 4, 0.0) - np.sum(1.0 / (nu * (nu - w[:, None])), axis=-1) / beta
+    eye = np.eye(n_bands)
+    return LocalFourPoint(np.einsum("ad,bc,w->abcdw", eye, eye, tail), SpinChannel.NONE, 1, 0, False)
+
+
 def create_rpa_susceptibility(
-    gchi0_q_sum_inv: FourPoint, u_loc: LocalInteraction, v_nonloc: Interaction, channel: SpinChannel
+    gchi0_q_sum: FourPoint, u_loc: LocalInteraction, v_nonloc: Interaction, channel: SpinChannel
 ) -> FourPoint:
     r"""
-    Returns the RPA susceptibility :math:`\chi^{\mathrm{q}}_{r;\mathrm{RPA}} = ((\chi^{\mathrm{q}}_{0})^{-1} + U_{r} +
-    V^{\mathbf{q}}_{r})^{-1}` of a channel from the inverse of the frequency-summed bubble :math:`\chi^{\mathrm{q}}_{0}
-    = \frac{1}{\beta^2} \sum_{\nu} \chi^{\mathrm{q}\nu}_{0}`, the form the shell-corrected physical susceptibility takes
-    (see :func:`create_generalized_chi_q_with_shell_correction`).
+    Returns the RPA susceptibility :math:`\chi^{\mathrm{q}}_{r;\mathrm{RPA}} = \chi^{\mathrm{q}}_{0} (1 + (U_{r} +
+    V^{\mathbf{q}}_{r}) \chi^{\mathrm{q}}_{0})^{-1}` of a channel from the frequency-summed bubble
+    :math:`\chi^{\mathrm{q}}_{0} = \frac{1}{\beta^2} \sum_{\nu} \chi^{\mathrm{q}\nu}_{0}`. Where the bubble is
+    invertible this is :math:`((\chi^{\mathrm{q}}_{0})^{-1} + U_{r} + V^{\mathbf{q}}_{r})^{-1}`, the form the
+    shell-corrected physical susceptibility takes (see :func:`create_generalized_chi_q_with_shell_correction`). The
+    bubble itself is never inverted: summed over all frequencies it is singular where a density is conserved, at
+    :math:`\mathbf{q} = 0` and :math:`\omega \neq 0`.
 
-    :param gchi0_q_sum_inv: The inverse of the frequency-summed bare bubble over the full box.
+    :param gchi0_q_sum: The frequency-summed bare bubble.
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
     :param channel: Spin channel of the susceptibility, i.e. density or magnetic.
     :return: The RPA susceptibility as a :class:`FourPoint` in ``channel``.
     """
-    u_r = u_loc.as_channel(channel) + v_nonloc.as_channel(channel)
-    return (gchi0_q_sum_inv + u_r).invert(False).set_channel(channel)
+    u_r = v_nonloc.as_channel(channel) + u_loc.as_channel(channel)
+    eye = np.eye(gchi0_q_sum.n_bands)
+    dressing = (u_r @ gchi0_q_sum).add(LocalInteraction(np.einsum("ad,bc->abcd", eye, eye)), copy=False)
+    return (gchi0_q_sum @ dressing.invert(False)).set_channel(channel)
 
 
 def calculate_and_save_chi_q_r_rpa(
     gchi0_q_full_sum: FourPoint, u_loc: LocalInteraction, v_nonloc: Interaction, mpi_dist_irrk: MpiDistributor
 ):
     r"""
-    Calculates and saves the RPA susceptibility (for both density and magnetic channels) from the DMFT Green's
-    functions, :math:`\chi^{\mathrm{q}}_{r;\mathrm{RPA}} = ((\chi^{\mathrm{q}}_{0})^{-1} + U_{r} +
-    V^{\mathbf{q}}_{r})^{-1}` with the frequency-summed bubble :math:`\chi^{\mathrm{q}}_{0} = \frac{1}{\beta^2}
-    \sum_{\nu} \chi^{\mathrm{q}\nu}_{0}`, the form the shell-corrected physical susceptibility takes (see
-    :func:`create_generalized_chi_q_with_shell_correction`). The result is gathered to rank 0 and written to file.
+    Calculates and saves the RPA susceptibility (for both density and magnetic channels) of the frequency-summed bubble
+    :math:`\chi^{\mathrm{q}}_{0} = \frac{1}{\beta^2} \sum_{\nu} \chi^{\mathrm{q}\nu}_{0}`,
+    :math:`\chi^{\mathrm{q}}_{r;\mathrm{RPA}} = \chi^{\mathrm{q}}_{0} (1 + (U_{r} + V^{\mathbf{q}}_{r})
+    \chi^{\mathrm{q}}_{0})^{-1}` (see :func:`create_rpa_susceptibility`). The result is gathered to rank 0 and written
+    to file.
 
     :param gchi0_q_full_sum: The frequency-summed bare bubble over the full box.
     :param u_loc: The bare local interaction :math:`U`.
@@ -771,9 +872,8 @@ def calculate_and_save_chi_q_r_rpa(
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :return: None.
     """
-    gchi0_q_sum_inv = gchi0_q_full_sum.invert()
     for channel in [SpinChannel.DENS, SpinChannel.MAGN]:
-        chi_rpa_q_r = create_rpa_susceptibility(gchi0_q_sum_inv, u_loc, v_nonloc, channel)
+        chi_rpa_q_r = create_rpa_susceptibility(gchi0_q_full_sum, u_loc, v_nonloc, channel)
         chi_rpa_q_r.mat = mpi_dist_irrk.gather(chi_rpa_q_r.mat)
 
         if mpi_dist_irrk.my_rank == 0:
@@ -781,7 +881,6 @@ def calculate_and_save_chi_q_r_rpa(
 
         chi_rpa_q_r.free()
         config.logger.info(f"Calculated RPA susceptibility ({channel.value}).")
-    gchi0_q_sum_inv.free()
 
 
 def _select_and_apply_lambda_correction(chi_phys_q_r: FourPoint, lambda_previous: dict | None = None) -> FourPoint:
@@ -1403,6 +1502,53 @@ def _run_column_sde(
     return stream.finish(0)
 
 
+def _sde_tail_moment(kernel: FourPoint, mpi_dist_irrk: MpiDistributor) -> np.ndarray | None:
+    r"""
+    Returns the coefficient :math:`\Sigma_{1}` of :math:`-1/\imath\nu` that the contraction of :func:`_run_column_sde`
+    approaches for a kernel without fermionic frequency where the Green's function falls off as
+    :math:`\delta_{ab}/\imath\nu`,
+
+    .. math:: \Sigma_{1;12} = \frac{1}{2\beta n_{\mathbf{q}}} \sum_{\mathrm{q}} \sum_{a} K^{\mathrm{q}}_{a12a},
+
+    with the momentum sum over the full BZ, unfolded as in the contraction one bosonic frequency at a time on rank 0,
+    and the bosonic sum over the contraction's box, its negative half the conjugate of the positive one at
+    :math:`\mathbf{R} = 0` (time reversal, see :class:`_ColumnSdeStream`). The partial trace is taken before the
+    unfold: under it :math:`T_{12} = \sum_{a} K_{a12a}` goes to :math:`U^{*} T U^{T}` (the unfold keeps no
+    anti-symmetry), so :math:`T^{T}` unfolds as a two-index object, :math:`n_{\mathrm{o}}^{2}` numbers per momentum
+    instead of :math:`n_{\mathrm{o}}^{4}`.
+
+    :param kernel: The rank-local irreducible-BZ kernel ``[q, o1, o2, o3, o4, w]`` (half bosonic range, no fermionic
+        axis, compressed momentum axis); only read.
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :return: :math:`\Sigma_{1}`, shape ``[o1, o2]``, on rank 0; ``None`` elsewhere.
+    """
+    k_grid, moment = config.lattice.k_grid, None
+    for w in range(kernel.current_shape[-1]):
+        trace = sum(kernel.mat[:, a, :, :, a, w] for a in range(kernel.n_bands))
+        column = mpi_dist_irrk.gather(trace.swapaxes(1, 2)[..., None])
+        if column is None:
+            continue
+        full = TwoPoint(column, config.lattice.nk, False, True).map_to_full_bz(k_grid)
+        local = full.mat[..., 0].sum(axis=0).T / k_grid.nk_tot
+        contribution = local if w == 0 else local + local.conj()
+        moment = contribution if moment is None else moment + contribution
+    return None if moment is None else moment / (2.0 * config.sys.beta)
+
+
+def _rpa_shell_donor(moment: np.ndarray, niv: int) -> SelfEnergy:
+    r"""
+    Returns the momentum-local shell donor of RPA mode on ``niv`` positive frequencies, the tail
+    :math:`-\Sigma_{1}/\imath\nu` of its self-energy; the tail's constant, the Hartree-Fock term, enters as the shell
+    offset (see :meth:`SelfEnergy.concatenate_self_energies`).
+
+    :param moment: The coefficient :math:`\Sigma_{1}`, shape ``[o1, o2]`` (see :func:`_sde_tail_moment`).
+    :param niv: Number of positive fermionic frequencies.
+    :return: The donor :class:`SelfEnergy` (one momentum, full fermionic range, moments not fitted).
+    """
+    iv = 1j * MFHelper.vn(niv, config.sys.beta)
+    return SelfEnergy((-moment[..., None] / iv)[None, None, None], calc_smom=False, beta=config.sys.beta)
+
+
 def _sde_chunk_budget(comm: MPI.Comm, shared_node_comm) -> int:
     r"""
     Returns the chunk byte budget of the self-energy section, identical on every rank: each rank derives its node's
@@ -1964,9 +2110,9 @@ def calculate_sigma_proposal(
     with the three-leg vertex on the first external orbital and the interaction on the second, time reversal maps it
     onto the mirrored form, and the average is the two-sided equation. One band needs no average, its one-sided
     equation already obeys time reversal. An orbital permutation that transposes the dispersion (see
-    :func:`_orbital_involution`) reaches the Bethe-Salpeter slices of both channels. With
-    ``config.rpa.use_rpa_susceptibility`` no local vertex is loaded and no Bethe-Salpeter slice is solved: the
-    double-counting kernel takes the bare vertex (see :func:`calculate_bare_dc_kernel`) and each channel the RPA
+    :func:`_orbital_involution`) reaches the Bethe-Salpeter slices of both channels. In the bare-vertex modes
+    (``config.misc.do_flex``, ``config.misc.do_rpa``) no local vertex is loaded and no Bethe-Salpeter slice is solved:
+    the double-counting kernel takes the bare vertex (see :func:`calculate_bare_dc_kernel`) and each channel the RPA
     kernel of its RPA susceptibility (see :func:`calculate_rpa_kernel_r_q`), treated like the ladder's (see
     :func:`_finish_physical_susceptibility`); both carry no fermionic frequency until the contraction.
 
@@ -1983,8 +2129,7 @@ def calculate_sigma_proposal(
     :param v_nonloc_full: The non-local interaction on the full q-grid (for the Hartree/Fock term); only read on
         rank 0.
     :param sigma_dmft: The DMFT self-energy (cut to the loop's niv), providing the high-frequency tail.
-    :param delta_sigma: The DMFT-minus-local noise-removal term on the core box (zero with
-        ``config.rpa.use_rpa_susceptibility``).
+    :param delta_sigma: The DMFT-minus-local noise-removal term on the core box (zero in the bare-vertex modes).
     :param my_irr_q_list: This rank's irreducible q-point list.
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param comm: The MPI communicator.
@@ -1995,8 +2140,8 @@ def calculate_sigma_proposal(
     :param chunk_budgets: Chunk byte budgets, of which the self-energy contraction reads its own (sized by the driver
         from the memory estimate); ``None`` gives it the job-wide fair-share budget of :func:`_sde_chunk_budget`.
     :param save_eliashberg: Whether to write this rank's Eliashberg intermediates (inverse bubble, three-leg vertices,
-        physical susceptibilities; in RPA mode the physical susceptibilities only); the loop asks for it in its last
-        scheduled iteration.
+        physical susceptibilities; in the bare-vertex modes the physical susceptibilities only); the loop asks for it
+        in its last scheduled iteration.
     :param eliashberg_only: Whether to stop after the two channel kernels: the double-counting kernel and the SDE are
         skipped and ``None`` is returned on every rank (the pass after a loop that converged before its last
         iteration).
@@ -2035,9 +2180,9 @@ def calculate_sigma_proposal(
 
     # the local vertices are identical on every rank, so they are loaded once per node into shared windows; the
     # double-counting kernel only enters the SDE, which the Eliashberg-only pass skips
-    rpa = config.rpa.use_rpa_susceptibility
-    dc_contraction = None
-    if not eliashberg_only and not rpa:
+    bare_vertex = config.misc.bare_vertex
+    dc_contraction = tail_moment = None
+    if not eliashberg_only and not bare_vertex:
         f_dc_loc, f_dc_win = _load_node_shared_local_vertex(
             shared_node_comm,
             os.path.join(config.output.output_path, "f_dc_loc.npy"),
@@ -2052,23 +2197,29 @@ def calculate_sigma_proposal(
 
     gchi0_q_full_sum = gchi0_q.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
     chunk_bytes = _sde_chunk_budget(comm, shared_node_comm) if chunk_budgets is None else chunk_budgets.sde
-    if rpa:
+    if bare_vertex:
         gchi0_q.free()
+        # the RPA susceptibility needs the whole frequency sum of the bubble, so the box sum gets its tail
+        tail = create_bubble_tail(gchi0_q_full_sum.n_bands, config.box.niw_core, config.box.niv_full, config.sys.beta)
+        gchi0_q_full_sum.add(tail, copy=False)
         # the bare-vertex kernels do not depend on the fermionic frequency, so they get its axis only for the SDE
         kernel = None if eliashberg_only else calculate_bare_dc_kernel(gchi0_q_full_sum, u_loc)
         if current_iter == 1:
             calculate_and_save_chi_q_r_rpa(gchi0_q_full_sum, u_loc, v_nonloc, mpi_dist_irrk)
-        gchi0_q_sum_inv = gchi0_q_full_sum.invert()
-        gchi0_q_full_sum.free()
         for channel, weight in ((SpinChannel.DENS, 1.0), (SpinChannel.MAGN, 3.0)):
-            chi_q_r = create_rpa_susceptibility(gchi0_q_sum_inv, u_loc, v_nonloc, channel)
+            _monitor_stoner_factor(gchi0_q_full_sum, u_loc, v_nonloc, channel, mpi_dist_irrk, annealer)
+            chi_q_r = create_rpa_susceptibility(gchi0_q_full_sum, u_loc, v_nonloc, channel)
             chi_q_r = _finish_physical_susceptibility(
                 chi_q_r, mpi_dist_irrk, annealer, save_eliashberg, lambda_previous
             )
             if kernel is not None:
                 kernel.add(calculate_rpa_kernel_r_q(chi_q_r, v_nonloc, u_loc).scale(weight), copy=False)
             logger.info(f"Calculated RPA kernel for {channel.value} channel.")
-        gchi0_q_sum_inv.free()
+        gchi0_q_full_sum.free()
+        # RPA mode pads its proposal with its own tail, whose 1/iv coefficient comes from the kernel before its
+        # fermionic axis
+        if kernel is not None and config.misc.do_rpa:
+            tail_moment = _sde_tail_moment(kernel, mpi_dist_irrk)
         if kernel is not None:
             kernel = kernel.repeat_over_vn(config.box.niv_core, 1)
     else:
@@ -2194,7 +2345,13 @@ def calculate_sigma_proposal(
     # This is done to minimize noise. We remove some fluctuations from dmft that are included in the local self-energy
     # calculated in this code and add the smooth dmft self-energy
     sigma_prop += delta_sigma
-    sigma_prop = sigma_prop.concatenate_self_energies(sigma_dmft, shell_offset=hf_v)
+    if config.misc.do_rpa:
+        # RPA mode carries no DMFT self-energy: its shell is the whole Hartree-Fock term and the kernels' 1/iv tail
+        sigma_prop = sigma_prop.concatenate_self_energies(
+            _rpa_shell_donor(tail_moment, sigma_dmft.niv), shell_offset=(hartree + fock)[..., 0]
+        )
+    else:
+        sigma_prop = sigma_prop.concatenate_self_energies(sigma_dmft, shell_offset=hf_v)
     # the one-sided SDE breaks Sigma(-k) = Sigma(k)^T for several orbitals; the average is the two-sided SDE
     if sigma_prop.n_bands > 1 and _has_time_reversal(config.lattice.hamiltonian.get_ek()):
         removed = sigma_prop.symmetrize_time_reversal()
@@ -2270,7 +2427,8 @@ def _relative_core_residual(new_core: np.ndarray, old_core: np.ndarray) -> float
     \Sigma_{\mathrm{old}})\rVert / \lVert\mathrm{Im}\,\Sigma_{\mathrm{old}}\rVert\big)` over all momenta, orbitals and
     frequencies of the window. Each part is measured against its own norm, so a change in the smaller part is not
     hidden by the larger one; a part whose norm vanishes is measured against :math:`\lVert\Sigma_{\mathrm{old}}\rVert`
-    instead. A local (single-k) old window is broadcast against a full-BZ new one.
+    instead, and a vanishing old window has no relative residual (infinite). A local (single-k) old window is
+    broadcast against a full-BZ new one.
 
     :param new_core: The positive core window of the new self-energy.
     :param old_core: The positive core window the residual is measured against.
@@ -2281,6 +2439,8 @@ def _relative_core_residual(new_core: np.ndarray, old_core: np.ndarray) -> float
     diff = new_core - old_core
     old_re, old_im = np.linalg.norm(old_core.real), np.linalg.norm(old_core.imag)
     old_full = np.hypot(old_re, old_im)
+    if not old_full:
+        return float("inf")
     return float(
         max(np.linalg.norm(diff.real) / (old_re or old_full), np.linalg.norm(diff.imag) / (old_im or old_full))
     )
@@ -2656,12 +2816,16 @@ def calculate_self_energy_q(
     :meth:`~dgamore.jacobian_stabilization.JacobianTracker.minimum_iterations` (capped by ``max_iter``), and a
     convergence below the count of the whole certified spectrum (in-band modes counted with the band) is warned about.
 
+    With ``config.misc.do_rpa`` the run starts from the non-interacting lattice instead of the DMFT self-energy: the
+    filling of the DMFT lattice is the target, the chemical potential at which a zero self-energy holds it is stored in
+    ``config.sys.mu_non_interacting``, and the proposals are evaluated from there.
+
     :param comm: The MPI communicator.
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` on the full q-grid; only read on rank 0.
     :param sigma_dmft: The DMFT self-energy (used as the starting point and for the shell/tail correction).
     :param sigma_local: The locally recomputed self-energy (used for smoothing out the DGA :class:`SelfEnergy`; not
-        read with ``config.rpa.use_rpa_susceptibility``).
+        read in the bare-vertex modes).
     :param chunk_budgets: Chunk byte budgets, of which the self-energy contraction reads its own (sized by the driver
         from the memory estimate); ``None`` gives it the job-wide fair-share budget of :func:`_sde_chunk_budget`.
     :return: The converged (or last-iteration) momentum-dependent DGA :class:`SelfEnergy` on rank 0; ``None`` on every
@@ -2728,11 +2892,13 @@ def calculate_self_energy_q(
     # the DMFT lattice Green's function on the whole DMFT box is built only for the DMFT spectrum continuation; a warm
     # start holds its filling, which is summed without building it
     if comm.rank == 0 and config.ana_cont.do_spectrum_dmft:
+        logger.info("Calculating lattice Green's function.")
         giwk_full_dmft = GreensFunction.get_g_full(
             sigma_dmft_full, config.sys.mu_dmft, ek, config.sys.beta, orbitals=orbitals
         )
         giwk_full_dmft.save(output_dir=config.output.output_path, name="g_latt_dmft")
         giwk_full_dmft.free()
+        logger.info("Lattice Green's function calculated.")
     if comm.rank == 0 and starting_iter > 0:
         n_dmft = GreensFunction.get_occupation(
             sigma_dmft_full, config.sys.mu_dmft, ek, config.sys.beta, orbitals=orbitals
@@ -2755,6 +2921,30 @@ def calculate_self_energy_q(
             else np.zeros((0, 1, 1, nb, nb))
         )
         config.sys.n, config.sys.occ, config.sys.occ_k = _assemble_occupation(occ_k_my, mpi_dist_fullbz, orbitals)
+        if config.misc.do_rpa:
+            # RPA mode evaluates its one proposal on the non-interacting lattice: a zero self-energy (new, so its
+            # fitted moments vanish too) at the chemical potential at which it holds the filling just assembled
+            sigma_old = SelfEnergy(
+                np.zeros_like(sigma_old.mat),
+                sigma_old.nq,
+                sigma_old.full_niv_range,
+                sigma_old.has_compressed_q_dimension,
+                beta=config.sys.beta,
+            )
+            mu_history[-1] = comm.bcast(non_interacting_mu(ek, config.sys.n, config.sys.beta), root=0)
+            config.sys.mu = config.sys.mu_non_interacting = mu_history[-1]
+            occ_k_my = (
+                GreensFunction.get_occupation(
+                    sigma_old, mu_history[-1], ek_my, config.sys.beta, real_ek, orbitals=orbitals
+                )[2]
+                if n_my
+                else np.zeros((0, 1, 1, nb, nb))
+            )
+            n_bare, config.sys.occ, config.sys.occ_k = _assemble_occupation(occ_k_my, mpi_dist_fullbz, orbitals)
+            logger.info(
+                f"RPA mode starts from the non-interacting lattice: mu = {config.sys.mu} gives the filling "
+                f"{n_bare:.6f} (target {config.sys.n:.6f})."
+            )
     else:
         # a warm start's own filling drifts along a chain of rungs, so mu is re-solved for the DMFT lattice filling on
         # the loop's frequency box, every rank on its momenta of rank 0's starting iterate
@@ -2804,8 +2994,8 @@ def calculate_self_energy_q(
     if starting_iter > 0 and sc_node_comm is not None:
         sigma_old, sigma_win = _share_sigma_per_node(sigma_old, comm, sc_node_comm, sc_roots_comm)
 
-    # RPA mode adds no noise-removal term: its self-energy is the particle-hole FLEX one of the RPA kernels alone
-    reference = sigma_dmft if config.rpa.use_rpa_susceptibility else sigma_local
+    # the bare-vertex modes add no noise-removal term: their self-energy is the one of their RPA kernels alone
+    reference = sigma_dmft if config.misc.bare_vertex else sigma_local
     delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - reference.cut_niv(config.box.niv_core)
 
     # only rank 0 finishes the proposal with the Hartree-Fock term, which reads the full q-grid interaction
@@ -2822,8 +3012,8 @@ def calculate_self_energy_q(
     exact_args = (u_loc, v_nonloc, v_nonloc_full, sigma_dmft_full, mpi_dist_irrk, mpi_dist_fullbz, comm, chunk_budgets)
 
     annealer = LambdaAnnealer() if config.stabilization.use_lambda_annealing else None
-    # the pole ratio watches the density Bethe-Salpeter slices, which RPA mode does not solve
-    pole_vertex = first_frequency_local_vertex() if comm.rank == 0 and not config.rpa.use_rpa_susceptibility else None
+    # the pole ratio watches the density Bethe-Salpeter slices, which the bare-vertex modes do not solve
+    pole_vertex = first_frequency_local_vertex() if comm.rank == 0 and not config.misc.bare_vertex else None
     # one dict for the whole run warm-starts every channel's search from the previous iteration's lambda
     lambda_previous = None
     if config.stabilization.use_lambda_correction and not config.lambda_correction.perform_lambda_correction:
@@ -2903,7 +3093,11 @@ def calculate_self_energy_q(
 
         # only rank 0 mixes and measures the residual, so only rank 0 keeps a private copy of the previous iterate
         # (the cut copies everything still needed from the previous iteration's shared sigma buffer)
-        shell_offset = sigma_old.shell_offset_from(sigma_dmft) if comm.rank == 0 else None
+        donor = sigma_dmft
+        if comm.rank == 0 and config.misc.do_rpa:
+            # RPA mode pads with its own tail again, whose moments the outermost frequency holds exactly
+            donor = _rpa_shell_donor(sigma_old.fit_smom(n_freq=1)[1], sigma_dmft.niv)
+        shell_offset = sigma_old.shell_offset_from(donor) if comm.rank == 0 else None
         sigma_old = sigma_old.cut_niv(config.box.niv_core) if comm.rank == 0 else None
         _free_shared_window(sigma_win, sc_node_comm)
         sigma_win = None
@@ -2914,9 +3108,9 @@ def calculate_self_energy_q(
         # ranks once per node through a shared window instead of once per rank
         damped_step = False
         if comm.rank == 0:
-            sigma_old = sigma_old.concatenate_self_energies(sigma_dmft, shell_offset=shell_offset)
+            sigma_old = sigma_old.concatenate_self_energies(donor, shell_offset=shell_offset)
             if config.stabilization.use_jacobian_stabilization:
-                # the record of the pairs the tracker reads: the core window, the rest is the DMFT tail and its offset
+                # the record of the pairs the tracker reads: the core window, the rest is the shell tail and its offset
                 _save_sigma_iteration(sigma_new.cut_niv(config.box.niv_core), "sigma_dga_proposal", current_iter)
 
             mixed = apply_mixing_strategy(sigma_new, sigma_old, history_cap, mixing_history, tracker)
@@ -2932,15 +3126,18 @@ def calculate_self_energy_q(
             _relative_sigma_residual(sigma_new, sigma_old.compress_q_dimension()) if comm.rank == 0 else None
         )
 
-        # every rank solves mu on its momenta of the shared sigma; the moment is fitted on rank 0 alone
+        # every rank solves mu on its momenta of the shared sigma; the moments are fitted on rank 0 alone, in RPA mode
+        # from the outermost frequency, where its shell holds them exactly however short the shell is
         old_mu = mu_history[-1]
+        n_freq = 1 if config.misc.do_rpa else None
+        smom0, smom1 = comm.bcast(sigma_new.fit_smom(n_freq) if comm.rank == 0 else None, root=0)
         config.sys.mu = update_mu(
             old_mu,
             config.sys.n,
             config.lattice.hamiltonian.get_ek(),
             sigma_new.mat[mpi_dist_fullbz.my_slice],
             config.sys.beta,
-            comm.bcast(sigma_new.fit_smom()[0] if comm.rank == 0 else None, root=0),
+            smom0,
             logger=logger,
             mpi_dist=mpi_dist_fullbz,
             orbitals=config.sys.correlated_orbitals,
@@ -2948,10 +3145,11 @@ def calculate_self_energy_q(
         mu_history.append(config.sys.mu)
         logger.info(f"Updated mu from {old_mu} to {config.sys.mu}.")
 
-        # new occupation matrix and energies from the new Green's function (outside the asympt region it is the
-        # DMFT lattice Green's function); k-distributed, so no rank builds the whole DMFT-box Green's function
+        # new occupation matrix and energies from the new Green's function (outside the asympt region its shell is the
+        # donor's: DMFT, or RPA mode's own tail); k-distributed, so no rank builds the whole DMFT-box Green's function
+        donor = _rpa_shell_donor(smom1, sigma_dmft_full.niv) if config.misc.do_rpa else sigma_dmft_full
         n_current, config.sys.occ, config.sys.occ_k, ekin, epot = _update_occ_and_energies_distributed(
-            sigma_new, sigma_dmft_full, mpi_dist_fullbz, config.sys.mu
+            sigma_new, donor, mpi_dist_fullbz, config.sys.mu
         )
         logger.info(f"Filling of the updated Green's function: {n_current:.6f} (target {config.sys.n:.6f}).")
         logger.info(f"Kinetic energy: {ekin:.4f} [t or eV].")

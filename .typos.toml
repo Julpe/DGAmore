@@ -12,6 +12,8 @@ extend-ignore-words-re = [
     "BSE",
     "gam",
     "mis",
+    # the gap's sector parity T O_U (frequency flip times orbital exchange), labeled TOU in gap_parity.txt
+    "TOU",
     # numpy exposes the array flag as ``arr.flags.writeable``; not a typo.
     "writeable"
 ]

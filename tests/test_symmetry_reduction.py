@@ -15,7 +15,7 @@ import pytest
 from unittest.mock import MagicMock
 
 import dgamore.symmetry_reduction as sr
-from tests.conftest import emery_hk, p_orbital_hk
+from tests.conftest import bilayer_chain_hk, chain_without_inversion_hk, emery_hk, p_orbital_hk, site_lattice_hk
 
 
 def test_enumerate_integer_matrices_returns_only_gl3z_matrices():
@@ -1426,6 +1426,183 @@ def test_coordinate_mirror_matrix_flips_only_the_requested_axis():
         M = sr._coordinate_mirror_matrix(axis)
         assert M.dtype == np.int64
         assert np.array_equal(M, np.diag([-1 if i == axis else 1 for i in range(3)]))
+
+
+def _inverted(H: np.ndarray) -> np.ndarray:
+    """H(-k) on the periodic grid of H [nx, ny, nz, o, o]."""
+    return np.roll(np.flip(H, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+
+
+def test_find_inversion_orbital_unitary_returns_the_layer_swap_of_a_bilayer():
+    """Inversion of a bilayer with interlayer hopping into the next cell acts as the layer swap."""
+    H = bilayer_chain_hk(6)
+    u = sr.find_inversion_orbital_unitary(H)
+
+    assert not np.allclose(_inverted(H), H)
+    assert _matches_up_to_global_sign(u, np.array([[0.0, 1.0], [1.0, 0.0]]))
+    assert np.allclose(_inverted(H), np.einsum("ij,...jk,lk->...il", u, H, u.conj()), atol=1e-10)
+
+
+def test_find_inversion_orbital_unitary_returns_the_identity_for_inversion_even_orbitals():
+    """The t2g orbitals of a cubic lattice are even under inversion: the orbital action is the identity."""
+    assert _matches_up_to_global_sign(sr.find_inversion_orbital_unitary(_cubic_t2g_hamiltonian()), np.eye(3))
+
+
+def test_find_inversion_orbital_unitary_returns_none_without_inversion():
+    """A chain whose inter-orbital hopping differs along +x and -x has no orbital action mapping H(k) onto H(-k)."""
+    assert sr.find_inversion_orbital_unitary(chain_without_inversion_hk(6)) is None
+
+
+def test_find_inversion_orbital_unitary_rejects_a_large_grid_without_inversion_on_few_momenta(monkeypatch):
+    """Without inversion the U-solver fails on 64 momenta of well separated bands and never runs on the whole grid."""
+    solve, sizes = sr._solve_U_for_op, []
+
+    def spy(hg, h, *args, **kwargs):
+        sizes.append(int(np.prod(h.shape[:3])))
+        return solve(hg, h, *args, **kwargs)
+
+    monkeypatch.setattr(sr, "_solve_U_for_op", spy)
+
+    assert sr.find_inversion_orbital_unitary(chain_without_inversion_hk(96)) is None
+    assert sizes and max(sizes) <= 64
+
+
+@pytest.mark.parametrize("case", ["bilayer chain", "CsCl"])
+def test_find_inversion_orbital_unitary_solves_a_large_grid_on_few_momenta_first_then_on_all(monkeypatch, case):
+    """With inversion above 64 momenta, the action found on 64 momenta is solved for and holds on the whole grid."""
+    solve, sizes = sr._solve_U_for_op, []
+
+    def spy(hg, h, *args, **kwargs):
+        sizes.append(int(np.prod(h.shape[:3])))
+        return solve(hg, h, *args, **kwargs)
+
+    monkeypatch.setattr(sr, "_solve_U_for_op", spy)
+    if case == "bilayer chain":
+        H = bilayer_chain_hk(96)
+    else:
+        H = site_lattice_hk((8, 8, 8), [[0, 0, 0], [0.5, 0.5, 0.5]], [0.3, -0.4], [[1.0, 0.8], [0.8, 0.6]])
+
+    u = sr.find_inversion_orbital_unitary(H)
+
+    assert 64 in sizes and H[..., 0, 0].size in sizes
+    assert u.shape == ((2, 2) if case == "bilayer chain" else H.shape) and _maps_onto_inverted(H, u)
+
+
+def test_find_inversion_orbital_unitary_acts_on_the_correlated_orbitals():
+    """On the correlated d orbital of the Emery model the inversion acts as the identity."""
+    u = sr.find_inversion_orbital_unitary(emery_hk((4, 4, 1)), orbitals=np.array([0]))
+
+    assert u is not None and np.allclose(np.abs(u), [[1.0]])
+
+
+def _maps_onto_inverted(field: np.ndarray, u: np.ndarray) -> bool:
+    """X(-k) = U(k) X(k) U(k)^dagger for a constant or momentum-dependent U."""
+    u = np.broadcast_to(u, field.shape)
+    return np.allclose(_inverted(field), u @ field @ u.conj().swapaxes(-1, -2), atol=1e-10)
+
+
+@pytest.mark.parametrize("nk", [8, 12])
+def test_find_inversion_orbital_unitary_returns_an_involution_for_decoupled_orbital_blocks(nk):
+    """A bilayer beside a decoupled band, whose commutant phases differ per block, still gives an involutive action."""
+    H = np.zeros((nk, 1, 1, 3, 3), dtype=complex)
+    H[..., :2, :2] = bilayer_chain_hk(nk)
+    H[..., 2, 2] = (0.2 - 1.3 * np.cos(2 * np.pi * np.arange(nk) / nk))[:, None, None]
+
+    u = sr.find_inversion_orbital_unitary(H)
+
+    assert u is not None and _maps_onto_inverted(H, u)
+    u = np.broadcast_to(u, H.shape)
+    assert np.allclose(u @ _inverted(u), np.eye(3), atol=1e-10)
+
+
+def _complex_bilayer_beside_a_band(nk: int, a: float, b: float, c: float, e2: float, t2: float) -> np.ndarray:
+    """H(k) [kx, 1, 1, 3, 3] of a bilayer with interlayer hopping a + b e^{ik}, exchanged by inversion, beside a
+    decoupled band e2 - 2 t2 cos k."""
+    k = 2 * np.pi * np.arange(nk) / nk
+    H = np.zeros((nk, 1, 1, 3, 3), dtype=complex)
+    H[:, 0, 0, 0, 0] = H[:, 0, 0, 1, 1] = -2 * c * np.cos(k)
+    H[:, 0, 0, 0, 1] = a + b * np.exp(1j * k)
+    H[:, 0, 0, 1, 0] = np.conj(H[:, 0, 0, 0, 1])
+    H[:, 0, 0, 2, 2] = e2 - 2 * t2 * np.cos(k)
+    return H
+
+
+def test_find_inversion_orbital_unitary_solves_decoupled_blocks_where_the_whole_solve_stops():
+    """The layer swap of a bilayer beside a decoupled band is found for every hopping, also where the U-solver stops."""
+    rng = np.random.default_rng(1)
+    models = [_complex_bilayer_beside_a_band(6, 0.71, 0.12, 0.38, 0.88, 0.9)] + [
+        _complex_bilayer_beside_a_band(int(rng.choice([6, 8, 10, 12, 16])), *rng.uniform(0.1, 1.0, 5))
+        for _ in range(20)
+    ]
+
+    for H in models:
+        u = sr.find_inversion_orbital_unitary(H)
+
+        assert u is not None and _maps_onto_inverted(H, u)
+        u = np.broadcast_to(u, H.shape)
+        assert np.allclose(u @ _inverted(u), np.eye(3), atol=1e-10)
+
+
+def test_inverse_square_root_takes_one_root_for_an_eigenvalue_that_rounding_split():
+    """A degenerate eigenvalue -1 that rounding split into -1 +- i eps gets one root, so the root is a function of M."""
+    m = np.diag([-1 + 1e-13j, -1 - 1e-13j, 1.0])
+
+    root = sr._inverse_square_root(m, 1e-6)
+
+    assert np.allclose(root[:2, :2], root[0, 0] * np.eye(2), atol=1e-10)
+    assert np.allclose(root @ root @ m, np.eye(3), atol=1e-10)
+
+
+CSCL_CHAIN = ([[0, 0, 0], [0.5, 0, 0]], [0.3, -0.4], [[1.0, 0.8], [0.8, 0.6]])
+
+
+@pytest.mark.parametrize(
+    "nk, lattice",
+    [
+        ((6, 1, 1), CSCL_CHAIN),
+        ((5, 1, 1), CSCL_CHAIN),
+        ((4, 4, 4), ([[0, 0, 0], [0.5, 0.5, 0.5]], [0.3, -0.4], [[1.0, 0.8], [0.8, 0.6]])),
+        (
+            (6, 1, 1),
+            (
+                [[0, 0, 0], [0.3, 0, 0], [0.7, 0, 0]],
+                [0.4, -0.2, -0.2],
+                [[1, 0.9, 0.9], [0.9, 0.5, 0.7], [0.9, 0.7, 0.5]],
+            ),
+        ),
+        (
+            (4, 4, 1),
+            ([[0, 0, 0], [0.5, 0, 0], [0, 0.5, 0], [0.5, 0.5, 0]], [0.3, -0.4, -0.4, 0.1], 0.8 + 0.1 * np.eye(4)),
+        ),
+    ],
+    ids=["CsCl chain", "CsCl chain, odd grid", "CsCl", "folded trilayer", "four inversion centers"],
+)
+def test_find_inversion_orbital_unitary_returns_a_momentum_dependent_action_where_no_constant_one_exists(nk, lattice):
+    """Sites inverted into another cell give an involutive U(k) where no constant orbital action exists."""
+    H = site_lattice_hk(nk, *lattice)
+
+    u = sr.find_inversion_orbital_unitary(H)
+
+    assert sr._solve_U_for_op(_inverted(H), H, 1e-8) is None
+    assert u.shape == H.shape and _maps_onto_inverted(H, u)
+    assert np.allclose(u @ _inverted(u), np.eye(H.shape[-1]), atol=1e-10)
+
+
+def test_find_inversion_orbital_unitary_returns_the_momentum_dependent_action_on_the_correlated_orbitals():
+    """On the correlated sites of a CsCl chain with ligands the action carries B's phase and maps the resolvent."""
+    H = site_lattice_hk(
+        (6, 1, 1),
+        [[0, 0, 0], [0.5, 0, 0], [0.25, 0, 0], [0.75, 0, 0]],
+        [0.3, -0.4, -2.0, -2.0],
+        [[1.0, 0.8, 0.9, 0.9], [0.8, 0.6, 0.7, 0.7], [0.9, 0.7, 0.4, 0.4], [0.9, 0.7, 0.4, 0.4]],
+    )
+    orbitals = np.array([0, 1])
+
+    u = sr.find_inversion_orbital_unitary(H, orbitals=orbitals)
+
+    resolvent = np.linalg.inv((0.3 + 0.7j) * np.eye(4) - H)[..., orbitals[:, None], orbitals]
+    assert u.shape == (6, 1, 1, 2, 2) and _maps_onto_inverted(resolvent, u)
+    assert not np.allclose(u, u[:1, :1, :1])
 
 
 def test_find_coordinate_mirror_orbital_unitaries_recovers_t2g_sign_matrices():

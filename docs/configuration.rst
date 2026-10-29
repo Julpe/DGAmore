@@ -385,46 +385,78 @@ For single-band data the ``type`` field selects the correction scheme: ``spch`` 
 magnetic susceptibility, whereas ``sp`` corrects only the magnetic one; the multi-band scheme always
 corrects both channels.
 
-.. _rpa:
+.. _misc:
 
-RPA susceptibility
-------------------
+FLEX and RPA
+------------
 
-This section replaces the ladder susceptibility of the non-local step by the random phase approximation (RPA).
+This section replaces the ladder of the non-local step by one of two bare-vertex modes, particle-hole FLEX or the
+multi-orbital random phase approximation (RPA). The two exclude each other.
 
 .. code-block:: yaml
 
-   rpa:
-     use_rpa_susceptibility: False # bool
+   misc:
+     do_flex: False # bool
+     do_rpa: False # bool
 
-With ``use_rpa_susceptibility`` set to ``True`` the non-local step takes the local irreducible vertex as the bare
-interaction, :math:`\Gamma_{r} = U_{r}`. No auxiliary susceptibility and no three-leg vertex are calculated: the
-three-leg vertex is one, and the physical susceptibility is the RPA susceptibility of each iteration's bubble,
+Both take the local irreducible vertex as the bare interaction, :math:`\Gamma_{r} = U_{r}`. No auxiliary
+susceptibility and no three-leg vertex are calculated: the three-leg vertex is one, and the physical susceptibility is
+the RPA susceptibility of the bubble,
 
-.. math:: \chi^{\mathrm{q}}_{r} = \big((\chi^{\mathrm{q}}_{0})^{-1} + U_{r} + V^{\mathbf{q}}_{r}\big)^{-1}, \qquad
+.. math:: \chi^{\mathrm{q}}_{r} = \chi^{\mathrm{q}}_{0} \big(1 + (U_{r} + V^{\mathbf{q}}_{r})
+   \chi^{\mathrm{q}}_{0}\big)^{-1}, \qquad
    \chi^{\mathrm{q}}_{0} = \frac{1}{\beta^2} \sum_{\nu} \chi^{\mathrm{q}\nu}_{0}.
 
+The bubble is summed over all fermionic frequencies: over the box of :math:`n` = ``niv_core + niv_shell`` positive
+and as many negative frequencies, plus the analytic sum beyond it to the leading order :math:`G \simeq 1/\imath\nu` of
+the Green's function (:func:`~dgamore.nonlocal_sde.create_bubble_tail`). Without that tail the bubble falls short by
+about :math:`\beta / (2\pi^2 n)` on the diagonal of its compound-index matrix, which keeps every susceptibility away
+from its Stoner pole, most at low temperature. The tail is of second order for bosonic frequencies well inside the
+box; towards its edge the left-out frequencies reach :math:`\nu \approx \omega`, where :math:`G(\nu - \omega)` is far
+from its asymptote, and the error stays of first order, so ``niv_core + niv_shell`` should be about twice
+``niw_core`` or more. The ladder's shell correction keeps the box sum.
+
 The kernel of each channel reduces to :math:`-\mathcal{U}^{\mathbf{q}}_{r} \chi^{\mathrm{q}}_{r}
-\mathcal{U}^{\mathbf{q}}_{r}`, and the double-counting kernel of the Schwinger-Dyson equation subtracts the bare
-vertex :math:`\tfrac12(U_{\mathrm{d}} + 3U_{\mathrm{m}})` instead of the local one, so the second-order diagram is
-counted once. With it, the density and magnetic kernels form the particle-hole fluctuation-exchange (FLEX)
-self-energy, without the particle-particle T-matrix, and no noise-removal term
-:math:`\Sigma_{\mathrm{DMFT}} - \Sigma_{\mathrm{loc}}` is added; since the self-consistent loop rebuilds the bubble from
-the dressed Green's function, a self-consistent run is particle-hole FLEX started from DMFT.
-The local Schwinger-Dyson step still runs: the lambda correction reads its local susceptibilities, and its local
-self-energy is written as a diagnostic.
+\mathcal{U}^{\mathbf{q}}_{r}`, no noise-removal term :math:`\Sigma_{\mathrm{DMFT}} - \Sigma_{\mathrm{loc}}` is added,
+and the pairing vertex of each channel is :math:`F^{\mathrm{q}}_{r} = \mathcal{U}^{\mathbf{q}}_{r} -
+\mathcal{U}^{\mathbf{q}}_{r} \chi^{\mathrm{q}}_{r} \mathcal{U}^{\mathbf{q}}_{r}`. The local Schwinger-Dyson step still
+runs and writes its local self-energy as a diagnostic. ``use_exact_jacobian`` linearizes the ladder map and is
+disabled with a warning. Every iteration logs the static Stoner factor of each channel, the largest eigenvalue of
+:math:`-(U_{r} + V^{\mathbf{q}}_{r}) \chi^{(\mathbf{q},\omega=0)}_{0}`. Where it reaches 1 and no lambda correction,
+restriction or annealing moves the pole, the RPA susceptibility is past its pole, and a warning says that the
+self-energy and the pairing vertices built from it are unphysical.
 
-The lambda correction, the restriction and the annealing of the :ref:`stabilization section <stabilization>` act on
-the RPA susceptibility as on the ladder one. At couplings typical of DΓA the magnetic RPA susceptibility can lie
-beyond its Stoner pole, where only a lambda correction makes it physical. ``use_exact_jacobian`` linearizes the
-ladder map and is disabled with a warning.
-
-The Eliashberg equation takes its pairing vertex from the same susceptibility: per channel the vertex is
-:math:`F^{\mathrm{q}}_{r} = \mathcal{U}^{\mathbf{q}}_{r} - \mathcal{U}^{\mathbf{q}}_{r} \chi^{\mathrm{q}}_{r}
-\mathcal{U}^{\mathbf{q}}_{r}`, combined into the singlet and triplet vertex like the ladder vertex, with the bare
-up-down interaction counted once in place of the local diagrams. For one band these are the spin-fluctuation
-interactions :math:`U + \tfrac32 U^2 \chi_{\mathrm{m}} - \tfrac12 U^2 \chi_{\mathrm{d}}` (singlet) and
+**FLEX** (``do_flex``). The magnetic kernel enters three times, its longitudinal and both transverse spin components,
+and the double-counting kernel of the Schwinger-Dyson equation subtracts the bare vertex
+:math:`\tfrac12(U_{\mathrm{d}} + 3U_{\mathrm{m}})` instead of the local one, so the second-order diagram is counted
+once. The density and magnetic kernels then form the particle-hole fluctuation-exchange (FLEX) self-energy, without
+the particle-particle T-matrix; since the self-consistent loop rebuilds the bubble from the dressed Green's function, a
+self-consistent run is particle-hole FLEX started from DMFT. The lambda correction, the restriction and the annealing of
+the :ref:`stabilization section <stabilization>` act on the RPA susceptibility as on the ladder one, the lambda
+correction with the local susceptibilities of the local step. At couplings typical of DΓA the magnetic RPA
+susceptibility can lie beyond its Stoner pole, where only a lambda correction makes it physical. The pairing vertices
+are combined into the singlet and triplet vertex like the ladder vertex, with the bare up-down interaction counted once
+in place of the local diagrams; for one band these are the spin-fluctuation interactions
+:math:`U + \tfrac32 U^2 \chi_{\mathrm{m}} - \tfrac12 U^2 \chi_{\mathrm{d}}` (singlet) and
 :math:`-\tfrac12 U^2 (\chi_{\mathrm{m}} + \chi_{\mathrm{d}})` (triplet).
+
+**RPA** (``do_rpa``). The multi-orbital random phase approximation of spin-fluctuation pairing used for multi-orbital
+materials (e.g. Graser et al., New J. Phys. 11, 025016 (2009)): the channel interactions, the kernels and the pairing
+vertices of FLEX, evaluated on the non-interacting (DFT) lattice. The run starts from a zero self-energy at the
+chemical potential at which the non-interacting lattice holds the DMFT filling, from the Fermi sum of the band
+energies. With ``max_iter`` 1 it is the one-shot RPA: the pairing vertices carry the longitudinal and both transverse
+spin fluctuations of the non-interacting bubble, for one band the singlet and triplet interactions above, the kernels
+give the one-shot FLEX self-energy of the non-interacting Green's function, which is written to ``sigma_dga.npy`` and
+dresses ``giwk_dga.npy``, and the Eliashberg bubble takes the non-interacting Green's function. With ``max_iter`` above
+1 the self-energy is fed back with the configured mixing and the run is self-consistent RPA, particle-hole FLEX from
+the non-interacting lattice; the Eliashberg bubble then takes the converged Green's function. In both the self-energy
+carries no DMFT part: beyond the core box it is the Hartree-Fock term of the current occupations and the
+:math:`1/\imath\nu` tail of the kernels, the coefficient their contraction approaches at large :math:`\nu`. The
+bare-vertex modes take :math:`H(\mathbf{k})` as the non-interacting lattice and add the full Hartree-Fock term, like a
+DMFT input without double counting. ``previous_sc_path`` is ignored, and a lambda correction, the restriction or the
+annealing stop the run with an error, since each reshapes the RPA susceptibility (the lambda corrections with the local
+DMFT susceptibility). At couplings typical of DΓA the RPA susceptibility lies beyond its Stoner pole, which is why RPA
+studies take a smaller interaction.
 
 DMFT input
 ----------
@@ -513,7 +545,7 @@ Superconducting properties are obtained by solving the linearized Eliashberg equ
      symmetry: "random"                   # str
      symmetrize_degenerate_gaps: True     # bool
      resolve_degenerate_multiplets: False # bool
-     resolve_frequency_parity: True       # bool
+     resolve_parity_sectors: True         # bool
      subfolder_name: "Eliashberg"         # str
 
 The equation is solved only when ``perform_eliashberg`` is ``True``. Enabling ``save_pairing_vertex`` or ``save_fq``
@@ -524,7 +556,10 @@ still an inherently large file (``nk_irr * no^4 * (niw_core + 1) * (2 niv_core)^
 remains I/O-bound at scale.
 
 The equation is solved with a Lanczos algorithm based on the ARPACK routines, retrieving the ``n_eig`` largest
-eigenvalues and the corresponding gap functions to an accuracy of ``epsilon``. The ``symmetry`` field sets the
+eigenvalues and the corresponding gap functions to an accuracy of ``epsilon``. A sector that misses it
+within 3000 restarts is solved again with a 100 times looser tolerance, twice at most, with a warning
+each time: in single precision a sector whose eigenvalues are small against the rest of the kernel cannot
+reach a small relative accuracy, since the kernel's rounding is absolute. The ``symmetry`` field sets the
 starting vector of the iteration: entering ``"d-wave"``, for example, begins from a gap function with d-wave
 symmetry, but ``"random"`` is sufficient most of the time. The random start is drawn from a fixed seed, so a run
 reproduces the same gap functions when repeated. A single start vector reaches only one direction of an exactly
@@ -544,12 +579,12 @@ multiplets (including purely local, momentum-independent ones) are resolved as w
 :math:`E_g` doublet, for instance, which would need a three-fold rotation about :math:`[111]` - keeps its Loewdin
 basis instead of being rotated arbitrarily.
 
-The ``resolve_frequency_parity`` field controls whether the physical gap-symmetry sectors are returned. The
-unprojected eigensolver leaks onto the globally dominant eigenvector, mixing frequency-even and frequency-odd modes;
-projecting the trial vector onto a fixed symmetry sector at every iteration separates them.
+The ``resolve_parity_sectors`` field controls whether each channel is solved in its two exact parity sectors. The
+unprojected eigensolver converges onto the globally dominant eigenvector of the channel; restricting the trial vector
+to a fixed symmetry sector at every iteration returns the leading gaps of both sectors.
 
-The orbital gap :math:`\Delta_{12}(\mathbf{k}, \nu)` (with the spin part folded into the channel) acts on three
-commuting involutions built from the same array operations as the pairing kernel: the frequency flip
+The orbital gap :math:`\Delta_{12}(\mathbf{k}, \nu)` (orbital 1 at :math:`-\mathbf{k}`, orbital 2 at
+:math:`\mathbf{k}`, the spin part folded into the channel) is acted on by the frequency flip
 :math:`(T\Delta)_{12}(\mathbf{k}, \nu) = \Delta_{12}(\mathbf{k}, -\nu)`, the momentum flip
 :math:`(P\Delta)_{12}(\mathbf{k}, \nu) = \Delta_{12}(-\mathbf{k}, \nu)` and the orbital transpose
 :math:`(O\Delta)_{12}(\mathbf{k}, \nu) = \Delta_{21}(\mathbf{k}, \nu)`. The Pauli principle requires the Cooper-pair
@@ -559,12 +594,29 @@ amplitude to be antisymmetric under the combined exchange of spin, momentum, orb
 
    \hat{S}\, P\, O\, T\, \Delta = -\Delta ,
 
-where :math:`\hat{S}` is the spin exchange (a scalar :math:`s_S = -1` for the singlet, :math:`+1` for the triplet).
-Writing :math:`G \equiv P\,O\,T`, physical gaps are eigenvectors :math:`G\Delta = g_S\,\Delta` with
-:math:`g_S = -s_S`, which equals the channel sign ``sign`` (:math:`+1` singlet, :math:`-1` triplet) that the kernel
-already carries. Choosing the frequency parity :math:`\varepsilon_T \in \{+1\ (\text{even}), -1\ (\text{odd})\}`
-therefore fixes the combined momentum-orbital parity through
-:math:`\varepsilon_{PO} = \mathrm{sign}\cdot\varepsilon_T`:
+where :math:`\hat{S}` is the spin exchange (:math:`-1` for the singlet, :math:`+1` for the triplet), so physical gaps
+satisfy :math:`P\,O\,T\,\Delta = \mathrm{sign}\,\Delta` with the channel sign ``sign`` (:math:`+1` singlet,
+:math:`-1` triplet); the kernel maps every gap onto this form.
+
+The frequency flip :math:`T` is a symmetry of the kernel only for one band or for orbitals that do not hybridize; once
+they hybridize, even and odd frequencies mix (Black-Schaffer and Balatsky, Phys. Rev. B **88**, 104514 (2013)). The
+exact quantum number is the inversion parity. Inversion maps the Hamiltonian as
+:math:`H(-\mathbf{k}) = U(\mathbf{k})\, H(\mathbf{k})\, U(\mathbf{k})^\dagger` with an orbital action
+:math:`U(\mathbf{k})`, :math:`U(\mathbf{k})\, U(-\mathbf{k}) = 1`: the identity for inversion-even orbitals on a site
+at the inversion center, a permutation for sites that inversion exchanges (the two layers of a bilayer), and
+momentum-dependent, :math:`U(\mathbf{k}) = U_0\, \mathrm{diag}(e^{i\mathbf{k}\cdot\mathbf{s}_a})`, where inversion
+maps a site into another unit cell relative to the others (sites on inversion centers of different kind, as in CsCl
+or the B sites of a distorted perovskite, or the outer layers of a trilayer stored one cell apart). It acts on the
+gap as
+
+.. math::
+
+   (P_U\Delta)(\mathbf{k}, \nu) = U(\mathbf{k})\, \Delta(-\mathbf{k}, \nu)\, U(-\mathbf{k})^T , \qquad
+   (O_U\Delta)(\mathbf{k}, \nu) = U(\mathbf{k})\, \Delta(\mathbf{k}, \nu)^T\, U(-\mathbf{k})^T ,
+
+so that :math:`O_U P_U = O\,P` and the Pauli condition reads :math:`T\,O_U = \mathrm{sign}\, P_U` on physical gaps.
+Choosing the parity :math:`\varepsilon_T \in \{+1\ (\text{even}), -1\ (\text{odd})\}` under :math:`T\,O_U` therefore
+fixes the inversion parity :math:`\varepsilon_P = \mathrm{sign}\cdot\varepsilon_T`:
 
 .. list-table::
    :header-rows: 1
@@ -572,7 +624,7 @@ therefore fixes the combined momentum-orbital parity through
    * - channel
      - ``sign``
      - :math:`\varepsilon_T` (even / odd)
-     - forced :math:`\varepsilon_{PO}`
+     - forced :math:`\varepsilon_P`
    * - singlet
      - :math:`+1`
      - :math:`+1` / :math:`-1`
@@ -582,25 +634,50 @@ therefore fixes the combined momentum-orbital parity through
      - :math:`+1` / :math:`-1`
      - :math:`-1` / :math:`+1`
 
-The gap is projected onto the sector with the commuting Hermitian projector (only the product :math:`P\,O` is fixed,
-never :math:`P` and :math:`O` separately)
+For one band :math:`O_U` and :math:`U` are trivial and :math:`\varepsilon_T` is the frequency parity, so the labels
+keep their one-band meaning: the singlet-even sector holds the s- and d-wave gaps, the triplet-even one the p-wave
+gaps. The gap is projected onto a sector with the commuting Hermitian projector
 
 .. math::
 
-   \Pi = \tfrac{1}{2}\left(1 + \varepsilon_T\, T\right)\,\tfrac{1}{2}\left(1 + \varepsilon_{PO}\, P\,O\right) ,
+   \Pi = \tfrac{1}{2}\left(1 + \varepsilon_T\, T\,O_U\right)\,\tfrac{1}{2}\left(1 + \varepsilon_P\, P_U\right) ,
 
-applied to both the matrix-vector product and the starting vector at every iteration. Setting
-``resolve_frequency_parity`` to ``True`` returns the frequency-even and frequency-odd sectors for each of the
-singlet and triplet channels, while ``False`` (the default) returns the overall leading eigenpairs without any
-projection.
-Clean frequency-parity separation additionally requires the pairing vertex to satisfy the time-reversal-plus-inversion
-symmetry :math:`\Gamma^{\nu\nu'}(\mathbf{q}) = \Gamma^{(-\nu)(-\nu')}(-\mathbf{q})`. Sector-resolved gap functions
-are written as ``gap_<channel>_<parity>_<i>`` (for example ``gap_sing_even_1``), while the unprojected case keeps the
+the projector onto the physical gaps of inversion parity :math:`\varepsilon_P`, applied to both the matrix-vector
+product and the starting vector at every iteration. Wherever inversion is a symmetry the pairing kernel commutes with
+:math:`P_U`, so the two sectors of a channel are invariant subspaces that together hold its whole spectrum.
+
+At the start of the run the orbital action is solved for from :math:`H(\mathbf{k})` (from the correlated block of its
+resolvent when uncorrelated orbitals are present), to :math:`10^{-4}` of its largest element (above the print
+precision of a Wannier Hamiltonian), and the local interaction and, outside RPA mode, the local DMFT self-energy are
+checked to keep their form under it to the same relative precision; the non-local interaction is taken to share the
+symmetry of :math:`H(\mathbf{k})`, as in the symmetry reduction of the momenta. Without inversion (a
+non-centrosymmetric lattice), or with a local interaction or DMFT self-energy that breaks it, the sectors would mix:
+``resolve_parity_sectors`` is then switched off with a warning and both channels are solved unprojected. Two atoms
+that inversion maps onto each other but DMFT solved as separate impurities (``ineq_ordering: [1, 2]``) differ by
+their QMC noise and lose the sectors this way; ``ineq_ordering: [1, 1]`` reads both from one impurity. After each
+projected solve the log reports the residual of the sector's leading gap under the unprojected kernel, relative to
+the larger of its eigenvalue and 1 (the instability), which vanishes up to rounding and the eigensolver tolerance
+where the sector is exact; above the larger of :math:`10^{-4}` and ten times ``epsilon`` a warning says the sectors are
+no symmetry of the kernel.
+
+Setting ``resolve_parity_sectors`` to ``True`` (the default) returns both sectors of the singlet and the triplet
+channel, while ``False`` returns the overall leading eigenpairs without any projection. With more than one orbital
+every gap holds an even- and an odd-frequency part,
+:math:`\Delta^{\pm}(\nu) = \tfrac{1}{2}\left[\Delta(\nu) \pm \Delta(-\nu)\right]`: the log reports the even-frequency
+weight :math:`\lVert\Delta^{+}\rVert^2 / \lVert\Delta\rVert^2` of every gap. Sector-resolved gap functions are
+written as ``gap_<channel>_<parity>_<i>`` (for example ``gap_sing_even_1``), while the unprojected case keeps the
 ``gap_<channel>_<i>`` naming. A ``gap_parity.txt`` file is written alongside them with one line per saved gap: a
-compact wave-symmetry label (``s`` / ``d`` / ``p``, or ``x`` if unclassified, followed by ``+`` / ``-`` for the
-frequency parity) followed by the measured parity Rayleigh quotients
-:math:`\langle \Delta, X\Delta \rangle / \langle \Delta, \Delta \rangle` for :math:`X \in \{T, P, O, P O\}`. The
-wave letter is read from the momentum structure of every orbital block that carries appreciable weight, not only the
+compact wave-symmetry label followed by ``+`` / ``-`` for the frequency parity, the measured parity Rayleigh quotients
+:math:`\langle \Delta, X\Delta \rangle / \langle \Delta, \Delta \rangle` for
+:math:`X \in \{T\,O_U, P_U, T, P, O, P\,O\}` (keys ``TOU``, ``PU``, ``T``, ``P``, ``O``, ``PO``, the first two only
+where the sectors were solved) and the even-frequency weight ``freq_even``. The wave is ``s``, ``s±``, ``d`` (the
+:math:`d_{x^2-y^2}` type), ``dxy`` (``dxz``, ``dyz`` in the other planes), ``g`` or ``p``, or ``x`` if none of these
+match; the momentum tests reflect the grid axes, so the names presume the axes of a square or cubic lattice (on other
+lattices read the parity quotients).
+An ``s`` wave becomes ``s±`` when its band gap :math:`\psi_n^\dagger \Delta^{T} \psi_n` (the gap's first orbital sits
+at :math:`-\mathbf{k}`) at the first Matsubara frequency has opposite signs on the Fermi sheets of two bands, those of
+the bare bands at the run's filling; bands degenerate at a momentum all carry their summed band gap there. The wave
+is read from the momentum structure of every orbital block that carries appreciable weight, not only the
 orbital-diagonal one: when the blocks agree the label stays a single token, and when they differ it lists each wave
 with the blocks realizing it, ordered by weight (for example ``d+[00,11]|s+[22]``), while the frequency-parity sign
 is taken from the global :math:`T` Rayleigh quotient. Finally, the results are written to a subfolder named according

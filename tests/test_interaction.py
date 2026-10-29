@@ -8,6 +8,7 @@ import pytest
 import numpy as np
 from dgamore.hamiltonian import Hamiltonian
 from dgamore.interaction import Interaction, LocalInteraction, SpinChannel
+from tests.conftest import general_su2_u, graser_spin_charge_u
 
 u_loc = np.random.rand(2, 2, 2, 2)
 
@@ -404,3 +405,12 @@ def test_density_and_magnetic_projections_of_the_kanamori_tensor_carry_the_inter
     slots = [(0, 0, 0, 0), (0, 0, 1, 1), (0, 1, 1, 0), (0, 1, 0, 1)]
     assert np.allclose([u_d[s] for s in slots], [u, 2 * u_prime - j, 2 * j - u_prime, j])
     assert np.allclose([u_m[s] for s in slots], [-u, -j, -u_prime, -j])
+
+
+def test_channel_projections_of_a_general_su2_tensor_are_graser_charge_and_spin_matrices():
+    """U_d and -U_m of a general SU(2) tensor are Graser's U^c and U^s in the compound layout (12),(43)."""
+    u_s, u_c = graser_spin_charge_u(3, 2.0, 1.3, 0.35, 0.25)
+    u_loc = LocalInteraction(general_su2_u(3, 2.0, 1.3, 0.35, 0.25))
+
+    assert np.allclose(u_loc.as_channel(SpinChannel.DENS).mat, u_c.transpose(0, 1, 3, 2))
+    assert np.allclose(u_loc.as_channel(SpinChannel.MAGN).mat, -u_s.transpose(0, 1, 3, 2))

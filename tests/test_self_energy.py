@@ -872,6 +872,21 @@ def test_fit_smom_recovers_hermitian_moments_with_complex_off_diagonals():
     assert np.allclose(fit1, mom1, atol=1e-5)
 
 
+def test_fit_smom_reads_the_exact_moments_of_a_shell_shorter_than_its_window_from_one_frequency():
+    """One frequency gives the exact moments of a tail shell shorter than the default window, which misses them."""
+    beta, niv, n_shell = 10.0, 20, 2
+    mom0 = np.array([[1.0, 0.3 + 0.2j], [0.3 - 0.2j, 1.5]])
+    mom1 = np.array([[0.8, 0.1 - 0.15j], [0.1 + 0.15j, 0.6]])
+    mat = _hermitian_tail(mom0, mom1, niv, beta)
+    mat[..., niv : 2 * niv - n_shell] += 0.5 + 0.5j  # a core no tail of these moments describes
+    se = _se(mat, beta=beta)
+
+    fit0, fit1 = se.fit_smom(n_freq=1)
+
+    assert np.allclose(fit0, mom0, atol=1e-5) and np.allclose(fit1, mom1, atol=1e-5)
+    assert not np.allclose(se.fit_smom()[1], mom1, atol=1e-5)
+
+
 def test_fit_smom_of_an_orbitally_symmetric_self_energy_equals_the_elementwise_fit():
     """For Sigma_12 = Sigma_21 the moments equal the elementwise real/imaginary-part fit exactly and stay real."""
     rng = np.random.default_rng(3)

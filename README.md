@@ -31,7 +31,7 @@ For the implemented equations, see the author's
   that warm-starts low-temperature runs from converged higher-temperature ones, and three stabilization techniques
   for the regime close to the Bethe-Salpeter instability; the one-shot Moriya lambda correction is available as well.
 - The multi-orbital Eliashberg equation, yielding the leading singlet and triplet eigenvalues and gap functions,
-  optionally resolved by frequency parity and sorted into symmetry-adapted multiplets.
+  optionally resolved into inversion-parity sectors and sorted into symmetry-adapted multiplets.
 - Optional analytic continuation of the DGA and DMFT Green's functions to real frequencies with the maximum entropy
   method.
 - MPI parallelization over the irreducible Brillouin zone with automatic symmetry discovery, shared-memory windows for

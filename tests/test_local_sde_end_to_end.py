@@ -65,6 +65,7 @@ def test_extracts_dmft_quantities_correctly(setup, niw_core, niv_core, niv_shell
     config.box.niw_core = niw_core
     config.box.niv_core = niv_core
     config.box.niv_shell = niv_shell
+    config.dmft.symmetrize_orbitals = []
 
     g_dmft, s_dmft, g2_dens, g2_magn = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
 
@@ -197,7 +198,6 @@ def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
     config.box.niw_core = niw_core
     config.box.niv_core = niv_core
     config.box.niv_shell = niv_shell
-    config.dmft.symmetrize_orbitals = []
 
     g_dmft, s_dmft, g2_dens, g2_magn = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
     config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
@@ -246,18 +246,19 @@ def test_calculates_local_sde_correctly(setup, niw_core, niv_core, niv_shell):
     compare_quantity(gchi_d, gchi_m, "gchi_dens_loc", "gchi_magn_loc", 2, config.box.niv_core)
 
     def compare_full_vertex(obj_sde, name: str, channel: SpinChannel):
-        """The full vertex is built on the asymmetric nu x nu' box, so it matches the reference's nu' window."""
+        """The full vertex is built on the asymmetric nu x nu' box; its square core cut is the stored reference."""
         ref = LocalFourPoint.load(f"{folder}/{name}.npy", channel, num_vn_dimensions=2)
-        window = slice(config.box.niv_full - config.box.niv_core, config.box.niv_full + config.box.niv_core)
 
         assert obj_sde.niv_first == config.box.niv_full and obj_sde.niv == config.box.niv_core
         assert obj_sde.channel == ref.channel and obj_sde.full_niw_range == ref.full_niw_range
         assert obj_sde.num_wn_dimensions == ref.num_wn_dimensions
         assert obj_sde.current_shape == (2, 2, 2, 2, 21, 2 * config.box.niv_full, 2 * config.box.niv_core)
-        assert np.allclose(obj_sde.mat, ref.mat[..., window], atol=1e-3)
+        assert np.allclose(obj_sde.cut_niv(config.box.niv_core).mat, ref.mat, atol=1e-3)
 
     compare_full_vertex(f_d, "f_dens_loc", SpinChannel.DENS)
     compare_full_vertex(f_m, "f_magn_loc", SpinChannel.MAGN)
+    f_dc_ref = np.load(f"{folder}/f_dc_loc.npy")
+    assert np.allclose(local_sde.double_counting_vertex(f_d, f_m).mat, f_dc_ref, atol=1e-3)
 
     sigma_loc_ref = np.load(f"{folder}/siw_dga_local.npy")
     assert np.allclose(sigma_loc.mat, sigma_loc_ref, atol=1e-5)

@@ -86,7 +86,7 @@ folder, whose name encodes run-specific parameters such as the momentum-grid siz
 
 .. note::
    The in-memory Eliashberg solve spreads the (channel, parity) sectors as evenly as possible over the nodes: one
-   node hosts all of them, two nodes one channel each, four nodes one sector each (with ``resolve_frequency_parity``
+   node hosts all of them, two nodes one channel each, four nodes one sector each (with ``resolve_parity_sectors``
    there are four sectors; nodes beyond that idle through the solve). Each channel's pairing vertex is built into
    an MPI shared-memory window on every node that hosts one of its sectors, by all of that node's ranks in column
    blocks; on a symmetry-reduced grid only the irreducible wedge of the real-space grid is kept (the vertex at every
@@ -96,13 +96,13 @@ folder, whose name encodes run-specific parameters such as the momentum-grid siz
    the team's ranks by fermionic frequency, so every rank handles its block of momenta in the vertex contractions
    and its block of frequencies in the sector projections, the bubble multiply, the Fourier transforms and the
    orthogonalizations. The eigenvalues agree with a single-rank solve to the solver tolerance (the matrix-vector
-   product is bit-identical on a symmetry-free grid and equal to rounding on a reduced one), so ``OMP_NUM_THREADS=1``
+   product is bit-identical without grid symmetries or orbital action, else equal to rounding), so ``OMP_NUM_THREADS=1``
    with one rank per core is the right binding here as everywhere else. When a node cannot hold its share of vertex
    windows at once, the channels are solved one after the other, each spread over the nodes the same way. On a
    single-rank run the sectors are solved in turn on that rank with scipy's eigensolver, with the matrix-vector
-   products threaded over the rank's CPU affinity mask. In both in-memory solves, for one band with a frequency-even
-   pp bubble the crossed term of a projected sector is formed from the direct one, which halves the vertex
-   contractions. When no node
+   products threaded over the rank's CPU affinity mask. Every solve forms the crossed (exchange) term of the pairing
+   kernel from the direct one by an index permutation, so each matrix-vector product needs one vertex contraction.
+   When no node
    holds even one channel's window, the solver instead distributes the vertex over a two-dimensional
    frequency-block grid spanning all ranks: the sectors then run sequentially on the whole grid, every rank holds
    and contracts one vertex block, and the eigensolver iterates in lockstep with one block-sized reduction and one
