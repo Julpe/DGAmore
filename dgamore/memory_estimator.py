@@ -81,8 +81,9 @@ CHI0Q_IFFTN_TRANSIENT_FACTOR: int = 0
 # vertex is never stored - the matvec reuses the direct array via gap-sized index shuffles). Peak 2, residency 1.
 LANCZOS_VERTEX_FACTOR: int = 2
 
-# Gap-sized matvec temporaries beyond the ARPACK basis (chi0*gap, its flipped copy, the output) in both variants.
-ARPACK_EXTRA_VECTORS: int = 3
+# Gap-sized matvec temporaries beyond the ARPACK basis (chi0*gap, its flipped copy, the output) in both variants, and
+# the two of the sector projection's orbital rotation where the inversion has an orbital action.
+ARPACK_EXTRA_VECTORS: int = 5
 
 # Smallest Lanczos basis handed to the eigensolver (scipy's own floor is 20): ncv = max(2 n_eig + 1, this floor).
 LANCZOS_NCV_FLOOR: int = 12
@@ -110,9 +111,9 @@ KERNEL_GROUP_TRANSIENT: int = 4
 # Gap-sized scratch windows of one team matvec (the gap, its dressed transform, the direct and the crossed term).
 TEAM_SCRATCH_VECTORS: int = 4
 
-# Gap-sized temporaries of one team beyond its basis and eigenvectors, summed over the team's ranks: the four-block
-# peak of the sector projection plus the Krylov iteration's input copy (measured 4.5 gap vectors).
-TEAM_MATVEC_TRANSIENT_VECTORS: int = 5
+# Gap-sized temporaries of one team beyond its basis and eigenvectors, summed over the team's ranks: the sector
+# projection's peak and the Krylov input copy (measured 4.4 gap vectors, 6.0 with an orbital action of the inversion).
+TEAM_MATVEC_TRANSIENT_VECTORS: int = 6
 
 # Bytes of one column block a node rank expands, transforms and writes at a time while the team solve builds a
 # channel's full-BZ vertex window from the node-shared irreducible source.
@@ -255,9 +256,8 @@ def exact_jacobian_budgets(
 def solver_grid_shape(n_ranks: int, n_freq: int) -> tuple[int, int]:
     r"""
     Chooses the ``(rows, cols)`` block grid of the distributed Eliashberg solver: frequency rows :math:`\nu` first
-    (up to one row per frequency), then whole-divisor column blocks of the :math:`\nu'` axis, so the column
-    partition is always mirror-symmetric (the crossed matvec term reads each block's mirror). A 1x1 grid degenerates
-    into the in-memory matvec.
+    (up to one row per frequency), then whole-divisor column blocks of the :math:`\nu'` axis, so every column block
+    has the same width. A 1x1 grid degenerates into the in-memory matvec.
 
     :param n_ranks: Number of available MPI ranks.
     :param n_freq: Number of fermionic frequencies ``2 niv_pp`` of the pp box.
@@ -862,6 +862,7 @@ def estimate_peaks(
     overhead: float = OVERHEAD_FACTOR,
     chunk_budgets: ChunkBudgets = ChunkBudgets(),
     n_orbitals: int | None = None,
+    bare_vertex: bool = False,
 ) -> dict[str, BranchPeak]:
     r"""
     Estimates the per-rank peak host-memory (in bytes) of the fast and lean code path of each memory-sensitive
@@ -886,7 +887,7 @@ def estimate_peaks(
     shared window is active (its ``giwk_shareable`` covers the node-shared arrays). The Eliashberg branches run after
     the self-consistency loop with ``sigma_dga`` freed and ``giwk_dga`` on rank 0 only, so their baseline is the
     per-rank footprint, plus for ``fq`` the node-shared local vertex the Bethe-Salpeter slices are built from (its
-    ``giwk_shareable``); the surviving copy is counted in their single-rank slots. The
+    ``giwk_shareable``, absent with ``bare_vertex``); the surviving copy is counted in their single-rank slots. The
     ``sigma_loop`` branch is the loop's mixing step after the SDE, which runs on rank 0 alone: the history plus the
     proposal and the rebuilt previous iterate with the three linear-mixing copies or the accelerated least-squares
     solve, which dominate the proposal tail and the hand-over; the other node roots hold at most their received array
@@ -970,6 +971,9 @@ def estimate_peaks(
     :param n_orbitals: Number of orbitals of H(k), the size of the Dyson matrix in the chemical-potential search, the
         occupation and the energies (uncorrelated orbitals included); None takes ``n_bands``. With more orbitals than
         bands the exact Jacobian also holds the window of :math:`(G G)_{dd}`.
+    :param bare_vertex: Whether a bare-vertex mode runs (``config.misc.bare_vertex``), whose pairing-vertex chunks
+        are the RPA vertex of the physical susceptibility: ``"fq"`` then holds no local vertex, one-fermion inputs or
+        Bethe-Salpeter slices.
     :return: A dict mapping each branch key to its :class:`BranchPeak`.
     """
     nb = n_bands
@@ -1101,11 +1105,22 @@ def estimate_peaks(
         window_slice = DTYPE_BYTES * _two_fermion_block(1, nb, 1, fq_nv)
         fq_chunk = min(max(chunk_budgets.fq, window_slice), qi * fq_nw * window_slice)
         q_group = max(1, fq_chunk // (fq_nw * window_slice))
-        fq_distributed = scale * (
-            _two_fermion_block(qi, nb, 1, vpp) + 2 * _bubble_block(qi + q_group, nb, wp, vc)
-        ) + overhead * _fq_transient(fq_chunk, fq_chunk * vc // fq_nv**2, one_slice, save_fq)
-        # the local vertex the slices are built from, node-shared (counted once per node)
-        local_vertex_fq = scale * _two_fermion_block(1, nb, wp, vc)
+        if bare_vertex:
+            # the RPA chunks read the physical susceptibility alone (and its momentum-group copy): the chunk's window,
+            # the pp-band write's cut and negative half, and one pp slice of the latter's transient; no slice solve
+            pp_slice = DTYPE_BYTES * _two_fermion_block(1, nb, 1, vpp)
+            fq_transient = fq_chunk + 2 * (fq_chunk * vpp**2 // fq_nv**2) + pp_slice
+            fq_distributed = (
+                scale * (_two_fermion_block(qi, nb, 1, vpp) + _bubble_block(qi + q_group, nb, wp, 1))
+                + overhead * fq_transient
+            )
+            local_vertex_fq = 0.0
+        else:
+            fq_distributed = scale * (
+                _two_fermion_block(qi, nb, 1, vpp) + 2 * _bubble_block(qi + q_group, nb, wp, vc)
+            ) + overhead * _fq_transient(fq_chunk, fq_chunk * vc // fq_nv**2, one_slice, save_fq)
+            # the local vertex the slices are built from, node-shared (counted once per node)
+            local_vertex_fq = scale * _two_fermion_block(1, nb, wp, vc)
         peaks["fq"] = BranchPeak(
             baseline=rank_base + local_vertex_fq,
             giwk_shareable=local_vertex_fq,

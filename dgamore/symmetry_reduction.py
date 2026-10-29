@@ -64,6 +64,8 @@ import string
 import warnings
 from functools import lru_cache
 
+from scipy.sparse.csgraph import connected_components
+
 # ============================================================================
 # Spatial ops on a discrete reciprocal grid
 
@@ -1141,6 +1143,216 @@ def find_coordinate_mirror_orbital_unitaries(H, atol=1e-8, orbitals: np.ndarray 
         if U is not None:
             mirrors[axis] = U
     return mirrors
+
+
+def _cell_shift_phases(shifts: np.ndarray, nk: tuple) -> np.ndarray:
+    r"""
+    Returns the Bloch phases :math:`e^{i\mathbf{k}\cdot\mathbf{s}_a}` of orbitals whose images lie
+    :math:`\mathbf{s}_a` cells away, on the k-grid (momenta :math:`2\pi m_i / n_i` along the reciprocal basis).
+
+    :param shifts: The integer cell shifts of shape ``(norb, 3)``.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+    :return: The phases of shape ``(nx, ny, nz, norb)``.
+    """
+    return np.exp(2j * np.pi * (_grid_index_stack(tuple(nk)) / np.asarray(nk)) @ np.asarray(shifts).T)
+
+
+def _inversion_shift_candidates(H: np.ndarray, Hg: np.ndarray, atol: float, max_candidates: int = 64):
+    r"""
+    Yields candidate cell shifts of an inversion that acts as a signed orbital permutation :math:`\pi` times momentum
+    phases, :math:`H(-\mathbf{k})_{\pi(a)\pi(b)} = d_a d_b^* e^{i\mathbf{k}\cdot(\mathbf{s}_a - \mathbf{s}_b)}
+    H_{ab}(\mathbf{k})`: the action of sites that inversion maps into another unit cell (an orbital off every
+    inversion center the cell-periodic gauge can put at its origin). The phases cancel on the diagonal, so
+    :math:`\pi(a)` carries the diagonal of :math:`a`; for every such involution the shift difference of two coupled
+    orbitals is the peak of the Fourier transform of :math:`H(-\mathbf{k})_{\pi(a)\pi(b)} H_{ab}(\mathbf{k})^*`,
+    the autocorrelation of the hopping :math:`H_{ab}` displaced by :math:`\mathbf{s}_a - \mathbf{s}_b`, and the
+    shifts follow along the couplings from zero on one orbital of each connected block.
+
+    :param H: The Hamiltonian field of shape ``(nx, ny, nz, norb, norb)``.
+    :param Hg: Its inverse image :math:`H(-\mathbf{k})` on the same grid.
+    :param atol: Absolute tolerance of the diagonal comparison and of a coupling.
+    :param max_candidates: Number of involutions tried at most.
+    :return: A generator of integer shift arrays of shape ``(norb, 3)``.
+    """
+    nk, norb = H.shape[:3], H.shape[-1]
+    diag = np.diagonal(H, axis1=-2, axis2=-1).reshape(-1, norb)
+    diag_g = np.diagonal(Hg, axis1=-2, axis2=-1).reshape(-1, norb)
+    partners = [
+        [b for b in range(norb) if np.allclose(diag_g[:, b], diag[:, a], rtol=0.0, atol=atol)] for a in range(norb)
+    ]
+    coupled = np.abs(H).max(axis=(0, 1, 2)) > atol
+
+    def involutions(pi: list, a: int):
+        if a == norb:
+            yield list(pi)
+            return
+        if pi[a] is not None:
+            yield from involutions(pi, a + 1)
+            return
+        for b in partners[a]:
+            if b >= a and pi[b] is None:
+                pi[a], pi[b] = b, a
+                yield from involutions(pi, a + 1)
+                pi[a] = pi[b] = None
+
+    # ponytail: at most max_candidates involutions; a cell with many orbitals of equal diagonal could need more
+    for pi in itertools.islice(involutions([None] * norb, 0), max_candidates):
+        shifts, placed = np.zeros((norb, 3), dtype=np.int64), np.zeros(norb, dtype=bool)
+        for root in range(norb):
+            if placed[root]:
+                continue
+            placed[root], stack = True, [root]
+            while stack:
+                a = stack.pop()
+                for b in np.flatnonzero(coupled[a] & ~placed):
+                    lag = np.fft.fftn(Hg[..., pi[a], pi[b]] * H[..., a, b].conj(), axes=(0, 1, 2))
+                    shifts[b] = shifts[a] - np.array(np.unravel_index(np.argmax(np.abs(lag)), nk))
+                    placed[b] = True
+                    stack.append(b)
+        yield shifts % np.asarray(nk)
+
+
+def _solve_on_generic_momenta_first(Hg, Hk_eff, atol, ev_k, ev_g, generic) -> np.ndarray | None:
+    r"""
+    Runs :func:`_solve_U_for_op` on the momenta ``generic`` first and on the whole grid only where they admit a
+    unitary: a unitary relating the two fields on the grid relates them on any subset of it, and the solver fails
+    slowly on a large grid without one, while a few momenta with well separated bands decide quickly.
+
+    :param Hg: The target Hamiltonian field of shape ``(nx, ny, nz, norb, norb)``.
+    :param Hk_eff: The (effective) source Hamiltonian field of the same shape.
+    :param atol: Absolute tolerance for validating the relation.
+    :param ev_k: ``eigvalsh(Hk_eff)``.
+    :param ev_g: ``eigvalsh(Hg)``.
+    :param generic: Flat momentum indices to try first; ``None`` solves on the whole grid at once.
+    :return: The solver's unitary on the whole grid, or None.
+    """
+    if generic is not None:
+
+        def few(a: np.ndarray) -> np.ndarray:
+            return a.reshape((-1,) + a.shape[3:])[generic].reshape((len(generic), 1, 1) + a.shape[3:])
+
+        if _solve_U_for_op(few(Hg), few(Hk_eff), atol, ev_k=few(ev_k), ev_g=few(ev_g)) is None:
+            return None
+    return _solve_U_for_op(Hg, Hk_eff, atol, ev_k=ev_k, ev_g=ev_g)
+
+
+def find_inversion_orbital_unitary(H, rtol=1e-8, orbitals: np.ndarray | None = None) -> np.ndarray | None:
+    r"""
+    Solves for the orbital part of the inversion :math:`\mathbf{k} \to -\mathbf{k}` of ``H``, a unitary
+    :math:`U(\mathbf{k})` with :math:`H(-\mathbf{k}) = U(\mathbf{k}) H(\mathbf{k}) U(\mathbf{k})^\dagger`, normalized
+    to an involution, :math:`U(\mathbf{k}) U(-\mathbf{k}) = 1`, by :math:`U M^{-1/2}` with the constant square
+    :math:`M = U(\mathbf{k}) U(-\mathbf{k})`. A constant :math:`U` is tried first, with the
+    U-solver of the symmetry discovery (:func:`_solve_U_for_op`) as :func:`find_coordinate_mirror_orbital_unitaries`
+    does for the mirrors: orbitals even under inversion give the identity, orbitals on two sites the inversion
+    exchanges (the two layers of a bilayer) the permutation of the sites. Where inversion maps a site into another
+    unit cell relative to the others (sites on inversion centers of different kind, as in CsCl or the B sites of a
+    distorted perovskite, or the outer layers of a trilayer stored one cell apart) no constant :math:`U` exists, and
+    the action is :math:`U(\mathbf{k}) = U_0\, \mathrm{diag}(e^{i\mathbf{k}\cdot\mathbf{s}_a})` with the cell shifts
+    of :func:`_inversion_shift_candidates` (a signed permutation :math:`U_0` assumed only to find them). Where the
+    U-solver stops at an orbital without couplings, the decoupled orbital blocks are solved one by one
+    (:func:`_blockwise_inversion`). :math:`U` is fixed up to the commutant of :math:`H`. Each solve runs on the 64
+    momenta of the most widely separated bands first, and on the whole grid only where they admit a unitary.
+
+    With ``orbitals`` the inversion is solved on :func:`correlated_block_proxy` and checked like
+    :func:`check_correlated_group`, so it acts on the correlated orbitals alone, also where its action on the other
+    orbitals depends on the momentum (an orbital off the unit-cell origin).
+
+    :param H: The Hamiltonian field of shape ``(nx, ny, nz, norb, norb)``.
+    :param rtol: Tolerance for validating the relation, relative to the largest element of ``H``; the correlated
+        moments, normalized by it, and the checks of the unitary take it as it is.
+    :param orbitals: Indices of the correlated orbitals; None solves on every orbital of ``H``.
+    :return: The constant orbital unitary of shape ``(norb, norb)``, else the momentum-dependent one of the shape of
+        ``H``, or None when the inversion is no symmetry of ``H`` (of its correlated block).
+    """
+    nk = H.shape[:3]
+    idx = _apply_M_to_kgrid_indices(-np.eye(3, dtype=np.int64), nk)
+    if orbitals is not None:
+        u = find_inversion_orbital_unitary(correlated_block_proxy(H, orbitals), rtol)
+        if u is None:
+            return None
+        blocks, spectrum = _correlated_moments(H, orbitals)
+        u_flat = np.broadcast_to(u, blocks[0].shape).reshape(-1, len(orbitals), len(orbitals))
+        for block in blocks[:-1]:
+            flat = block.reshape(u_flat.shape)
+            if not np.allclose(flat[idx], u_flat @ flat @ u_flat.conj().swapaxes(-1, -2), rtol=0.0, atol=rtol):
+                return None
+        return u if np.allclose(spectrum, spectrum[idx], rtol=0.0, atol=rtol) else None
+    norb = H.shape[-1]
+    H = np.asarray(H, dtype=complex)
+    atol = rtol * np.abs(H).max()
+    ev = np.linalg.eigvalsh(H)
+    Hg = H.reshape(-1, norb, norb)[idx].reshape(H.shape)
+    ev_g = ev.reshape(-1, norb)[idx].reshape(ev.shape)
+    # the momenta whose bands lie farthest apart, where the solver tells an inversion from none quickly
+    spacing = np.diff(ev.reshape(-1, norb), axis=-1).min(axis=-1, initial=np.inf)
+    generic = np.argsort(spacing)[-64:] if spacing.size > 64 else None
+    u = _solve_on_generic_momenta_first(Hg, H, atol, ev, ev_g, generic)
+    if u is None and np.allclose(ev, ev_g, atol=10 * atol):
+        for shifts in _inversion_shift_candidates(H, Hg, atol):
+            phases = _cell_shift_phases(shifts, nk)
+            u = _solve_on_generic_momenta_first(
+                Hg, phases[..., :, None] * H * phases[..., None, :].conj(), atol, ev, ev_g, generic
+            )
+            if u is not None:
+                u = u * phases[..., None, :]
+                break
+    if u is None:
+        # the U-solver stops at an orbital without couplings, so decoupled orbital blocks are solved one by one
+        u = _blockwise_inversion(H, rtol, atol)
+    if u is None:
+        return None
+
+    def square(v: np.ndarray) -> np.ndarray:
+        return v @ v if v.ndim == 2 else v @ v.reshape(-1, norb, norb)[idx].reshape(v.shape)
+
+    # a constant square M = U(k) U(-k) commutes with H and U, so U M^{-1/2} is an involution with the same action: it
+    # removes the commutant phases, which differ between decoupled orbital blocks
+    m = square(u)
+    m0 = m.reshape(-1, norb, norb)[0]
+    if not np.allclose(m, m0, atol=10 * rtol):
+        return None
+    u = u @ _inverse_square_root(m0, 10 * rtol)
+    unitary = np.allclose(u @ u.conj().swapaxes(-1, -2), np.eye(norb), atol=10 * rtol)
+    return u if unitary and np.allclose(square(u), np.eye(norb), atol=10 * rtol) else None
+
+
+def _blockwise_inversion(H: np.ndarray, rtol: float, atol: float) -> np.ndarray | None:
+    r"""
+    Returns the orbital action of the inversion of ``H`` assembled from those of its decoupled orbital blocks, the
+    connected components of the couplings above ``atol``, each solved by :func:`find_inversion_orbital_unitary`.
+
+    :param H: The Hamiltonian field of shape ``(nx, ny, nz, norb, norb)``.
+    :param rtol: Tolerance of the solve of every block, relative to its largest element.
+    :param atol: Absolute tolerance above which two orbitals count as coupled.
+    :return: The block-diagonal action, constant ``(norb, norb)`` or momentum-dependent of the shape of ``H``, or
+        None when ``H`` is one block or a block has no inversion of its own (as two blocks the inversion exchanges).
+    """
+    _, labels = connected_components(np.abs(H).max(axis=(0, 1, 2)) > atol, directed=False)
+    blocks = [np.flatnonzero(labels == label) for label in np.unique(labels)]
+    if len(blocks) < 2:
+        return None
+    parts = [find_inversion_orbital_unitary(H[..., block[:, None], block], rtol) for block in blocks]
+    if any(part is None for part in parts):
+        return None
+    u = np.zeros(H.shape if any(part.ndim > 2 for part in parts) else H.shape[-2:], dtype=complex)
+    for block, part in zip(blocks, parts):
+        u[..., block[:, None], block] = part
+    return u
+
+
+def _inverse_square_root(m: np.ndarray, tol: float) -> np.ndarray:
+    r"""
+    Returns :math:`M^{-1/2}` of a diagonalizable matrix, with one principal root per group of eigenvalues closer than
+    ``tol``: rounding splits a degenerate eigenvalue :math:`-1` into :math:`-1 \pm \imath\epsilon` on either side of
+    the branch cut, and a root per eigenvalue would then be no function of :math:`M`.
+
+    :param m: The matrix.
+    :param tol: Distance below which two eigenvalues count as one.
+    :return: The inverse square root.
+    """
+    values, vectors = np.linalg.eig(m.astype(complex))
+    first = np.argmax(np.abs(values[:, None] - values) < tol, axis=1)
+    return (vectors * values[first] ** -0.5) @ np.linalg.inv(vectors)
 
 
 def auto_transform_groups(us: np.ndarray, sigmas: np.ndarray, conjs: np.ndarray) -> list[np.ndarray]:

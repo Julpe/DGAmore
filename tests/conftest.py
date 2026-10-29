@@ -96,7 +96,7 @@ def reset_config():
     config.box = config.BoxConfig()
     config.lattice = config.LatticeConfig()
     config.lambda_correction = config.LambdaCorrectionConfig()
-    config.rpa = config.RpaConfig()
+    config.misc = config.MiscConfig()
     config.dmft = config.DmftConfig()
     config.sys = config.SystemConfig()
     config.output = config.OutputConfig()
@@ -121,6 +121,7 @@ def create_default_config(config, folder: str):
     config.dmft.n_ineq = 1
     config.dmft.ineq_ordering = [1]
     config.dmft.n_bands_per_ineq = []
+    config.dmft.symmetrize_orbitals = [1, 2]
     config.eliashberg.perform_eliashberg = False
     config.self_consistency.mixing = 1
     config.self_consistency.max_iter = 1
@@ -203,7 +204,9 @@ import traceback as _traceback
 import types as _types
 
 _tls = _threading.local()
-_BARRIER_TIMEOUT = _QUEUE_TIMEOUT = 20.0
+# a deadlock guard, not a timing check: one rank of the 7-rank Jacobian tests can trail the others by more than 20 s
+# on a slow CI runner under coverage
+_BARRIER_TIMEOUT = _QUEUE_TIMEOUT = 120.0
 
 
 class _InPlace:
@@ -457,8 +460,10 @@ def run_parallel(size, fn, hostnames=None):
     threads = [_threading.Thread(target=worker, args=(r,), name=f"rank{r}") for r in range(size)]
     for t in threads:
         t.start()
+    # every rank is waited for: the barrier and queue timeouts end a deadlock, while a join timeout would hand back a
+    # slow rank's result as None
     for t in threads:
-        t.join(timeout=60)
+        t.join()
     for r, e in enumerate(errors):
         if e is not None:
             raise AssertionError(f"rank {r} raised:\n{e[1]}") from e[0]
@@ -553,3 +558,84 @@ def linear_pairs(
         proposals.append(proposal.copy())
         x = x + p * (proposal - x)
     return iterates, proposals
+
+
+def general_su2_u(n_bands: int, u: float, u_prime: float, j: float, j_prime: float) -> np.ndarray:
+    """A general SU(2) local interaction in the equation layout: U on aaaa, the inter-orbital density U' on aabb, the
+    Hund's exchange J on abba and the pair hopping J' on abab (Kanamori is U' = U - 2J, J' = J)."""
+    u_mat = np.zeros((n_bands,) * 4)
+    for a in range(n_bands):
+        for b in range(n_bands):
+            u_mat[a, a, b, b] = u if a == b else u_prime
+            if a != b:
+                u_mat[a, b, b, a], u_mat[a, b, a, b] = j, j_prime
+    return u_mat
+
+
+def graser_spin_charge_u(n_bands: int, u: float, u_prime: float, j: float, j_prime: float) -> tuple:
+    """U^s and U^c of Graser et al., New J. Phys. 11, 025016 (2009), below eq. 20, in Kubo's notation (U~' = U',
+    J~ = J, J~' = J'), stored as (U)^{l1 l2}_{l3 l4} -> [l1, l2, l3, l4]: U^s has U, U' (l1 = l3 != l2 = l4), J
+    (l1 = l2 != l3 = l4) and J' (l1 = l4 != l2 = l3), U^c has U, 2J - U', 2U' - J and J' on the same patterns."""
+    u_s, u_c = np.zeros((n_bands,) * 4), np.zeros((n_bands,) * 4)
+    for a in range(n_bands):
+        u_s[a, a, a, a] = u_c[a, a, a, a] = u
+        for b in range(n_bands):
+            if a != b:
+                u_s[a, b, a, b], u_c[a, b, a, b] = u_prime, 2 * j - u_prime
+                u_s[a, a, b, b], u_c[a, a, b, b] = j, 2 * u_prime - j
+                u_s[a, b, b, a] = u_c[a, b, b, a] = j_prime
+    return u_s, u_c
+
+
+def chain_without_inversion_hk(nk: int) -> np.ndarray:
+    """H(k) [kx, 1, 1, o, o] of a time-reversal symmetric two-orbital chain whose inter-orbital hopping differs along
+    +x and -x: complex, H(-k) = H(k)^*, and no inversion (no orbital action maps H(k) onto H(-k))."""
+    hop = np.array([[-1.0, 0.3], [0.1, -0.6]])
+    phase = np.exp(2j * np.pi * np.arange(nk) / nk)[:, None, None]
+    return (np.array([[0.2, 0.15], [0.15, -0.1]]) + hop * phase + hop.T * phase.conj())[:, None, None]
+
+
+def bilayer_chain_hk(nk: int) -> np.ndarray:
+    """H(k) [kx, 1, 1, o, o] of two layers of one orbital on a chain whose interlayer hopping reaches into the next
+    cell: complex, H(-k) = H(k)^* != H(k), and inversion swaps the layers, H(-k) = S H(k) S."""
+    phase = np.exp(2j * np.pi * np.arange(nk) / nk)
+    hk = np.zeros((nk, 1, 1, 2, 2), dtype=complex)
+    hk[..., 0, 0] = hk[..., 1, 1] = (-2.0 * phase.real)[:, None, None]
+    hk[..., 0, 1] = (0.5 + 0.3 * phase)[:, None, None]
+    hk[..., 1, 0] = np.conj(hk[..., 0, 1])
+    return hk
+
+
+def site_lattice_hk(nk: tuple[int, int, int], positions, onsite, hopping) -> np.ndarray:
+    """H(k) [nx, ny, nz, o, o] in the cell-periodic gauge of one orbital per site at the fractional positions of a
+    cubic cell: H_ab(k) = sum_R t_ab(|x_b + R - x_a|) e^{i k.R} over the neighboring cells along the axes with more
+    than one k-point, t_ab(r) = hopping[a][b] exp(-2 r) for 0 < r < 1.01. Distance-only hoppings keep every symmetry
+    of the site arrangement, so a site that inversion maps into another cell gives a momentum-dependent action."""
+    positions, hopping = np.asarray(positions, dtype=float), np.asarray(hopping, dtype=float)
+    k = np.stack(np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nk), indexing="ij"), axis=-1)
+    hk = np.zeros((*nk, len(positions), len(positions)), dtype=complex)
+    hk[..., np.arange(len(positions)), np.arange(len(positions))] = onsite
+    for cell in np.stack(np.meshgrid(*([-1, 0, 1] if n > 1 else [0] for n in nk), indexing="ij"), -1).reshape(-1, 3):
+        r = np.linalg.norm(positions[None, :] + cell - positions[:, None], axis=-1)
+        hop = np.where((r > 1e-9) & (r < 1.01), hopping * np.exp(-2 * r), 0.0)
+        hk += hop * np.exp(1j * k @ cell)[..., None, None]
+    return hk
+
+
+def chain_without_inversion_green(nk: int, beta: float, mu: float, niv: int) -> np.ndarray:
+    """G(k, i nu) = (i nu + mu - H(k))^-1 [kx, 1, 1, o, o, v] on 2 niv frequencies of the chain of
+    :func:`chain_without_inversion_hk`."""
+    hk = chain_without_inversion_hk(nk)[:, 0, 0]
+    nu = (2 * np.arange(-niv, niv) + 1) * np.pi / beta
+    g = np.linalg.inv((1j * nu[:, None, None, None] + mu) * np.eye(2) - hk[None])  # [v, k, o, o]
+    return g.transpose(1, 2, 3, 0)[:, None, None]
+
+
+def graser_bubble(g: np.ndarray, q, w: int, niv: int) -> np.ndarray:
+    """Graser's eq. 12, chi^{pq}_{st}(q, i w) = -T/N sum_k sum_nu G_sp(k, nu) G_qt(k + q, nu + w), as [p, q, s, t],
+    with nu on [-niv, niv) (the box of DGAmore's summed bubble) and T = 1 / config.sys.beta; g holds G(k, i nu)
+    [kx, ky, kz, o, o, v] on a centered box of at least niv + |w| positive frequencies."""
+    ng = g.shape[-1] // 2
+    g_k = g[..., ng - niv : ng + niv]
+    g_kq = np.roll(g, shift=tuple(-np.asarray(q)), axis=(0, 1, 2))[..., ng - niv + w : ng + niv + w]
+    return -np.einsum("xyzspv,xyzqtv->pqst", g_k, g_kq) / (config.sys.beta * np.prod(g.shape[:3]))

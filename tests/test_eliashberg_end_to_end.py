@@ -51,15 +51,17 @@ def setup(monkeypatch):
     yield folder, comm_mock
 
 
-def _assert_gap_sector_parity(results: dict) -> None:
-    """Asserts every returned Eliashberg gap carries its sector's frequency (T) and momentum-orbital (P.O) parity."""
+def _assert_gap_sector_parity(results: dict, inversion: np.ndarray | None) -> None:
+    """Asserts every returned Eliashberg gap carries its sector's parity under the frequency flip times the orbital
+    exchange (TOU) and the inversion parity (PU) the Pauli principle ties to it; the frequency parity T alone is
+    mixed once the two orbitals hybridize."""
     channel_sign = {SpinChannel.SING: 1, SpinChannel.TRIP: -1}
     parity_sign = {"even": 1, "odd": -1}
     for (channel, parity), (_lambdas, gaps) in results.items():
         for gap in gaps:
-            diagnostics = gap_parity_diagnostics(gap.mat.flatten(), gap.mat.shape)
-            assert np.isclose(diagnostics["T"].real, parity_sign[parity], atol=1e-3)
-            assert np.isclose(diagnostics["PO"].real, channel_sign[channel] * parity_sign[parity], atol=1e-3)
+            diagnostics = gap_parity_diagnostics(gap.mat.flatten(), gap.mat.shape, inversion)
+            assert np.isclose(diagnostics["TOU"].real, parity_sign[parity], atol=1e-3)
+            assert np.isclose(diagnostics["PU"].real, channel_sign[channel] * parity_sign[parity], atol=1e-3)
 
 
 @pytest.mark.parametrize("save_fq", [True, False])
@@ -76,7 +78,7 @@ def test_eliashberg_equation_with_local_part(setup, save_fq):
     config.eliashberg.perform_eliashberg = True
     config.output.output_path = folder
     config.output.eliashberg_path = config.output.output_path
-    config.eliashberg.resolve_frequency_parity = True
+    config.eliashberg.resolve_parity_sectors = True
     config.eliashberg.save_fq = save_fq
 
     u_loc = config.lattice.hamiltonian.get_local_u()
@@ -84,7 +86,7 @@ def test_eliashberg_equation_with_local_part(setup, save_fq):
 
     g_dga = GreensFunction(np.load(f"{folder}/giwk_dga.npy"), nk=config.lattice.nk)
 
-    results = eliashberg_solver.solve(g_dga, g_dmft, u_loc, v_nonloc, comm_mock)
+    results, inversion = eliashberg_solver.solve(g_dga, g_dmft, u_loc, v_nonloc, comm_mock)
     assert set(results) == {
         (SpinChannel.SING, "even"),
         (SpinChannel.SING, "odd"),
@@ -93,12 +95,12 @@ def test_eliashberg_equation_with_local_part(setup, save_fq):
     }
     for (_channel, _parity), (lambdas, gaps) in results.items():
         assert len(gaps) == config.eliashberg.n_eig and len(lambdas) == config.eliashberg.n_eig
-    # sing/even reproduces the unprojected leading singlet and trip/odd the unprojected leading triplet
-    assert np.allclose(results[(SpinChannel.SING, "even")][0], [1.00111, 0.98595, 0.48783, 0.45501], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.SING, "odd")][0], [0.51245, 0.51245, 0.47951, 0.47951], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.TRIP, "even")][0], [0.03748, 0.03626, 0.03626, 0.02470], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.TRIP, "odd")][0], [1.55254, 1.53935, 0.58601, 0.58248], atol=1e-2)
-    _assert_gap_sector_parity(results)
+    # sing/odd holds the unprojected leading singlet and trip/odd the unprojected leading triplet
+    assert np.allclose(results[(SpinChannel.SING, "even")][0], [0.27912, 0.27912, 0.24109, 0.22996], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.SING, "odd")][0], [1.82116, 1.82116, 1.82116, 1.82116], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.TRIP, "even")][0], [0.13606, 0.13606, 0.13606, 0.13606], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.TRIP, "odd")][0], [4.27357, 4.27355, 0.60454, 0.60454], atol=1e-2)
+    _assert_gap_sector_parity(results, inversion)
 
 
 def _fft_index_map(nq: tuple, f) -> np.ndarray:
@@ -112,8 +114,8 @@ def _fft_index_map(nq: tuple, f) -> np.ndarray:
     return m
 
 
-def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeypatch):
-    """The densified two-band pairing kernel matches the index formula and the thesis Eq. (4.63) spectrum."""
+def test_kernel_is_the_direct_term_plus_its_exchange_on_the_two_band_vertex(setup, monkeypatch):
+    """The two-band kernel is (1 + E) D, and the thesis's nu'-flipped crossed term keeps its leading spectrum."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20
@@ -126,7 +128,7 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeyp
     config.output.output_path = folder
     config.output.eliashberg_path = folder
     config.eliashberg.save_fq = False
-    config.eliashberg.resolve_frequency_parity = False
+    config.eliashberg.resolve_parity_sectors = False
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
@@ -135,7 +137,7 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeyp
     captured = {}
     real_solver = eliashberg_solver.solve_eliashberg_lanczos
 
-    def capture_solver(gamma_r_pp, gchi0_q0_pp, ranks, parities=None):
+    def capture_solver(gamma_r_pp, gchi0_q0_pp, ranks, parities=None, u=None):
         dense_holder = []
 
         def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
@@ -169,16 +171,15 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeyp
     giwk = g_dga.cut_niv(niv_pp).compress_q_dimension().mat.astype(np.complex128)
     kdiff = _fft_index_map(nq, lambda a, c, n: (a - c) % n)
     kncross = _fft_index_map(nq, lambda a, c, n: (-a - c) % n)
+    kminus = _fft_index_map(nq, lambda a, c, n: (-a) % n)[:, 0]
     norm = 0.5 / nq_tot / beta
 
     for ch, sign in (("sing", 1.0), ("trip", -1.0)):
         gam = captured[ch]["gamma"].astype(np.complex128).reshape(nq_tot, o, o, o, o, n2, n2)
         dense = captured[ch]["dense"].astype(np.complex128)
 
-        gcm = np.transpose(gam, (0, 1, 4, 3, 2, 5, 6))[kncross][..., ::-1]
-        m_rec = norm * np.einsum(
-            "KQexfyvp,Qehp,Qgfp->KxyvQghp", gam[kdiff] + sign * gcm, giwk, np.conj(giwk), optimize=True
-        )
+        d = norm * np.einsum("KQexfyvp,Qehp,Qgfp->KxyvQghp", gam[kdiff], giwk, np.conj(giwk), optimize=True)
+        m_rec = d + sign * d[kminus].swapaxes(1, 2)[:, :, :, ::-1]
         assert np.allclose(dense, m_rec.reshape(dense.shape), atol=1e-5 * np.abs(dense).max())
 
         gam_th = np.transpose(gam, (0, 2, 3, 4, 1, 5, 6))
@@ -192,14 +193,25 @@ def test_kernel_matches_thesis_eliashberg_form_on_two_band_vertex(setup, monkeyp
         assert np.allclose(ev_code, ev_thesis, atol=1e-3)
 
 
-def _phase_align(gap: np.ndarray, reference: np.ndarray) -> np.ndarray:
-    """Removes the global-phase ambiguity of an eigenvector by rotating it onto the reference's phase."""
-    overlap = np.vdot(reference, gap)
-    return gap if overlap == 0 else gap * (np.abs(overlap) / overlap)
+def _degenerate_clusters(lambdas: np.ndarray) -> list[list[int]]:
+    """Groups the indices of consecutive eigenvalues that agree to symmetrize_degenerate_gaps' relative tolerance."""
+    clusters = [[0]]
+    for i in range(1, len(lambdas)):
+        if abs(lambdas[i] - lambdas[i - 1]) <= 1e-4 * abs(lambdas[i]):
+            clusters[-1].append(i)
+        else:
+            clusters.append([i])
+    return clusters
+
+
+def _span_projector(vectors: list[np.ndarray]) -> np.ndarray:
+    """The orthogonal projector onto the span of the given arrays (flattened)."""
+    q, _ = np.linalg.qr(np.stack([np.asarray(v, dtype=np.complex128).ravel() for v in vectors], axis=1))
+    return q @ q.conj().T
 
 
 def test_eliashberg_gap_functions_carry_sector_parity_and_match_reference(setup):
-    """Each gap carries its sector's T and P.O parity and, with a fixed seed, matches the reference up to a phase."""
+    """Each gap carries its sector parities, and every degenerate cluster of gaps spans the space of its references."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20
@@ -212,7 +224,7 @@ def test_eliashberg_gap_functions_carry_sector_parity_and_match_reference(setup)
     config.output.output_path = folder
     config.output.eliashberg_path = folder
     config.eliashberg.n_eig = 4
-    config.eliashberg.resolve_frequency_parity = True
+    config.eliashberg.resolve_parity_sectors = True
     # at the default 1e-6 the admixture of the nearest gap (~1e-3) depends on the BLAS platform
     config.eliashberg.epsilon = 1e-10
 
@@ -220,18 +232,16 @@ def test_eliashberg_gap_functions_carry_sector_parity_and_match_reference(setup)
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
     g_dga = GreensFunction(np.load(f"{folder}/giwk_dga.npy"), nk=config.lattice.nk)
 
+    assert eliashberg_solver.check_parity_sectors() is None and config.eliashberg.resolve_parity_sectors
     np.random.seed(0)
-    results = eliashberg_solver.solve(g_dga, g_dmft, u_loc, v_nonloc, comm_mock)
+    results, inversion = eliashberg_solver.solve(g_dga, g_dmft, u_loc, v_nonloc, comm_mock)
 
-    channel_sign = {SpinChannel.SING: 1, SpinChannel.TRIP: -1}
-    parity_sign = {"even": 1, "odd": -1}
-    for (channel, parity), (_lambdas, gaps) in results.items():
-        for i, gap in enumerate(gaps):
-            diagnostics = gap_parity_diagnostics(gap.mat.flatten(), gap.mat.shape)
-            assert np.isclose(diagnostics["T"].real, parity_sign[parity], atol=1e-3)
-            assert np.isclose(diagnostics["PO"].real, channel_sign[channel] * parity_sign[parity], atol=1e-3)
-            reference = np.load(f"{folder}/gap_{channel.value}_{parity}_{i + 1}.npy")
-            assert np.allclose(_phase_align(gap.mat, reference), reference, atol=1e-4)
+    _assert_gap_sector_parity(results, inversion)
+    for (channel, parity), (lambdas, gaps) in results.items():
+        references = [np.load(f"{folder}/gap_{channel.value}_{parity}_{i + 1}.npy") for i in range(len(gaps))]
+        for cluster in _degenerate_clusters(lambdas):
+            spans = _span_projector([gaps[i].mat for i in cluster]), _span_projector([references[i] for i in cluster])
+            assert np.allclose(*spans, atol=1e-4)
 
 
 def test_eliashberg_grid_solver_matches_reference(setup, monkeypatch):
@@ -247,16 +257,16 @@ def test_eliashberg_grid_solver_matches_reference(setup, monkeypatch):
     config.eliashberg.perform_eliashberg = True
     config.output.output_path = folder
     config.output.eliashberg_path = config.output.output_path
-    config.eliashberg.resolve_frequency_parity = True
+    config.eliashberg.resolve_parity_sectors = True
     monkeypatch.setattr(eliashberg_solver, "FORCE_GRID_SOLVER", True)
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
     g_dga = GreensFunction(np.load(f"{folder}/giwk_dga.npy"), nk=config.lattice.nk)
 
-    results = eliashberg_solver.solve(g_dga, g_dmft, u_loc, v_nonloc, comm_mock)
+    results, _ = eliashberg_solver.solve(g_dga, g_dmft, u_loc, v_nonloc, comm_mock)
 
-    assert np.allclose(results[(SpinChannel.SING, "even")][0], [1.00111, 0.98595, 0.48783, 0.45501], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.SING, "odd")][0], [0.51245, 0.51245, 0.47951, 0.47951], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.TRIP, "even")][0], [0.03748, 0.03626, 0.03626, 0.02470], atol=1e-2)
-    assert np.allclose(results[(SpinChannel.TRIP, "odd")][0], [1.55254, 1.53935, 0.58601, 0.58248], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.SING, "even")][0], [0.27912, 0.27912, 0.24109, 0.22996], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.SING, "odd")][0], [1.82116, 1.82116, 1.82116, 1.82116], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.TRIP, "even")][0], [0.13606, 0.13606, 0.13606, 0.13606], atol=1e-2)
+    assert np.allclose(results[(SpinChannel.TRIP, "odd")][0], [4.27357, 4.27355, 0.60454, 0.60454], atol=1e-2)

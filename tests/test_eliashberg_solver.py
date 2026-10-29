@@ -28,7 +28,7 @@ from dgamore.eliashberg_solver import (
     _apply_gchi0_pp,
     _chi0_to_matmul_layout,
     _compute_once_per_node,
-    _frequency_parity_sectors,
+    _parity_sectors,
     _gap_orbital_mirrors,
     _mirror_acts_on_orbitals,
     _mirror_operator,
@@ -48,12 +48,24 @@ from dgamore.eliashberg_solver import (
     transform_vertex_loc_frequencies_w0,
 )
 from dgamore.four_point import FourPoint
+from dgamore.gap_function import GapFunction
 from dgamore.greens_function import GreensFunction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import FrequencyNotation, SpinChannel
+from dgamore.self_energy import SelfEnergy
 from tests import conftest
-from tests.conftest import FAKE_MPI, run_parallel
+from tests.conftest import (
+    FAKE_MPI,
+    bilayer_chain_hk,
+    chain_without_inversion_green,
+    chain_without_inversion_hk,
+    general_su2_u,
+    graser_bubble,
+    graser_spin_charge_u,
+    run_parallel,
+    site_lattice_hk,
+)
 
 
 def test_apply_gchi0_pp_matches_einsum():
@@ -123,38 +135,6 @@ def _make_pp_chi_and_bubble(
 def _j_conjugate(mat: np.ndarray) -> np.ndarray:
     """Conjugates a full-index pp tensor with the crossing operator J (swap both orbital pairs, flip both v)."""
     return np.einsum("abcdwvp->cdabwvp", mat)[..., ::-1, ::-1]
-
-
-def test_crossed_term_reuses_direct_vertex_via_index_shuffles():
-    """The crossed matvec term equals sign*flip_K[swap_ab[Gamma @ flip_p(gap)]], reusing the direct vertex."""
-    from dgamore.n_point_base import FrequencyNotation
-
-    rng = np.random.default_rng(37)
-    nqx, nqy, nqz, o, n2 = 3, 4, 2, 2, 4
-    shape = (nqx, nqy, nqz, o, o, o, o, n2, n2)
-    gam = FourPoint(
-        rng.standard_normal(shape) + 1j * rng.standard_normal(shape),
-        SpinChannel.SING,
-        (nqx, nqy, nqz),
-        0,
-        2,
-        True,
-        True,
-        False,
-        FrequencyNotation.PP,
-    )
-    gap_gg = rng.standard_normal((nqx, nqy, nqz, o, o, n2)) + 1j * rng.standard_normal((nqx, nqy, nqz, o, o, n2))
-    gap_gg = gap_gg.astype(np.complex64)
-    for sign in (1.0, -1.0):
-        flipped = gam.flip_momentum_axis().flip_frequency_axis(-1, False).permute_orbitals("abcd->adcb", False)
-        flipped_mm = _gamma_to_matmul_layout(flipped.permute_orbitals("abcd->badc", False).mat) * sign
-        gap_gg_flipped = np.roll(np.flip(gap_gg, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-        ref = _apply_gamma_pp(flipped_mm, gap_gg_flipped, o)
-
-        direct_mm = _gamma_to_matmul_layout(gam.copy().permute_orbitals("abcd->badc", False).mat)
-        crossed = _apply_gamma_pp(direct_mm, np.flip(gap_gg, axis=-1), o)
-        crossed = sign * np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-        assert np.allclose(crossed, ref, atol=1e-4)
 
 
 def test_full_vertex_first_term_restructure_matches_original_expression():
@@ -414,7 +394,7 @@ def test_degenerate_decoupled_bands_reproduce_single_band_kernel(monkeypatch, ch
     config.eliashberg.n_eig = 2
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "random"
-    config.eliashberg.resolve_frequency_parity = False
+    config.eliashberg.resolve_parity_sectors = False
     config.logger = MagicMock()
 
     rng = np.random.default_rng(21)
@@ -566,7 +546,7 @@ def test_solve_eliashberg_lanczos_runs_eigsh_inside_thread_budget(monkeypatch):
     config.eliashberg.n_eig = 1
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "random"
-    config.eliashberg.resolve_frequency_parity = False
+    config.eliashberg.resolve_parity_sectors = False
     config.logger = MagicMock()
 
     rng = np.random.default_rng(4)
@@ -617,7 +597,7 @@ def test_solve_eliashberg_lanczos_declares_the_dtype_and_logs_matvecs_thread_bud
     """The operator carries the vertex dtype (no probe matvec) and the solve logs its matvecs, threads and RSS."""
     nq, niv_pp = (4, 2, 1), 2
     _grid_test_config(nq, niv_pp)
-    config.eliashberg.resolve_frequency_parity = False
+    config.eliashberg.resolve_parity_sectors = False
     gamma, chi0 = _random_pairing_vertex_and_bubble(nq, 1, niv_pp, 3)
     seen = []
 
@@ -644,7 +624,7 @@ def test_in_memory_matvec_threads_the_bubble_multiply(monkeypatch):
 
     nq, niv_pp = (4, 2, 1), 2
     _grid_test_config(nq, niv_pp)
-    config.eliashberg.resolve_frequency_parity = False
+    config.eliashberg.resolve_parity_sectors = False
     gamma, chi0 = _random_pairing_vertex_and_bubble(nq, 1, niv_pp, 3)
     spy = create_autospec(es._apply_gchi0_pp, wraps=es._apply_gchi0_pp)
 
@@ -666,7 +646,7 @@ def test_solve_eliashberg_lanczos_parities_subset_solves_only_requested(monkeypa
     config.eliashberg.n_eig = 2
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "random"
-    config.eliashberg.resolve_frequency_parity = True
+    config.eliashberg.resolve_parity_sectors = True
     gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=13)
 
     calls = []
@@ -689,7 +669,7 @@ def test_solve_eliashberg_lanczos_hands_eigsh_the_floored_basis_size(monkeypatch
     config.eliashberg.n_eig = 2
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "random"
-    config.eliashberg.resolve_frequency_parity = False
+    config.eliashberg.resolve_parity_sectors = False
     gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=13)
     seen = []
 
@@ -704,56 +684,13 @@ def test_solve_eliashberg_lanczos_hands_eigsh_the_floored_basis_size(monkeypatch
     assert seen == [12]
 
 
-def test_bubble_is_frequency_even_accepts_an_even_bubble_and_rejects_a_perturbed_one():
-    """The evenness guard passes a bubble that is symmetric in the fermionic frequency and fails one that is not."""
-    rng = np.random.default_rng(2)
-    chi0 = rng.standard_normal((3, 2, 1, 6, 4, 4)) + 1j * rng.standard_normal((3, 2, 1, 6, 4, 4))
-    even = 0.5 * (chi0 + np.flip(chi0, axis=3))
-    assert es._bubble_is_frequency_even(even)
-    odd = even.copy()
-    odd[1, 0, 0, 0, 2, 3] *= 1 + 1e-4
-    assert not es._bubble_is_frequency_even(odd)
-
-
-@pytest.mark.parametrize("channel", [SpinChannel.SING, SpinChannel.TRIP])
-def test_single_band_sector_matvec_forms_the_crossed_term_from_the_direct_one_on_an_even_bubble(monkeypatch, channel):
-    """For one band and an exactly even bubble the shortcut sector matvec equals the two-contraction one bit for bit."""
-    nq, niv_pp = (4, 2, 1), 2
-    _grid_test_config(nq, niv_pp)
-    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, 1, niv_pp, 3)
-    gamma.channel = channel
-    chi0.mat = 0.5 * (chi0.mat + np.flip(chi0.mat, axis=-1))
-    gap_shape = nq + (1, 1, 2 * niv_pp)
-    rng = np.random.default_rng(8)
-    probes = [
-        (rng.standard_normal(gap_shape) + 1j * rng.standard_normal(gap_shape)).ravel().astype(np.complex64)
-        for _ in range(3)
-    ]
-    captured = []
-
-    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
-        captured.append(op)
-        return np.ones(k), np.ones((op.shape[0], k), dtype=np.complex64)
-
-    outputs = {}
-    for guard in (True, False):
-        with monkeypatch.context() as mp:
-            mp.setattr(es, "_bubble_is_frequency_even", lambda chi0_mm, rtol=1e-6: guard)
-            mp.setattr(es, "_solver_thread_budget", MagicMock(return_value=1))
-            mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
-            solve_eliashberg_lanczos(deepcopy(gamma), deepcopy(chi0), (0, 0))
-        outputs[guard] = [[op.matvec(x) for x in probes] for op in captured[-2:]]
-    for got, ref in zip(outputs[True], outputs[False]):
-        assert all(np.array_equal(a, b) for a, b in zip(got, ref))
-
-
 def test_solve_eliashberg_lanczos_keeps_the_converged_subset_when_arpack_does_not_converge(monkeypatch):
     """An ArpackNoConvergence keeps the eigenpairs that did converge, sized off what came back, with a warning."""
     nq, niv_pp = (4, 4, 1), 2
     config.eliashberg.n_eig = 3
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "random"
-    config.eliashberg.resolve_frequency_parity = False
+    config.eliashberg.resolve_parity_sectors = False
     gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=13)
 
     def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
@@ -948,19 +885,22 @@ def test_shared_vertex_window_matches_the_single_rank_layout_on_every_node_rank(
     assert res[0][1]
 
 
-def test_project_frequency_block_matches_the_block_of_the_full_projection():
-    """Each frequency block of the sector projector, formed from the block and its mirror, equals the full one."""
+@pytest.mark.parametrize("action", ["none", "swap", "momentum-dependent"])
+def test_project_frequency_block_matches_the_block_of_the_full_projection(action):
+    """Each frequency block of the sector projector equals the full one, bit for bit or, with an action, to rounding."""
     gap_shape = (4, 2, 1, 2, 2, 6)
+    u = _orbital_actions(gap_shape[:3])[action]
     rng = np.random.default_rng(5)
     gap = (rng.standard_normal(gap_shape) + 1j * rng.standard_normal(gap_shape)).astype(np.complex64)
     for eps_t in (1, -1):
-        for eps_po in (1, -1):
-            full = es._project_gap_to_sector(gap.reshape(-1), gap_shape, eps_t, eps_po).reshape(gap_shape)
+        for eps_p in (1, -1):
+            full = es._project_gap_to_sector(gap.reshape(-1), gap_shape, eps_t, eps_p, u).reshape(gap_shape)
             for v0, v1 in ((0, 6), (0, 2), (2, 5), (5, 6)):
-                assert np.array_equal(es._project_frequency_block(gap, v0, v1, eps_t, eps_po), full[..., v0:v1])
+                block, expected = es._project_frequency_block(gap, v0, v1, eps_t, eps_p, u), full[..., v0:v1]
+                assert np.array_equal(block, expected) if u is None else np.allclose(block, expected, atol=1e-6)
 
 
-def _matvec_references(monkeypatch, gamma, chi0, gap_shape, eps_list):
+def _matvec_references(monkeypatch, gamma, chi0, gap_shape, eps_list, u=None):
     """Captures the single-rank sector matvecs of both channels on random probes, keyed by (channel, eps_t)."""
     rng = np.random.default_rng(8)
     n = int(np.prod(gap_shape))
@@ -977,13 +917,13 @@ def _matvec_references(monkeypatch, gamma, chi0, gap_shape, eps_list):
         for channel in (SpinChannel.SING, SpinChannel.TRIP):
             source = deepcopy(gamma)
             source.channel = channel
-            solve_eliashberg_lanczos(source, deepcopy(chi0), (0, 0))
+            solve_eliashberg_lanczos(source, deepcopy(chi0), (0, 0), u=u)
             for eps_t, op in zip(eps_list, captured[-len(eps_list) :]):
                 references[(channel, eps_t)] = [op.matvec(x) for x in probes]
     return probes, references
 
 
-def _team_matvec_blocks(size, gamma, chi0, norm, gap_shape, o, probes, references, orbits, shortcut=False):
+def _team_matvec_blocks(size, gamma, chi0, norm, gap_shape, o, probes, references, orbits, u=None):
     """Runs the team matvec on ``size`` fake ranks of one node and returns every rank's output blocks per sector."""
     nq = gap_shape[:3]
 
@@ -1001,13 +941,13 @@ def _team_matvec_blocks(size, gamma, chi0, norm, gap_shape, o, probes, reference
             wins.append(win)
         scratch = [mu.allocate_node_shared_array(comm, gap_shape, windows[SpinChannel.SING].dtype) for _ in range(4)]
         apply_block, (v0, v1) = es._team_matvec(
-            comm, windows, _chi0_to_matmul_layout(chi0_shared), [a for a, _ in scratch], gap_shape, o, orbits, shortcut
+            comm, windows, _chi0_to_matmul_layout(chi0_shared), [a for a, _ in scratch], gap_shape, o, orbits, u
         )
         outputs = {}
         for channel, eps_t in references:
-            eps_po = None if eps_t is None else (1 if channel == SpinChannel.SING else -1) * eps_t
+            eps_p = None if eps_t is None else (1 if channel == SpinChannel.SING else -1) * eps_t
             outputs[(channel, eps_t)] = [
-                apply_block(channel, eps_t, eps_po, x.reshape(gap_shape)[..., v0:v1]) for x in probes
+                apply_block(channel, eps_t, eps_p, x.reshape(gap_shape)[..., v0:v1]) for x in probes
             ]
         comm.Barrier()
         for win in wins + [w for _, w in scratch]:
@@ -1030,7 +970,7 @@ def test_team_matvec_matches_the_single_rank_matvec_bit_for_bit(monkeypatch, siz
     """The team matvec over node-shared windows equals the single-rank sector matvec bit for bit, raw and projected."""
     nq, niv_pp = (4, 2, 1), 2
     _grid_test_config(nq, niv_pp)
-    config.eliashberg.resolve_frequency_parity = projected
+    config.eliashberg.resolve_parity_sectors = projected
     gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)
     gap_shape = nq + (o, o, 2 * niv_pp)
     probes, references = _matvec_references(monkeypatch, gamma, chi0, gap_shape, (1, -1) if projected else (None,))
@@ -1040,6 +980,25 @@ def test_team_matvec_matches_the_single_rank_matvec_bit_for_bit(monkeypatch, siz
     for key, expected in references.items():
         for i, ref in enumerate(expected):
             assert np.array_equal(_assemble_blocks(res, key, i), ref)
+
+
+@pytest.mark.parametrize("size", [1, 3])
+@pytest.mark.parametrize("action", ["swap", "momentum-dependent"])
+def test_team_matvec_with_an_orbital_action_matches_the_single_rank_matvec_to_rounding(monkeypatch, size, action):
+    """With an orbital action of the inversion the projected team matvec equals the single-rank one to rounding."""
+    nq, niv_pp, o = (4, 2, 1), 2, 2
+    _grid_test_config(nq, niv_pp)
+    config.eliashberg.resolve_parity_sectors = True
+    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)
+    gap_shape = nq + (o, o, 2 * niv_pp)
+    u = _orbital_actions(nq)[action]
+    probes, references = _matvec_references(monkeypatch, gamma, chi0, gap_shape, (1, -1), u)
+    norm = 0.5 / config.lattice.k_grid.nk_tot / config.sys.beta
+    monkeypatch.setattr("dgamore.mpi_utils.MPI", conftest.FAKE_MPI)
+    res = _team_matvec_blocks(size, gamma, chi0, norm, gap_shape, o, probes, references, None, u)
+    for key, expected in references.items():
+        for i, ref in enumerate(expected):
+            assert np.max(np.abs(_assemble_blocks(res, key, i) - ref)) <= 1e-5 * np.max(np.abs(ref))
 
 
 def _wedge_vertex(nq, o, niv_pp, seed, grid):
@@ -1104,22 +1063,6 @@ def test_wedge_orbits_partition_the_grid_by_star():
     points, offsets, order, us = es._wedge_orbits(auto)
     assert auto.nk_irr == len(points) < auto.nk_tot and us.shape == (auto.nk_tot, 2, 2)
     assert all(np.allclose(us[point], np.eye(2)) for point in points)
-
-
-def test_team_matvec_forms_the_crossed_term_from_the_direct_one_on_an_even_bubble(monkeypatch):
-    """With one band and an even bubble the team matvec's shortcut sectors equal the single-rank sector matvec."""
-    nq, niv_pp, o = (4, 2, 1), 2, 1
-    _grid_test_config(nq, niv_pp)
-    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)
-    chi0.mat = 0.5 * (chi0.mat + np.flip(chi0.mat, axis=-1))
-    gap_shape = nq + (o, o, 2 * niv_pp)
-    probes, references = _matvec_references(monkeypatch, gamma, chi0, gap_shape, (1, -1))
-    norm = 0.5 / config.lattice.k_grid.nk_tot / config.sys.beta
-    monkeypatch.setattr("dgamore.mpi_utils.MPI", conftest.FAKE_MPI)
-    res = _team_matvec_blocks(3, gamma, chi0, norm, gap_shape, o, probes, references, None, shortcut=True)
-    for key, expected in references.items():
-        for i, ref in enumerate(expected):
-            assert np.array_equal(_assemble_blocks(res, key, i), ref)
 
 
 @pytest.mark.parametrize("size", [1, 3])
@@ -1663,58 +1606,417 @@ def test_local_gamma_ud_pp_w0_per_ineq_reuses_repeated_atoms():
     assert np.allclose(gamma_full.mat[:2, :2, :2, :2], create_local_gamma_ud_pp_w0(chi_a, chi0_a, beta).mat, atol=1e-6)
 
 
-# --- frequency-parity gap sectors (physical-gap projection) ---
+# --- parity gap sectors (physical-gap projection) ---
 def _flip_nu(g: np.ndarray) -> np.ndarray:
     """T involution on a [kx, ky, kz, o1, o2, v] gap array (nu -> -nu)."""
     return np.flip(g, axis=-1)
 
 
-def _flip_po(g: np.ndarray) -> np.ndarray:
-    """P.O involution on a [kx, ky, kz, o1, o2, v] gap array (k -> -k and o1 <-> o2)."""
-    return np.roll(np.flip(g.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+def _at_minus_k(g: np.ndarray) -> np.ndarray:
+    """A [kx, ky, kz, ...] array read at -k on the periodic grid."""
+    return np.roll(np.flip(g, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+
+
+def _orbital_actions(nk: tuple) -> dict:
+    """No action, the constant layer swap and a momentum-dependent action U(k) = diag(1, e^{i k_x}) (U(k) U(-k) = 1)
+    for two orbitals on the grid nk."""
+    phase = np.exp(2j * np.pi * np.arange(nk[0]) / nk[0])[:, None, None]
+    field = np.zeros(nk + (2, 2), dtype=complex)
+    field[..., 0, 0], field[..., 1, 1] = 1.0, np.broadcast_to(phase, nk)
+    return {"none": None, "swap": np.array([[0.0, 1.0], [1.0, 0.0]]), "momentum-dependent": field}
+
+
+def _rotated(g: np.ndarray, u) -> np.ndarray:
+    """U(k) g(k) U(-k)^T of a [kx, ky, kz, o1, o2, v] array."""
+    if u is None:
+        return g
+    u = np.broadcast_to(u, g.shape[:3] + u.shape[-2:])
+    return np.einsum("xyzac,xyzcdv,xyzbd->xyzabv", u, g, _at_minus_k(u))
 
 
 @pytest.mark.parametrize("resolve, expected", [(True, [("even", 1), ("odd", -1)]), (False, [("none", None)])])
-def test_frequency_parity_sectors_maps_boolean(resolve, expected):
-    """_frequency_parity_sectors returns the even and odd sectors when resolving parity, else the raw sector."""
-    assert _frequency_parity_sectors(resolve) == expected
+def test_parity_sectors_maps_boolean(resolve, expected):
+    """_parity_sectors returns the even and odd sectors when resolving parity, else the raw sector."""
+    assert _parity_sectors(resolve) == expected
 
 
-@pytest.mark.parametrize("eps_t, eps_po", [(1, 1), (1, -1), (-1, 1), (-1, -1)])
-def test_project_gap_to_sector_is_idempotent_and_selects_parities(eps_t, eps_po):
-    """The sector projector is idempotent and its image has T-parity eps_t and (P.O)-parity eps_po."""
-    shape = (2, 2, 1, 2, 2, 4)
+@pytest.mark.parametrize("action", ["none", "swap", "momentum-dependent"])
+@pytest.mark.parametrize("eps_t, eps_p", [(1, 1), (1, -1), (-1, 1), (-1, -1)])
+def test_project_gap_to_sector_is_idempotent_and_selects_parities(eps_t, eps_p, action):
+    """The sector projector is idempotent and its image has parity eps_t under T O_U and eps_p under P_U."""
+    shape = (3, 2, 1, 2, 2, 4)
+    u = _orbital_actions(shape[:3])[action]
     rng = np.random.default_rng(7)
     vec = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).ravel()
-    proj = _project_gap_to_sector(vec, shape, eps_t, eps_po)
-    assert np.allclose(_project_gap_to_sector(proj, shape, eps_t, eps_po), proj, atol=1e-12)
+    proj = _project_gap_to_sector(vec, shape, eps_t, eps_p, u)
+    assert np.allclose(_project_gap_to_sector(proj, shape, eps_t, eps_p, u), proj, atol=1e-12)
     g = proj.reshape(shape)
-    assert np.allclose(_flip_nu(g), eps_t * g, atol=1e-12)
-    assert np.allclose(_flip_po(g), eps_po * g, atol=1e-12)
+    assert np.allclose(_rotated(_flip_nu(g).swapaxes(3, 4), u), eps_t * g, atol=1e-12)
+    assert np.allclose(_rotated(_at_minus_k(g), u), eps_p * g, atol=1e-12)
 
 
-def test_project_gap_to_sector_is_hermitian_and_partitions_identity():
-    """The four sector projectors are Hermitian and sum to the identity over a channel (even/odd x its forced P.O)."""
-    shape = (2, 2, 1, 2, 2, 4)
+@pytest.mark.parametrize("action", ["none", "swap", "momentum-dependent"])
+def test_project_gap_to_sector_is_hermitian_and_partitions_identity(action):
+    """The four sector projectors are Hermitian and sum to the identity."""
+    shape = (3, 2, 1, 2, 2, 4)
+    u = _orbital_actions(shape[:3])[action]
     n = int(np.prod(shape))
     basis = np.eye(n, dtype=np.complex128)
     total = np.zeros((n, n), dtype=np.complex128)
-    for eps_t, eps_po in [(1, 1), (1, -1), (-1, 1), (-1, -1)]:
-        proj = np.column_stack([_project_gap_to_sector(basis[:, i], shape, eps_t, eps_po) for i in range(n)])
+    for eps_t, eps_p in [(1, 1), (1, -1), (-1, 1), (-1, -1)]:
+        proj = np.column_stack([_project_gap_to_sector(basis[:, i], shape, eps_t, eps_p, u) for i in range(n)])
         assert np.allclose(proj, proj.conj().T, atol=1e-12)
         total += proj
     assert np.allclose(total, np.eye(n), atol=1e-12)
 
 
-@pytest.mark.parametrize("eps_t, eps_po", [(1, -1), (-1, 1)])
-def test_gap_parity_diagnostics_reports_projected_parities(eps_t, eps_po):
-    """_gap_parity_diagnostics returns the T and P.O Rayleigh quotients of a gap projected into a known sector."""
-    shape = (2, 2, 1, 2, 2, 4)
+@pytest.mark.parametrize("action", ["none", "swap", "momentum-dependent"])
+@pytest.mark.parametrize("eps_t, eps_p", [(1, -1), (-1, 1)])
+def test_gap_parity_diagnostics_reports_projected_parities(eps_t, eps_p, action):
+    """gap_parity_diagnostics returns the T O_U and P_U Rayleigh quotients of a gap projected into a known sector."""
+    shape = (3, 2, 1, 2, 2, 4)
+    u = _orbital_actions(shape[:3])[action]
     rng = np.random.default_rng(3)
     vec = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).ravel()
-    diag = gap_parity_diagnostics(_project_gap_to_sector(vec, shape, eps_t, eps_po), shape)
-    assert np.isclose(diag["T"].real, eps_t, atol=1e-10) and np.isclose(diag["T"].imag, 0.0, atol=1e-10)
-    assert np.isclose(diag["PO"].real, eps_po, atol=1e-10) and np.isclose(diag["PO"].imag, 0.0, atol=1e-10)
+    diag = gap_parity_diagnostics(_project_gap_to_sector(vec, shape, eps_t, eps_p, u), shape, u)
+    assert np.isclose(diag["TOU"], eps_t, atol=1e-10) and np.isclose(diag["PU"], eps_p, atol=1e-10)
+
+
+def test_sector_residual_passes_an_eigenvector_of_a_complex_eigenvalue_and_warns_on_a_mixture():
+    """The Rayleigh-quotient residual passes an eigenvector of a complex eigenvalue and warns on a mixture."""
+    config.logger = MagicMock()
+    rng = np.random.default_rng(2)
+    kernel = rng.standard_normal((6, 6)) + 1j * rng.standard_normal((6, 6))
+    _, vec = np.linalg.eig(kernel)
+
+    es._log_sector_residual(vec[:, 0], kernel @ vec[:, 0], "the singlet/even sector", (0,))
+    assert not config.logger.warning.called
+
+    mixed = vec[:, 0] + 0.1 * vec[:, 1]
+    es._log_sector_residual(mixed, kernel @ mixed, "the singlet/even sector", (0,))
+    assert config.logger.warning.called
+
+
+@pytest.mark.parametrize("epsilon, warns", [(1e-2, False), (1e-6, True)])
+def test_sector_residual_warns_only_beyond_ten_times_the_eigensolver_tolerance(monkeypatch, epsilon, warns):
+    """A relative residual of 1e-2 is within ten times a 1e-2 eigensolver tolerance, but warns at 1e-6."""
+    config.logger = MagicMock()
+    monkeypatch.setattr(config.eliashberg, "epsilon", epsilon)
+    gap = np.array([1.0, 0.0, 0.0], dtype=complex)
+
+    es._log_sector_residual(gap, np.array([2.0, 2e-2, 0.0], dtype=complex), "the singlet/even sector", (0,))
+
+    assert config.logger.warning.called is warns
+
+
+@pytest.mark.parametrize("raw, warns", [([1e-3, 1e-5, 0.0], False), ([0.5, 1e-2, 0.0], True)])
+def test_sector_residual_measures_a_small_eigenvalue_against_the_instability(raw, warns):
+    """Single-precision noise of 1e-5 next to an eigenvalue of 1e-3 passes; a leak of 1e-2 at 0.5 still warns."""
+    config.logger = MagicMock()
+
+    es._log_sector_residual(np.array([1.0, 0.0, 0.0], dtype=complex), np.array(raw, dtype=complex), "sector", (0,))
+
+    assert config.logger.warning.called is warns
+
+
+@pytest.mark.parametrize("converges_at, tols", [(5e-5, [1e-6, 1e-4]), (1.0, [1e-6, 1e-4, 1e-2])])
+def test_solve_loosening_retries_an_unconverged_sector_at_looser_tolerances_with_a_warning(converges_at, tols):
+    """A sector short of eigenpairs is retried at 100x looser tolerances, twice at most, with a warning each time."""
+    config.logger = MagicMock()
+    calls = []
+
+    def solve(tol):
+        calls.append(tol)
+        return (np.ones(2 if tol >= converges_at else 1),)
+
+    es._solve_loosening(solve, 1e-6, 2, "sector", (0,))
+
+    assert np.allclose(calls, tols) and config.logger.warning.call_count == len(tols) - 1
+
+
+def test_team_solve_logs_the_matvecs_of_every_attempt(monkeypatch):
+    """A team sector that converges only on its looser retry logs the matvecs and matvec time of both attempts."""
+    nq, niv_pp = (4, 2, 1), 2
+    _grid_test_config(nq, niv_pp)
+    config.eliashberg.resolve_parity_sectors = False
+    gap_shape = nq + (1, 1, 2 * niv_pp)
+    vector = np.ones((1, int(np.prod(gap_shape))), dtype=np.complex64)
+
+    def fake_arnoldi(apply_block, seed, n_eig, ncv, tol, maxiter, comm, n_block=1):
+        k = n_eig if tol > config.eliashberg.epsilon else 0
+        return np.ones(k), np.ones((1, k)), vector, 7, 0.5
+
+    def fn(comm, rank):
+        team = es.LanczosTeam("h", 0, (0,), ((SpinChannel.SING, "none"),))
+        gap_w = np.zeros(gap_shape, dtype=np.complex64)
+        return es._solve_team_sectors(comm, team, MagicMock(), (0, 2 * niv_pp), gap_w, gap_shape)
+
+    monkeypatch.setattr(es, "_team_arnoldi", fake_arnoldi)
+    run_parallel(1, fn)
+
+    assert any("14 matvecs, 1.0 s in the matvec" in c.args[0] for c in config.logger.info.call_args_list)
+
+
+def _inversion_symmetric_kernel(monkeypatch, channel, perm):
+    """The densified kernel of a random pairing vertex and the pp bubble of a two-orbital chain, both symmetric under
+    the inversion k -> -k that permutes the orbitals by perm (hybridized orbitals, so frequency parity mixes)."""
+    nq, o, niv_pp, beta = (4, 1, 1), 2, 2, 10.0
+    nk, n2 = nq[0], 2 * niv_pp
+    phase = np.exp(2j * np.pi * np.arange(nk) / nk)
+    if perm == [0, 1]:  # real symmetric hoppings: H(-k) = H(k)
+        hk = np.array([[0.3, 0.2], [0.2, -0.1]]) + np.array([[-1.0, 0.4], [0.4, -0.7]]) * 2 * phase.real[:, None, None]
+    else:  # two layers of one orbital, the interlayer hopping reaching into the next cell: H(-k) = S H(k) S
+        hk = np.zeros((nk, 2, 2), dtype=complex)
+        hk[:, 0, 0] = hk[:, 1, 1] = -2.0 * phase.real
+        hk[:, 0, 1] = 0.5 + 0.3 * phase
+        hk[:, 1, 0] = np.conj(hk[:, 0, 1])
+    nu = (2 * np.arange(-niv_pp, niv_pp) + 1) * np.pi / beta
+    g = np.linalg.inv((1j * nu[None, :, None, None] + 0.1) * np.eye(o) - hk[:, None])  # [k, v, o, o]
+    minus = -np.arange(nk) % nk
+    chi0 = np.einsum("kvad,kvbc->kabcdv", g, g[minus][:, ::-1])
+    rng = np.random.default_rng(17)
+    shape = (nk, o, o, o, o, n2, n2)
+    gamma = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    gamma = 0.5 * (gamma + gamma[minus][:, perm][:, :, perm][:, :, :, perm][:, :, :, :, perm])
+    return _densify_pairing_kernel(monkeypatch, gamma, chi0, nq, channel), (nk, 1, 1, o, o, n2)
+
+
+def _assert_parity_sectors_split_the_kernel(kernel: np.ndarray, gap_shape: tuple, sign: int, u) -> None:
+    """Both parity sectors of a channel are invariant subspaces of the kernel, K Pi = Pi K Pi, and the union of their
+    spectra is the whole nonzero (Pauli-allowed) spectrum."""
+    n = len(kernel)
+    spectra = []
+    for eps in (1, -1):
+        basis = np.eye(n, dtype=np.complex128)
+        proj = np.column_stack([_project_gap_to_sector(basis[:, i], gap_shape, eps, sign * eps, u) for i in range(n)])
+        assert np.allclose(kernel @ proj, proj @ kernel @ proj, atol=1e-10 * np.abs(kernel).max())
+        w, v = np.linalg.eigh(proj)
+        sector = v[:, w > 0.5]
+        spectra.append(np.linalg.eigvals(sector.conj().T @ kernel @ sector))
+    full = np.linalg.eigvals(kernel)
+    tol = 1e-8 * np.abs(full).max()
+    remaining = list(full[np.abs(full) > 1e-9 * np.abs(full).max()])
+    union = np.concatenate(spectra)
+    for value in union[np.abs(union) > 1e-9 * np.abs(full).max()]:  # nearest match: conjugate pairs sort either way
+        nearest = int(np.argmin(np.abs(np.asarray(remaining) - value)))
+        assert abs(remaining.pop(nearest) - value) < tol
+    assert not remaining
+
+
+@pytest.mark.parametrize("perm", [[0, 1], [1, 0]])
+@pytest.mark.parametrize("channel", [SpinChannel.SING, SpinChannel.TRIP])
+def test_parity_sectors_are_invariant_subspaces_of_an_inversion_symmetric_kernel(monkeypatch, channel, perm):
+    """The T O_U and P_U sectors of hybridized orbitals are invariant subspaces holding the whole spectrum."""
+    monkeypatch.setattr(n_point_base, "DTYPE", np.complex128)
+    kernel, gap_shape = _inversion_symmetric_kernel(monkeypatch, channel, perm)
+    u = None if perm == [0, 1] else np.eye(2)[perm]
+
+    _assert_parity_sectors_split_the_kernel(kernel, gap_shape, 1 if channel == SpinChannel.SING else -1, u)
+
+
+def _rpa_kernel_of_site_lattice(monkeypatch, hk: np.ndarray, u_site: float, channel) -> tuple[np.ndarray, tuple]:
+    """The densified pairing kernel of a lattice with one orbital per site and a Hubbard U on every site, from the
+    code's own path: the RPA susceptibilities of the bubble of G(k), their pairing vertices in pp notation, and the
+    pp bubble G(k) G(-k)."""
+    monkeypatch.setattr(n_point_base, "DTYPE", np.complex128)
+    nq, o = hk.shape[:3], hk.shape[-1]
+    beta, niw, niv, niv_pp = 10.0, 4, 6, 2
+    config.sys.beta, config.sys.n_bands = beta, o
+    q_grid = config.lattice.k_grid = bz.KGrid(nq, symmetries=[])
+    nu = (2 * np.arange(-(niv + niw), niv + niw) + 1) * np.pi / beta
+    g = np.linalg.inv((1j * nu[:, None, None, None, None, None] + 0.2) * np.eye(o) - hk[None])  # [v, kx, ky, kz, o, o]
+    giwk = GreensFunction(np.moveaxis(g, 0, -1).copy(), calc_filling=False, nk=nq, beta=beta)
+    bubble = BubbleGenerator.create_generalized_chi0_q_loop(giwk, niw, niv, q_grid.get_irrq_list(), q_grid, beta)
+    summed = bubble.sum_over_all_vn(beta).scale(1.0 / beta)
+    u_mat = np.zeros((o,) * 4)
+    u_mat[(np.arange(o),) * 4] = u_site
+    u_loc = LocalInteraction(u_mat)
+    v_q = Interaction(np.zeros((int(np.prod(nq)),) + (o,) * 4), SpinChannel.NONE, nq, True)
+    f_pp = {}
+    for ph in (SpinChannel.DENS, SpinChannel.MAGN):
+        chi = nonlocal_sde.create_rpa_susceptibility(summed, u_loc, v_q, ph)
+        chi.save(name=f"chi_phys_q_{ph.value}_rank_0", output_dir=config.output.eliashberg_path)
+        f_pp[ph] = es._build_pairing_vertex_pp(u_loc, v_q, None, niv_pp, _make_single_rank_distributor(), channel=ph)
+    gamma = 0.5 * f_pp[SpinChannel.DENS].mat - 1.5 * f_pp[SpinChannel.MAGN].mat
+    gamma += u_loc.permute_orbitals("abcd->adcb").mat[None, ..., None, None]
+    if channel == SpinChannel.TRIP:
+        gamma += 2.0 * f_pp[SpinChannel.MAGN].mat
+    g_pp = np.moveaxis(g[niv + niw - niv_pp : niv + niw + niv_pp], 0, 3).reshape(-1, 2 * niv_pp, o, o)  # [k, v, o, o]
+    minus = np.roll(np.flip(np.arange(len(g_pp)).reshape(nq), axis=(0, 1, 2)), 1, axis=(0, 1, 2)).ravel()
+    chi0 = np.einsum("kvad,kvbc->kabcdv", g_pp, g_pp[minus][:, ::-1])
+    return _densify_pairing_kernel(monkeypatch, gamma, chi0, nq, channel), (*nq, o, o, 2 * niv_pp)
+
+
+@pytest.mark.parametrize(
+    "nk, lattice",
+    [
+        ((4, 1, 1), ([[0, 0, 0], [0.5, 0, 0]], [0.3, -0.4], [[1.0, 0.8], [0.8, 0.6]])),
+        (
+            (4, 1, 1),
+            (
+                [[0, 0, 0], [0.3, 0, 0], [0.7, 0, 0]],
+                [0.4, -0.2, -0.2],
+                [[1, 0.9, 0.9], [0.9, 0.5, 0.7], [0.9, 0.7, 0.5]],
+            ),
+        ),
+        ((3, 3, 3), ([[0, 0, 0], [0.5, 0.5, 0.5]], [0.3, -0.4], [[1.0, 0.8], [0.8, 0.6]])),
+    ],
+    ids=["CsCl chain", "folded trilayer", "CsCl"],
+)
+@pytest.mark.parametrize("channel", [SpinChannel.SING, SpinChannel.TRIP])
+def test_parity_sectors_of_a_momentum_dependent_inversion_split_the_rpa_kernel(
+    setup, monkeypatch, channel, nk, lattice
+):
+    """The sectors of a momentum-dependent inversion action split the code's RPA kernel into invariant subspaces."""
+    hk = site_lattice_hk(nk, *lattice)
+    u = symmetry_reduction.find_inversion_orbital_unitary(hk)
+    assert u.ndim == 5
+
+    kernel, gap_shape = _rpa_kernel_of_site_lattice(monkeypatch, hk, 1.5, channel)
+
+    _assert_parity_sectors_split_the_kernel(kernel, gap_shape, 1 if channel == SpinChannel.SING else -1, u)
+
+
+@pytest.mark.parametrize(
+    "case, kept",
+    [
+        ("bilayer", True),
+        ("bilayer to 1e-6", True),
+        ("no inversion", False),
+        ("layer-dependent U", False),
+        ("one band", True),
+    ],
+)
+def test_check_parity_sectors_keeps_them_only_where_inversion_is_a_symmetry(case, kept):
+    """The sectors stay for a bilayer, also one printed to 6 digits, and one band; else they are switched off."""
+    config.eliashberg.perform_eliashberg = True
+    config.eliashberg.resolve_parity_sectors = True
+    config.sys.correlated_orbitals = None
+    config.logger = MagicMock()
+    u_mat = general_su2_u(2, 2.0, 1.3, 0.35, 0.25)
+    if case == "layer-dependent U":
+        u_mat[1, 1, 1, 1] = 2.5
+    hk = chain_without_inversion_hk(6) if case == "no inversion" else bilayer_chain_hk(6)
+    if case == "bilayer to 1e-6":
+        # a wannier90 H(k) keeps inversion only to the precision of its print
+        noise = 1e-6 * np.random.default_rng(3).standard_normal(hk.shape)
+        hk = hk + noise + noise.swapaxes(-1, -2)
+    if case == "one band":
+        hk = hk[..., :1, :1]
+        u_mat = u_mat[:1, :1, :1, :1]
+    config.sys.n_bands = hk.shape[-1]
+    config.lattice.k_grid = bz.KGrid((6, 1, 1), symmetries=[])
+    config.lattice.hamiltonian = MagicMock(
+        get_ek=MagicMock(return_value=hk), get_local_u=MagicMock(return_value=LocalInteraction(u_mat))
+    )
+
+    u = es.check_parity_sectors()
+
+    assert config.eliashberg.resolve_parity_sectors is kept
+    assert config.logger.warning.called is not kept
+    assert (u is not None) is case.startswith("bilayer")
+
+
+def _bilayer_with_inversion():
+    """Sets up a bilayer chain with an interaction invariant under its layer swap, sectors switched on."""
+    config.eliashberg.resolve_parity_sectors = True
+    config.sys.correlated_orbitals = None
+    config.sys.n_bands = 2
+    config.logger = MagicMock()
+    config.lattice.k_grid = bz.KGrid((6, 1, 1), symmetries=[])
+    config.lattice.hamiltonian = MagicMock(
+        get_ek=MagicMock(return_value=bilayer_chain_hk(6)),
+        get_local_u=MagicMock(return_value=LocalInteraction(general_su2_u(2, 2.0, 1.3, 0.35, 0.25))),
+    )
+
+
+@pytest.mark.parametrize("log", [True, False])
+def test_check_parity_sectors_logs_the_action_it_finds_only_when_asked(log):
+    """The inversion action is returned either way and logged only with log=True."""
+    _bilayer_with_inversion()
+
+    u = es.check_parity_sectors(log=log)
+
+    assert u is not None and config.logger.info.called is log
+
+
+@pytest.mark.parametrize("ordering, shift, kept", [([1, 1], 0.0, True), ([1, 2], 0.0, True), ([1, 2], 1e-2, False)])
+def test_check_parity_sectors_keeps_them_only_for_an_inversion_invariant_dmft_self_energy(
+    monkeypatch, ordering, shift, kept
+):
+    """Layers with equal DMFT self-energies keep the sectors; self-energies 1e-2 apart switch them off."""
+    _bilayer_with_inversion()
+    monkeypatch.setattr(config.dmft, "ineq_ordering", ordering)
+    nu = (2 * np.arange(-4, 4) + 1) * np.pi / 10.0
+    sigma = 0.8 - 1.3j / nu
+    sigma_per_ineq = [SelfEnergy(s[None, None, None, None, None], calc_smom=False) for s in (sigma, sigma + shift)]
+
+    es.check_parity_sectors(sigma_dmft_per_ineq=sigma_per_ineq)
+
+    assert config.eliashberg.resolve_parity_sectors is kept
+    assert config.logger.warning.called is not kept
+
+
+@pytest.mark.parametrize("unit", [1.0, 1000.0], ids=["eV", "meV"])
+def test_inversion_check_finds_no_inversion_in_a_d_p_chain_without_it_in_any_energy_unit(unit):
+    """A d-p chain whose correlated block has no inversion fails the H(k) test of the inversion, in eV as in meV."""
+    config.sys.correlated_orbitals = np.array([0, 1])
+    hk = np.zeros((6, 1, 1, 3, 3), dtype=complex)
+    hk[..., :2, :2] = chain_without_inversion_hk(6)
+    hk[..., 2, 2] = -2.5
+    hk[..., 0, 2] = 0.9 * (1 + np.exp(2j * np.pi * np.arange(6) / 6))[:, None, None]
+    hk[..., 2, 0] = hk[..., 0, 2].conj()
+    config.sys.n_bands = 2
+    config.lattice.k_grid = bz.KGrid((6, 1, 1), symmetries=[])
+    config.lattice.hamiltonian = MagicMock(
+        get_ek=MagicMock(return_value=unit * hk),
+        get_local_u=MagicMock(return_value=LocalInteraction(unit * general_su2_u(2, 2.0, 1.3, 0.35, 0.25))),
+    )
+
+    u, reason = es._inversion_action()
+
+    assert u is None and reason.startswith("inversion is no symmetry of H(k)")
+
+
+@pytest.mark.parametrize("perform_eliashberg", [True, False])
+def test_solve_projects_with_the_inversion_action_it_finds_itself(setup, monkeypatch, perform_eliashberg):
+    """solve() finds a bilayer's layer swap itself, without the start-up check, also called directly as a library."""
+    nk, no = 4, 2
+    config.lattice.nk, config.lattice.k_grid = (nk, 1, 1), bz.KGrid((nk, 1, 1), symmetries=[])
+    config.eliashberg.perform_eliashberg = perform_eliashberg
+    config.eliashberg.resolve_parity_sectors = True
+    config.sys.correlated_orbitals = None
+    u_loc = LocalInteraction(general_su2_u(no, 2.0, 1.3, 0.35, 0.25))
+    config.lattice.hamiltonian = MagicMock(
+        get_ek=MagicMock(return_value=bilayer_chain_hk(nk)), get_local_u=MagicMock(return_value=u_loc)
+    )
+    zero = FourPoint(np.zeros((nk,) + (no,) * 4 + (N_W,)), SpinChannel.NONE, (nk, 1, 1), 1, 0, False, True, True)
+    for channel in ("dens", "magn"):
+        zero.save(name=f"chi_phys_q_{channel}_rank_0", output_dir=config.output.eliashberg_path)
+    captured = {}
+    monkeypatch.setattr(
+        es, "_solve_sectors_in_memory", lambda *a: captured.update(parities=a[-2], inversion=a[-1]) or {}
+    )
+    config.misc.do_rpa = True
+    config.sys.n_bands = no
+    v_nonloc = Interaction(np.zeros((nk, 1, 1) + (no,) * 4), SpinChannel.NONE, (nk, 1, 1))
+
+    _, inversion = es.solve(None, None, u_loc, v_nonloc, conftest.create_comm_mock())
+
+    assert captured["parities"] == ["even", "odd"]
+    assert inversion is captured["inversion"] and np.allclose(np.abs(inversion), [[0, 1], [1, 0]])
+
+
+def test_frequency_parts_split_a_gap_into_its_even_and_odd_frequency_components():
+    """The parts sum to the gap, are even and odd under the frequency flip, and their weights add up to one."""
+    rng = np.random.default_rng(5)
+    gap = rng.standard_normal((2, 2, 1, 2, 2, 6)) + 1j * rng.standard_normal((2, 2, 1, 2, 2, 6))
+
+    even, odd = es.frequency_parts(gap)
+
+    assert np.allclose(even + odd, gap)
+    assert np.allclose(np.flip(even, axis=-1), even) and np.allclose(np.flip(odd, axis=-1), -odd)
+    assert np.isclose(np.vdot(even, even).real + np.vdot(odd, odd).real, np.vdot(gap, gap).real)
 
 
 def test_gap_parity_diagnostics_zero_gap_returns_zeros():
@@ -1752,6 +2054,91 @@ _P_FORM = np.broadcast_to(np.sin(_K4)[:, None], (4, 4)).astype(float).copy()
 def test_classify_gap_symmetry_labels_wave_and_frequency_parity(form, parity, expected):
     """classify_gap_symmetry labels the spatial wave (s/d/p) and the frequency parity (+/-) of a gap."""
     assert classify_gap_symmetry(_wave_gap(form.astype(complex), parity)) == expected
+
+
+_K8 = 2 * np.pi * np.arange(8) / 8
+_DXY_FORM = np.sin(_K8)[:, None] * np.sin(_K8)[None, :]
+_G_FORM = _DXY_FORM * (np.cos(_K8)[:, None] - np.cos(_K8)[None, :])
+
+
+@pytest.mark.parametrize("form, expected", [(_DXY_FORM, "dxy+"), (_G_FORM, "g+")])
+def test_classify_gap_symmetry_names_the_dxy_and_g_waves(form, expected):
+    """A gap odd under k_x -> -k_x and k_y -> -k_y is d_xy when symmetric under k_x <-> k_y and g when antisymmetric."""
+    assert classify_gap_symmetry(_wave_gap(form.astype(complex), "even")) == expected
+
+
+def test_classify_gap_symmetry_names_the_plane_of_a_cubic_dxy_type_wave():
+    """On a cubic grid sin k_x sin k_z is the d_xz wave."""
+    k = 2 * np.pi * np.arange(6) / 6
+    gap = _orbital_gap({(0, 0): np.sin(k)[:, None, None] * np.sin(k)[None, None, :] * np.ones((1, 6, 1))}, 1)
+    assert classify_gap_symmetry(gap) == "dxz+"
+
+
+@pytest.mark.parametrize(
+    "pairing, expected",
+    [
+        ("interlayer", "s±+"),
+        ("intralayer", "s+"),
+        ("intralayer d", "d+"),
+        ("intralayer d, weak interlayer s", "d+[00,11]|s+[01,10]"),
+    ],
+)
+def test_classify_gap_symmetry_tells_s_pm_from_s_with_the_fermi_surface(pairing, expected):
+    """With the bands, an s gap of opposite sign on the bonding and antibonding Fermi sheets of a bilayer is s±."""
+    eps = -2.0 * (np.cos(_K8)[:, None] + np.cos(_K8)[None, :])
+    hk = np.zeros((8, 8, 1, 2, 2), dtype=complex)
+    hk[..., 0, 0] = hk[..., 1, 1] = eps[..., None]
+    hk[..., 0, 1] = hk[..., 1, 0] = 0.6
+    form = np.ones((8, 8)) if pairing in ("interlayer", "intralayer") else np.cos(_K8)[:, None] - np.cos(_K8)[None, :]
+    pair = np.array([[0.0, 1.0], [1.0, 0.0]]) if pairing == "interlayer" else np.eye(2)
+    gap = np.broadcast_to((form[:, :, None, None, None] * pair)[..., None], (8, 8, 1, 2, 2, 4)).astype(complex)
+    if pairing.endswith("weak interlayer s"):
+        gap = gap + 0.3 * np.array([[0.0, 1.0], [1.0, 0.0]])[None, None, None, :, :, None]
+
+    assert classify_gap_symmetry(gap, bands=es.fermi_surface_bands(hk, 0.0)) == expected
+
+
+def test_classify_gap_symmetry_reads_the_band_gap_of_the_transposed_gap():
+    """The gap's first orbital sits at -k, so the band gap is psi^dagger Delta^T psi: s± on this complex bilayer."""
+    nk = 64
+    k = 2 * np.pi * np.arange(nk) / nk
+    hk = np.zeros((nk, 1, 1, 2, 2), dtype=complex)
+    hk[..., 0, 0] = hk[..., 1, 1] = -2.0 * np.cos(k)[:, None, None]
+    hk[..., 0, 1] = (0.5 + 0.3 * np.exp(1j * k))[:, None, None]
+    hk[..., 1, 0] = hk[..., 0, 1].conj()
+    gap = np.full((nk, 1, 1, 2, 2, 4), -1.0, dtype=complex)
+    gap[..., 0, 1, :] += 1j * np.sin(k)[:, None, None, None]
+    gap[..., 1, 0, :] -= 1j * np.sin(k)[:, None, None, None]
+
+    assert classify_gap_symmetry(gap, bands=es.fermi_surface_bands(hk, 0.3)) == "x+[01,10]|s±+[00,11]"
+
+
+def test_classify_gap_symmetry_sees_no_s_pm_between_degenerate_bands():
+    """Two identical decoupled orbitals share one Fermi surface, so a gap of opposite sign on them stays s."""
+    eps = -2.0 * (np.cos(_K8)[:, None] + np.cos(_K8)[None, :])
+    hk = np.zeros((8, 8, 1, 2, 2), dtype=complex)
+    hk[..., 0, 0] = hk[..., 1, 1] = eps[..., None]
+    gap = np.broadcast_to(np.diag([1.0, -1.0])[None, None, None, :, :, None], (8, 8, 1, 2, 2, 4)).astype(complex)
+
+    assert classify_gap_symmetry(gap, bands=es.fermi_surface_bands(hk, 0.0)) == "s+"
+
+
+@pytest.mark.parametrize(
+    "split, third",
+    [(1e-6, None), (0.0, (1.0, 0.5)), (0.0, (0.5, 0.15))],
+    ids=["split pair", "pair and a band", "pair and a crossing band"],
+)
+def test_classify_gap_symmetry_merges_degenerate_bands_into_one_fermi_surface(split, third):
+    """A pair split by 1e-6, or beside a third band crossing it or not, is one Fermi surface without s±."""
+    eps = -2.0 * (np.cos(_K8)[:, None] + np.cos(_K8)[None, :])
+    n = 2 if third is None else 3
+    hk = np.zeros((8, 8, 1, n, n), dtype=complex)
+    hk[..., 0, 0], hk[..., 1, 1] = eps[..., None], eps[..., None] + split
+    if third is not None:
+        hk[..., 2, 2] = third[0] * eps[..., None] + third[1]
+    gap = np.broadcast_to(np.diag([1.0, -1.0, 1.0][:n])[None, None, None, :, :, None], (8, 8, 1, n, n, 4))
+
+    assert classify_gap_symmetry(gap.astype(complex), bands=es.fermi_surface_bands(hk, 0.0)) == "s+"
 
 
 def test_classify_gap_symmetry_returns_unknown_for_zero_gap():
@@ -1881,7 +2268,7 @@ def test_solve_eliashberg_lanczos_both_projects_matvec_and_v0_into_each_sector(m
     config.eliashberg.n_eig = 2
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "random"
-    config.eliashberg.resolve_frequency_parity = True
+    config.eliashberg.resolve_parity_sectors = True
     gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=11)
 
     seen = []
@@ -1900,11 +2287,11 @@ def test_solve_eliashberg_lanczos_both_projects_matvec_and_v0_into_each_sector(m
     assert set(result) == {"even", "odd"}
     for parity, (lambdas, gaps) in result.items():
         assert len(gaps) == config.eliashberg.n_eig and len(lambdas) == config.eliashberg.n_eig
-    for (parity, eps_t, eps_po), (v0, probe) in zip([("even", 1, 1), ("odd", -1, -1)], seen):
+    for (parity, eps_t, eps_p), (v0, probe) in zip([("even", 1, 1), ("odd", -1, -1)], seen):
         for vec in (v0, probe):
             g = vec.reshape(gap_shape)
             assert np.allclose(_flip_nu(g), eps_t * g, atol=1e-5)
-            assert np.allclose(_flip_po(g), eps_po * g, atol=1e-5)
+            assert np.allclose(_at_minus_k(g), eps_p * g, atol=1e-5)
 
 
 def _densify_pairing_kernel(monkeypatch, gamma_arr: np.ndarray, chi0_arr: np.ndarray, nq: tuple, channel) -> np.ndarray:
@@ -1915,7 +2302,7 @@ def _densify_pairing_kernel(monkeypatch, gamma_arr: np.ndarray, chi0_arr: np.nda
     config.eliashberg.n_eig = 1
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "random"
-    config.eliashberg.resolve_frequency_parity = False
+    config.eliashberg.resolve_parity_sectors = False
     config.eliashberg.symmetrize_degenerate_gaps = False
     config.logger = MagicMock()
     dense = []
@@ -1971,6 +2358,35 @@ def test_kernel_conserves_frequency_parity_only_for_tr_inversion_symmetric_verte
     assert generic_commutator > 1e-1
 
 
+@pytest.mark.parametrize("channel", [SpinChannel.SING, SpinChannel.TRIP])
+def test_pairing_kernel_is_the_direct_term_plus_its_exchange_for_any_vertex(monkeypatch, channel):
+    """For any vertex the kernel is (1 + E) D, E the exchange (E X)_ab(k, v) = sign X_ba(-k, -v)."""
+    monkeypatch.setattr(n_point_base, "DTYPE", np.complex128)
+    nq, o, niv_pp = (3, 2, 1), 2, 2
+    nq_tot, n2 = int(np.prod(nq)), 2 * niv_pp
+    sign = 1 if channel == SpinChannel.SING else -1
+    rng = np.random.default_rng(3)
+    gamma_shape, chi0_shape = (nq_tot,) + (o,) * 4 + (n2, n2), (nq_tot,) + (o,) * 4 + (n2,)
+    gamma = rng.standard_normal(gamma_shape) + 1j * rng.standard_normal(gamma_shape)
+    chi0 = rng.standard_normal(chi0_shape) + 1j * rng.standard_normal(chi0_shape)
+
+    kernel = _densify_pairing_kernel(monkeypatch, gamma, chi0, nq, channel)
+
+    k = np.array(np.unravel_index(np.arange(nq_tot), nq)).T
+    flat = [np.ravel_multi_index(tuple(np.mod(kk, nq)), nq) for kk in k]
+    minus = [np.ravel_multi_index(tuple(np.mod(-kk, nq)), nq) for kk in k]
+    direct = np.zeros((nq_tot, o, o, n2, nq_tot, o, o, n2), complex)
+    for ik, jk in np.ndindex(nq_tot, nq_tot):
+        q = np.ravel_multi_index(tuple(np.mod(k[ik] - k[jk], nq)), nq)
+        direct[ik, :, :, :, jk] = np.einsum("cadbvp,cdefp->abvefp", gamma[q], chi0[flat[jk]])
+    direct = direct.reshape(kernel.shape) * 0.5 / (nq_tot * config.sys.beta)
+    idx = np.arange(len(kernel)).reshape(nq_tot, o, o, n2)
+    exchange = np.zeros(kernel.shape)
+    exchange[idx.reshape(-1), idx[minus].swapaxes(1, 2)[..., ::-1].reshape(-1)] = sign
+    expected = (np.eye(len(kernel)) + exchange) @ direct
+    assert np.allclose(kernel, expected, atol=1e-10 * np.abs(expected).max())
+
+
 def test_solve_eliashberg_lanczos_reseeds_when_symmetry_seed_orthogonal_to_sector(monkeypatch):
     """When the symmetry seed is orthogonal to the sector the solver reseeds so eigsh starts nonzero with parity."""
     nq, niv_pp = (4, 4, 1), 2
@@ -1978,7 +2394,7 @@ def test_solve_eliashberg_lanczos_reseeds_when_symmetry_seed_orthogonal_to_secto
     config.eliashberg.n_eig = 1
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "d-wave"
-    config.eliashberg.resolve_frequency_parity = True
+    config.eliashberg.resolve_parity_sectors = True
     gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=5)
 
     seeds = []
@@ -1995,7 +2411,7 @@ def test_solve_eliashberg_lanczos_reseeds_when_symmetry_seed_orthogonal_to_secto
     assert set(result) == {"even", "odd"}
     v0_odd = seeds[1].reshape(gap_shape)
     assert np.linalg.norm(v0_odd) > 0
-    assert np.allclose(_flip_nu(v0_odd), -v0_odd, atol=1e-6) and np.allclose(_flip_po(v0_odd), -v0_odd, atol=1e-6)
+    assert np.allclose(_flip_nu(v0_odd), -v0_odd, atol=1e-6) and np.allclose(_at_minus_k(v0_odd), -v0_odd, atol=1e-6)
 
 
 def test_solve_eliashberg_lanczos_seeds_empty_sector_with_nonzero_base(monkeypatch):
@@ -2004,7 +2420,7 @@ def test_solve_eliashberg_lanczos_seeds_empty_sector_with_nonzero_base(monkeypat
     config.eliashberg.n_eig = 1
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "random"
-    config.eliashberg.resolve_frequency_parity = True
+    config.eliashberg.resolve_parity_sectors = True
     config.eliashberg.symmetrize_degenerate_gaps = False
     gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=8)
 
@@ -2028,7 +2444,7 @@ def test_solve_eliashberg_lanczos_none_returns_single_unprojected_sector(monkeyp
     config.eliashberg.n_eig = 2
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "random"
-    config.eliashberg.resolve_frequency_parity = False
+    config.eliashberg.resolve_parity_sectors = False
     gamma, chi0 = _single_band_pp_operands(nq, niv_pp, seed=12)
 
     calls = []
@@ -2059,7 +2475,7 @@ def test_solve_sectors_in_memory_solves_both_channels_in_turn_on_the_single_rank
     config.logger = MagicMock()
     solved, built = [], []
 
-    def fake_solver(gamma, gchi0, ranks, parities=None):
+    def fake_solver(gamma, gchi0, ranks, parities=None, u=None):
         solved.append((gamma.channel, ranks, tuple(parities)))
         marker = len(solved)
         gap = np.full(nq + (o, o, n2), marker, dtype=np.complex64)
@@ -2163,13 +2579,13 @@ def test_local_vertex_pp_transforms_are_blind_to_a_nu_prime_restricted_vertex(o)
 )
 def test_sector_log_label_names_the_sectors_a_call_covers(resolve, parities, expected):
     """The log label names the covered sectors, so concurrently solving ranks never emit identical lines."""
-    config.eliashberg.resolve_frequency_parity = resolve
+    config.eliashberg.resolve_parity_sectors = resolve
     assert _sector_log_label(SpinChannel.SING, parities) == expected
 
 
 def test_sector_log_label_distinguishes_the_channels():
     """Both channels get their own label, so the four concurrent sector solves are told apart in the log."""
-    config.eliashberg.resolve_frequency_parity = True
+    config.eliashberg.resolve_parity_sectors = True
     labels = [_sector_log_label(c, [p]) for c in (SpinChannel.SING, SpinChannel.TRIP) for p in ("even", "odd")]
     assert len(set(labels)) == 4
 
@@ -2543,11 +2959,11 @@ def test_solve_pairing_sectors_runs_the_block_iteration_where_the_symmetry_force
     config.eliashberg.n_eig = n_eig
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetrize_degenerate_gaps = False
-    config.eliashberg.resolve_frequency_parity = None
+    config.eliashberg.resolve_parity_sectors = None
     config.logger = MagicMock()
 
     res = es._solve_pairing_sectors(
-        mv=lambda gap, eps_t, eps_po: h @ gap,
+        mv=lambda gap, eps_t, eps_p: h @ gap,
         gap_shape=gap_shape,
         sign=1,
         channel=SpinChannel.SING,
@@ -2581,11 +2997,11 @@ def test_solve_pairing_sectors_passes_the_orbital_mirrors_into_the_symmetrizatio
     monkeypatch.setattr(es.sp.sparse.linalg, "eigsh", lambda *a, **kw: (np.array([0.3]), np.ones((n, 1))))
     config.eliashberg.n_eig = 1
     config.eliashberg.symmetrize_degenerate_gaps = True
-    config.eliashberg.resolve_frequency_parity = None
+    config.eliashberg.resolve_parity_sectors = None
     config.logger = MagicMock()
 
     es._solve_pairing_sectors(
-        mv=lambda gap, eps_t, eps_po: gap,
+        mv=lambda gap, eps_t, eps_p: gap,
         gap_shape=gap_shape,
         sign=1,
         channel=SpinChannel.SING,
@@ -2798,17 +3214,30 @@ def _write_random_intermediates(no: int, niv: int, niw: int, nq: int):
     return LocalFourPoint(gamma, SpinChannel.DENS, 1, 2, False, True), u_loc, v_nonloc
 
 
-@pytest.mark.parametrize("save_fq, no, niv, niw", [(False, 3, 12, 12), (False, 2, 20, 6), (True, 3, 12, 12)])
+@pytest.mark.parametrize(
+    "bare_vertex, save_fq, no, niv, niw",
+    [
+        (False, False, 3, 12, 12),
+        (False, False, 2, 20, 6),
+        (False, True, 3, 12, 12),
+        (True, False, 3, 16, 16),
+        (True, True, 3, 16, 16),
+    ],
+)
 @pytest.mark.parametrize("budget", [1, memory_estimator.MAX_CHUNK_BUDGET_BYTES])
-def test_fq_estimate_bounds_the_traced_peak_of_the_pairing_vertex_build(setup, save_fq, no, niv, niw, budget):
-    """The modeled fq branch covers the traced peak of the build at one-frequency chunks and at whole momenta."""
+def test_fq_estimate_bounds_the_traced_peak_of_the_pairing_vertex_build(
+    setup, bare_vertex, save_fq, no, niv, niw, budget
+):
+    """The fq model covers the traced peak of the ladder and RPA builds at one-frequency chunks and at whole momenta."""
     config.eliashberg.save_fq = save_fq
     gamma_r, u_loc, v_nonloc = _write_random_intermediates(no, niv, niw, nq=2)
+    gamma_r = None if bare_vertex else gamma_r
     niv_pp = min(niw // 2, niv // 2)
     build = es.create_pairing_vertex_streaming_fq if save_fq else es.create_pairing_vertex_slice_q_r
+    dist = _make_single_rank_distributor()
     tracemalloc.start()
     try:
-        build(u_loc, v_nonloc, gamma_r, niv_pp, _make_single_rank_distributor(), chunk_bytes=budget)
+        build(u_loc, v_nonloc, gamma_r, niv_pp, dist, budget, SpinChannel.DENS)
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
@@ -2826,6 +3255,7 @@ def test_fq_estimate_bounds_the_traced_peak_of_the_pairing_vertex_build(setup, s
         with_eliashberg=True,
         save_fq=save_fq,
         chunk_budgets=memory_estimator.ChunkBudgets(fq=budget),
+        bare_vertex=bare_vertex,
     )["fq"].off_distributed
     assert 0.7 * modeled < peak <= modeled
 
@@ -2933,36 +3363,41 @@ def test_rpa_vertex_chunk_is_the_ladder_vertex_chunk_at_the_bare_local_vertex(mo
     assert np.allclose(out.mat, ladder.mat, atol=1e-9 * np.abs(ladder.mat).max())
 
 
-def _rpa_solve_capturing_vertices(monkeypatch, u_loc: LocalInteraction, no: int) -> tuple[np.ndarray, np.ndarray]:
-    """Runs solve in RPA mode on the rank files in place and returns the singlet and triplet vertex the solver gets."""
-    config.rpa.use_rpa_susceptibility = True
+def _rpa_solve_capturing_vertices(
+    monkeypatch, u_loc: LocalInteraction, no: int, mode: str, nk: tuple = (N_Q, 1, 1)
+) -> tuple[np.ndarray, np.ndarray]:
+    """Runs solve in a bare-vertex mode on the rank files in place and returns the singlet and triplet vertex the
+    solver gets."""
+    setattr(config.misc, mode, True)
     config.sys.n_bands = no
+    config.eliashberg.resolve_parity_sectors = False  # the vertices do not depend on the sectors, which read H(k)
     captured = {}
     monkeypatch.setattr(
         es,
         "_solve_sectors_in_memory",
         lambda dist, sing, trip, *a: captured.update(sing=sing.mat.copy(), trip=trip.mat.copy()) or {},
     )
-    v_nonloc = Interaction(np.zeros((N_Q, 1, 1) + (no,) * 4), SpinChannel.NONE, (N_Q, 1, 1))
+    v_nonloc = Interaction(np.zeros(nk + (no,) * 4), SpinChannel.NONE, nk)
     es.solve(None, None, u_loc, v_nonloc, conftest.create_comm_mock())
     return captured["sing"], captured["trip"]
 
 
-def test_rpa_pairing_vertices_of_one_band_are_the_spin_fluctuation_vertices(setup, monkeypatch):
+@pytest.mark.parametrize("mode", ["do_flex", "do_rpa"])
+def test_rpa_pairing_vertices_of_one_band_are_the_spin_fluctuation_vertices(setup, monkeypatch, mode):
     """One band: singlet -(U + 3/2 U^2 chi_m - 1/2 U^2 chi_d), triplet U + 1/2 U^2 (chi_d + chi_m) at w = v - v'."""
     u, rank_path = 1.7, config.output.eliashberg_path
     u_loc = LocalInteraction(np.full((1, 1, 1, 1), u))
     chi0_mat, _, _ = _toy_arrays(1, np.random.default_rng(6))
     gchi0_q = FourPoint(chi0_mat, SpinChannel.NONE, (N_Q, 1, 1), 1, 1, False, True, True)
-    sum_inv = gchi0_q.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta).invert()
+    summed = gchi0_q.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
     v_q = Interaction(np.zeros((N_Q, 1, 1, 1, 1)), SpinChannel.NONE, (N_Q, 1, 1), True)
     chi = {}
     for channel in (SpinChannel.DENS, SpinChannel.MAGN):
-        chi_q_r = nonlocal_sde.create_rpa_susceptibility(sum_inv, u_loc, v_q, channel)
+        chi_q_r = nonlocal_sde.create_rpa_susceptibility(summed, u_loc, v_q, channel)
         nonlocal_sde._finish_physical_susceptibility(chi_q_r, _make_single_rank_distributor(), save_eliashberg=True)
         chi[channel] = np.load(os.path.join(rank_path, f"chi_phys_q_{channel.value}_rank_0.npy")).reshape(N_Q, N_W)
 
-    sing, trip = _rpa_solve_capturing_vertices(monkeypatch, u_loc, 1)
+    sing, trip = _rpa_solve_capturing_vertices(monkeypatch, u_loc, 1, mode)
 
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
     w = np.arange(-niv_pp, niv_pp)[:, None] - np.arange(-niv_pp, niv_pp)[None, :]
@@ -2973,8 +3408,9 @@ def test_rpa_pairing_vertices_of_one_band_are_the_spin_fluctuation_vertices(setu
     assert np.allclose(trip.reshape(trip_expected.shape), trip_expected, atol=1e-5 * np.abs(trip_expected).max())
 
 
+@pytest.mark.parametrize("mode", ["do_flex", "do_rpa"])
 @pytest.mark.parametrize("save_fq", [False, True])
-def test_rpa_pairing_vertices_without_susceptibility_are_the_bare_interaction(setup, monkeypatch, save_fq):
+def test_rpa_pairing_vertices_without_susceptibility_are_the_bare_interaction(setup, monkeypatch, save_fq, mode):
     """With chi = 0 the RPA singlet and triplet vertices are -U_{1234} and +U_{1234}: the bare U counted once."""
     no = 2
     config.eliashberg.save_fq = save_fq
@@ -2983,7 +3419,7 @@ def test_rpa_pairing_vertices_without_susceptibility_are_the_bare_interaction(se
     for channel in ("dens", "magn"):
         zero.save(name=f"chi_phys_q_{channel}_rank_0", output_dir=config.output.eliashberg_path)
 
-    sing, trip = _rpa_solve_capturing_vertices(monkeypatch, LocalInteraction(u_mat), no)
+    sing, trip = _rpa_solve_capturing_vertices(monkeypatch, LocalInteraction(u_mat), no, mode)
 
     bare = np.broadcast_to(u_mat[None, ..., None, None], sing.shape)
     assert np.allclose(sing, -bare, atol=1e-6)
@@ -3011,6 +3447,72 @@ def test_rpa_local_pairing_term_is_the_ladder_one_at_the_bare_local_vertex(monke
 
     rpa_term = np.broadcast_to(u_loc.permute_orbitals("abcd->adcb").mat[..., None, None], ladder_term.shape)
     assert np.allclose(ladder_term, rpa_term, atol=1e-6)
+
+
+def _graser_gap_kernel(g: np.ndarray, niv: int, niv_pp: int, sign: int, u_s: np.ndarray, u_c: np.ndarray) -> np.ndarray:
+    """Graser's linearized gap equation in Matsubara form on a chain, Delta'_st(k, nu) = -T/N sum Gamma^{pq}_{st}(k, nu;
+    k', nu') G_pa(k', nu') G_qb(-k', -nu') Delta_ab(k', nu') (s at k), with Gamma^{pq}_{st} = M^{tq}_{ps} at the
+    transfer (k' - k, nu' - nu) exchange-symmetrized with sign (eq. 29): M is the bracket of eq. 25, 3/2 U^s chi_1 U^s -
+    1/2 U^c chi_0 U^c + (U^s + U^c)/2, for the singlet and -1/2 U^s chi_1 U^s - 1/2 U^c chi_0 U^c + (U^s + U^c)/2
+    (Takimoto et al., Phys. Rev. B 69, 104504 (2004)) for the triplet. Returned in DGAmore's gap layout (a at -k)."""
+    nk, no, n2 = g.shape[0], g.shape[3], 2 * niv_pp
+    s, c = u_s.reshape(no * no, no * no), u_c.reshape(no * no, no * no)
+    eye = np.eye(no * no)
+
+    def bracket(q: int, w: int) -> np.ndarray:
+        x = graser_bubble(g, (q % nk, 0, 0), w, niv).reshape(no * no, no * no)
+        chi_1, chi_0 = x @ np.linalg.inv(eye - s @ x), x @ np.linalg.inv(eye + c @ x)
+        spin = 1.5 * s @ chi_1 @ s if sign == 1 else -0.5 * s @ chi_1 @ s
+        return (spin - 0.5 * c @ chi_0 @ c + 0.5 * (s + c)).reshape((no,) * 4)
+
+    ng = g.shape[-1] // 2
+    g_pp = g[:, 0, 0, ..., ng - niv_pp : ng + niv_pp]
+    nus, norm = np.arange(-niv_pp, niv_pp), -1.0 / (config.sys.beta * nk)
+    kernel = np.zeros((nk, no, no, n2, nk, no, no, n2), complex)
+    for ik, jk, iv, jv in np.ndindex(nk, nk, n2, n2):
+        direct = np.einsum("tqps->pqst", bracket(jk - ik, nus[jv] - nus[iv]))
+        crossed = np.einsum("tpqs->pqst", bracket(-jk - ik, -(nus[iv] + nus[jv] + 1)))
+        gamma = 0.5 * (direct + sign * crossed)
+        g_k, g_minus_k = g_pp[jk, ..., jv], g_pp[-jk % nk, ..., n2 - 1 - jv]
+        kernel[ik, :, :, iv, jk, :, :, jv] = norm * np.einsum("pqst,pa,qb->stab", gamma, g_k, g_minus_k)
+    perm = np.arange(nk * no * no * n2).reshape(nk, no, no, n2).transpose(0, 2, 1, 3).reshape(-1)
+    return kernel.reshape(perm.size, perm.size)[np.ix_(perm, perm)]
+
+
+@pytest.mark.parametrize("channel", [SpinChannel.SING, SpinChannel.TRIP])
+def test_rpa_pairing_vertices_of_kanamori_orbitals_give_the_graser_gap_equation(setup, monkeypatch, channel):
+    """The exchange-symmetrized RPA kernel of a two-orbital chain is Graser's gap kernel (NJP 11, 025016, eq. 25)."""
+    monkeypatch.setattr(n_point_base, "DTYPE", np.complex128)
+    nk, no, niv, mu = 4, 2, 8, 0.15
+    sign = 1 if channel == SpinChannel.SING else -1
+    config.lattice.nk, config.lattice.k_grid = (nk, 1, 1), bz.KGrid((nk, 1, 1), symmetries=[])
+    beta, niw = config.sys.beta, config.box.niw_core
+    g = chain_without_inversion_green(nk, beta, mu, niv + niw)
+    giwk = GreensFunction(g.copy(), calc_filling=False, nk=(nk, 1, 1), beta=beta)
+    q_list = config.lattice.k_grid.get_irrq_list()
+    bubble = BubbleGenerator.create_generalized_chi0_q_loop(giwk, niw, niv, q_list, config.lattice.k_grid, beta)
+    summed = bubble.sum_over_all_vn(beta).scale(1.0 / beta)
+    u_loc = LocalInteraction(general_su2_u(no, 2.0, 1.3, 0.35, 0.25))
+    v_q = Interaction(np.zeros((nk,) + (no,) * 4), SpinChannel.NONE, (nk, 1, 1), True)
+    for r in (SpinChannel.DENS, SpinChannel.MAGN):
+        chi = nonlocal_sde.create_rpa_susceptibility(summed, u_loc, v_q, r)
+        nonlocal_sde._finish_physical_susceptibility(chi, _make_single_rank_distributor(), save_eliashberg=True)
+    sing, trip = _rpa_solve_capturing_vertices(monkeypatch, u_loc, no, "do_rpa", nk=(nk, 1, 1))
+    niv_pp = min(niw // 2, config.box.niv_core // 2)
+    n2 = 2 * niv_pp
+    chi0_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(giwk, niv_pp, config.lattice.k_grid).mat
+
+    gamma = (sing if sign == 1 else trip).reshape((nk,) + (no,) * 4 + (n2, n2))
+    direct = np.zeros((nk, no, no, n2, nk, no, no, n2), complex)
+    for ik, jk in np.ndindex(nk, nk):
+        direct[ik, :, :, :, jk] = np.einsum("cadbvp,cdefp->abvefp", gamma[(ik - jk) % nk], chi0_pp[jk])
+    direct = direct.reshape(nk * no * no * n2, -1) * 0.5 / (nk * beta)
+    idx = np.arange(direct.shape[0]).reshape(nk, no, no, n2)
+    exchange = np.zeros(direct.shape)
+    exchange[idx.reshape(-1), idx[-np.arange(nk) % nk].swapaxes(1, 2)[..., ::-1].reshape(-1)] = sign
+
+    graser = _graser_gap_kernel(g, niv, niv_pp, sign, *graser_spin_charge_u(no, 2.0, 1.3, 0.35, 0.25))
+    assert np.allclose(direct @ (np.eye(len(exchange)) + exchange), graser, atol=1e-10 * np.abs(graser).max())
 
 
 def test_solver_grid_shape_degenerates_and_caps():
@@ -3042,7 +3544,7 @@ def _grid_test_config(nq, niv_pp):
     config.eliashberg.n_eig = 2
     config.eliashberg.epsilon = 1e-10
     config.eliashberg.symmetry = "random"
-    config.eliashberg.resolve_frequency_parity = True
+    config.eliashberg.resolve_parity_sectors = True
     config.eliashberg.symmetrize_degenerate_gaps = False
     config.logger = MagicMock()
 
@@ -3119,9 +3621,12 @@ def test_grid_solver_ships_the_bubble_inside_the_grid_only(monkeypatch):
     assert sum(1 for s in seen if s == 2) == 2
 
 
-@pytest.mark.parametrize("size, niv_pp", [(2, 2), (4, 1), (3, 2), (3, 1)])
-def test_grid_solver_multi_rank_matches_in_memory_solver(monkeypatch, size, niv_pp):
-    """Row-split, 2x2, uneven-row and idle-rank grids reproduce the in-memory eigenvalues on the fake MPI."""
+@pytest.mark.parametrize(
+    "size, niv_pp, o, action",
+    [(2, 2, 1, "none"), (4, 1, 1, "none"), (3, 2, 1, "none"), (3, 1, 1, "none"), (3, 2, 2, "momentum-dependent")],
+)
+def test_grid_solver_multi_rank_matches_in_memory_solver(monkeypatch, size, niv_pp, o, action):
+    """Row-split, 2x2, uneven-row and idle-rank grids, one with an orbital action, match the in-memory eigenvalues."""
     from copy import deepcopy
 
     monkeypatch.setattr(es, "MPI", conftest.FAKE_MPI)
@@ -3136,12 +3641,13 @@ def test_grid_solver_multi_rank_matches_in_memory_solver(monkeypatch, size, niv_
 
     monkeypatch.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
 
-    nq, o = (4, 2, 1), 1
+    nq = (4, 2, 1)
     _grid_test_config(nq, niv_pp)
     gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 5)
+    u = _orbital_actions(nq)[action]
 
     np.random.seed(0)
-    reference = solve_eliashberg_lanczos(deepcopy(gamma), deepcopy(chi0), (0,))
+    reference = solve_eliashberg_lanczos(deepcopy(gamma), deepcopy(chi0), (0,), u=u)
 
     nq_tot = int(np.prod(nq))
     bounds = np.linspace(0, nq_tot, size + 1).astype(int)
@@ -3161,7 +3667,7 @@ def test_grid_solver_multi_rank_matches_in_memory_solver(monkeypatch, size, niv_
         )
         bubble = deepcopy(chi0) if rank == 0 else None
         np.random.seed(0)
-        return es.solve_eliashberg_lanczos_grid(local, bubble, comm, 0)
+        return es.solve_eliashberg_lanczos_grid(local, bubble, comm, 0, u)
 
     _, results = conftest.run_parallel(size, worker)
 
@@ -3177,12 +3683,12 @@ def test_grid_solver_multi_rank_matches_in_memory_solver(monkeypatch, size, niv_
 
 @pytest.mark.parametrize("size", [2, 3])
 def test_grid_solver_runs_the_block_iteration_in_lockstep_where_the_symmetry_forces_multiplets(monkeypatch, size):
-    """With a forced block size every grid rank runs the block iteration instead of ARPACK and matches in memory."""
+    """With a forced block size every grid rank runs the block iteration in lockstep and matches in memory."""
     from copy import deepcopy
 
     monkeypatch.setattr(es, "MPI", conftest.FAKE_MPI)
     monkeypatch.setattr(es, "block_size", lambda k_grid, parity=None: 2)
-    nq, o, niv_pp = (4, 2, 1), 1, 2
+    nq, o, niv_pp = (4, 2, 1), 2, 2
     _grid_test_config(nq, niv_pp)
     gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 5)
     np.random.seed(0)
@@ -3288,22 +3794,43 @@ def test_pairing_vertex_gather_scatter_round_trip_preserves_rank_shares(setup, m
     conftest.run_parallel(2, worker)
 
 
+def _frequency_gap(parity: int, n_bands: int = 1) -> GapFunction:
+    """A gap of definite frequency parity on a 2x2 grid with the given number of orbitals."""
+    mat = np.random.default_rng(3).standard_normal((2, 2, 1, n_bands, n_bands, 4)).astype(complex)
+    return GapFunction(0.5 * (mat + parity * np.flip(mat, axis=-1)), SpinChannel.SING, (2, 2, 1))
+
+
 def test_even_sectors_degenerate_flags_equal_leading_even_eigenvalues():
     """Equal leading singlet-even and triplet-even eigenvalues are flagged, distinct or unprojected sectors are not."""
 
     def results(singlet: float, triplet: float) -> dict:
-        """Solver output with the two even sectors and one odd sector."""
+        """Solver output of one band with the two even sectors and one odd sector."""
         return {
-            (SpinChannel.SING, "even"): (np.array([singlet, 0.1]), []),
-            (SpinChannel.SING, "odd"): (np.array([1.12]), []),
-            (SpinChannel.TRIP, "even"): (np.array([triplet]), []),
+            (SpinChannel.SING, "even"): (np.array([singlet, 0.1]), [_frequency_gap(1), _frequency_gap(1)]),
+            (SpinChannel.SING, "odd"): (np.array([1.12]), [_frequency_gap(-1)]),
+            (SpinChannel.TRIP, "even"): (np.array([triplet]), [_frequency_gap(1)]),
         }
 
     assert es.even_sectors_degenerate(results(0.617, 0.6170001))
     assert es.even_sectors_degenerate(results(0.436512, 0.435412))
     assert not es.even_sectors_degenerate(results(0.21, 0.011))
-    unprojected = {(SpinChannel.SING, "none"): (np.array([0.5]), []), (SpinChannel.TRIP, "none"): (np.array([0.5]), [])}
+    unprojected = {
+        (SpinChannel.SING, "none"): (np.array([0.5]), [_frequency_gap(1)]),
+        (SpinChannel.TRIP, "none"): (np.array([0.5]), [_frequency_gap(1)]),
+    }
     assert not es.even_sectors_degenerate(unprojected)
+
+
+def test_even_sectors_degenerate_finds_the_even_frequency_triplet_in_either_sector():
+    """Hybridized orbitals may put the even-frequency triplet in the odd sector; an odd-frequency gap never counts."""
+    results = {
+        (SpinChannel.SING, "even"): (np.array([0.5]), [_frequency_gap(1, 2)]),
+        (SpinChannel.TRIP, "even"): (np.array([0.2]), [_frequency_gap(1, 2)]),
+        (SpinChannel.TRIP, "odd"): (np.array([0.5000001]), [_frequency_gap(1, 2)]),
+    }
+    assert es.even_sectors_degenerate(results)
+    results[(SpinChannel.TRIP, "odd")] = (np.array([0.5000001]), [_frequency_gap(-1, 2)])
+    assert not es.even_sectors_degenerate(results)
 
 
 def _set_hybridized_mirror_lattice(monkeypatch) -> None:

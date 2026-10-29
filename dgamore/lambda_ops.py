@@ -885,7 +885,8 @@ class LambdaAnnealer:
     def apply(self, chi_phys_q_r: FourPoint, mpi_dist_irrq: MpiDistributor, measure: bool = True) -> FourPoint:
         r"""
         Measures the channel's static boson gap (unless ``measure`` is False) and, if the shared mass is nonzero,
-        adds it to the compound diagonal of the inverse susceptibility at all bosonic frequencies.
+        adds it to the compound diagonal of the inverse susceptibility at all bosonic frequencies, evaluated as
+        :math:`\chi(1 + \lambda\chi)^{-1}` so that :math:`\chi^{-1}` is never formed.
 
         :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r;1234}` (no fermionic frequency
             dimensions).
@@ -901,15 +902,16 @@ class LambdaAnnealer:
         if self._mass == 0.0:
             return chi_phys_q_r
 
-        chi_inv = chi_phys_q_r.invert(copy=False).to_compound_indices()
-        idx = np.arange(chi_inv.mat.shape[-1])
-        chi_inv.mat[..., idx, idx] += self._mass
+        # the resolvent form keeps a nearly singular chi (the tail-corrected bubble at q = 0) at its precision
+        chi = chi_phys_q_r.to_half_niw_range().to_compound_indices()
+        mass = self._mass * np.eye(chi.mat.shape[-1])
+        chi.mat = MultiOrbitalLambdaCorrection.apply_lambda_matrix(chi.mat, mass).astype(chi.mat.dtype)
         if measure:
             config.logger.info(
                 f"Lambda annealing ({channel}): shared boson mass lambda={self._mass:.6f} applied "
                 f"(static gap of 1/chi: {self._gaps[channel]:.6f})."
             )
-        return chi_inv.invert(copy=False)
+        return chi.to_full_indices()
 
     @staticmethod
     def _static_gap(chi_phys_q_r: FourPoint, mpi_dist_irrq: MpiDistributor) -> float:

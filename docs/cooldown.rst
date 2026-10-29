@@ -123,7 +123,7 @@ The rung at :math:`\beta = 20`, ``dga_config_beta20.yaml``:
      epsilon: 1e-6
      symmetry: "random"
      symmetrize_degenerate_gaps: True
-     resolve_frequency_parity: True
+     resolve_parity_sectors: True
      subfolder_name: "Eliashberg"
 
    self_energy_interpolation:
@@ -190,7 +190,7 @@ The rung at :math:`\beta = 25`, ``dga_config_beta25.yaml``, differs in exactly t
      epsilon: 1e-6
      symmetry: "random"
      symmetrize_degenerate_gaps: True
-     resolve_frequency_parity: True
+     resolve_parity_sectors: True
      subfolder_name: "Eliashberg"
 
    self_energy_interpolation:
@@ -1119,8 +1119,8 @@ where the estimate reaches, and a start that contracts into another one still la
 None of the three is tied to a cooldown; each can just as well support a cold run at a temperature where the plain
 cycle fails, and the Jacobian tracking can accompany any of them. Whatever the technique, the result is certified the
 same way as above: a converged pure phase, a non-negative static susceptibility in both channels on the final
-iteration, no pole warnings at the end (the first-frequency one included), no warning that the leading singlet-even
-and triplet-even Eliashberg eigenvalues agree to within 1% when the frequency parity is resolved (a hint rather than
+iteration, no pole warnings at the end (the first-frequency one included), no warning that the leading even-frequency
+singlet and triplet Eliashberg eigenvalues agree to within 1% when the parity sectors are resolved (a hint rather than
 a verdict, since two physical sectors can meet by accident, and expected for an SU(2N)-symmetric interaction), and
 agreement with a second route to the same temperature.
 

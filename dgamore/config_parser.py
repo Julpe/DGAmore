@@ -85,7 +85,7 @@ class ConfigParser:
         config.stabilization = self._build_stabilization_config(config_file)
         config.eliashberg = self._build_eliashberg_config(config_file)
         config.lambda_correction = self._build_lambda_correction_config(config_file)
-        config.rpa = self._build_rpa_config(config_file)
+        config.misc = self._build_misc_config(config_file)
         config.box = self._build_box_config(config_file)
         config.lattice = self._build_lattice_config(config_file)
         config.self_energy_interpolation = self._build_self_energy_interpolation_config(config_file)
@@ -280,9 +280,7 @@ class ConfigParser:
         conf.resolve_degenerate_multiplets = self._try_parse(
             section, "resolve_degenerate_multiplets", conf.resolve_degenerate_multiplets
         )
-        conf.resolve_frequency_parity = self._try_parse(
-            section, "resolve_frequency_parity", conf.resolve_frequency_parity
-        )
+        conf.resolve_parity_sectors = self._try_parse(section, "resolve_parity_sectors", conf.resolve_parity_sectors)
         conf.subfolder_name = self._try_parse(section, "subfolder_name", conf.subfolder_name)
 
         return conf
@@ -308,21 +306,22 @@ class ConfigParser:
 
         return conf
 
-    def _build_rpa_config(self, config_file) -> RpaConfig:
+    def _build_misc_config(self, config_file) -> MiscConfig:
         """
-        Builds the RPA config from the ``rpa`` section (defaults if absent).
+        Builds the config of the bare-vertex modes from the ``misc`` section (defaults if absent).
 
         :param config_file: The parsed YAML mapping.
-        :return: The populated :class:`RpaConfig`.
+        :return: The populated :class:`MiscConfig`.
         """
-        conf = RpaConfig()
+        conf = MiscConfig()
         try:
-            section = config_file["rpa"]
+            section = config_file["misc"]
         except KeyError:
-            config.logger.info(f"'rpa' section not found. Using default values.")
+            config.logger.info(f"'misc' section not found. Using default values.")
             return conf
 
-        conf.use_rpa_susceptibility = self._try_parse(section, "use_rpa_susceptibility", conf.use_rpa_susceptibility)
+        conf.do_rpa = self._try_parse(section, "do_rpa", conf.do_rpa)
+        conf.do_flex = self._try_parse(section, "do_flex", conf.do_flex)
 
         return conf
 

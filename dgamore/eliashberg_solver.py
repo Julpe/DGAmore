@@ -49,16 +49,22 @@ from dgamore.memory_estimator import (
 )
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE, deferred_collection
+from dgamore.self_energy import SelfEnergy
 from dgamore.symmetry_reduction import (
     _M_preserves_grid,
     _close_group,
     find_coordinate_mirror_orbital_unitaries,
+    find_inversion_orbital_unitary,
     forced_multiplicity,
     point_group_orbits,
 )
 
 EVEN_SECTOR_DEGENERACY = 1e-2  # largest relative difference of the leading singlet-even and triplet-even eigenvalues
 # at which even_sectors_degenerate reports them as coinciding
+SECTOR_RESIDUAL_WARNING = 1e-4  # residual (over max(|rho|, 1)) of a sector's leading gap under the unprojected kernel
+# above which (or above ten times a larger eigensolver tolerance) the parity sectors are reported as no symmetry of it
+LANCZOS_RESTARTS = 3000  # restart cap of one eigensolver attempt, after which _solve_loosening retries the sector
+TOLERANCE_LOOSENING = 1e2  # factor of each of the at most two looser retries of an unconverged sector
 
 
 def delete_files(filepath: str, *args) -> None:
@@ -757,36 +763,45 @@ def get_initial_gap_function(shape: tuple, channel: SpinChannel) -> np.ndarray:
     return gap0
 
 
-# --- Physical-gap symmetry sectors (frequency parity + forced momentum/orbital parity) ---
+# --- Physical-gap symmetry sectors (parity under T O_U + forced inversion parity) ---
 def even_sectors_degenerate(results: dict) -> bool:
-    """
-    Returns whether the leading singlet-even and triplet-even eigenvalues agree to the relative tolerance
-    ``EVEN_SECTOR_DEGENERACY``, i.e. to 1 %. False when either sector was not solved (no frequency-parity resolution, or
-    no converged eigenvalue).
+    r"""
+    Returns whether the leading even-frequency singlet and triplet eigenvalues agree to the relative tolerance
+    ``EVEN_SECTOR_DEGENERACY``, i.e. to 1 %. A gap counts as even-frequency when most of its weight is even in the
+    frequency (see :func:`frequency_parts`): for one band these are the gaps of the even sectors, while with hybridized
+    orbitals either parity sector can hold one (an orbital-antisymmetric even-frequency triplet is odd under
+    :math:`T O_U`). False without parity resolution or without an even-frequency gap in either channel.
 
-    :param results: The solver output ``{(channel, parity): (lambdas, gaps)}``.
-    :return: Whether the two leading even eigenvalues coincide.
+    :param results: The solver output ``{(channel, parity): (lambdas, gaps)}`` with its gaps (rank 0).
+    :return: Whether the two leading even-frequency eigenvalues coincide.
     """
     leading = []
     for channel in (SpinChannel.SING, SpinChannel.TRIP):
-        if (channel, "even") not in results or len(results[(channel, "even")][0]) == 0:
+        even = [
+            float(np.real(lam))
+            for parity in ("even", "odd")
+            for lam, gap in zip(*results.get((channel, parity), ((), ())))
+            if _even_frequency_weight(gap.mat) > 0.5
+        ]
+        if not even:
             return False
-        leading.append(float(np.max(np.asarray(results[(channel, "even")][0]).real)))
+        leading.append(max(even))
     return abs(leading[0] - leading[1]) <= EVEN_SECTOR_DEGENERACY * max(abs(leading[0]), abs(leading[1]))
 
 
-def _frequency_parity_sectors(resolve_frequency_parity: bool) -> list[tuple[str, int | None]]:
+def _parity_sectors(resolve_parity_sectors: bool) -> list[tuple[str, int | None]]:
     r"""
-    Returns the list of gap sectors to solve, each a ``(label, eps_T)`` pair where ``eps_T`` is the requested
-    T-parity (:math:`+1` even, :math:`-1` odd) or ``None`` for the unprojected case. When ``resolve_frequency_parity``
-    is set, the frequency-even and frequency-odd sectors are both returned; otherwise the single unprojected sector
-    is returned. The paired momentum/orbital parity is fixed by the Pauli constraint ``eps_{P.O} = sign * eps_T``
-    inside the solver, so it is not carried here.
+    Returns the list of gap sectors to solve, each a ``(label, eps_T)`` pair where ``eps_T`` is the requested parity
+    under the frequency flip times the orbital exchange, :math:`T O_U` (:math:`+1` even, :math:`-1` odd; the frequency
+    parity for one band, see :func:`_project_gap_to_sector`), or ``None`` for the unprojected case. When
+    ``resolve_parity_sectors`` is set, the even and odd sectors are both returned; otherwise the single unprojected
+    sector is returned. The paired inversion parity is fixed by the Pauli constraint ``eps_P = sign * eps_T`` inside
+    the solver, so it is not carried here.
 
-    :param resolve_frequency_parity: Whether to split the gap into the frequency-even and frequency-odd sectors.
+    :param resolve_parity_sectors: Whether to split the gap into the even and odd sectors.
     :return: The ``[(label, eps_T), ...]`` sector list.
     """
-    return [("even", 1), ("odd", -1)] if resolve_frequency_parity else [("none", None)]
+    return [("even", 1), ("odd", -1)] if resolve_parity_sectors else [("none", None)]
 
 
 def _sector_log_label(channel: SpinChannel, parities: list[str] | None = None) -> str:
@@ -799,7 +814,7 @@ def _sector_log_label(channel: SpinChannel, parities: list[str] | None = None) -
     :return: ``"the singlet channel"`` when the parity projection is off, otherwise the covered sectors, e.g.
         ``"the singlet/even & odd sectors"`` or ``"the triplet/odd sector"``.
     """
-    labels = [label for label, _ in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)]
+    labels = [label for label, _ in _parity_sectors(config.eliashberg.resolve_parity_sectors)]
     if parities is not None:
         labels = [label for label in labels if label in parities]
     if labels == ["none"]:
@@ -807,53 +822,271 @@ def _sector_log_label(channel: SpinChannel, parities: list[str] | None = None) -
     return f"the {channel.value}let/{' & '.join(labels)} sector{'' if len(labels) == 1 else 's'}"
 
 
-def _project_gap_to_sector(vec: np.ndarray, gap_shape: tuple, eps_t: int, eps_po: int) -> np.ndarray:
+def _local_dmft_self_energy(sigma_dmft_per_ineq: list[SelfEnergy]) -> np.ndarray:
+    r"""
+    Returns the local DMFT self-energy on the correlated orbitals, block diagonal over the atoms of
+    ``config.dmft.ineq_ordering``.
+
+    :param sigma_dmft_per_ineq: The DMFT :class:`SelfEnergy` of each inequivalent atom.
+    :return: The self-energy, shape ``[o1, o2, v]``.
+    """
+    blocks = [sigma_dmft_per_ineq[ineq - 1].mat[0, 0, 0] for ineq in config.dmft.ineq_ordering]
+    sigma = np.zeros((sum(len(block) for block in blocks),) * 2 + blocks[0].shape[-1:], dtype=complex)
+    start = 0
+    for block in blocks:
+        sigma[start : start + len(block), start : start + len(block)] = block
+        start += len(block)
+    return sigma
+
+
+def _inversion_action(sigma_dmft: np.ndarray | None = None) -> tuple[np.ndarray | None, str | None]:
+    r"""
+    Returns the orbital action of the inversion on the orbitals of the gap (the correlated ones), found on
+    :math:`H(\mathbf{k})` by :func:`~dgamore.symmetry_reduction.find_inversion_orbital_unitary`, with the reason the
+    parity sectors are not exact, ``None`` when they are. They need inversion to be a symmetry of the whole pairing
+    problem: of :math:`H(\mathbf{k})` (of its correlated block), of the local interaction, which has to keep its form
+    under the action and may only couple orbitals whose inversion images lie in one unit cell (else the inverted
+    interaction is no local one), and of the local DMFT self-energy when it is given. The non-local interaction is
+    taken to share the symmetry of :math:`H(\mathbf{k})`, as in the symmetry reduction of the momenta. A multiple of
+    the identity comes back as ``None`` (no action).
+
+    :param sigma_dmft: The local DMFT self-energy on the correlated orbitals, shape ``[o1, o2, v]`` (see
+        :func:`_local_dmft_self_energy`); ``None`` skips its test.
+    :return: ``(u, None)`` with the constant ``[o, o]`` or momentum-dependent ``[kx, ky, kz, o, o]`` action (``None``
+        for none), or ``(None, reason)``.
+    """
+    hamiltonian = config.lattice.hamiltonian
+    ek = hamiltonian.get_ek(config.lattice.k_grid)
+    # to 1e-4 of the largest element, the tolerance of the self-energy's symmetry tests: a wannier90 H(k) keeps
+    # inversion only to the precision of its print
+    u = find_inversion_orbital_unitary(ek, 1e-4, orbitals=config.sys.correlated_orbitals)
+    if u is None:
+        return None, "inversion is no symmetry of H(k) to 1e-4 of its largest element"
+    u_mat = hamiltonian.get_local_u().mat
+    u0 = u if u.ndim == 2 else u[0, 0, 0]
+    if u.ndim == 5:
+        # U(0)^dagger U(k) = diag(e^{i k.s_a}): the Bloch phases of the cells the orbitals' images lie in
+        phases = np.diagonal(u0.conj().T @ u, axis1=-2, axis2=-1).reshape(-1, len(u0))
+        same_cell = np.isclose(phases[:, :, None], phases[:, None, :]).all(axis=0)
+        a, b, c, d = np.nonzero(np.abs(u_mat) > 1e-12)
+        if not (same_cell[a, b] & same_cell[a, c] & same_cell[a, d]).all():
+            return None, "the local interaction couples orbitals whose inversion images lie in different unit cells"
+    # the action carries the precision of H(k), so the interaction is compared to the same relative tolerance
+    rotated = np.einsum("ia,jb,kc,ld,abcd->ijkl", u0, u0.conj(), u0, u0.conj(), u_mat)
+    if not np.allclose(rotated, u_mat, rtol=0.0, atol=1e-4 * max(1.0, np.abs(u_mat).max())):
+        return None, "the local interaction is not invariant under the orbital action of the inversion"
+    if sigma_dmft is not None:
+        rotated_sigma = np.einsum("ia,abv,jb->ijv", u0, sigma_dmft, u0.conj())
+        if not np.allclose(rotated_sigma, sigma_dmft, rtol=0.0, atol=1e-4 * max(1.0, np.abs(sigma_dmft).max())):
+            return None, "the DMFT self-energy is not invariant under the orbital action of the inversion"
+    if u.ndim == 2 and np.allclose(u, u[0, 0] * np.eye(len(u))):
+        return None, None
+    return u, None
+
+
+def check_parity_sectors(
+    comm: MPI.Comm | None = None, sigma_dmft_per_ineq: list[SelfEnergy] | None = None, log: bool = True
+) -> np.ndarray | None:
+    r"""
+    Prepares the parity sectors of the gap (``config.eliashberg.resolve_parity_sectors``): rank 0 looks for the
+    orbital action of the inversion (see :func:`_inversion_action`) and broadcasts it, and every rank gets it back for
+    the sector projectors (see :func:`_project_gap_to_sector`). Where inversion is no symmetry of the pairing problem
+    the sectors would mix, so the flag is switched off with a warning and both channels are solved unprojected. The
+    driver calls it before the memory estimate, which counts the sectors, when the run solves the gap, and
+    :func:`solve` again for the action, so the momentum-dependent one is held only while the gap is solved. The
+    driver's call also tests the DMFT self-energy (outside RPA mode, which reads none) and leaves the log line of the
+    action to the second call.
+
+    :param comm: The MPI communicator; ``None`` on a single rank.
+    :param sigma_dmft_per_ineq: The DMFT :class:`SelfEnergy` of each inequivalent atom, read on rank 0 (see
+        :func:`_local_dmft_self_energy`); ``None`` skips its test.
+    :param log: Whether to log the action found.
+    :return: The constant ``[o, o]`` or momentum-dependent ``[kx, ky, kz, o, o]`` action, ``None`` for none or without
+        the sectors.
+    """
+    eliashberg = config.eliashberg
+    if not eliashberg.resolve_parity_sectors:
+        return None
+    found = None
+    if comm is None or comm.rank == 0:
+        found = _inversion_action(None if sigma_dmft_per_ineq is None else _local_dmft_self_energy(sigma_dmft_per_ineq))
+    if comm is not None and comm.size > 1:
+        found = comm.bcast(found, root=0)
+    u, reason = found
+    if reason is not None:
+        config.logger.warning(
+            f"The parity sectors of the gap are switched off: {reason}, so the sectors would mix. Both channels are "
+            "solved unprojected."
+        )
+        eliashberg.resolve_parity_sectors = False
+        return None
+    if log:
+        action = (
+            "leaves the orbitals unchanged"
+            if u is None
+            else (
+                "acts on the orbitals by a constant unitary"
+                if u.ndim == 2
+                else "acts on the orbitals by a momentum-dependent unitary (it maps a site into another unit cell)"
+            )
+        )
+        config.logger.info(f"Parity sectors of the gap: the inversion {action}.")
+    return u
+
+
+def frequency_parts(gap: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    r"""
+    Splits a gap into its even- and odd-frequency parts, :math:`\Delta^{\pm}(\nu) = \tfrac{1}{2}[\Delta(\nu) \pm
+    \Delta(-\nu)]`. Once the orbitals hybridize, the frequency flip is no symmetry of the kernel and the gap of a
+    parity sector holds both parts; their weights :math:`\lVert\Delta^{\pm}\rVert^2 / \lVert\Delta\rVert^2` add up to
+    one.
+
+    :param gap: The gap, the fermionic frequency (on a box symmetric about zero) as its last axis.
+    :return: ``(even, odd)``, each of the shape of ``gap``.
+    """
+    mirror = np.flip(gap, axis=-1)
+    return 0.5 * (gap + mirror), 0.5 * (gap - mirror)
+
+
+def _even_frequency_weight(gap: np.ndarray) -> float:
+    r"""The weight :math:`\lVert\Delta^{+}\rVert^2 / \lVert\Delta\rVert^2` of a gap's even-frequency part (see
+    :func:`frequency_parts`), zero for a zero gap."""
+    norm2 = np.vdot(gap, gap).real
+    even = frequency_parts(gap)[0]
+    return float(np.vdot(even, even).real / norm2) if norm2 > 0 else 0.0
+
+
+def _log_sector_residual(gap: np.ndarray, raw: np.ndarray, label: str, ranks, reduce: Callable | None = None) -> None:
+    r"""
+    Logs the residual :math:`\lVert K\Delta - \rho\Delta\rVert / (\max(\lvert\rho\rvert, 1) \lVert\Delta\rVert)` of a
+    projected sector's leading gap under the unprojected kernel :math:`K`, with the Rayleigh quotient
+    :math:`\rho = \langle\Delta, K\Delta\rangle / \langle\Delta, \Delta\rangle` (the eigensolvers report only the real
+    part of a complex eigenvalue). It is relative to the eigenvalue, but at most to the instability at 1: the rounding
+    of a single-precision kernel is absolute, so a sector whose eigenvalue lies far below 1 cannot reach a small
+    relative residual, and it matters no more for the instability. Where the sector is a symmetry of the kernel the
+    residual vanishes up to rounding and the eigensolver tolerance ``eliashberg.epsilon``; above the larger of
+    ``SECTOR_RESIDUAL_WARNING`` and ten times that tolerance a warning follows.
+
+    :param gap: The leading gap of the sector (this rank's block of it on a team).
+    :param raw: :math:`K\Delta` (the same block).
+    :param label: The sector label for the log.
+    :param ranks: The ranks that log.
+    :param reduce: Sums a block quantity over the ranks holding the gap (a team's ``allreduce``); ``None`` for a whole
+        gap.
+    :return: None.
+    """
+    reduce = (lambda x: x) if reduce is None else reduce
+    norm2 = float(np.real(reduce(np.vdot(gap, gap))))
+    rayleigh = complex(reduce(np.vdot(gap, raw))) / norm2 if norm2 > 0 else 0j
+    if rayleigh == 0:
+        return  # an empty sector (every k equal to -k on a tiny grid) leaves no eigenvalue to check
+    leak = raw - rayleigh * gap
+    residual = np.sqrt(float(np.real(reduce(np.vdot(leak, leak)))) / norm2) / max(abs(rayleigh), 1.0)
+    logger = config.logger
+    logger.info(f"Leading gap of {label} under the unprojected kernel: residual {residual:.1e}.", allowed_ranks=ranks)
+    # a Ritz vector keeps a residual of the eigensolver tolerance even where the sector is exact
+    if residual > max(SECTOR_RESIDUAL_WARNING, 10 * config.eliashberg.epsilon):
+        logger.warning(
+            f"The leading gap of {label} is no eigenvector of the unprojected kernel (residual "
+            f"{residual:.1e}): the parity sectors are no symmetry of this pairing kernel, and the sector eigenvalues "
+            "belong to the projected kernel only. 'eliashberg.resolve_parity_sectors: False' solves the channels "
+            "unprojected.",
+            allowed_ranks=ranks,
+        )
+
+
+def _at_minus_k(a: np.ndarray) -> np.ndarray:
+    r"""An array with the momentum grid on its three leading axes, read at :math:`-\mathbf{k}` on the periodic grid."""
+    return np.roll(np.flip(a, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
+
+
+def _rotate_orbital_pair(g: np.ndarray, u: np.ndarray | None) -> np.ndarray:
+    r"""
+    Applies the orbital action of the inversion to both orbitals of a gap ``[kx, ky, kz, o1, o2, v]``,
+    :math:`U(\mathbf{k})\, g(\mathbf{k})\, U(-\mathbf{k})^T`, for a constant ``u`` (an involution, so
+    :math:`U(-\mathbf{k}) = U`) or a momentum-dependent one of shape ``[kx, ky, kz, o, o]``; ``None`` is no action.
+    """
+    if u is None:
+        return g
+    u = u.astype(g.dtype, copy=False)
+    if u.ndim == 2:
+        return np.einsum("ac,xyzcdv,bd->xyzabv", u, g, u, optimize=True)
+    return np.einsum("xyzac,xyzcdv,xyzbd->xyzabv", u, g, _at_minus_k(u), optimize=True)
+
+
+def _exchange_orbitals(g: np.ndarray, u: np.ndarray | None) -> np.ndarray:
+    r""":math:`O_U`: the orbital transpose of a gap followed by the orbital action of the inversion,
+    :math:`U(\mathbf{k})\, g(\mathbf{k})^T U(-\mathbf{k})^T`."""
+    return _rotate_orbital_pair(g.swapaxes(3, 4), u)
+
+
+def _invert(g: np.ndarray, u: np.ndarray | None) -> np.ndarray:
+    r""":math:`P_U`: the inversion of a gap, :math:`\Delta(\mathbf{k}) \to U(\mathbf{k})\, \Delta(-\mathbf{k})\,
+    U(-\mathbf{k})^T`."""
+    return _rotate_orbital_pair(_at_minus_k(g), u)
+
+
+def _project_gap_to_sector(
+    vec: np.ndarray, gap_shape: tuple, eps_t: int, eps_p: int, u: np.ndarray | None = None
+) -> np.ndarray:
     r"""
     Projects a flattened gap onto a physical symmetry sector by applying the two commuting Hermitian projectors
-    :math:`\tfrac{1}{2}(1 + \varepsilon_T T)` and :math:`\tfrac{1}{2}(1 + \varepsilon_{PO}\, P O)` in turn, where the
-    three involutions act on the orbital gap :math:`\Delta^{\nu}_{12}(\mathbf{k})` as
-    :math:`(T\Delta)^{\nu}_{12}(\mathbf{k}) = \Delta^{-\nu}_{12}(\mathbf{k})` (fermionic-frequency flip),
-    :math:`(P\Delta)^{\nu}_{12}(\mathbf{k}) = \Delta^{\nu}_{12}(-\mathbf{k})` (momentum flip) and
-    :math:`(O\Delta)^{\nu}_{12}(\mathbf{k}) = \Delta^{\nu}_{21}(\mathbf{k})` (orbital transpose), realized by the same
-    array operations the pairing-kernel matvec uses. The Pauli antisymmetry :math:`\hat{S}\,P\,O\,T\,\Delta = -\Delta`
-    with the spin exchange :math:`\hat{S}` a scalar in the singlet/triplet basis fixes :math:`P\,O\,T\,\Delta =
-    \mathrm{sign}\,\Delta` (``sign`` the channel sign), so once the frequency parity :math:`\varepsilon_T` is chosen the
-    combined momentum-orbital parity is forced to :math:`\varepsilon_{PO} = \mathrm{sign}\cdot\varepsilon_T`; only the
-    product :math:`P\,O` is fixed, never :math:`P` and :math:`O` separately.
+    :math:`\tfrac{1}{2}(1 + \varepsilon_T\, T O_U)` and :math:`\tfrac{1}{2}(1 + \varepsilon_P P_U)` in turn, where
+    the involutions act on the orbital gap :math:`\Delta^{\nu}_{12}(\mathbf{k})` as
+    :math:`(T\Delta)^{\nu}(\mathbf{k}) = \Delta^{-\nu}(\mathbf{k})` (fermionic-frequency flip),
+    :math:`(O_U\Delta)^{\nu}(\mathbf{k}) = U(\mathbf{k}) (\Delta^{\nu}(\mathbf{k}))^T U(-\mathbf{k})^T` (orbital
+    exchange) and :math:`(P_U\Delta)^{\nu}(\mathbf{k}) = U(\mathbf{k}) \Delta^{\nu}(-\mathbf{k}) U(-\mathbf{k})^T`
+    (inversion), with :math:`U(\mathbf{k})` the orbital action of the inversion,
+    :math:`H(-\mathbf{k}) = U(\mathbf{k}) H(\mathbf{k}) U(\mathbf{k})^\dagger` and :math:`U(\mathbf{k}) U(-\mathbf{k})
+    = 1`, constant unless inversion maps a site into another unit cell (see :func:`check_parity_sectors`).
+    The Pauli antisymmetry :math:`\hat{S}\,P\,O\,T\,\Delta = -\Delta` with the spin exchange :math:`\hat{S}` a scalar
+    in the singlet/triplet basis fixes :math:`T O_U \Delta = \mathrm{sign}\, P_U \Delta` (``sign`` the channel sign),
+    so once :math:`\varepsilon_T` is chosen the inversion parity is forced to :math:`\varepsilon_P = \mathrm{sign}\cdot
+    \varepsilon_T`, and the sectors are the inversion-parity sectors of the channel. The pairing kernel conserves
+    :math:`P_U` wherever inversion is a symmetry, so they are invariant subspaces; the frequency parity :math:`T` alone
+    is no symmetry once the orbitals hybridize (even and odd frequencies mix), and for one band :math:`O_U` is trivial
+    and :math:`\varepsilon_T` is the frequency parity.
 
     :param vec: The flattened gap vector.
     :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
-    :param eps_t: The requested T-parity, :math:`+1` (even) or :math:`-1` (odd).
-    :param eps_po: The forced combined ``P.O`` parity, :math:`\mathrm{sign}\cdot\varepsilon_T`.
+    :param eps_t: The requested parity under :math:`T O_U`, :math:`+1` (even) or :math:`-1` (odd).
+    :param eps_p: The forced inversion parity, :math:`\mathrm{sign}\cdot\varepsilon_T`.
+    :param u: The orbital action of the inversion, or ``None`` for none (one band, inversion-even orbitals).
     :return: The projected flattened gap vector (dtype preserved).
     """
     g = vec.reshape(gap_shape)
-    g = 0.5 * (g + eps_t * np.flip(g, axis=-1))
-    g = 0.5 * (g + eps_po * np.roll(np.flip(g.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2)))
+    g = 0.5 * (g + eps_t * _exchange_orbitals(np.flip(g, axis=-1), u))
+    g = 0.5 * (g + eps_p * _invert(g, u))
     return g.reshape(-1).astype(vec.dtype, copy=False)
 
 
-def _project_frequency_block(gap: np.ndarray, v0: int, v1: int, eps_t: int, eps_po: int) -> np.ndarray:
+def _project_frequency_block(
+    gap: np.ndarray, v0: int, v1: int, eps_t: int, eps_p: int, u: np.ndarray | None = None
+) -> np.ndarray:
     r"""
     Returns the fermionic-frequency block ``[..., v0:v1]`` of the sector projection of a gap ``[kx, ky, kz, o1, o2, v]``
-    (see :func:`_project_gap_to_sector`), computed from that block and its frequency mirror alone: the T projector
-    pairs :math:`\nu` with :math:`-\nu` and the P.O projector acts within one frequency, so every element is formed
-    by the same operations, in the same order, as in the projection of the whole gap.
+    (see :func:`_project_gap_to_sector`), computed from that block and its frequency mirror alone: the :math:`T O_U`
+    projector pairs :math:`\nu` with :math:`-\nu` and the :math:`P_U` projector acts within one frequency, so every
+    element is formed by the same operations as in the projection of the whole gap: bit for bit without an orbital
+    action, and to rounding with one, whose einsum picks its contraction path by the operand shapes.
 
     :param gap: The gap in shape ``[kx, ky, kz, o1, o2, v]``.
     :param v0: First frequency index of the block.
     :param v1: One past the last frequency index of the block.
-    :param eps_t: The requested T-parity, :math:`+1` (even) or :math:`-1` (odd).
-    :param eps_po: The forced combined ``P.O`` parity, :math:`\mathrm{sign}\cdot\varepsilon_T`.
+    :param eps_t: The requested parity under :math:`T O_U`, :math:`+1` (even) or :math:`-1` (odd).
+    :param eps_p: The forced inversion parity, :math:`\mathrm{sign}\cdot\varepsilon_T`.
+    :param u: The orbital action of the inversion, or ``None`` for none.
     :return: The projected block, shape ``[kx, ky, kz, o1, o2, v1 - v0]``.
     """
     nv = gap.shape[-1]
     mirror = gap[..., nv - v1 : nv - v0][..., ::-1]  # np.flip(gap, axis=-1)[..., v0:v1]
-    g = 0.5 * (gap[..., v0:v1] + eps_t * mirror)
-    return 0.5 * (g + eps_po * np.roll(np.flip(g.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2)))
+    g = 0.5 * (gap[..., v0:v1] + eps_t * _exchange_orbitals(mirror, u))
+    return 0.5 * (g + eps_p * _invert(g, u))
 
 
-def _sector_seed(base_seed: np.ndarray, gap_shape: tuple, eps_t: int | None, eps_po: int | None) -> np.ndarray:
+def _sector_seed(
+    base_seed: np.ndarray, gap_shape: tuple, eps_t: int | None, eps_p: int | None, u: np.ndarray | None = None
+) -> np.ndarray:
     r"""
     Returns the eigensolver's starting vector of one sector: the base seed projected onto the sector, with a
     deterministic random fallback when the projection of the seed collapses (a seed whose parity is orthogonal to
@@ -863,23 +1096,29 @@ def _sector_seed(base_seed: np.ndarray, gap_shape: tuple, eps_t: int | None, eps
 
     :param base_seed: The flattened initial gap seed.
     :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
-    :param eps_t: The requested T-parity, or ``None`` for the raw kernel.
-    :param eps_po: The forced combined ``P.O`` parity.
+    :param eps_t: The requested parity under :math:`T O_U`, or ``None`` for the raw kernel.
+    :param eps_p: The forced inversion parity.
+    :param u: The orbital action of the inversion (see :func:`_project_gap_to_sector`).
     :return: The flattened seed of the sector.
     """
     if eps_t is None:
         return base_seed
-    seed = _project_gap_to_sector(base_seed, gap_shape, eps_t, eps_po)
+    seed = _project_gap_to_sector(base_seed, gap_shape, eps_t, eps_p, u)
     if np.linalg.norm(seed) >= 1e-10 * max(np.linalg.norm(base_seed), 1e-30):
         return seed
     rng = np.random.default_rng(0)
     fallback = (rng.standard_normal(gap_shape) + 1j * rng.standard_normal(gap_shape)).flatten()
-    fallback = _project_gap_to_sector(fallback.astype(base_seed.dtype, copy=False), gap_shape, eps_t, eps_po)
+    fallback = _project_gap_to_sector(fallback.astype(base_seed.dtype, copy=False), gap_shape, eps_t, eps_p, u)
     return fallback if np.linalg.norm(fallback) > 0 else base_seed
 
 
 def _sector_seeds(
-    base_seed: np.ndarray, gap_shape: tuple, eps_t: int | None, eps_po: int | None, n_seeds: int
+    base_seed: np.ndarray,
+    gap_shape: tuple,
+    eps_t: int | None,
+    eps_p: int | None,
+    n_seeds: int,
+    u: np.ndarray | None = None,
 ) -> np.ndarray:
     r"""
     Returns the ``n_seeds`` starting vectors of one sector along a leading axis: the seed of :func:`_sector_seed`
@@ -887,16 +1126,17 @@ def _sector_seeds(
 
     :param base_seed: The flattened initial gap seed.
     :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
-    :param eps_t: The requested T-parity, or ``None`` for the raw kernel.
-    :param eps_po: The forced combined ``P.O`` parity.
+    :param eps_t: The requested parity under :math:`T O_U`, or ``None`` for the raw kernel.
+    :param eps_p: The forced inversion parity.
     :param n_seeds: Number of starting vectors.
+    :param u: The orbital action of the inversion (see :func:`_project_gap_to_sector`).
     :return: The seeds, shape ``[n_seeds, n]``.
     """
     rng = np.random.default_rng(1)
-    seeds = [_sector_seed(base_seed, gap_shape, eps_t, eps_po)]
+    seeds = [_sector_seed(base_seed, gap_shape, eps_t, eps_p, u)]
     for _ in range(n_seeds - 1):
         extra = (rng.standard_normal(base_seed.size) + 1j * rng.standard_normal(base_seed.size)).astype(base_seed.dtype)
-        seeds.append(extra if eps_t is None else _project_gap_to_sector(extra, gap_shape, eps_t, eps_po))
+        seeds.append(extra if eps_t is None else _project_gap_to_sector(extra, gap_shape, eps_t, eps_p, u))
     return np.stack(seeds)
 
 
@@ -935,7 +1175,40 @@ def _finish_sector(
         f"Largest eigenvalue{plural} for {label}: " + ", ".join(f"{lam:.6f}" for lam in lambdas), allowed_ranks=ranks
     )
     gaps = [np.ascontiguousarray(gaps[:, i]).reshape(gap_shape) for i in range(gaps.shape[1])]
+    if gap_shape[3] > 1:
+        weights = [_even_frequency_weight(gap) for gap in gaps]
+        config.logger.info(
+            f"Even-frequency weight of the gap{plural} for {label}: " + ", ".join(f"{w:.4f}" for w in weights),
+            allowed_ranks=ranks,
+        )
     return lambdas, [GapFunction(gap, channel, nq) for gap in gaps]
+
+
+def _solve_loosening(solve: Callable[[float], tuple], tol: float, n_eig: int, label: str, ranks) -> tuple:
+    r"""
+    Returns the eigensolver's result at ``tol`` once it delivers ``n_eig`` eigenpairs within ``LANCZOS_RESTARTS``
+    restarts, else retries at a tolerance ``TOLERANCE_LOOSENING`` times looser, twice at most, with a warning each
+    time, and returns the last attempt whatever it delivered. In single precision a sector whose eigenvalues are small
+    against the rest of the kernel cannot reach a relative tolerance below the kernel's absolute rounding, and the
+    eigensolver would run to its restart cap for nothing.
+
+    :param solve: Runs the eigensolver at a tolerance; the first entry of its result holds the converged eigenvalues.
+    :param tol: The tolerance of the first attempt.
+    :param n_eig: Number of eigenpairs asked for.
+    :param label: The sector label for the log.
+    :param ranks: The ranks that log.
+    :return: The result of the last attempt.
+    """
+    for attempt in range(3):
+        result = solve(tol)
+        if len(result[0]) >= n_eig or attempt == 2:
+            return result
+        config.logger.warning(
+            f"Lanczos for {label} did not converge to {tol:.0e} within {LANCZOS_RESTARTS} restarts; retrying at "
+            f"{tol * TOLERANCE_LOOSENING:.0e}.",
+            allowed_ranks=ranks,
+        )
+        tol *= TOLERANCE_LOOSENING
 
 
 def _team_arnoldi(
@@ -1069,54 +1342,52 @@ def _team_arnoldi(
         restarts += 1
 
 
-def _bubble_is_frequency_even(chi0_mm: np.ndarray, rtol: float = 1e-6) -> bool:
+def _crossed_term(direct: np.ndarray, sign: int, v0: int = 0, v1: int | None = None) -> np.ndarray:
     r"""
-    Whether the pp bubble in matmul layout ``[x, y, z, v, o2, o2]`` is even in the fermionic frequency,
-    :math:`\chi_0^{\mathbf{k}\nu} = \chi_0^{\mathbf{k},-\nu}`, to a relative tolerance on every element; checked
-    one momentum row at a time so no bubble-sized temporary is formed.
+    Forms the crossed term of the pairing kernel from the direct term :math:`D`, as the exchange of its outgoing
+    pair: the gap's first orbital sits at :math:`-\mathrm{k}` (see :func:`_apply_gchi0_pp`), so the exchange is
+    :math:`(E X)_{ab}(\mathrm{k}) = \mathrm{sign}\,X_{ba}(-\mathrm{k})` with :math:`-\mathrm{k} = (-\mathbf{k}, -\nu)`
+    and the kernel is :math:`(1 + E) D`. It maps every gap onto the Pauli-allowed form :math:`E\Delta = \Delta` and
+    agrees with the exchange-symmetrized gap equation on it, for any vertex. The momentum flip is the same index map
+    in real space and in momentum space, so either form of the direct term may be passed.
 
-    :param chi0_mm: The bubble in matmul layout (see :func:`_chi0_to_matmul_layout`).
-    :param rtol: Relative tolerance per element.
-    :return: True when every element passes.
-    """
-    return all(np.allclose(row, np.flip(row, axis=2), rtol=rtol, atol=0.0) for row in chi0_mm)
-
-
-def _crossed_from_direct(direct: np.ndarray, sign: int, eps_t: int) -> np.ndarray:
-    r"""
-    Forms the crossed term of the pairing kernel from the direct term for one band in a projected sector: with a
-    frequency-even bubble and a gap of T-parity :math:`\varepsilon_T`, the flipped right-hand side equals
-    :math:`\varepsilon_T` times the direct one, so the crossed term is :math:`\mathrm{sign}\,\varepsilon_T` times
-    the momentum-flipped direct term and the second vertex contraction is not needed.
-
-    :param direct: The direct term in real space, ``[x, y, z, o1, o2, v]`` or a frequency block of it.
+    :param direct: The direct term ``[x, y, z, o1, o2, v]`` on the full fermionic box.
     :param sign: The channel sign (:math:`+1` singlet, :math:`-1` triplet).
-    :param eps_t: The T-parity of the sector.
-    :return: The crossed term, a new array of the same shape.
+    :param v0: First fermionic index of the returned block.
+    :param v1: One past the last fermionic index of the returned block (``None``: the whole axis).
+    :return: The crossed term on the fermionic block ``[v0, v1)``, a new array.
     """
-    crossed = np.roll(np.flip(direct.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-    if sign * eps_t != 1:
-        crossed *= sign * eps_t
+    nv = direct.shape[-1]
+    v1 = nv if v1 is None else v1
+    crossed = _at_minus_k(np.flip(direct.swapaxes(3, 4)[..., nv - v1 : nv - v0], axis=-1))
+    if sign != 1:
+        crossed *= sign
     return crossed
 
 
-def gap_parity_diagnostics(gap: np.ndarray, gap_shape: tuple) -> dict[str, complex]:
+def gap_parity_diagnostics(gap: np.ndarray, gap_shape: tuple, u: np.ndarray | None = None) -> dict[str, complex]:
     r"""
     Reports the parity Rayleigh quotients :math:`\langle \Delta, X \Delta \rangle / \langle \Delta, \Delta \rangle`
-    of a flattened gap for the involutions ``T`` (frequency flip), ``P`` (momentum flip), ``O`` (orbital transpose)
-    and their product ``P.O``. A pure-parity gap returns :math:`\pm 1` for the involutions it is an eigenvector of;
-    the values certify the parity of a returned gap and expose any leakage.
+    of a flattened gap for the involutions ``T`` (frequency flip), ``P`` (momentum flip), ``O`` (orbital transpose),
+    their product ``PO``, and the two the parity sectors fix (see :func:`_project_gap_to_sector`): ``TOU``, the
+    frequency flip times the orbital exchange :math:`O_U`, and ``PU``, the inversion :math:`P_U`, with ``u`` the
+    orbital action of the inversion (``None``: none, so they are ``T.O`` and ``P``). A pure-parity gap returns
+    :math:`\pm 1` for the involutions it is an eigenvector of; the values certify the parity of a returned gap and
+    expose any leakage.
 
     :param gap: The flattened gap vector.
     :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
-    :return: A dict mapping ``"T"``, ``"P"``, ``"O"``, ``"PO"`` to the corresponding Rayleigh quotient.
+    :param u: The orbital action of the inversion (see :func:`check_parity_sectors`).
+    :return: A dict mapping ``"T"``, ``"P"``, ``"O"``, ``"PO"``, ``"TOU"``, ``"PU"`` to the Rayleigh quotient.
     """
     g = gap.reshape(gap_shape)
     ops = {
         "T": np.flip(g, axis=-1),
-        "P": np.roll(np.flip(g, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2)),
+        "P": _at_minus_k(g),
         "O": g.swapaxes(3, 4),
-        "PO": np.roll(np.flip(g.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2)),
+        "PO": _at_minus_k(g.swapaxes(3, 4)),
+        "TOU": _exchange_orbitals(np.flip(g, axis=-1), u),
+        "PU": _invert(g, u),
     }
     denom = np.vdot(g, g)
     if denom == 0:
@@ -1126,7 +1397,8 @@ def gap_parity_diagnostics(gap: np.ndarray, gap_shape: tuple) -> dict[str, compl
 
 def _classify_momentum_block(block: np.ndarray, purity: float) -> str:
     r"""
-    Classifies the wave symmetry of one orbital block's momentum profile, returning ``s``, ``d``, ``p`` or ``x``.
+    Classifies the wave symmetry of one orbital block's momentum profile, returning ``s``, ``d``, ``dxy`` (``dxz``,
+    ``dyz``), ``g``, ``p`` or ``x``.
 
     The block is decomposed into symmetry sectors rather than compared element-wise: for an involution :math:`X`,
     the fraction of the block's weight that is even under it is
@@ -1146,7 +1418,10 @@ def _classify_momentum_block(block: np.ndarray, purity: float) -> str:
     :param block: The momentum profile ``[kx, ky, kz]`` of one orbital block.
     :param purity: Minimum weight fraction for a symmetry sector to count as realized.
     :return: ``s`` (even under every inversion, symmetric under every applicable exchange), ``d`` (even under every
-        inversion, antisymmetric under some exchange), ``p`` (odd under the full inversion) or ``x``.
+        inversion, antisymmetric under some exchange: the :math:`d_{x^2-y^2}` type), ``dxy`` (odd under
+        :math:`k_x \to -k_x` and :math:`k_y \to -k_y`, even under the third, symmetric under their exchange; ``dxz``,
+        ``dyz`` in the other planes), ``g`` (odd under two inversions, antisymmetric under their exchange), ``p`` (odd
+        under the full inversion) or ``x``.
     """
 
     def even_fraction(arr: np.ndarray, mirrored: np.ndarray) -> float:
@@ -1170,16 +1445,93 @@ def _classify_momentum_block(block: np.ndarray, purity: float) -> str:
         if all(even_fraction(block, swap) >= purity for swap in swapped):
             return "s"
         return "x"
+    odd_axes = [axis for axis in range(3) if 1.0 - even_axis[axis] >= purity]
+    if len(odd_axes) == 2 and even_axis[3 - sum(odd_axes)] >= purity:
+        i, j = odd_axes
+        if block.shape[i] == block.shape[j]:
+            swapped = np.swapaxes(block, i, j)
+            if even_fraction(block, swapped) >= purity:
+                return f"d{'xyz'[i]}{'xyz'[j]}"
+            if even_fraction(block, -swapped) >= purity:
+                return "g"
+        return "x"
     if even_fraction(block, -invert(block, (0, 1, 2))) >= purity:  # odd under the full inversion
         return "p"
     return "x"
 
 
-def classify_gap_symmetry(gap: np.ndarray, purity: float = 0.9, weight_floor: float = 0.01) -> str:
+def fermi_surface_bands(ek: np.ndarray, mu: float, orbitals: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    r"""
+    Returns the band energies relative to the chemical potential and the band eigenvectors on the gap's orbitals,
+    :math:`\varepsilon_n(\mathbf{k}) - \mu` and :math:`\psi_{an}(\mathbf{k})`, the input of the Fermi-surface sign test
+    of :func:`classify_gap_symmetry`.
+
+    :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})` on the whole grid, shape ``[kx, ky, kz, o1, o2]``.
+    :param mu: Chemical potential :math:`\mu`.
+    :param orbitals: Indices of the orbitals the gap lives on (the correlated ones); ``None`` for every orbital.
+    :return: ``(energies, vectors)`` of shapes ``[kx, ky, kz, n]`` and ``[kx, ky, kz, o, n]``.
+    """
+    energies, vectors = np.linalg.eigh(ek)
+    return energies - mu, (vectors if orbitals is None else vectors[..., orbitals, :])
+
+
+def _changes_sign_between_fermi_sheets(
+    gap_slice: np.ndarray, bands: tuple[np.ndarray, np.ndarray], consistency: float = 0.5, floor: float = 0.05
+) -> bool:
+    r"""
+    Whether a gap at one frequency has opposite signs on the Fermi sheets of two bands. The intraband gap
+    :math:`\Delta_n(\mathbf{k}) = \psi_n(\mathbf{k})^\dagger \Delta(\mathbf{k})^{T} \psi_n(\mathbf{k})` (the band gap of
+    the time-reversal gauge :math:`\psi(-\mathbf{k}) = \psi(\mathbf{k})^*` for the gap's first orbital at
+    :math:`-\mathbf{k}`, independent of the eigenvector phases) is read on the momenta next to a sign change of
+    :math:`\varepsilon_n - \mu` towards a grid neighbor, after the global phase that makes it most nearly real. A band
+    counts when its sheet carries at least ``floor`` of the largest sheet's weight and keeps at least ``consistency`` of
+    it in the signed sum (one sign on most of the sheet). Bands degenerate at a momentum to 1e-4 of the largest band
+    energy all carry the trace over them there as their band gap, independent of the basis the eigensolver picked
+    among them, so degenerate partners count with one sign, also where another band crosses them.
+
+    :param gap_slice: The gap at one frequency, shape ``[kx, ky, kz, o1, o2]``.
+    :param bands: The ``(energies, vectors)`` of :func:`fermi_surface_bands`.
+    :param consistency: Minimum ratio of the signed to the absolute sum on a sheet.
+    :param floor: Minimum weight of a sheet relative to the largest one.
+    :return: True when two counted Fermi surfaces carry opposite signs.
+    """
+    energies, vectors = bands
+    intra = np.einsum("xyzan,xyzba,xyzbn->xyzn", vectors.conj(), gap_slice, vectors)
+    sheet = np.zeros(energies.shape, dtype=bool)
+    for axis in range(3):
+        if energies.shape[axis] > 1:
+            crossing = energies * np.roll(energies, -1, axis=axis) < 0
+            sheet |= crossing | np.roll(crossing, 1, axis=axis)
+    if not sheet.any():
+        return False
+    # bands degenerate at a momentum all carry the trace over them there as their band gap
+    degenerate = np.abs(energies[..., :, None] - energies[..., None, :]) <= 1e-4 * np.abs(energies).max()
+    intra = np.einsum("xyznm,xyzm->xyzn", degenerate, intra)
+    signed = (intra * np.exp(-0.5j * np.angle(np.sum(intra[sheet] ** 2)))).real
+    sums = [
+        (signed[..., n][sheet[..., n]].sum(), np.abs(intra[..., n][sheet[..., n]]).sum())
+        for n in range(intra.shape[-1])
+    ]
+    largest = max(weight for _, weight in sums)
+    signs = [
+        np.sign(total) for total, weight in sums if weight > floor * largest and abs(total) >= consistency * weight
+    ]
+    return min(signs, default=0) < 0 < max(signs, default=0)
+
+
+def classify_gap_symmetry(
+    gap: np.ndarray,
+    purity: float = 0.9,
+    weight_floor: float = 0.01,
+    bands: tuple[np.ndarray, np.ndarray] | None = None,
+) -> str:
     r"""
     Classifies the momentum wave symmetry and Matsubara-frequency parity of a gap and returns a compact label of the
-    form ``<wave><parity>``. The wave letter is ``s``, ``d`` or ``p`` (``x`` if none of these match), and the parity
-    sign is ``+`` (even in :math:`\nu`), ``-`` (odd) or empty (neither). The frequency parity is the sign of the
+    form ``<wave><parity>``. The wave is ``s``, ``s±``, ``d`` (:math:`d_{x^2-y^2}` type), ``dxy`` (``dxz``, ``dyz``),
+    ``g`` or ``p`` (``x`` if none of these match), and the parity sign is ``+`` (even in :math:`\nu`), ``-`` (odd) or
+    empty (neither). The momentum tests are reflections of the grid axes, so the names presume the axes of a square or
+    cubic lattice. With ``bands`` an ``s`` wave whose band gap has opposite signs on the Fermi sheets of two bands
+    becomes ``s±`` (see :func:`_changes_sign_between_fermi_sheets`). The frequency parity is the sign of the
     global T Rayleigh quotient :math:`\langle \Delta, T\Delta \rangle / \langle \Delta, \Delta \rangle` (with
     :math:`T` the fermionic-frequency flip), so it is consistent with the parity diagnostics.
 
@@ -1197,6 +1549,8 @@ def classify_gap_symmetry(gap: np.ndarray, purity: float = 0.9, weight_floor: fl
     :param gap: The gap array in the ``[kx, ky, kz, o1, o2, v]`` layout.
     :param purity: Minimum weight fraction for a symmetry sector to count as realized within a block.
     :param weight_floor: Minimum weight of a block relative to the heaviest one for it to be classified at all.
+    :param bands: The band energies and eigenvectors of :func:`fermi_surface_bands`, for the ``s±`` test; ``None``
+        skips it.
     :return: The ``<wave><parity>`` label, or ``"unknown"`` for an all-zero gap.
     """
     denom = np.vdot(gap, gap)
@@ -1220,6 +1574,8 @@ def classify_gap_symmetry(gap: np.ndarray, purity: float = 0.9, weight_floor: fl
 
     if not labeled:
         return f"x{freq_label}"
+    if "s" in labeled and bands is not None and _changes_sign_between_fermi_sheets(gap[..., gap.shape[-1] // 2], bands):
+        labeled["s±"] = labeled.pop("s")
     if len(labeled) == 1:
         return f"{next(iter(labeled))}{freq_label}"
     order = sorted(labeled.items(), key=lambda kv: -sum(w for w, _ in kv[1]))
@@ -1270,7 +1626,7 @@ def _gather_grid_vertex_block(
 
 
 def solve_eliashberg_lanczos_grid(
-    gamma_r_pp: FourPoint, gchi0_q0_pp: FourPoint | None, comm: MPI.Comm, bubble_rank: int
+    gamma_r_pp: FourPoint, gchi0_q0_pp: FourPoint | None, comm: MPI.Comm, bubble_rank: int, u: np.ndarray | None = None
 ) -> dict[str, tuple[np.ndarray, list[GapFunction]]] | None:
     r"""
     Solves the linearized Eliashberg equation with the pairing vertex distributed over a 2-D ``(nu, nu')`` block grid,
@@ -1280,16 +1636,18 @@ def solve_eliashberg_lanczos_grid(
 
     Every grid rank holds one full-BZ, Fourier-transformed, matmul-layout block of the vertex and runs the
     eigensolver in lockstep on the full gap vector (the collectives inside the matvec keep every rank's iterates
-    identical). Per matvec each rank dresses its own and its mirror
-    :math:`\nu'`-column block locally (the crossed term reads the mirror block through the :math:`\nu'` flip), so
-    the only communication is one block-sized ``Allreduce`` over each row group (completing the :math:`\nu'` sum)
-    and one gap-sized ``Allgatherv`` over each column group (reassembling the :math:`\nu` rows). Sectors and
-    channels run sequentially on the whole grid; ranks beyond ``rows * cols`` idle and return ``None``.
+    identical). Per matvec each rank dresses its own :math:`\nu'`-column block of the gap and contracts it with its
+    vertex block, so the only communication is one block-sized ``Allreduce`` over each row group (completing the
+    :math:`\nu'` sum) and one gap-sized ``Allgatherv`` over each column group (reassembling the :math:`\nu` rows);
+    the crossed term reads the mirror :math:`\nu` rows (see :func:`_crossed_term`), so every rank adds it to the
+    reassembled direct term. Sectors and channels run sequentially on the whole grid; ranks beyond ``rows * cols``
+    idle and return ``None``.
 
     :param gamma_r_pp: This rank's irreducible-BZ share of the pairing vertex; consumed by the solve.
     :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{\mathrm{pp}}` (only read on ``bubble_rank``).
     :param comm: The MPI communicator.
     :param bubble_rank: The rank holding the pp bubble.
+    :param u: The orbital action of the inversion for the parity sectors (see :func:`_project_gap_to_sector`).
     :return: ``{parity_label: (lambdas, gaps)}`` on grid ranks, ``None`` on idle ranks.
     """
     logger = config.logger
@@ -1310,9 +1668,7 @@ def solve_eliashberg_lanczos_grid(
     row_bounds = np.linspace(0, n_freq, rows + 1).astype(int)
     row_slice = slice(int(row_bounds[i]), int(row_bounds[i + 1]))
     width = n_freq // cols
-    mirror_j = cols - 1 - j
     col_slice = slice(j * width, (j + 1) * width)
-    mirror_slice = slice(mirror_j * width, (mirror_j + 1) * width)
 
     # collective splits must involve every rank, including idle ones (distinct colors keep them out of the groups)
     reduce_comm = comm.Split(i if in_grid else rows, comm.rank)  # same nu rows, nu' columns vary
@@ -1350,9 +1706,6 @@ def solve_eliashberg_lanczos_grid(
     chi0_full = FourPoint(chi0_mat, SpinChannel.NONE, k_grid.nk, 0, 1, False, True, True, FrequencyNotation.PP)
     chi0_full = chi0_full.decompress_q_dimension()
     chi0_own = _chi0_to_matmul_layout(np.ascontiguousarray(chi0_full.mat[..., col_slice]))
-    chi0_mir = (
-        chi0_own if mirror_j == j else _chi0_to_matmul_layout(np.ascontiguousarray(chi0_full.mat[..., mirror_slice]))
-    )
     chi0_full.free()
 
     gap_shape = k_grid.nk + 2 * (n_bands,) + (n_freq,)
@@ -1362,10 +1715,10 @@ def solve_eliashberg_lanczos_grid(
 
     def mv(gap: np.ndarray):
         r"""
-        Applies the pairing kernel to a full flattened gap vector on the solver grid: this rank dresses its own and
-        its mirror :math:`\nu'`-column block of the gap, contracts them with its vertex block (direct and crossed
-        term), completes the :math:`\nu'` sum by an ``Allreduce`` over the row group, and reassembles the full
-        :math:`\nu` axis by an ``Allgatherv`` over the column group, so every rank returns the identical full result.
+        Applies the pairing kernel to a full flattened gap vector on the solver grid: this rank dresses its own
+        :math:`\nu'`-column block of the gap, contracts it with its vertex block, completes the :math:`\nu'` sum by an
+        ``Allreduce`` over the row group, reassembles the full :math:`\nu` axis by an ``Allgatherv`` over the column
+        group and adds the crossed term, so every rank returns the identical full result.
 
         :param gap: The flattened gap vector (full length, identical on every grid rank).
         :return: The flattened result of applying the pairing kernel to ``gap``.
@@ -1376,40 +1729,24 @@ def solve_eliashberg_lanczos_grid(
             axes=(0, 1, 2),
             overwrite_x=True,
         )
-        gg_mirror = (
-            gap_gg
-            if mirror_j == j
-            else sp.fft.fftn(
-                _apply_gchi0_pp(chi0_mir, np.ascontiguousarray(gap6[..., mirror_slice]), n_bands),
-                axes=(0, 1, 2),
-                overwrite_x=True,
-            )
-        )
         part = _apply_gamma_pp(gamma_mm, gap_gg, n_bands)
-        # crossed term: flip_p of the FULL dressed gap restricted to this rank's columns equals the mirror block
-        # flipped, so the mirror dressing above replaces any exchange (see solve_eliashberg_lanczos for the identity)
-        crossed = _apply_gamma_pp(gamma_mm, np.ascontiguousarray(np.flip(gg_mirror, axis=-1)), n_bands)
-        crossed = np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-        if sign != 1:
-            crossed *= sign
-        part += crossed
         if cols > 1:
             part = np.ascontiguousarray(part)
             reduce_comm.Allreduce(MPI.IN_PLACE, part)
         part = sp.fft.ifftn(part, axes=(0, 1, 2), overwrite_x=True)
-        if rows == 1:
-            return part.flatten()
-        send = np.ascontiguousarray(np.moveaxis(part, -1, 0))
-        recv = np.empty((n_freq,) + send.shape[1:], dtype=send.dtype)
-        gather_comm.Allgatherv(send, [recv, (row_counts, row_displs)])
-        return np.moveaxis(recv, 0, -1).flatten()
+        if rows > 1:
+            send = np.ascontiguousarray(np.moveaxis(part, -1, 0))
+            recv = np.empty((n_freq,) + send.shape[1:], dtype=send.dtype)
+            gather_comm.Allgatherv(send, [recv, (row_counts, row_displs)])
+            part = np.moveaxis(recv, 0, -1)
+        return (part + _crossed_term(part, sign)).flatten()
 
-    def sector_mv(gap: np.ndarray, eps_t: int | None, eps_po: int | None) -> np.ndarray:
+    def sector_mv(gap: np.ndarray, eps_t: int | None, eps_p: int | None) -> np.ndarray:
         # a projected sector applies Pi mv Pi with the projector of _project_gap_to_sector
         if eps_t is None:
             return mv(gap)
         return _project_gap_to_sector(
-            mv(_project_gap_to_sector(gap, gap_shape, eps_t, eps_po)), gap_shape, eps_t, eps_po
+            mv(_project_gap_to_sector(gap, gap_shape, eps_t, eps_p, u)), gap_shape, eps_t, eps_p, u
         )
 
     # get_initial_gap_function draws from a fixed-seed generator, so every lockstep rank computes the same seed
@@ -1425,6 +1762,7 @@ def solve_eliashberg_lanczos_grid(
         seed.flatten(),
         None,
         gamma_mm.dtype,
+        u,
     )
 
 
@@ -1668,8 +2006,8 @@ def symmetrize_degenerate_gaps(
 ) -> np.ndarray:
     r"""
     Orthonormalizes the eigenvectors returned by the Lanczos solver within clusters of (near-)degenerate
-    eigenvalues and rotates every cluster to a mirror-adapted basis. The pairing kernel is only symmetrizable, not
-    Hermitian in the plain inner product, so ARPACK may return oblique (mutually non-orthogonal) combinations
+    eigenvalues and rotates every cluster to a mirror-adapted basis. The pairing kernel is not Hermitian in the
+    plain inner product, so ARPACK may return oblique (mutually non-orthogonal) combinations
     inside a degenerate cluster: the cluster subspace is symmetry-covariant, but the returned vectors then do not
     form the symmetry-adapted partners.
 
@@ -2002,24 +2340,24 @@ def _team_matvec(
     gap_shape: tuple,
     n_bands: int,
     orbits: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None] | None = None,
-    shortcut: bool = False,
+    u: np.ndarray | None = None,
 ) -> tuple[Callable, tuple[int, int]]:
     r"""
     Builds the pairing-kernel matvec of a team of ranks that share their node's vertex windows. Every rank holds one
-    frequency block of the vectors and every matvec runs in lockstep stages over the team's gap-sized scratch
-    windows (the gap, its dressed transform, the direct and the crossed term), each rank working on its own share:
-    the sector projection of the input (see :func:`_project_frequency_block`), the bubble multiply and the momentum
-    FFT on a contiguous block of fermionic frequencies, the two vertex contractions on a contiguous block of momenta,
-    the crossed-term reassembly with the inverse FFT again on the frequency block, and for a projected sector the
+    frequency block of the vectors and every matvec runs in lockstep stages over the team's gap-sized scratch windows
+    (the gap, its dressed transform, the direct and the crossed term), each rank working on its own share: the sector
+    projection of the input (see :func:`_project_frequency_block`), the bubble multiply and the momentum FFT on a
+    contiguous block of fermionic frequencies, the vertex contraction on a contiguous block of momenta, the crossed term
+    of the frequency block (see :func:`_crossed_term`, which reads the mirror block of the direct term, so it is staged
+    in its window before any block is overwritten), its addition and the inverse FFT, and for a projected sector the
     projection of the result on that block. Every element is computed by the same operations as in the single-rank
-    sector matvec, so the result is bit-identical to it. With ``orbits`` the windows hold the irreducible wedge of
-    the real-space grid and each rank contracts the stars of its irreducible points instead, one matrix product per
-    star with the members' direct and flipped right-hand sides as columns (rotated into and out of the irreducible
-    point's orbital frame on an auto-symmetry grid: the layout's row and column pairs both carry the conjugate
-    unitary, so :math:`W_{(12),(ab)} = U^*_{1a} U^*_{2b}` enters as :math:`W^\dagger` on the right-hand sides and
-    as :math:`W` on the result); the result then equals the
-    single-rank one to rounding. With ``shortcut`` (one band, frequency-even bubble) a projected sector forms the
-    crossed term from the direct one (see :func:`_crossed_from_direct`).
+    sector matvec, so the result is bit-identical to it without an orbital action, and agrees to rounding with one (the
+    orbital rotation's einsum picks its contraction path by the block's shape). With ``orbits`` the windows hold the
+    irreducible wedge of the real-space grid and each rank contracts the stars of its irreducible points instead, one
+    matrix product per star with the members' right-hand sides as columns (rotated into and out of the irreducible
+    point's orbital frame on an auto-symmetry grid: the layout's row and column pairs both carry the conjugate unitary,
+    so :math:`W_{(12),(ab)} = U^*_{1a} U^*_{2b}` enters as :math:`W^\dagger` on the right-hand sides and as :math:`W` on
+    the result); the result then equals the single-rank one to rounding.
 
     :param team_comm: The team communicator (rank 0 is the lead).
     :param gamma_by_channel: The node-shared matmul-layout vertices per channel, ``[x, y, z, o2*nv, o2*np]`` on the
@@ -2029,9 +2367,9 @@ def _team_matvec(
     :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
     :param n_bands: Number of orbitals ``o``.
     :param orbits: The stars of :func:`_wedge_orbits` for wedge windows, else ``None``.
-    :param shortcut: Whether a projected sector may form the crossed term from the direct one.
+    :param u: The orbital action of the inversion for the parity sectors (see :func:`_project_gap_to_sector`).
     :return: ``(apply_block, (v0, v1))``: the collective sector matvec on this rank's frequency block
-        ``[..., v0:v1]`` of the gap, ``apply_block(channel, eps_t, eps_po, block) -> block`` (``eps_t`` of ``None``
+        ``[..., v0:v1]`` of the gap, ``apply_block(channel, eps_t, eps_p, block) -> block`` (``eps_t`` of ``None``
         applies the raw kernel; every team rank calls it with the same sector), and the block bounds.
     """
     gap_w, gg_w, direct_w, crossed_w = scratch
@@ -2045,7 +2383,6 @@ def _team_matvec(
     k0, k1 = int(chunks[rank]), int(chunks[rank + 1])
     gg_flat = gg_w.reshape(nk, rows, 1)
     direct_flat = direct_w.reshape(nk, rows, 1)
-    crossed_flat = crossed_w.reshape(nk, rows, 1)
     if orbits is not None:
         _, offsets, order, us = orbits
         # this rank's irreducible points, balanced by the number of star members (the matrix-product columns)
@@ -2056,68 +2393,49 @@ def _team_matvec(
             members = us[order[offsets[r0] : offsets[r1]]]
             rotations = np.einsum("kab,kcd->kacbd", members.conj(), members.conj()).reshape(len(members), oo, oo)
 
-    def contract_stars(gamma_irr: np.ndarray, with_crossed: bool) -> None:
+    def contract_stars(gamma_irr: np.ndarray) -> None:
         for r in range(r0, r1):
             members = order[offsets[r] : offsets[r + 1]]
-            m = len(members)
             rhs = gg_flat[members, :, 0].T  # [(c, d, p), m]
-            if with_crossed:
-                flipped = np.flip(rhs.reshape(oo, nv, m), axis=1).reshape(rows, m)
-                rhs = np.concatenate([rhs, flipped], axis=1)
             if rotations is not None:
                 w = rotations[offsets[r] - offsets[r0] : offsets[r + 1] - offsets[r0]]
-                w = np.concatenate([w, w]) if with_crossed else w
                 rhs = np.einsum("jab,apj->bpj", w.conj(), rhs.reshape(oo, nv, -1)).reshape(rows, -1)
             out = gamma_irr[r] @ rhs
             if rotations is not None:
                 out = np.einsum("jab,bvj->avj", w, out.reshape(oo, nv, -1)).reshape(rows, -1)
-            direct_flat[members, :, 0] = out[:, :m].T
-            if with_crossed:
-                crossed_flat[members, :, 0] = out[:, m:].T
+            direct_flat[members, :, 0] = out.T
 
-    def run(channel: SpinChannel, eps_t: int | None, eps_po: int | None) -> None:
+    def run(channel: SpinChannel, eps_t: int | None, eps_p: int | None) -> None:
         gamma_flat = gamma_by_channel[channel].reshape(-1, rows, rows)
         sign = 1 if channel == SpinChannel.SING else -1
-        from_direct = shortcut and eps_t is not None
         team_comm.Barrier()
         if v1 > v0:
-            block = gap_w[..., v0:v1] if eps_t is None else _project_frequency_block(gap_w, v0, v1, eps_t, eps_po)
+            block = gap_w[..., v0:v1] if eps_t is None else _project_frequency_block(gap_w, v0, v1, eps_t, eps_p, u)
             dressed = _apply_gchi0_pp(chi0_mm[:, :, :, v0:v1], block, n_bands)
             gg_w[..., v0:v1] = sp.fft.fftn(dressed, axes=(0, 1, 2), overwrite_x=True)
             del block, dressed
         team_comm.Barrier()
         if orbits is not None:
-            contract_stars(gamma_flat, not from_direct)
+            contract_stars(gamma_flat)
         elif k1 > k0:
             np.matmul(gamma_flat[k0:k1], gg_flat[k0:k1], out=direct_flat[k0:k1])
-            if not from_direct:
-                # crossed term: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]; the
-                # flipped RHS is materialized contiguously so np.matmul stays on the BLAS fast path
-                flipped = np.ascontiguousarray(np.flip(gg_w.reshape(nk, n_bands, n_bands, nv)[k0:k1], axis=-1))
-                np.matmul(gamma_flat[k0:k1], flipped.reshape(k1 - k0, rows, 1), out=crossed_flat[k0:k1])
         team_comm.Barrier()
         if v1 > v0:
-            if from_direct:
-                crossed = _crossed_from_direct(direct_w[..., v0:v1], sign, eps_t)
-            else:
-                crossed = np.roll(
-                    np.flip(crossed_w.swapaxes(3, 4)[..., v0:v1], axis=(0, 1, 2)), shift=1, axis=(0, 1, 2)
-                )
-                if sign != 1:
-                    crossed *= -1
-            direct_w[..., v0:v1] += crossed
-            del crossed
+            crossed_w[..., v0:v1] = _crossed_term(direct_w, sign, v0, v1)
+        team_comm.Barrier()
+        if v1 > v0:
+            direct_w[..., v0:v1] += crossed_w[..., v0:v1]
             direct_w[..., v0:v1] = sp.fft.ifftn(direct_w[..., v0:v1], axes=(0, 1, 2), overwrite_x=True)
         team_comm.Barrier()
         if eps_t is not None:
             # the projected result goes to the (no longer needed) gap window; every rank reads the mirror block
             if v1 > v0:
-                gap_w[..., v0:v1] = _project_frequency_block(direct_w, v0, v1, eps_t, eps_po)
+                gap_w[..., v0:v1] = _project_frequency_block(direct_w, v0, v1, eps_t, eps_p, u)
             team_comm.Barrier()
 
-    def apply_block(channel: SpinChannel, eps_t: int | None, eps_po: int | None, block: np.ndarray) -> np.ndarray:
+    def apply_block(channel: SpinChannel, eps_t: int | None, eps_p: int | None, block: np.ndarray) -> np.ndarray:
         gap_w[..., v0:v1] = block.reshape(gap_shape[:-1] + (v1 - v0,))
-        run(channel, eps_t, eps_po)
+        run(channel, eps_t, eps_p)
         return (direct_w if eps_t is None else gap_w)[..., v0:v1].copy()
 
     return apply_block, (v0, v1)
@@ -2171,7 +2489,7 @@ def plan_lanczos_teams(
         node_host[node_root] = host
         node_available[node_root] = min(node_available.get(node_root, avail), avail)
     nodes = list(node_ranks)
-    parities = [label for label, _ in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)]
+    parities = [label for label, _ in _parity_sectors(config.eliashberg.resolve_parity_sectors)]
     sectors = [(channel, parity) for channel in (SpinChannel.SING, SpinChannel.TRIP) for parity in parities]
 
     def spread(group: list[tuple[SpinChannel, str]]) -> dict[int, list[tuple[SpinChannel, str]]]:
@@ -2227,6 +2545,7 @@ def _solve_sectors_in_teams(
     giwk_dga: GreensFunction | None,
     niv_pp: int,
     rounds: tuple[tuple[LanczosTeam, ...], ...],
+    u: np.ndarray | None = None,
 ) -> dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]]:
     r"""
     Solves every ``(channel, parity)`` sector with the teams of :func:`plan_lanczos_teams`. The pp bubble is built
@@ -2275,14 +2594,11 @@ def _solve_sectors_in_teams(
             mpi_dist_irrk.send_to_rank(gchi0_q_pp, dest=root, base_tag=BUBBLE_TAG)
         elif my_rank == root:
             gchi0_q_pp = mpi_dist_irrk.recv_from_rank(source=0, base_tag=BUBBLE_TAG)
-    chi0_mm, chi0_win, shortcut = None, None, False
+    chi0_mm, chi0_win = None, None
     if my_node_root in hosting_roots:
         chi0_shared, chi0_win = mpi_utils.build_node_shared_array(node_comm, lambda: gchi0_q_pp.mat)
         chi0_mm = _chi0_to_matmul_layout(chi0_shared)
         del chi0_shared
-        # one band with a frequency-even bubble lets a projected sector skip the crossed contraction
-        shortcut = n_bands == 1 and _bubble_is_frequency_even(chi0_mm) if node_comm.Get_rank() == 0 else None
-        shortcut = node_comm.bcast(shortcut, root=0)
     if gchi0_q_pp is not None:
         gchi0_q_pp.free()
 
@@ -2329,12 +2645,12 @@ def _solve_sectors_in_teams(
                 gap_shape,
                 n_bands,
                 orbits,
-                shortcut,
+                u,
             )
             # ponytail: one BLAS thread per team rank (production binds one rank per core); a per-rank executor
             # if few-rank jobs on wide nodes ever matter
             with threadpool_limits(limits=1):
-                local = _solve_team_sectors(team_comm, my_team, apply_block, (v0, v1), scratch[0][0], gap_shape)
+                local = _solve_team_sectors(team_comm, my_team, apply_block, (v0, v1), scratch[0][0], gap_shape, u)
             # every view into a window dies before the window is freed (the matvec closure holds the scratch
             # arrays and the vertex dict)
             scratch_wins = [win for _, win in scratch]
@@ -2370,6 +2686,7 @@ def _solve_team_sectors(
     bounds: tuple[int, int],
     gap_w: np.ndarray,
     gap_shape: tuple,
+    u: np.ndarray | None = None,
 ) -> dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]]:
     r"""
     Solves the sectors of one team with the team-distributed Krylov-Schur iteration (:func:`_team_arnoldi`): every
@@ -2384,6 +2701,7 @@ def _solve_team_sectors(
     :param bounds: This rank's frequency block ``(v0, v1)``.
     :param gap_w: The team's gap-shaped scratch window used to assemble the eigenvectors.
     :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
+    :param u: The orbital action of the inversion for the parity sectors (see :func:`_project_gap_to_sector`).
     :return: ``{(channel, parity): (lambdas, gaps)}`` on the lead, an empty dict elsewhere.
     """
     logger = config.logger
@@ -2392,7 +2710,7 @@ def _solve_team_sectors(
     n_eig, tol = config.eliashberg.n_eig, config.eliashberg.epsilon
     ncv = min(lanczos_ncv(n_eig), int(np.prod(gap_shape)))
     orbital_mirrors = _gap_orbital_mirrors(gap_shape[3]) if config.eliashberg.symmetrize_degenerate_gaps else {}
-    eps_by_parity = dict(_frequency_parity_sectors(config.eliashberg.resolve_frequency_parity))
+    eps_by_parity = dict(_parity_sectors(config.eliashberg.resolve_parity_sectors))
     ranks = (team.ranks[0],)
     labels = [_sector_log_label(channel, [parity]) for channel, parity in team.sectors]
     logger.info(f"Lanczos team for {', '.join(labels)}: {len(team.ranks)} rank(s) on {team.host}.", allowed_ranks=ranks)
@@ -2401,18 +2719,35 @@ def _solve_team_sectors(
     for (channel, parity), label in zip(team.sectors, labels):
         sign = 1 if channel == SpinChannel.SING else -1
         eps_t = eps_by_parity[parity]
-        eps_po = None if eps_t is None else sign * eps_t
+        eps_p = None if eps_t is None else sign * eps_t
         logger.info(f"Starting Lanczos method for {label}.", allowed_ranks=ranks)
         if channel != seeded_channel:
             base_seed, seeded_channel = get_initial_gap_function(gap_shape, channel).flatten(), channel
-        n_block = block_size(config.lattice.k_grid, eps_po if gap_shape[3] == 1 else None)
-        seeds = _sector_seeds(base_seed, gap_shape, eps_t, eps_po, n_block)
+        n_block = block_size(config.lattice.k_grid, eps_p if gap_shape[3] == 1 else None)
+        seeds = _sector_seeds(base_seed, gap_shape, eps_t, eps_p, n_block, u)
         seed = np.ascontiguousarray(seeds.reshape((n_block,) + tuple(gap_shape))[..., v0:v1])
         del seeds
+        attempts = []
+
+        def attempt(t: float) -> tuple:
+            attempts.append(
+                _team_arnoldi(
+                    lambda block: apply_block(channel, eps_t, eps_p, block),
+                    seed,
+                    n_eig,
+                    ncv,
+                    t,
+                    LANCZOS_RESTARTS,
+                    team_comm,
+                    n_block,
+                )
+            )
+            return attempts[-1]
+
         start = time.perf_counter()
-        lambdas, ritz, basis, n_matvec, matvec_seconds = _team_arnoldi(
-            lambda block: apply_block(channel, eps_t, eps_po, block), seed, n_eig, ncv, tol, 10000, team_comm, n_block
-        )
+        lambdas, ritz, basis, _, _ = _solve_loosening(attempt, tol, n_eig, label, ranks)
+        # the log counts every attempt, as the single-rank solve does
+        n_matvec, matvec_seconds = sum(a[3] for a in attempts), sum(a[4] for a in attempts)
         logger.info(
             f"Lanczos for {label}: {n_matvec} matvecs, {matvec_seconds:.1f} s in the matvec "
             f"({1e3 * matvec_seconds / max(n_matvec, 1):.0f} ms each), {time.perf_counter() - start:.1f} s "
@@ -2425,6 +2760,10 @@ def _solve_team_sectors(
                 f"{n_eig} converged eigenpair(s).",
                 allowed_ranks=ranks,
             )
+        if eps_t is not None and len(lambdas):
+            leading = ritz[:, int(np.argmax(lambdas))] @ basis
+            raw = apply_block(channel, None, None, leading).reshape(-1)
+            _log_sector_residual(leading, raw, label, ranks, team_comm.allreduce)
         # the eigenvectors travel block by block through the shared gap window to the lead
         gaps = np.empty((int(np.prod(gap_shape)), len(lambdas)), dtype=basis.dtype) if lead else None
         for i in range(len(lambdas)):
@@ -2454,15 +2793,18 @@ def _solve_pairing_sectors(
     base_seed: np.ndarray,
     parities: list[str] | None = None,
     dtype: np.dtype = DTYPE,
+    u: np.ndarray | None = None,
 ) -> dict[str, tuple[np.ndarray, list[GapFunction]]]:
     r"""
-    Runs the ARPACK/Lanczos solve of the pairing kernel ``mv`` once per physical frequency-parity sector selected by
-    ``config.eliashberg.resolve_frequency_parity`` and returns the leading ``n_eig`` eigenpairs of each. Every projected
-    sector hands the matvec its Hermitian sector projector :math:`\Pi` (T-parity ``eps_T`` and the Pauli-forced
-    combined parity ``eps_PO = sign * eps_T``) and projects the seed with it; the ``"none"`` sector runs the raw kernel
-    unchanged. The passed ``executor`` (the momentum-batch thread pool, or ``None``) is shut down before returning.
+    Runs the ARPACK/Lanczos solve of the pairing kernel ``mv`` once per parity sector selected by
+    ``config.eliashberg.resolve_parity_sectors`` and returns the leading ``n_eig`` eigenpairs of each. Every projected
+    sector hands the matvec its Hermitian sector projector :math:`\Pi` (parity ``eps_T`` under :math:`T O_U` and the
+    Pauli-forced inversion parity ``eps_P = sign * eps_T``, see :func:`_project_gap_to_sector`) and projects the seed
+    with it, and the residual of its leading gap under the raw kernel is logged (see
+    :func:`_log_sector_residual`); the ``"none"`` sector runs the raw kernel unchanged. The passed ``executor`` (the
+    momentum-batch thread pool, or ``None``) is shut down before returning.
 
-    :param mv: The sector matvec ``mv(gap, eps_t, eps_po)`` (maps a full-length gap vector to a full-length gap
+    :param mv: The sector matvec ``mv(gap, eps_t, eps_p)`` (maps a full-length gap vector to a full-length gap
         vector, projected onto the sector unless ``eps_t`` is ``None``).
     :param gap_shape: The ``[kx, ky, kz, o1, o2, v]`` shape of the gap.
     :param sign: The channel sign (:math:`+1` singlet, :math:`-1` triplet).
@@ -2475,13 +2817,14 @@ def _solve_pairing_sectors(
     :param parities: An optional subset of parity labels to solve; ``None`` solves every configured sector.
     :param dtype: The dtype ``mv`` returns (that of the pairing vertex); declared on the eigensolver's operator so
         scipy does not probe it with an extra matvec.
+    :param u: The orbital action of the inversion for the parity sectors (see :func:`_project_gap_to_sector`).
     :return: ``{parity_label: (lambdas, [GapFunction, ...])}`` for each solved sector.
     """
     logger = config.logger
     n_eig = config.eliashberg.n_eig
     shape_flat = int(np.prod(gap_shape))
 
-    sectors = _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)
+    sectors = _parity_sectors(config.eliashberg.resolve_parity_sectors)
     if parities is not None:
         sectors = [(label, eps_t) for label, eps_t in sectors if label in parities]
 
@@ -2491,36 +2834,42 @@ def _solve_pairing_sectors(
     results: dict[str, tuple[np.ndarray, list[GapFunction]]] = {}
     try:
         for parity, eps_t in sectors:
-            eps_po = None if eps_t is None else sign * eps_t
+            eps_p = None if eps_t is None else sign * eps_t
             label = _sector_log_label(channel, [parity])
             logger.info(f"Starting Lanczos method for {label}.", allowed_ranks=ranks)
             n_matvec, matvec_seconds = 0, 0.0
 
-            def counted_matvec(gap: np.ndarray, eps_t=eps_t, eps_po=eps_po) -> np.ndarray:
+            def counted_matvec(gap: np.ndarray, eps_t=eps_t, eps_p=eps_p) -> np.ndarray:
                 nonlocal n_matvec, matvec_seconds
                 start = time.perf_counter()
-                result = mv(gap, eps_t, eps_po)
+                result = mv(gap, eps_t, eps_p)
                 n_matvec += 1
                 matvec_seconds += time.perf_counter() - start
                 return result
 
             mat = sp.sparse.linalg.LinearOperator(shape=(shape_flat, shape_flat), matvec=counted_matvec, dtype=dtype)
-            n_block = block_size(config.lattice.k_grid, eps_po if gap_shape[3] == 1 else None)
+            n_block = block_size(config.lattice.k_grid, eps_p if gap_shape[3] == 1 else None)
             eigsh_start = time.perf_counter()
             # BLAS is pinned to one thread for the solve (threadpool_limits resizes the live pool; an environment
             # change would be ignored) so the momentum-batch threads never nest BLAS threads underneath.
             with threadpool_limits(limits=1 if executor is not None else None):
                 if n_block > 1:
                     # forced multiplets need the block iteration, run on the full vectors of this rank
-                    lambdas, ritz, basis, _, _ = _team_arnoldi(
-                        counted_matvec,
-                        _sector_seeds(base_seed, gap_shape, eps_t, eps_po, n_block),
-                        n_eig,
-                        min(lanczos_ncv(n_eig), shape_flat),
+                    lambdas, ritz, basis, _, _ = _solve_loosening(
+                        lambda t: _team_arnoldi(
+                            counted_matvec,
+                            _sector_seeds(base_seed, gap_shape, eps_t, eps_p, n_block, u),
+                            n_eig,
+                            min(lanczos_ncv(n_eig), shape_flat),
+                            t,
+                            LANCZOS_RESTARTS,
+                            None,
+                            n_block,
+                        ),
                         config.eliashberg.epsilon,
-                        10000,
-                        None,
-                        n_block,
+                        n_eig,
+                        label,
+                        ranks,
                     )
                     gaps = (ritz.T @ basis).T
                     del basis
@@ -2531,19 +2880,24 @@ def _solve_pairing_sectors(
                             allowed_ranks=ranks,
                         )
                 else:
-                    try:
-                        lambdas, gaps = sp.sparse.linalg.eigsh(
-                            mat,
-                            k=n_eig,
-                            tol=config.eliashberg.epsilon,
-                            v0=_sector_seed(base_seed, gap_shape, eps_t, eps_po),
-                            ncv=min(lanczos_ncv(n_eig), shape_flat),
-                            which="LA",
-                            maxiter=10000,
-                        )
-                    except sp.sparse.linalg.ArpackNoConvergence as exc:
-                        # the converged subset is kept; the delivery sizes the gap transfer off what came back
-                        lambdas, gaps = exc.eigenvalues.real, exc.eigenvectors
+
+                    def solve(tol: float) -> tuple[np.ndarray, np.ndarray]:
+                        try:
+                            return sp.sparse.linalg.eigsh(
+                                mat,
+                                k=n_eig,
+                                tol=tol,
+                                v0=_sector_seed(base_seed, gap_shape, eps_t, eps_p, u),
+                                ncv=min(lanczos_ncv(n_eig), shape_flat),
+                                which="LA",
+                                maxiter=LANCZOS_RESTARTS,
+                            )
+                        except sp.sparse.linalg.ArpackNoConvergence as exc:
+                            # the converged subset is kept; the delivery sizes the gap transfer off what came back
+                            return exc.eigenvalues.real, exc.eigenvectors
+
+                    lambdas, gaps = _solve_loosening(solve, config.eliashberg.epsilon, n_eig, label, ranks)
+                    if len(lambdas) < n_eig:
                         logger.warning(
                             f"Lanczos for {label} did not converge within the iteration limit; keeping the "
                             f"{len(lambdas)} of {n_eig} converged eigenpair(s).",
@@ -2555,6 +2909,11 @@ def _solve_pairing_sectors(
                 f"in eigsh.",
                 allowed_ranks=ranks,
             )
+            if eps_t is not None and len(lambdas):
+                leading = gaps[:, int(np.argmax(lambdas))]
+                # the check's matvec runs on the momentum-batch threads as well, so BLAS stays pinned
+                with threadpool_limits(limits=1 if executor is not None else None):
+                    _log_sector_residual(leading, mv(leading, None, None), label, ranks)
             results[parity] = _finish_sector(lambdas, gaps, gap_shape, channel, nq, label, orbital_mirrors, ranks)
     finally:
         if executor is not None:
@@ -2565,7 +2924,11 @@ def _solve_pairing_sectors(
 
 
 def solve_eliashberg_lanczos(
-    gamma_r_pp: FourPoint, gchi0_q0_pp: FourPoint, ranks: tuple[int, int], parities: list[str] | None = None
+    gamma_r_pp: FourPoint,
+    gchi0_q0_pp: FourPoint,
+    ranks: tuple[int, int],
+    parities: list[str] | None = None,
+    u: np.ndarray | None = None,
 ) -> dict[str, tuple[np.ndarray, list[GapFunction]]]:
     r"""
     Solves the linearized Eliashberg equation for the leading superconducting eigenvalue(s) and gap function(s) using
@@ -2573,8 +2936,8 @@ def solve_eliashberg_lanczos(
     variant holds the full-BZ pairing vertex on the solving rank. The passed pairing vertex is **consumed** (mapped
     to the full BZ and Fourier transformed in place, then freed once its matmul-layout copy is built).
 
-    When ``config.eliashberg.resolve_frequency_parity`` is set, the matvec and the starting vector are, for each
-    physical frequency-parity sector, sandwiched in the sector projector :math:`\Pi` (see
+    When ``config.eliashberg.resolve_parity_sectors`` is set, the matvec and the starting vector are, for each
+    parity sector, sandwiched in the sector projector :math:`\Pi` (see
     :func:`_project_gap_to_sector`), so the eigensolver returns the leading eigenpairs of :math:`\Pi M \Pi` restricted
     to that sector; otherwise the raw kernel :math:`M` is run unchanged.
 
@@ -2583,8 +2946,9 @@ def solve_eliashberg_lanczos(
     :param gchi0_q0_pp: The bare pp bubble :math:`\chi_0^{\mathrm{pp}}` at :math:`\omega = 0`.
     :param ranks: The ranks used for logging.
     :param parities: An optional subset of parity labels to solve (``None`` solves every configured sector).
+    :param u: The orbital action of the inversion for the parity sectors (see :func:`_project_gap_to_sector`).
     :return: A dict ``{parity_label: (lambdas, gaps)}`` of the leading eigenvalues and :class:`GapFunction` objects
-        per solved physical frequency-parity sector (a single ``"none"`` key when no projection is requested).
+        per solved parity sector (a single ``"none"`` key when no projection is requested).
     """
     logger = config.logger
     import psutil
@@ -2635,25 +2999,23 @@ def solve_eliashberg_lanczos(
     )
 
     sign = 1 if gamma_r_pp.channel == SpinChannel.SING else -1
-    shortcut = n_bands == 1 and _bubble_is_frequency_even(chi0_mm)
 
-    def mv(gap: np.ndarray, eps_t: int | None, eps_po: int | None) -> np.ndarray:
+    def mv(gap: np.ndarray, eps_t: int | None, eps_p: int | None) -> np.ndarray:
         r"""
         Applies the pairing kernel of one sector to a flattened gap vector (the matrix-vector product for the
         eigensolver): projects onto the sector (unless ``eps_t`` is ``None``), multiplies by
-        :math:`\chi_0^{\mathrm{pp}}`, FFTs to real space, contracts with the pairing vertex (direct plus the crossed
-        term, the latter reusing the direct vertex via gap-sized index shuffles, or formed from the direct term for
-        one band with a frequency-even bubble, see :func:`_crossed_from_direct`), transforms back and projects again.
-        The orbital contractions are batched ``np.matmul`` products and the BZ transforms run in place through
-        ``scipy.fft`` (both threaded up to the solver thread budget).
+        :math:`\chi_0^{\mathrm{pp}}`, FFTs to real space, contracts with the pairing vertex (the direct term, plus the
+        crossed term formed from it by the exchange of the outgoing pair, see :func:`_crossed_term`), transforms back
+        and projects again. The orbital contractions are batched ``np.matmul`` products and the BZ transforms run in
+        place through ``scipy.fft`` (both threaded up to the solver thread budget).
 
         :param gap: The flattened gap vector.
-        :param eps_t: The T-parity of the sector, or ``None`` for the raw kernel.
-        :param eps_po: The forced combined ``P.O`` parity of the sector.
+        :param eps_t: The parity of the sector under :math:`T O_U`, or ``None`` for the raw kernel.
+        :param eps_p: The forced inversion parity of the sector.
         :return: The flattened result of applying the sector kernel to ``gap``.
         """
         if eps_t is not None:
-            gap = _project_gap_to_sector(gap, gap_shape, eps_t, eps_po)
+            gap = _project_gap_to_sector(gap, gap_shape, eps_t, eps_p, u)
         gap_gg = sp.fft.fftn(
             _apply_gchi0_pp(chi0_mm, gap, n_bands, executor, n_threads),
             axes=(0, 1, 2),
@@ -2661,21 +3023,10 @@ def solve_eliashberg_lanczos(
             workers=n_threads,
         )
         gap_new = _apply_gamma_pp(gamma_mm, gap_gg, n_bands, executor, n_threads)
-        if shortcut and eps_t is not None:
-            crossed = _crossed_from_direct(gap_new, sign, eps_t)
-        else:
-            # crossed term: Gamma_flip[K] @ gap_flip[K] == sign * flip_K[swap_ab[Gamma @ flip_p(gap_gg)]]; the flipped
-            # RHS is materialized contiguously so np.matmul stays on the BLAS fast path (a single-band flip is a view).
-            crossed = _apply_gamma_pp(
-                gamma_mm, np.ascontiguousarray(np.flip(gap_gg, axis=-1)), n_bands, executor, n_threads
-            )
-            crossed = np.roll(np.flip(crossed.swapaxes(3, 4), axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
-            if sign != 1:
-                crossed *= sign
-        gap_new += crossed
+        gap_new += _crossed_term(gap_new, sign)
         gap_new = sp.fft.ifftn(gap_new, axes=(0, 1, 2), overwrite_x=True, workers=n_threads)
         out = gap_new.flatten()
-        return out if eps_t is None else _project_gap_to_sector(out, gap_shape, eps_t, eps_po)
+        return out if eps_t is None else _project_gap_to_sector(out, gap_shape, eps_t, eps_p, u)
 
     base_seed = get_initial_gap_function(gap_shape, gamma_r_pp.channel).flatten()
     return _solve_pairing_sectors(
@@ -2689,6 +3040,7 @@ def solve_eliashberg_lanczos(
         base_seed,
         parities,
         gamma_mm.dtype,
+        u,
     )
 
 
@@ -2723,10 +3075,11 @@ def dispatch_full_vertex_calculation(
     :math:`\frac{1}{\beta^2}\sum_{\nu\nu'}\chi^{\mathrm{q}\nu\nu'}_{r}`, and the three-leg vertices carry the net
     normalization :math:`\gamma^{\mathrm{q}\nu}_{r} = (\chi^{\mathrm{q}\nu}_{0})^{-1}\sum_{\nu'}
     \chi^{*;\mathrm{q}\nu\nu'}_{r}` (the explicit :math:`\beta` in their construction cancels the :math:`1/\beta` of the
-    fused frequency sum), such that :math:`\gamma^{\mathrm{q}\nu}_{r} \to \mathbb{1}` for :math:`\nu \to \infty`. With
-    ``config.rpa.use_rpa_susceptibility`` no local vertex is loaded and the vertex is the RPA one,
-    :math:`F^{\mathrm{q}}_{r} = \mathcal{U}^{\mathbf{q}}_{r} - \mathcal{U}^{\mathbf{q}}_{r}\chi^{\mathrm{q}}_{r}
-    \mathcal{U}^{\mathbf{q}}_{r}` (see :func:`_build_rpa_vertex_chunk`).
+    fused frequency sum), such that :math:`\gamma^{\mathrm{q}\nu}_{r} \to \mathbb{1}` for :math:`\nu \to \infty`. In the
+    bare-vertex modes (``config.misc.do_flex``, ``config.misc.do_rpa``) no local vertex is loaded and the vertex is the
+    RPA one, :math:`F^{\mathrm{q}}_{r} = \mathcal{U}^{\mathbf{q}}_{r} -
+    \mathcal{U}^{\mathbf{q}}_{r}\chi^{\mathrm{q}}_{r}\mathcal{U}^{\mathbf{q}}_{r}` (see
+    :func:`_build_rpa_vertex_chunk`).
 
     :param channel: The spin channel (density or magnetic).
     :param u_loc: The bare local interaction :math:`U`.
@@ -2738,7 +3091,7 @@ def dispatch_full_vertex_calculation(
         node into an MPI shared-memory window instead of once per rank (the build only reads it).
     :return: The full ladder pp vertex :math:`F^{\mathrm{q}}_{r}` as a :class:`FourPoint`.
     """
-    if config.rpa.use_rpa_susceptibility:
+    if config.misc.bare_vertex:
         build = create_pairing_vertex_streaming_fq if config.eliashberg.save_fq else create_pairing_vertex_slice_q_r
         f_q_r = build(u_loc, v_nonloc, None, niv_pp, mpi_dist, chunk_bytes, channel=channel)
         mpi_dist.barrier()
@@ -2765,6 +3118,7 @@ def _solve_sectors_in_memory(
     giwk_dga: GreensFunction,
     niv_pp: int,
     parities: list[str],
+    u: np.ndarray | None = None,
 ) -> dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]]:
     r"""
     Solves every ``(channel, parity)`` sector in turn on the single rank of the job (the in-memory path of a
@@ -2778,13 +3132,14 @@ def _solve_sectors_in_memory(
     :param giwk_dga: The DGA Green's function (used to build the bubble).
     :param niv_pp: Number of positive fermionic frequencies of the pp box.
     :param parities: The parity labels to solve.
+    :param u: The orbital action of the inversion for the parity sectors (see :func:`_project_gap_to_sector`).
     :return: ``{(channel, parity): (lambdas, gaps)}`` for every sector.
     """
     gchi0_q_pp = BubbleGenerator.create_generalized_chi0_q_pp_w0(giwk_dga, niv_pp, config.lattice.k_grid)
     config.logger.info("Created the bare bubble susceptibility in pp notation.")
     results: dict[tuple[SpinChannel, str], tuple[np.ndarray, list[GapFunction]]] = {}
     for gamma_pp in (gamma_sing_pp, gamma_trip_pp):
-        sectors = solve_eliashberg_lanczos(gamma_pp, gchi0_q_pp, (0,), parities)
+        sectors = solve_eliashberg_lanczos(gamma_pp, gchi0_q_pp, (0,), parities, u)
         results.update({(gamma_pp.channel, parity): sectors[parity] for parity in parities})
     mpi_dist_irrk.delete_file()
     return results
@@ -2800,9 +3155,10 @@ def solve(
 ):
     r"""
     Drives the Eliashberg step: assembles the singlet and triplet pairing vertices from the saved
-    ladder-DGA full vertices (optionally adding the local reducible diagrams; with
-    ``config.rpa.use_rpa_susceptibility`` from the RPA vertices, counting the bare up-down interaction once instead),
-    then solves the linearized gap equation for each channel and returns the leading eigenvalues and gap functions. A
+    ladder-DGA full vertices (optionally adding the local reducible diagrams; in the bare-vertex modes
+    ``config.misc.do_flex`` and ``config.misc.do_rpa`` from the RPA vertices, counting the bare up-down interaction
+    once instead), then solves the linearized gap equation for each channel and returns the leading eigenvalues and
+    gap functions. A
     single rank solves in memory, sector after sector; a multi-rank job solves in memory as concurrent (channel x
     parity) sector teams that share one vertex window per channel and node when a node holds such a window (see
     :func:`plan_lanczos_teams`, decided from the available node memory), and on the block-distributed solver grid
@@ -2817,11 +3173,12 @@ def solve(
     :param chunk_budgets: Chunk byte budgets sized by the driver from the memory estimate, of which the pairing-vertex
         budget is used; ``None`` gives the fair-share budget of
         :func:`~dgamore.memory_estimator.dynamic_chunk_budget`.
-    :return: A dict keyed by ``(channel, parity_label)`` mapping to ``(lambdas, gaps)`` of the leading eigenvalues
-        and :class:`GapFunction` objects for each solved physical frequency-parity sector; the eigenvalues are
-        present on every rank, the gap functions on rank 0 only (an empty list elsewhere). When
-        ``config.eliashberg.resolve_frequency_parity`` is set the parity labels are ``"even"`` and ``"odd"``,
-        otherwise a single unprojected ``"none"`` sector is returned.
+    :return: ``(results, inversion)``: a dict keyed by ``(channel, parity_label)`` mapping to ``(lambdas, gaps)`` of
+        the leading eigenvalues and :class:`GapFunction` objects for each solved parity sector, and the orbital action
+        of the inversion the sectors were projected with (see :func:`check_parity_sectors`; ``None`` for none or
+        without the sectors). The eigenvalues are present on every rank, the gap functions on rank 0 only (an empty
+        list elsewhere). When ``config.eliashberg.resolve_parity_sectors`` is set the parity labels are ``"even"``
+        and ``"odd"``, otherwise a single unprojected ``"none"`` sector is returned.
     """
     logger = config.logger
     import psutil
@@ -2831,7 +3188,9 @@ def solve(
     )
     v_nonloc = nonlocal_sde.scatter_irreducible_interaction(v_nonloc, mpi_dist_irrk)
 
-    parities = [parity for parity, _ in _frequency_parity_sectors(config.eliashberg.resolve_frequency_parity)]
+    # the check may switch the sectors off, so it runs before they are fixed
+    inversion = check_parity_sectors(comm)
+    parities = [parity for parity, _ in _parity_sectors(config.eliashberg.resolve_parity_sectors)]
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
 
     # one sector's single-rank residency, from the memory_estimator formula the driver's fit check reads as well;
@@ -2921,7 +3280,7 @@ def solve(
     f_magn_pp.free()
     logger.info("Calculated full ladder-vertex (triplet) in pp notation.")
 
-    if config.rpa.use_rpa_susceptibility:
+    if config.misc.bare_vertex:
         # Eqs. (4.49)-(4.52) with the bare up-down vertex U as the local full vertex and no pp-reducible diagrams:
         # its minus in crossed-slot form, -(-U_{1432}), keeps one copy of U, which both RPA ladders start with
         u_crossed = u_loc.permute_orbitals("abcd->adcb")
@@ -2978,7 +3337,7 @@ def solve(
         results = {}
         for gamma_pp in (gamma_sing_pp, gamma_trip_pp):
             channel = gamma_pp.channel
-            sectors = solve_eliashberg_lanczos_grid(gamma_pp, gchi0_q_pp, comm, bubble_rank)
+            sectors = solve_eliashberg_lanczos_grid(gamma_pp, gchi0_q_pp, comm, bubble_rank, inversion)
             for parity in parities:
                 local = sectors[parity] if sectors is not None else None
                 lambdas = comm.bcast(local[0] if local is not None else None, root=0)
@@ -2986,15 +3345,17 @@ def solve(
                 results[(channel, parity)] = (lambdas, local[1] if comm.rank == 0 else [])
             sectors = None
     elif rounds is None:
-        results = _solve_sectors_in_memory(mpi_dist_irrk, gamma_sing_pp, gamma_trip_pp, giwk_dga, niv_pp, parities)
+        results = _solve_sectors_in_memory(
+            mpi_dist_irrk, gamma_sing_pp, gamma_trip_pp, giwk_dga, niv_pp, parities, inversion
+        )
     else:
         results = _solve_sectors_in_teams(
-            mpi_dist_irrk, comm, node_comm, gamma_sing_pp, gamma_trip_pp, giwk_dga, niv_pp, rounds
+            mpi_dist_irrk, comm, node_comm, gamma_sing_pp, gamma_trip_pp, giwk_dga, niv_pp, rounds, inversion
         )
     if node_comm is not None:
         node_comm.Free()
 
-    return results
+    return results, inversion
 
 
 # Fraction of a node's available host memory the sector packing may occupy (mirrors DGAmore.NODE_MEMORY_FRACTION).
