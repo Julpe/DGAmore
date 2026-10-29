@@ -45,6 +45,8 @@ from dgamore.sigma_jacobian import (
 )
 from tests import conftest
 
+pytestmark = pytest.mark.usefixtures("one_blas_thread")
+
 
 def _p_orbital_grid(nk: tuple[int, int, int] = (4, 4, 1)) -> tuple[bz.KGrid, np.ndarray]:
     """The auto-symmetry grid of the p_x/p_y dispersion, returned with the dispersion."""
