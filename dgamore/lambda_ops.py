@@ -10,10 +10,10 @@ bosonic mass :math:`\lambda`:
 - :class:`LambdaCorrection` - the Moriya sum-rule :math:`\lambda`-correction: a single constant per channel chosen
   so the momentum sum of :math:`\chi^{\mathrm{q}}_{r}` matches the local sum rule. Single-band only (a multi-orbital
   correction would be non-unique).
-- :class:`MultiOrbitalLambdaCorrection` - the matrix-valued generalization of the sum-rule correction: a full
-  real-symmetric :math:`n_{\mathrm{o}}^2\times n_{\mathrm{o}}^2` mass matrix :math:`\Lambda_r` per channel, calibrated
-  so the momentum sum of :math:`\chi^{\mathrm{q}}_{r}` matches the local sum rule component by component (a well-posed
-  matrix root). Multi-orbital.
+- :class:`MultiOrbitalLambdaCorrection` - the matrix-valued generalization of the sum-rule correction: a Hermitian
+  :math:`n_{\mathrm{o}}^2\times n_{\mathrm{o}}^2` mass matrix :math:`\Lambda_r` per channel, restricted to the masses
+  that keep the corrected susceptibility physical and calibrated so the momentum sum of :math:`\chi^{\mathrm{q}}_{r}`
+  matches the local sum rule on the components those masses reach (a well-posed matrix root). Multi-orbital.
 - :class:`LambdaAnnealer` - the lambda-annealing convergence scaffold: a bosonic mass measured from the
   susceptibility spectrum, held per convergence phase and annealed to zero, so the final result is pure
   self-consistency. Multi-orbital-safe.
@@ -24,10 +24,12 @@ one); they differ only in how it is chosen and whether it survives into the fina
 """
 
 import os
+from collections.abc import Sequence
 
 import numpy as np
 from mpi4py import MPI
 from scipy import optimize as opt
+from scipy.linalg import block_diag
 
 from dgamore import config
 from dgamore.four_point import FourPoint
@@ -358,21 +360,22 @@ class MultiOrbitalLambdaCorrection:
     :class:`LambdaCorrection` shifts the scalar inverse susceptibility by one number; here the mass is a
     :math:`n_{\mathrm{o}}^2\times n_{\mathrm{o}}^2` matrix :math:`\Lambda_r` added to the compound inverse
     susceptibility :math:`(\chi^{\mathrm{q}}_{r})^{-1} \to (\chi^{\mathrm{q}}_{r})^{-1} + \Lambda_r`, calibrated so the
-    momentum- and frequency-summed corrected susceptibility matches the local (AIM) sum rule component by component on
-    the orbital pairs of each atom - :math:`n_{\mathrm{o},A}^2(n_{\mathrm{o},A}^2+1)/2` real conditions per atom
-    :math:`A` with :math:`n_{\mathrm{o},A}` orbitals, for the same number of real parameters (a well-posed matrix root
-    problem, not a rugged optimization). The mass is zero between atoms: the single-site AIM carries no inter-atom
-    correlation, so those components of the target are not matched, and the corrected susceptibility carries them from
-    the lattice through the matrix inverse. With ``spch`` both channels are corrected with independent
-    :math:`\Lambda_d, \Lambda_m`.
+    momentum- and frequency-summed corrected susceptibility matches the local (AIM) sum rule on the components the
+    allowed masses reach. The allowed masses (:meth:`_allowed_basis`) keep the corrected susceptibility physical: they
+    are Hermitian (:math:`\Lambda_{1234} = \Lambda^*_{4321}`), equal to their exchange
+    (:math:`\Lambda_{1234} = \Lambda_{3412}`), invariant under the site group of an auto-discovered grid
+    (:meth:`_site_transforms`), zero between atoms and, when DMFT occupations are known, free of the entries linking two
+    inter-orbital pairs of unequal occupation, which would shift the :math:`1/(i\omega)^2` moment
+    (:meth:`_tail_coefficient`). Unknowns and matched sum-rule components span the same space (a well-posed matrix root
+    problem, not a rugged optimization). The single-site AIM carries no inter-atom correlation, so those components of
+    the target are not matched, and the corrected susceptibility carries them from the lattice through the matrix
+    inverse. With ``spch`` both channels are corrected with independent :math:`\Lambda_d, \Lambda_m`.
 
     The calibration is done in complex128 (the near-singular static inversions that dominate the sum rule are
-    least trustworthy in the object's native complex64). Two deliberate simplifications relative to the design
-    note: the mass is enforced real-symmetric (P3) but is *not* explicitly projected onto the point-group-invariant
-    subspace - that covariance is automatic, since the residual and Jacobian are built from the symmetric full-BZ
-    sum; and the converged :math:`\Lambda_r` (a single point-group-invariant matrix) is applied to the irreducible-BZ
-    representatives, so the downstream :meth:`~dgamore.n_point_base.IAmNonLocal.map_to_full_bz` reconstructs the
-    corrected full-BZ susceptibility consistently.
+    least trustworthy in the object's native complex64). Since the mass commutes with the site group, the converged
+    :math:`\Lambda_r` is applied to the irreducible-BZ representatives and the downstream
+    :meth:`~dgamore.n_point_base.IAmNonLocal.map_to_full_bz` reconstructs the corrected full-BZ susceptibility
+    consistently.
 
     Crucially the momentum sum is evaluated over the FULL Brillouin zone, not by weighting the irreducible-BZ value
     with its multiplicity: symmetry-related momenta carry orbitally-rotated susceptibility matrices
@@ -395,6 +398,9 @@ class MultiOrbitalLambdaCorrection:
     _MAX_LINE_SEARCH = 40  # maximum step halvings in the damped line search
     _GAP_TOL = 1e-6  # static-gap floor min_q lambda_min(Herm(chi^-1 + Lambda)); set above the complex64 input
     # noise (~1e-7): a smaller gap is unresolvable given the single-precision susceptibility feeding the calibration
+    _MAX_START_DOUBLINGS = 40  # doublings of the start offset above the feasibility bound before giving up
+    _OCC_DEGENERACY_TOL = 1e-2  # occupation splits below this count as degenerate: above the DMFT QMC noise
+    # (1e-4 .. 1e-3), far below crystal-field splits; the 1/(iw)^2 moment shift scales with the split squared
 
     @staticmethod
     def get_lambda_start_matrix(chi_inv_static: np.ndarray) -> float:
@@ -447,47 +453,184 @@ class MultiOrbitalLambdaCorrection:
         """
         full = np.take(slice_irr, q_grid.irrk_inv.ravel(), axis=0)
         if q_grid.is_auto:
-            from dgamore import symmetry_reduction
-
-            n_bands = int(round(np.sqrt(slice_irr.shape[-1])))
             nk_tot = full.shape[0]
-            # compound rows pair (o1 o2), columns (o4 o3); the rotation acts on the [o1, o2, o3, o4] layout
-            four = full.reshape(nk_tot, n_bands, n_bands, n_bands, n_bands).transpose(0, 1, 2, 4, 3)
-            four = symmetry_reduction.apply_auto_orbital_transform(
-                np.ascontiguousarray(four),
-                us=q_grid._auto_us.reshape(nk_tot, *q_grid._auto_us.shape[3:]),
-                sigmas=q_grid._auto_sigmas.reshape(-1),
-                conjs=q_grid._auto_conjs.reshape(-1),
-                num_orbital_dimensions=4,
+            full = MultiOrbitalLambdaCorrection._rotate_compound(
+                full,
+                q_grid._auto_us.reshape(nk_tot, *q_grid._auto_us.shape[3:]),
+                q_grid._auto_sigmas.reshape(-1),
+                q_grid._auto_conjs.reshape(-1),
             )
-            full = np.ascontiguousarray(four.transpose(0, 1, 2, 4, 3)).reshape(nk_tot, *slice_irr.shape[1:])
         return full
 
     @staticmethod
-    def _symmetric_basis(no2: int) -> np.ndarray:
+    def _rotate_compound(stack: np.ndarray, us: np.ndarray, sigmas: np.ndarray, conjs: np.ndarray) -> np.ndarray:
         r"""
-        Returns an orthonormal (Frobenius) basis of the real-symmetric
-        :math:`n_{\mathrm{o}}^2\times n_{\mathrm{o}}^2` matrices, flattened to columns, shape
-        ``[no^2 * no^2, no^2(no^2+1)/2]``. Newton runs in the span of this basis, so the solve is restricted to the
-        symmetric (and thereby well-posed) subspace.
+        Applies the per-entry orbital transformation :math:`(\sigma, U, \mathrm{conj})` of
+        :func:`~dgamore.symmetry_reduction.apply_auto_orbital_transform` to a stack of compound matrices.
+
+        :param stack: Compound matrices, shape ``[n, no^2, no^2]``.
+        :param us: One orbital unitary per matrix, shape ``[n, no, no]``.
+        :param sigmas: One sign per matrix, shape ``[n]``.
+        :param conjs: One conjugation flag per matrix, shape ``[n]``.
+        :return: The transformed stack, same shape and dtype as ``stack``.
         """
-        mats = []
+        from dgamore import symmetry_reduction
+
+        n, no2 = stack.shape[0], stack.shape[-1]
+        n_bands = int(round(np.sqrt(no2)))
+        # compound rows pair (o1 o2), columns (o4 o3); the rotation acts on the [o1, o2, o3, o4] layout
+        four = stack.reshape(n, n_bands, n_bands, n_bands, n_bands).transpose(0, 1, 2, 4, 3)
+        four = symmetry_reduction.apply_auto_orbital_transform(
+            np.ascontiguousarray(four), us=us, sigmas=sigmas, conjs=conjs, num_orbital_dimensions=4
+        )
+        return np.ascontiguousarray(four.transpose(0, 1, 2, 4, 3)).reshape(n, no2, no2)
+
+    @staticmethod
+    def _transform(lambda_mat: np.ndarray, u: np.ndarray) -> np.ndarray:
+        r"""
+        Returns the mass rotated by the orbital unitary :math:`U` of a symmetry operation, with the action the
+        operation has on the susceptibility (:meth:`_rotate_compound`). A :math:`\Lambda` invariant under every
+        operation of the site group keeps the corrected susceptibility covariant.
+
+        :param lambda_mat: The mass matrix :math:`\Lambda`, shape ``[no^2, no^2]``.
+        :param u: The orbital unitary, shape ``[no, no]``.
+        :return: The rotated mass, shape ``[no^2, no^2]``.
+        """
+        return MultiOrbitalLambdaCorrection._rotate_compound(
+            lambda_mat[None], u[None], np.ones(1), np.zeros(1, dtype=bool)
+        )[0]
+
+    @staticmethod
+    def _site_transforms(q_grid) -> list[np.ndarray]:
+        r"""
+        Returns the orbital unitaries of the site group: the unitary, sign-free symmetry operations of an
+        auto-discovered grid that fix :math:`\mathbf{q} = 0`. A momentum-independent mass keeps the corrected
+        susceptibility covariant iff it commutes with all of them. Named symmetries act on momenta alone, so they
+        give none.
+
+        :param q_grid: The momentum grid.
+        :return: The orbital unitaries, each of shape ``[no, no]`` (empty for a grid without auto-discovered
+            symmetries).
+        """
+        if not q_grid.is_auto:
+            return []
+        from dgamore import symmetry_reduction
+
+        gamma = np.zeros(1, dtype=int)
+        stabilizers = symmetry_reduction.stabilizer_unitaries(q_grid._auto_group, tuple(q_grid.nk), gamma)
+        return [u for positions, u in stabilizers if positions.size]
+
+    @staticmethod
+    def _local_density_matrix(transforms: Sequence[np.ndarray]) -> np.ndarray | None:
+        r"""
+        Returns the local density matrix :math:`\rho_{12} = \langle c^\dagger_1 c_2 \rangle` of the DMFT
+        (:data:`config.sys.occ_dmft_per_ineq`), block diagonal along ``config.dmft.ineq_ordering`` (one inequivalent
+        atom when unset) and averaged over the site group, :math:`\rho \to \overline{U^* \rho\, U^T}`, so the
+        occupations the symmetry makes equal are exactly equal.
+
+        :param transforms: Orbital unitaries of the site group, each of shape ``[no, no]``.
+        :return: The density matrix, shape ``[no, no]``, or ``None`` without DMFT occupations.
+        """
+        occ = config.sys.occ_dmft_per_ineq
+        if not occ:
+            return None
+        rho = block_diag(*[np.asarray(occ[i - 1]) for i in (config.dmft.ineq_ordering or [1])]).astype(np.complex128)
+        if transforms:
+            rho = np.mean([u.conj() @ rho @ u.T for u in transforms], axis=0)
+        return rho
+
+    @staticmethod
+    def _tail_coefficient(rho: np.ndarray) -> np.ndarray:
+        r"""
+        Returns the :math:`1/(i\omega)` coefficient of the susceptibility in the compound layout, for the operator
+        ordering :math:`\langle T c_1 c^\dagger_2 c_3 c^\dagger_4 \rangle` of the susceptibility:
+        :math:`C_{1234} = \langle [c_1 c^\dagger_2, c_3 c^\dagger_4] \rangle = \delta_{14} \rho_{23} - \delta_{23}
+        \rho_{41}`. Eigenvalues of :math:`\rho` closer than :data:`_OCC_DEGENERACY_TOL` are first merged to their mean.
+        A mass with :math:`C \Lambda C = 0` leaves the :math:`1/(i\omega)^2` moment of the corrected susceptibility
+        unchanged; in the eigenbasis of :math:`\rho` this sets :math:`\Lambda_{1234} = 0` whenever
+        :math:`n_1 \neq n_2` and :math:`n_3 \neq n_4`.
+
+        :param rho: The local density matrix, shape ``[no, no]``.
+        :return: The coefficient :math:`C`, shape ``[no^2, no^2]``.
+        """
+        n_bands = rho.shape[0]
+        occupations, vectors = np.linalg.eigh(0.5 * (rho + rho.conj().T))
+        merged, first = occupations.copy(), 0
+        for i in range(1, n_bands + 1):
+            if i == n_bands or occupations[i] - occupations[i - 1] > MultiOrbitalLambdaCorrection._OCC_DEGENERACY_TOL:
+                merged[first:i] = occupations[first:i].mean()
+                first = i
+        rho = (vectors * merged) @ vectors.conj().T
+        delta = np.eye(n_bands)
+        four = np.einsum("ad,bc->abcd", delta, rho) - np.einsum("bc,da->abcd", delta, rho)
+        return four.transpose(0, 1, 3, 2).reshape(n_bands**2, n_bands**2)
+
+    @staticmethod
+    def _exchange(lambda_mat: np.ndarray) -> np.ndarray:
+        r"""
+        Returns the exchanged mass :math:`\Lambda_{1234} \to \Lambda_{3412}`, the reversal of all four orbital axes
+        of the compound layout. A mass equal to its exchange keeps the operator-exchange symmetry
+        :math:`\chi^{(\mathbf{q},\omega)}_{1234} = \chi^{(-\mathbf{q},-\omega)}_{3412}` of the corrected susceptibility.
+
+        :param lambda_mat: The mass matrix :math:`\Lambda`, shape ``[no^2, no^2]``.
+        :return: The exchanged mass, same shape.
+        """
+        n_bands = int(round(np.sqrt(lambda_mat.shape[0])))
+        return lambda_mat.reshape((n_bands,) * 4).transpose(3, 2, 1, 0).reshape(lambda_mat.shape)
+
+    @staticmethod
+    def _allowed_basis(
+        no2: int, on_site: np.ndarray, transforms: Sequence[np.ndarray] = (), tail: np.ndarray | None = None
+    ) -> np.ndarray:
+        r"""
+        Returns an orthonormal basis, under :math:`\mathrm{Re}\,\mathrm{tr}(A^\dagger B)`, of the masses that keep the
+        corrected susceptibility physical: Hermitian (:math:`\Lambda_{1234} = \Lambda^*_{4321}`), equal to their
+        exchange (:meth:`_exchange`), supported on the ``on_site`` entries, invariant under every orbital unitary in
+        ``transforms`` (:meth:`_transform`) and, when ``tail`` is given, with :math:`C \Lambda C = 0`. The basis spans
+        the null space of these linear constraints within the Hermitian on-site matrices.
+
+        :param no2: Compound dimension :math:`n_{\mathrm{o}}^2`.
+        :param on_site: Boolean mask of the entries the mass may populate, shape ``[no^2, no^2]``.
+        :param transforms: Orbital unitaries of the site group, each of shape ``[no, no]``.
+        :param tail: The high-frequency coefficient :math:`C` of the susceptibility, shape ``[no^2, no^2]``.
+        :return: The basis as columns of flattened compound matrices, shape ``[no^2 * no^2, m]``, complex.
+        """
+        coords = []
         for i in range(no2):
-            e = np.zeros((no2, no2))
-            e[i, i] = 1.0
-            mats.append(e.reshape(-1))
-        for i in range(no2):
-            for j in range(i + 1, no2):
-                e = np.zeros((no2, no2))
-                e[i, j] = e[j, i] = 1.0 / np.sqrt(2.0)
-                mats.append(e.reshape(-1))
-        return np.stack(mats, axis=1)
+            for j in range(i, no2):
+                if not on_site[i, j]:
+                    continue
+                e = np.zeros((no2, no2), dtype=np.complex128)
+                if i == j:
+                    e[i, i] = 1.0
+                    coords.append(e)
+                    continue
+                e[i, j] = e[j, i] = np.sqrt(0.5)
+                coords.append(e)
+                e = np.zeros((no2, no2), dtype=np.complex128)
+                e[i, j], e[j, i] = 1j * np.sqrt(0.5), -1j * np.sqrt(0.5)
+                coords.append(e)
+
+        def violations(lam: np.ndarray) -> np.ndarray:
+            parts = [lam - MultiOrbitalLambdaCorrection._exchange(lam)]
+            parts += [lam - MultiOrbitalLambdaCorrection._transform(lam, u) for u in transforms]
+            if tail is not None:
+                parts.append(tail @ lam @ tail)
+            flat = np.concatenate([part.reshape(-1) for part in parts])
+            return np.concatenate([flat.real, flat.imag])
+
+        hermitian = np.stack([e.reshape(-1) for e in coords], axis=1)
+        # ponytail: one thin SVD of the stacked 2 n_ops no^4 x no^4 constraints (~300 MB for 5 orbitals under O_h)
+        constraints = np.stack([violations(e) for e in coords], axis=1)
+        singular, vh = np.linalg.svd(constraints, full_matrices=False)[1:]
+        rank = int(np.sum(singular > 1e-10 * singular.max()))
+        return hermitian @ vh[rank:].conj().T
 
     @staticmethod
     def _residual(chi_qw: np.ndarray, lambda_mat: np.ndarray, s_r: np.ndarray, beta: float, nk_tot: int, q_grid=None):
         r"""
-        Returns the real-symmetric sum-rule residual :math:`G(\Lambda) = (\beta n_{\mathbf{q}})^{-1}\sum_{\mathrm{q}}
-        (\chi^{\mathrm{q}}_{r}{}^{-1} + \Lambda)^{-1} - S_r` (Hermitian part, real), with the corrected susceptibility
+        Returns the Hermitian sum-rule residual :math:`G(\Lambda) = (\beta n_{\mathbf{q}})^{-1}\sum_{\mathrm{q}}
+        (\chi^{\mathrm{q}}_{r}{}^{-1} + \Lambda)^{-1} - S_r` (Hermitian part), with the corrected susceptibility
         evaluated in resolvent form :math:`(\mathbb{1} + \chi^{\mathrm{q}}_{r}\Lambda)^{-1}\chi^{\mathrm{q}}_{r}` so
         :math:`\chi^{-1}` is never formed. Bosonic frequencies are looped so the transients never exceed a single
         frequency slice; when ``q_grid`` is given the cached susceptibility lives on the irreducible wedge and each
@@ -500,7 +643,7 @@ class MultiOrbitalLambdaCorrection:
         :param beta: Inverse temperature :math:`\beta`.
         :param nk_tot: Number of full-BZ momenta :math:`n_{\mathbf{q}}`.
         :param q_grid: The momentum grid for the per-slice full-BZ expansion (``None`` for a full-BZ input).
-        :return: The residual matrix ``G`` (real, symmetric), shape ``[no^2, no^2]``.
+        :return: The residual matrix ``G`` (complex Hermitian), shape ``[no^2, no^2]``.
         """
         no2 = lambda_mat.shape[0]
         identity = np.eye(no2)
@@ -511,7 +654,7 @@ class MultiOrbitalLambdaCorrection:
                 chi_w = MultiOrbitalLambdaCorrection._expand_compound_slice_to_full_bz(chi_w, q_grid)
             g_sum += (np.linalg.inv(identity + chi_w @ lambda_mat) @ chi_w).sum(axis=0)
         g = g_sum / (beta * nk_tot) - s_r
-        return (0.5 * (g + np.conj(g.T))).real
+        return 0.5 * (g + np.conj(g.T))
 
     @staticmethod
     def residual_and_jacobian(
@@ -539,23 +682,23 @@ class MultiOrbitalLambdaCorrection:
         :param beta: Inverse temperature :math:`\beta`.
         :param nk_tot: Number of full-BZ momenta :math:`n_{\mathbf{q}}`.
         :param q_grid: The momentum grid for the per-slice full-BZ expansion (``None`` for a full-BZ input).
-        :return: A tuple ``(G, J)`` of the real-symmetric residual (``[no^2, no^2]``) and the real Jacobian tensor
-            (``[no^2, no^2, no^2, no^2]``).
+        :return: A tuple ``(G, J)`` of the complex Hermitian residual (``[no^2, no^2]``) and the complex Jacobian
+            tensor (``[no^2, no^2, no^2, no^2]``).
         """
         no2 = lambda_mat.shape[0]
         identity = np.eye(no2)
         factor = 1.0 / (beta * nk_tot)
         g_sum = np.zeros((no2, no2), dtype=np.complex128)
-        jac = np.zeros((no2, no2, no2, no2), dtype=np.float64)
+        jac = np.zeros((no2, no2, no2, no2), dtype=np.complex128)
         for w in range(chi_qw.shape[1]):
             chi_w = chi_qw[:, w]
             if q_grid is not None:
                 chi_w = MultiOrbitalLambdaCorrection._expand_compound_slice_to_full_bz(chi_w, q_grid)
             chi_lam = np.linalg.inv(identity + chi_w @ lambda_mat) @ chi_w
             g_sum += chi_lam.sum(axis=0)
-            jac += np.einsum("qac,qdb->abcd", chi_lam, chi_lam).real
+            jac += np.einsum("qac,qdb->abcd", chi_lam, chi_lam)
         g = g_sum * factor - s_r
-        g = (0.5 * (g + np.conj(g.T))).real
+        g = 0.5 * (g + np.conj(g.T))
         jac *= -factor
         return g, jac
 
@@ -570,22 +713,27 @@ class MultiOrbitalLambdaCorrection:
         maxiter: int = None,
         q_grid=None,
         atoms: list[int] | np.ndarray | None = None,
+        transforms: Sequence[np.ndarray] = (),
+        tail: np.ndarray | None = None,
     ) -> np.ndarray:
         r"""
-        Solves the matrix sum rule :math:`G(\Lambda_r) = 0` for the real-symmetric mass :math:`\Lambda_r` by a damped
-        Newton iteration in the symmetric subspace. The Newton system :math:`H\,\delta\lambda = -g` is the Jacobian
-        and residual projected onto the orthonormal symmetric basis (:meth:`_symmetric_basis`); each step is line-
-        searched to keep the static gap positive (feasibility) and to decrease the residual. Mass and residual are
-        restricted to the on-site entries, the compound entries :math:`(12),(43)` whose four orbitals sit on one atom:
-        the basis keeps only those entries and the residual norm counts only them. Starts from
-        :math:`\Lambda_0 = (\lambda_{\mathrm{start}} + \delta)` times the identity on the on-site pairs, with
-        :math:`\lambda_{\mathrm{start}}` the feasibility bound of a full identity shift (on a single atom
-        :math:`\Lambda_0 = (\lambda_{\mathrm{start}} + \delta)\mathbb{1}`). All sum-rule
-        evaluations use the resolvent form :math:`(\mathbb{1} + \chi\Lambda)^{-1}\chi`, so the only inversion of the
-        susceptibility itself is the single static slice the feasibility/gap machinery needs. When ``q_grid`` is
-        given, ``chi_qw`` holds only the irreducible wedge and every sum-rule evaluation expands the slices to the
-        full BZ on the fly (:meth:`_expand_compound_slice_to_full_bz`) - same result, ``nq/nq_irr`` times less
-        resident memory.
+        Solves the matrix sum rule :math:`G(\Lambda_r) = 0` for the mass :math:`\Lambda_r` by a damped Newton iteration
+        on the allowed masses (:meth:`_allowed_basis`): Hermitian, equal to their exchange, on-site (the compound
+        entries :math:`(12),(43)` whose four orbitals sit on one atom), invariant under the site-group ``transforms``
+        and, with ``tail``, free of the inter-orbital entries that would change the :math:`1/(i\omega)^2` moment. The
+        Newton system :math:`H\,\delta\lambda = -g` is the Jacobian and residual projected onto that basis
+        (real coordinates under :math:`\mathrm{Re}\,\mathrm{tr}(A^\dagger B)`), so the solve matches the components
+        of the sum rule the allowed masses reach: unknowns and equations span the same space. Each step is
+        line-searched to keep the static gap positive (feasibility) and to decrease the projected residual. Starts
+        from :math:`(\lambda_{\mathrm{start}} + \delta)` times the projection of the on-site identity onto the
+        allowed masses, with :math:`\lambda_{\mathrm{start}}` the feasibility bound of a full identity shift. All
+        sum-rule evaluations use the resolvent form :math:`(\mathbb{1} + \chi\Lambda)^{-1}\chi`, so the only
+        inversion of the susceptibility itself is the single static slice the feasibility/gap machinery needs. When
+        ``q_grid`` is given, ``chi_qw`` holds only the irreducible wedge and every sum-rule evaluation expands the
+        slices to the full BZ on the fly (:meth:`_expand_compound_slice_to_full_bz`) - same result, ``nq/nq_irr``
+        times less resident memory. On convergence the on-site residual left outside the allowed masses (the entries
+        the tail constraint excludes, and any symmetry breaking of the susceptibility or the target) is logged. When the
+        start is infeasible its offset above the feasibility bound is doubled until the static gap opens.
 
         :param chi_qw: Compound susceptibility, shape ``[nq, nw, no^2, no^2]`` (complex128) over the full BZ, or
             over the irreducible wedge when ``q_grid`` is given.
@@ -593,14 +741,17 @@ class MultiOrbitalLambdaCorrection:
         :param beta: Inverse temperature :math:`\beta`.
         :param nk_tot: Number of full-BZ momenta :math:`n_{\mathbf{q}}`.
         :param delta: Offset of the initial guess above the feasibility bound (default :data:`_DELTA`).
-        :param eps: Convergence tolerance on the Frobenius norm of the residual (default :data:`_EPS`).
+        :param eps: Convergence tolerance on the norm of the projected residual (default :data:`_EPS`).
         :param maxiter: Maximum number of Newton iterations (default :data:`_MAXITER`).
         :param q_grid: The momentum grid for the per-slice full-BZ expansion (``None`` for a full-BZ input).
         :param atoms: The atom of every orbital, e.g. ``[0, 0, 1, 1]`` for two two-orbital atoms (``None`` puts every
             orbital on one atom).
-        :return: The converged mass matrix :math:`\Lambda_r`, shape ``[no^2, no^2]``, real symmetric.
-        :raises ValueError: If the on-site start leaves the static gap non-positive, i.e. a static pole between the
-            atoms that no on-site mass lifts.
+        :param transforms: Orbital unitaries of the site group the mass must be invariant under.
+        :param tail: The high-frequency coefficient :math:`C` of the susceptibility; ``None`` drops the constraint
+            :math:`C\Lambda C = 0`.
+        :return: The converged mass matrix :math:`\Lambda_r`, shape ``[no^2, no^2]``, complex Hermitian.
+        :raises ValueError: If the start leaves the static gap non-positive, i.e. a static pole in a sector no allowed
+            mass lifts (between the atoms, or in a crystal-field-split (polarized) inter-orbital sector with ``tail``).
         """
         delta = MultiOrbitalLambdaCorrection._DELTA if delta is None else delta
         eps = MultiOrbitalLambdaCorrection._EPS if eps is None else eps
@@ -611,31 +762,46 @@ class MultiOrbitalLambdaCorrection:
         # atom of every compound pair (12), -1 for a pair between atoms; on-site entries join two pairs of one atom
         pair_atom = np.where(atoms[:, None] == atoms[None, :], atoms[:, None], -1).reshape(-1)
         on_site = (pair_atom[:, None] == pair_atom[None, :]) & (pair_atom[:, None] >= 0)
-        basis = MultiOrbitalLambdaCorrection._symmetric_basis(no2)
-        basis = basis[:, np.any(basis[on_site.reshape(-1)] != 0, axis=0)]
+        basis = MultiOrbitalLambdaCorrection._allowed_basis(no2, on_site, transforms, tail)
+
+        def coords(mat: np.ndarray) -> np.ndarray:
+            return (basis.conj().T @ mat.reshape(-1)).real
+
         chi_static = chi_qw[:, chi_qw.shape[1] // 2]  # omega=0 slice, the binding frequency
         if q_grid is not None:
             # the static feasibility/gap machinery keeps seeing the full BZ (one small slice, resident once)
             chi_static = MultiOrbitalLambdaCorrection._expand_compound_slice_to_full_bz(chi_static, q_grid)
         chi_inv_static = np.linalg.inv(chi_static)
         start = MultiOrbitalLambdaCorrection.get_lambda_start_matrix(chi_inv_static)
-        lambda_mat = (start + delta) * np.diag(pair_atom >= 0)
-        gap = MultiOrbitalLambdaCorrection._static_gap(chi_inv_static, lambda_mat)
-        if gap <= MultiOrbitalLambdaCorrection._GAP_TOL:
-            # ponytail: one check, no search; double the on-site shift until feasible if a liftable pole ever fails it
+        identity = (basis @ coords(np.diag(pair_atom >= 0).astype(np.complex128))).reshape(no2, no2)
+        offset = delta
+        for _ in range(MultiOrbitalLambdaCorrection._MAX_START_DOUBLINGS):
+            lambda_mat = (start + offset) * identity
+            gap = MultiOrbitalLambdaCorrection._static_gap(chi_inv_static, lambda_mat)
+            if gap > MultiOrbitalLambdaCorrection._GAP_TOL:
+                break
+            offset *= 2.0
+        else:
             raise ValueError(
-                f"Multi-orbital lambda correction: the on-site start leaves the static gap at {gap:.3e}, a static "
-                "pole between the atoms that no on-site mass lifts."
+                f"Multi-orbital lambda correction: the start leaves the static gap at {gap:.3e}, a static pole that "
+                "no allowed mass lifts (between the atoms or in a crystal-field-split (polarized) inter-orbital "
+                "sector)."
             )
 
         for _ in range(maxiter):
             g, jac = MultiOrbitalLambdaCorrection.residual_and_jacobian(chi_qw, lambda_mat, s_r, beta, nk_tot, q_grid)
-            res = float(np.linalg.norm(g * on_site))
+            grad = coords(g)
+            res = float(np.linalg.norm(grad))
             if res < eps:
+                outside = g - (basis @ grad).reshape(no2, no2)
+                config.logger.info(
+                    "Multi-orbital lambda correction converged; on-site sum-rule residual outside the allowed masses "
+                    "(excluded tail entries, symmetry breaking of chi or the target) "
+                    f"{np.linalg.norm(outside * on_site):.3e}."
+                )
                 return lambda_mat
 
-            hess = basis.T @ jac.reshape(no2 * no2, no2 * no2) @ basis
-            grad = basis.T @ g.reshape(-1)
+            hess = (basis.conj().T @ jac.reshape(no2 * no2, no2 * no2) @ basis).real
             try:
                 step = np.linalg.solve(hess, -grad)
             except np.linalg.LinAlgError:
@@ -650,8 +816,7 @@ class MultiOrbitalLambdaCorrection:
                     gap > MultiOrbitalLambdaCorrection._GAP_TOL
                     and float(
                         np.linalg.norm(
-                            on_site
-                            * MultiOrbitalLambdaCorrection._residual(chi_qw, candidate, s_r, beta, nk_tot, q_grid)
+                            coords(MultiOrbitalLambdaCorrection._residual(chi_qw, candidate, s_r, beta, nk_tot, q_grid))
                         )
                     )
                     < res
@@ -688,7 +853,9 @@ class MultiOrbitalLambdaCorrection:
         cache; the converged (point-group-invariant) mass is then applied to the irreducible-BZ representatives,
         consistent with the downstream full-BZ mapping. The atom of every orbital comes from
         ``config.dmft.ineq_ordering`` and ``config.dmft.n_bands_per_ineq`` (one atom when they are unset), so the mass
-        lives on the on-site blocks of each atom.
+        lives on the on-site blocks of each atom. The mass commutes with the site group of the momentum grid
+        (:meth:`_site_transforms`) and, when DMFT occupations are known, keeps the :math:`1/(i\omega)^2` moment
+        (:meth:`_local_density_matrix`, :meth:`_tail_coefficient`).
 
         :param chi_r: Physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` in the irreducible BZ (no fermionic
             frequencies, compressed momentum dimension). Consumed in place.
@@ -713,8 +880,17 @@ class MultiOrbitalLambdaCorrection:
             if dmft.n_bands_per_ineq
             else None
         )
+        transforms = MultiOrbitalLambdaCorrection._site_transforms(q_grid)
+        rho = MultiOrbitalLambdaCorrection._local_density_matrix(transforms)
         lambda_r = MultiOrbitalLambdaCorrection.find_lambda_matrix(
-            chi_qw, s_r, beta, q_grid.nk_tot, q_grid=q_grid, atoms=atoms
+            chi_qw,
+            s_r,
+            beta,
+            q_grid.nk_tot,
+            q_grid=q_grid,
+            atoms=atoms,
+            transforms=transforms,
+            tail=None if rho is None else MultiOrbitalLambdaCorrection._tail_coefficient(rho),
         )
         del chi_qw
 
