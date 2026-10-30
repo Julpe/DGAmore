@@ -18,7 +18,15 @@ from dgamore.n_point_base import SpinChannel
 import dgamore.config as config
 import dgamore.brillouin_zone as bz
 
-from tests.conftest import FAKE_MPI
+from tests.conftest import FAKE_MPI, p_orbital_hk
+
+
+@pytest.fixture(autouse=True)
+def _mock_config_logger(monkeypatch):
+    """Every test sees a mocked config logger, since the matrix solver logs its residual on convergence, and no DMFT
+    occupations unless it sets them, since they switch on the tail constraint of the matrix correction."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    monkeypatch.setattr(config.sys, "occ_dmft_per_ineq", [])
 
 
 def load_four_point(lc_type: str, filename: str, channel: SpinChannel) -> FourPoint:
@@ -166,13 +174,82 @@ def _synthetic_chi_qw(n_bands: int, nq: int, nw: int, seed: int = 0) -> np.ndarr
     return np.linalg.inv(_synthetic_chi_inv_qw(n_bands, nq, nw, seed))
 
 
+def _on_site_mask(atoms: list[int]) -> np.ndarray:
+    """The compound entries (12),(43) whose four orbitals sit on one atom, as find_lambda_matrix restricts them."""
+    a = np.asarray(atoms)
+    pair_atom = np.where(a[:, None] == a[None, :], a[:, None], -1).reshape(-1)
+    return (pair_atom[:, None] == pair_atom[None, :]) & (pair_atom[:, None] >= 0)
+
+
+def _exchange_even(lam: np.ndarray) -> np.ndarray:
+    """The exchange-symmetric part of a mass, the component the derived constraints allow."""
+    return 0.5 * (lam + MultiOrbitalLambdaCorrection._exchange(lam))
+
+
+def test_exchange_is_the_four_index_reversal_and_an_involution():
+    """The exchange map sends Lambda_1234 to Lambda_3412, the reversal of all four compound axes, and is an
+    involution."""
+    rng = np.random.default_rng(0)
+    lam = rng.standard_normal((9, 9)) + 1j * rng.standard_normal((9, 9))
+
+    ex = MultiOrbitalLambdaCorrection._exchange(lam)
+
+    assert np.array_equal(ex.reshape(3, 3, 3, 3), lam.reshape(3, 3, 3, 3).transpose(3, 2, 1, 0))
+    assert np.array_equal(MultiOrbitalLambdaCorrection._exchange(ex), lam)
+
+
+@pytest.mark.parametrize(
+    "n_bands, atoms, transforms, dim",
+    [
+        (1, [0], (), 1),
+        (2, [0, 0], (), 10),
+        (2, [0, 0], (np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128),), 6),
+        (4, [0, 0, 1, 1], (), 20),
+    ],
+)
+def test_allowed_basis_dimensions_and_constraints(n_bands, atoms, transforms, dim):
+    """The allowed masses are Hermitian, exchange-symmetric, on-site and invariant under the transforms; the basis
+    is orthonormal under the real Frobenius product and has the measured dimension."""
+    no2 = n_bands**2
+    on_site = _on_site_mask(atoms)
+
+    basis = MultiOrbitalLambdaCorrection._allowed_basis(no2, on_site, transforms)
+
+    assert basis.shape == (no2 * no2, dim)
+    assert np.allclose((basis.conj().T @ basis).real, np.eye(dim))
+    for column in basis.T:
+        lam = column.reshape(no2, no2)
+        assert np.allclose(lam, lam.conj().T)
+        assert np.allclose(lam, MultiOrbitalLambdaCorrection._exchange(lam))
+        assert np.all(lam[~on_site] == 0.0)
+        assert all(np.allclose(MultiOrbitalLambdaCorrection._transform(lam, u), lam) for u in transforms)
+
+
+def test_transform_matches_the_full_bz_expansion_of_one_slice():
+    """The orbital action on a mass is exactly the one the full-BZ expansion applies to a susceptibility slice."""
+    rng = np.random.default_rng(3)
+    u = np.linalg.qr(rng.standard_normal((2, 2)) + 1j * rng.standard_normal((2, 2)))[0]
+    lam = rng.standard_normal((4, 4)) + 1j * rng.standard_normal((4, 4))
+    grid = MagicMock(
+        is_auto=True,
+        irrk_inv=np.zeros(1, dtype=int),
+        _auto_us=u[None, None, None],
+        _auto_sigmas=np.ones((1, 1, 1)),
+        _auto_conjs=np.zeros((1, 1, 1), dtype=bool),
+    )
+
+    expected = MultiOrbitalLambdaCorrection._expand_compound_slice_to_full_bz(lam[None], grid)[0]
+
+    assert np.allclose(MultiOrbitalLambdaCorrection._transform(lam, u), expected)
+
+
 def test_find_lambda_matrix_recovers_planted_lambda():
     """The matrix Newton solver recovers a planted real-symmetric mass from the sum-rule target it generates."""
     beta, nq, nw, n_bands = 5.0, 6, 5, 2
     chi_inv_qw = _synthetic_chi_inv_qw(n_bands, nq, nw)
     no2 = n_bands**2
     a = np.random.default_rng(1).standard_normal((no2, no2))
-    lambda_star = 0.3 * 0.5 * (a + a.T)
+    lambda_star = _exchange_even(0.3 * 0.5 * (a + a.T))
     s_r = np.linalg.inv(chi_inv_qw + lambda_star).sum(axis=(0, 1)).real / (beta * nq)
 
     lambda_found = MultiOrbitalLambdaCorrection.find_lambda_matrix(_synthetic_chi_qw(n_bands, nq, nw), s_r, beta, nq)
@@ -186,19 +263,19 @@ def test_find_lambda_matrix_solution_is_symmetric_feasible_and_off_diagonal():
     chi_inv_qw = _synthetic_chi_inv_qw(n_bands, nq, nw, seed=3)
     no2 = n_bands**2
     a = np.random.default_rng(4).standard_normal((no2, no2))
-    lambda_star = 0.2 * 0.5 * (a + a.T)
+    lambda_star = _exchange_even(0.2 * 0.5 * (a + a.T))
     s_r = np.linalg.inv(chi_inv_qw + lambda_star).sum(axis=(0, 1)).real / (beta * nq)
     chi_qw = _synthetic_chi_qw(n_bands, nq, nw, seed=3)
 
     lam = MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, s_r, beta, nq)
 
-    assert np.allclose(lam, lam.T)
+    assert np.allclose(lam, lam.conj().T) and np.allclose(lam, MultiOrbitalLambdaCorrection._exchange(lam))
     assert not np.allclose(lam, np.diag(np.diag(lam)))
     assert np.linalg.norm(MultiOrbitalLambdaCorrection._residual(chi_qw, lam, s_r, beta, nq)) < 1e-6
     assert MultiOrbitalLambdaCorrection._static_gap(chi_inv_qw, lam) > 0.0
 
 
-def test_matrix_jacobian_is_negative_definite_on_symmetric_subspace():
+def test_matrix_jacobian_is_negative_definite_on_allowed_subspace():
     """The reduced Newton Jacobian is negative definite: the sum-rule map is strictly monotone (unique root)."""
     beta, nq, nw, n_bands = 8.0, 5, 5, 2
     chi_qw = _synthetic_chi_qw(n_bands, nq, nw, seed=5)
@@ -206,10 +283,52 @@ def test_matrix_jacobian_is_negative_definite_on_symmetric_subspace():
     _, jac = MultiOrbitalLambdaCorrection.residual_and_jacobian(
         chi_qw, 0.5 * np.eye(no2), np.zeros((no2, no2)), beta, nq
     )
-    basis = MultiOrbitalLambdaCorrection._symmetric_basis(no2)
-    hess = basis.T @ jac.reshape(no2 * no2, no2 * no2) @ basis
+    basis = MultiOrbitalLambdaCorrection._allowed_basis(no2, np.ones((no2, no2), dtype=bool))
+    hess = (basis.conj().T @ jac.reshape(no2 * no2, no2 * no2) @ basis).real
 
-    assert float(np.linalg.eigvalsh(hess).max()) < 0.0
+    assert float(np.linalg.eigvalsh(0.5 * (hess + hess.T)).max()) < 0.0
+
+
+def test_find_lambda_matrix_recovers_complex_hermitian_mass():
+    """Without a real orbital basis the mass is complex Hermitian: a planted allowed mass with an imaginary part is
+    recovered from the complex sum-rule target it generates."""
+    beta, nq, nw, no2 = 5.0, 6, 5, 4
+    rng = np.random.default_rng(21)
+    w0 = nw // 2
+    chi_inv_qw = np.empty((nq, nw, no2, no2), dtype=np.complex128)
+    for q in range(nq):
+        a = rng.standard_normal((no2, no2)) + 1j * rng.standard_normal((no2, no2))
+        base = _exchange_even(0.5 * (a + a.conj().T)) + (no2 + 3.0) * np.eye(no2)
+        for w in range(nw):
+            chi_inv_qw[q, w] = base + (1.5 * (w - w0)) ** 2 * np.eye(no2)
+    basis = MultiOrbitalLambdaCorrection._allowed_basis(no2, np.ones((no2, no2), dtype=bool))
+    r = rng.standard_normal((no2, no2)) + 1j * rng.standard_normal((no2, no2))
+    lambda_star = 0.2 * (basis @ (basis.conj().T @ (0.5 * (r + r.conj().T)).reshape(-1)).real).reshape(no2, no2)
+    s_r = np.linalg.inv(chi_inv_qw + lambda_star).sum(axis=(0, 1)) / (beta * nq)
+
+    lam = MultiOrbitalLambdaCorrection.find_lambda_matrix(np.linalg.inv(chi_inv_qw), s_r, beta, nq)
+
+    assert np.allclose(lam, lambda_star, atol=1e-4)
+    assert np.abs(lambda_star.imag).max() > 1e-2
+
+
+def test_find_lambda_matrix_converges_when_the_target_breaks_exchange():
+    """A target with an exchange-odd part (not reachable by any allowed mass) is matched on the allowed components:
+    no warning, an exchange-symmetric mass, and the same mass as for the target without the odd part."""
+    beta, nq, nw, n_bands = 5.0, 6, 5, 2
+    chi_inv_qw = _synthetic_chi_inv_qw(n_bands, nq, nw)
+    a = np.random.default_rng(1).standard_normal((4, 4))
+    s_r = np.linalg.inv(chi_inv_qw + _exchange_even(0.3 * 0.5 * (a + a.T))).sum(axis=(0, 1)).real / (beta * nq)
+    odd = np.random.default_rng(2).standard_normal((4, 4))
+    odd = 0.5 * (odd + odd.T)
+    s_r_broken = s_r + 1e-3 * (odd - MultiOrbitalLambdaCorrection._exchange(odd))
+    chi_qw = _synthetic_chi_qw(n_bands, nq, nw)
+
+    lam_broken = MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, s_r_broken, beta, nq)
+
+    assert not config.logger.warning.called
+    assert np.allclose(lam_broken, MultiOrbitalLambdaCorrection._exchange(lam_broken))
+    assert np.allclose(lam_broken, MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, s_r, beta, nq), atol=1e-10)
 
 
 def test_find_lambda_matrix_warns_on_non_convergence():
@@ -222,7 +341,7 @@ def test_find_lambda_matrix_warns_on_non_convergence():
 
     lam = MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, s_r, beta, nq, maxiter=5)
 
-    assert np.all(np.isfinite(lam)) and np.allclose(lam, lam.T)
+    assert np.all(np.isfinite(lam)) and np.allclose(lam, lam.conj().T)
     assert config.logger.warning.called
 
 
@@ -254,6 +373,7 @@ def test_find_lambda_matrix_on_two_atoms_fits_only_the_on_site_blocks():
     for block in (on_a, on_b):
         a = rng.standard_normal((4, 4))
         lambda_star[np.ix_(block, block)] = 0.2 * 0.5 * (a + a.T)
+    lambda_star = _exchange_even(lambda_star)
     lattice_sum = np.linalg.inv(chi_inv_qw + lambda_star).sum(axis=(0, 1)).real / (beta * nq)
     s_r = np.where(on_site, lattice_sum, 0.0)
 
@@ -279,6 +399,145 @@ def test_find_lambda_matrix_on_one_atom_is_unchanged_by_the_atom_map():
     lam_one_atom = MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, s_r, beta, nq, atoms=[0, 0])
 
     assert np.array_equal(lam_one_atom, MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, s_r, beta, nq))
+
+
+def test_tail_coefficient_is_the_occupation_difference_for_a_diagonal_rho():
+    """For a diagonal density matrix the tail coefficient is diagonal with n_2 - n_1 on the pair (12)."""
+    c = MultiOrbitalLambdaCorrection._tail_coefficient(np.diag([0.6, 0.4]).astype(np.complex128))
+
+    assert np.allclose(c, np.diag([0.0, -0.2, 0.2, 0.0]))
+
+
+def test_tail_coefficient_merges_occupations_within_the_tolerance():
+    """Occupations closer than the degeneracy tolerance count as equal, so no inter-orbital pair is polarized."""
+    rho = np.diag([0.5, 0.5 + 5e-5]).astype(np.complex128)
+
+    assert np.allclose(MultiOrbitalLambdaCorrection._tail_coefficient(rho), 0.0)
+
+
+@pytest.mark.parametrize("split", [2.07e-4, 3e-3])
+def test_tail_coefficient_treats_qmc_level_splits_as_degenerate(split):
+    """Occupation splits at the QMC noise of DMFT data (a few 1e-4, here the two-band test fixture's 2.07e-4) do not
+    switch the tail constraint on."""
+    rho = np.diag([0.45, 0.45 + split]).astype(np.complex128)
+
+    assert np.allclose(MultiOrbitalLambdaCorrection._tail_coefficient(rho), 0.0)
+
+
+def test_tail_coefficient_is_covariant_under_the_site_transforms(monkeypatch):
+    """For a complex site unitary, the tail coefficient built from the group-averaged density matrix is invariant under
+    the orbital action on compound matrices, so the tail constraint is compatible with the site group."""
+    angle = 2.0 * np.pi / 3.0
+    generator = np.array([[0.0, 1.0 - 1.0j], [1.0 + 1.0j, 0.0]]) / np.sqrt(2.0)
+    u = np.cos(angle) * np.eye(2) + 1j * np.sin(angle) * generator
+    group = [np.eye(2, dtype=np.complex128), u, u @ u]
+    monkeypatch.setattr(config.dmft, "ineq_ordering", [1])
+    monkeypatch.setattr(config.sys, "occ_dmft_per_ineq", [np.array([[0.6, 0.1], [0.1, 0.4]])])
+
+    tail = MultiOrbitalLambdaCorrection._tail_coefficient(MultiOrbitalLambdaCorrection._local_density_matrix(group))
+
+    assert np.abs(tail).max() > 1e-2
+    assert all(np.allclose(MultiOrbitalLambdaCorrection._transform(tail, g), tail) for g in group)
+
+
+def test_allowed_basis_memory_stays_linear_in_the_constraint_rows():
+    """The null space comes from a thin SVD: the peak allocation stays near the size of the constraint matrix instead
+    of its square."""
+    import tracemalloc
+
+    u = np.linalg.qr(np.random.default_rng(5).standard_normal((3, 3)))[0].astype(np.complex128)
+    tracemalloc.start()
+    MultiOrbitalLambdaCorrection._allowed_basis(9, np.ones((9, 9), dtype=bool), [u] * 8)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+
+    assert peak < 8e6  # constraint matrix 1620 x 81 doubles is 1 MB; the square of its rows would be 21 MB
+
+
+def test_find_lambda_matrix_lifts_a_pole_that_couples_into_the_polarized_sector():
+    """A static pole in a liftable pair that couples into the polarized sector needs a larger start than the fixed
+    shift: the start is enlarged until feasible and the planted mass is recovered instead of raising."""
+    chi_inv = np.diag([-1.0, 0.1, 0.1, 2.0]).astype(np.complex128)
+    chi_inv[0, 1] = chi_inv[1, 0] = chi_inv[0, 2] = chi_inv[2, 0] = 0.5
+    tail = MultiOrbitalLambdaCorrection._tail_coefficient(np.diag([0.6, 0.4]).astype(np.complex128))
+    lambda_star = np.diag([10.0, 0.0, 0.0, 10.0]).astype(np.complex128)
+    s_r = np.linalg.inv(chi_inv + lambda_star) / 5.0
+
+    lam = MultiOrbitalLambdaCorrection.find_lambda_matrix(np.linalg.inv(chi_inv)[None, None], s_r, 5.0, 1, tail=tail)
+
+    assert np.allclose(lam, lambda_star, atol=1e-4)
+
+
+def test_allowed_basis_with_tail_has_no_polarized_entries():
+    """With split occupations the masses linking two polarized pairs (01), (10) are excluded; with equal occupations
+    they are allowed again."""
+    on_site = np.ones((4, 4), dtype=bool)
+    tail = MultiOrbitalLambdaCorrection._tail_coefficient(np.diag([0.6, 0.4]).astype(np.complex128))
+
+    basis = MultiOrbitalLambdaCorrection._allowed_basis(4, on_site, tail=tail)
+
+    assert basis.shape[1] == 7
+    assert np.allclose(basis.reshape(4, 4, -1)[np.ix_([1, 2], [1, 2])], 0.0)
+    degenerate = MultiOrbitalLambdaCorrection._tail_coefficient(np.diag([0.5, 0.5]).astype(np.complex128))
+    assert MultiOrbitalLambdaCorrection._allowed_basis(4, on_site, tail=degenerate).shape[1] == 10
+
+
+def test_find_lambda_matrix_with_tail_keeps_the_tail():
+    """The converged mass leaves the 1/(iw)^2 moment unchanged (C Lambda C = 0) and recovers a planted mass of the
+    constrained form."""
+    beta, nq, nw, n_bands = 5.0, 6, 5, 2
+    chi_inv_qw = _synthetic_chi_inv_qw(n_bands, nq, nw)
+    tail = MultiOrbitalLambdaCorrection._tail_coefficient(np.diag([0.6, 0.4]).astype(np.complex128))
+    basis = MultiOrbitalLambdaCorrection._allowed_basis(4, np.ones((4, 4), dtype=bool), tail=tail)
+    a = np.random.default_rng(1).standard_normal((4, 4))
+    lambda_star = 0.3 * (basis @ (basis.conj().T @ (0.5 * (a + a.T)).reshape(-1)).real).reshape(4, 4)
+    s_r = np.linalg.inv(chi_inv_qw + lambda_star).sum(axis=(0, 1)) / (beta * nq)
+
+    lam = MultiOrbitalLambdaCorrection.find_lambda_matrix(_synthetic_chi_qw(n_bands, nq, nw), s_r, beta, nq, tail=tail)
+
+    assert np.allclose(tail @ lam @ tail, 0.0, atol=1e-12)
+    assert np.allclose(lam, lambda_star, atol=1e-4)
+
+
+def test_find_lambda_matrix_raises_when_the_polarized_sector_has_a_static_pole():
+    """A static pole living only in the polarized pairs (01), (10) is out of reach once the tail is kept."""
+    chi_inv = np.diag([2.0, -1.0, -1.0, 2.0]).astype(np.complex128)
+    tail = MultiOrbitalLambdaCorrection._tail_coefficient(np.diag([0.6, 0.4]).astype(np.complex128))
+
+    with pytest.raises(ValueError, match="polarized"):
+        MultiOrbitalLambdaCorrection.find_lambda_matrix(
+            np.linalg.inv(chi_inv)[None, None], np.zeros((4, 4)), 5.0, 1, tail=tail
+        )
+
+
+def test_local_density_matrix_stacks_the_ineq_blocks_along_the_ordering(monkeypatch):
+    """The local density matrix is block diagonal along the ineq ordering; without occupations there is none."""
+    monkeypatch.setattr(config.dmft, "ineq_ordering", [2, 1])
+    monkeypatch.setattr(config.dmft, "n_bands_per_ineq", [2, 1])
+    monkeypatch.setattr(config.sys, "occ_dmft_per_ineq", [np.diag([0.6, 0.4]), np.array([[0.9]])])
+
+    rho = MultiOrbitalLambdaCorrection._local_density_matrix([])
+
+    assert np.allclose(rho, np.diag([0.9, 0.6, 0.4]))
+    monkeypatch.setattr(config.sys, "occ_dmft_per_ineq", [])
+    assert MultiOrbitalLambdaCorrection._local_density_matrix([]) is None
+
+
+def test_multiorbital_perform_single_keeps_the_tail_for_split_occupations(monkeypatch):
+    """With split DMFT occupations the object path drops every mass entry between the polarized pairs."""
+    monkeypatch.setattr(config.sys, "beta", 8.0)
+    monkeypatch.setattr(config.sys, "n_bands", 2)
+    monkeypatch.setattr(config.dmft, "ineq_ordering", [1])
+    monkeypatch.setattr(config.dmft, "n_bands_per_ineq", [2])
+    monkeypatch.setattr(config.sys, "occ_dmft_per_ineq", [np.diag([1.2, 0.8]).astype(np.complex128)])
+    chi = _multiorbital_chi_fourpoint(2, (4, 4, 1), 3, seed=7)
+    q_grid = config.lattice.k_grid
+    chi_inv_qw = np.linalg.inv(chi.copy().map_to_full_bz(q_grid).to_compound_indices().mat.astype(np.complex128))
+    s_r = np.linalg.inv(chi_inv_qw + 0.1 * np.eye(4)).sum(axis=(0, 1)) / (8.0 * q_grid.nk_tot)
+
+    _, lam = MultiOrbitalLambdaCorrection.perform_single(chi.copy(), s_r)
+
+    assert np.allclose(lam[np.ix_([1, 2], [1, 2])], 0.0, atol=1e-12)
 
 
 def test_find_lambda_matrix_raises_when_no_on_site_mass_lifts_the_static_pole():
@@ -351,7 +610,7 @@ def test_multiorbital_perform_single_recovers_matrix_mass_and_sum_rule():
     q_grid = config.lattice.k_grid
     no2 = 4
     a = np.random.default_rng(9).standard_normal((no2, no2))
-    lambda_star = 0.2 * 0.5 * (a + a.T)
+    lambda_star = _exchange_even(0.2 * 0.5 * (a + a.T))
     chi_inv_qw = np.linalg.inv(chi.copy().map_to_full_bz(q_grid).to_compound_indices().mat.astype(np.complex128))
     s_r = np.linalg.inv(chi_inv_qw + lambda_star).sum(axis=(0, 1)).real / (config.sys.beta * q_grid.nk_tot)
 
@@ -476,7 +735,7 @@ def test_find_lambda_matrix_feasibility_binds_at_omega_zero_only():
     no2 = n_bands**2
     chi_inv_qw[:, -1] = -50.0 * np.eye(no2)
     a = np.random.default_rng(11).standard_normal((no2, no2))
-    lambda_star = 0.3 * 0.5 * (a + a.T)
+    lambda_star = _exchange_even(0.3 * 0.5 * (a + a.T))
     s_r = np.linalg.inv(chi_inv_qw + lambda_star).sum(axis=(0, 1)).real / (beta * nq)
 
     lambda_found = MultiOrbitalLambdaCorrection.find_lambda_matrix(np.linalg.inv(chi_inv_qw), s_r, beta, nq)
@@ -572,6 +831,42 @@ def _chi_on_grid(grid, n_bands: int, nw_half: int, seed: int) -> FourPoint:
     )
 
 
+def test_site_transforms_are_empty_on_a_named_grid():
+    """Named symmetries act on momenta only, so they put no constraint on the orbital structure of the mass."""
+    grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+
+    assert MultiOrbitalLambdaCorrection._site_transforms(grid) == []
+
+
+def test_multiorbital_perform_single_mass_commutes_with_the_site_group_on_an_auto_grid(monkeypatch):
+    """On an auto grid the mass is invariant under every orbital unitary fixing Gamma, a planted invariant mass is
+    recovered, and the corrected chi mapped to the full BZ from the wedge satisfies the full-BZ sum rule."""
+    grid = bz.KGrid(nk=(4, 4, 1), symmetries=[bz.KnownSymmetries.AUTO])
+    grid.specify_auto_symmetries(p_orbital_hk((4, 4, 1)))
+    monkeypatch.setattr(config.lattice, "k_grid", grid)
+    monkeypatch.setattr(config.sys, "beta", 5.0)
+    monkeypatch.setattr(config.sys, "n_bands", 2)
+    monkeypatch.setattr(config.dmft, "ineq_ordering", [])
+    monkeypatch.setattr(config.dmft, "n_bands_per_ineq", [])
+    transforms = MultiOrbitalLambdaCorrection._site_transforms(grid)
+    chi = _chi_on_grid(grid, 2, 2, seed=7)
+    basis = MultiOrbitalLambdaCorrection._allowed_basis(4, np.ones((4, 4), dtype=bool), transforms)
+    a = np.random.default_rng(8).standard_normal((4, 4))
+    lambda_star = 0.2 * (basis @ (basis.conj().T @ (0.5 * (a + a.T)).reshape(-1)).real).reshape(4, 4)
+    full_chi = chi.copy().map_to_full_bz(grid).to_compound_indices().mat.astype(np.complex128)
+    s_r = np.linalg.inv(np.linalg.inv(full_chi) + lambda_star).sum(axis=(0, 1)) / (5.0 * grid.nk_tot)
+
+    corrected, lam = MultiOrbitalLambdaCorrection.perform_single(chi.copy(), s_r)
+
+    assert len(transforms) > 1
+    assert all(np.allclose(MultiOrbitalLambdaCorrection._transform(lam, u), lam, atol=1e-10) for u in transforms)
+    assert np.allclose(lam, lambda_star, atol=1e-4)
+    lhs = corrected.to_full_niw_range().map_to_full_bz(grid).to_compound_indices().mat.astype(np.complex128).sum(
+        axis=(0, 1)
+    ) / (5.0 * grid.nk_tot)
+    assert np.allclose(lhs, s_r, atol=1e-5)
+
+
 def test_expand_compound_slice_is_exact_gather_without_auto_data():
     """Without auto data the FBZ expansion is the plain irrk_inv gather, matching map_to_full_bz per frequency."""
     grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
@@ -608,7 +903,7 @@ def test_find_lambda_matrix_ibz_resident_matches_full_bz_reference(auto):
     chi = _chi_on_grid(grid, n_bands, 2, seed=7)
     no2 = n_bands**2
     a = np.random.default_rng(8).standard_normal((no2, no2))
-    lambda_star = 0.2 * 0.5 * (a + a.T)
+    lambda_star = _exchange_even(0.2 * 0.5 * (a + a.T))
 
     full_chi = chi.copy().map_to_full_bz(grid).to_compound_indices().mat.astype(np.complex128)
     s_r = np.linalg.inv(np.linalg.inv(full_chi) + lambda_star).sum(axis=(0, 1)).real / (beta * grid.nk_tot)
