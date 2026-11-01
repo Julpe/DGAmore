@@ -12,4 +12,4 @@ psutil~=7.2
 threadpoolctl~=3.6
 # Exact pins: research codes whose updates are not tracked by DGAmore.
 mini_pole==0.7
-kneed==0.8.6
+kneed==0.9.0

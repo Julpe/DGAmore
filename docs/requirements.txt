@@ -16,4 +16,4 @@ multimethod~=2.0
 ruamel.yaml~=0.19
 threadpoolctl~=3.6
 mini_pole==0.7
-kneed==0.8.6
+kneed==0.9.0
