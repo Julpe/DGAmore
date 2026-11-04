@@ -1221,6 +1221,34 @@ def test_team_arnoldi_block_finds_both_partners_of_every_doublet(size):
             assert np.linalg.norm(h @ vec - lam * vec) <= 1e-6 * abs(lam)
 
 
+@pytest.mark.parametrize("size", [1, 3])
+@pytest.mark.parametrize("n_block", [1, 2])
+@pytest.mark.parametrize("weight", [0.0, 1.0])
+def test_team_arnoldi_continues_from_a_fresh_direction_when_the_operator_annihilates_a_basis_vector(
+    size, n_block, weight
+):
+    """A first seed in the null space of the operator, or an operator that is zero, still gives the exact eigenpairs."""
+    m, n_eig = 30, 3
+    copies, seeds = _doublet_problem(m)
+    h = np.kron(np.diag([0.0, weight]), copies[:m, :m])
+    expected = np.sort(np.linalg.eigvals(h).real)[::-1][:n_eig]
+
+    def fn(comm, rank):
+        bounds = np.linspace(0, 2 * m, comm.Get_size() + 1).astype(int)
+        s0, s1 = int(bounds[rank]), int(bounds[rank + 1])
+        apply_block = lambda block: (h @ np.concatenate(comm.allgather(block)))[s0:s1]
+        lambdas, ritz, basis, _, _ = es._team_arnoldi(
+            apply_block, seeds[:n_block, s0:s1], n_eig, 12, 1e-10, 300, comm, n_block
+        )
+        return lambdas, np.concatenate(comm.allgather(ritz.T @ basis), axis=1)
+
+    _, res = run_parallel(size, fn)
+    for lambdas, vectors in res:
+        assert np.allclose(lambdas, expected, atol=1e-7)
+        for lam, vec in zip(lambdas, vectors):
+            assert np.linalg.norm(h @ vec - lam * vec) <= 1e-6 * abs(lam) and abs(np.linalg.norm(vec) - 1) < 1e-8
+
+
 @pytest.mark.parametrize(
     "symmetries, nk, expected",
     [
@@ -1376,6 +1404,20 @@ def test_symmetrize_degenerate_gaps_phase_fixes_dependent_vectors():
         assert np.isclose(np.linalg.norm(fixed[:, col]), 1.0, atol=1e-12)
         leading = fixed[np.argmax(np.abs(fixed[:, col])), col]
         assert leading.real > 0 and np.isclose(leading.imag, 0.0, atol=1e-12)
+
+
+def test_symmetrize_degenerate_gaps_phase_fix_keeps_the_sign_of_noisy_d_wave_gaps():
+    """The opposite-sign maxima of a d-wave gap are resolved by position, never by single-precision solver noise."""
+    nk, n2, draws = 4, 4, 20
+    gap_shape = (nk, nk, 1, 1, 1, n2)
+    k = 2 * np.pi * np.arange(nk) / nk
+    d_wave = ((np.cos(k)[:, None] - np.cos(k)[None, :])[:, :, None, None, None, None] * np.ones(gap_shape)).ravel()
+    d_wave /= np.linalg.norm(d_wave)
+    rng = np.random.default_rng(0)
+    noise = rng.standard_normal((d_wave.size, draws)) + 1j * rng.standard_normal((d_wave.size, draws))
+    gaps = (d_wave[:, None] + 1e-5 * np.abs(d_wave).max() * noise).astype(np.complex64)
+    fixed = symmetrize_degenerate_gaps(np.linspace(1.0, 0.1, draws), gaps, gap_shape)
+    assert np.all((d_wave @ fixed).real > 0)
 
 
 def _make_p_wave_triplet(nk: int = 4, n2: int = 4) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple]:

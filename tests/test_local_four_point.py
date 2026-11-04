@@ -800,6 +800,17 @@ def test_adds_two_local_four_point_objects_with_different_vn_dimensions(monkeypa
         assert np.allclose(result6.mat, (mat1 + mat1)[..., 10:, :, :], atol=1e-4)
 
 
+@pytest.mark.parametrize("self_vn, other_vn", [(2, 2), (2, 0), (0, 2), (1, 0), (0, 0)])
+@pytest.mark.parametrize("subtract", [False, True])
+def test_add_and_sub_take_the_non_none_channel_for_any_vn_dimensions(self_vn, other_vn, subtract):
+    """A channel-less LocalFourPoint plus or minus a density object is density, whatever its fermionic axes."""
+    shapes = {0: (1, 1, 1, 1, 3), 1: (1, 1, 1, 1, 3, 4), 2: (1, 1, 1, 1, 3, 4, 4)}
+    a = LocalFourPoint(np.ones(shapes[self_vn]), SpinChannel.NONE, 1, self_vn, False, True)
+    b = LocalFourPoint(np.ones(shapes[other_vn]), SpinChannel.DENS, 1, other_vn, False, True)
+    result = a - b if subtract else a + b
+    assert result.channel == SpinChannel.DENS
+
+
 def test_adds_local_four_point_and_scalar_correctly():
     """Adding a scalar to a LocalFourPoint adds elementwise."""
     mat = np.random.rand(2, 2, 2, 2, 5, 4, 4)

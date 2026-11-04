@@ -140,7 +140,7 @@ def test_asympt_returns_self_energy_unchanged_when_core_equals_niv():
 def test_asympt_returns_self_energy_unchanged_when_asympt_niv_is_zero():
     """create_with_asympt_up_to_core leaves the data unchanged when the tail is zero."""
     self_energy = _se(mat_decompressed, nk=nk, has_compressed_q_dimension=False)
-    self_energy._get_asympt = lambda niv: _se(np.zeros_like(self_energy.mat), nk=nk)
+    self_energy._get_asympt = lambda niv, n_min: _se(np.zeros_like(self_energy.mat), nk=nk)
     result = self_energy.create_with_asympt_up_to_core()
     assert np.allclose(result.mat, self_energy.mat)
 
@@ -149,7 +149,7 @@ def test_concatenates_core_and_asymptotic_tail_correctly():
     """create_with_asympt_up_to_core stitches the core between the asymptotic tails."""
     self_energy = _se(mat_decompressed, nk=nk, has_compressed_q_dimension=False)
     self_energy._niv_core = 3
-    asympt = self_energy._get_asympt(niv=self_energy.niv)
+    asympt = self_energy._get_asympt(niv=self_energy.niv, n_min=0)
     result = self_energy.create_with_asympt_up_to_core()
     expected = np.concatenate(
         (
@@ -173,7 +173,7 @@ def test_handles_tail_edge_case_with_zero_core_niv():
 def test_appends_asymptotic_tail_correctly_when_niv_is_greater_than_current():
     """append_asympt extends the box with the analytic tail on both sides."""
     self_energy = _se(mat_decompressed, nk=nk, has_compressed_q_dimension=False)
-    asympt = self_energy._get_asympt(niv=10)
+    asympt = self_energy._get_asympt(niv=10, n_min=0)
     result = self_energy.append_asympt(niv=10)
     expected = np.concatenate(
         (
@@ -196,7 +196,7 @@ def test_append_returns_self_energy_unchanged_when_niv_is_less_than_or_equal_to_
 def test_appends_asymptotic_tail_correctly_with_large_niv():
     """append_asympt extends the box correctly for a large target niv."""
     self_energy = _se(mat_decompressed, nk=nk, has_compressed_q_dimension=False)
-    asympt = self_energy._get_asympt(niv=100)
+    asympt = self_energy._get_asympt(niv=100, n_min=0)
     result = self_energy.append_asympt(niv=100)
     expected = np.concatenate(
         (
@@ -899,6 +899,25 @@ def test_fit_smom_of_an_orbitally_symmetric_self_energy_equals_the_elementwise_f
     assert mom0.dtype.kind == "f" and mom1.dtype.kind == "f"
     assert np.array_equal(mom0, np.mean(fitdata.real, axis=-1))
     assert np.array_equal(mom1, np.mean(fitdata.imag * vn, axis=-1))
+
+
+def test_append_asympt_places_the_tail_at_the_frequencies_of_the_extended_box():
+    """append_asympt of a self-energy that is its own tail reproduces that tail on every frequency of the larger box."""
+    beta = 10.0
+    mom0 = np.array([[1.0, 0.3 + 0.2j], [0.3 - 0.2j, 1.5]])
+    mom1 = np.array([[0.8, 0.1 - 0.15j], [0.1 + 0.15j, 0.6]])
+    se = _se(_hermitian_tail(mom0, mom1, 5, beta), beta=beta)
+    assert np.allclose(se.append_asympt(niv=10).mat, _hermitian_tail(mom0, mom1, 10, beta), atol=1e-5)
+
+
+def test_create_with_asympt_up_to_core_places_the_tail_at_the_shell_frequencies():
+    """create_with_asympt_up_to_core of a self-energy that is its own tail leaves every frequency unchanged."""
+    beta = 10.0
+    mom0 = np.array([[1.0, 0.3 + 0.2j], [0.3 - 0.2j, 1.5]])
+    mom1 = np.array([[0.8, 0.1 - 0.15j], [0.1 + 0.15j, 0.6]])
+    se = _se(_hermitian_tail(mom0, mom1, 30, beta), beta=beta)
+    se._niv_core = 10
+    assert np.allclose(se.create_with_asympt_up_to_core().mat, _hermitian_tail(mom0, mom1, 30, beta), atol=1e-5)
 
 
 def _time_reversed(mat: np.ndarray, grid: tuple) -> np.ndarray:
