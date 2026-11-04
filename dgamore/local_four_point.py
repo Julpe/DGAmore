@@ -726,7 +726,7 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
             result = LocalFourPoint(
                 op(self_mat, other_mat),
-                self.channel,
+                channel,
                 max(self.num_wn_dimensions, other.num_wn_dimensions),
                 max(self.num_vn_dimensions, other.num_vn_dimensions),
                 self.full_niw_range,

@@ -1228,9 +1228,10 @@ def _team_arnoldi(
     inner product is a team allreduce, so all ranks walk the same iteration with the same scalars. The basis is
     orthogonalized by classical Gram-Schmidt, repeated once when the first pass removed more than a fixed share of
     the new vector (:data:`REORTHOGONALIZE_BELOW`, the criterion ARPACK uses), so a well-conditioned step streams
-    the basis twice instead of four times. A vector the second pass also cuts below that share lies in the span of
-    the basis (the Krylov space is invariant, e.g. a sector smaller than the basis): the iteration then continues
-    from a random direction orthogonalized against the basis, as ARPACK does, with the vanishing norm kept in the
+    the basis twice instead of four times. A vector the second pass also cuts below that share, or an image that
+    vanishes exactly, lies in the span of the basis (the Krylov space is invariant, e.g. a sector smaller than the
+    basis or one the operator annihilates): the iteration then continues from a random direction orthogonalized
+    against the basis, as ARPACK does, with the vanishing norm kept in the
     Rayleigh quotient so the Arnoldi relation stays exact. When the ``ncv``-vector basis is full, the Ritz pairs of the
     Rayleigh quotient are formed; a pair counts as converged when its residual estimate :math:`|\beta_m|\,|y_m|` is
     at most ``tol`` times the modulus of its Ritz value. Otherwise the Schur form of the Rayleigh quotient is
@@ -1301,12 +1302,12 @@ def _team_arnoldi(
         h = dots(basis[:top], w)
         w = w - h @ basis[:top]
         beta, spent = norm(w), False
-        if beta < REORTHOGONALIZE_BELOW * w_norm:
+        if beta <= REORTHOGONALIZE_BELOW * w_norm:
             correction = dots(basis[:top], w)
             w = w - correction @ basis[:top]
             h += correction
             beta, previous = norm(w), beta
-            spent = beta < REORTHOGONALIZE_BELOW * previous
+            spent = beta <= REORTHOGONALIZE_BELOW * previous
         rayleigh[:top, j] = h
         rayleigh[top, j] = beta
         if j + 1 < ncv:
@@ -2029,9 +2030,13 @@ def symmetrize_degenerate_gaps(
     simultaneously and orders the partners by the axes each one is odd under (:math:`p`-like as ``x, y, z``,
     two-axis :math:`d`-like as ``xy, xz, yz``), provided every partner is a clean :math:`\pm 1` eigenstate and no
     two partners share a sign pattern (otherwise the mirrors do not resolve the cluster and the Loewdin basis is
-    kept); (iii) the global phase of every vector is fixed such that its largest-magnitude element is real and
-    positive. Eigenvalues are not modified; vectors of non-degenerate eigenvalues are only phase-fixed. Enabled via
-    ``symmetrize_degenerate_gaps`` of :class:`~dgamore.config.EliashbergConfig`.
+    kept); (iii) the global phase of every vector is fixed such that its first element (in flattened order) within a
+    relative :math:`10^{-3}` of the largest magnitude is real and positive. The band lies far above the eigenvector
+    noise of the single-precision solve, so the opposite-sign, symmetry-equivalent largest elements of a
+    :math:`d`- or :math:`p`-wave gap are told apart by their position rather than by rounding, and the global sign does
+    not depend on the rank count, BLAS or thread count. Eigenvalues are not modified; vectors of non-degenerate
+    eigenvalues are only phase-fixed. Enabled via ``symmetrize_degenerate_gaps`` of
+    :class:`~dgamore.config.EliashbergConfig`.
 
     The mirrors act on the orbital indices as well as on the momenta (:math:`U_y` above, see
     :func:`_mirror_operator`). Without that orbital factor the operator is not a symmetry of a multi-orbital pairing
@@ -2092,8 +2097,9 @@ def symmetrize_degenerate_gaps(
             mags = np.abs(block[:, col])
             if mags.max() == 0:  # an all-zero vector has no phase to fix (and dividing by it would yield nan)
                 continue
-            # tie-break on the first index among the maximal-modulus elements, stable against fp noise
-            phase = block[np.flatnonzero(mags >= mags.max() * (1.0 - 1e-8))[0], col]
+            # first element within 1e-3 of the largest modulus: the band lies far above the eigenvector noise, so
+            # opposite-sign symmetry partners among the largest elements (d-, p-wave) are told apart by position
+            phase = block[np.flatnonzero(mags >= mags.max() * (1.0 - 1e-3))[0], col]
             block[:, col] *= phase.conjugate() / abs(phase)
         gaps[:, cluster] = block
 

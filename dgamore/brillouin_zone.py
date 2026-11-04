@@ -992,7 +992,7 @@ class KPath:
         :return: The band energies along the path, shape ``[nk_path, n_bands]``.
         """
         ek_kpath = self.map_to_kpath(ek)
-        bands = np.zeros((ek_kpath.current_shape[:-1]))
+        bands = np.zeros(ek_kpath.shape[:-1])
         for i, eki in enumerate(ek_kpath):
             val, _ = np.linalg.eig(eki)
             bands[i, :] = np.sort(val).real

@@ -543,19 +543,18 @@ def test_get_kpath_val_reads_each_axis_for_its_own_column():
     assert np.array_equal(kz_vals, np.array([32.0, 31.0]))
 
 
-def test_get_bands_returns_sorted_real_eigenvalues(monkeypatch):
-    """get_bands returns sorted real eigenvalues for each k-point of the object KPath.map_to_kpath yields."""
+def test_get_bands_returns_sorted_real_eigenvalues():
+    """get_bands returns the sorted real eigenvalues of a plain-array dispersion at each point of the path."""
     kp = KPath(nk=(4, 4, 4), path="gamma-x")
-    # two diagonal 2x2 matrices with eigenvalues [2, 1] and [4, 3], expected sorted to [1, 2] and [3, 4]
-    mats = [np.array([[2.0, 0.0], [0.0, 1.0]]), np.array([[4.0, 0.0], [0.0, 3.0]])]
-    mock_ek = MagicMock(current_shape=(len(mats), mats[0].shape[0], mats[0].shape[0]))
-    mock_ek.__iter__.side_effect = lambda: iter(mats)
+    # band 0 runs as kx and crosses the flat band 0.5 along the path, so the sort must reorder them
+    ek = np.zeros((4, 4, 4, 2, 2))
+    ek[..., 0, 0] = np.arange(4)[:, None, None]
+    ek[..., 1, 1] = 0.5
 
-    with monkeypatch.context() as mp:
-        mp.setattr(KPath, "map_to_kpath", MagicMock(return_value=mock_ek))
-        bands = kp.get_bands(ek=None)
+    bands = kp.get_bands(ek)
 
-    expected = np.array([[1.0, 2.0], [3.0, 4.0]])
+    expected = np.sort(np.stack([kp.kpts[:, 0], np.full(len(kp.kpts), 0.5)], axis=-1), axis=-1)
+    assert bands.shape == (len(kp.kpts), 2)
     assert np.allclose(bands, expected)
 
 

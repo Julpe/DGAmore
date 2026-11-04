@@ -148,7 +148,7 @@ class SelfEnergy(TwoPoint):
         """
         # ``_get_asympt`` reads only the moments/grid (not ``mat``), and ``cut_niv`` already returns an independent
         # copy, so source from ``self`` directly and drop the wasteful initial ``deepcopy`` of the full array.
-        asympt = self._get_asympt(niv=self.niv)
+        asympt = self._get_asympt(niv=self.niv, n_min=0)
 
         if self._niv_core == self.niv:
             return self.copy()
@@ -172,7 +172,7 @@ class SelfEnergy(TwoPoint):
         :param niv: Target number of positive fermionic frequencies.
         :return: A copy of the self-energy extended to ``niv``.
         """
-        asympt = self._get_asympt(niv)
+        asympt = self._get_asympt(niv, n_min=0)
         if niv <= self.niv:
             return self.copy()
         # ``np.concatenate`` allocates the result and only reads ``self.mat``, so clone the metadata without
