@@ -275,6 +275,47 @@ def test_add_inplace_with_nonlocal_interaction_matches_copy(rng):
     assert np.array_equal(a.mat, ref.mat)
 
 
+@pytest.mark.parametrize("nonlocal_u", [False, True])
+@pytest.mark.parametrize("operation", ["add", "sub", "matmul"])
+@pytest.mark.parametrize("copy", [True, False])
+def test_channel_less_vertex_takes_the_interaction_channel(rng, nonlocal_u, operation, copy):
+    """A channel-less FourPoint plus, minus or times a density (Local)Interaction is density, like two vertices."""
+    a = _kernel_block(rng, SpinChannel.NONE, num_vn=2)
+    u = _channel_interactions(rng)[nonlocal_u]
+    assert getattr(a, operation)(u, copy=copy).channel == SpinChannel.DENS
+
+
+def _broadcast_operand(rng, num_vn, local, o=2, n=4):
+    """Builds a half-niw (Local)FourPoint [(q,) o, o, o, o, n, (n,) * num_vn] with equal bosonic and fermionic sizes."""
+    shape = (o, o, o, o) + (n,) * (1 + num_vn)
+    if local:
+        return LocalFourPoint(rng.standard_normal(shape), SpinChannel.DENS, 1, num_vn, False, True)
+    return FourPoint(rng.standard_normal((4,) + shape), SpinChannel.DENS, (2, 2, 1), 1, num_vn, False, True, True)
+
+
+@pytest.mark.parametrize("self_vn, other_vn", [(1, 0), (2, 0), (0, 1), (0, 2)])
+@pytest.mark.parametrize("local_self, local_other", [(False, True), (False, False), (True, False)])
+@pytest.mark.parametrize("subtract", [False, True])
+def test_add_broadcasts_an_operand_without_fermionic_axes(rng, self_vn, other_vn, local_self, local_other, subtract):
+    """An operand without fermionic axes is added at every fermionic frequency of the other, in either order."""
+    a, b = _broadcast_operand(rng, self_vn, local_self), _broadcast_operand(rng, other_vn, local_other)
+    vn = max(self_vn, other_vn)
+    a_pad, b_pad = (
+        (x.mat if isinstance(x, FourPoint) else x.mat[None])[(...,) + (None,) * (vn - x.num_vn_dimensions)]
+        for x in (a, b)
+    )
+    result = a - b if subtract else a + b
+    assert isinstance(result, FourPoint) and result.num_vn_dimensions == vn
+    assert np.allclose(result.mat, a_pad - b_pad if subtract else a_pad + b_pad, atol=1e-12)
+
+
+def test_add_inplace_rejects_an_operand_without_fermionic_axes(rng):
+    """copy=False cannot broadcast a fermionic axis in place and raises, as for LocalFourPoint."""
+    a, b = _kernel_block(rng, SpinChannel.DENS, num_vn=1), _local_block(rng, num_vn=0)
+    with pytest.raises(ValueError, match="fermionic axis has to be broadcast"):
+        a.add(b, copy=False)
+
+
 def _local_block(rng, num_vn=2, o=2, niw=3, niv=3):
     """Builds a half-niw LocalFourPoint [o, o, o, o, niw + 1, (2*niv,) * num_vn] with random complex entries."""
     from dgamore.local_four_point import LocalFourPoint

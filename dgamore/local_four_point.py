@@ -486,6 +486,8 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         if isinstance(other, LocalFourPoint) and other.frequency_notation != self.frequency_notation:
             raise ValueError("Cannot multiply two objects with different frequency notations.")
 
+        channel = self.channel if self.channel != SpinChannel.NONE else other.channel
+
         if isinstance(other, LocalInteraction):
             left_orbs, right_orbs, final_orbs = (
                 ("abij", "jief", "abef")
@@ -504,15 +506,13 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
                     if left_hand_side
                     else np.einsum(einsum_str, other.mat, self.mat, optimize=True)
                 ),
-                self.channel,
+                channel,
                 self.num_wn_dimensions,
                 self.num_vn_dimensions,
                 self.full_niw_range,
                 self.full_niv_range,
                 self.frequency_notation,
             )
-
-        channel = self.channel if self.channel != SpinChannel.NONE else other.channel
 
         if self.num_vn_dimensions in (0, 1) or other.num_vn_dimensions in (0, 1):
             # special case if either object lacks two fermionic frequency dimensions: straightforward contraction saves
@@ -672,6 +672,8 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
                 self.frequency_notation,
             )
 
+        channel = self.channel if self.channel != SpinChannel.NONE else other.channel
+
         if isinstance(other, LocalInteraction):
             other_mat = other.mat.reshape(other.mat.shape + (1,) * (self.num_wn_dimensions + self.num_vn_dimensions))
             is_local = not isinstance(other, Interaction)
@@ -687,10 +689,11 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
             if not copy:
                 # broadcast-accumulate the (small) interaction into self in place: no full-size result block
                 op(self.mat, other_mat, out=self.mat)
+                self.channel = channel
                 return self
             return LocalFourPoint(
                 op(self.mat, other_mat),
-                self.channel,
+                channel,
                 self.num_wn_dimensions,
                 self.num_vn_dimensions,
                 self.full_niw_range,
@@ -706,8 +709,6 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
 
         self.to_half_niw_range()
         other = other.to_half_niw_range()
-
-        channel = self.channel if self.channel != SpinChannel.NONE else other.channel
 
         if self.num_vn_dimensions == 0 or other.num_vn_dimensions == 0:
             if not copy:
