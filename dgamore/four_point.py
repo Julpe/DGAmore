@@ -1036,7 +1036,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         niw range to save memory.
 
         :param other: A :class:`FourPoint`, :class:`LocalFourPoint`, :class:`Interaction`, :class:`LocalInteraction`,
-            numpy array, or number. Local operands are broadcast over the momentum axis.
+            numpy array, or number. Local operands are broadcast over the momentum axis, and an operand without
+            fermionic frequency dimensions over the fermionic frequencies of the other.
         :param subtract: If True, subtract ``other`` instead of adding it (used by :meth:`sub` to avoid a negated copy).
         :param copy: If True (default), return a new :class:`FourPoint`; if False, accumulate the result into
             ``self.mat`` in place and return ``self`` (no out-of-place result block). The in-place branch is
@@ -1047,7 +1048,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         :return: A new :class:`FourPoint` (in the half niw range for the vertex-vertex case), or ``self`` when
             ``copy=False``.
         :raises ValueError: If ``other`` has an unsupported type, or ``copy=False`` would have to diagonally extend
-            ``self``.
+            ``self`` or broadcast an operand without fermionic frequency dimensions.
         :raises NotImplementedError: If ``copy=False`` and ``other`` is not a :class:`FourPoint`.
         """
         if not isinstance(
@@ -1086,10 +1087,11 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             if not copy:
                 # broadcast-accumulate the (small) interaction into self in place: no full-size result block
                 op(self.mat, other_mat, out=self.mat)
+                self.channel = channel
                 return self
             return FourPoint(
                 op(self.mat, other_mat),
-                self.channel,
+                channel,
                 self.nq,
                 self.num_wn_dimensions,
                 self.num_vn_dimensions,
@@ -1099,11 +1101,49 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
                 self.frequency_notation,
             )
 
+        num_vn = max(self.num_vn_dimensions, other.num_vn_dimensions)
+        vn_broadcast = num_vn > 0 and 0 in (self.num_vn_dimensions, other.num_vn_dimensions)
+        if vn_broadcast and not copy:
+            raise ValueError(
+                "In-place addition/subtraction (copy=False) is not supported when a fermionic axis has to be "
+                "broadcast (an operand without fermionic frequency dimensions)."
+            )
+
         self_full_niw_range = self.full_niw_range
         other_full_niw_range = other.full_niw_range
 
         self.to_half_niw_range()
         other = other.to_half_niw_range()
+
+        if vn_broadcast:
+            if isinstance(other, FourPoint):
+                other = self._align_q_dimensions_for_operations(other)
+                other_mat = other.mat
+            else:
+                other_mat = (
+                    other.mat[None, ...] if self.has_compressed_q_dimension else other.mat[None, None, None, ...]
+                )
+            # the operand without fermionic axes is added at every fermionic frequency of the other one
+            vn_axes = tuple(range(-num_vn, 0))
+            self_mat = np.expand_dims(self.mat, vn_axes) if self.num_vn_dimensions == 0 else self.mat
+            other_mat = np.expand_dims(other_mat, vn_axes) if other.num_vn_dimensions == 0 else other_mat
+            result = FourPoint(
+                op(self_mat, other_mat),
+                channel,
+                self.nq,
+                self.num_wn_dimensions,
+                num_vn,
+                False,
+                (other if self.num_vn_dimensions == 0 else self).full_niv_range,
+                self.has_compressed_q_dimension,
+                self.frequency_notation,
+            )
+
+            if self_full_niw_range:
+                self.to_full_niw_range()
+            if other_full_niw_range:
+                other = other.to_full_niw_range()
+            return result
 
         if not isinstance(other, FourPoint):
             # if other is LocalFourPoint
@@ -1274,6 +1314,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         if isinstance(other, LocalFourPoint) and other.frequency_notation != self.frequency_notation:
             raise ValueError("Cannot multiply two objects with different frequency notations.")
 
+        channel = self.channel if self.channel != SpinChannel.NONE else other.channel
+
         if isinstance(other, (LocalInteraction, Interaction)):
             is_local = not isinstance(other, Interaction)
             q_prefix = "" if is_local else "q"
@@ -1299,10 +1341,11 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             operands = (self.mat, u) if left_hand_side else (u, self.mat)
             if not copy:
                 np.einsum(einsum_str, *operands, out=self.mat, optimize=True)
+                self.channel = channel
                 return self
             return FourPoint(
                 np.einsum(einsum_str, *operands, optimize=True),
-                self.channel,
+                channel,
                 self.nq,
                 self.num_wn_dimensions,
                 self.num_vn_dimensions,
@@ -1313,7 +1356,6 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
             )
 
         is_local = not isinstance(other, FourPoint)
-        channel = self.channel if self.channel != SpinChannel.NONE else other.channel
 
         if self.num_vn_dimensions in (0, 1) or other.num_vn_dimensions in (0, 1):
             # special case if either object lacks two fermionic frequency dimensions: straightforward contraction saves

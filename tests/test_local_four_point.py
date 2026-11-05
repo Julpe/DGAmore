@@ -777,6 +777,8 @@ def test_adds_two_local_four_point_objects_with_different_vn_dimensions(monkeypa
         result4 = obj2 + obj2
         result5 = obj3 + obj3
         result6 = obj1 + obj1
+        result7 = obj3 + obj1
+        result8 = obj3 + obj2
         assert mock_extend.call_count == 1
         assert result1.mat.shape == (2, 2, 2, 2, 11, 4, 4)
         assert result2.mat.shape == (2, 2, 2, 2, 11, 4, 4)
@@ -784,6 +786,8 @@ def test_adds_two_local_four_point_objects_with_different_vn_dimensions(monkeypa
         assert result4.mat.shape == (2, 2, 2, 2, 11, 4)
         assert result5.mat.shape == (2, 2, 2, 2, 11)
         assert result6.mat.shape == (2, 2, 2, 2, 11, 4, 4)
+        assert result7.mat.shape == (2, 2, 2, 2, 11, 4, 4)
+        assert result8.mat.shape == (2, 2, 2, 2, 11, 4)
 
         assert result1.full_niw_range is False
         assert result2.full_niw_range is False
@@ -791,12 +795,16 @@ def test_adds_two_local_four_point_objects_with_different_vn_dimensions(monkeypa
         assert result4.full_niw_range is False
         assert result5.full_niw_range is False
         assert result6.full_niw_range is False
+        assert result7.full_niw_range is False
+        assert result8.full_niw_range is False
 
         assert np.allclose(result1.mat, (mat1 + mat2_diagonal)[..., 10:, :, :], atol=1e-4)
         assert np.allclose(result2.mat, (mat1 + mat3[..., None, None])[..., 10:, :, :], atol=1e-4)
         assert np.allclose(result3.mat, (mat2 + mat3[..., None])[..., 10:, :], atol=1e-4)
         assert np.allclose(result4.mat, (mat2 + mat2)[..., 10:, :], atol=1e-4)
         assert np.allclose(result5.mat, (mat3 + mat3)[..., 10:], atol=1e-4)
+        assert np.allclose(result7.mat, (mat3[..., None, None] + mat1)[..., 10:, :, :], atol=1e-4)
+        assert np.allclose(result8.mat, (mat3[..., None] + mat2)[..., 10:, :], atol=1e-4)
         assert np.allclose(result6.mat, (mat1 + mat1)[..., 10:, :, :], atol=1e-4)
 
 
@@ -809,6 +817,17 @@ def test_add_and_sub_take_the_non_none_channel_for_any_vn_dimensions(self_vn, ot
     b = LocalFourPoint(np.ones(shapes[other_vn]), SpinChannel.DENS, 1, other_vn, False, True)
     result = a - b if subtract else a + b
     assert result.channel == SpinChannel.DENS
+
+
+@pytest.mark.parametrize(
+    "operation, kwargs",
+    [("add", {}), ("add", {"copy": False}), ("sub", {}), ("sub", {"copy": False}), ("matmul", {})],
+)
+def test_channel_less_vertex_takes_the_interaction_channel(operation, kwargs):
+    """A channel-less LocalFourPoint plus, minus or times a density LocalInteraction is density, like two vertices."""
+    a = LocalFourPoint(np.ones((1, 1, 1, 1, 3, 4, 4)), SpinChannel.NONE, 1, 2, False, True)
+    u = LocalInteraction(np.ones((1, 1, 1, 1)), SpinChannel.DENS)
+    assert getattr(a, operation)(u, **kwargs).channel == SpinChannel.DENS
 
 
 def test_adds_local_four_point_and_scalar_correctly():

@@ -1334,7 +1334,7 @@ def _team_arnoldi(
         for c0 in range(0, basis.shape[1], chunk):
             basis[:kept, c0 : c0 + chunk] = vectors[:, :kept].T @ basis[:ncv, c0 : c0 + chunk]
         basis[kept : kept + n_block - 1] = basis[ncv:]
-        basis[kept + n_block - 1] = w / beta
+        basis[kept + n_block - 1] = fresh_direction(kept + n_block - 1) if spent else w / beta
         coupling = beta * vectors[-1, :kept] if n_block == 1 else rayleigh[ncv:] @ vectors[:, :kept]
         rayleigh[...] = 0.0
         rayleigh[:kept, :kept] = schur[:kept, :kept]
@@ -2807,8 +2807,9 @@ def _solve_pairing_sectors(
     sector hands the matvec its Hermitian sector projector :math:`\Pi` (parity ``eps_T`` under :math:`T O_U` and the
     Pauli-forced inversion parity ``eps_P = sign * eps_T``, see :func:`_project_gap_to_sector`) and projects the seed
     with it, and the residual of its leading gap under the raw kernel is logged (see
-    :func:`_log_sector_residual`); the ``"none"`` sector runs the raw kernel unchanged. The passed ``executor`` (the
-    momentum-batch thread pool, or ``None``) is shut down before returning.
+    :func:`_log_sector_residual`); the ``"none"`` sector runs the raw kernel unchanged. A sector on which ARPACK stops
+    with an error (a kernel that annihilates the seed, e.g. a sector it vanishes on) is solved by :func:`_team_arnoldi`
+    instead. The passed ``executor`` (the momentum-batch thread pool, or ``None``) is shut down before returning.
 
     :param mv: The sector matvec ``mv(gap, eps_t, eps_p)`` (maps a full-length gap vector to a full-length gap
         vector, projected onto the sector unless ``eps_t`` is ``None``).
@@ -2888,19 +2889,31 @@ def _solve_pairing_sectors(
                 else:
 
                     def solve(tol: float) -> tuple[np.ndarray, np.ndarray]:
+                        seed = _sector_seed(base_seed, gap_shape, eps_t, eps_p, u)
+                        ncv = min(lanczos_ncv(n_eig), shape_flat)
                         try:
                             return sp.sparse.linalg.eigsh(
                                 mat,
                                 k=n_eig,
                                 tol=tol,
-                                v0=_sector_seed(base_seed, gap_shape, eps_t, eps_p, u),
-                                ncv=min(lanczos_ncv(n_eig), shape_flat),
+                                v0=seed,
+                                ncv=ncv,
                                 which="LA",
                                 maxiter=LANCZOS_RESTARTS,
                             )
                         except sp.sparse.linalg.ArpackNoConvergence as exc:
                             # the converged subset is kept; the delivery sizes the gap transfer off what came back
                             return exc.eigenvalues.real, exc.eigenvectors
+                        except sp.sparse.linalg.ArpackError as exc:
+                            # ARPACK stops when the kernel annihilates the seed (e.g. a sector it vanishes on); the
+                            # team iteration continues from a fresh direction instead
+                            logger.info(
+                                f"{label}: {exc}; continuing with the team Arnoldi iteration.", allowed_ranks=ranks
+                            )
+                            lambdas, ritz, basis, _, _ = _team_arnoldi(
+                                counted_matvec, seed, n_eig, ncv, tol, LANCZOS_RESTARTS, None
+                            )
+                            return lambdas, (ritz.T @ basis).T
 
                     lambdas, gaps = _solve_loosening(solve, config.eliashberg.epsilon, n_eig, label, ranks)
                     if len(lambdas) < n_eig:

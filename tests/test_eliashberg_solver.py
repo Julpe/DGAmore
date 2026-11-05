@@ -1249,6 +1249,23 @@ def test_team_arnoldi_continues_from_a_fresh_direction_when_the_operator_annihil
             assert np.linalg.norm(h @ vec - lam * vec) <= 1e-6 * abs(lam) and abs(np.linalg.norm(vec) - 1) < 1e-8
 
 
+@pytest.mark.parametrize("ncv", [7, 9])
+def test_team_arnoldi_restarts_from_a_fresh_direction_when_the_last_image_of_a_fill_vanishes(ncv):
+    """A block restart after an image that vanished in the fill continues from a fresh direction to the leading pair."""
+    p, m = 4, 10
+    rng = np.random.default_rng(0)
+    b = rng.standard_normal((m, m))
+    # a nilpotent shift block: the chain of the first seed vanishes after p steps
+    h = np.zeros((p + m, p + m), dtype=complex)
+    h[:p, :p], h[p:, p:] = np.eye(p, k=-1), b + b.T + 10 * np.eye(m)
+    seeds = np.zeros((2, p + m), dtype=complex)
+    seeds[0, 0], seeds[1, p:] = 1.0, rng.standard_normal(m)
+    lambdas, ritz, basis, _, _ = es._team_arnoldi(lambda x: h @ x, seeds, 1, ncv, 1e-10, 300, None, 2)
+    vec = ritz[:, 0] @ basis
+    assert np.allclose(lambdas, np.linalg.eigvalsh(b + b.T + 10 * np.eye(m))[-1:], atol=1e-7)
+    assert np.linalg.norm(h @ vec - lambdas[0] * vec) <= 1e-6 * abs(lambdas[0])
+
+
 @pytest.mark.parametrize(
     "symmetries, nk, expected",
     [
@@ -3017,6 +3034,38 @@ def test_solve_pairing_sectors_runs_the_block_iteration_where_the_symmetry_force
     )
     ((lambdas, gaps),) = res.values()
     assert np.allclose(lambdas, np.sort(np.linalg.eigvals(h).real)[::-1][:n_eig], atol=1e-7)
+    for lam, gap in zip(lambdas, gaps):
+        assert np.linalg.norm(h @ gap.mat.reshape(-1) - lam * gap.mat.reshape(-1)) <= 1e-5
+
+
+@pytest.mark.parametrize("weight", [0.0, 1.0])
+def test_solve_pairing_sectors_survives_a_kernel_that_annihilates_the_seed(monkeypatch, weight):
+    """A seed in the kernel's null space, or a zero kernel, still gives the exact eigenpairs on one rank."""
+    m, n_eig = 20, 3
+    rng = np.random.default_rng(3)
+    b = rng.standard_normal((m, m))
+    h = np.kron(np.diag([0.0, weight]), b + b.T) + 0j
+    gap_shape = (2 * m, 1, 1, 1, 1, 1)
+    monkeypatch.setattr(es, "block_size", lambda k_grid, parity=None: 1)
+    config.eliashberg.n_eig = n_eig
+    config.eliashberg.epsilon = 1e-10
+    config.eliashberg.symmetrize_degenerate_gaps = False
+    config.eliashberg.resolve_parity_sectors = None
+    config.logger = MagicMock()
+
+    res = es._solve_pairing_sectors(
+        mv=lambda gap, eps_t, eps_p: h @ gap,
+        gap_shape=gap_shape,
+        sign=1,
+        channel=SpinChannel.SING,
+        nq=gap_shape[:3],
+        executor=None,
+        ranks=(0, 0),
+        base_seed=np.concatenate([rng.standard_normal(m), np.zeros(m)]) + 0j,
+        dtype=np.complex128,
+    )
+    ((lambdas, gaps),) = res.values()
+    assert np.allclose(lambdas, np.linalg.eigvalsh(h)[::-1][:n_eig], atol=1e-7)
     for lam, gap in zip(lambdas, gaps):
         assert np.linalg.norm(h @ gap.mat.reshape(-1) - lam * gap.mat.reshape(-1)) <= 1e-5
 
