@@ -298,7 +298,8 @@ separate momentum axes.
      - Full ladder vertex :math:`F^{\mathrm{q}\nu\nu'}_{\mathrm{r}}` (only written with ``save_fq``)
      - ``[nq_irr, no, no, no, no, niw_core + 1, 2 niv_core, 2 niv_core]``
    * - ``sigma_dga.npy``
-     - Converged non-local self-energy :math:`\Sigma^{\mathrm{k}}_{12}`
+     - Converged non-local self-energy :math:`\Sigma^{\mathrm{k}}_{12}` (read back when a run is resumed from a folder
+       without raw iterates)
      - ``[nkx, nky, nkz, no, no, 2 niv]``
    * - ``giwk_dga.npy``
      - Non-local Green's function built from the converged self-energy

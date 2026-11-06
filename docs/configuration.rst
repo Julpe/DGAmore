@@ -154,8 +154,9 @@ between ``linear``, ``pulay`` and ``anderson`` mixing; the latter two build a se
 collected in memory as the run iterates, and mix linearly for the first ``mixing_history_length`` iterations while
 those pairs accumulate. The ``previous_sc_path`` field points to
 the folder (``LDGA_...``) of an earlier, possibly unconverged, self-consistency run: the code then resumes from the
-last iteration found in its ``Sigma_Iterates`` subfolder (or in the run folder itself for older runs) and from its
-chemical potential, and continues converging. With ``use_jacobian_stabilization`` on, every iteration also writes
+last iteration found in its ``Sigma_Iterates`` subfolder (or in the run folder itself for older runs), or from its
+final ``sigma_dga.npy`` with the iteration count restarting at 1 if it kept no iterates, and from its chemical
+potential, and continues converging. With ``use_jacobian_stabilization`` on, every iteration also writes
 the core window of the un-mixed proposal (``sigma_dga_proposal_iteration_<i>.npy``) next to the mixed self-energy.
 The resumed run
 rebuilds the accelerated-mixing history from scratch, mixing linearly for the first ``mixing_history_length``

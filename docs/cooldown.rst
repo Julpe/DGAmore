@@ -274,9 +274,12 @@ At the start of the cycle, the predecessor's result becomes the rung's starting 
 * The cycle looks for ``sigma_dga_interpolated_beta<b>_niv<n>.npy`` in ``previous_sc_path`` and, if several exist,
   takes the one whose ``<b>`` is closest to the rung's inverse temperature. Without ``use_interpolated_sigma`` it
   takes the raw ``sigma_dga_iteration_<i>.npy`` with the highest ``<i>`` instead. Either way the iteration count
-  continues from the highest raw iterate. Beyond its name the file carries no metadata, so its content is taken at
-  face value as a self-energy at the rung's own temperature; a predecessor aimed at the wrong ``target_beta`` is
-  only caught when a better-matching file sits next to it.
+  continues from the highest raw iterate. A finished predecessor that kept no raw iterates (its ``Sigma_Iterates``
+  subfolder deleted, say) is resumed from its final ``sigma_dga.npy``, the same array as its last iterate, or from
+  its interpolated file; its iteration count is then unknown, so the rung starts at iteration 1 and logs a warning.
+  Beyond its name the file carries no metadata, so its content is taken at face value as a self-energy at the rung's
+  own temperature; a predecessor aimed at the wrong ``target_beta`` is only caught when a better-matching file sits
+  next to it.
 * The raw iterates ``sigma_dga_iteration_<i>.npy`` live in the ``Sigma_Iterates`` subfolder of the run folder (a
   predecessor written before that subfolder existed keeps them in the run folder itself, which is searched as the
   fallback), together with the core window of the un-mixed proposals ``sigma_dga_proposal_iteration_<i>.npy``, which
@@ -346,8 +349,9 @@ The only positive evidence that the chain engaged is the log line
 
    Using previous calculation and starting the self-consistency loop at iteration N.
 
-with an iteration number that continues from the predecessor. If ``previous_sc_path`` does not exist, or holds no
-file matching the requested pattern, the run starts cold from DMFT *without any warning* and finishes with
+with an iteration number that continues from the predecessor, or iteration 1 after a warning when the predecessor
+kept no raw iterates and the rung resumed from its ``sigma_dga.npy``. If ``previous_sc_path`` does not exist, or
+holds no file matching the requested pattern, the run starts cold from DMFT *without any warning* and finishes with
 plausible-looking output. The usual way to end up there is a predecessor that ran with ``do_interpolation`` set to
 ``False`` while the successor asks for ``use_interpolated_sigma``. The two flags live in different sections and
 nothing cross-validates them, so check the log of every rung.
@@ -1154,7 +1158,8 @@ The cooldown, step by step:
    the configured ``mixing``, a smaller ``mixing`` for this rung is worth considering. With the flag
    on, the rung also reads the predecessor's ``jacobian.npz``; nothing has to be configured for that.
 6. Run it and check the log for ``Using previous calculation and starting the self-consistency loop at iteration
-   N`` with an iteration number that continues from the predecessor; without that line the rung started cold.
+   N`` with an iteration number that continues from the predecessor (iteration 1 if it kept no raw iterates); without
+   that line the rung started cold.
 7. If the rung stops at ``max_iter``, do not chain from it. Either resume it at the same temperature
    (``previous_sc_path`` pointing at its own folder, ``use_interpolated_sigma: False``), insert an intermediate
    temperature, or switch on one flag of the :ref:`stabilization section <stabilization>` for that rung and rerun
