@@ -63,7 +63,7 @@ EVEN_SECTOR_DEGENERACY = 1e-2  # largest relative difference of the leading sing
 # at which even_sectors_degenerate reports them as coinciding
 SECTOR_RESIDUAL_WARNING = 1e-4  # residual (over max(|rho|, 1)) of a sector's leading gap under the unprojected kernel
 # above which (or above ten times a larger eigensolver tolerance) the parity sectors are reported as no symmetry of it
-LANCZOS_RESTARTS = 3000  # restart cap of one eigensolver attempt, after which _solve_loosening retries the sector
+LANCZOS_MATVECS = 3000  # matvec cap of one eigensolver attempt, after which _solve_loosening retries the sector
 TOLERANCE_LOOSENING = 1e2  # factor of each of the at most two looser retries of an unconverged sector
 
 
@@ -188,9 +188,7 @@ def _build_ladder_vertex_chunk(
     gamma_r: LocalFourPoint,
     gchi0_q_inv: FourPoint,
     vrg_q_r_left: FourPoint,
-    chi_phys_q_r: FourPoint,
-    u_loc: LocalInteraction,
-    u_r: Interaction,
+    middle_q_r: FourPoint,
     w_start: int,
     w_stop: int,
     niv_pp: int | None,
@@ -198,28 +196,30 @@ def _build_ladder_vertex_chunk(
 ) -> FourPoint:
     r"""
     Builds the full ladder vertex :math:`F^{\mathrm{q}}_{r}` for the momenta of the inputs and the bosonic window
-    ``[w_start, w_stop)``, i.e. the amputated auxiliary susceptibility plus the separable interaction part. The
-    right-sided three-leg vertex :math:`\tilde\gamma^{\mathrm{q}\nu'}_{r;1234} = \beta \sum_{ab}\sum_{\nu}
-    \chi^{*;\mathrm{q}\nu\nu'}_{r;12ab} (\chi^{\mathrm{q}\nu'}_{0;ba34})^{-1}` of the separable part sums the
-    auxiliary susceptibility over its first frequency, which the build takes from the same inversion (exact also where
-    the Bethe-Salpeter matrix is not complex-symmetric). The Bethe-Salpeter matrix is built one compound slice at a
-    time from the local vertex and the inverse bubble, never as a whole window.
+    ``[w_start, w_stop)`` from the ladder of :math:`\Gamma_{r}` alone: its amputated susceptibility plus the separable
+    part :math:`(\gamma^{\Gamma}_{r} Y_{r}) \tilde\gamma^{\Gamma}_{r}` with the matrix :math:`Y_{r}` between the
+    three-leg vertices (see :func:`~dgamore.nonlocal_sde.create_ladder_vertex_middle`). This is the vertex of the
+    auxiliary ladder (shift :math:`U_{r}`), written so that no inversion meets the zero eigenvalues the auxiliary
+    Bethe-Salpeter matrix can have where the physical susceptibility is regular. The right-sided three-leg vertex
+    :math:`\tilde\gamma^{\Gamma;\mathrm{q}\nu'}_{r;1234} = \beta \sum_{ab}\sum_{\nu}
+    \chi^{\Gamma;\mathrm{q}\nu\nu'}_{r;12ab} (\chi^{\mathrm{q}\nu'}_{0;ba34})^{-1}` sums the ladder susceptibility
+    over its first frequency, which the build takes from the same inversion (exact also where the Bethe-Salpeter matrix
+    is not complex-symmetric). The Bethe-Salpeter matrix is built one compound slice at a time from the local vertex
+    and the inverse bubble, never as a whole window.
 
-    With ``niv_pp`` given, only what the :math:`\omega' = 0` pp band reads is built: the auxiliary susceptibility on
-    the anti-diagonal :math:`\nu + \nu' = \omega` of the pp box (see
+    With ``niv_pp`` given, only what the :math:`\omega' = 0` pp band reads is built: the ladder susceptibility on the
+    anti-diagonal :math:`\nu + \nu' = \omega` of the pp box (see
     :meth:`FourPoint.invert_with_local_kernel_on_anti_diagonal`, with the inverse bubble as the frequency-diagonal
-    part, the kernel :math:`\Gamma_{r}`, the shift :math:`U_{r}` and the scale :math:`1/\beta^2`), and the whole
-    chain on the pp box, so the result is exact on that anti-diagonal only. With ``niv_pp`` None the whole core box
-    is inverted (see :meth:`FourPoint.invert_with_local_kernel`) and every entry is exact (the streamed full
-    vertex).
+    part, the kernel :math:`\Gamma_{r}`, a zero shift and the scale :math:`1/\beta^2`), and the whole chain on the pp
+    box, so the result is exact on that anti-diagonal only. With ``niv_pp`` None the whole core box is inverted (see
+    :meth:`FourPoint.invert_with_local_kernel`) and every entry is exact (the streamed full vertex).
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel, from :math:`\omega = 0` on
         (half bosonic range) or on the full range.
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` of the momenta.
-    :param vrg_q_r_left: The three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}` of the momenta.
-    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{phys};\mathrm{q}}_{r}` of the momenta.
-    :param u_loc: The bare local interaction :math:`U`.
-    :param u_r: The channel-projected total interaction :math:`\mathcal{U}^{\mathbf{q}}_{r}`.
+    :param vrg_q_r_left: The three-leg vertex :math:`\gamma^{\Gamma;\mathrm{q}\nu}_{r}` of the ladder of
+        :math:`\Gamma_{r}` of the momenta.
+    :param middle_q_r: The matrix :math:`Y^{\mathrm{q}}_{r}` between the three-leg vertices of the momenta.
     :param w_start: First bosonic index of the window.
     :param w_stop: One past the last bosonic index of the window.
     :param niv_pp: Number of positive fermionic frequencies of the pp box, or None for the whole core box.
@@ -227,28 +227,27 @@ def _build_ladder_vertex_chunk(
     :return: The ladder vertex over that window as a :class:`FourPoint` (half niw range, two fermionic dimensions).
     """
     beta = config.sys.beta
-    u_r_loc = u_loc.as_channel(gamma_r.channel)
+    zero = LocalInteraction(np.zeros((gamma_r.n_bands,) * 4), gamma_r.channel)
     gchi0_w = gchi0_q_inv.take_wn_slice(w_start, w_stop)
     vrg_left_w = vrg_q_r_left.take_wn_slice(w_start, w_stop)
     if niv_pp is None:
-        chi_aux = gchi0_w.invert_with_local_kernel(gamma_r, u_r_loc, 1.0 / beta**2, w_start)
-        chi_aux_first_sum = chi_aux.sum_over_vn(beta, axis=(-2,))
+        chi_ladder = gchi0_w.invert_with_local_kernel(gamma_r, zero, 1.0 / beta**2, w_start)
+        chi_ladder_first_sum = chi_ladder.sum_over_vn(beta, axis=(-2,))
     else:
-        chi_aux, chi_aux_first_sum = gchi0_w.invert_with_local_kernel_on_anti_diagonal(
-            gamma_r, u_r_loc, 1.0 / beta**2, beta, niv_pp, w_start, inactive_pairs
+        chi_ladder, chi_ladder_first_sum = gchi0_w.invert_with_local_kernel_on_anti_diagonal(
+            gamma_r, zero, 1.0 / beta**2, beta, niv_pp, w_start, inactive_pairs
         )
         gchi0_w = gchi0_w.cut_niv(niv_pp)
         vrg_left_w = vrg_left_w.cut_niv(niv_pp)
 
-    # chi* is released right after the first matmul and its product by rebinding; the bubble term enters in place
-    f_chunk = gchi0_w @ chi_aux
-    del chi_aux
+    # chi is released right after the first matmul and its product by rebinding; the bubble term enters in place
+    f_chunk = gchi0_w @ chi_ladder
+    del chi_ladder
     f_chunk = f_chunk @ gchi0_w
     f_chunk = f_chunk.scale(-(beta**2)).add_on_vn_diagonal(gchi0_w, factor=beta**2)
 
-    vrg_right_w = (chi_aux_first_sum @ gchi0_w).scale(beta)
-    chi_phys_w = chi_phys_q_r.take_wn_slice(w_start, w_stop)
-    return f_chunk.add((vrg_left_w @ u_r - vrg_left_w @ (u_r @ chi_phys_w @ u_r)) * vrg_right_w, copy=False)
+    vrg_right_w = (chi_ladder_first_sum @ gchi0_w).scale(beta)
+    return f_chunk.add((vrg_left_w @ middle_q_r.take_wn_slice(w_start, w_stop)) * vrg_right_w, copy=False)
 
 
 def _build_rpa_vertex_chunk(chi_q_r: FourPoint, u_r: Interaction, w_start: int, w_stop: int, niv: int) -> FourPoint:
@@ -321,9 +320,10 @@ def _build_pairing_vertex_pp(
     Shared loop of the slice-direct pairing-vertex construction: walks the rank-local momenta and, per momentum, the
     bosonic axis in byte-bounded chunks, building each ladder-vertex chunk once and reading its :math:`\omega' = 0`
     pp band (see :func:`_pp_w0_band`). When ``chunk_writer`` is given, every ph-notation chunk is handed to it before
-    being released, so a caller can stream the full vertex to disk in the same pass. Without a local vertex the
-    chunks are the RPA vertex of the saved physical susceptibility (see :func:`_build_rpa_vertex_chunk`), the only
-    intermediate read then.
+    being released, so a caller can stream the full vertex to disk in the same pass. The ladder chunks read the saved
+    inverse bubble, three-leg vertex and vertex middle of the ladder of :math:`\Gamma_{r}` (see
+    :func:`_build_ladder_vertex_chunk`). Without a local vertex the chunks are the RPA vertex of the saved physical
+    susceptibility (see :func:`_build_rpa_vertex_chunk`), the only intermediate read then.
 
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
@@ -345,13 +345,14 @@ def _build_pairing_vertex_pp(
         vrg_q_r_left = FourPoint.load(
             os.path.join(path, f"vrg_q_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=1
         )
-    chi_phys_q_r = FourPoint.load(
-        os.path.join(path, f"chi_phys_q_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=0
+    bosonic_name = "vrg_middle_q" if gamma_r is not None else "chi_phys_q"
+    bosonic_q_r = FourPoint.load(
+        os.path.join(path, f"{bosonic_name}_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=0
     )
     logger.info(f"Loaded the intermediates for the {channel.value} pairing vertex.")
 
     my_irr_q_list = config.lattice.k_grid.get_irrq_list()[mpi_dist_irrk.my_slice]
-    niw_stored = chi_phys_q_r.current_shape[-1] - 1
+    niw_stored = bosonic_q_r.current_shape[-1] - 1
     _, omega = _pp_w0_band(niv_pp, niw_stored)
     # the pp band only reads |w| <= 2 niv_pp - 1, but a streamed full vertex must cover the whole stored box
     niw_build = niw_stored if chunk_writer is not None else int(np.max(omega))
@@ -359,7 +360,7 @@ def _build_pairing_vertex_pp(
     n_bands = config.sys.n_bands
     # orbital pairs without vertex are eliminated from every slice, as in the kernel step's auxiliary susceptibility
     inactive = None if gamma_r is None else gamma_r.orbital_pairs_without_vertex(u_loc.as_channel(channel))
-    f_pp_mat = np.zeros((len(my_irr_q_list),) + (n_bands,) * 4 + (2 * niv_pp,) * 2, dtype=chi_phys_q_r.mat.dtype)
+    f_pp_mat = np.zeros((len(my_irr_q_list),) + (n_bands,) * 4 + (2 * niv_pp,) * 2, dtype=bosonic_q_r.mat.dtype)
 
     # the budget bounds a chunk's two-fermion window on the box its chain runs on (pp box for the band, core box for a
     # streamed full vertex): as many whole momenta as fit, else one momentum's bosonic axis is chunked
@@ -375,22 +376,20 @@ def _build_pairing_vertex_pp(
             if gamma_r is not None:
                 gchi0_grp = gchi0_q_inv.take_q_index_slice(q_start, q_stop)
                 vrg_left_grp = vrg_q_r_left.take_q_index_slice(q_start, q_stop)
-            chi_phys_grp = chi_phys_q_r.take_q_index_slice(q_start, q_stop)
-            v_nonloc_grp = v_nonloc.take_q_index_slice(q_start, q_stop)
-            u_r = u_loc.as_channel(channel) + v_nonloc_grp.as_channel(channel)
+            else:
+                u_r = u_loc.as_channel(channel) + v_nonloc.take_q_index_slice(q_start, q_stop).as_channel(channel)
+            bosonic_grp = bosonic_q_r.take_q_index_slice(q_start, q_stop)
 
             for w_start in range(0, niw_build + 1, w_chunk):
                 w_stop = min(w_start + w_chunk, niw_build + 1)
                 if gamma_r is None:
-                    f_chunk = _build_rpa_vertex_chunk(chi_phys_grp, u_r, w_start, w_stop, niv_window)
+                    f_chunk = _build_rpa_vertex_chunk(bosonic_grp, u_r, w_start, w_stop, niv_window)
                 else:
                     f_chunk = _build_ladder_vertex_chunk(
                         gamma_r,
                         gchi0_grp,
                         vrg_left_grp,
-                        chi_phys_grp,
-                        u_loc,
-                        u_r,
+                        bosonic_grp,
                         w_start,
                         w_stop,
                         None if chunk_writer is not None else niv_pp,
@@ -404,16 +403,17 @@ def _build_pairing_vertex_pp(
             if gamma_r is not None:
                 gchi0_grp.free()
                 vrg_left_grp.free()
-            chi_phys_grp.free()
+            bosonic_grp.free()
 
     if gamma_r is not None:
         gchi0_q_inv.free()
         vrg_q_r_left.free()
-    chi_phys_q_r.free()
+    bosonic_q_r.free()
 
     delete_files(
         path,
         f"vrg_q_{channel.value}_rank_{rank}.npy",
+        f"vrg_middle_q_{channel.value}_rank_{rank}.npy",
         f"chi_phys_q_{channel.value}_rank_{rank}.npy",
     )
 
@@ -1186,11 +1186,11 @@ def _finish_sector(
 
 def _solve_loosening(solve: Callable[[float], tuple], tol: float, n_eig: int, label: str, ranks) -> tuple:
     r"""
-    Returns the eigensolver's result at ``tol`` once it delivers ``n_eig`` eigenpairs within ``LANCZOS_RESTARTS``
-    restarts, else retries at a tolerance ``TOLERANCE_LOOSENING`` times looser, twice at most, with a warning each
-    time, and returns the last attempt whatever it delivered. In single precision a sector whose eigenvalues are small
-    against the rest of the kernel cannot reach a relative tolerance below the kernel's absolute rounding, and the
-    eigensolver would run to its restart cap for nothing.
+    Returns the eigensolver's result at ``tol`` once it delivers ``n_eig`` eigenpairs within ``LANCZOS_MATVECS``
+    operator applications, else retries at a tolerance ``TOLERANCE_LOOSENING`` times looser, twice at most, with a
+    warning each time, and returns the last attempt whatever it delivered. In single precision a sector whose
+    eigenvalues are small against the rest of the kernel cannot reach a relative tolerance below the kernel's absolute
+    rounding, and the eigensolver would run to its matvec cap for nothing.
 
     :param solve: Runs the eigensolver at a tolerance; the first entry of its result holds the converged eigenvalues.
     :param tol: The tolerance of the first attempt.
@@ -1204,7 +1204,7 @@ def _solve_loosening(solve: Callable[[float], tuple], tol: float, n_eig: int, la
         if len(result[0]) >= n_eig or attempt == 2:
             return result
         config.logger.warning(
-            f"Lanczos for {label} did not converge to {tol:.0e} within {LANCZOS_RESTARTS} restarts; retrying at "
+            f"Lanczos for {label} did not converge to {tol:.0e} within {LANCZOS_MATVECS} matvecs; retrying at "
             f"{tol * TOLERANCE_LOOSENING:.0e}.",
             allowed_ranks=ranks,
         )
@@ -1217,7 +1217,7 @@ def _team_arnoldi(
     n_eig: int,
     ncv: int,
     tol: float,
-    maxiter: int,
+    max_matvec: int,
     team_comm: MPI.Comm | None,
     n_block: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, float]:
@@ -1237,8 +1237,9 @@ def _team_arnoldi(
     at most ``tol`` times the modulus of its Ritz value. Otherwise the Schur form of the Rayleigh quotient is
     reordered so that the ``n_eig`` wanted Ritz values and half of the rest lead, and the basis is compacted to
     those Schur vectors plus the residual direction before the iteration continues. Stops when the wanted pairs have
-    converged or after ``maxiter`` restarts, returning the converged pairs in either case; the eigenvalues are
-    returned as real parts, the way scipy's ``eigsh`` reports a complex operator's spectrum.
+    converged or at the first full basis after ``max_matvec`` operator applications, returning the converged pairs in
+    either case; the eigenvalues are returned as real parts, the way scipy's ``eigsh`` reports a complex operator's
+    spectrum.
 
     With ``n_block > 1`` it is the block (band) variant: the basis starts from ``n_block`` orthonormalized seeds, the
     image of basis vector :math:`j` is orthogonalized against the first :math:`j + n_\mathrm{block}` vectors and
@@ -1253,7 +1254,7 @@ def _team_arnoldi(
     :param n_eig: Number of wanted eigenpairs.
     :param ncv: Size of the Krylov basis (``n_eig < ncv``).
     :param tol: Relative residual tolerance of a Ritz pair.
-    :param maxiter: Maximum number of restarts.
+    :param max_matvec: Number of operator applications after which the next full basis ends the iteration.
     :param team_comm: The team communicator, or ``None`` for a single process holding the whole vectors.
     :param n_block: Number of starting vectors, the largest eigenvalue multiplicity resolved in exact arithmetic.
     :return: ``(lambdas, ritz, basis, n_matvec, matvec_seconds)``: the converged eigenvalues in descending order,
@@ -1291,7 +1292,7 @@ def _team_arnoldi(
         w = w - dots(basis[:i], w) @ basis[:i]
         basis[i] = w / norm(w)
     del seed_block, seeds
-    j, restarts = 0, 0
+    j = 0
     while True:
         start = time.perf_counter()
         w = apply_block(basis[j].copy()).reshape(-1).astype(dtype, copy=False)
@@ -1320,7 +1321,7 @@ def _team_arnoldi(
         theta, ritz = theta[order], ritz[:, order]
         residual = beta * np.abs(ritz[-1]) if n_block == 1 else np.linalg.norm(rayleigh[ncv:] @ ritz, axis=0)
         converged = residual <= tol * np.abs(theta)
-        if converged[:n_eig].all() or restarts >= maxiter:
+        if converged[:n_eig].all() or n_matvec >= max_matvec:
             chosen = [i for i in range(n_eig) if converged[i]]
             return theta[chosen].real, ritz[:, chosen], basis[:ncv], n_matvec, matvec_seconds
         # Krylov-Schur restart: the wanted Ritz values and half of the rest lead the reordered Schur form
@@ -1340,7 +1341,6 @@ def _team_arnoldi(
         rayleigh[:kept, :kept] = schur[:kept, :kept]
         rayleigh[kept : kept + n_block, :kept] = coupling
         j = kept
-        restarts += 1
 
 
 def _crossed_term(direct: np.ndarray, sign: int, v0: int = 0, v1: int | None = None) -> np.ndarray:
@@ -2743,7 +2743,7 @@ def _solve_team_sectors(
                     n_eig,
                     ncv,
                     t,
-                    LANCZOS_RESTARTS,
+                    LANCZOS_MATVECS,
                     team_comm,
                     n_block,
                 )
@@ -2762,7 +2762,7 @@ def _solve_team_sectors(
         )
         if len(lambdas) < n_eig:
             logger.warning(
-                f"Lanczos for {label} did not converge within the restart limit; keeping the {len(lambdas)} of "
+                f"Lanczos for {label} did not converge within the matvec limit; keeping the {len(lambdas)} of "
                 f"{n_eig} converged eigenpair(s).",
                 allowed_ranks=ranks,
             )
@@ -2869,7 +2869,7 @@ def _solve_pairing_sectors(
                             n_eig,
                             min(lanczos_ncv(n_eig), shape_flat),
                             t,
-                            LANCZOS_RESTARTS,
+                            LANCZOS_MATVECS,
                             None,
                             n_block,
                         ),
@@ -2882,7 +2882,7 @@ def _solve_pairing_sectors(
                     del basis
                     if len(lambdas) < n_eig:
                         logger.warning(
-                            f"Lanczos for {label} did not converge within the restart limit; keeping the "
+                            f"Lanczos for {label} did not converge within the matvec limit; keeping the "
                             f"{len(lambdas)} of {n_eig} converged eigenpair(s).",
                             allowed_ranks=ranks,
                         )
@@ -2892,6 +2892,7 @@ def _solve_pairing_sectors(
                         seed = _sector_seed(base_seed, gap_shape, eps_t, eps_p, u)
                         ncv = min(lanczos_ncv(n_eig), shape_flat)
                         try:
+                            # ARPACK counts restarts, each of at most ncv - n_eig products after the first basis
                             return sp.sparse.linalg.eigsh(
                                 mat,
                                 k=n_eig,
@@ -2899,7 +2900,7 @@ def _solve_pairing_sectors(
                                 v0=seed,
                                 ncv=ncv,
                                 which="LA",
-                                maxiter=LANCZOS_RESTARTS,
+                                maxiter=(LANCZOS_MATVECS - ncv) // (ncv - n_eig) + 1,
                             )
                         except sp.sparse.linalg.ArpackNoConvergence as exc:
                             # the converged subset is kept; the delivery sizes the gap transfer off what came back
@@ -2911,14 +2912,14 @@ def _solve_pairing_sectors(
                                 f"{label}: {exc}; continuing with the team Arnoldi iteration.", allowed_ranks=ranks
                             )
                             lambdas, ritz, basis, _, _ = _team_arnoldi(
-                                counted_matvec, seed, n_eig, ncv, tol, LANCZOS_RESTARTS, None
+                                counted_matvec, seed, n_eig, ncv, tol, LANCZOS_MATVECS, None
                             )
                             return lambdas, (ritz.T @ basis).T
 
                     lambdas, gaps = _solve_loosening(solve, config.eliashberg.epsilon, n_eig, label, ranks)
                     if len(lambdas) < n_eig:
                         logger.warning(
-                            f"Lanczos for {label} did not converge within the iteration limit; keeping the "
+                            f"Lanczos for {label} did not converge within the matvec limit; keeping the "
                             f"{len(lambdas)} of {n_eig} converged eigenpair(s).",
                             allowed_ranks=ranks,
                         )

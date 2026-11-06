@@ -479,7 +479,7 @@ are expected in the folder given by ``input_path``, with ``fname_1p`` and ``fnam
 two-particle results. The two-particle Green's function is always symmetrized under the exchange of its two
 fermionic frequencies :math:`(\nu, \nu')` on load: this is the time-reversal-plus-inversion symmetry that makes the
 right three-leg vertex the first-frequency-summed transpose of the left one, so both are obtained from a single
-auxiliary susceptibility sum. The same symmetry lets the double-counting kernel of the Schwinger-Dyson equation
+summed ladder susceptibility. The same symmetry lets the double-counting kernel of the Schwinger-Dyson equation
 read its summed (second) frequency argument off the stored first axis of the local vertex. That kernel subtracts
 the local part of the transversal ladder term, :math:`\tfrac12(F_{\mathrm{d}} + 3F_{\mathrm{m}})` (see
 :func:`dgamore.local_sde.double_counting_vertex`), paired with the density form of the local equation.

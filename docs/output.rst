@@ -414,7 +414,8 @@ vertex to ``eliashberg_path``, one file per MPI rank, so that the vertex can be 
 written once: in the last scheduled iteration or, when the loop converges earlier, by one more kernel pass on the
 converged self-energy, whose Green's function the particle-particle bubble of the Eliashberg step uses as well. Their
 leading axis holds only the irreducible momenta of the writing rank, and they are deleted once the vertex has been
-built. With ``misc.do_flex`` or ``misc.do_rpa`` only the physical susceptibilities are written.
+built. Ladder runs write the first three files of the table; with ``misc.do_flex`` or ``misc.do_rpa`` only the
+physical susceptibilities are written.
 
 .. list-table::
    :header-rows: 1
@@ -427,8 +428,13 @@ built. With ``misc.do_flex`` or ``misc.do_rpa`` only the physical susceptibiliti
      - Inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` on the core box
      - ``[nq_rank, no, no, no, no, niw_core + 1, 2 niv_core]``
    * - ``vrg_q_<channel>_rank_<r>.npy``
-     - Three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{\mathrm{r}}`
+     - Three-leg vertex :math:`\gamma^{\Gamma;\mathrm{q}\nu}_{\mathrm{r}}` of the ladder of :math:`\Gamma_{\mathrm{r}}`
+       alone
      - ``[nq_rank, no, no, no, no, niw_core + 1, 2 niv_core]``
+   * - ``vrg_middle_q_<channel>_rank_<r>.npy``
+     - Matrix :math:`Y^{\mathrm{q}}_{\mathrm{r}}` between the three-leg vertices of the ladder vertex (see
+       :func:`dgamore.nonlocal_sde.create_ladder_vertex_middle`)
+     - ``[nq_rank, no, no, no, no, niw_core + 1]``
    * - ``chi_phys_q_<channel>_rank_<r>.npy``
      - Physical susceptibility of that rank's momenta
      - ``[nq_rank, no, no, no, no, niw_core + 1]``

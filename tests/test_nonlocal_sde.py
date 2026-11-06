@@ -606,6 +606,145 @@ def test_auxiliary_chi_r_q_chain_resums_to_the_ladder_with_the_nonlocal_rung():
     assert np.allclose(chain.mat, direct.mat, atol=1e-8)
 
 
+def _middle_inputs(o: int, q: int, nw: int, seed: int):
+    """Random summed Gamma ladder X_G (density), bubble sums, U and V(q) for the ladder-vertex middle tests."""
+    rng = np.random.default_rng(seed)
+    c = lambda *s: rng.standard_normal(s) + 1j * rng.standard_normal(s)
+    meta = ((q, 1, 1), 1, 0, False, True, True)
+    x_g = FourPoint(0.3 * c(q, o, o, o, o, nw), SpinChannel.DENS, *meta)
+    sums = [FourPoint(0.1 * c(q, o, o, o, o, nw), SpinChannel.NONE, *meta) for _ in range(2)]
+    v_nonloc = Interaction(0.1 * rng.standard_normal((q,) + (o,) * 4), SpinChannel.NONE, (q, 1, 1), True)
+    return x_g, sums, LocalInteraction(rng.standard_normal((o,) * 4)), v_nonloc
+
+
+def _auxiliary_middle(x_g, u_loc, v_nonloc, chi_hat):
+    """The auxiliary form (1 - U X_G)^-1 (U~ - U~ chi^ U~)(1 - X_G U)^-1 - (1 - U X_G)^-1 U of the vertex middle."""
+    u_r = u_loc.as_channel(x_g.channel)
+    u_tot = u_r + v_nonloc.as_channel(x_g.channel)
+    one = LocalInteraction(np.einsum("ad,bc->abcd", np.eye(x_g.n_bands), np.eye(x_g.n_bands)))
+    left = ((u_r @ x_g).scale(-1.0) + one).invert()
+    right = ((x_g @ u_r).scale(-1.0) + one).invert()
+    return left @ ((u_tot @ chi_hat @ u_tot).scale(-1.0) + u_tot) @ right - left @ u_r
+
+
+@pytest.mark.parametrize("o", [1, 2])
+@pytest.mark.parametrize("lam", [0.0, 0.3])
+def test_ladder_vertex_middle_is_the_auxiliary_separable_part_of_the_vertex(monkeypatch, o, lam):
+    """Y equals (1 - U X_G)^-1 (U~ - U~ chi^ U~)(1 - X_G U)^-1 - (1 - U X_G)^-1 U, the auxiliary form, with and
+    without a lambda-corrected chi^."""
+    monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
+    x_g, (full, core), u_loc, v_nonloc = _middle_inputs(o, 3, 4, 41)
+    x_star = (x_g.invert() - u_loc.as_channel(SpinChannel.DENS)).invert()
+    chi = nonlocal_sde.create_generalized_chi_q_with_shell_correction(x_star, full, core, u_loc, v_nonloc)
+    one = LocalInteraction(np.einsum("ad,bc->abcd", np.eye(o), np.eye(o)))
+    chi_hat = (chi.invert() + one.scale(lam, copy=True)).invert()
+
+    middle = nonlocal_sde.create_ladder_vertex_middle(x_g, full, core, u_loc, v_nonloc, chi, chi_hat)
+
+    ref = _auxiliary_middle(x_g, u_loc, v_nonloc, chi_hat)
+    assert middle.channel == SpinChannel.DENS and middle.num_vn_dimensions == 0
+    assert np.allclose(middle.mat, ref.mat, rtol=0.0, atol=1e-12 * np.abs(ref.mat).max())
+
+
+def test_ladder_vertex_middle_stays_well_conditioned_at_a_zero_of_the_auxiliary_ladder(monkeypatch):
+    """At 1 - U X_G = 1e-9, where the auxiliary ladder is singular, the complex64 middle matches the complex128 one,
+    while the auxiliary form cannot even be formed in complex64, where U X_G rounds to one."""
+    x_g, (full, core), _, _ = _middle_inputs(1, 1, 1, 42)
+    x, u = 0.4, (1.0 - 1e-9) / 0.4
+    out = {}
+    for dtype in (np.complex64, np.complex128):
+        monkeypatch.setattr("dgamore.n_point_base.DTYPE", dtype)
+        x_g.mat, full.mat, core.mat = np.full((1,) * 6, x), np.full((1,) * 6, 0.05), np.zeros((1,) * 6)
+        v_nonloc = Interaction(np.zeros((1,) * 5), SpinChannel.NONE, (1, 1, 1), True)
+        u_loc = LocalInteraction(np.full((1,) * 4, u))
+        chi = nonlocal_sde.create_generalized_chi_q_with_shell_correction(x_g, full, core, u_loc, v_nonloc)
+        out[dtype] = nonlocal_sde.create_ladder_vertex_middle(x_g, full, core, u_loc, v_nonloc, chi, chi).mat
+        if dtype is np.complex64:
+            with pytest.raises(np.linalg.LinAlgError):
+                _auxiliary_middle(x_g, u_loc, v_nonloc, chi)
+    assert np.allclose(out[np.complex64], out[np.complex128], rtol=1e-6, atol=0.0)
+
+
+@pytest.mark.parametrize("o", [1, 2])
+def test_gamma_ladder_chi_is_the_shell_corrected_auxiliary_chi(monkeypatch, o):
+    """[X_G + S (1 - U X_G)] D^-1 equals the shell correction of the auxiliary sum X* = (X_G^-1 - U)^-1."""
+    monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
+    x_g, (full, core), u_loc, v_nonloc = _middle_inputs(o, 3, 4, 43)
+    x_star = (x_g.invert() - u_loc.as_channel(SpinChannel.DENS)).invert()
+    ref = nonlocal_sde.create_generalized_chi_q_with_shell_correction(x_star, full, core, u_loc, v_nonloc)
+
+    chi = nonlocal_sde.create_shell_corrected_chi_from_gamma_ladder(x_g, full, core, u_loc, v_nonloc)
+
+    assert chi.channel == SpinChannel.DENS and chi.num_vn_dimensions == 0
+    assert np.allclose(chi.mat, ref.mat, rtol=0.0, atol=1e-12 * np.abs(ref.mat).max())
+
+
+def test_gamma_ladder_chi_stays_well_conditioned_at_a_zero_of_the_auxiliary_ladder(monkeypatch):
+    """At 1 - U X_G = 1e-9, where the auxiliary ladder is singular, the complex64 chi matches the complex128 one,
+    while the auxiliary sum X* = X_G (1 - U X_G)^-1 cannot even be formed in complex64, where U X_G rounds to one."""
+    x_g, (full, core), _, _ = _middle_inputs(1, 1, 1, 42)
+    out = {}
+    for dtype in (np.complex64, np.complex128):
+        monkeypatch.setattr("dgamore.n_point_base.DTYPE", dtype)
+        x_g.mat, full.mat, core.mat = np.full((1,) * 6, 0.4), np.full((1,) * 6, 0.05), np.zeros((1,) * 6)
+        v_nonloc = Interaction(np.zeros((1,) * 5), SpinChannel.NONE, (1, 1, 1), True)
+        u_loc = LocalInteraction(np.full((1,) * 4, (1.0 - 1e-9) / 0.4))
+        out[dtype] = nonlocal_sde.create_shell_corrected_chi_from_gamma_ladder(x_g, full, core, u_loc, v_nonloc).mat
+        if dtype is np.complex64:
+            one = LocalInteraction(np.ones((1,) * 4))
+            with pytest.raises(np.linalg.LinAlgError):
+                x_star = x_g @ ((u_loc.as_channel(SpinChannel.DENS) @ x_g).scale(-1.0) + one).invert()
+                nonlocal_sde.create_generalized_chi_q_with_shell_correction(x_star, full, core, u_loc, v_nonloc)
+    assert np.allclose(out[np.complex64], out[np.complex128], rtol=1e-6, atol=0.0)
+
+
+@pytest.mark.parametrize("o", [1, 2])
+@pytest.mark.parametrize("lam", [0.0, 0.3])
+def test_pole_free_kernel_is_the_auxiliary_kernel(monkeypatch, o, lam):
+    """gamma_G Y_K in the kernel equals gamma* - gamma* U~ chi^ with gamma* = gamma_G (1 - U X_G)^-1, with and
+    without a lambda-corrected chi^."""
+    monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
+    x_g, (full, core), u_loc, v_nonloc = _middle_inputs(o, 3, 4, 44)
+    u_r = u_loc.as_channel(SpinChannel.DENS)
+    one = LocalInteraction(np.einsum("ad,bc->abcd", np.eye(o), np.eye(o)))
+    x_star = (x_g.invert() - u_r).invert()
+    chi = nonlocal_sde.create_generalized_chi_q_with_shell_correction(x_star, full, core, u_loc, v_nonloc)
+    chi_hat = (chi.invert() + one.scale(lam, copy=True)).invert()
+    rng = np.random.default_rng(45)
+    vrg_mat = rng.standard_normal((3,) + (o,) * 4 + (4, 6)) + 0j
+    vrg_g = FourPoint(vrg_mat, SpinChannel.DENS, (3, 1, 1), 1, 1, False, True, True)
+    vrg_star = vrg_g @ ((u_r @ x_g).scale(-1.0) + one).invert()
+    ref = nonlocal_sde.calculate_kernel_r_q(vrg_star, chi_hat, v_nonloc, u_loc)
+
+    middle = nonlocal_sde.create_kernel_middle(x_g, full, core, u_loc, v_nonloc, chi, chi_hat)
+    out = nonlocal_sde.calculate_pole_free_kernel_r_q(vrg_g, middle, v_nonloc, u_loc)
+
+    assert np.allclose(out.mat, ref.mat, rtol=0.0, atol=1e-12 * np.abs(ref.mat).max())
+
+
+@pytest.mark.parametrize("build", ["create_kernel_middle", "create_ladder_vertex_middle"])
+def test_middles_form_the_auxiliary_pole_term_only_at_momenta_whose_chi_changed(monkeypatch, build):
+    """A momentum with chi^ == chi gets no (1 - U X_G)^-1 term, also where 1 - U X_G is exactly singular; every other
+    momentum gets the middle of its own momentum alone."""
+    monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
+    x_g, (full, core), _, v_nonloc = _middle_inputs(1, 3, 2, 46)
+    u_loc = LocalInteraction(np.full((1,) * 4, 2.0))
+    v_nonloc.mat[...] = 0.0
+    x_g.mat[1] = 0.5  # 1 - U_r X_G = 0 exactly at the middle momentum
+    chi = nonlocal_sde.create_shell_corrected_chi_from_gamma_ladder(x_g, full, core, u_loc, v_nonloc)
+    chi_hat = chi.copy()
+    chi_hat.mat[[0, 2]] *= 1.1
+    parts = (x_g, full, core, u_loc, v_nonloc, chi, chi_hat)
+
+    middle = getattr(nonlocal_sde, build)(*parts)
+
+    assert np.isfinite(middle.mat).all()
+    for q in range(3):
+        alone = [p if p is u_loc else p.take_q_index_slice(q, q + 1) for p in parts]
+        ref = getattr(nonlocal_sde, build)(*alone)
+        assert np.allclose(middle.mat[q], ref.mat[0], rtol=1e-14, atol=0.0)
+
+
 def test_calculate_kernel_r_q_matches_rewired_reference():
     """The kernel equals [gamma(1 - U chi) - 1] right-multiplied by U_r, in the sigma-contraction layout.
 
@@ -1258,17 +1397,19 @@ def test_select_and_apply_lambda_correction_dispatch(monkeypatch):
 
 @pytest.mark.parametrize("save", [False, True])
 def test_kernel_step_writes_the_eliashberg_intermediates_only_when_asked(monkeypatch, save):
-    """The per-rank three-leg vertex and physical susceptibility are written only with save_eliashberg."""
+    """The per-rank Gamma-ladder vertex and its middle are written only with save_eliashberg, from the one Gamma
+    ladder solved without the U shift; the physical susceptibility only to the run's output, as the ladder vertex
+    does not read it."""
     config.eliashberg.perform_eliashberg = True  # the flag decides, not the config
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
-    vrg, chi = MagicMock(), MagicMock()
+    vrg, chi, middle = MagicMock(), MagicMock(), MagicMock()
     vrg.channel.value = "dens"
     chi.channel = SpinChannel.DENS
     aux_kwargs = []
     monkeypatch.setattr(nonlocal_sde, "create_auxiliary_chi_r_q_sum", lambda *a, **k: aux_kwargs.append(k) or vrg)
     monkeypatch.setattr(nonlocal_sde, "create_vrg_r_q", lambda *a, **k: vrg)
-    monkeypatch.setattr(nonlocal_sde, "create_generalized_chi_q_with_shell_correction", lambda *a: chi)
-    monkeypatch.setattr(nonlocal_sde, "_select_and_apply_lambda_correction", lambda c: c)
+    monkeypatch.setattr(nonlocal_sde, "create_shell_corrected_chi_from_gamma_ladder", lambda *a: chi)
+    monkeypatch.setattr(nonlocal_sde, "create_ladder_vertex_middle", lambda *a: middle)
     monkeypatch.setattr(nonlocal_sde, "_select_and_apply_lambda_correction", lambda c, lambda_previous=None: c)
     monkeypatch.setattr(nonlocal_sde, "min_static_compound_eigenvalue", lambda c: 1.0)
     monkeypatch.setattr(nonlocal_sde.LambdaAnnealer, "_static_gap", staticmethod(lambda c, dist: 1.0))
@@ -1284,9 +1425,11 @@ def test_kernel_step_writes_the_eliashberg_intermediates_only_when_asked(monkeyp
         nonlocal_sde.calculate_sigma_kernel_r_q(*args, dist, None, save_eliashberg=save, involution=involution) is None
     )
 
-    assert vrg.save.called == save and aux_kwargs == [{"involution": involution}]
+    assert aux_kwargs == [{"involution": involution, "subtract_u": False}]
+    assert [c.kwargs["name"] for c in vrg.save.call_args_list] == (["vrg_q_dens_rank_0"] if save else [])
+    assert [c.kwargs["name"] for c in middle.save.call_args_list] == (["vrg_middle_q_dens_rank_0"] if save else [])
     names = [c.kwargs["name"] for c in chi.save.call_args_list]
-    assert names == ["chi_phys_q_dens"] + (["chi_phys_q_dens_rank_0"] if save else [])
+    assert names == ["chi_phys_q_dens"]
 
 
 @pytest.mark.parametrize("ek, involution", [(np.zeros((1, 1, 1, 1, 1)), None), (np.ones((1, 1, 1, 2, 2)), [1, 0])])
@@ -2573,6 +2716,19 @@ def test_create_auxiliary_chi_r_q_sum_is_the_assembled_per_slice_solve_bit_for_b
     assert np.array_equal(out.mat, ref.mat) and np.array_equal(half.mat, ref.mat)
 
 
+@pytest.mark.parametrize("o", [1, 2])
+def test_create_auxiliary_chi_r_q_sum_without_the_u_shift_sums_the_gamma_ladder(o):
+    """With subtract_u=False the sum is that of the assembled chi0^-1 + Gamma/beta^2, the ladder of Gamma alone."""
+    gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(np.random.default_rng(32), o=o)
+    zero = u_loc.as_channel(gamma.channel).scale(0.0)
+    ref = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, zero).invert_and_sum_over_last_vn_v2(
+        config.sys.beta
+    )
+    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, subtract_u=False)
+    shifted = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    assert np.array_equal(out.mat, ref.mat) and not np.allclose(out.mat, shifted.mat)
+
+
 def test_create_auxiliary_chi_r_q_sum_eliminates_the_pairs_without_vertex_of_a_two_atom_cell(monkeypatch):
     """For two atoms built atom by atom the free pairs are logged and eliminated; the sum matches the full inversion."""
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
@@ -2667,16 +2823,75 @@ def test_kernel_step_in_momentum_groups_adds_the_bits_of_the_whole_rank_chain(mo
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
     config.sys.beta, config.box.niv_core = 9.0, 4
     gamma, inv, sums, u_loc, v_nonloc, kernel = _kernel_step_inputs(2, 7, 3, 8)
-    aux = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, inv, u_loc)
-    vrg = (inv @ aux).scale(9.0)
-    chi = nonlocal_sde.create_generalized_chi_q_with_shell_correction(aux.sum_over_all_vn(9.0), *sums, u_loc, v_nonloc)
-    expected = kernel.mat + nonlocal_sde.calculate_kernel_r_q(vrg, chi, v_nonloc, u_loc).scale(3.0).mat
+    ladder = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, inv, u_loc, subtract_u=False)
+    vrg, x_g = (inv @ ladder).scale(9.0), ladder.sum_over_all_vn(9.0)
+    chi = nonlocal_sde.create_shell_corrected_chi_from_gamma_ladder(x_g, *sums, u_loc, v_nonloc)
+    middle = nonlocal_sde.create_kernel_middle(x_g, *sums, u_loc, v_nonloc, chi, chi)
+    expected = kernel.mat + nonlocal_sde.calculate_pole_free_kernel_r_q(vrg, middle, v_nonloc, u_loc).scale(3.0).mat
     dist = mpi_utils.MpiDistributor(ntasks=7, comm=create_comm_mock())
 
     out = nonlocal_sde.calculate_sigma_kernel_r_q(gamma, inv, *sums, u_loc, v_nonloc, dist, kernel=kernel, weight=3.0)
 
     assert out is kernel and kernel.mat.dtype == dtype
     assert np.array_equal(kernel.mat, expected)
+
+
+def _drop_inter_orbital_pairs(gamma: LocalFourPoint, u_loc: LocalInteraction) -> None:
+    """Zeroes, in place, every vertex entry with an inter-orbital pair and U off the orbital diagonal, so those pairs
+    carry neither, as the inter-atom pairs of a cell built atom by atom."""
+    eye = np.eye(gamma.n_bands)
+    gamma.mat *= np.einsum("ab,cd->abcd", eye, eye)[..., None, None, None]
+    u_loc.mat *= np.einsum("ab,bc,cd->abcd", eye, eye, eye)
+
+
+@pytest.mark.parametrize("blocks", [False, True])
+def test_kernel_step_with_a_boson_mass_adds_the_auxiliary_kernel_of_the_annealed_chi(monkeypatch, blocks):
+    """With an annealer that shifts chi in place, the step adds the auxiliary kernel of the annealed chi (complex128),
+    also when the inter-orbital pairs carry no vertex or interaction and the Bethe-Salpeter solves drop them."""
+    monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    config.sys.beta, config.box.niv_core = 9.0, 4
+    gamma, inv, sums, u_loc, v_nonloc, kernel = _kernel_step_inputs(2, 7, 3, 8)
+    if blocks:
+        _drop_inter_orbital_pairs(gamma, u_loc)
+    assert gamma.orbital_pairs_without_vertex(u_loc.as_channel(SpinChannel.DENS)).tolist() == ([1, 2] if blocks else [])
+    one = LocalInteraction(np.einsum("ad,bc->abcd", np.eye(2), np.eye(2)))
+    shift = lambda chi: (chi.invert() + one.scale(0.3, copy=True)).invert()
+    annealer = SimpleNamespace(apply=lambda chi, dist: setattr(chi, "mat", shift(chi).mat) or chi)
+    aux = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, inv, u_loc)
+    chi = nonlocal_sde.create_generalized_chi_q_with_shell_correction(aux.sum_over_all_vn(9.0), *sums, u_loc, v_nonloc)
+    ref = nonlocal_sde.calculate_kernel_r_q((inv @ aux).scale(9.0), shift(chi), v_nonloc, u_loc).mat
+    expected = kernel.mat + ref
+    dist = mpi_utils.MpiDistributor(ntasks=7, comm=create_comm_mock())
+
+    nonlocal_sde.calculate_sigma_kernel_r_q(gamma, inv, *sums, u_loc, v_nonloc, dist, annealer=annealer, kernel=kernel)
+
+    assert np.allclose(kernel.mat, expected, rtol=0.0, atol=1e-10 * np.abs(ref).max())
+
+
+def test_eliashberg_pass_saves_the_gamma_ladder_vertex_and_its_middle_and_keeps_the_kernel(monkeypatch, tmp_path):
+    """With save_eliashberg the step writes the Gamma-ladder three-leg vertex and its middle, the kernel unchanged."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    config.sys.beta, config.box.niv_core = 9.0, 4
+    config.output.eliashberg_path = str(tmp_path)
+    files = {}
+    monkeypatch.setattr(np, "save", lambda path, arr, **k: files.__setitem__(os.path.basename(path), np.array(arr)))
+    gamma, inv, sums, u_loc, v_nonloc, kernel = _kernel_step_inputs(2, 7, 3, 8)
+    dist = mpi_utils.MpiDistributor(ntasks=7, comm=create_comm_mock())
+    plain, saved = kernel.copy(), kernel.copy()
+
+    nonlocal_sde.calculate_sigma_kernel_r_q(gamma, inv, *sums, u_loc, v_nonloc, dist, kernel=plain)
+    nonlocal_sde.calculate_sigma_kernel_r_q(
+        gamma, inv, *sums, u_loc, v_nonloc, dist, save_eliashberg=True, kernel=saved
+    )
+
+    ladder = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, inv, u_loc, subtract_u=False)
+    x_g = ladder.sum_over_all_vn(9.0)
+    chi = nonlocal_sde.create_shell_corrected_chi_from_gamma_ladder(x_g, *sums, u_loc, v_nonloc)
+    middle = nonlocal_sde.create_ladder_vertex_middle(x_g, *sums, u_loc, v_nonloc, chi, chi)
+    assert np.array_equal(saved.mat, plain.mat)
+    assert np.array_equal(files["vrg_q_dens_rank_0.npy"], nonlocal_sde.create_vrg_r_q(ladder, inv).mat)
+    assert np.array_equal(files["vrg_middle_q_dens_rank_0.npy"], middle.mat)
 
 
 def test_kernel_step_holds_one_block_and_one_momentum_group_beside_its_inputs(monkeypatch):
@@ -4320,21 +4535,23 @@ def test_sigma_kernel_pipeline_restricts_chi_phys_and_reports_the_count_of_every
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     config.stabilization.use_chi_phys_restriction = True
     config.sys.beta, config.sys.n_bands = 10.0, 1
-    logger, kernels, aux = stab_logger, {}, MagicMock(channel=SpinChannel.DENS)
+    logger, kernels, shells, aux = stab_logger, {}, {}, MagicMock(channel=SpinChannel.DENS)
     monkeypatch.setattr(nonlocal_sde, "create_auxiliary_chi_r_q_sum", lambda *a, **k: aux)
     monkeypatch.setattr(nonlocal_sde, "create_vrg_r_q", lambda *a, **k: aux)
     monkeypatch.setattr(
         nonlocal_sde,
-        "create_generalized_chi_q_with_shell_correction",
+        "create_shell_corrected_chi_from_gamma_ladder",
         lambda *a: _chi_from_compound(
             np.array([[[[0.1]], [[0.05]]], [[[-0.2]], [[0.05]]]], dtype=complex), 1
         ).take_q_index_slice(*((0, 1) if threading.current_thread().name == "rank0" else (1, 2))),
     )
     monkeypatch.setattr(
         nonlocal_sde,
-        "calculate_kernel_r_q",
-        lambda vrg, chi, v, u: kernels.setdefault(threading.current_thread().name, chi),
+        "create_kernel_middle",
+        lambda *a: kernels.setdefault(threading.current_thread().name, a[-1])
+        and shells.setdefault(threading.current_thread().name, a[-2]),
     )
+    monkeypatch.setattr(nonlocal_sde, "calculate_pole_free_kernel_r_q", lambda *a: MagicMock())
 
     def fn(comm, rank):
         dist = mpi_utils.MpiDistributor(ntasks=2, comm=comm)
@@ -4346,6 +4563,7 @@ def test_sigma_kernel_pipeline_restricts_chi_phys_and_reports_the_count_of_every
     assert sum("(dens): 1 eigenvalues restricted" in line for line in warnings) == 2
     assert np.allclose(_compound_of(kernels["rank1"], 1)[0, 0], 0.2, atol=1e-6)
     assert np.allclose(_compound_of(kernels["rank0"], 1)[0, 0], 0.1, atol=1e-6)
+    assert np.allclose(_compound_of(shells["rank1"], 1)[0, 0], -0.2, atol=1e-6)  # the middle reads chi unrestricted
 
 
 def _random_momentum_g(nk: tuple, nb: int, niv: int, seed: int) -> GreensFunction:
