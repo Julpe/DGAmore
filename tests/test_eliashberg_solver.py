@@ -618,6 +618,25 @@ def test_solve_eliashberg_lanczos_declares_the_dtype_and_logs_matvecs_thread_bud
     assert any("resident set" in message and "GB" in message for message in messages)
 
 
+def test_solve_eliashberg_lanczos_gives_arpack_the_restarts_of_the_matvec_cap(monkeypatch):
+    """ARPACK, which counts restarts, gets as many as keep one attempt within LANCZOS_MATVECS operator applications."""
+    nq, niv_pp = (4, 2, 1), 2
+    _grid_test_config(nq, niv_pp)
+    config.eliashberg.resolve_parity_sectors = False
+    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, 1, niv_pp, 3)
+    seen = []
+
+    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
+        seen.append((k, ncv, maxiter))
+        return np.ones(k), np.ones((op.shape[0], k), dtype=np.complex64)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(es, "_solver_thread_budget", MagicMock(return_value=1))
+        mp.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
+        solve_eliashberg_lanczos(gamma, chi0, (0, 0))
+    assert seen and all(maxiter == (es.LANCZOS_MATVECS - ncv) // (ncv - k) + 1 for k, ncv, maxiter in seen)
+
+
 def test_in_memory_matvec_threads_the_bubble_multiply(monkeypatch):
     """With a thread budget above one the in-memory matvec hands its executor to the bubble multiply as well."""
     from unittest.mock import create_autospec
@@ -1101,7 +1120,7 @@ def _power_loop_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
     return np.array([lam] * k), np.repeat(vec[:, None], k, axis=1)
 
 
-def _power_loop_team_arnoldi(apply_block, seed, n_eig, ncv, tol, maxiter, comm, n_block=1):
+def _power_loop_team_arnoldi(apply_block, seed, n_eig, ncv, tol, max_matvec, comm, n_block=1):
     """Deterministic stand-in for the team Krylov-Schur: the same short power iteration on distributed blocks."""
     vec = seed.reshape(n_block, -1)[0].astype(np.complex64)
     for _ in range(6):
@@ -1190,6 +1209,15 @@ def test_team_arnoldi_returns_the_converged_subset_at_the_restart_limit():
     assert 0 < len(lambdas) < n_eig and blocks.shape == (len(lambdas), n)
     for lam, vec in zip(lambdas, blocks):
         assert np.linalg.norm(h @ vec - lam * vec) <= 1e-1 * abs(lam)
+
+
+@pytest.mark.parametrize("max_matvec", [0, 30, 57])
+def test_team_arnoldi_stops_at_the_first_full_basis_past_its_matvec_cap(max_matvec):
+    """A solve that never converges stops at the first full basis that reaches its matvec cap, short of the next."""
+    h = _test_matrix(60, 4, False)
+    seed = np.random.default_rng(5).standard_normal(60) + 0j
+    n_matvec = es._team_arnoldi(lambda block: h @ block, seed, 3, 12, 0.0, max_matvec, None)[3]
+    assert max(max_matvec, 12) <= n_matvec < max(max_matvec, 12) + 12 - 3
 
 
 def _doublet_problem(m):
@@ -1801,7 +1829,7 @@ def test_team_solve_logs_the_matvecs_of_every_attempt(monkeypatch):
     gap_shape = nq + (1, 1, 2 * niv_pp)
     vector = np.ones((1, int(np.prod(gap_shape))), dtype=np.complex64)
 
-    def fake_arnoldi(apply_block, seed, n_eig, ncv, tol, maxiter, comm, n_block=1):
+    def fake_arnoldi(apply_block, seed, n_eig, ncv, tol, max_matvec, comm, n_block=1):
         k = n_eig if tol > config.eliashberg.epsilon else 0
         return np.ones(k), np.ones((1, k)), vector, 7, 0.5
 
@@ -3285,6 +3313,52 @@ def test_pairing_vertex_build_gives_the_bits_of_the_assembled_bethe_salpeter_win
     assert not save_fq or np.array_equal(streamed, np.load(file_path))
 
 
+@pytest.mark.parametrize("lam", [0.0, 0.2])
+@pytest.mark.parametrize("no, blocks", [(1, False), (2, False), (2, True)])
+def test_ladder_vertex_chunk_is_the_auxiliary_ladder_vertex_in_double_precision(monkeypatch, no, blocks, lam):
+    """The Gamma-ladder chunk with its middle is F* + (gamma* U~ - gamma* U~ chi^ U~) * gamma~* of the auxiliary
+    ladder (shift U_r), with V(q), shell sums and a lambda-shifted chi^, on the whole box; with ``blocks`` the
+    inter-orbital pairs carry no vertex or interaction and the chunk drops them, as the pairing-vertex build does."""
+    monkeypatch.setattr(n_point_base, "DTYPE", np.complex128)
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    config.sys.beta = beta = 7.3
+    rng = np.random.default_rng(17)
+    chi0_mat, gamma_mat, u_mat = _toy_arrays(no, rng)
+    if blocks:
+        eye = np.eye(no)
+        gamma_mat = gamma_mat * np.einsum("ab,cd->abcd", eye, eye)[..., None, None, None]
+        u_mat = u_mat * np.einsum("ab,bc,cd->abcd", eye, eye, eye)
+    gamma_r = LocalFourPoint(gamma_mat, SpinChannel.DENS, 1, 2, full_niw_range=False).symmetrize_v_vp()
+    u_loc = LocalInteraction(0.5 * u_mat)
+    v_mat = rng.standard_normal((N_Q,) + (no,) * 4)
+    v_nonloc = Interaction(0.05 * (v_mat + v_mat.transpose(0, 2, 1, 4, 3)), SpinChannel.NONE, (N_Q, 1, 1), True)
+    meta = (SpinChannel.NONE, (N_Q, 1, 1), 1, 0, False, True, True)
+    sums = [FourPoint(0.01 * rng.standard_normal((N_Q,) + (no,) * 4 + (N_W,)) + 0j, *meta) for _ in range(2)]
+    gchi0_q_inv = FourPoint(chi0_mat, SpinChannel.NONE, (N_Q, 1, 1), 1, 1, False, True, True).invert()
+    u_r_loc = u_loc.as_channel(SpinChannel.DENS)
+    u_r = u_r_loc + v_nonloc.as_channel(SpinChannel.DENS)
+    aux = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc)
+    chi = nonlocal_sde.create_generalized_chi_q_with_shell_correction(aux.sum_over_all_vn(beta), *sums, u_loc, v_nonloc)
+    one = LocalInteraction(np.einsum("ad,bc->abcd", np.eye(no), np.eye(no)))
+    chi_hat = (chi.invert() + one.scale(lam, copy=True)).invert()
+    ladder = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc, subtract_u=False)
+    middle = nonlocal_sde.create_ladder_vertex_middle(
+        ladder.sum_over_all_vn(beta), *sums, u_loc, v_nonloc, chi, chi_hat
+    )
+    vrg_g = nonlocal_sde.create_vrg_r_q(ladder, gchi0_q_inv)
+    inactive = gamma_r.orbital_pairs_without_vertex(u_r_loc)
+    assert inactive.tolist() == ([1, 2] if blocks else [])
+
+    out = es._build_ladder_vertex_chunk(gamma_r, gchi0_q_inv, vrg_g, middle, 0, N_W, None, inactive)
+
+    chi_aux = gchi0_q_inv.invert_with_local_kernel(gamma_r, u_r_loc, 1.0 / beta**2, 0)
+    vrg_right = (chi_aux.sum_over_vn(beta, axis=(-2,)) @ gchi0_q_inv).scale(beta)
+    ref = (gchi0_q_inv @ chi_aux @ gchi0_q_inv).scale(-(beta**2)).add_on_vn_diagonal(gchi0_q_inv, factor=beta**2)
+    vrg = nonlocal_sde.create_vrg_r_q(aux, gchi0_q_inv)
+    ref = ref.add((vrg @ u_r - vrg @ (u_r @ chi_hat @ u_r)) * vrg_right)
+    assert np.allclose(out.mat, ref.mat, rtol=0.0, atol=1e-10 * np.abs(ref.mat).max())
+
+
 def _write_random_intermediates(no: int, niv: int, niw: int, nq: int):
     """Writes random rank-0 pairing-vertex intermediates of the given box and returns (gamma_r, u_loc, v_nonloc)."""
     config.sys.n_bands, config.box.niv_core, config.box.niw_core = no, niv, niw
@@ -3300,6 +3374,7 @@ def _write_random_intermediates(no: int, niv: int, niw: int, nq: int):
     np.save(f"{path}/gchi0_q_inv_rank_0.npy", chi0_inv.astype(np.complex64))
     np.save(f"{path}/vrg_q_dens_rank_0.npy", (0.01 * chi0_inv + 1.0).astype(np.complex64))
     np.save(f"{path}/chi_phys_q_dens_rank_0.npy", (0.01 * chi0_inv[..., 0]).astype(np.complex64))
+    np.save(f"{path}/vrg_middle_q_dens_rank_0.npy", (0.01 * chi0_inv[..., 0]).astype(np.complex64))
     u_loc = LocalInteraction(rng.standard_normal((no,) * 4))
     v_nonloc = Interaction(np.zeros((nq,) + (no,) * 4), SpinChannel.NONE, (nq, 1, 1), True)
     return LocalFourPoint(gamma, SpinChannel.DENS, 1, 2, False, True), u_loc, v_nonloc
@@ -3444,10 +3519,17 @@ def test_rpa_vertex_chunk_is_the_ladder_vertex_chunk_at_the_bare_local_vertex(mo
     u_r_mat = u_loc.as_channel(channel).mat[..., None, None, None]
     gamma_r = LocalFourPoint(np.broadcast_to(u_r_mat, box).copy(), channel, 1, 2, False, True)
     gchi0_q_inv = FourPoint(chi0_mat, SpinChannel.NONE, (N_Q, 1, 1), 1, 1, False, True, True).invert()
-    unit = FourPoint.identity(no, N_W - 1, NIV, N_Q, (N_Q, 1, 1), num_vn_dimensions=1).set_channel(channel)
     chi_mat = rng.standard_normal((N_Q,) + (no,) * 4 + (N_W,)) + 1j * rng.standard_normal((N_Q,) + (no,) * 4 + (N_W,))
     chi = FourPoint(chi_mat, channel, (N_Q, 1, 1), 1, 0, False, True, True)
-    ladder = es._build_ladder_vertex_chunk(gamma_r, gchi0_q_inv, unit, chi, u_loc, u_r, 0, N_W, None)
+    # the ladder of Gamma_r alone and its middle for the shell-free susceptibility of the auxiliary ladder and chi
+    zero_sum = FourPoint(np.zeros_like(chi_mat), SpinChannel.NONE, (N_Q, 1, 1), 1, 0, False, True, True)
+    aux = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc).sum_over_all_vn(config.sys.beta)
+    chi_shell = nonlocal_sde.create_generalized_chi_q_with_shell_correction(aux, zero_sum, zero_sum, u_loc, v_nonloc)
+    ladder_sum = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc, subtract_u=False)
+    x_g = ladder_sum.sum_over_all_vn(config.sys.beta)
+    middle = nonlocal_sde.create_ladder_vertex_middle(x_g, zero_sum, zero_sum, u_loc, v_nonloc, chi_shell, chi)
+    vrg = nonlocal_sde.create_vrg_r_q(ladder_sum, gchi0_q_inv)
+    ladder = es._build_ladder_vertex_chunk(gamma_r, gchi0_q_inv, vrg, middle, 0, N_W, None)
 
     out = es._build_rpa_vertex_chunk(chi, u_r, 0, N_W, NIV)
 
@@ -3829,7 +3911,7 @@ def test_streaming_fq_multi_rank_writes_disjoint_slabs_matching_single_rank(setu
 
     # split the regenerated single-rank intermediates into per-rank q-shares (the q axis leads in every file)
     gamma_r, u_loc, v_nonloc, _ = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    for name in ("gchi0_q_inv", "vrg_q_dens", "chi_phys_q_dens"):
+    for name in ("gchi0_q_inv", "vrg_q_dens", "vrg_middle_q_dens"):
         whole = np.load(f"{config.output.output_path}/{name}_rank_0.npy")
         np.save(f"{config.output.output_path}/{name}_rank_1.npy", whole[1:])
         np.save(f"{config.output.output_path}/{name}_rank_0.npy", whole[:1])
@@ -3866,7 +3948,7 @@ def test_pairing_vertex_gather_scatter_round_trip_preserves_rank_shares(setup, m
     reference = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, deepcopy(gamma_r), niv_pp, dist)
 
     gamma_r, u_loc, v_nonloc, _ = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    for name in ("gchi0_q_inv", "vrg_q_dens", "chi_phys_q_dens"):
+    for name in ("gchi0_q_inv", "vrg_q_dens", "vrg_middle_q_dens"):
         whole = np.load(f"{config.output.output_path}/{name}_rank_0.npy")
         np.save(f"{config.output.output_path}/{name}_rank_1.npy", whole[1:])
         np.save(f"{config.output.output_path}/{name}_rank_0.npy", whole[:1])

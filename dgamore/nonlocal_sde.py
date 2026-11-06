@@ -205,6 +205,7 @@ def create_auxiliary_chi_r_q_sum(
     inactive: np.ndarray | None = None,
     slice_rhs: Callable[[int, int, FourPoint], list[FourPoint]] | None = None,
     involution: np.ndarray | None = None,
+    subtract_u: bool = True,
 ) -> FourPoint | list[FourPoint] | tuple[FourPoint, list[FourPoint]]:
     r"""
     Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis,
@@ -219,6 +220,10 @@ def create_auxiliary_chi_r_q_sum(
     the transient is two compound slices regardless of the box size. The orbital pairs without vertex (see
     :meth:`~dgamore.local_four_point.LocalFourPoint.orbital_pairs_without_vertex`), found once per call unless the
     caller passes them, are eliminated frequency by frequency inside every slice.
+
+    With ``subtract_u`` False the shift is zero and the sum is that of the ladder of :math:`\Gamma_{r}` alone,
+    :math:`\sum_{\nu'}((\chi^{\mathrm{q}\nu}_{0;1234})^{-1} + \Gamma^{\omega\nu\nu'}_{r;1234}/\beta^2)^{-1}`, whose
+    matrix stays regular where the shifted one has a near-zero eigenvalue the physical susceptibility does not have.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` (full or half bosonic range).
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
@@ -240,17 +245,20 @@ def create_auxiliary_chi_r_q_sum(
         with which slices that are complex-symmetric only with their orbital pairs permuted take the permuted
         factorization (see
         :meth:`~dgamore.four_point.FourPoint.invert_with_local_kernel_and_sum_over_last_vn`), or None.
-    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` as a
-        :class:`FourPoint` (half niw range, one fermionic dimension), the solutions for ``rhs`` as a list, or with
-        ``slice_rhs`` the tuple ``(sum, solutions)``.
+    :param subtract_u: Whether the shift is :math:`U_{r}` (the auxiliary susceptibility) or zero.
+    :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` (with
+        ``subtract_u`` False that of the ladder of :math:`\Gamma_{r}` alone) as a :class:`FourPoint` (half niw range,
+        one fermionic dimension), the solutions for ``rhs`` as a list, or with ``slice_rhs`` the tuple
+        ``(sum, solutions)``.
     """
     u_r = u_loc.as_channel(gamma_r.channel)
     gamma_half = gamma_r.copy().to_half_niw_range() if gamma_r.full_niw_range else gamma_r
     if inactive is None:
         inactive = _inactive_orbital_pairs(gamma_half, u_r)
     beta = config.sys.beta
+    shift = u_r if subtract_u else u_r.scale(0.0, copy=True)
     return gchi0_q_inv.invert_with_local_kernel_and_sum_over_last_vn(
-        gamma_half, u_r, 1.0 / beta**2, beta, inactive, rhs, slice_rhs, involution
+        gamma_half, shift, 1.0 / beta**2, beta, inactive, rhs, slice_rhs, involution
     )
 
 
@@ -261,7 +269,8 @@ def create_vrg_r_q(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint, copy: bo
     \chi^{*;\mathrm{q}\nu\nu'}_{r;ba34}`.
 
     :param gchi_aux_q_r_sum: The frequency-summed auxiliary susceptibility
-        :math:`\sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r}`.
+        :math:`\sum_{\nu'}\chi^{*;\mathrm{q}\nu\nu'}_{r}`, or that of the ladder of :math:`\Gamma_{r}` alone (see
+        :func:`create_auxiliary_chi_r_q_sum` with ``subtract_u`` False), which gives its three-leg vertex.
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
     :param copy: If True, return the vertex as a new object; if False, write it over ``gchi_aux_q_r_sum`` in place and
         return that object.
@@ -293,6 +302,185 @@ def create_generalized_chi_q_with_shell_correction(
         (chi_phys_q_r + gchi0_q_full_sum - gchi0_q_core_sum).invert()
         + (u_loc.as_channel(chi_phys_q_r.channel) + v_nonloc.as_channel(chi_phys_q_r.channel))
     ).invert()
+
+
+def create_ladder_vertex_middle(
+    x_g: FourPoint,
+    gchi0_q_full_sum: FourPoint,
+    gchi0_q_core_sum: FourPoint,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    chi: FourPoint,
+    chi_hat: FourPoint,
+) -> FourPoint:
+    r"""
+    Returns the matrix between the three-leg vertices of the ladder vertex built from the ladder of :math:`\Gamma_{r}`
+    alone (see :func:`create_auxiliary_chi_r_q_sum` with ``subtract_u`` False), in compound products,
+
+    .. math:: Y^{\mathrm{q}}_{r} = D^{-1} (V^{\mathbf{q}}_{r} - \mathcal{U}^{\mathbf{q}}_{r} S U_{r})
+        - (\mathbb{1} - U_{r} X)^{-1} \mathcal{U}^{\mathbf{q}}_{r} (\hat\chi - \chi) \mathcal{U}^{\mathbf{q}}_{r}
+        (\mathbb{1} - X U_{r})^{-1}, \qquad
+        D = \mathbb{1} + V^{\mathbf{q}}_{r} X + \mathcal{U}^{\mathbf{q}}_{r} S (\mathbb{1} - U_{r} X),
+
+    with :math:`X` the summed ladder ``x_g``, :math:`S` the shell bubble (full-box minus core-box sum),
+    :math:`\mathcal{U}^{\mathbf{q}}_{r} = U_{r} + V^{\mathbf{q}}_{r}`, :math:`\chi` the shell-corrected physical
+    susceptibility and :math:`\hat\chi` the one the self-energy kernel reads. The ladder vertex
+    :math:`F_{r} = F^{\Gamma}_{r} + (\gamma^{\Gamma}_{r} Y_{r}) \tilde\gamma^{\Gamma}_{r}`, with the full vertex and
+    the left and right three-leg vertices of the ladder of :math:`\Gamma_{r}`, is then exactly the vertex of the
+    auxiliary ladder (shift :math:`U_{r}`) with its three-leg vertices and :math:`\hat\chi` (Woodbury identity on the
+    frequency-constant shift). The first term never inverts a matrix that is singular where the auxiliary ladder is,
+    so it stays exact wherever the physical susceptibility is regular. The second term carries
+    :math:`(\mathbb{1} - U_{r} X)^{-1}`, singular there, and is formed only at the momenta where :math:`\hat\chi
+    \neq \chi` (an annealing, restriction or lambda correction of the channel).
+
+    :param x_g: The summed ladder of :math:`\Gamma_{r}`, :math:`\frac{1}{\beta^2}\sum_{\nu\nu'}
+        ((\chi^{\mathrm{q}\nu}_{0})^{-1} + \Gamma^{\omega\nu\nu'}_{r}/\beta^2)^{-1}`.
+    :param gchi0_q_full_sum: The frequency-summed bare bubble over the full box.
+    :param gchi0_q_core_sum: The frequency-summed bare bubble over the core box.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :param chi: The shell-corrected physical susceptibility :math:`\chi^{\mathrm{q}}_{r}`.
+    :param chi_hat: The physical susceptibility the self-energy kernel reads.
+    :return: The matrix :math:`Y^{\mathrm{q}}_{r}` as a :class:`FourPoint` in the channel of ``x_g`` (half niw range,
+        no fermionic dimension).
+    """
+    u_r, v_r, u_tot, one, shell, d_inv = _gamma_ladder_shift_parts(
+        x_g, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc
+    )
+    middle = d_inv @ ((u_tot @ shell @ u_r).scale(-1.0) + v_r)
+    delta = chi_hat - chi
+    for start, stop in _changed_momentum_windows(delta):
+        x_w, u_w = x_g.take_q_index_slice(start, stop, copy=False), u_tot.take_q_index_slice(start, stop, copy=False)
+        left = ((u_r @ x_w).scale(-1.0) + one).invert()
+        right = ((x_w @ u_r).scale(-1.0) + one).invert()
+        middle.take_q_index_slice(start, stop, copy=False).sub(
+            left @ (u_w @ delta.take_q_index_slice(start, stop, copy=False) @ u_w) @ right, copy=False
+        )
+    return middle
+
+
+def _changed_momentum_windows(delta: FourPoint) -> list[tuple[int, int]]:
+    r"""
+    Returns the windows of consecutive momenta at which :math:`\hat\chi - \chi` has a non-zero entry, the only
+    momenta whose vertex and kernel middles get the term carrying :math:`(\mathbb{1} - U_{r} X)^{-1}`.
+
+    :param delta: The difference :math:`\hat\chi - \chi` (compressed momenta).
+    :return: The windows ``(start, stop)`` in momentum order.
+    """
+    changed = np.any(delta.mat.reshape(delta.mat.shape[0], -1) != 0, axis=1)
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], changed.astype(np.int8), [0]))))
+    return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
+
+
+def _gamma_ladder_shift_parts(
+    x_g: FourPoint,
+    gchi0_q_full_sum: FourPoint,
+    gchi0_q_core_sum: FourPoint,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+) -> tuple:
+    r"""
+    Returns what the pole-free forms of the shell-corrected susceptibility, the kernel and the ladder vertex share: the
+    channel interactions :math:`U_{r}`, :math:`V^{\mathbf{q}}_{r}` and :math:`\mathcal{U}^{\mathbf{q}}_{r} = U_{r} +
+    V^{\mathbf{q}}_{r}`, the compound identity, the shell bubble :math:`S` (full-box minus core-box sum) and
+
+    .. math:: D^{-1} = [\mathbb{1} + V^{\mathbf{q}}_{r} X + \mathcal{U}^{\mathbf{q}}_{r} S (\mathbb{1} - U_{r} X)]^{-1},
+
+    in compound products, with :math:`X` the summed ladder of :math:`\Gamma_{r}`. :math:`D` is regular wherever the
+    physical susceptibility is, also where :math:`\mathbb{1} - U_{r} X` (the auxiliary ladder) is singular.
+
+    :param x_g: The summed ladder of :math:`\Gamma_{r}`, :math:`\frac{1}{\beta^2}\sum_{\nu\nu'}
+        ((\chi^{\mathrm{q}\nu}_{0})^{-1} + \Gamma^{\omega\nu\nu'}_{r}/\beta^2)^{-1}`.
+    :param gchi0_q_full_sum: The frequency-summed bare bubble over the full box.
+    :param gchi0_q_core_sum: The frequency-summed bare bubble over the core box.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :return: ``(u_r, v_r, u_tot, one, shell, d_inv)``.
+    """
+    channel = x_g.channel
+    u_r, v_r = u_loc.as_channel(channel), v_nonloc.as_channel(channel)
+    u_tot = u_r + v_r
+    eye = np.eye(u_loc.n_bands)
+    one = LocalInteraction(np.einsum("ad,bc->abcd", eye, eye), channel)  # the compound identity
+    shell = gchi0_q_full_sum - gchi0_q_core_sum
+    d_inv = (x_g.matmul(v_r, left_hand_side=False) + u_tot @ (shell - shell @ u_r @ x_g) + one).invert()
+    return u_r, v_r, u_tot, one, shell, d_inv
+
+
+def create_shell_corrected_chi_from_gamma_ladder(
+    x_g: FourPoint,
+    gchi0_q_full_sum: FourPoint,
+    gchi0_q_core_sum: FourPoint,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+) -> FourPoint:
+    r"""
+    Returns the shell-corrected physical susceptibility of :func:`create_generalized_chi_q_with_shell_correction` from
+    the summed ladder of :math:`\Gamma_{r}` alone (see :func:`create_auxiliary_chi_r_q_sum` with ``subtract_u``
+    False), in compound products,
+
+    .. math:: \chi^{\mathrm{q}}_{r} = [X + S (\mathbb{1} - U_{r} X)]\, D^{-1}
+
+    with :math:`D` of :func:`_gamma_ladder_shift_parts` (Woodbury identity on the frequency-constant shift, the
+    auxiliary sum being :math:`X (\mathbb{1} - U_{r} X)^{-1}`). Neither :math:`\mathbb{1} - U_{r} X` nor :math:`X`
+    or :math:`U_{r}` is inverted, so the result stays exact where the auxiliary ladder is singular.
+
+    :param x_g: The summed ladder of :math:`\Gamma_{r}`, :math:`\frac{1}{\beta^2}\sum_{\nu\nu'}
+        ((\chi^{\mathrm{q}\nu}_{0})^{-1} + \Gamma^{\omega\nu\nu'}_{r}/\beta^2)^{-1}`.
+    :param gchi0_q_full_sum: The frequency-summed bare bubble over the full box.
+    :param gchi0_q_core_sum: The frequency-summed bare bubble over the core box.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :return: The shell-corrected physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` as a :class:`FourPoint`.
+    """
+    u_r, _, _, _, shell, d_inv = _gamma_ladder_shift_parts(x_g, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc)
+    return (x_g + shell - shell @ u_r @ x_g) @ d_inv
+
+
+def create_kernel_middle(
+    x_g: FourPoint,
+    gchi0_q_full_sum: FourPoint,
+    gchi0_q_core_sum: FourPoint,
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    chi: FourPoint,
+    chi_hat: FourPoint,
+) -> FourPoint:
+    r"""
+    Returns the matrix that right-multiplies the three-leg vertex of the ladder of :math:`\Gamma_{r}` in the
+    Schwinger-Dyson bracket, in compound products,
+
+    .. math:: Y^{\mathrm{q}}_{r} = D^{-1} - (\mathbb{1} - U_{r} X)^{-1} \mathcal{U}^{\mathbf{q}}_{r}
+        (\hat\chi - \chi),
+
+    with :math:`D` of :func:`_gamma_ladder_shift_parts`, :math:`\chi` the shell-corrected physical susceptibility and
+    :math:`\hat\chi` the one the kernel reads. Then :math:`\gamma^{\Gamma}_{r} Y_{r} = \gamma^{*}_{r} -
+    \gamma^{*}_{r} \mathcal{U}^{\mathbf{q}}_{r} \hat\chi`, the bracket of :func:`calculate_kernel_r_q` with the
+    auxiliary three-leg vertex :math:`\gamma^{*}_{r} = \gamma^{\Gamma}_{r} (\mathbb{1} - U_{r} X)^{-1}`. The first
+    term stays exact where the auxiliary ladder is singular; the second carries :math:`(\mathbb{1} - U_{r} X)^{-1}` and
+    is formed only at the momenta where :math:`\hat\chi \neq \chi` (an annealing, restriction or lambda correction of
+    the channel).
+
+    :param x_g: The summed ladder of :math:`\Gamma_{r}`, :math:`\frac{1}{\beta^2}\sum_{\nu\nu'}
+        ((\chi^{\mathrm{q}\nu}_{0})^{-1} + \Gamma^{\omega\nu\nu'}_{r}/\beta^2)^{-1}`.
+    :param gchi0_q_full_sum: The frequency-summed bare bubble over the full box.
+    :param gchi0_q_core_sum: The frequency-summed bare bubble over the core box.
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :param chi: The shell-corrected physical susceptibility :math:`\chi^{\mathrm{q}}_{r}`.
+    :param chi_hat: The physical susceptibility the self-energy kernel reads.
+    :return: The matrix :math:`Y^{\mathrm{q}}_{r}` as a :class:`FourPoint` (half niw range, no fermionic dimension).
+    """
+    u_r, _, u_tot, one, _, d_inv = _gamma_ladder_shift_parts(x_g, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc)
+    delta = chi_hat - chi
+    for start, stop in _changed_momentum_windows(delta):
+        x_w = x_g.take_q_index_slice(start, stop, copy=False)
+        d_inv.take_q_index_slice(start, stop, copy=False).sub(
+            ((u_r @ x_w).scale(-1.0) + one).invert()
+            @ (u_tot.take_q_index_slice(start, stop, copy=False) @ delta.take_q_index_slice(start, stop, copy=False)),
+            copy=False,
+        )
+    return d_inv
 
 
 def restrict_chi_phys_to_positive_eigenvalues(
@@ -695,8 +883,42 @@ def calculate_kernel_r_q(
         :class:`FourPoint`.
     """
     u_r = v_nonloc.as_channel(vrg_q_r.channel) + u_loc.as_channel(vrg_q_r.channel)
-    kernel = vrg_q_r - vrg_q_r.matmul(u_r, per_wn=per_wn) @ chi_phys_q_r
+    return _kernel_from_bracket(vrg_q_r - vrg_q_r.matmul(u_r, per_wn=per_wn) @ chi_phys_q_r, u_r, per_wn)
 
+
+def calculate_pole_free_kernel_r_q(
+    vrg_q_r: FourPoint, middle_q_r: FourPoint, v_nonloc: Interaction, u_loc: LocalInteraction
+) -> FourPoint:
+    r"""
+    Returns the self-energy kernel of :func:`calculate_kernel_r_q` from the three-leg vertex of the ladder of
+    :math:`\Gamma_{r}` alone, whose bracket :math:`\gamma^{\Gamma}_{r} Y_{r}` equals
+    :math:`\gamma^{*}_{r} - \gamma^{*}_{r} \mathcal{U}^{\mathbf{q}}_{r} \hat\chi` (see
+    :func:`create_kernel_middle`) without the zero eigenvalues of the auxiliary ladder.
+
+    :param vrg_q_r: The three-leg vertex :math:`\gamma^{\Gamma;\mathrm{q}\nu}_{r}` of the ladder of
+        :math:`\Gamma_{r}`.
+    :param middle_q_r: The matrix :math:`Y^{\mathrm{q}}_{r}` of :func:`create_kernel_middle`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
+    :param u_loc: The bare local interaction :math:`U`.
+    :return: The self-energy kernel :math:`[(K-\mathbb{1})\,\mathcal{U}_r]` (contraction layout) as a
+        :class:`FourPoint`.
+    """
+    u_r = v_nonloc.as_channel(vrg_q_r.channel) + u_loc.as_channel(vrg_q_r.channel)
+    return _kernel_from_bracket(vrg_q_r @ middle_q_r, u_r)
+
+
+def _kernel_from_bracket(kernel: FourPoint, u_r: Interaction, per_wn: bool = False) -> FourPoint:
+    r"""
+    Subtracts the identity from the Schwinger-Dyson bracket :math:`K` in place and returns
+    :math:`(K - \mathbb{1})\,\mathcal{U}^{\mathbf{q}}_{r}` in the layout of the sigma contraction (see
+    :func:`calculate_kernel_r_q`).
+
+    :param kernel: The bracket :math:`K`; overwritten.
+    :param u_r: The channel-projected total interaction :math:`\mathcal{U}^{\mathbf{q}}_{r}`.
+    :param per_wn: Whether the product with the channel interaction takes the bosonic frequency as a batch index
+        (see :meth:`~dgamore.four_point.FourPoint.matmul`).
+    :return: The self-energy kernel (contraction layout) as a :class:`FourPoint`.
+    """
     # subtract the identity directly on the compound-identity positions (o1 == o4, o2 == o3, every frequency) instead
     # of materializing an identity block; the channel weights (1x dens, 3x magn) turn this into -U_d - 3U_m
     orb = np.arange(kernel.n_bands)
@@ -985,17 +1207,22 @@ def calculate_sigma_kernel_r_q(
 ) -> FourPoint | None:
     r"""
     Adds the kernel for the self-energy calculation in a specific spin channel, times ``weight``, to ``kernel`` in
-    place. Calculates the auxiliary susceptibility, the three-leg vertex and the physical susceptibility with shell
-    correction. Also performs a :math:`\lambda`-correction on the physical susceptibility if specified in the config
-    (dispatched by the band count). Saves the physical susceptibility (and, with ``save_eliashberg``, the per-rank
-    Eliashberg intermediates) to file.
+    place. Solves the ladder of :math:`\Gamma_{r}` without the :math:`U_{r}` shift (see
+    :func:`create_auxiliary_chi_r_q_sum` with ``subtract_u`` False) and builds from it the three-leg vertex, the
+    shell-corrected physical susceptibility (see :func:`create_shell_corrected_chi_from_gamma_ladder`) and the kernel
+    (see :func:`create_kernel_middle` and :func:`calculate_pole_free_kernel_r_q`), so no inversion meets the zero
+    eigenvalues the auxiliary Bethe-Salpeter matrix can have where the physical susceptibility is regular. Also performs
+    a :math:`\lambda`-correction on the physical susceptibility if specified in the config (dispatched by the band
+    count). Saves the physical susceptibility to file and, with ``save_eliashberg``, the per-rank Eliashberg
+    intermediates: the three-leg vertex as ``vrg_q_{channel}_rank_{rank}`` and the matrix between the three-leg
+    vertices of the ladder vertex (see :func:`create_ladder_vertex_middle`) as ``vrg_middle_q_{channel}_rank_{rank}``.
 
     The three-leg vertex and the channel kernel are built in momentum groups of
     :func:`~dgamore.memory_estimator.kernel_momentum_group` on views of the rank's arrays: each group of the summed
-    auxiliary susceptibility is overwritten with its three-leg vertex, and each group's kernel is added to its window
-    of ``kernel``. Beside ``kernel`` and the inverse bubble the step holds a single one-fermion block (the summed
-    susceptibility, then the vertex) and one group's temporaries, and every momentum gets the bits of the ungrouped
-    products.
+    ladder susceptibility is overwritten with its three-leg vertex, and each group's kernel is added to its window
+    of ``kernel``. Beside ``kernel``, the inverse bubble and the bosonic matrices the step holds a single one-fermion
+    block (the summed susceptibility, then the vertex) and one group's temporaries, and every momentum gets the bits of
+    the ungrouped products.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}`.
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
@@ -1006,7 +1233,7 @@ def calculate_sigma_kernel_r_q(
     :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param annealer: The active :class:`LambdaAnnealer` (its boson mass is applied to the physical susceptibility),
         or ``None`` when annealing is off.
-    :param save_eliashberg: Whether to write this rank's three-leg vertex and physical susceptibility for the
+    :param save_eliashberg: Whether to write this rank's Gamma-ladder three-leg vertex and vertex middle for the
         Eliashberg step (the self-consistency loop asks for it once per run).
     :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, kept by the
         self-consistency loop across its iterations; ``None`` for the one-shot correction.
@@ -1019,69 +1246,86 @@ def calculate_sigma_kernel_r_q(
     """
     logger = config.logger
 
-    gchi_aux_q_r_sum = create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc, involution=involution)
+    gchi_ladder_q_r_sum = create_auxiliary_chi_r_q_sum(
+        gamma_r, gchi0_q_inv, u_loc, involution=involution, subtract_u=False
+    )
 
     mpi_dist_irrq.barrier()
 
     # reported as the full two-fermion auxiliary susceptibility, which the summed object stands in for
     logger.log_memory_usage(
-        f"Auxiliary susceptibility ({gchi_aux_q_r_sum.channel.value})",
-        gchi_aux_q_r_sum,
+        f"Auxiliary susceptibility ({gchi_ladder_q_r_sum.channel.value})",
+        gchi_ladder_q_r_sum,
         mpi_dist_irrq.comm.size,
         scale=2 * config.box.niv_core,
     )
-    logger.info(f"Non-Local auxiliary susceptibility ({gchi_aux_q_r_sum.channel.value}) calculated.")
+    logger.info(f"Non-Local auxiliary susceptibility ({gchi_ladder_q_r_sum.channel.value}) calculated.")
 
-    chi_phys_q_r = gchi_aux_q_r_sum.sum_over_all_vn(config.sys.beta)
+    x_g = gchi_ladder_q_r_sum.sum_over_all_vn(config.sys.beta)
 
     n_q = gchi0_q_inv.current_shape[0]
     step = memory_estimator.kernel_momentum_group(n_q)
     windows = [(start, min(n_q, start + step)) for start in range(0, n_q, step)]
-    with deferred_collection():
-        # each window of the summed auxiliary susceptibility becomes its three-leg vertex in place (views, same bits)
-        for start, stop in windows:
-            create_vrg_r_q(
-                gchi_aux_q_r_sum.take_q_index_slice(start, stop, copy=False),
-                gchi0_q_inv.take_q_index_slice(start, stop, copy=False),
-                copy=False,
-            )
-    vrg_q_r = gchi_aux_q_r_sum
-    del gchi_aux_q_r_sum
+    vrg_q_r = _three_leg_vertex_in_place(gchi_ladder_q_r_sum, gchi0_q_inv, windows)
+    del gchi_ladder_q_r_sum
 
     logger.info(f"Non-local three-leg vertex gamma^wv ({vrg_q_r.channel.value}) done.")
     logger.log_memory_usage(f"Three-leg vertex ({vrg_q_r.channel.value})", vrg_q_r, mpi_dist_irrq.comm.size)
 
-    if save_eliashberg:
-        vrg_q_r.save(
-            name=f"vrg_q_{vrg_q_r.channel.value}_rank_{mpi_dist_irrq.comm.rank}",
-            output_dir=config.output.eliashberg_path,
-        )
-
-    chi_phys_q_r = create_generalized_chi_q_with_shell_correction(
-        chi_phys_q_r, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc
+    chi_phys_q_r = create_shell_corrected_chi_from_gamma_ladder(
+        x_g, gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc
     )
 
     logger.info(f"Updated non-local susceptibility chi^q ({chi_phys_q_r.channel.value}) with asymptotic correction.")
 
+    # the finishing step overwrites its input, and the middles read chi before it; the Eliashberg step reads the
+    # middles, so the per-rank chi is not written
+    chi_shell = chi_phys_q_r.copy()
     chi_phys_q_r = _finish_physical_susceptibility(
-        chi_phys_q_r, mpi_dist_irrq, annealer, save_eliashberg, lambda_previous
+        chi_phys_q_r, mpi_dist_irrq, annealer, lambda_previous=lambda_previous
     )
+    parts = (gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc, chi_shell, chi_phys_q_r)
 
-    if kernel is None:
-        return None
-    # one statement per group, so its objects are released inside the deferred collection
+    if kernel is not None:
+        middle_q_r = create_kernel_middle(x_g, *parts)
+        # one statement per group, so its objects are released inside the deferred collection
+        with deferred_collection():
+            for start, stop in windows:
+                kernel.take_q_index_slice(start, stop, copy=False).add(
+                    calculate_pole_free_kernel_r_q(
+                        vrg_q_r.take_q_index_slice(start, stop, copy=False),
+                        middle_q_r.take_q_index_slice(start, stop, copy=False),
+                        v_nonloc.take_q_index_slice(start, stop, copy=False),
+                        u_loc,
+                    ).scale(weight),
+                    copy=False,
+                )
+    if save_eliashberg:
+        channel, rank, path = vrg_q_r.channel.value, mpi_dist_irrq.comm.rank, config.output.eliashberg_path
+        vrg_q_r.save(name=f"vrg_q_{channel}_rank_{rank}", output_dir=path)
+        create_ladder_vertex_middle(x_g, *parts).save(name=f"vrg_middle_q_{channel}_rank_{rank}", output_dir=path)
+        logger.info(f"Saved the Gamma-ladder three-leg vertex and vertex middle ({channel}) for the Eliashberg step.")
+    return kernel
+
+
+def _three_leg_vertex_in_place(gchi_q_r_sum: FourPoint, gchi0_q_inv: FourPoint, windows: list) -> FourPoint:
+    r"""
+    Overwrites a frequency-summed susceptibility with its three-leg vertex (see :func:`create_vrg_r_q`) one momentum
+    window at a time, on views, so every momentum gets the bits of the ungrouped product.
+
+    :param gchi_q_r_sum: The frequency-summed susceptibility; overwritten.
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
+    :param windows: The momentum windows ``(start, stop)`` of the rank.
+    :return: ``gchi_q_r_sum``, now the three-leg vertex.
+    """
     with deferred_collection():
         for start, stop in windows:
-            kernel.take_q_index_slice(start, stop, copy=False).add(
-                calculate_kernel_r_q(
-                    vrg_q_r.take_q_index_slice(start, stop, copy=False),
-                    chi_phys_q_r.take_q_index_slice(start, stop, copy=False),
-                    v_nonloc.take_q_index_slice(start, stop, copy=False),
-                    u_loc,
-                ).scale(weight),
+            create_vrg_r_q(
+                gchi_q_r_sum.take_q_index_slice(start, stop, copy=False),
+                gchi0_q_inv.take_q_index_slice(start, stop, copy=False),
                 copy=False,
             )
-    return kernel
+    return gchi_q_r_sum
 
 
 def calculate_sigma_from_kernel(kernel: FourPoint, giwk: GreensFunction, my_full_q_list: np.ndarray) -> SelfEnergy:
@@ -2139,9 +2383,9 @@ def calculate_sigma_proposal(
         is off.
     :param chunk_budgets: Chunk byte budgets, of which the self-energy contraction reads its own (sized by the driver
         from the memory estimate); ``None`` gives it the job-wide fair-share budget of :func:`_sde_chunk_budget`.
-    :param save_eliashberg: Whether to write this rank's Eliashberg intermediates (inverse bubble, three-leg vertices,
-        physical susceptibilities; in the bare-vertex modes the physical susceptibilities only); the loop asks for it
-        in its last scheduled iteration.
+    :param save_eliashberg: Whether to write this rank's Eliashberg intermediates (inverse bubble, three-leg vertices
+        and vertex middles; in the bare-vertex modes the physical susceptibilities only); the loop asks for it in its
+        last scheduled iteration.
     :param eliashberg_only: Whether to stop after the two channel kernels: the double-counting kernel and the SDE are
         skipped and ``None`` is returned on every rank (the pass after a loop that converged before its last
         iteration).
