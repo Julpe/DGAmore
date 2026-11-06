@@ -62,11 +62,11 @@ LOCAL_SDE_DATA = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/local_
 
 
 def test_init_mu_history_fresh_uses_current_mu():
-    """A fresh run (starting_iter == 0) seeds the history with the current (DMFT) chemical potential and leaves it."""
+    """A fresh run (no warm start) seeds the history with the current (DMFT) chemical potential and leaves it."""
     config.sys.mu = 0.7
     config.self_consistency.previous_sc_path = ""
 
-    mu_history = _init_mu_history(0)
+    mu_history = _init_mu_history(False)
 
     assert mu_history == [0.7]
     assert config.sys.mu == 0.7  # unchanged on a fresh run
@@ -79,7 +79,7 @@ def test_init_mu_history_from_previous_syncs_global_mu(monkeypatch, tmp_path):
     previous_mu = 1.5
     monkeypatch.setattr(np, "load", lambda *args, **kwargs: np.array([0.9, 1.2, previous_mu]))
 
-    mu_history = _init_mu_history(3)
+    mu_history = _init_mu_history(True)
 
     assert mu_history == [previous_mu]
     assert config.sys.mu == previous_mu
@@ -113,7 +113,7 @@ def test_get_starting_sigma_picks_the_interpolated_file_closest_in_beta_and_coun
     loaded = _previous_run_folder(tmp_path, monkeypatch, names + ("sigma_dga_interpolated_beta25.0_niv4.npy",))
     config.self_consistency.use_interpolated_sigma = True
 
-    sigma, starting_iter = nonlocal_sde.get_starting_sigma(MagicMock())
+    sigma, starting_iter, _ = nonlocal_sde.get_starting_sigma(MagicMock())
 
     assert loaded == ["sigma_dga_interpolated_beta25.0_niv4.npy"]
     assert starting_iter == 7
@@ -126,7 +126,7 @@ def test_get_starting_sigma_without_interpolation_loads_the_highest_raw_iterate(
     loaded = _previous_run_folder(tmp_path, monkeypatch, names)
     config.self_consistency.use_interpolated_sigma = False
 
-    _, starting_iter = nonlocal_sde.get_starting_sigma(MagicMock())
+    _, starting_iter, _ = nonlocal_sde.get_starting_sigma(MagicMock())
 
     assert loaded == ["sigma_dga_iteration_7.npy"]
     assert starting_iter == 7
@@ -139,7 +139,7 @@ def test_get_starting_sigma_warns_when_use_interpolated_sigma_has_no_previous_pa
     config.self_consistency.use_interpolated_sigma = True
     default = MagicMock()
 
-    sigma, starting_iter = nonlocal_sde.get_starting_sigma(default)
+    sigma, starting_iter, _ = nonlocal_sde.get_starting_sigma(default)
 
     assert sigma is default
     assert starting_iter == 0
@@ -152,12 +152,30 @@ def test_get_starting_sigma_falls_back_to_the_default_and_warns_without_an_inter
     config.self_consistency.use_interpolated_sigma = True
     default = MagicMock()
 
-    sigma, starting_iter = nonlocal_sde.get_starting_sigma(default)
+    sigma, starting_iter, _ = nonlocal_sde.get_starting_sigma(default)
 
     assert sigma is default
     assert starting_iter == 0
     assert loaded == []
     config.logger.warning.assert_called_once()
+
+
+@pytest.mark.parametrize("interpolated", [False, True])
+def test_get_starting_sigma_without_iterates_warm_starts_from_the_final_sigma_at_iteration_one(
+    monkeypatch, tmp_path, interpolated
+):
+    """Without raw iterates the predecessor's final sigma_dga.npy (or its interpolated file) is a warm start whose
+    loop counts its iterations from one, with a warning."""
+    interpolated_name = "sigma_dga_interpolated_beta25.0_niv4.npy"
+    loaded = _previous_run_folder(tmp_path, monkeypatch, ("sigma_dga.npy", interpolated_name))
+    config.self_consistency.use_interpolated_sigma = interpolated
+
+    sigma, starting_iter, warm_start = nonlocal_sde.get_starting_sigma(MagicMock())
+
+    assert loaded == [interpolated_name if interpolated else "sigma_dga.npy"]
+    assert (starting_iter, warm_start) == (0, True)
+    assert sigma.mat.shape == (2, 2, 1, 1, 1, 4)
+    assert "iteration 1" in config.logger.warning.call_args.args[0]
 
 
 def test_nonlocal_hartree_fock_matches_local_reference():
@@ -1680,8 +1698,8 @@ def test_loop_writes_the_eliashberg_intermediates_once(
     if start:
         mat = np.full((1, 1, 1, 16), 1.0 + 0.1j, dtype=np.complex64)
         resumed = SelfEnergy(mat, (1, 1, 1), has_compressed_q_dimension=True, beta=10.0)
-        monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (resumed, start))
-        monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [config.sys.mu])
+        monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (resumed, start, True))
+        monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda warm_start: [config.sys.mu])
     fake, seen = nonlocal_sde.calculate_sigma_proposal, []
 
     def spy(*args, **kwargs):
@@ -1719,7 +1737,7 @@ def test_resumed_run_shares_the_starting_iterate_per_node_before_the_first_propo
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
     run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
-    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [config.sys.mu])
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda warm_start: [config.sys.mu])
     original, before, loads, broadcasts = nonlocal_sde._share_sigma_per_node, [], [], []
 
     def spy(sigma, comm, node_comm, roots_comm):
@@ -1736,7 +1754,7 @@ def test_resumed_run_shares_the_starting_iterate_per_node_before_the_first_propo
 
     def loaded(default):
         loads.append(threading.current_thread().name)
-        return SelfEnergy(mat.copy(), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0), 3
+        return SelfEnergy(mat.copy(), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0), 3, True
 
     monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", loaded)
     run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
@@ -1747,23 +1765,24 @@ def test_resumed_run_shares_the_starting_iterate_per_node_before_the_first_propo
 
     before.clear()
     calls.clear()
-    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (default, 0))
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (default, 0, False))
     run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
     assert before == []
 
 
-def test_warm_start_holds_the_dmft_filling_and_resolves_mu(monkeypatch, tmp_path):
+@pytest.mark.parametrize("start", [3, 0])  # resuming after iteration 3, and a warm start without raw iterates
+def test_warm_start_holds_the_dmft_filling_and_resolves_mu(monkeypatch, tmp_path, start):
     """A resumed run holds the DMFT lattice filling, not its start's filling at the predecessor's mu, and re-solves
-    the start's mu for it before the first proposal."""
+    the start's mu for it before the first proposal, which is iteration start + 1."""
     run, calls, logger = _setup_self_energy_loop(
         monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0
     )
     config.sys.mu_dmft = 0.5
-    start = SelfEnergy(
+    resumed = SelfEnergy(
         np.full((1, 1, 1, 16), 0.5 + 0.2j, dtype=np.complex64), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0
     )
-    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3))
-    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [0.7])  # the predecessor's mu
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (resumed, start, True))
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda warm_start: [0.7])  # the predecessor's mu
 
     built = []
 
@@ -1782,19 +1801,21 @@ def test_warm_start_holds_the_dmft_filling_and_resolves_mu(monkeypatch, tmp_path
     )
     solves = []
     monkeypatch.setattr(nonlocal_sde, "update_mu", lambda mu0, n, *a, **k: solves.append((mu0, n)) or 0.42)
-    fake, proposal_mus = nonlocal_sde.calculate_sigma_proposal, []
+    fake, proposal_mus, iterations = nonlocal_sde.calculate_sigma_proposal, [], []
 
     def spy(sigma_in, mu, *args, **kwargs):
         proposal_mus.append(mu)
+        iterations.append(args[-1])
         return fake(sigma_in, mu, *args, **kwargs)
 
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", spy)
     run()
     assert solves[0] == (0.7, 0.85)  # the start's mu re-solved for the DMFT lattice filling
-    assert proposal_mus[0] == 0.42 and config.sys.n == 0.85
+    assert proposal_mus[0] == 0.42 and config.sys.n == 0.85 and iterations[0] == start + 1
     assert all(n == 0.85 for _, n in solves)  # every later mu update holds the same filling
     infos = [str(c.args[0]) for c in logger.info.call_args_list]
     assert "Filling of the updated Green's function: 1.000000 (target 0.850000)." in infos  # the stub reports 1.0
+    assert f"Using previous calculation and starting the self-consistency loop at iteration {start + 1}." in infos
     assert built == []  # without the DMFT spectrum no whole-box Green's function is built, only its occupation
 
 
@@ -1807,8 +1828,8 @@ def test_dmft_spectrum_builds_and_saves_the_lattice_green_function_once_next_to_
     start = SelfEnergy(
         np.full((1, 1, 1, 16), 0.5 + 0.2j, dtype=np.complex64), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0
     )
-    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3))
-    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [0.7])
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3, True))
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda warm_start: [0.7])
     monkeypatch.setattr(nonlocal_sde, "update_mu", lambda *a, **k: 0.42)
     fill = (0.85, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1)))
     built, saved, occupations = [], [], []
@@ -1857,8 +1878,8 @@ def test_warm_start_and_loop_solve_mu_on_every_rank_with_its_momenta(monkeypatch
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((3, 1, 1, 1, 1)))
     mat = (np.arange(3.0)[:, None, None, None] + 0.1j + np.zeros((3, 1, 1, 16))).astype(np.complex64)
     start = SelfEnergy(mat, (3, 1, 1), has_compressed_q_dimension=True, beta=10.0)
-    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3))
-    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [0.7])
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3, True))
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda warm_start: [0.7])
     mixing, mixed, seen = nonlocal_sde.apply_mixing_strategy, [], []
 
     def mix(*args):
@@ -4045,9 +4066,9 @@ def test_loop_carries_the_spectrum_only_when_resuming(monkeypatch, tmp_path, res
     config.stabilization.use_jacobian_stabilization = True
     carried = []
     run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1)
-    if resumed:  # previous_sc_path stays empty: a starting iteration above zero is what triggers the carry-over
-        monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda sigma: (sigma, 5))
-        monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [0.5])
+    if resumed:  # previous_sc_path stays empty: the warm-start flag is what triggers the carry-over
+        monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda sigma: (sigma, 5, True))
+        monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda warm_start: [0.5])
     monkeypatch.setattr(nonlocal_sde, "_carry_jacobian_spectrum", lambda tracker, annealer: carried.append(tracker))
     monkeypatch.setattr(nonlocal_sde, "_save_jacobian_spectrum", lambda tracker, converged, *rows: None)
     run()
@@ -4129,7 +4150,7 @@ def test_loop_saves_the_core_window_of_the_proposal_as_the_map_returned_it(monke
 def test_get_starting_sigma_reads_the_iterates_subfolder_before_the_run_folder(monkeypatch, tmp_path):
     """The highest iterate of the Sigma_Iterates subfolder is the primary read path; run-folder files never win."""
     default = _fake_previous_run(monkeypatch, tmp_path, [3, 9], run_folder_iters=(4, 12))
-    sigma, starting_iter = nonlocal_sde.get_starting_sigma(default)
+    sigma, starting_iter, _ = nonlocal_sde.get_starting_sigma(default)
     # the loaded array carries the iteration number of the file it came from
     assert starting_iter == 9
     assert np.array_equal(sigma.mat, np.full(sigma.mat.shape, 9.0, dtype=sigma.mat.dtype))
@@ -4144,7 +4165,7 @@ def test_get_starting_sigma_falls_back_to_files_in_the_run_folder(monkeypatch, t
 def test_get_starting_sigma_without_previous_run_returns_default(monkeypatch, tmp_path):
     """Without a usable previous run the DMFT self-energy starts the loop at iteration zero."""
     default = _fake_previous_run(monkeypatch, tmp_path, [])
-    assert nonlocal_sde.get_starting_sigma(default) == (default, 0)
+    assert nonlocal_sde.get_starting_sigma(default) == (default, 0, False)
 
 
 def test_loop_threads_one_persistent_lambda_dict_to_every_proposal(monkeypatch, tmp_path):
@@ -4434,8 +4455,8 @@ def test_warm_start_reads_the_dmft_filling_without_building_the_dmft_box_greens_
     start = SelfEnergy(
         np.full((1, 1, 1, 16), 0.5 + 0.2j, dtype=np.complex64), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0
     )
-    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3))
-    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda starting_iter: [0.7])
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3, True))
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda warm_start: [0.7])
     built, fillings = [], []
     fill = (0.85, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1)))
     greens = SimpleNamespace(

@@ -1810,19 +1810,22 @@ def _sde_chunk_budget(comm: MPI.Comm, shared_node_comm) -> int:
     return comm.allreduce(chunk_bytes, op=MPI.MIN) if comm.size > 1 else chunk_bytes
 
 
-def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
+def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int, bool]:
     r"""
     Retrieves the starting self-energy of the self-consistency cycle from a previous run. With
     ``use_interpolated_sigma`` this is the predecessor's final self-energy re-gridded to this temperature,
     ``sigma_dga_interpolated_beta<b>_niv<n>.npy`` (the file with ``<b>`` closest to the current :math:`\beta` if
     several exist); otherwise it is the raw iterate ``sigma_dga_iteration_<i>.npy`` with the highest ``<i>``. The
     iteration count comes from the raw iterates in both cases, read from the run's ``Sigma_Iterates`` subfolder or,
-    for a run written before that subfolder existed, from the run folder itself. Without a usable file the DMFT
-    self-energy is returned.
+    for a run written before that subfolder existed, from the run folder itself. A finished run without raw iterates
+    (one that wrote ``sigma_dga.npy``, the same array as its last iterate) is resumed from that file, or from its
+    interpolated file with ``use_interpolated_sigma``, with a warning: its iteration count is unknown, so the loop
+    starts at iteration 1. Without a usable file the DMFT self-energy is returned.
 
     :param default_sigma: The fallback (DMFT) :class:`SelfEnergy` used when no previous result is found.
-    :return: A tuple of the starting :class:`SelfEnergy` (cut to the core box and interpolated onto the k-grid) and
-        the iteration number it was taken from (0 if none found).
+    :return: A tuple of the starting :class:`SelfEnergy` (cut to the core box and interpolated onto the k-grid), the
+        iteration number it was taken from (0 if none found) and whether it comes from the previous run (a warm
+        start).
     """
     previous_sc_path = config.self_consistency.previous_sc_path
 
@@ -1831,17 +1834,21 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
             config.logger.warning(
                 "use_interpolated_sigma is set but previous_sc_path is empty or missing; starting from DMFT."
             )
-        return default_sigma, 0
+        return default_sigma, 0, False
 
     pattern = "sigma_dga_iteration_*.npy"
     iterates = glob.glob(
         os.path.join(previous_sc_path, config.self_consistency.sigma_iterates_subfolder_name, pattern)
     ) or glob.glob(os.path.join(previous_sc_path, pattern))
     files = {int(match.group(1)): f for f in iterates if (match := re.search(r"iteration_(\d+)\.npy$", f))}
+    max_iter = max(files, default=0)
+    max_file = files.get(max_iter, os.path.join(previous_sc_path, "sigma_dga.npy"))
     if not files:
-        return default_sigma, 0
-    max_iter = max(files)
-    max_file = files[max_iter]
+        if not os.path.isfile(max_file):
+            return default_sigma, 0, False
+        config.logger.warning(
+            f"No {pattern} in {previous_sc_path}: its iteration count is unknown, so the loop starts at iteration 1."
+        )
 
     if config.self_consistency.use_interpolated_sigma:
         beta_regex = re.compile(r"sigma_dga_interpolated_beta([0-9.eE+-]+)_niv\d+\.npy$")
@@ -1851,18 +1858,18 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int]:
         ]
         if not betas:
             config.logger.warning(f"No interpolated self-energy found in {previous_sc_path}; starting from DMFT.")
-            return default_sigma, 0
+            return default_sigma, 0, False
         max_file = min(betas, key=lambda x: x[0])[1]
     config.logger.info(f"Starting the self-consistency from {max_file} (iteration {max_iter}).")
     mat = np.load(max_file)
     sigma = SelfEnergy(mat, mat.shape[:3], True, False, beta=config.sys.beta).cut_niv(config.box.niv_core)
-    return sigma.interpolate_q_grid(config.lattice.k_grid.nk, False), max_iter
+    return sigma.interpolate_q_grid(config.lattice.k_grid.nk, False), max_iter, True
 
 
-def _init_mu_history(starting_iter: int) -> list[float]:
+def _init_mu_history(warm_start: bool) -> list[float]:
     r"""
-    Seeds the chemical-potential history for the self-consistency loop. For a fresh run (``starting_iter == 0``) the
-    history starts at the current (DMFT) chemical potential :math:`\mu`. When resuming from a previous self-consistency
+    Seeds the chemical-potential history for the self-consistency loop. For a fresh run (no warm start) the history
+    starts at the current (DMFT) chemical potential :math:`\mu`. When resuming from a previous self-consistency
     calculation it is seeded with that run's last :math:`\mu` (from ``mu_history.npy``) and the global ``config.sys.mu``
     is synced to it: otherwise ``config.sys.mu`` would stay at the DMFT value while ``giwk_full`` is built with the
     previous run's :math:`\mu`, and any quantity computed from the global (e.g. the lattice filling in
@@ -1870,10 +1877,10 @@ def _init_mu_history(starting_iter: int) -> list[float]:
     That value is only the starting guess: :func:`calculate_self_energy_q` re-solves it so the starting self-energy has
     the DMFT lattice filling.
 
-    :param starting_iter: The iteration the previous calculation stopped at (0 for a fresh run).
+    :param warm_start: Whether the loop starts from a previous run's self-energy (see :func:`get_starting_sigma`).
     :return: The single-element chemical-potential history list.
     """
-    if starting_iter == 0:
+    if not warm_start:
         return [config.sys.mu]
 
     previous_mu = float(np.load(os.path.join(config.self_consistency.previous_sc_path, "mu_history.npy"))[-1])
@@ -3098,14 +3105,14 @@ def calculate_self_energy_q(
     sigma_win = None
 
     # only rank 0 reads a previous run's iterate; the other ranks receive it below, once per node
-    sigma_old, starting_iter = get_starting_sigma(sigma_dmft) if comm.rank == 0 else (sigma_dmft, 0)
-    starting_iter = comm.bcast(starting_iter, root=0)
-    if starting_iter > 0:
+    sigma_old, starting_iter, warm_start = get_starting_sigma(sigma_dmft) if comm.rank == 0 else (sigma_dmft, 0, False)
+    starting_iter, warm_start = comm.bcast((starting_iter, warm_start), root=0)
+    if warm_start:
         logger.info(
             f"Using previous calculation and starting the self-consistency loop at iteration {starting_iter + 1}."
         )
 
-    mu_history = _init_mu_history(starting_iter)
+    mu_history = _init_mu_history(warm_start)
 
     # rank 0 keeps the accelerated-mixing (iterate, proposal) pair history in memory; the saved sigma files hold
     # only post-mixing iterates (no proposals), so resumed runs start empty and re-arm as pairs accumulate
@@ -3143,15 +3150,15 @@ def calculate_self_energy_q(
         giwk_full_dmft.save(output_dir=config.output.output_path, name="g_latt_dmft")
         giwk_full_dmft.free()
         logger.info("Lattice Green's function calculated.")
-    if comm.rank == 0 and starting_iter > 0:
+    if comm.rank == 0 and warm_start:
         n_dmft = GreensFunction.get_occupation(
             sigma_dmft_full, config.sys.mu_dmft, ek, config.sys.beta, orbitals=orbitals
         )[0]
 
-    if comm.rank == 0 or starting_iter == 0:
+    if comm.rank == 0 or not warm_start:
         sigma_old = sigma_old.concatenate_self_energies(sigma_dmft_full)
 
-    if starting_iter == 0:
+    if not warm_start:
         # a fresh start holds the momentum-local DMFT sigma on every rank, so each rank evaluates the filling of the
         # full DMFT box on its own momentum slice (arithmetic decided on all momenta) and assembles it exactly
         n_my, nb = mpi_dist_fullbz.my_size, ek.shape[-1]
@@ -3235,7 +3242,7 @@ def calculate_self_energy_q(
 
     # rank 0 holds a resumed run's full-BZ starting iterate: spread it like the loop's mixed iterate, one window
     # per node (the loop frees this window after the first proposal)
-    if starting_iter > 0 and sc_node_comm is not None:
+    if warm_start and sc_node_comm is not None:
         sigma_old, sigma_win = _share_sigma_per_node(sigma_old, comm, sc_node_comm, sc_roots_comm)
 
     # the bare-vertex modes add no noise-removal term: their self-energy is the one of their RPA kernels alone
@@ -3262,7 +3269,7 @@ def calculate_self_energy_q(
     lambda_previous = None
     if config.stabilization.use_lambda_correction and not config.lambda_correction.perform_lambda_correction:
         lambda_previous = {}
-    if tracker is not None and comm.rank == 0 and starting_iter > 0:
+    if tracker is not None and comm.rank == 0 and warm_start:
         _carry_jacobian_spectrum(tracker, annealer)
     anneal_reset_iter = None
     release_iter = None
