@@ -29,12 +29,13 @@ jobs:
         with:
           python-version: "3.13"
           cache: 'pip'
+          cache-dependency-path: pyproject.toml
 
-      # 3. Install documentation dependencies (mpi4py and psutil are mocked in conf.py)
+      # 3. Install the package (for its runtime dependencies) and the docs group; conf.py mocks mpi4py and psutil
       - name: Install documentation dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r docs/requirements.txt
+          pip install . --group docs
 
       # 4. Build HTML docs; -W turns warnings into errors, --keep-going reports them all
       - name: Build HTML documentation

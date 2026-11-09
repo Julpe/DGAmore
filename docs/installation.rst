@@ -48,9 +48,10 @@ pick up upstream changes simply by pulling the latest version. Please make sure 
 dependencies are reused, as this can lead to installation problems.
 
 Installing the package also places the entry points ``DGAmore`` and ``symmetrize`` on your ``PATH``, so you can
-launch a run from anywhere without specifying its full path. ``pytest`` is installed along with the other
-dependencies, so the installation can be verified by running the test suite from the repository directory:
+launch a run from anywhere without specifying its full path. To verify the installation, install the test
+dependencies (``pip`` 25.1 or newer) and run the test suite from the repository directory:
 
 .. code-block:: bash
 
+   pip install --group test
    pytest

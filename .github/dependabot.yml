@@ -6,6 +6,10 @@ updates:
     schedule:
       interval: "monthly"
   - package-ecosystem: "pip"
-    directory: "/" # root requirements.txt (docs/requirements.txt is intentionally pinned, left out)
+    directory: "/" # root pyproject.toml
     schedule:
       interval: "monthly"
+    ignore:
+      # The docs group is intentionally pinned, see the comment in pyproject.toml.
+      - dependency-name: "sphinx"
+      - dependency-name: "pydata-sphinx-theme"

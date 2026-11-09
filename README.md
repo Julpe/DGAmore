@@ -64,7 +64,7 @@ cd DGAmore
 pip install .
 ```
 
-To check the installation, run `pytest tests` from the repository directory. A calculation needs three inputs: the
+To check the installation, run `pip install --group test`, then `pytest tests`. A calculation needs three inputs: the
 one- and two-particle output of a w2dynamics DMFT run (the two-particle file goes through the installed `symmetrize`
 script first), a Hamiltonian in real space (Wannier90 format) or in momentum space, and a YAML configuration file.
 Edit the configuration, then start the routine with `-p` pointing at the directory that holds it and `-c` naming it
