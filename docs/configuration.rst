@@ -728,7 +728,7 @@ never rejected; poles in the lower half plane with negative weights represent it
 scattering keeps growing toward :math:`\nu \to 0` as in a pseudogap, stay with the plain extrapolation: at the noise
 level of a DGA self-energy their pole fits are not stable. Expect about one second per flagged momentum and orbital
 pair. ``mini_pole`` and its dependency ``kneed`` are research codes and therefore pinned to exact versions in
-``requirements.txt``.
+``pyproject.toml``.
 
 Output
 ------

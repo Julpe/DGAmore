@@ -8,7 +8,6 @@ ignore:
   - "*.log"
   - "*.txt"
   - "*.html"
-  - "**/setup.py"
   - "**/DGAmore.py"
   - "**/plotting.py"
   - "**/config_parser.py"

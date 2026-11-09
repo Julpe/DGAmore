@@ -1,6 +1,50 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+# 77 is the first release that accepts an SPDX string for `license`.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "DGAmore"
+version = "1.0.0"
+description = "Self-consistent multi-orbital ladder-DGA code for the multi-band Hubbard Model"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Julian Peil", email = "julian.peil@tuwien.ac.at" }]
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "numpy~=2.5",
+    "matplotlib~=3.10",
+    "mpi4py~=4.0",
+    "h5py~=3.16",
+    "pandas~=2.2",
+    "scipy~=1.18",
+    "multimethod~=2.0",
+    "ruamel.yaml~=0.19",
+    "psutil~=7.2",
+    "threadpoolctl~=3.6",
+    # Exact pins: research codes whose updates are not tracked by DGAmore.
+    "mini_pole==0.7",
+    "kneed==0.8.6",
+]
+
+[dependency-groups]
+test = ["pytest~=9.1", "pytest-cov~=7.1"]
+# Pinned: the pydata theme's navbar/sidebar options and layout change across minor releases, so an unpinned
+# upgrade can silently shift the rendered docs. Bump these deliberately and re-check the navbar/sidebar locally.
+docs = ["sphinx~=9.1", "pydata-sphinx-theme~=0.21.0"]
+
+[project.scripts]
+DGAmore = "dgamore.DGAmore:main"
+symmetrize = "dgamore.symmetrize:main"
+
+[tool.setuptools.packages.find]
+include = ["dgamore*"]
 
 [tool.black]
 line-length = 120

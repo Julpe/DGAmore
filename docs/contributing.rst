@@ -54,7 +54,7 @@ to reinstall the package every time:
 
    git clone https://github.com/<your-username>/DGAmore.git
    cd DGAmore
-   pip install -e .
+   pip install -e . --group test   # --group test adds pytest and pytest-cov (pip 25.1 or newer)
 
 From here you are ready to make changes, run the code, and run the tests.
 
@@ -81,12 +81,6 @@ When you would like to contribute code, the following workflow keeps things smoo
 
       pytest tests                     # fast suite (skips tests marked slow)
       pytest tests --runslow           # full suite, as run in CI
-
-   The coverage run additionally needs ``pytest-cov``, which is not part of the runtime dependencies:
-
-   .. code-block:: bash
-
-      pip install pytest-cov
       pytest tests --runslow --cov=dgamore --cov-report=term-missing --cov-fail-under=85   # coverage, as CI runs it
 
 5. **Open a pull request** against the ``main`` branch, with a short description of what you changed and why. If your
