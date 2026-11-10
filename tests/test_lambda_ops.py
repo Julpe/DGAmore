@@ -113,12 +113,18 @@ def test_lambda_correction_sp():
 
 
 @pytest.mark.parametrize("lc_type", ["sp", "spch"])
-def test_lambda_correction_in_sde_sp(monkeypatch, lc_type):
+def test_lambda_correction_in_sde_sp(monkeypatch, tmp_path, lc_type):
     """LambdaCorrection.perform reproduces reference chi for both sp and spch types."""
+    import shutil
+
     config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.sys.beta = 12.5
     config.lambda_correction.type = lc_type
-    config.output.output_path = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/lambda_correction/{lc_type}"
+    # perform appends to a lambda file in output_path, so work on a copy to keep the test data clean
+    src = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/lambda_correction/{lc_type}"
+    for name in os.listdir(src):
+        shutil.copy(f"{src}/{name}", tmp_path / name)
+    config.output.output_path = str(tmp_path)
 
     comm_mock = MagicMock(wraps=FAKE_MPI.COMM_WORLD)
     with monkeypatch.context() as mp:
@@ -136,6 +142,7 @@ def test_lambda_correction_in_sde_sp(monkeypatch, lc_type):
 
         assert np.allclose(chi_dens_corrected.mat, reference_chi_dens.mat)
         assert np.allclose(chi_magn_corrected.mat, reference_chi_magn.mat)
+        assert (tmp_path / f"lambda_{lc_type}.txt").exists()
 
         if lc_type == "sp":
             assert np.allclose(chi_dens_corrected.mat, chi_dens_q_before_lambda.mat)
