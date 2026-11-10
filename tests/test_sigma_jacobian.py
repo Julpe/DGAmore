@@ -1256,7 +1256,6 @@ def test_exact_jacobian_in_single_precision_keeps_the_reference_eigenvalues(loop
     assert n > 0 and np.all(error < 5e-3)
 
 
-@pytest.mark.slow
 @pytest.mark.parametrize("block", [1, 4])
 def test_exact_jacobian_leading_eigenpairs_are_the_reference_operators(loop_state, monkeypatch, block):
     """ARPACK and the block search on the windowed operator find the reference's leading eigenvalues to tolerance."""

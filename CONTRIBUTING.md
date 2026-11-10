@@ -67,9 +67,8 @@ When you would like to contribute code, the following workflow keeps things smoo
    ```
 4. **Run the tests locally** before opening your pull request, so that any problems surface early:
    ```bash
-   pytest tests                       # fast suite (skips tests marked slow)
-   pytest tests --runslow             # full suite, as run in CI
-   pytest tests --runslow --cov=dgamore --cov-report=term-missing --cov-fail-under=85   # coverage, as CI runs it
+   pytest tests                       # full suite, as run in CI
+   pytest tests --cov=dgamore --cov-report=term-missing --cov-fail-under=85   # coverage, as CI runs it
    ```
 5. **Open a pull request** against the `main` branch, with a short description of what you changed and why. If your
    pull request is related to an existing issue, mentioning it helps connect the two.

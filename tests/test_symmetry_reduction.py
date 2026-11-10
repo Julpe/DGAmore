@@ -780,29 +780,13 @@ def test_solve_u_for_op_one_orbital_does_not_call_eigh(monkeypatch):
 
 _HAMILTONIANS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_data", "auto_symmetries")
 
-# (filename, expected_shape, marks)
-# Slow tests are skipped by default; run them with `pytest --runslow`.
+# (filename, expected_shape)
 _HAMILTONIAN_CASES = [
     pytest.param("hk_1band_square_32x32x1.npy", (32, 32, 1, 1, 1), id="1band_square_32x32x1"),
     pytest.param("hk_1band_anisotropy_48x48x1.npy", (48, 48, 1, 1, 1), id="1band_anisotropy_48x48x1"),
-    pytest.param(
-        "hk_3band_srvo3_cubic_12x12x12.npy",
-        (12, 12, 12, 3, 3),
-        id="3band_srvo3_cubic_12x12x12",
-        marks=pytest.mark.slow,
-    ),
-    pytest.param(
-        "hk_3band_srvo3_cubic_20x20x20.npy",
-        (20, 20, 20, 3, 3),
-        id="3band_srvo3_cubic_20x20x20",
-        marks=pytest.mark.slow,
-    ),
-    pytest.param(
-        "hk_4band_la3ni2o7_32x32x32.npy",
-        (32, 32, 32, 4, 4),
-        id="4band_la3ni2o7_32x32x32",
-        marks=pytest.mark.slow,
-    ),
+    pytest.param("hk_3band_srvo3_cubic_12x12x12.npy", (12, 12, 12, 3, 3), id="3band_srvo3_cubic_12x12x12"),
+    pytest.param("hk_3band_srvo3_cubic_20x20x20.npy", (20, 20, 20, 3, 3), id="3band_srvo3_cubic_20x20x20"),
+    pytest.param("hk_4band_la3ni2o7_32x32x32.npy", (32, 32, 32, 4, 4), id="4band_la3ni2o7_32x32x32"),
 ]
 
 
@@ -879,7 +863,6 @@ def test_auto_discovery_finds_smaller_group_for_anisotropic_lattice():
     assert 2.5 < reduction < 5.0, f"Unexpected reduction factor {reduction:.2f}"
 
 
-@pytest.mark.slow
 def test_auto_discovery_matches_explicit_cubic_group_for_12cubed_hamiltonian():
     """The auto IBZ partition matches the explicit three_dimensional_cubic partition for a cubic 3-band H (12^3)."""
     import dgamore.brillouin_zone as bz
@@ -897,7 +880,6 @@ def test_auto_discovery_matches_explicit_cubic_group_for_12cubed_hamiltonian():
     assert np.array_equal(kg_auto.fbz2irrk, kg_explicit.fbz2irrk)
 
 
-@pytest.mark.slow
 def test_auto_discovery_matches_explicit_cubic_group_for_20cubed_hamiltonian():
     """Same as above for the 20^3 grid. (Even slower - covers the larger-grid path.)"""
     import dgamore.brillouin_zone as bz

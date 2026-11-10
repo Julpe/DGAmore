@@ -20,31 +20,6 @@ import dgamore.config as config
 import dgamore.local_n_point as local_n_point
 
 
-def pytest_addoption(parser):
-    """Registers --runslow so @pytest.mark.slow tests are skipped unless --runslow is passed."""
-    parser.addoption(
-        "--runslow",
-        action="store_true",
-        default=False,
-        help="Run tests marked as slow (large-grid auto-symmetry discovery, etc.).",
-    )
-
-
-def pytest_configure(config):
-    """Register the 'slow' marker so pytest doesn't warn about an unknown marker."""
-    config.addinivalue_line("markers", "slow: mark test as slow (deselect with '-m \"not slow\"')")
-
-
-def pytest_collection_modifyitems(config, items):
-    """Skip @pytest.mark.slow tests unless --runslow was given."""
-    if config.getoption("--runslow"):
-        return
-    skip_slow = pytest.mark.skip(reason="need --runslow option to run")
-    for item in items:
-        if "slow" in item.keywords:
-            item.add_marker(skip_slow)
-
-
 def pytest_collection_finish(session):
     """Freezes the collected session so the gc.collect() of every IHaveMat.free() walks only what the tests create."""
     gc.collect()
