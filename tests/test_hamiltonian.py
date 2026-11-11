@@ -387,25 +387,14 @@ def test_kanamori_dp_no_unexpected_terms():
     assert np.isclose(u[2, 0, 1, 2], 0.0)
 
 
-def test_convham_2_orbs():
-    """_convham_2_orbs Fourier-transforms a 2-orbital real-space hopping to k-space."""
-    h = Hamiltonian()
-    h._er_r_grid = np.zeros((1, 1, 1, 3))
-    h._er_r_weights = np.ones((1, 1))
-    h._er = np.ones((1, 1, 1))
-    kmesh = np.zeros((3, 1))
-    out = h._convham_2_orbs(kmesh)
-    assert np.allclose(out, 1.0)
-
-
-def _per_pair_phase_dispersion(h: Hamiltonian, k_mesh: np.ndarray) -> np.ndarray:
-    """Evaluates the dispersion with one exponential per orbital pair and lattice vector, the bit reference."""
-    result = np.zeros((*h._er.shape[1:], k_mesh.shape[1]), dtype=np.complex128)
-    for r in range(h._er.shape[0]):
-        phase = np.exp(1j * np.tensordot(h._er_r_grid[r], k_mesh, axes=([2], [0])))
-        phase /= float(h._er_r_weights[r, 0])
-        result += phase * h._er[r, ..., None]
-    return np.transpose(result, axes=(2, 0, 1))
+def _direct_lattice_sum(x_r: np.ndarray, r_grid: np.ndarray, r_weights: np.ndarray, k_grid: KGrid) -> np.ndarray:
+    """Evaluates sum_R e^{ikR} X(R) / w_R directly, one exponential per lattice vector and orbital tuple."""
+    k_mesh = k_grid.kmesh.reshape(3, -1)
+    result = np.zeros((*x_r.shape[1:], k_mesh.shape[1]), dtype=np.complex128)
+    for r in range(x_r.shape[0]):
+        phase = np.exp(1j * np.tensordot(r_grid[r], k_mesh, axes=([-1], [0])))
+        result += phase * x_r[r, ..., None] / float(r_weights[r, 0])
+    return np.moveaxis(result, -1, 0).reshape(*k_grid.nk, *x_r.shape[1:])
 
 
 def _hr_hamiltonian(hr_file: str) -> Hamiltonian:
@@ -420,44 +409,58 @@ def _two_band_builder_hamiltonian() -> Hamiltonian:
     return Hamiltonian()._add_kinetic_term([HoppingElement(r, orbs, t) for r, orbs, t in hops])
 
 
-@pytest.mark.parametrize("n_bands", [1, 2, 3])
-def test_convham_2_orbs_evaluates_one_phase_per_lattice_vector_bit_identical_to_per_pair_phases(n_bands, monkeypatch):
-    """With one lattice vector for every orbital pair, each exponential covers all pairs and e(k) keeps its bits."""
-    h = {
-        1: lambda: _hr_hamiltonian("hamiltonian/wannier_hr_oneband.dat"),
-        2: _two_band_builder_hamiltonian,
-        3: lambda: _hr_hamiltonian("srvo3_end2end/wan_hr.dat"),
-    }[n_bands]()
-    k_mesh = KGrid(nk=(8, 6, 5), symmetries=[]).kmesh.reshape(3, -1)
-    shapes, exp = [], np.exp
-    with monkeypatch.context() as mp:
-        mp.setattr(np, "exp", lambda x: shapes.append(x.shape) or exp(x))
-        ek = h._convham_2_orbs(k_mesh)
-    assert h._er.shape[-1] == n_bands and np.array_equal(ek, _per_pair_phase_dispersion(h, k_mesh))
-    assert shapes == [(1, 1, k_mesh.shape[1])] * h._er.shape[0]
+@pytest.mark.parametrize(
+    "make_hamiltonian, nk",
+    [
+        (lambda: _hr_hamiltonian("hamiltonian/wannier_hr_oneband.dat"), (8, 6, 5)),
+        (_two_band_builder_hamiltonian, (8, 6, 5)),
+        (lambda: _hr_hamiltonian("srvo3_end2end/wan_hr.dat"), (8, 6, 5)),
+        (lambda: _hr_hamiltonian("srvo3_end2end/wan_hr.dat"), (3, 2, 1)),
+        (lambda: _hr_hamiltonian("hamiltonian/wannier_hr_twoband.dat"), (8, 6, 1)),
+    ],
+    ids=["one-band-hr", "two-band-builder", "srvo3-hr", "srvo3-hr-coarse", "two-band-hr-per-pair-vectors"],
+)
+def test_get_ek_matches_the_direct_lattice_sum(make_hamiltonian, nk):
+    """The FFT dispersion equals the direct lattice sum, also when lattice vectors exceed the grid and wrap around."""
+    h, k_grid = make_hamiltonian(), KGrid(nk=nk, symmetries=[])
+    ek = h.get_ek(k_grid)
+    assert ek.shape == (*nk, *h._er.shape[1:]) and ek.dtype == np.complex128
+    assert np.allclose(ek, _direct_lattice_sum(h._er, h._er_r_grid, h._er_r_weights, k_grid), rtol=0, atol=1e-12)
 
 
-def test_convham_2_orbs_keeps_per_pair_phases_when_the_lattice_vectors_differ(monkeypatch):
-    """A file whose orbital pairs carry different lattice vectors keeps one exponential per pair and its bits."""
-    h = _hr_hamiltonian("hamiltonian/wannier_hr_twoband.dat")
-    k_mesh = KGrid(nk=(8, 6, 1), symmetries=[]).kmesh.reshape(3, -1)
-    shapes, exp = [], np.exp
-    with monkeypatch.context() as mp:
-        mp.setattr(np, "exp", lambda x: shapes.append(x.shape) or exp(x))
-        ek = h._convham_2_orbs(k_mesh)
-    assert np.array_equal(ek, _per_pair_phase_dispersion(h, k_mesh))
-    assert shapes == [(2, 2, k_mesh.shape[1])] * h._er.shape[0]
+def _two_band_nonlocal_hamiltonian() -> Hamiltonian:
+    """Builds a two-band interaction with V(R) != V(-R) and lattice-vector weights 2 and 4."""
+    inter = _two_band_local([]) + [
+        InteractionElement([1, 0, 0], [1, 1, 2, 2], 0.5),
+        InteractionElement([-1, 0, 0], [2, 2, 1, 1], 0.5),
+        InteractionElement([1, 0, 0], [2, 2, 1, 1], 0.2),
+        InteractionElement([-1, 0, 0], [1, 1, 2, 2], 0.2),
+    ]
+    return Hamiltonian()._add_interaction_term(inter, {(1, 0, 0): 2.0, (-1, 0, 0): 4.0})
 
 
-def test_convham_4_orbs():
-    """_convham_4_orbs Fourier-transforms a 4-orbital real-space interaction to k-space."""
-    h = Hamiltonian()
-    h._ur_r_grid = np.zeros((1, 1, 1, 1, 1, 3))
-    h._ur_r_weights = np.ones((1, 1))
-    h._ur_nonlocal = np.ones((1, 1, 1, 1, 1))
-    kmesh = np.zeros((3, 1))
-    out = h._convham_4_orbs(kmesh)
-    assert np.allclose(out, 1.0)
+def _u_matrix_example_hamiltonian() -> Hamiltonian:
+    """Reads the documented two-band u_matrix.dat (lattice vectors up to (1, 1, 0))."""
+    return Hamiltonian().read_umatrix(f"{os.path.dirname(os.path.abspath(__file__))}/../docs/u_matrix.dat")
+
+
+@pytest.mark.parametrize(
+    "make_hamiltonian, nk",
+    [
+        (_u_matrix_example_hamiltonian, (4, 4, 1)),
+        (_u_matrix_example_hamiltonian, (2, 2, 1)),
+        (_two_band_nonlocal_hamiltonian, (4, 1, 1)),
+        (_two_band_nonlocal_hamiltonian, (2, 3, 1)),
+        (lambda: Hamiltonian()._add_interaction_term(_two_band_local([])), (2, 2, 2)),
+    ],
+    ids=["u-matrix", "u-matrix-coarse", "two-band-weighted", "two-band-weighted-coarse", "local-only"],
+)
+def test_get_vq_matches_the_direct_lattice_sum(make_hamiltonian, nk):
+    """The FFT V^q equals the direct lattice sum, with weights, wrap-around and no non-local vectors at all."""
+    h, q_grid = make_hamiltonian(), KGrid(nk=nk, symmetries=[])
+    vq = h.get_vq(q_grid).mat
+    ref = _direct_lattice_sum(h._ur_nonlocal, h._ur_r_grid, h._ur_r_weights, q_grid)
+    assert vq.shape == ref.shape and np.allclose(vq, ref, rtol=0, atol=1e-6)
 
 
 def test_set_and_get_ek():

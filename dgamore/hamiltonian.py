@@ -556,9 +556,7 @@ class Hamiltonian:
         """
         if self._ek is not None:
             return self._ek
-        self._ek = self._convham_2_orbs(k_grid.kmesh.reshape(3, -1))
-        n_bands = self._ek.shape[-1]
-        self._ek = self._ek.reshape(*k_grid.nk, n_bands, n_bands)
+        self._ek = self._fourier_transform(self._er, self._er_r_grid, self._er_r_weights, k_grid.nk)
         return self._ek
 
     def set_ek(self, ek: np.ndarray) -> "Hamiltonian":
@@ -588,9 +586,8 @@ class Hamiltonian:
         :param q_grid: The :class:`KGrid` defining the momentum grid.
         :return: The non-local interaction as an :class:`Interaction`.
         """
-        uq = self._convham_4_orbs(q_grid.kmesh.reshape(3, -1))
-        n_bands = uq.shape[-1]
-        return Interaction(uq.reshape(q_grid.nk + (n_bands,) * 4), SpinChannel.NONE, q_grid.nk)
+        vq = self._fourier_transform(self._ur_nonlocal, self._ur_r_grid, self._ur_r_weights, q_grid.nk)
+        return Interaction(vq, SpinChannel.NONE, q_grid.nk)
 
     def _add_kinetic_term(self, hopping_elements: list) -> "Hamiltonian":
         """
@@ -765,51 +762,26 @@ class Hamiltonian:
         index = r_to_index[r_vec]
         ur_mat[index, orb1 - 1, orb2 - 1, orb3 - 1, orb4 - 1] = value
 
-    def _convham_2_orbs(self, k_mesh: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _fourier_transform(x_r: np.ndarray, r_grid: np.ndarray, r_weights: np.ndarray, nk: tuple) -> np.ndarray:
         r"""
-        Fourier-transforms the real-space hopping to the band dispersion :math:`\varepsilon_{12}(\mathbf{k})`, looping
-        over lattice vectors to keep the memory footprint low. When the phase argument
-        :math:`\mathbf{k} \cdot \mathbf{R}` of a lattice vector is the same for every orbital pair (wien2k hr files, the
-        hopping builders), its exponential is evaluated once and broadcast over the orbital pairs.
+        Fourier-transforms a real-space quantity, :math:`X(\mathbf{k}) = \sum_{\mathbf{R}} e^{i\mathbf{k}\mathbf{R}}
+        X(\mathbf{R}) / w_{\mathbf{R}}` (one value per orbital tuple), on the regular grid
+        :math:`k_i = 2\pi m_i / n_i`, :math:`m_i = 0, \ldots, n_i - 1`. Since :math:`e^{i\mathbf{k}\mathbf{R}}` is
+        periodic in :math:`\mathbf{R}` with the grid size, every element is accumulated at :math:`\mathbf{R} \bmod n`
+        and the sum is evaluated by a single in-place inverse FFT.
 
-        :param k_mesh: The k-points as an array of shape ``[3, nk]``.
-        :return: The band dispersion of shape ``[nk, o1, o2]``.
+        :param x_r: The real-space values of shape ``[n_rp, o1, ...]``.
+        :param r_grid: The lattice vector of every element, of shape ``[n_rp, o1, ..., 3]``.
+        :param r_weights: The weight of every lattice vector, of shape ``[n_rp, 1]``.
+        :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+        :return: The momentum-space values of shape ``[kx, ky, kz, o1, ...]``.
         """
-        n_rp = self._er.shape[0]
-        n_orbs = self._er.shape[1]
-        nk = k_mesh.shape[1]
-
-        result = np.zeros((n_orbs, n_orbs, nk), dtype=np.complex128)
-
-        for r in range(n_rp):
-            arg = np.tensordot(self._er_r_grid[r], k_mesh, axes=([2], [0]))
-            if (arg == arg[:1, :1]).all():
-                arg = arg[:1, :1]
-            phase = np.exp(1j * arg)
-            phase /= float(self._er_r_weights[r, 0])
-            result += phase * self._er[r, ..., None]
-
-        return np.transpose(result, axes=(2, 0, 1))
-
-    def _convham_4_orbs(self, k_mesh: np.ndarray) -> np.ndarray:
-        r"""
-        Fourier-transforms the real-space non-local interaction to :math:`V_{1234}(\mathbf{q})`, looping over lattice
-        vectors to keep the memory footprint low.
-
-        :param k_mesh: The q-points as an array of shape ``[3, nk]``.
-        :return: The momentum-dependent interaction of shape ``[nk, o1, o2, o3, o4]``.
-        """
-        n_rp = self._ur_nonlocal.shape[0]
-        n_orbs = self._ur_nonlocal.shape[1]
-        nk = k_mesh.shape[1]
-        result = np.zeros((n_orbs, n_orbs, n_orbs, n_orbs, nk), dtype=np.complex128)
-
-        for r in range(n_rp):
-            phase = np.exp(1j * np.tensordot(self._ur_r_grid[r], k_mesh, axes=([4], [0])))
-            phase /= float(self._ur_r_weights[r, 0])
-            result += phase * self._ur_nonlocal[r, ..., None]
-
-        return np.transpose(result, axes=(4, 0, 1, 2, 3))
+        x_folded = np.zeros((*nk, *x_r.shape[1:]), dtype=np.complex128)
+        r_folded = r_grid.astype(int) % np.asarray(nk)
+        weights = r_weights.reshape(-1, *[1] * (x_r.ndim - 1))
+        np.add.at(x_folded, (*np.moveaxis(r_folded, -1, 0), *np.indices(x_r.shape[1:])), x_r / weights)
+        return np.fft.ifftn(x_folded, axes=(0, 1, 2), norm="forward", out=x_folded)
 
     def _parse_elements(self, elements: list, element_type: type) -> list:
         """
