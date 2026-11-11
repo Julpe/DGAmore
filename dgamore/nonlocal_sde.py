@@ -1950,6 +1950,19 @@ def _save_sigma_iteration(sigma: SelfEnergy, base_name: str, current_iter: int) 
     config.logger.info(f"Saved {base_name} for iteration {current_iter}.")
 
 
+def _prune_sigma_iterates(keep_from: int) -> None:
+    """
+    Deletes the files ``<base_name>_iteration_<i>.npy`` with ``i < keep_from`` from the run's ``Sigma_Iterates``
+    subfolder (the mixed iterates and, with Jacobian stabilization, the proposals).
+
+    :param keep_from: The first iteration whose files are kept.
+    :return: None.
+    """
+    for f in glob.glob(os.path.join(config.output.sigma_iterates_path, "*_iteration_*.npy")):
+        if (match := re.search(r"_iteration_(\d+)\.npy$", f)) and int(match.group(1)) < keep_from:
+            os.remove(f)
+
+
 def _load_node_shared_local_vertex(
     node_comm,
     path: str,
@@ -3585,6 +3598,9 @@ def calculate_self_energy_q(
             compressed = sigma_new.has_compressed_q_dimension
             view = SelfEnergy(sigma_new.mat, sigma_new.nq, sigma_new.full_niv_range, compressed, calc_smom=False)
             saving = saver.submit(_save_sigma_iteration, view, "sigma_dga", current_iter)
+            if not config.self_consistency.save_sigma_iterates:
+                # the earlier writes have finished; only this iteration's file is still being written
+                _prune_sigma_iterates(current_iter - config.self_consistency.mixing_history_length)
 
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
@@ -3692,6 +3708,8 @@ def calculate_self_energy_q(
         if saving is not None:
             saving.result()
     mixing_history = tracker_window = previous_proposal = None  # nothing after the loop reads them
+    if comm.rank == 0 and not config.self_consistency.save_sigma_iterates:
+        _prune_sigma_iterates(current_iter)
     if tracker is not None and comm.rank == 0:
         tracker.release_after_loop()
 
