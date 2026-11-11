@@ -405,7 +405,14 @@ class GreensFunction(TwoPoint):
         return self._occ_k
 
     @staticmethod
-    def get_g_full(siw: SelfEnergy, mu: float, ek: np.ndarray, beta: float, orbitals: np.ndarray | None = None):
+    def get_g_full(
+        siw: SelfEnergy,
+        mu: float,
+        ek: np.ndarray,
+        beta: float,
+        orbitals: np.ndarray | None = None,
+        out: np.ndarray | None = None,
+    ):
         r"""
         Builds the full momentum-dependent Green's function :math:`G^{\mathrm{k}} = [(\imath\nu + \mu) -
         \varepsilon(\mathbf{k}) - \Sigma^{\mathrm{k}}]^{-1}`. The Dyson matrix is assembled and inverted in bounded
@@ -420,11 +427,15 @@ class GreensFunction(TwoPoint):
         :param beta: Inverse temperature :math:`\beta`.
         :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals);
             None when it acts on every orbital.
+        :param out: Array of the result's shape ``[kx, ky, kz, o1, o2, 2 niv]`` the Green's function is written into
+            (e.g. a slice of a shared-memory window), or ``None`` to allocate it in the self-energy's dtype.
         :return: The momentum-dependent :class:`GreensFunction` (filling not recomputed).
         """
         sigma_mat = siw.decompress_q_dimension().mat
         # a momentum-local sigma ([1, 1, 1, ...]) broadcasts against the dispersion, so the result is always full-k
-        mat = np.empty((*ek.shape[:3], siw.n_bands, siw.n_bands, 2 * siw.niv), dtype=sigma_mat.dtype)
+        mat = out
+        if mat is None:
+            mat = np.empty((*ek.shape[:3], siw.n_bands, siw.n_bands, 2 * siw.niv), dtype=sigma_mat.dtype)
         for start, stop, inverse in GreensFunction._dyson_chunks(sigma_mat, siw.niv, mu, ek, beta, orbitals):
             mat[..., start:stop] = orbital_block(inverse, orbitals, frequency_last=True)
         return GreensFunction(

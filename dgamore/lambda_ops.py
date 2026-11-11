@@ -696,7 +696,7 @@ class MultiOrbitalLambdaCorrection:
                 chi_w = MultiOrbitalLambdaCorrection._expand_compound_slice_to_full_bz(chi_w, q_grid)
             chi_lam = np.linalg.inv(identity + chi_w @ lambda_mat) @ chi_w
             g_sum += chi_lam.sum(axis=0)
-            jac += np.einsum("qac,qdb->abcd", chi_lam, chi_lam)
+            jac += np.einsum("qac,qdb->abcd", chi_lam, chi_lam, optimize=True)
         g = g_sum * factor - s_r
         g = 0.5 * (g + np.conj(g.T))
         jac *= -factor
@@ -724,7 +724,11 @@ class MultiOrbitalLambdaCorrection:
         Newton system :math:`H\,\delta\lambda = -g` is the Jacobian and residual projected onto that basis
         (real coordinates under :math:`\mathrm{Re}\,\mathrm{tr}(A^\dagger B)`), so the solve matches the components
         of the sum rule the allowed masses reach: unknowns and equations span the same space. Each step is
-        line-searched to keep the static gap positive (feasibility) and to decrease the projected residual. Starts
+        line-searched to keep the static gap positive (feasibility) and to decrease the projected residual. The gap
+        is taken on the inverse of the on-site slice of the susceptibility, :math:`\chi_{RR}^{-1}` over the pairs
+        :math:`(12)` whose two orbitals sit on one atom: the interaction contracts only those pairs, and the on-site
+        block of :math:`(\chi^{-1} + \Lambda)^{-1}` is :math:`(\chi_{RR}^{-1} + \Lambda_{RR})^{-1}`, so a soft mode
+        leaking into the pairs between atoms, which no mass reaches and nothing reads, does not block the solve. Starts
         from :math:`(\lambda_{\mathrm{start}} + \delta)` times the projection of the on-site identity onto the
         allowed masses, with :math:`\lambda_{\mathrm{start}}` the feasibility bound of a full identity shift. All
         sum-rule evaluations use the resolvent form :math:`(\mathbb{1} + \chi\Lambda)^{-1}\chi`, so the only
@@ -751,7 +755,7 @@ class MultiOrbitalLambdaCorrection:
             :math:`C\Lambda C = 0`.
         :return: The converged mass matrix :math:`\Lambda_r`, shape ``[no^2, no^2]``, complex Hermitian.
         :raises ValueError: If the start leaves the static gap non-positive, i.e. a static pole in a sector no allowed
-            mass lifts (between the atoms, or in a crystal-field-split (polarized) inter-orbital sector with ``tail``).
+            mass lifts (a crystal-field-split (polarized) inter-orbital sector with ``tail``).
         """
         delta = MultiOrbitalLambdaCorrection._DELTA if delta is None else delta
         eps = MultiOrbitalLambdaCorrection._EPS if eps is None else eps
@@ -771,21 +775,21 @@ class MultiOrbitalLambdaCorrection:
         if q_grid is not None:
             # the static feasibility/gap machinery keeps seeing the full BZ (one small slice, resident once)
             chi_static = MultiOrbitalLambdaCorrection._expand_compound_slice_to_full_bz(chi_static, q_grid)
-        chi_inv_static = np.linalg.inv(chi_static)
+        on_site_pairs = np.ix_(pair_atom >= 0, pair_atom >= 0)  # the pairs the interaction contracts
+        chi_inv_static = np.linalg.inv(chi_static[(slice(None), *on_site_pairs)])
         start = MultiOrbitalLambdaCorrection.get_lambda_start_matrix(chi_inv_static)
         identity = (basis @ coords(np.diag(pair_atom >= 0).astype(np.complex128))).reshape(no2, no2)
         offset = delta
         for _ in range(MultiOrbitalLambdaCorrection._MAX_START_DOUBLINGS):
             lambda_mat = (start + offset) * identity
-            gap = MultiOrbitalLambdaCorrection._static_gap(chi_inv_static, lambda_mat)
+            gap = MultiOrbitalLambdaCorrection._static_gap(chi_inv_static, lambda_mat[on_site_pairs])
             if gap > MultiOrbitalLambdaCorrection._GAP_TOL:
                 break
             offset *= 2.0
         else:
             raise ValueError(
                 f"Multi-orbital lambda correction: the start leaves the static gap at {gap:.3e}, a static pole that "
-                "no allowed mass lifts (between the atoms or in a crystal-field-split (polarized) inter-orbital "
-                "sector)."
+                "no allowed mass lifts (a crystal-field-split (polarized) inter-orbital sector)."
             )
 
         for _ in range(maxiter):
@@ -811,7 +815,7 @@ class MultiOrbitalLambdaCorrection:
             step_length = 1.0
             for _ in range(MultiOrbitalLambdaCorrection._MAX_LINE_SEARCH):
                 candidate = lambda_mat + step_length * d_lambda
-                gap = MultiOrbitalLambdaCorrection._static_gap(chi_inv_static, candidate)
+                gap = MultiOrbitalLambdaCorrection._static_gap(chi_inv_static, candidate[on_site_pairs])
                 if (
                     gap > MultiOrbitalLambdaCorrection._GAP_TOL
                     and float(

@@ -245,6 +245,11 @@ class _Request:
 
     Wait = wait
 
+    def Test(self):
+        # the fake completes a request when it is tested, so a test is a wait that reports completion
+        self.wait()
+        return True
+
 
 class Request:
     @staticmethod
@@ -417,6 +422,9 @@ class Comm:
 
     def Irecv(self, buf, source, tag=0):
         return _Request(lambda: _assign(buf, self._queue(self.rank, (source, tag)).get(timeout=_QUEUE_TIMEOUT)))
+
+    def Ibarrier(self):
+        return _Request(self._bw)
 
 
 class Win:

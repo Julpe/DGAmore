@@ -43,6 +43,23 @@ def _make_momentum_g(nk: tuple, nb: int, niv: int, seed: int = 0) -> GreensFunct
     return GreensFunction(mat, has_compressed_q_dimension=False, nk=nk)
 
 
+def _make_hermitian_g(nk: tuple, nb: int, niv: int, seed: int = 0) -> GreensFunction:
+    """Builds a momentum Green's function obeying G(k, -v) = G(k, v)^dagger exactly, from random data at v >= 0."""
+    g = _make_momentum_g(nk, nb, niv, seed)
+    g.mat[..., :niv] = np.conj(g.mat[..., niv:][..., ::-1].swapaxes(-2, -3))
+    return g
+
+
+def _make_crossing_g(nk: tuple, nb: int, niv: int, seed: int = 0, hermitian: bool = True) -> GreensFunction:
+    """Builds a momentum Green's function obeying G(-k, v) = G(k, v)^T and G(k, -v) = G(k, v)^dagger exactly."""
+    g = _make_momentum_g(nk, nb, niv, seed)
+    flipped = np.roll(np.flip(g.mat, axis=(0, 1, 2)), 1, axis=(0, 1, 2)).swapaxes(-2, -3)
+    g.mat[...] = (g.mat + flipped) / 2  # commutative sum: the -k partner gets the same bits
+    if hermitian:
+        g.mat[..., :niv] = np.conj(g.mat[..., niv:][..., ::-1].swapaxes(-2, -3))
+    return g
+
+
 def test_create_generalized_chi0_matches_reference():
     """create_generalized_chi0 matches an explicit hand-rolled reference of the documented formula."""
     nb, niv, niw, beta = 2, 1, 1, 2.0
@@ -335,39 +352,166 @@ def test_fft_bubble_distributed_with_node_shared_greens_function(monkeypatch):
     assert np.allclose(assembled, ref.mat, atol=1e-5)
 
 
-def test_fft_bubble_distributed_with_fewer_columns_than_ranks(monkeypatch):
-    """With fewer (w,v) columns than ranks the idle ranks still receive their q-slice and the bubble matches."""
+@pytest.mark.parametrize("crossing", [False, True])
+@pytest.mark.parametrize("nk, ranks", [((5, 1, 1), 5), ((2, 1, 1), 3)])
+def test_fft_bubble_distributed_with_fewer_columns_than_ranks(nk, ranks, crossing, monkeypatch):
+    """With fewer (w,v) columns or momenta than ranks the idle ranks still take part and the bubble matches."""
     import dgamore.mpi_utils as mpi_utils
     from dgamore.mpi_utils import MpiDistributor
     from tests.conftest import FAKE_MPI, run_parallel
 
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
-    nk, nb, niv, niw, beta = (5, 1, 1), 1, 1, 0, 2.0
-    g = _make_momentum_g(nk, nb, niv + niw + 1, seed=13)
+    nb, niv, niw, beta = 1, 1, 0, 2.0
+    g = (_make_crossing_g if crossing else _make_momentum_g)(nk, nb, niv + niw + 1, seed=13)
     q_grid = bz.KGrid(nk, symmetries=[])
     ref = _fft_bubble_reference(g, niw, niv, q_grid, beta)
 
     # one Green's function per fake rank, as every MPI rank holds its own: cut_niv parks its source's mat at None
     # while it clones it (_clone_without_mat), so ranks sharing one object race on it
-    g_ranks = [g.copy() for _ in range(5)]
+    g_ranks = [g.copy() for _ in range(ranks)]
 
     def fn(comm, rank):
         dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
         return BubbleGenerator.create_generalized_chi0_q_fft(dist, g_ranks[rank], niw, niv, q_grid, beta).mat
 
-    _, res = run_parallel(5, fn)
+    _, res = run_parallel(ranks, fn)
     assembled = np.concatenate(res, axis=0)
-    assert np.allclose(assembled, ref.mat, atol=1e-5)
+    assert np.array_equal(assembled, ref.mat)
 
 
+def test_crossing_bubble_matches_the_direct_bubble_and_derives_its_partners_from_their_own_momentum_bit_for_bit():
+    """The derived column (w, w - v) is the conjugate of the computed (w, v) at the same q with orbitals 3412."""
+    nk, nb, niv, niw, beta = (4, 3, 1), 2, 3, 3, 2.5
+    n = niv + niw + 2
+    g = _make_crossing_g(nk, nb, n, seed=75)
+    # time reversal off by 1e-7, inside the guard
+    g.mat[..., n:] += 1e-7 * _make_momentum_g(nk, nb, n, seed=76).mat[..., n:]
+    g.mat[..., :n] = np.conj(g.mat[..., n:][..., ::-1].swapaxes(-2, -3))
+    assert BubbleGenerator._has_crossing_symmetries(g, niv + niw)
+    q_grid = bz.KGrid(nk, symmetries=[])
+    bubble = _fft_bubble_reference(g, niw, niv, q_grid, beta).mat
+    q_list = np.array(q_grid.get_irrq_list())
+    direct = BubbleGenerator.create_generalized_chi0_q_loop(g, niw, niv, q_list, q_grid, beta).mat
+    assert np.allclose(bubble, direct, atol=1e-4)
+    columns, partners = BubbleGenerator._crossing_columns(MFHelper.wn(niw, return_only_positive=True), niv)
+    for column, partner in zip(columns[partners >= 0], partners[partners >= 0]):
+        (iw, iv), ip = divmod(column, 2 * niv), partner % (2 * niv)
+        assert np.array_equal(bubble[..., iw, ip], np.conj(bubble[..., iw, iv].transpose(0, 3, 4, 1, 2)))
+
+
+@pytest.mark.parametrize(
+    "nb, ranks, hostnames, compressed, one_column_budget",
+    [
+        (2, 2, None, True, True),
+        (2, 3, ["n0", "n0", "n1"], False, False),
+        (3, 3, None, False, True),
+        (1, 4, ["n0", "n0", "n1", "n1"], True, False),
+    ],
+)
+def test_crossing_bubble_of_a_crossing_g_transforms_only_the_computed_columns_and_keeps_the_rank0_bits(
+    nb, ranks, hostnames, compressed, one_column_budget, monkeypatch
+):
+    """On a symmetric G only the crossing's computed columns are transformed, with the rank-0 bits at any rank count."""
+    import scipy as sp
+
+    import dgamore.bubble_gen as bubble_gen
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, niv, niw, beta = (4, 4, 1), 4, 3, 2.5
+    if one_column_budget:
+        monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", int(np.prod(nk)) * nb**4 * 8)
+    g = _make_crossing_g(nk, nb, niv + niw + 2, seed=70 + nb)
+    g = g.compress_q_dimension() if compressed else g
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    n_computed = len(BubbleGenerator._crossing_columns(MFHelper.wn(niw, return_only_positive=True), niv)[0])
+    shapes, ifftn = [], sp.fft.ifftn
+    monkeypatch.setattr(sp.fft, "ifftn", lambda x, **kwargs: shapes.append(x.shape) or ifftn(x, **kwargs))
+    ref = _fft_bubble_reference(g, niw, niv, q_grid, beta).mat
+    assert sum(s[-1] for s in shapes) == n_computed < (niw + 1) * 2 * niv
+    shapes.clear()
+
+    # one Green's function per fake rank, as every MPI rank holds its own: cut_niv parks its source's mat at None
+    # while it clones it (_clone_without_mat), so ranks sharing one object race on it
+    g_ranks = [g.copy() for _ in range(ranks)]
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED) if hostnames else None
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+        return BubbleGenerator.create_generalized_chi0_q_fft(
+            dist, g_ranks[rank], niw, niv, q_grid, beta, node_comm=node_comm
+        ).mat
+
+    _, res = run_parallel(ranks, fn, hostnames=hostnames)
+    assert np.array_equal(np.concatenate(res, axis=0), ref)
+    assert sum(s[-1] for s in shapes) == n_computed
+
+
+def test_crossing_bubble_exchanges_only_the_computed_columns(monkeypatch):
+    """Every rank derives the partners of its own momenta, so only the computed columns are sent."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta, ranks = (4, 4, 1), 2, 4, 3, 2.5, 3
+    g = _make_crossing_g(nk, nb, niv + niw + 2, seed=81)
+    q_grid = bz.KGrid(nk, symmetries=[])
+    n_computed = len(BubbleGenerator._crossing_columns(MFHelper.wn(niw, return_only_positive=True), niv)[0])
+    sent, isend = [], mpi_utils._isend_rows
+    monkeypatch.setattr(
+        mpi_utils,
+        "_isend_rows",
+        lambda comm, arr, *args, **kwargs: sent.append(arr.shape[-1]) or isend(comm, arr, *args, **kwargs),
+    )
+    g_ranks = [g.copy() for _ in range(ranks)]
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+        return BubbleGenerator.create_generalized_chi0_q_fft(dist, g_ranks[rank], niw, niv, q_grid, beta).mat
+
+    run_parallel(ranks, fn)
+    assert sum(sent) == n_computed * (ranks - 1)
+
+
+@pytest.mark.parametrize("ranks", [1, 3])
+def test_bubble_of_a_hermitian_g_without_time_reversal_transforms_every_column(ranks, monkeypatch):
+    """A Hermitian G without time reversal skips the crossing: every column is transformed, with the plain bits."""
+    import scipy as sp
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 4, 3, 2.5
+    g = _make_hermitian_g(nk, nb, niv + niw + 2, seed=80)
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    g_ranks = [g.copy() for _ in range(2 * ranks)]
+
+    def bubble(first: int) -> np.ndarray:
+        if ranks == 1:
+            return _fft_bubble_reference(g_ranks[first], niw, niv, q_grid, beta).mat
+
+        def fn(comm, rank):
+            dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm, name="Q")
+            return BubbleGenerator.create_generalized_chi0_q_fft(
+                dist, g_ranks[first + rank], niw, niv, q_grid, beta
+            ).mat
+
+        return np.concatenate(run_parallel(ranks, fn)[1], axis=0)
+
+    shapes, ifftn = [], sp.fft.ifftn
+    monkeypatch.setattr(sp.fft, "ifftn", lambda x, **kwargs: shapes.append(x.shape) or ifftn(x, **kwargs))
+    result = bubble(0)
+    assert sum(s[-1] for s in shapes) == (niw + 1) * 2 * niv
+    monkeypatch.setattr(BubbleGenerator, "_has_crossing_symmetries", staticmethod(lambda *args: False))
+    assert np.array_equal(result, bubble(ranks))
+
+
+@pytest.mark.parametrize("crossing", [False, True])
 @pytest.mark.parametrize("size", [1, 2])
-def test_fft_bubble_subtracted_in_place_has_the_bits_of_the_difference_of_both_bubbles(size, monkeypatch):
+def test_fft_bubble_subtracted_in_place_has_the_bits_of_the_difference_of_both_bubbles(size, crossing, monkeypatch):
     """A bubble subtracted from another as its blocks arrive equals a.sub(b) of the two built bubbles bit for bit."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     nk, nb, niv, niw, beta = (4, 4, 1), 2, 2, 2, 2.5
-    greens = [_make_momentum_g(nk, nb, niv + niw + 2, seed=seed) for seed in (14, 15)]
+    make = _make_crossing_g if crossing else _make_momentum_g
+    greens = [make(nk, nb, niv + niw + 2, seed=seed) for seed in (14, 15)]
     for g in greens:
         g.mat[..., 1, 0, :] *= 1e-7  # bubble entries below the filter threshold
+        g.mat[..., 0, 1, :] *= 1e-7  # and the transposed partners, so both symmetries survive
+    assert all(BubbleGenerator._has_crossing_symmetries(g, niv + niw) == crossing for g in greens)
     q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
 
     def fn(comm, rank):
@@ -417,6 +561,76 @@ def test_distributed_fft_bubble_subtracts_received_blocks_in_the_precision_they_
 
     _, results = run_parallel(2, fn)
     assert all(dtype == np.complex64 and np.array_equal(out, ref) for dtype, out, ref in results)
+
+
+@pytest.mark.parametrize("niw, niv", [(0, 3), (3, 2), (2, 4), (5, 1), (40, 140)])
+def test_crossing_columns_split_every_frequency_into_computed_columns_and_their_partners(niw, niv):
+    """Every column is computed or the v' = w - v partner of exactly one computed column, which lies above it."""
+    wn = MFHelper.wn(niw, return_only_positive=True)
+    n_v = 2 * niv
+    columns, partners = BubbleGenerator._crossing_columns(wn, niv)
+    derived = partners[partners >= 0]
+    assert np.array_equal(np.sort(np.concatenate([columns, derived])), np.arange(len(wn) * n_v))
+    iw, iv = np.divmod(columns[partners >= 0], n_v)
+    assert np.array_equal(derived // n_v, iw) and np.array_equal(derived % n_v, 2 * niv + wn[iw] - 1 - iv)
+    assert np.all(derived % n_v > iv)
+    assert np.sum(columns < n_v) == niv  # w = 0 pairs every v with -v
+    if (niw, niv) == (40, 140):
+        assert len(columns) == 6160
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_crossing_guard_holds_for_a_hermitian_time_reversal_g_and_fails_without_either(compressed, monkeypatch):
+    """The guard agrees over the ranks, sees a perturbation in one rank's share and ignores one outside the window."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niv_window = (4, 3, 1), 2, 5, 3
+    g = _make_crossing_g(nk, nb, niv, seed=50)
+    inside, outside = g.copy(), g.copy()
+    inside.mat[3, 2, 0, 0, 1, niv - niv_window] += 1e-3  # flat k 11 is rank 2's share, its -k row 4 rank 1's
+    outside.mat[3, 2, 0, 0, 1, niv - niv_window - 1] += 1e-3
+    hermitian_only = _make_hermitian_g(nk, nb, niv, seed=51)
+    time_reversal_only = _make_crossing_g(nk, nb, niv, seed=52, hermitian=False)
+    greens = [g, inside, outside, hermitian_only, time_reversal_only]
+    greens = [x.compress_q_dimension() if compressed else x for x in greens]
+
+    def fn(comm, rank):
+        return [BubbleGenerator._has_crossing_symmetries(x, niv_window, comm) for x in greens]
+
+    expected = [True, False, True, False, False]
+    assert run_parallel(3, fn)[1] == [expected] * 3
+    assert [BubbleGenerator._has_crossing_symmetries(x, niv_window) for x in greens] == expected
+
+
+@pytest.mark.parametrize("dtype, holds", [(np.complex64, True), (np.complex128, False)])
+def test_crossing_guard_demands_the_storage_precision_below_one_in_a_million(dtype, holds, monkeypatch):
+    """A 1e-7 break of time reversal or Hermiticity passes in complex64 and fails in complex128 (64 ulps)."""
+    monkeypatch.setattr(n_point_base, "DTYPE", dtype)
+    nk, nb, niv = (4, 3, 1), 2, 5
+    exact = _make_crossing_g(nk, nb, niv, seed=53)
+    noise = 1e-7 * np.abs(exact.mat).max()
+    time_reversal, hermiticity = exact.copy(), exact.copy()
+    time_reversal.mat[..., niv:] += noise * _make_momentum_g(nk, nb, niv, seed=54).mat[..., niv:] / 5
+    time_reversal.mat[..., :niv] = np.conj(time_reversal.mat[..., niv:][..., ::-1].swapaxes(-2, -3))
+    hermiticity.mat[1, 2, 0, 0, 1, 0] += noise
+    assert exact.mat.dtype == dtype and BubbleGenerator._has_crossing_symmetries(exact, niv)
+    assert [BubbleGenerator._has_crossing_symmetries(g, niv) for g in (time_reversal, hermiticity)] == [holds] * 2
+
+
+def test_column_pass_peak_does_not_grow_with_the_number_of_rounds():
+    """A rank drops a round's irreducible rows before it builds the next round, so four rounds peak as one does."""
+    nk, nb, n_v = (16, 16, 1), 2, 8
+    q_grid = bz.KGrid(nk, symmetries=[])
+    dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock(), name="Q")
+
+    def peak(n_w: int) -> int:
+        def run():
+            fill = lambda out, part, iw, iv: out.fill(1.0)
+            BubbleGenerator._run_columns(dist, q_grid, n_w, n_v, 1, nb, np.complex64, fill, lambda where, b: None)
+
+        return traced_peak(run)[1]
+
+    one_round = peak(1)
+    assert peak(4) <= 1.05 * one_round
 
 
 def _on_ranks(ranks: int, fn, hostnames=None) -> list:

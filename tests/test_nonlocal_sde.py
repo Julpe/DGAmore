@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, create_autospec
 
 import numpy as np
 import pytest
+import scipy as sp
 
 import dgamore.brillouin_zone as bz
 import dgamore.config as config
@@ -507,6 +508,54 @@ def test_build_giwk_full_keeps_no_self_energy_so_its_copies_never_duplicate_sigm
     cut = giwk.cut_niv(4)
     assert giwk._sigma is None and cut._sigma is None and np.array_equal(cut._ek, ek)
     _release_shared_giwk(win, node_comm)
+
+
+@pytest.mark.parametrize(
+    "nk, local, compressed, orbitals",
+    [
+        ((3, 2, 2), False, True, None),
+        ((3, 2, 2), False, False, [0, 2]),
+        ((3, 2, 2), True, False, None),
+        ((3, 1, 1), False, True, None),
+    ],
+)
+@pytest.mark.parametrize("hostnames", [["n0", "n0", "n1"], ["n0"] * 4])
+def test_build_giwk_full_node_ranks_fill_the_window_with_the_bits_of_the_single_rank_build(
+    nk, local, compressed, orbitals, hostnames, monkeypatch
+):
+    """Every node rank inverts its share of the momenta into the window, which holds the bits of the one-rank build."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(config.sys, "correlated_orbitals", None if orbitals is None else np.array(orbitals))
+    rng = np.random.default_rng(11)
+    nb, n_orb, niv, beta = 2, 3 if orbitals else 2, 5, 10.0
+    shape = ((1, 1, 1) if local else nk) + (nb, nb, 2 * niv)
+    sigma_mat = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    ek = rng.standard_normal((*nk, n_orb, n_orb)) + 1j * rng.standard_normal((*nk, n_orb, n_orb))
+
+    def make_sigma() -> SelfEnergy:
+        sigma = SelfEnergy(sigma_mat.copy(), (1, 1, 1) if local else nk, calc_smom=False, beta=beta)
+        return sigma.compress_q_dimension() if compressed else sigma
+
+    expected = GreensFunction.get_g_full(make_sigma(), 0.3, ek, beta, orbitals=config.sys.correlated_orbitals).mat
+    shares, dyson = [], GreensFunction.get_g_full
+    monkeypatch.setattr(
+        GreensFunction,
+        "get_g_full",
+        staticmethod(lambda s, m, e, *a, **kw: shares.append(e.shape[0]) or dyson(s, m, e, *a, **kw)),
+    )
+
+    def fn(comm, rank):
+        giwk, win, node_comm = _build_giwk_full(comm, make_sigma(), 0.3, ek, beta)
+        result = giwk.mat.copy()
+        giwk.mat = None
+        _release_shared_giwk(win, node_comm)
+        return result
+
+    _, results = run_parallel(len(hostnames), fn, hostnames=hostnames)
+    assert all(np.array_equal(result, expected) for result in results)
+    n, sizes = int(np.prod(nk)), [hostnames.count(host) for host in dict.fromkeys(hostnames)]
+    expected_shares = [(r + 1) * n // s - r * n // s for s in sizes for r in range(s)]
+    assert sorted(shares) == sorted(share for share in expected_shares if share)
 
 
 def test_release_shared_giwk_without_sharing_is_noop():
@@ -1532,7 +1581,8 @@ def test_bare_vertex_eliashberg_only_proposal_dumps_both_channels_without_a_loca
     monkeypatch.setattr(
         nonlocal_sde,
         "_finish_physical_susceptibility",
-        lambda chi, dist, annealer, save, lam: steps.append((chi.channel, save)) or chi,
+        lambda chi, dist, annealer, save, lam, static_magn=None, last_chi=None: steps.append((chi.channel, save))
+        or chi,
     )
     args = [MagicMock() for _ in range(8)]  # mu, u_loc, v_nonloc, v_nonloc_full, sigma_dmft, delta_sigma, q list, dist
 
@@ -1709,6 +1759,137 @@ def test_loop_writes_the_eliashberg_intermediates_once(
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", spy)
     run()
     assert seen == expected
+
+
+def test_loop_writes_each_iterate_in_the_background_before_its_window_is_freed(monkeypatch, tmp_path):
+    """Rank 0 writes every iterate off the main thread and awaits the write before the next mixing frees its window."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0)
+    events, free = [], nonlocal_sde._free_shared_window
+
+    def slow_save(sigma, name, current_iter):
+        threading.Event().wait(0.05)  # a write that outlasts the rest of the iteration unless it is awaited
+        events.append((name, current_iter, threading.current_thread() is threading.main_thread(), sigma.mat.copy()))
+
+    monkeypatch.setattr(nonlocal_sde, "_save_sigma_iteration", slow_save)
+    monkeypatch.setattr(nonlocal_sde, "_free_shared_window", lambda win, comm: events.append("free") or free(win, comm))
+    result = run()
+
+    saves = [event for event in events if event != "free"]
+    assert [event if event == "free" else event[1] for event in events] == ["free", 1, "free", 2, "free", 3]
+    assert all(name == "sigma_dga" and not on_main for name, _, on_main, _ in saves)
+    assert np.array_equal(saves[-1][3].reshape(result.mat.shape), result.mat)
+
+
+def test_loop_lets_the_other_ranks_sleep_through_the_serial_steps_of_rank_0(monkeypatch, tmp_path):
+    """Each iteration idles before its window is freed and before the mixed iterate is shared, the run at its end."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
+    events, free = [], nonlocal_sde._free_shared_window
+    monkeypatch.setattr(mpi_utils, "idle_barrier", lambda comm, *a, **k: events.append("idle"))
+    monkeypatch.setattr(nonlocal_sde, "_free_shared_window", lambda win, comm: events.append("free") or free(win, comm))
+    monkeypatch.setattr(nonlocal_sde, "update_mu", lambda *a, **k: events.append("mu") or 0.5)
+    run()
+    assert events == ["idle", "free", "idle", "mu"] * 2 + ["idle"]
+
+
+def test_loop_raises_the_error_of_a_background_iterate_write(monkeypatch, tmp_path):
+    """A failed background write of an iterate surfaces as the loop's own error."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
+    monkeypatch.setattr(nonlocal_sde, "_save_sigma_iteration", MagicMock(side_effect=OSError("disk full")))
+    with pytest.raises(OSError, match="disk full"):
+        run()
+
+
+@pytest.mark.parametrize(
+    "perform, epsilon, max_iter, fitted",
+    [
+        (False, 0.0, 3, 3),  # ends at max_iter: the third proposal's slice
+        (False, 1e-3, 5, 2),  # converges early: the second proposal's slice
+        (True, 1e-3, 5, 3),  # converges early with the Eliashberg step: the post-loop pass's slice
+    ],
+)
+def test_loop_fits_the_ornstein_zernike_form_once_after_the_last_proposal(
+    monkeypatch, tmp_path, perform, epsilon, max_iter, fitted
+):
+    """The loop fits the Ornstein-Zernike form once, at its end, to the static slice the last proposal kept."""
+    step = lambda s, n, a: s.copy()  # a fixed point: converges at the first check unless epsilon is zero
+    run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, step, max_iter=max_iter, epsilon=epsilon)
+    config.eliashberg.perform_eliashberg = perform
+    fake, fits = nonlocal_sde.calculate_sigma_proposal, []
+
+    def keeping(*args, **kwargs):
+        kwargs["static_magn"][:] = [len(calls) + 1]
+        return fake(*args, **kwargs)
+
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", keeping)
+    monkeypatch.setattr(nonlocal_sde, "perform_ornstein_zernike_fit", fits.append)
+    run()
+    assert fits == [fitted]
+
+
+def test_finish_keeps_the_static_magnetic_slice_for_the_loops_fit(monkeypatch):
+    """Rank 0 replaces the held slice with the w = 0 magnetic susceptibility, skips the density one and fits nothing."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    monkeypatch.setattr(nonlocal_sde, "perform_ornstein_zernike_fit", MagicMock(side_effect=AssertionError))
+    monkeypatch.setattr(nonlocal_sde, "_monitor_chi_phys", lambda chi, dist: None)
+    mat = np.arange(10, dtype=np.complex64).reshape(2, 1, 1, 1, 1, 5)
+    static = mat[..., 2:3].copy()
+    dist = MagicMock()
+    dist.comm.size, dist.comm.rank = 1, 0
+    dist.gather.side_effect = dist.scatter.side_effect = lambda m: m
+    kept = ["previous"]
+
+    for channel in (SpinChannel.DENS, SpinChannel.MAGN):
+        chi = FourPoint(mat.copy(), channel, (2, 1, 1), 1, 0, True, True, True)
+        nonlocal_sde._finish_physical_susceptibility(chi, dist, static_magn=kept)
+        assert kept == ["previous"] if channel == SpinChannel.DENS else len(kept) == 1
+
+    assert not kept[0].full_niw_range and np.array_equal(kept[0].mat, static)
+
+
+@pytest.mark.parametrize("lambda_on", [False, True])
+def test_finish_without_a_lambda_correction_hands_the_momenta_to_the_loops_single_write(monkeypatch, lambda_on):
+    """Without a lambda correction the holder takes a copy of the rank's momenta and nothing is gathered or written."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    monkeypatch.setattr(nonlocal_sde, "_monitor_chi_phys", lambda chi, dist: None)
+    monkeypatch.setattr(nonlocal_sde, "_select_and_apply_lambda_correction", lambda chi, lam: chi)
+    monkeypatch.setattr(config.lambda_correction, "perform_lambda_correction", False)
+    monkeypatch.setattr(config.stabilization, "use_lambda_correction", lambda_on)
+    saved = []
+    monkeypatch.setattr(FourPoint, "save", lambda self, name, output_dir: saved.append(name))
+    mat = np.arange(10, dtype=np.complex64).reshape(2, 1, 1, 1, 1, 5)
+    dist = MagicMock()
+    dist.comm.size, dist.comm.rank = 1, 0
+    dist.gather.side_effect = dist.scatter.side_effect = lambda m: m
+    held = {}
+
+    chi = nonlocal_sde._finish_physical_susceptibility(
+        FourPoint(mat.copy(), SpinChannel.DENS, (2, 1, 1), 1, 0, True, True, True), dist, last_chi=held
+    )
+
+    assert np.array_equal(chi.mat, mat)
+    if lambda_on:
+        assert dist.gather.called and dist.scatter.called and saved == ["chi_phys_q_dens"] and held == {}
+    else:
+        assert not dist.gather.called and not dist.scatter.called and not saved
+        assert list(held) == [SpinChannel.DENS] and held[SpinChannel.DENS] is not chi
+        assert np.array_equal(held[SpinChannel.DENS].mat, mat)
+
+
+def test_loop_writes_the_held_susceptibilities_once_after_the_last_proposal(monkeypatch, tmp_path):
+    """The loop writes the susceptibilities its proposals held once, after the last one, with the OZ slice holder."""
+    run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0)
+    fake, writes = nonlocal_sde.calculate_sigma_proposal, []
+
+    def holding(*args, **kwargs):
+        kwargs["last_chi"][SpinChannel.MAGN] = len(calls) + 1
+        return fake(*args, **kwargs)
+
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", holding)
+    monkeypatch.setattr(
+        nonlocal_sde, "_write_physical_susceptibility", lambda chi, dist, static_magn: writes.append((chi, static_magn))
+    )
+    run()
+    assert writes == [(3, [])]
 
 
 def test_early_converged_loop_builds_the_eliashberg_intermediates_from_the_final_sigma_and_mu(monkeypatch, tmp_path):
@@ -3223,6 +3404,24 @@ def test_share_sigma_per_node_hands_rank0_sigma_with_its_metadata_to_every_rank_
     assert all(r[3] == (True, (2, 2, 1), 6, 10.0) for r in res)
 
 
+@pytest.mark.parametrize("hostnames", [["n0", "n0", "n1", "n1", "n1"], ["n0", "n1", "n2"], ["n0", "n0"]])
+def test_share_sigma_per_node_receives_into_the_node_windows_without_a_private_copy(monkeypatch, hostnames):
+    """The node roots receive rank 0's array straight into their node's buffer: no rank allocates a receive copy."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mpi_utils, "bcast_rows", MagicMock(side_effect=AssertionError("private receive buffer")))
+    mixed = (np.arange(2 * 2 * 12).reshape(2, 2, 1, 1, 1, 12) - 3j).astype(np.complex64)
+
+    def fn(comm, rank):
+        sigma = SelfEnergy(mixed.copy(), (2, 2, 1), calc_smom=False, beta=10.0) if rank == 0 else None
+        node_comm = comm.Split_type(0)
+        roots_comm = comm.Split(0 if node_comm.rank == 0 else 1)
+        shared, win = nonlocal_sde._share_sigma_per_node(sigma, comm, node_comm, roots_comm)
+        return shared.mat.copy(), shared.nq
+
+    _, res = run_parallel(len(hostnames), fn, hostnames=hostnames)
+    assert all(np.array_equal(mat, mixed.reshape(4, 1, 1, 12)) and nq == (2, 2, 1) for mat, nq in res)
+
+
 def test_assemble_occupation_from_momentum_slices_matches_the_full_grid_filling(monkeypatch):
     """The slice-wise filling of a momentum-local sigma assembles to the full-grid filling bit for bit."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
@@ -4600,10 +4799,80 @@ def test_in_place_rspace_window_holds_the_bits_of_the_window_of_the_cut_green_fu
     """A window of niv_window frequencies holds the bits of the frequency-first window of the cut Green's function."""
     niv_window = 5
     g = _random_momentum_g((4, 4, 2), nb, niv_window + 2, seed=48)
-    ref, _ = nonlocal_sde._build_rspace_giwk_window(g.cut_niv(niv_window), create_comm_mock())
+    ref = np.moveaxis(g.cut_niv(niv_window).fft().mat.reshape(32, nb, nb, -1), -1, 0)
     g = g.compress_q_dimension() if compressed else g
     g_r, win = nonlocal_sde._build_rspace_giwk_window(g, create_comm_mock(), niv_window=niv_window)
     assert win is None and np.array_equal(g_r, ref)
+
+
+@pytest.mark.parametrize("average", [True, False])
+@pytest.mark.parametrize(
+    "hostnames, niv_donor", [(["n0"], 4), (["n0", "n0", "n0", "n1"], 4), (["n0"] * 6, 2), (["n0", "n1"], 3)]
+)
+def test_finish_on_node_builds_the_proposal_with_the_bits_of_rank_0_alone(monkeypatch, average, hostnames, niv_donor):
+    """Rank 0's node concatenates and averages the proposal in frequency slabs with the bits of rank 0 building it."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    rng = np.random.default_rng(13)
+    nk, nb = (4, 2, 1), 2
+    core_mat = (rng.standard_normal((8, nb, nb, 2)) + 1j * rng.standard_normal((8, nb, nb, 2))).astype(np.complex64)
+    donor_mat = (rng.standard_normal((1, 1, 1, nb, nb, 2 * niv_donor)) + 0.2j).astype(np.complex64)
+    offset = rng.standard_normal((8, nb, nb))
+
+    def make():
+        core = SelfEnergy(core_mat.copy(), nk, True, True, calc_smom=False, beta=10.0)
+        return core, SelfEnergy(donor_mat.copy(), (1, 1, 1), calc_smom=False, beta=10.0)
+
+    core, donor = make()
+    ref = core.concatenate_self_energies(donor, shell_offset=offset)
+    ref_moments = ref.smom
+    ref_removed = ref.symmetrize_time_reversal() if average else None
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        if not node_comm.bcast(rank == 0, root=0):
+            return None
+        core, donor = make() if rank == 0 else (None, None)
+        args = (offset, average) if rank == 0 else (None, False)
+        sigma, removed = nonlocal_sde._finish_proposal_on_node(core, donor, *args, node_comm)
+        return (
+            None
+            if sigma is None
+            else (sigma.mat.copy(), sigma.nq, sigma.smom, sigma.has_compressed_q_dimension, removed)
+        )
+
+    _, res = run_parallel(len(hostnames), fn, hostnames=hostnames)
+    mat, nq, moments, compressed, removed = res[0]
+    assert np.array_equal(mat, ref.mat) and nq == nk and compressed and removed == ref_removed
+    assert all(np.array_equal(a, b) for a, b in zip(moments, ref_moments)) and all(r is None for r in res[1:])
+
+
+@pytest.mark.parametrize(
+    "hostnames, niv_window", [(["n0", "n0"], None), (["n0", "n0", "n0", "n1"], None), (["n0"] * 3, 1)]
+)
+def test_rspace_window_ranks_transform_their_own_frequencies_with_the_bits_of_the_object_fft(
+    hostnames, niv_window, monkeypatch
+):
+    """Every node rank transforms its own share of the frequencies in place; the window holds the bits of fft()."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    g = _random_momentum_g((4, 4, 2), 2, 3, seed=51)
+    niv = g.niv if niv_window is None else niv_window
+    expected = np.moveaxis(g.cut_niv(niv).fft().mat.reshape(32, 2, 2, -1), -1, 0)
+    shares, fftn = [], sp.fft.fftn
+    monkeypatch.setattr(sp.fft, "fftn", lambda x, *a, **kw: shares.append(x.shape[0]) or fftn(x, *a, **kw))
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        g_r, win = nonlocal_sde._build_rspace_giwk_window(g, node_comm, niv_window=niv_window)
+        result = g_r.copy()
+        g_r = None
+        nonlocal_sde._free_shared_window(win, node_comm)
+        return result
+
+    _, results = run_parallel(len(hostnames), fn, hostnames=hostnames)
+    assert all(np.array_equal(result, expected) for result in results)
+    n_v, sizes = 2 * niv, [hostnames.count(host) for host in dict.fromkeys(hostnames)]
+    expected_shares = [(r + 1) * n_v // s - r * n_v // s for s in sizes for r in range(s)]
+    assert sorted(shares) == sorted(share for share in expected_shares if share)
 
 
 def test_in_place_rspace_window_refuses_more_frequencies_than_the_green_function_holds():

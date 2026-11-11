@@ -27,6 +27,7 @@ import gc
 import os
 import pickle
 import socket
+import time
 
 import h5py
 import mpi4py.MPI as MPI
@@ -43,6 +44,24 @@ MAX_MPI_BYTES = 2**31 - 1
 ORDERED_SUM_TAG = 1400
 
 
+def idle_barrier(comm, interval: float = 0.005) -> None:
+    r"""
+    Synchronizes the ranks of ``comm`` like a barrier, but a rank that arrives early sleeps ``interval`` seconds between
+    tests of the barrier instead of waiting inside MPI. Placed before a collective that waits for the serial work of
+    one rank (rank 0 or a node root), it keeps the other ranks from busy-polling the transport meanwhile, which a TCP
+    provider does through system calls. Collective over ``comm``; a single-rank communicator returns at once.
+
+    :param comm: The MPI communicator.
+    :param interval: Seconds a waiting rank sleeps between two tests of the barrier.
+    :return: None.
+    """
+    if comm.size == 1:
+        return
+    request = comm.Ibarrier()
+    while not request.Test():
+        time.sleep(interval)
+
+
 def build_node_shared_array(node_comm, compute_fn, dtype=None):
     r"""
     Build an array once per node and expose it to every rank on that node through a single MPI shared-memory window,
@@ -50,7 +69,8 @@ def build_node_shared_array(node_comm, compute_fn, dtype=None):
     instead of once per rank** and computed only on the node root.
 
     ``compute_fn`` is called **only on the node-local root rank** (rank 0 of ``node_comm``) and must return the fully
-    built numpy array; the other ranks do not call it. Its result is copied into a shared-memory segment allocated by
+    built numpy array; the other ranks do not call it and sleep meanwhile (see :func:`idle_barrier`). Its result is
+    copied into a shared-memory segment allocated by
     the root, and every rank receives a numpy view of that same physical buffer (read-only by convention - only the
     root writes it). ``node_comm`` must be a node-local communicator, e.g. ``comm.Split_type(MPI.COMM_TYPE_SHARED)``.
 
@@ -68,6 +88,7 @@ def build_node_shared_array(node_comm, compute_fn, dtype=None):
     local = compute_fn() if is_root else None
     if node_comm.Get_size() == 1:
         return local, None
+    idle_barrier(node_comm)  # the other node ranks sleep while the root computes
     shape, dtype = node_comm.bcast((local.shape, dtype or local.dtype) if is_root else None)
     shared, win = allocate_node_shared_array(node_comm, shape, dtype)
     if is_root:
