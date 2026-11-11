@@ -4308,6 +4308,31 @@ def test_loop_saves_the_raw_proposal_only_with_jacobian_stabilization(monkeypatc
     assert all(call.kwargs["output_dir"] == config.output.sigma_iterates_path for call in save.call_args_list)
 
 
+@pytest.mark.parametrize("save_iterates", [True, False])
+def test_loop_prunes_the_iterates_outside_the_mixing_history_without_save_sigma_iterates(
+    monkeypatch, tmp_path, save_iterates
+):
+    """Without save_sigma_iterates the last mixing_history_length + 1 iterates stay during the loop, the last after it."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=5, epsilon=0.0)
+    config.self_consistency.mixing_history_length = 2
+    config.self_consistency.save_sigma_iterates = save_iterates
+    prune = MagicMock()
+    monkeypatch.setattr(nonlocal_sde, "_prune_sigma_iterates", prune)
+    run()
+    assert [call.args[0] for call in prune.call_args_list] == ([] if save_iterates else [-1, 0, 1, 2, 3, 5])
+
+
+def test_prune_sigma_iterates_deletes_the_iterates_and_proposals_before_the_kept_iteration(monkeypatch, tmp_path):
+    """Every *_iteration_<i>.npy below keep_from goes; later iterations and other files stay."""
+    monkeypatch.setattr(os, "remove", os.unlink)  # conftest stubs os.remove out
+    config.output.sigma_iterates_path = str(tmp_path)
+    names = [f"sigma_dga{p}_iteration_{i}.npy" for p in ("", "_proposal") for i in (1, 2, 10)] + ["sigma_dga.npy"]
+    for name in names:
+        (tmp_path / name).touch()
+    nonlocal_sde._prune_sigma_iterates(2)
+    assert sorted(os.listdir(tmp_path)) == sorted(n for n in names if "_iteration_1." not in n)
+
+
 def test_loop_saves_the_core_window_of_the_proposal_as_the_map_returned_it(monkeypatch, tmp_path):
     """The saved proposal is the raw map output's core window, neither reflected nor mixed, unlike the next iterate."""
     run, _, _ = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=3, epsilon=0.0)

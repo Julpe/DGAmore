@@ -121,6 +121,9 @@ class SelfConsistencyConfig:
     :ivar int mixing_history_length: Number of past iterations used by the accelerated mixing schemes.
     :ivar str previous_sc_path: Path to a previous self-consistency run to resume from (empty to start fresh).
     :ivar bool use_interpolated_sigma: Whether to resume from the interpolated rather than the raw self-energy.
+    :ivar bool save_sigma_iterates: Whether to keep every per-iteration self-energy on disk. If False, the loop deletes
+        the iterates older than the last ``mixing_history_length + 1`` iterations as it goes and, after the loop, all
+        but the last iteration's.
     :ivar str sigma_iterates_subfolder_name: Subfolder name (under the output path) for the per-iteration
         self-energies the loop writes; the resolved directory is :attr:`OutputConfig.sigma_iterates_path`.
     """
@@ -133,6 +136,7 @@ class SelfConsistencyConfig:
         self.mixing_history_length: int = 3
         self.previous_sc_path: str = ""
         self.use_interpolated_sigma: bool = False
+        self.save_sigma_iterates: bool = True
         self.sigma_iterates_subfolder_name: str = "Sigma_Iterates"
 
 

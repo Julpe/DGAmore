@@ -309,7 +309,8 @@ separate momentum axes.
      - Lattice Green's function built from the DMFT self-energy (written when ``do_spectrum_dmft`` is enabled)
      - ``[nkx, nky, nkz, no, no, 2 niv]``
    * - ``Sigma_Iterates/sigma_dga_iteration_<i>.npy``
-     - Self-energy after self-consistency iteration ``i`` (also read back when a run is resumed)
+     - Self-energy after self-consistency iteration ``i`` (also read back when a run is resumed; only the last
+       iteration's is kept with ``save_sigma_iterates: False``)
      - ``[nkx, nky, nkz, no, no, 2 niv]``
    * - | ``sigma_dga_interpolated``
        | ``_beta<b>_niv<n>.npy``
