@@ -35,8 +35,8 @@ class SelfEnergy(TwoPoint):
     """
 
     # Upper bound (in bytes) on the transient of symmetrize_time_reversal: the gathered partners and their average of
-    # one fermionic chunk, so a full-BZ self-energy is never duplicated.
-    _TR_CHUNK_BYTES = 256 * 1024**2
+    # one fermionic chunk, so a full-BZ self-energy is never duplicated. Narrow chunks make the partner gather slow.
+    _TR_CHUNK_BYTES = 1024**3
 
     def __init__(
         self,
@@ -262,16 +262,29 @@ class SelfEnergy(TwoPoint):
         """
         return self._add(other, subtract=True)
 
-    def concatenate_self_energies(self, other: "SelfEnergy", shell_offset: np.ndarray | None = None) -> "SelfEnergy":
+    def concatenate_self_energies(
+        self,
+        other: "SelfEnergy",
+        shell_offset: np.ndarray | None = None,
+        out: np.ndarray | None = None,
+        frequencies: slice | None = None,
+    ) -> "SelfEnergy":
         """
         Builds a self-energy that keeps ``self`` inside its core box and uses ``other`` for the shell, up to
         ``other.niv``. An optional momentum-dependent constant is added to the shell frequencies only, e.g. the
-        momentum-dependent part of the Hartree-Fock term that a momentum-local shell donor does not carry.
+        momentum-dependent part of the Hartree-Fock term that a momentum-local shell donor does not carry. Every
+        frequency of the result is built on its own, so slabs of frequencies written one by one into ``out`` hold the
+        bits of the whole concatenation.
 
         :param other: The self-energy supplying the shell frequencies; must have at least as many frequencies as ``self``.
         :param shell_offset: Constant added to every shell frequency, shape ``[q, o1, o2]`` in the compressed momentum
             layout (or broadcastable to it); ``None`` adds nothing.
-        :return: A new :class:`SelfEnergy` spanning ``other``'s frequency box.
+        :param out: Array of the result's shape ``[q, o1, o2, 2 other.niv]`` the frequencies are written into (e.g. a
+            shared-memory window), or ``None`` to allocate it.
+        :param frequencies: The contiguous range of the result's frequency indices to build, or ``None`` for all;
+            the other frequencies of ``out`` are left as they are.
+        :return: A :class:`SelfEnergy` spanning ``other``'s frequency box, viewing ``out`` when given; its moments are
+            fitted only when every frequency is built.
         :raises ValueError: If ``other`` has fewer frequencies than ``self``.
         """
         if self.niv > other.niv:
@@ -282,19 +295,30 @@ class SelfEnergy(TwoPoint):
         other = other.compress_q_dimension()
 
         # the shell donor's momentum axis broadcasts into the result, so a local tail is never tiled over the BZ
-        result_mat = np.empty(self.current_shape[:-1] + (2 * other.niv,), dtype=self.mat.dtype)
-        result_mat[..., :niv_diff] = other.mat[..., :niv_diff]
-        result_mat[..., niv_diff : niv_diff + 2 * self.niv] = self.mat
-        result_mat[..., niv_diff + 2 * self.niv :] = other.mat[..., niv_diff + 2 * self.niv :]
-        if shell_offset is not None:
-            offset = np.asarray(shell_offset)[..., None]
-            result_mat[..., :niv_diff] += offset
-            result_mat[..., niv_diff + 2 * self.niv :] += offset
+        n_v, core = 2 * other.niv, slice(niv_diff, niv_diff + 2 * self.niv)
+        result_mat = np.empty(self.current_shape[:-1] + (n_v,), dtype=self.mat.dtype) if out is None else out
+        lo, hi = (0, n_v) if frequencies is None else (frequencies.start, frequencies.stop)
+        for start, stop in ((0, core.start), (core.start, core.stop), (core.stop, n_v)):
+            first, last = max(start, lo), min(stop, hi)
+            if first >= last:
+                continue
+            if start == core.start:
+                result_mat[..., first:last] = self.mat[..., first - niv_diff : last - niv_diff]
+                continue
+            result_mat[..., first:last] = other.mat[..., first:last]
+            if shell_offset is not None:
+                result_mat[..., first:last] += np.asarray(shell_offset)[..., None]
         return SelfEnergy(
-            result_mat, self.nq, self.full_niv_range, self.has_compressed_q_dimension, False, beta=self._beta
+            result_mat,
+            self.nq,
+            self.full_niv_range,
+            self.has_compressed_q_dimension,
+            False,
+            calc_smom=frequencies is None,
+            beta=self._beta,
         )
 
-    def symmetrize_time_reversal(self) -> float:
+    def symmetrize_time_reversal(self, frequencies: slice | None = None) -> float:
         r"""
         Enforces the time-reversal relation of real hoppings, :math:`\Sigma^{(\mathbf{k},\nu)}_{12} =
         \Sigma^{(-\mathbf{k},\nu)}_{21}`, in place by averaging every momentum with its time-reversed partner,
@@ -304,8 +328,12 @@ class SelfEnergy(TwoPoint):
 
         The average keeps the Matsubara Hermiticity and the causality of the input. It runs over chunks of the
         fermionic axis whose transient (the gathered partners and their average) stays below ``_TR_CHUNK_BYTES``.
+        Every frequency is averaged on its own, so contiguous ranges of ``frequencies`` averaged one by one hold the
+        bits of the whole average.
 
-        :return: The largest change of an element, i.e. half the largest time-reversal asymmetry of the input.
+        :param frequencies: The contiguous range of frequency indices to average, or ``None`` for all.
+        :return: The largest change of an element, i.e. half the largest time-reversal asymmetry of the input (of the
+            averaged frequencies).
         :raises ValueError: If the momentum axis is not compressed.
         """
         if not self.has_compressed_q_dimension:
@@ -316,9 +344,10 @@ class SelfEnergy(TwoPoint):
 
         mat = self.mat
         width = max(1, int(self._TR_CHUNK_BYTES // (2 * mat[..., :1].nbytes)))
+        lo, hi = (0, mat.shape[-1]) if frequencies is None else (frequencies.start, frequencies.stop)
         removed = 0.0
-        for start in range(0, mat.shape[-1], width):
-            block = mat[..., start : start + width]
+        for start in range(lo, hi, width):
+            block = mat[..., start : min(start + width, hi)]
             average = block[minus].swapaxes(1, 2)
             average += block
             average *= 0.5

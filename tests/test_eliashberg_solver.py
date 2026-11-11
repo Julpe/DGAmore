@@ -246,6 +246,29 @@ def test_local_gamma_ud_pp_w0_satisfies_decoupled_singlet_triplet_bse(o):
     assert np.allclose(f_t, gamma_t - gamma_t @ chi0 @ f_t / (2 * beta**2), atol=1e-3)
 
 
+@pytest.mark.parametrize("o", [4, 3, 2, 1])
+def test_local_gamma_ud_pp_w0_is_straight_up_down_bse_for_any_g(o):
+    """Gamma is the up-down pp BSE in the up/down pair basis also for G_12 != G_21 and a non-crossing-symmetric chi."""
+    beta, niv_pp = 10.0, 3
+    n2, dim = 2 * niv_pp, o * o * 2 * niv_pp
+    rng = np.random.default_rng(41)
+    g_mat = rng.standard_normal((o, o, n2 + 4)) + 1j * rng.standard_normal((o, o, n2 + 4)) + 2.0 * np.eye(o)[..., None]
+    chi = rng.standard_normal((o, o, o, o, n2, n2)) + 1j * rng.standard_normal((o, o, o, o, n2, n2))
+    chi = (chi + 4.0 * o * np.einsum("ad,bc,vp->abcdvp", np.eye(o), np.eye(o), np.eye(n2))).astype(np.complex64)
+    chi0 = BubbleGenerator.create_generalized_chi0_pp_w0(GreensFunction(g_mat[None, None, None]), niv_pp, beta)
+    chi_obj = LocalFourPoint(chi[:, :, :, :, None], SpinChannel.UD, 1, 2, True, True, FrequencyNotation.PP)
+    gamma = create_local_gamma_ud_pp_w0(chi_obj, chi0.extend_vn_to_diagonal(), beta).mat[:, :, :, :, 0]
+
+    def pairs(x):
+        return np.transpose(x[..., ::-1], (0, 2, 4, 1, 3, 5)).reshape(dim, dim).astype(np.complex128)
+
+    # chi0*J = -beta G_12(v) G_34(-v) delta_{v,-v'}: minus the ph straight term mapped to pp notation
+    gv = g_mat[:, :, 2:-2]
+    chi0_j = -beta * np.einsum("abv,cdv,vp->abcdvp", gv, gv[:, :, ::-1], np.eye(n2)[:, ::-1])
+    gamma_ref = beta**2 * (np.linalg.inv(pairs(chi - chi0_j)) - np.linalg.inv(pairs(-chi0_j)))
+    assert np.allclose(pairs(gamma), gamma_ref, atol=1e-2)
+
+
 @pytest.mark.parametrize("o", [5, 4, 3, 2, 1])
 def test_transform_vertex_loc_frequencies_w0_is_crossed_slot_form(o):
     """transform_vertex_loc_frequencies_w0 returns the crossed slot -F_{1432} (the permute shows only for >1 band)."""

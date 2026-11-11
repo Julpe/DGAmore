@@ -72,9 +72,15 @@ class BubbleGenerator:
         \sum_{\mathbf{k}} G^{\mathrm{k}}_{14}\, G^{\mathrm{k}-\mathrm{q}}_{32}`, evaluated via an FFT over the BZ with
         preallocated buffers. On a multi-rank run the bosonic-frequency loop is distributed across all ranks (see
         :meth:`_create_generalized_chi0_q_fft_distributed`); on a single rank the whole bubble is computed on rank 0
-        over the irreducible BZ and scattered across ranks. With ``subtract_from`` the bubble is subtracted from that
-        bubble in place instead of returned: the multi-rank path scales, filters and subtracts every column block as
-        it arrives, so the bubble's own array is never built; a single rank subtracts the finished bubble.
+        over the irreducible BZ and scattered across ranks. When the Green's function obeys Hermiticity and time
+        reversal on the box (see :meth:`_has_crossing_symmetries`), only the columns :meth:`_crossing_columns` leaves
+        are transformed, about half of them, and every other column follows at the same momentum from the crossing
+        relation :math:`\chi^{(\mathbf{q},\omega)\,\omega-\nu}_{0;1234} = [\chi^{(\mathbf{q},\omega)\,\nu}_{0;3412}]^*`
+        as the conjugated rows of its computed partner with the orbital pairs swapped, so the computed columns keep
+        their bits and the derived ones carry their partner's rounding, on one rank and on many alike. With
+        ``subtract_from`` the bubble is subtracted from that bubble in place instead of returned: the multi-rank path
+        scales, filters and subtracts every column block as it arrives, so the bubble's own array is never built; a
+        single rank subtracts the finished bubble.
 
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
         :param giwk: The momentum-dependent :class:`GreensFunction`.
@@ -111,13 +117,25 @@ class BubbleGenerator:
             end = giwk_niv + niv
             g_r = np.asarray(g_r.mat[..., start:end], order="C")
             g_r_rev = np.asarray(g_r_rev.mat, order="C")
+            columns, partners = np.arange(len(wn) * 2 * niv), np.full(len(wn) * 2 * niv, -1)
+            if BubbleGenerator._has_crossing_symmetries(giwk, niv + niw):
+                columns, partners = BubbleGenerator._crossing_columns(wn, niv)
 
             for iw, wn_i in enumerate(wn):
-                g_vw = g_r_rev[..., start - wn_i : end - wn_i]
-                np.multiply(g_r[:, :, :, :, None, None, :, :], g_vw[:, :, :, None, :, :, None, :], out=chi_r_v_buffer)
+                # the computed columns of a bosonic frequency are its first n_v fermionic ones
+                mine = columns // (2 * niv) == iw
+                n_v = np.count_nonzero(mine)
+                buf = chi_r_v_buffer[..., :n_v]
+                g_vw = g_r_rev[..., start - wn_i : start - wn_i + n_v]
+                np.multiply(g_r[:, :, :, :, None, None, :, :n_v], g_vw[:, :, :, None, :, :, None, :], out=buf)
                 # scipy.fft keeps complex64 in place; numpy.fft would upcast to complex128 (double work + 2x buffer)
-                chi_q_v = sp.fft.ifftn(chi_r_v_buffer, axes=(0, 1, 2), overwrite_x=True)
-                gchi0_q_mat[..., iw, :] = chi_q_v.reshape((k_grid.nk_tot, nb, nb, nb, nb, 2 * niv))[k_grid.irrk_ind]
+                chi_q_v = sp.fft.ifftn(buf, axes=(0, 1, 2), overwrite_x=True)
+                chi_q_v = chi_q_v.reshape((k_grid.nk_tot, nb, nb, nb, nb, n_v))
+                gchi0_q_mat[..., iw, :n_v] = chi_q_v[k_grid.irrk_ind]
+                found = partners[mine] >= 0
+                if found.any():
+                    crossed = np.conj(gchi0_q_mat[..., iw, :n_v][..., found].transpose(0, 3, 4, 1, 2, 5))
+                    gchi0_q_mat[..., iw, partners[mine][found] % (2 * niv)] = crossed
 
             gchi0_q_mat *= -beta / k_grid.nk_tot
         gchi0_q_mat = mpi_dist_irrk.scatter(gchi0_q_mat)
@@ -145,8 +163,10 @@ class BubbleGenerator:
         same window and as many changes). With :math:`\chi_{0}[A, B]^{\mathrm{q}\nu}_{1234} =
         -\frac{\beta}{n_{\mathbf{k}}} \sum_{\mathbf{k}} A^{\mathrm{k}}_{14}\, B^{\mathrm{k}-\mathrm{q}}_{32}`, the
         first bubble is :math:`\chi_{0}[G, G]`, scaled and filtered as :meth:`create_generalized_chi0_q_fft` builds
-        it, whose columns it equals bit for bit. For every window :math:`\delta G` of ``dg_rs`` the same column pass
-        returns the bilinear bubble :math:`\chi_{0}[G, \delta G] + \chi_{0}[\delta G, G]`, the derivative of the
+        it. Every column is computed here, so it equals that bubble's columns bit for bit, except the columns the
+        crossing relation derives there on a :math:`G` with both crossing symmetries, which agree to rounding. For
+        every window :math:`\delta G` of ``dg_rs`` the same column pass returns the bilinear bubble
+        :math:`\chi_{0}[G, \delta G] + \chi_{0}[\delta G, G]`, the derivative of the
         unfiltered bubble in the direction :math:`\delta G`, scaled but not filtered. A column's values depend neither
         on the window nor on the rank count, so any split of the bosonic range into windows keeps every bit. The
         partner :math:`B^{\mathrm{k}-\mathrm{q}}_{32}` of a column is gathered from its window at the reversed momenta
@@ -178,8 +198,8 @@ class BubbleGenerator:
                 f"real-space window holds {center}."
             )
 
-        # flat index of -R for every flat R: the partner of a column reads its window at the reversed momenta
-        rev = np.ravel_multi_index(tuple(-np.indices(nk).reshape(3, -1) % np.reshape(nk, (3, 1))), nk)
+        # the partner of a column reads its window at the reversed momenta
+        rev = BubbleGenerator._reversed_momenta(nk)
         slabs = np.empty((2, nk_tot, nb, nb), dtype=dtype)
         # the second product of a bilinear column runs in blocks of momenta of at most one round buffer
         rows = max(1, ROUND_BUFFER_BYTES // (nb**4 * np.dtype(dtype).itemsize))
@@ -209,11 +229,11 @@ class BubbleGenerator:
         mats = [np.empty((my_nq, nb, nb, nb, nb, n_w, n_v), dtype=dtype) for _ in range(n_parts)]
         cols = [np.reshape(mat, (my_nq, nb**4, n_w * n_v), copy=False) for mat in mats]
 
-        def deliver(c0: int, c1: int, block: np.ndarray) -> None:
+        def deliver(where: slice, block: np.ndarray) -> None:
             """Writes a column block of this rank's momenta into the arrays of every part."""
-            parts = block.reshape(my_nq, nb**4, n_parts, c1 - c0)
+            parts = block.reshape(my_nq, nb**4, n_parts, -1)
             for part, part_cols in enumerate(cols):
-                part_cols[:, :, c0:c1] = parts[:, :, part]
+                part_cols[:, :, where] = parts[:, :, part]
 
         if mpi_dist_irrk.comm.size > 1:
             BubbleGenerator._run_columns(mpi_dist_irrk, k_grid, n_w, n_v, n_parts, nb, dtype, fill, deliver)
@@ -318,13 +338,15 @@ class BubbleGenerator:
         the full-grid in-place ``scipy.fft.ifftn`` (bit-identical to the rank-0 path) only for its columns - reading
         the R-space Green's function and its momentum-flipped, orbital-transposed partner from per-node shared-memory
         windows - and the per-column irreducible-BZ results are ring-exchanged onto the irr-BZ q-distribution
-        (the same total bytes the former rank-0 scatter moved). The columns are processed in sub-chunks sized so
+        (at most the bytes the former rank-0 scatter moved). The columns are processed in sub-chunks sized so
         that a node's combined full-grid buffers stay well below the former rank-0 footprint and a sub-chunk's buffer
         stays within ``ROUND_BUFFER_BYTES`` (its column-wise fill is a strided write, so a larger buffer would stream
         every cache line through memory once per column; a column above the budget runs alone); the exchange is
         pipelined per sub-chunk on a globally derived schedule, so no rank ever holds more than its final irr-BZ
-        slice plus one sub-chunk in flight. With ``subtract_from`` every column block is scaled and filtered as the
-        finished bubble is and subtracted from that bubble's columns as it arrives, so no slice of its own is
+        slice plus one sub-chunk in flight. On a Green's function with both crossing symmetries only the crossing's
+        computed columns are transformed and exchanged, and every rank derives their partners on its own momenta as
+        the blocks arrive. With ``subtract_from`` every column block, computed or derived, is scaled and filtered as
+        the finished bubble is and subtracted from that bubble's columns as it arrives, so no slice of its own is
         allocated (the same elementwise operations, hence the bits of ``subtract_from.sub(bubble)``).
 
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
@@ -377,17 +399,30 @@ class BubbleGenerator:
                 out=out,
             )
 
-        def deliver(c0: int, c1: int, block: np.ndarray) -> None:
-            """Writes a column block of this rank's momenta, or subtracts it scaled and filtered (``subtract_from``)."""
-            cols = gchi0_cols[:, :, c0:c1]
-            if subtract_from is None:
-                cols[...] = block.reshape(cols.shape)
-                return
-            block *= -beta / nk_tot
-            zero_small_values(block)
-            cols -= block.reshape(cols.shape)
+        def deliver(where: slice | np.ndarray, block: np.ndarray) -> None:
+            """Writes a column block of this rank's momenta and the crossing partners it derives, or subtracts both
+            scaled and filtered (``subtract_from``)."""
+            if subtract_from is not None:
+                block *= -beta / nk_tot
+                zero_small_values(block)
+            parts = [(where, block)]
+            if partner_of is not None:
+                found = np.flatnonzero(partner_of[where] >= 0)
+                # the partner (w, w - v) of (w, v) at the same q: conjugated, orbital pairs 12 and 34 swapped
+                crossed = np.take(block.transpose(0, 3, 4, 1, 2, 5), found, axis=-1)
+                parts.append((partner_of[where][found], np.conjugate(crossed, out=crossed)))
+            for target, values in parts:
+                if subtract_from is None:
+                    gchi0_cols[:, :, target] = values.reshape(my_nq, nb**4, -1)
+                else:
+                    gchi0_cols[:, :, target] -= values.reshape(my_nq, nb**4, -1)
 
-        BubbleGenerator._run_columns(mpi_dist_irrk, k_grid, len(wn), vpos, 1, nb, g_r_mat.dtype, fill, deliver)
+        columns = partner_of = None
+        if BubbleGenerator._has_crossing_symmetries(giwk, niv + niw, mpi_dist_irrk.comm):
+            columns, partners = BubbleGenerator._crossing_columns(wn, niv)
+            partner_of = np.full(len(wn) * vpos, -1)
+            partner_of[columns] = partners
+        BubbleGenerator._run_columns(mpi_dist_irrk, k_grid, len(wn), vpos, 1, nb, g_r_mat.dtype, fill, deliver, columns)
         g_r_mat = g_r_rev_mat = None
         for win in (g_r_win, g_r_rev_win):
             if win is not None:
@@ -402,6 +437,71 @@ class BubbleGenerator:
         ).filter_small_values()
 
     @staticmethod
+    def _crossing_columns(wn: np.ndarray, niv: int) -> tuple[np.ndarray, np.ndarray]:
+        r"""
+        Returns the bubble columns left to compute under the crossing relation
+        :math:`\chi^{(\mathbf{q},\omega)\,\omega-\nu}_{0;1234} = [\chi^{(\mathbf{q},\omega)\,\nu}_{0;3412}]^*` and the
+        partner of each. A column is the flat index ``iw * 2 niv + iv`` of the bosonic frequency ``wn[iw]`` and the
+        fermionic frequency :math:`\nu_{iv - niv}`; the partner of ``iv`` at :math:`\omega_m` is
+        ``2 niv + m - 1 - iv``. A column is computed unless its partner lies in the box below it, so every column is
+        either computed or the partner of exactly one computed column, and the column paired with itself is computed.
+
+        :param wn: The non-negative bosonic frequency indices of the stored columns.
+        :param niv: Number of positive fermionic frequencies.
+        :return: The tuple ``(columns, partners)``: the flat columns to compute, ascending, and per column the flat
+            column of its partner, or ``-1`` when it has none in the box.
+        """
+        iv = np.arange(2 * niv)
+        partner = 2 * niv + np.asarray(wn)[:, None] - 1 - iv
+        flat = np.arange(len(wn))[:, None] * 2 * niv
+        computed = partner >= iv
+        partners = np.where((partner < 2 * niv) & (partner > iv), flat + partner, -1)
+        return (flat + iv)[computed], partners[computed]
+
+    @staticmethod
+    def _has_crossing_symmetries(giwk: GreensFunction, niv_window: int, comm=None) -> bool:
+        r"""
+        Returns whether Hermiticity, :math:`G^{(\mathbf{k},-\nu)}_{12} = [G^{(\mathbf{k},\nu)}_{21}]^*`, and time
+        reversal, :math:`G^{(-\mathbf{k},\nu)}_{12} = G^{(\mathbf{k},\nu)}_{21}`, the conditions of the bubble's
+        crossing relation at fixed momentum, both hold on the fermionic frequencies ``[-niv_window, niv_window)`` to
+        ``1e-6`` relative to the largest :math:`|G|` there, or to 64 units of rounding of the storage precision when
+        that is finer (complex128), so a derived column agrees with the transformed one to rounding. Collective over
+        ``comm``: every rank checks its share of the momenta in blocks of rows against the same rows and their
+        :math:`-\mathbf{k}` rows, so no copy of its share is held, and all ranks return the same answer.
+
+        :param giwk: The momentum-dependent :class:`GreensFunction`; only read.
+        :param niv_window: Number of positive fermionic frequencies checked.
+        :param comm: The MPI communicator, or ``None`` for a single rank.
+        :return: Whether both symmetries hold on every momentum and checked frequency.
+        """
+        nb = giwk.n_bands
+        mat = np.reshape(giwk.mat, (-1, nb, nb, giwk.mat.shape[-1]), copy=False)
+        mat = mat[..., giwk.niv - niv_window : giwk.niv + niv_window]
+        reversed_rows = BubbleGenerator._reversed_momenta(giwk.nq)
+        size, rank = (comm.size, comm.rank) if comm is not None else (1, 0)
+        first, last = rank * len(mat) // size, (rank + 1) * len(mat) // size
+        diff = scale = 0.0
+        for r0 in range(first, last, 64):
+            rows = mat[r0 : min(r0 + 64, last)]
+            diff = max(diff, float(np.abs(rows - np.conj(rows[..., ::-1].swapaxes(1, 2))).max()))
+            diff = max(diff, float(np.abs(rows - mat[reversed_rows[r0 : r0 + len(rows)]].swapaxes(1, 2)).max()))
+            scale = max(scale, float(np.abs(rows).max()))
+        if size > 1:
+            diff, scale = (max(values) for values in zip(*comm.allgather((diff, scale))))
+        return diff <= min(1e-6, 64 * np.finfo(mat.dtype).eps) * scale
+
+    @staticmethod
+    def _reversed_momenta(nk: tuple) -> np.ndarray:
+        r"""
+        Returns the flat index of :math:`-\mathbf{R}` for every flat :math:`\mathbf{R}` of the grid ``nk`` (C order),
+        which is also the flat index of :math:`-\mathbf{q}` on the transformed grid.
+
+        :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+        :return: The flat reversed indices, one per grid point.
+        """
+        return np.ravel_multi_index(tuple(-np.indices(nk).reshape(3, -1) % np.reshape(nk, (3, 1))), nk)
+
+    @staticmethod
     def _run_columns(
         mpi_dist_irrk: MpiDistributor,
         k_grid: KGrid,
@@ -411,21 +511,23 @@ class BubbleGenerator:
         nb: int,
         dtype: np.dtype,
         fill: Callable[[np.ndarray, int, int, int], None],
-        deliver: Callable[[int, int, np.ndarray], None],
+        deliver: Callable[[slice | np.ndarray, np.ndarray], None],
+        columns: np.ndarray | None = None,
     ) -> None:
         r"""
-        Runs the column evaluation of the distributed bubbles (collective). The ``n_w * n_v`` flattened
-        bosonic-fermionic columns :math:`(\omega, \nu)`, bosonic-major, are split across the ranks in contiguous runs
-        and processed in sub-chunk rounds of one full-grid buffer. Per round and part, ``fill(out, part, iw, iv)``
-        writes the R-space product of each of the rank's columns into the buffer, the in-place ``scipy.fft.ifftn``
-        transforms them and their irreducible-BZ rows are kept; the rows of all parts are ring-exchanged onto the
-        irr-BZ q-distribution and handed to ``deliver(c0, c1, block)``, ``block = [q, o1, o2, o3, o4, n_parts * (c1 -
-        c0)]`` holding this rank's momenta of the columns ``[c0, c1)``, part-major. The buffer stays within
-        ``ROUND_BUFFER_BYTES`` (the column-wise fill is a strided write, so a larger buffer would stream every cache
-        line through memory once per column; a column above the budget runs alone). The schedule depends only on the
-        column counts, the box and the rank count, so the pipelined exchange stays collectively matched and no rank
-        holds more than one round in flight. A column's values do not depend on the schedule: its product is
-        elementwise and the transform runs every momentum line of every column on its own.
+        Runs the column evaluation of the distributed bubbles (collective). The flattened bosonic-fermionic columns
+        :math:`(\omega, \nu)`, ``iw * n_v + iv`` bosonic-major (all ``n_w * n_v`` of them, or ``columns``), are split
+        across the ranks in contiguous runs and processed in sub-chunk rounds of one full-grid buffer. Per round and
+        part, ``fill(out, part, iw, iv)`` writes the R-space product of each of the rank's columns into the buffer, the
+        in-place ``scipy.fft.ifftn`` transforms them and their irreducible-BZ rows are kept; the rows of all parts are
+        ring-exchanged onto the irr-BZ q-distribution and handed to ``deliver(where, block)``, ``block = [q, o1, o2,
+        o3, o4, n_parts * n]`` holding this rank's momenta of the ``n`` flat columns ``where`` (a slice, or an index
+        array with ``columns``), part-major. The buffer stays within ``ROUND_BUFFER_BYTES`` (the column-wise fill is a
+        strided write, so a larger buffer would stream every cache line through memory once per column; a column above
+        the budget runs alone). The schedule depends only on the column counts, the box and the rank count, so the
+        pipelined exchange stays collectively matched and no rank holds more than one round in flight. A column's
+        values do not depend on the schedule: its product is elementwise and the transform runs every momentum line of
+        every column on its own.
 
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
         :param k_grid: The :class:`KGrid` over which the BZ sum/FFT is performed.
@@ -437,6 +539,7 @@ class BubbleGenerator:
         :param fill: Writes the R-space product ``part`` of the column ``(iw, iv)`` into ``out``
             ``[x, y, z, o1, o2, o3, o4]``.
         :param deliver: Receives every column block of this rank's momenta.
+        :param columns: The flat columns to compute, ascending, or ``None`` for all of them.
         :return: None.
         """
         comm = mpi_dist_irrk.comm
@@ -445,7 +548,7 @@ class BubbleGenerator:
 
         # globally derived column schedule: contiguous (w, v)-column runs per rank, processed in equal-size
         # sub-chunk rounds so the pipelined ring exchange stays collectively matched on every rank
-        total_cols = n_w * n_v
+        total_cols = n_w * n_v if columns is None else len(columns)
         col_bounds = np.linspace(0, total_cols, size + 1).astype(int)
         ncols_max = int(np.max(np.diff(col_bounds)))
         sub_cols = max(1, ncols_max * nk_irr // (6 * nk_tot), min(ncols_max, n_v // max(1, size)))
@@ -459,6 +562,10 @@ class BubbleGenerator:
             c0 = col_bounds[r] + rnd * sub_cols
             return c0, min(col_bounds[r + 1], c0 + sub_cols)
 
+        def targets(c0: int, c1: int) -> slice | np.ndarray:
+            """The flat columns of the round positions ``[c0, c1)``."""
+            return slice(c0, c1) if columns is None else columns[c0:c1]
+
         buf = np.empty((*k_grid.nk, nb, nb, nb, nb, sub_cols), dtype=dtype)
         for rnd in range(n_rounds):
             c0, c1 = round_cols(rank, rnd)
@@ -469,7 +576,7 @@ class BubbleGenerator:
                 pieces = []
                 for part in range(n_parts):
                     for col in range(c0, c1):  # fill column-wise: one (w, v) pair per column
-                        fill(buf_v[..., col - c0], part, *divmod(col, n_v))
+                        fill(buf_v[..., col - c0], part, *divmod(col if columns is None else columns[col], n_v))
                     # scipy.fft keeps complex64 in place; numpy.fft would upcast to complex128 (double work + 2x buffer)
                     transformed = sp.fft.ifftn(buf_v, axes=(0, 1, 2), overwrite_x=True)
                     pieces.append(
@@ -479,7 +586,7 @@ class BubbleGenerator:
                 chunk_irr = pieces[0] if n_parts == 1 else np.concatenate(pieces, axis=-1)
                 pieces = None
                 if my_nq:
-                    deliver(c0, c1, chunk_irr[my_q_slice])
+                    deliver(targets(c0, c1), chunk_irr[my_q_slice])
 
             # ring exchange of this round's sub-chunks onto the irr-BZ q-distribution
             for step in range(1, size):
@@ -499,7 +606,7 @@ class BubbleGenerator:
                 if reqs:
                     mpi_utils.MPI.Request.Waitall(reqs)
                 if staging is not None:
-                    deliver(s0, s1, staging)
+                    deliver(targets(s0, s1), staging)
 
     @staticmethod
     def create_generalized_chi0_q_loop(

@@ -965,6 +965,43 @@ def test_build_node_shared_array_computes_once_and_shares_within_node():
         assert np.array_equal(seen, np.full((2, 3), 7.0, dtype=np.complex64))
 
 
+def test_idle_barrier_sleeps_between_polls_until_every_rank_arrived(monkeypatch):
+    """An early rank tests the barrier and sleeps the interval between tests until the last rank has arrived."""
+    comm, sleeps = MagicMock(), []
+    comm.size = 3
+    comm.Ibarrier.return_value.Test.side_effect = [False, False, True]
+    monkeypatch.setattr(mu.time, "sleep", sleeps.append)
+
+    mu.idle_barrier(comm, interval=0.25)
+
+    assert comm.Ibarrier.call_count == 1 and sleeps == [0.25, 0.25]
+
+
+def test_idle_barrier_returns_at_once_on_a_single_rank():
+    """A single-rank communicator has nobody to wait for, so no barrier is posted."""
+    comm = create_comm_mock()
+    mu.idle_barrier(comm)
+    comm.Ibarrier.assert_not_called()
+
+
+def test_build_node_shared_array_lets_the_other_ranks_sleep_while_the_root_computes(monkeypatch):
+    """Every rank of a multi-rank node passes an idle barrier before the root's array is shared, one barrier each."""
+    waits, idle = [], mu.idle_barrier
+    monkeypatch.setattr(mu, "idle_barrier", lambda comm, *a, **k: waits.append(comm.Get_size()) or idle(comm, *a, **k))
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+        arr, win = mu.build_node_shared_array(node_comm, lambda: np.full((2, 2), 3.0, dtype=np.complex64))
+        seen = np.array(arr)
+        node_comm.Barrier()
+        if win is not None:
+            win.Free()
+        return seen
+
+    _, res = run_parallel(4, fn, hostnames=["h", "h", "h", "g"])
+    assert sorted(waits) == [3, 3, 3] and all(np.array_equal(seen, np.full((2, 2), 3.0)) for seen in res)
+
+
 def test_build_node_shared_array_takes_the_dtype_of_the_root_array():
     """Without an explicit dtype the window is allocated in the dtype the root computed, on every node rank."""
 

@@ -21,6 +21,7 @@ import pickle
 import re
 import zipfile
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import mpi4py.MPI as MPI
 import numpy as np
@@ -1127,18 +1128,55 @@ def _select_and_apply_lambda_correction(chi_phys_q_r: FourPoint, lambda_previous
     return chi_phys_q_r
 
 
+def _write_physical_susceptibility(
+    chi_phys_q_r: FourPoint,
+    mpi_dist_irrq: MpiDistributor,
+    lambda_previous: dict | None = None,
+    static_magn: list | None = None,
+) -> FourPoint:
+    r"""
+    Gathers the physical susceptibility on rank 0, which applies the configured lambda correction, writes it to file
+    and keeps the static slice of the magnetic channel in ``static_magn``. Collective over the communicator of
+    ``mpi_dist_irrq``.
+
+    :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` (rank-local momenta); its array is
+        replaced by the gathered one on rank 0 and by ``None`` elsewhere.
+    :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, kept by the
+        self-consistency loop across its iterations; ``None`` for the one-shot correction.
+    :param static_magn: Holder of the static magnetic susceptibility for the loop's Ornstein-Zernike fit (see
+        :func:`perform_ornstein_zernike_fit`): on rank 0 the magnetic channel replaces its content with the
+        irreducible-BZ :math:`\omega = 0` slice; ``None`` keeps nothing.
+    :return: The corrected, gathered susceptibility on rank 0; ``chi_phys_q_r`` without its array elsewhere.
+    """
+    chi_phys_q_r.mat = mpi_dist_irrq.gather(chi_phys_q_r.mat)
+    if mpi_dist_irrq.comm.rank == 0:
+        chi_phys_q_r = _select_and_apply_lambda_correction(chi_phys_q_r, lambda_previous)
+        chi_phys_q_r.save(name=f"chi_phys_q_{chi_phys_q_r.channel.value}", output_dir=config.output.output_path)
+
+        # the loop fits the Ornstein-Zernike form once after its last proposal, so only the static slice is kept
+        if chi_phys_q_r.channel == SpinChannel.MAGN and static_magn is not None:
+            static_magn[:] = [chi_phys_q_r.copy().to_half_niw_range().take_wn_slice(0, 1)]
+    config.logger.info(f"Saved physical susceptibility ({chi_phys_q_r.channel.value}) to file.")
+    return chi_phys_q_r
+
+
 def _finish_physical_susceptibility(
     chi_phys_q_r: FourPoint,
     mpi_dist_irrq: MpiDistributor,
     annealer: "LambdaAnnealer | None" = None,
     save_eliashberg: bool = False,
     lambda_previous: dict | None = None,
+    static_magn: list | None = None,
+    last_chi: dict | None = None,
 ) -> FourPoint:
     r"""
     Returns the physical susceptibility the self-energy kernel reads: the annealer's boson mass and the restriction are
     applied on every rank, the rank-0 gathered susceptibility gets the configured lambda correction, is written to file
-    (with the Ornstein-Zernike fit of the magnetic channel) and scattered back, the pole monitor reads it and, with
-    ``save_eliashberg``, every rank writes its momenta for the Eliashberg step.
+    (rank 0 keeps the static slice of the magnetic channel in ``static_magn``) and scattered back, the pole monitor
+    reads it and, with ``save_eliashberg``, every rank writes its momenta for the Eliashberg step. Without a lambda
+    correction a given ``last_chi`` takes every rank's copy of its momenta instead of the gather, the write and the
+    scatter, since the susceptibility only changes through the correction (see :func:`_write_physical_susceptibility`).
 
     :param chi_phys_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` (rank-local momenta).
     :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
@@ -1147,6 +1185,11 @@ def _finish_physical_susceptibility(
     :param save_eliashberg: Whether to write this rank's physical susceptibility for the Eliashberg step.
     :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, kept by the
         self-consistency loop across its iterations; ``None`` for the one-shot correction.
+    :param static_magn: Holder of the static magnetic susceptibility for the loop's Ornstein-Zernike fit (see
+        :func:`perform_ornstein_zernike_fit`): on rank 0 the magnetic channel replaces its content with the
+        irreducible-BZ :math:`\omega = 0` slice; ``None`` keeps nothing.
+    :param last_chi: Holder of the loop's latest physical susceptibility per channel, which the loop writes once
+        after its last proposal, or ``None`` to write it in every call.
     :return: The treated physical susceptibility (rank-local momenta).
     """
     logger = config.logger
@@ -1168,17 +1211,13 @@ def _finish_physical_susceptibility(
         f"Physical susceptibility ({chi_phys_q_r.channel.value})", chi_phys_q_r, mpi_dist_irrq.comm.size
     )
 
-    chi_phys_q_r.mat = mpi_dist_irrq.gather(chi_phys_q_r.mat)
-    if mpi_dist_irrq.comm.rank == 0:
-        chi_phys_q_r = _select_and_apply_lambda_correction(chi_phys_q_r, lambda_previous)
-        chi_phys_q_r.save(name=f"chi_phys_q_{chi_phys_q_r.channel.value}", output_dir=config.output.output_path)
-
-        # perform Ornstein-Zernike fit
-        if chi_phys_q_r.channel == SpinChannel.MAGN:
-            perform_ornstein_zernike_fit(chi_phys_q_r)
-
-    chi_phys_q_r.mat = mpi_dist_irrq.scatter(chi_phys_q_r.mat)
-    logger.info(f"Saved physical susceptibility ({chi_phys_q_r.channel.value}) to file.")
+    lambda_on = config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction
+    if last_chi is not None and not lambda_on:
+        last_chi[chi_phys_q_r.channel] = chi_phys_q_r.copy()
+    else:
+        chi_phys_q_r = _write_physical_susceptibility(chi_phys_q_r, mpi_dist_irrq, lambda_previous, static_magn)
+        mpi_utils.idle_barrier(mpi_dist_irrq.comm)  # the other ranks sleep while rank 0 corrects and writes
+        chi_phys_q_r.mat = mpi_dist_irrq.scatter(chi_phys_q_r.mat)
 
     _monitor_chi_phys(chi_phys_q_r, mpi_dist_irrq)
 
@@ -1204,6 +1243,8 @@ def calculate_sigma_kernel_r_q(
     kernel: FourPoint | None = None,
     weight: float = 1.0,
     involution: np.ndarray | None = None,
+    static_magn: list | None = None,
+    last_chi: dict | None = None,
 ) -> FourPoint | None:
     r"""
     Adds the kernel for the self-energy calculation in a specific spin channel, times ``weight``, to ``kernel`` in
@@ -1242,6 +1283,10 @@ def calculate_sigma_kernel_r_q(
     :param weight: The channel's weight in the sum of the kernels.
     :param involution: The orbital permutation that transposes the dispersion (see :func:`_orbital_involution`), or
         None; passed to :func:`create_auxiliary_chi_r_q_sum`.
+    :param static_magn: Holder of the static magnetic susceptibility for the loop's Ornstein-Zernike fit (see
+        :func:`_finish_physical_susceptibility`), or ``None``.
+    :param last_chi: Holder of the loop's latest physical susceptibility per channel (see
+        :func:`_finish_physical_susceptibility`), or ``None``.
     :return: ``kernel``.
     """
     logger = config.logger
@@ -1282,7 +1327,12 @@ def calculate_sigma_kernel_r_q(
     # middles, so the per-rank chi is not written
     chi_shell = chi_phys_q_r.copy()
     chi_phys_q_r = _finish_physical_susceptibility(
-        chi_phys_q_r, mpi_dist_irrq, annealer, lambda_previous=lambda_previous
+        chi_phys_q_r,
+        mpi_dist_irrq,
+        annealer,
+        lambda_previous=lambda_previous,
+        static_magn=static_magn,
+        last_chi=last_chi,
     )
     parts = (gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc, chi_shell, chi_phys_q_r)
 
@@ -1424,11 +1474,11 @@ def _build_rspace_giwk_window(
     r"""
     Builds the real-space Green's function :math:`F[G](R)` of the self-energy contraction once per node, in one
     shared-memory window in frequency-first layout ``[2 niv, n_R, o1, o2]``, so every frequency slab the
-    contraction reads is contiguous. The node root transforms :math:`G(\mathbf{k}) \to F[G](R)` (see
-    :meth:`GreensFunction.fft`) into the window, every other rank maps it read-only; a single-rank node holds a
-    private array. With ``niv_window`` the window holds the fermionic frequencies ``[-niv_window, niv_window)`` of
-    ``giwk``: the node root copies them into the window and transforms it there in place, so neither a cut nor a
-    transformed copy of ``giwk`` is allocated, and every frequency slab holds the bits of the window of the cut
+    contraction reads is contiguous. Every rank of the node copies its own contiguous share of the frequencies into
+    the window and transforms :math:`G(\mathbf{k}) \to F[G](R)` there in place, so neither a cut nor a transformed
+    copy of ``giwk`` is allocated; a single-rank node holds a private array. Each frequency transforms on its own, so
+    every frequency slab holds the bits of :meth:`GreensFunction.fft` at any rank count. With ``niv_window`` the
+    window holds the fermionic frequencies ``[-niv_window, niv_window)`` of ``giwk``, the bits of the window of the cut
     Green's function.
 
     :param giwk: The momentum-dependent :class:`GreensFunction` (cut to the self-energy box unless ``niv_window`` is
@@ -1440,26 +1490,22 @@ def _build_rspace_giwk_window(
         single-rank node).
     :raises ValueError: If ``niv_window`` exceeds ``giwk.niv``.
     """
-    if niv_window is not None:
-        if niv_window > giwk.niv:
-            raise ValueError(f"A window of {niv_window} positive frequencies exceeds the {giwk.niv} of the function.")
-        nk, nb = giwk.nq, giwk.n_bands
-        n_r = int(np.prod(nk))
-        g_r, win = mpi_utils.allocate_node_shared_array(node_comm, (2 * niv_window, n_r, nb, nb), giwk.mat.dtype)
-        if node_comm.Get_rank() == 0:
-            frequencies = slice(giwk.niv - niv_window, giwk.niv + niv_window)
-            g_r[...] = np.moveaxis(giwk.mat.reshape(n_r, nb, nb, -1)[..., frequencies], -1, 0)
-            # scipy.fft transforms the window in place; numpy.fft would return a complex128 copy
-            view = g_r.reshape(2 * niv_window, *nk, nb, nb)
-            transformed = sp.fft.fftn(view, axes=(1, 2, 3), overwrite_x=True)
-            if not np.shares_memory(transformed, view):
-                view[...] = transformed
-        node_comm.Barrier()
-        return g_r, win
-    nb, n_r = giwk.n_bands, config.lattice.k_grid.nk_tot
-    g_r, win = mpi_utils.allocate_node_shared_array(node_comm, (2 * giwk.niv, n_r, nb, nb), giwk.mat.dtype)
-    if node_comm.Get_rank() == 0:
-        g_r[...] = np.moveaxis(giwk.fft().mat.reshape(n_r, nb, nb, -1), -1, 0)
+    niv_window = giwk.niv if niv_window is None else niv_window
+    if niv_window > giwk.niv:
+        raise ValueError(f"A window of {niv_window} positive frequencies exceeds the {giwk.niv} of the function.")
+    nk, nb = giwk.nq, giwk.n_bands
+    n_r, n_v = int(np.prod(nk)), 2 * niv_window
+    g_r, win = mpi_utils.allocate_node_shared_array(node_comm, (n_v, n_r, nb, nb), giwk.mat.dtype)
+    size, rank = (node_comm.Get_size(), node_comm.Get_rank()) if win is not None else (1, 0)
+    first, last = rank * n_v // size, (rank + 1) * n_v // size
+    if last > first:
+        start = giwk.niv - niv_window
+        g_r[first:last] = np.moveaxis(giwk.mat.reshape(n_r, nb, nb, -1)[..., start + first : start + last], -1, 0)
+        # scipy.fft transforms the slab in place; numpy.fft would return a complex128 copy
+        view = g_r[first:last].reshape(last - first, *nk, nb, nb)
+        transformed = sp.fft.fftn(view, axes=(1, 2, 3), overwrite_x=True)
+        if not np.shares_memory(transformed, view):
+            view[...] = transformed
     node_comm.Barrier()
     return g_r, win
 
@@ -1990,14 +2036,15 @@ def _stream_file_into_node_window(
 
 def _build_giwk_full(comm: MPI.Comm, sigma: SelfEnergy, mu: float, ek: np.ndarray, beta: float) -> tuple:
     r"""
-    Builds the full-grid Green's function :math:`G^{\mathrm{k}}_{12}`, optionally deduplicated across the MPI ranks that
-    share a physical node. The Dyson inversion
-    runs only on each node's root rank and the result is placed in one MPI shared-memory window per node, so
-    ``giwk_full`` occupies a single physical buffer per node instead of one private copy per rank (see
-    :func:`dgamore.mpi_utils.build_node_shared_array`). Otherwise every rank builds its own copy. The node topology is
-    discovered at runtime via ``comm.Split_type(MPI.COMM_TYPE_SHARED)`` (nothing about the cluster is hard-coded).
-    The result keeps the dispersion but no reference to :math:`\Sigma`, so none of its copies (the frequency cut, the
-    real-space transforms) duplicates the full-BZ self-energy.
+    Builds the full-grid Green's function :math:`G^{\mathrm{k}}_{12}`, deduplicated across the MPI ranks that share a
+    physical node: ``giwk_full`` lives in one MPI shared-memory window per node, a single physical buffer per node
+    instead of one private copy per rank (see :func:`dgamore.mpi_utils.allocate_node_shared_array`), and every rank of
+    the node inverts the Dyson matrix of its own contiguous share of the momenta straight into the window. The inversion
+    is per momentum and frequency, so the window holds the bits of a single-rank build at any rank count. A single-rank
+    node builds a private array. The node topology is discovered at runtime via
+    ``comm.Split_type(MPI.COMM_TYPE_SHARED)`` (nothing about the cluster is hard-coded). The result keeps the dispersion
+    but no reference to :math:`\Sigma`, so none of its copies (the frequency cut, the real-space transforms) duplicates
+    the full-BZ self-energy.
 
     :param comm: The MPI communicator.
     :param sigma: The self-energy :math:`\Sigma` entering the Dyson equation.
@@ -2010,9 +2057,27 @@ def _build_giwk_full(comm: MPI.Comm, sigma: SelfEnergy, mu: float, ek: np.ndarra
     """
     node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
     orbitals = config.sys.correlated_orbitals
-    giwk_mat, win = mpi_utils.build_node_shared_array(
-        node_comm, lambda: GreensFunction.get_g_full(sigma, mu, ek, beta, orbitals=orbitals).mat
-    )
+    nk_tot, nb, n_orb = int(np.prod(ek.shape[:3])), sigma.n_bands, ek.shape[-1]
+    shape = (*ek.shape[:3], nb, nb, 2 * sigma.niv)
+    giwk_mat, win = mpi_utils.allocate_node_shared_array(node_comm, shape, sigma.mat.dtype)
+    size, rank = (node_comm.Get_size(), node_comm.Get_rank()) if win is not None else (1, 0)
+    mine = slice(rank * nk_tot // size, (rank + 1) * nk_tot // size)
+    n_my = mine.stop - mine.start
+    if n_my:
+        # a momentum-local sigma (one row) enters every rank's share whole and broadcasts against its dispersion
+        rows = sigma.mat.reshape(-1, *sigma.mat.shape[-3:])
+        rows = rows if rows.shape[0] == 1 else rows[mine]
+        sigma_my = SelfEnergy(rows, (rows.shape[0], 1, 1), sigma.full_niv_range, True, calc_smom=False, beta=beta)
+        GreensFunction.get_g_full(
+            sigma_my,
+            mu,
+            ek.reshape(nk_tot, n_orb, n_orb)[mine].reshape(n_my, 1, 1, n_orb, n_orb),
+            beta,
+            orbitals=orbitals,
+            out=giwk_mat.reshape(nk_tot, nb, nb, -1)[mine].reshape(n_my, 1, 1, nb, nb, -1),
+        )
+    if win is not None:
+        node_comm.Barrier()
     giwk_full = GreensFunction(
         giwk_mat, None, ek, sigma.full_niv_range, False, False, nk=ek.shape[:3], beta=beta, mu=mu, orbitals=orbitals
     )
@@ -2112,9 +2177,10 @@ def _share_sigma_per_node(
 ) -> tuple[SelfEnergy, MPI.Win | None]:
     r"""
     Hands rank 0's full-BZ self-energy to every rank as a view of one per-node MPI shared-memory window: rank 0
-    compresses the momenta and broadcasts the object without its array (a small pickled blob), the node roots receive
-    the array through a chunked broadcast over ``roots_comm`` and expose it to their node's other ranks (see
-    :func:`dgamore.mpi_utils.build_node_shared_array`). The self-consistency loop thereby holds the full-BZ
+    compresses the momenta and broadcasts the object without its array (a small pickled blob), every node allocates its
+    window (see :func:`dgamore.mpi_utils.allocate_node_shared_array`), rank 0 copies the array into its own and the
+    other node roots receive it straight into theirs through a chunked broadcast over ``roots_comm``, while the rest of
+    each node sleeps (see :func:`dgamore.mpi_utils.idle_barrier`). The self-consistency loop thereby holds the full-BZ
     self-energy **once per node instead of once per rank**, and only the node roots ever receive it. Every rank gets
     its own :class:`SelfEnergy` object; only the buffer is shared and must be treated as read-only (every consumer
     copies via ``cut_niv``/``copy``/``concatenate`` before writing).
@@ -2131,10 +2197,19 @@ def _share_sigma_per_node(
     if comm.rank == 0:
         sigma = sigma.compress_q_dimension()
         mat, sigma.mat = sigma.mat, None
-    sigma = pickle.loads(comm.bcast(pickle.dumps(sigma) if comm.rank == 0 else None, root=0))
+    blob = (pickle.dumps(sigma), mat.shape, mat.dtype) if comm.rank == 0 else None
+    blob, shape, dtype = comm.bcast(blob, root=0)
+    sigma = pickle.loads(blob)
+    shared, win = mpi_utils.allocate_node_shared_array(node_comm, shape, dtype)
+    mat = np.ascontiguousarray(mat) if comm.rank == 0 else None
     if node_comm.rank == 0:
-        mat = mpi_utils.bcast_rows(roots_comm, mat, root=0)
-    shared, win = mpi_utils.build_node_shared_array(node_comm, lambda: mat)
+        mpi_utils.bcast_rows_into(roots_comm, mat if comm.rank == 0 else shared, root=0)
+    # rank 0 sends from its own array first, so the other roots never wait for its copy into the window
+    if comm.rank == 0 and win is None:
+        shared = mat
+    elif comm.rank == 0:
+        shared[...] = mat
+    mpi_utils.idle_barrier(node_comm)
     sigma.mat = shared
     return sigma, win
 
@@ -2332,6 +2407,65 @@ def _orbital_involution(ek: np.ndarray, orbitals: np.ndarray | None = None) -> n
     return restricted if np.any(restricted != np.arange(len(orbitals))) else None
 
 
+def _finish_proposal_on_node(
+    core: SelfEnergy | None, donor: SelfEnergy | None, shell_offset: np.ndarray | None, average: bool, node_comm
+) -> tuple[SelfEnergy | None, float | None]:
+    r"""
+    Concatenates rank 0's core-box proposal with its shell donor (see :meth:`SelfEnergy.concatenate_self_energies`)
+    and, with ``average``, averages it with its time-reversed partner (see
+    :meth:`SelfEnergy.symmetrize_time_reversal`), every rank of rank 0's node building its own contiguous share of the
+    result's frequencies in one shared-memory window. Every frequency is built on its own, so the result holds the bits
+    of rank 0 building it alone. The other ranks sleep while rank 0 finishes the core (see
+    :func:`dgamore.mpi_utils.idle_barrier`). Collective over ``node_comm``, whose root is rank 0.
+
+    :param core: The core-box proposal on rank 0; ignored elsewhere.
+    :param donor: The momentum-local shell donor on rank 0; ignored elsewhere.
+    :param shell_offset: The shell offset ``[q, o1, o2]`` on rank 0 (see :meth:`SelfEnergy.concatenate_self_energies`);
+        ignored elsewhere.
+    :param average: Whether the proposal is averaged with its time-reversed partner; only read on rank 0.
+    :param node_comm: The node-local communicator of rank 0's node.
+    :return: The tuple ``(sigma, removed)`` of rank 0's private full-box proposal (compressed momentum axis) and the
+        largest change of the average (``None`` without it); ``(None, None)`` on every other rank.
+    """
+    mpi_utils.idle_barrier(node_comm)
+    root = node_comm.Get_rank() == 0
+    mat = None
+    if root:
+        core = core.compress_q_dimension()
+        mat, core.mat = core.mat, None
+    blob = pickle.dumps((core, donor, shell_offset, average, mat.shape, mat.dtype)) if root else None
+    core, donor, shell_offset, average, shape, dtype = pickle.loads(node_comm.bcast(blob, root=0))
+    core_mat, core_win = mpi_utils.allocate_node_shared_array(node_comm, shape, dtype)
+    if root and core_win is None:
+        core_mat = mat
+    elif root:
+        core_mat[...] = mat
+    mat = None
+    mpi_utils.idle_barrier(node_comm)
+    core.mat = core_mat
+
+    n_v = 2 * donor.niv
+    out, out_win = mpi_utils.allocate_node_shared_array(node_comm, (*shape[:-1], n_v), dtype)
+    size, rank = (node_comm.Get_size(), node_comm.Get_rank()) if out_win is not None else (1, 0)
+    mine = slice(rank * n_v // size, (rank + 1) * n_v // size)
+    sigma = core.concatenate_self_energies(donor, shell_offset=shell_offset, out=out, frequencies=mine)
+    if out_win is not None:
+        node_comm.Barrier()
+    # rank 0 fits the moments on the whole concatenation, before the average changes it, as a single build does
+    if root:
+        sigma = SelfEnergy(out, sigma.nq, sigma.full_niv_range, True, False, beta=sigma._beta)
+    mpi_utils.idle_barrier(node_comm)
+    removed = sigma.symmetrize_time_reversal(frequencies=mine) if average else None
+    removed = node_comm.allgather(removed)
+    removed = max(removed) if average else None
+
+    sigma = (sigma.copy() if out_win is not None else sigma) if root else None
+    core = core_mat = out = None
+    _free_shared_window(out_win, node_comm)
+    _free_shared_window(core_win, node_comm)
+    return sigma, removed if root else None
+
+
 def calculate_sigma_proposal(
     sigma_in: SelfEnergy,
     mu: float,
@@ -2349,6 +2483,8 @@ def calculate_sigma_proposal(
     save_eliashberg: bool = False,
     eliashberg_only: bool = False,
     lambda_previous: dict | None = None,
+    static_magn: list | None = None,
+    last_chi: dict | None = None,
 ) -> SelfEnergy | None:
     r"""
     Returns the raw (un-mixed) DGA self-energy proposal :math:`S(\Sigma_{\mathrm{in}})` at chemical potential
@@ -2398,6 +2534,10 @@ def calculate_sigma_proposal(
         iteration).
     :param lambda_previous: The per-iteration :math:`\lambda` of each corrected channel, kept by the
         self-consistency loop across its iterations; ``None`` for the one-shot correction.
+    :param static_magn: Holder of the static magnetic susceptibility for the loop's Ornstein-Zernike fit (see
+        :func:`_finish_physical_susceptibility`), or ``None``.
+    :param last_chi: Holder of the loop's latest physical susceptibility per channel (see
+        :func:`_finish_physical_susceptibility`), or ``None``.
     :return: The raw full-BZ proposal :class:`SelfEnergy` (DMFT tail attached) on rank 0; ``None`` on every other rank,
         since only rank 0 mixes it, and on every rank with ``eliashberg_only``.
     """
@@ -2461,7 +2601,13 @@ def calculate_sigma_proposal(
             _monitor_stoner_factor(gchi0_q_full_sum, u_loc, v_nonloc, channel, mpi_dist_irrk, annealer)
             chi_q_r = create_rpa_susceptibility(gchi0_q_full_sum, u_loc, v_nonloc, channel)
             chi_q_r = _finish_physical_susceptibility(
-                chi_q_r, mpi_dist_irrk, annealer, save_eliashberg, lambda_previous
+                chi_q_r,
+                mpi_dist_irrk,
+                annealer,
+                save_eliashberg,
+                lambda_previous,
+                static_magn=static_magn,
+                last_chi=last_chi,
             )
             if kernel is not None:
                 kernel.add(calculate_rpa_kernel_r_q(chi_q_r, v_nonloc, u_loc).scale(weight), copy=False)
@@ -2520,6 +2666,7 @@ def calculate_sigma_proposal(
             lambda_previous=lambda_previous,
             kernel=kernel,
             involution=involution,
+            last_chi=last_chi,
         )
         gamma_dens.mat = None
         if gamma_dens_win is None:
@@ -2545,6 +2692,8 @@ def calculate_sigma_proposal(
             kernel=kernel,
             weight=3.0,
             involution=involution,
+            static_magn=static_magn,
+            last_chi=last_chi,
         )
         gchi0_q_core_inv.free()
         gchi0_q_full_sum.free()
@@ -2574,38 +2723,42 @@ def calculate_sigma_proposal(
     sigma_prop = _run_column_sde(kernel, mpi_dist_irrk, g_r, giwk_niv, chunk_bytes)
     kernel.free()
     g_r = None
-    _release_shared_giwk(g_r_win, shared_node_comm)
+    _free_shared_window(g_r_win, shared_node_comm)
 
-    # only rank 0 mixes, so only rank 0 finishes the proposal; the others receive the mixed iterate once per node
-    if comm.rank != 0:
+    # only rank 0 mixes, so only rank 0's node finishes the proposal; the others receive the mixed iterate once per node
+    if not shared_node_comm.bcast(comm.rank == 0, root=0):
+        shared_node_comm.Free()
         return None
 
-    sigma_prop = sigma_prop.ifft().to_full_niv_range()
-    logger.info("Self-energy calculated from kernel.")
-    logger.log_memory_usage("Non-local sigma", sigma_prop)
+    donor = shell_offset = None
+    average = False
+    if comm.rank == 0:
+        sigma_prop = sigma_prop.ifft().to_full_niv_range()
+        logger.info("Self-energy calculated from kernel.")
+        logger.log_memory_usage("Non-local sigma", sigma_prop)
 
-    hartree, fock = get_hartree_fock(u_loc, v_nonloc_full)
-    # the V^q part of Hartree-Fock is absent from the impurity self-energy padding the shell, so it is re-added there
-    hartree_v, fock_v = get_hartree_fock(LocalInteraction(np.zeros_like(u_loc.mat)), v_nonloc_full)
-    hf_v = (hartree_v + fock_v)[..., 0]
-    logger.info("Calculated Hartree and Fock terms.")
+        hartree, fock = get_hartree_fock(u_loc, v_nonloc_full)
+        # the V^q part of Hartree-Fock is absent from the impurity self-energy padding the shell, so it is re-added
+        hartree_v, fock_v = get_hartree_fock(LocalInteraction(np.zeros_like(u_loc.mat)), v_nonloc_full)
+        logger.info("Calculated Hartree and Fock terms.")
 
-    sigma_prop = sigma_prop + hartree + fock
-    logger.info("Full non-local self-energy calculated.")
+        sigma_prop = sigma_prop + hartree + fock
+        logger.info("Full non-local self-energy calculated.")
 
-    # This is done to minimize noise. We remove some fluctuations from dmft that are included in the local self-energy
-    # calculated in this code and add the smooth dmft self-energy
-    sigma_prop += delta_sigma
-    if config.misc.do_rpa:
-        # RPA mode carries no DMFT self-energy: its shell is the whole Hartree-Fock term and the kernels' 1/iv tail
-        sigma_prop = sigma_prop.concatenate_self_energies(
-            _rpa_shell_donor(tail_moment, sigma_dmft.niv), shell_offset=(hartree + fock)[..., 0]
-        )
-    else:
-        sigma_prop = sigma_prop.concatenate_self_energies(sigma_dmft, shell_offset=hf_v)
-    # the one-sided SDE breaks Sigma(-k) = Sigma(k)^T for several orbitals; the average is the two-sided SDE
-    if sigma_prop.n_bands > 1 and _has_time_reversal(config.lattice.hamiltonian.get_ek()):
-        removed = sigma_prop.symmetrize_time_reversal()
+        # This is done to minimize noise. We remove some fluctuations from dmft that are included in the local
+        # self-energy calculated in this code and add the smooth dmft self-energy
+        sigma_prop += delta_sigma
+        donor, shell_offset = sigma_dmft, (hartree_v + fock_v)[..., 0]
+        if config.misc.do_rpa:
+            # RPA mode carries no DMFT self-energy: its shell is the whole Hartree-Fock term and the kernels' 1/iv tail
+            donor, shell_offset = _rpa_shell_donor(tail_moment, sigma_dmft.niv), (hartree + fock)[..., 0]
+        # the one-sided SDE breaks Sigma(-k) = Sigma(k)^T for several orbitals; the average is the two-sided SDE
+        average = sigma_prop.n_bands > 1 and _has_time_reversal(config.lattice.hamiltonian.get_ek())
+    sigma_prop, removed = _finish_proposal_on_node(sigma_prop, donor, shell_offset, average, shared_node_comm)
+    shared_node_comm.Free()
+    if comm.rank != 0:
+        return None
+    if average:
         logger.info(f"Time-reversal average of the self-energy proposal: largest change {removed:.3e}.")
     elif sigma_prop.n_bands > 1:
         logger.info("The dispersion breaks time reversal (complex hoppings); the self-energy proposal is not averaged.")
@@ -3071,6 +3224,11 @@ def calculate_self_energy_q(
     filling of the DMFT lattice is the target, the chemical potential at which a zero self-energy holds it is stored in
     ``config.sys.mu_non_interacting``, and the proposals are evaluated from there.
 
+    Rank 0 fits the Ornstein-Zernike form (:func:`perform_ornstein_zernike_fit`) once at the end, to the static
+    magnetic susceptibility of the last proposal (or of the Eliashberg-only pass after an early convergence).
+    Without a lambda correction the physical susceptibilities of the last proposal are written once after the loop,
+    since no iteration reads them from file.
+
     :param comm: The MPI communicator.
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` on the full q-grid; only read on rank 0.
@@ -3274,6 +3432,12 @@ def calculate_self_energy_q(
     anneal_reset_iter = None
     release_iter = None
     pure_converged = False
+    static_magn = []  # rank 0: the static magnetic susceptibility of the latest proposal, fitted after the loop
+    last_chi = {}  # every rank: its momenta of the latest physical susceptibilities, written after the loop
+    # rank 0 writes each iterate in the background while the next proposal runs; the write reads the shared window
+    # of the iterate, so it is awaited before that window is freed
+    saver = ThreadPoolExecutor(max_workers=1) if comm.rank == 0 else None
+    saving = None
     last_iter = starting_iter + config.self_consistency.max_iter
     for current_iter in range(starting_iter + 1, last_iter + 1):
         logger.info("----------------------------------------")
@@ -3310,6 +3474,8 @@ def calculate_self_energy_q(
             chunk_budgets=chunk_budgets,
             save_eliashberg=config.eliashberg.perform_eliashberg and current_iter == last_iter,
             lambda_previous=lambda_previous,
+            static_magn=static_magn,
+            last_chi=last_chi,
         )
         # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
         # the map's own distance from a fixed point and the change of the proposal, read before the mixing overwrites it
@@ -3350,6 +3516,9 @@ def calculate_self_energy_q(
             donor = _rpa_shell_donor(sigma_old.fit_smom(n_freq=1)[1], sigma_dmft.niv)
         shell_offset = sigma_old.shell_offset_from(donor) if comm.rank == 0 else None
         sigma_old = sigma_old.cut_niv(config.box.niv_core) if comm.rank == 0 else None
+        if saving is not None:
+            saving.result()
+        mpi_utils.idle_barrier(comm)  # the other ranks sleep while rank 0 finishes the proposal and its residuals
         _free_shared_window(sigma_win, sc_node_comm)
         sigma_win = None
 
@@ -3367,6 +3536,7 @@ def calculate_self_energy_q(
             mixed = apply_mixing_strategy(sigma_new, sigma_old, history_cap, mixing_history, tracker)
             # an accelerated step returns the proposal's object, a damped step a new one
             damped_step, sigma_new, mixed = mixed is not sigma_new, mixed, None
+        mpi_utils.idle_barrier(comm)  # the other ranks sleep while rank 0 mixes
         if sc_node_comm is not None:
             sigma_new, sigma_win = _share_sigma_per_node(sigma_new, comm, sc_node_comm, sc_roots_comm)
 
@@ -3411,7 +3581,10 @@ def calculate_self_energy_q(
             logger.info("Updated occupation matrix from new Green's function.")
 
         if comm.rank == 0:
-            _save_sigma_iteration(sigma_new, "sigma_dga", current_iter)
+            # the write gets an object of its own: saving decompresses it, while the loop goes on with sigma_new
+            compressed = sigma_new.has_compressed_q_dimension
+            view = SelfEnergy(sigma_new.mat, sigma_new.nq, sigma_new.full_niv_range, compressed, calc_smom=False)
+            saving = saver.submit(_save_sigma_iteration, view, "sigma_dga", current_iter)
 
         logger.info("Checking self-consistency convergence.")
         if comm.rank == 0 and current_iter > starting_iter + 1:
@@ -3514,6 +3687,10 @@ def calculate_self_energy_q(
         else:
             logger.info("Self-consistency not reached.")
 
+    if saver is not None:
+        saver.shutdown()
+        if saving is not None:
+            saving.result()
     mixing_history = tracker_window = previous_proposal = None  # nothing after the loop reads them
     if tracker is not None and comm.rank == 0:
         tracker.release_after_loop()
@@ -3539,7 +3716,14 @@ def calculate_self_energy_q(
             save_eliashberg=True,
             eliashberg_only=True,
             lambda_previous=lambda_previous,
+            static_magn=static_magn,
+            last_chi=last_chi,
         )
+
+    # without a lambda correction the proposals keep their susceptibilities on the ranks, so only the last is written
+    for chi in last_chi.values():
+        _write_physical_susceptibility(chi, mpi_dist_irrk, static_magn=static_magn)
+    last_chi = None
 
     # the exact Jacobian and the interpolation read the final sigma on every rank, so they run while the shared window
     # still holds it
@@ -3573,6 +3757,11 @@ def calculate_self_energy_q(
 
     if tracker is not None and comm.rank == 0:
         _save_jacobian_spectrum(tracker, pure_converged, rows_lam, rows_res, rows_damping)
+
+    # oz_coeff.txt reports the final susceptibility only, so the fit runs once instead of in every iteration
+    if static_magn:
+        perform_ornstein_zernike_fit(static_magn.pop())
+    mpi_utils.idle_barrier(comm)  # the other ranks sleep while rank 0 fits
 
     return sigma_old if comm.rank == 0 else None
 

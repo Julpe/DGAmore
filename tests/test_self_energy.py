@@ -591,6 +591,20 @@ def test_concatenate_self_energies_adds_the_shell_offset_outside_the_core_only()
     assert np.array_equal(result.mat[..., niv_diff : niv_diff + 2 * core.niv], core.mat)
 
 
+@pytest.mark.parametrize("with_offset", [True, False])
+@pytest.mark.parametrize("bounds", [(0, 16), (0, 3, 5, 11, 16), (0, 1, 2, 7, 7, 13, 16)])
+def test_concatenate_self_energies_in_frequency_slabs_writes_the_bits_of_the_whole_concatenation(bounds, with_offset):
+    """Concatenating contiguous frequency slabs into one array reproduces the whole concatenation bit for bit."""
+    core, shell, offset = _offset_setup(12)
+    offset = offset if with_offset else None
+    whole = core.copy().concatenate_self_energies(shell, shell_offset=offset)
+    out = np.full_like(whole.mat, np.nan)
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        part = core.copy().concatenate_self_energies(shell, shell_offset=offset, out=out, frequencies=slice(lo, hi))
+        assert part.mat is out
+    assert np.array_equal(out, whole.mat)
+
+
 def test_fit_smom_concatenated_with_shell_offset_is_bit_identical_to_the_offset_concatenation_fit():
     """fit_smom_concatenated with a shell offset equals the offset concatenation's own moment fit bit-for-bit."""
     core, shell, offset = _offset_setup(9)
@@ -953,6 +967,17 @@ def test_symmetrize_time_reversal_is_bit_invariant_under_the_chunk_size(monkeypa
     chunked = _se(mat.copy(), nk=(4, 4, 1), has_compressed_q_dimension=True)
     chunked.symmetrize_time_reversal()
     assert np.array_equal(chunked.mat, single.mat)
+
+
+def test_symmetrize_time_reversal_in_frequency_slabs_reproduces_the_whole_average():
+    """Averaging contiguous frequency slabs one by one gives the whole average's bits and its largest change."""
+    rng = np.random.default_rng(7)
+    mat = rng.standard_normal((16, 2, 2, 10)) + 1j * rng.standard_normal((16, 2, 2, 10))
+    whole = _se(mat.copy(), nk=(4, 4, 1), has_compressed_q_dimension=True)
+    removed = whole.symmetrize_time_reversal()
+    slabs = _se(mat.copy(), nk=(4, 4, 1), has_compressed_q_dimension=True)
+    parts = [slabs.symmetrize_time_reversal(frequencies=slice(lo, hi)) for lo, hi in ((0, 3), (3, 3), (3, 8), (8, 10))]
+    assert np.array_equal(slabs.mat, whole.mat) and max(parts) == removed
 
 
 def test_symmetrize_time_reversal_rejects_an_uncompressed_momentum_axis():
