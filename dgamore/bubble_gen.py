@@ -66,6 +66,7 @@ class BubbleGenerator:
         beta: float,
         node_comm=None,
         subtract_from: FourPoint | None = None,
+        involution: np.ndarray | None = None,
     ) -> FourPoint:
         r"""
         Returns the momentum-dependent generalized bare susceptibility :math:`\chi^{\mathrm{q}\nu}_{0;1234} = -\beta
@@ -82,6 +83,12 @@ class BubbleGenerator:
         scales, filters and subtracts every column block as it arrives, so the bubble's own array is never built; a
         single rank subtracts the finished bubble.
 
+        When the Green's function is transposed by an orbital permutation of order two at every momentum (see
+        :meth:`_orbital_transpose_permutation`), :math:`G^{\mathrm{k}}_{12} = G^{\mathrm{k}}_{\pi(2)\pi(1)}`, the
+        bubble obeys :math:`\chi^{\mathrm{q}\nu}_{0;1234} = \chi^{\mathrm{q}\nu}_{0;\pi(4)\pi(3)\pi(2)\pi(1)}`
+        at the same momentum and frequencies, so only one orbital component of each such pair is multiplied,
+        transformed and exchanged and the other is its copy (see :meth:`_independent_components`).
+
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
         :param giwk: The momentum-dependent :class:`GreensFunction`.
         :param niw: Number of positive bosonic frequencies.
@@ -92,12 +99,14 @@ class BubbleGenerator:
             Green's functions once per node in shared-memory windows.
         :param subtract_from: A bubble of the same box on this rank's irreducible q-points that the bubble is
             subtracted from in place, or ``None``.
+        :param involution: An orbital permutation of order two that may transpose the Green's function (tried after
+            the identity, see :meth:`_orbital_transpose_permutation`), or ``None``.
         :return: The bubble as a :class:`FourPoint` over the irreducible BZ (compressed momentum, half niw range), or
             ``subtract_from`` minus the bubble.
         """
         if mpi_dist_irrk.comm.size > 1:
             return BubbleGenerator._create_generalized_chi0_q_fft_distributed(
-                mpi_dist_irrk, giwk, niw, niv, k_grid, beta, node_comm, subtract_from
+                mpi_dist_irrk, giwk, niw, niv, k_grid, beta, node_comm, subtract_from, involution
             )
 
         gchi0_q_mat = None
@@ -109,8 +118,12 @@ class BubbleGenerator:
             g_r = g_k.fft().decompress_q_dimension()
             g_r_rev = g_r.flip_momentum_axis(copy=True).transpose_orbitals()
 
+            pi = BubbleGenerator._orbital_transpose_permutation(giwk, niv + niw, involution)
+            components = None if pi is None else BubbleGenerator._independent_components(nb, pi)
+            comp_shape = (nb,) * 4 if components is None else (len(components[0]),)
             gchi0_q_mat = np.zeros((len(k_grid.irrk_ind), nb, nb, nb, nb, len(wn), 2 * niv), dtype=g_r.mat.dtype)
-            chi_r_v_buffer = np.empty((*k_grid.nk, nb, nb, nb, nb, 2 * niv), dtype=g_r.mat.dtype)
+            gchi0_comps = gchi0_q_mat.reshape(len(k_grid.irrk_ind), nb**4, len(wn), 2 * niv)
+            chi_r_v_buffer = np.empty((*k_grid.nk, *comp_shape, 2 * niv), dtype=g_r.mat.dtype)
 
             giwk_niv = g_r.current_shape[-1] // 2
             start = giwk_niv - niv
@@ -127,11 +140,19 @@ class BubbleGenerator:
                 n_v = np.count_nonzero(mine)
                 buf = chi_r_v_buffer[..., :n_v]
                 g_vw = g_r_rev[..., start - wn_i : start - wn_i + n_v]
-                np.multiply(g_r[:, :, :, :, None, None, :, :n_v], g_vw[:, :, :, None, :, :, None, :], out=buf)
+                if components is None:
+                    np.multiply(g_r[:, :, :, :, None, None, :, :n_v], g_vw[:, :, :, None, :, :, None, :], out=buf)
+                else:
+                    BubbleGenerator._fill_components(buf, g_r[..., :n_v], g_vw, components[0], nb)
                 # scipy.fft keeps complex64 in place; numpy.fft would upcast to complex128 (double work + 2x buffer)
                 chi_q_v = sp.fft.ifftn(buf, axes=(0, 1, 2), overwrite_x=True)
-                chi_q_v = chi_q_v.reshape((k_grid.nk_tot, nb, nb, nb, nb, n_v))
-                gchi0_q_mat[..., iw, :n_v] = chi_q_v[k_grid.irrk_ind]
+                chi_q_v = chi_q_v.reshape((k_grid.nk_tot, *comp_shape, n_v))[k_grid.irrk_ind]
+                if components is None:
+                    gchi0_q_mat[..., iw, :n_v] = chi_q_v
+                else:
+                    computed, derived, source = components
+                    gchi0_comps[:, computed, iw, :n_v] = chi_q_v
+                    gchi0_comps[:, derived, iw, :n_v] = chi_q_v[:, source]
                 found = partners[mine] >= 0
                 if found.any():
                     crossed = np.conj(gchi0_q_mat[..., iw, :n_v][..., found].transpose(0, 3, 4, 1, 2, 5))
@@ -236,7 +257,7 @@ class BubbleGenerator:
                 part_cols[:, :, where] = parts[:, :, part]
 
         if mpi_dist_irrk.comm.size > 1:
-            BubbleGenerator._run_columns(mpi_dist_irrk, k_grid, n_w, n_v, n_parts, nb, dtype, fill, deliver)
+            BubbleGenerator._run_columns(mpi_dist_irrk, k_grid, n_w, n_v, n_parts, (nb,) * 4, dtype, fill, deliver)
         else:
             parts = ([None] if with_forward else []) + list(dg_rs)
             BubbleGenerator._fill_window_on_one_rank(mats, g_r, parts, center - niv, w0, k_grid, rev)
@@ -331,6 +352,7 @@ class BubbleGenerator:
         beta: float,
         node_comm=None,
         subtract_from: FourPoint | None = None,
+        involution: np.ndarray | None = None,
     ) -> FourPoint:
         r"""
         Distributed evaluation of :meth:`create_generalized_chi0_q_fft`: the flattened bosonic-fermionic
@@ -349,6 +371,10 @@ class BubbleGenerator:
         the finished bubble is and subtracted from that bubble's columns as it arrives, so no slice of its own is
         allocated (the same elementwise operations, hence the bits of ``subtract_from.sub(bubble)``).
 
+        On a Green's function an orbital permutation transposes, only the independent orbital components are
+        multiplied (in blocks of momenta), transformed and exchanged, and every rank copies the others from them as
+        the blocks arrive.
+
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
         :param giwk: The momentum-dependent :class:`GreensFunction`.
         :param niw: Number of positive bosonic frequencies.
@@ -358,6 +384,7 @@ class BubbleGenerator:
         :param node_comm: Optional node-local communicator for the shared R-space Green's functions.
         :param subtract_from: A bubble of the same box on this rank's irreducible q-points that the bubble is
             subtracted from in place, or ``None``.
+        :param involution: An orbital permutation of order two that may transpose the Green's function, or ``None``.
         :return: The bubble as a :class:`FourPoint` over the irreducible BZ (compressed momentum, half niw range), or
             ``subtract_from`` minus the bubble.
         """
@@ -365,6 +392,8 @@ class BubbleGenerator:
         nk_tot = k_grid.nk_tot
         wn = MFHelper.wn(niw, return_only_positive=True)
         vpos = 2 * niv
+        pi = BubbleGenerator._orbital_transpose_permutation(giwk, niv + niw, involution, mpi_dist_irrk.comm)
+        components = None if pi is None else BubbleGenerator._independent_components(nb, pi)
 
         def build_g_r() -> np.ndarray:
             return giwk.cut_niv(niv + niw).fft(copy=False).decompress_q_dimension().mat
@@ -393,15 +422,20 @@ class BubbleGenerator:
 
         def fill(out: np.ndarray, part: int, iw: int, iv: int) -> None:
             """Writes the R-space product of the column ``(w, v)``, the bubble's only part."""
-            np.multiply(
-                g_r_mat[:, :, :, :, None, None, :, start + iv],
-                g_r_rev_mat[:, :, :, None, :, :, None, start + iv - wn[iw]],
-                out=out,
-            )
+            left, right = g_r_mat[..., start + iv], g_r_rev_mat[..., start + iv - wn[iw]]
+            if components is None:
+                np.multiply(left[:, :, :, :, None, None, :], right[:, :, :, None, :, :, None], out=out)
+            else:
+                BubbleGenerator._fill_components(out, left, right, components[0], nb)
 
         def deliver(where: slice | np.ndarray, block: np.ndarray) -> None:
-            """Writes a column block of this rank's momenta and the crossing partners it derives, or subtracts both
-            scaled and filtered (``subtract_from``)."""
+            """Writes a column block of this rank's momenta, the orbital components copied from its independent ones
+            and the crossing partners it derives, or subtracts all of them scaled and filtered (``subtract_from``)."""
+            if components is not None:
+                computed, derived, source = components
+                every = np.empty((my_nq, nb**4, block.shape[-1]), dtype=block.dtype)
+                every[:, computed], every[:, derived] = block, block[:, source]
+                block = every.reshape(my_nq, nb, nb, nb, nb, -1)
             if subtract_from is not None:
                 block *= -beta / nk_tot
                 zero_small_values(block)
@@ -422,7 +456,10 @@ class BubbleGenerator:
             columns, partners = BubbleGenerator._crossing_columns(wn, niv)
             partner_of = np.full(len(wn) * vpos, -1)
             partner_of[columns] = partners
-        BubbleGenerator._run_columns(mpi_dist_irrk, k_grid, len(wn), vpos, 1, nb, g_r_mat.dtype, fill, deliver, columns)
+        comp_shape = (nb,) * 4 if components is None else (len(components[0]),)
+        BubbleGenerator._run_columns(
+            mpi_dist_irrk, k_grid, len(wn), vpos, 1, comp_shape, g_r_mat.dtype, fill, deliver, columns
+        )
         g_r_mat = g_r_rev_mat = None
         for win in (g_r_win, g_r_rev_win):
             if win is not None:
@@ -435,6 +472,90 @@ class BubbleGenerator:
         return FourPoint(
             gchi0_q_mat, SpinChannel.NONE, k_grid.nk, 1, 1, full_niw_range=False, has_compressed_q_dimension=True
         ).filter_small_values()
+
+    @staticmethod
+    def _independent_components(nb: int, pi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        r"""
+        Returns the orbital components of a bubble left to compute under :math:`\chi_{0;1234} =
+        \chi_{0;\pi(4)\pi(3)\pi(2)\pi(1)}`: of every pair of components the relation maps onto each other the one
+        with the smaller flat index ``((o1 nb + o2) nb + o3) nb + o4``, and every component it maps onto itself.
+
+        :param nb: Number of orbitals.
+        :param pi: The orbital permutation :math:`\pi` (an index array, its own inverse).
+        :return: The tuple ``(computed, derived, source)``: the flat indices of the computed components, ascending,
+            those of the derived ones, and per derived component the position of its partner among the computed
+            ones; None when no component is derived.
+        """
+        o = np.indices((nb,) * 4).reshape(4, -1)
+        partner = np.ravel_multi_index((pi[o[3]], pi[o[2]], pi[o[1]], pi[o[0]]), (nb,) * 4)
+        flat = np.arange(nb**4)
+        computed, derived = flat[flat <= partner], flat[flat > partner]
+        return (computed, derived, np.searchsorted(computed, partner[derived])) if derived.size else None
+
+    @staticmethod
+    def _fill_components(out: np.ndarray, left: np.ndarray, right: np.ndarray, computed: np.ndarray, nb: int) -> None:
+        r"""
+        Writes the products :math:`L_{14} R_{23}` of the orbital components ``computed`` of two real-space factors
+        into ``out``, in blocks of momenta of about 1 MiB of gathered factors, so no temporary of the size of ``out``
+        is made.
+
+        :param out: The products ``[x, y, z, component, ...]``; written in place.
+        :param left: The factor ``[x, y, z, o1, o4, ...]``.
+        :param right: The factor ``[x, y, z, o2, o3, ...]``, its trailing axes those of ``left``.
+        :param computed: The flat indices ``((o1 nb + o2) nb + o3) nb + o4`` of the components.
+        :param nb: Number of orbitals.
+        :return: None.
+        """
+        o1, o2, o3, o4 = np.unravel_index(computed, (nb,) * 4)
+        n_r = int(np.prod(out.shape[:3]))
+        flat = np.reshape(out, (n_r, *out.shape[3:]), copy=False)
+        left = np.reshape(left, (n_r, nb * nb, *left.shape[5:]), copy=False)
+        right = np.reshape(right, (n_r, nb * nb, *right.shape[5:]), copy=False)
+        rows = max(1, 2**20 // (flat[0].size * flat.itemsize))
+        for r0 in range(0, n_r, rows):
+            np.multiply(
+                left[r0 : r0 + rows, o1 * nb + o4], right[r0 : r0 + rows, o2 * nb + o3], out=flat[r0 : r0 + rows]
+            )
+
+    @staticmethod
+    def _orbital_transpose_permutation(
+        giwk: GreensFunction, niv_window: int, involution: np.ndarray | None = None, comm=None
+    ) -> np.ndarray | None:
+        r"""
+        Returns the orbital permutation :math:`\pi` of order two that transposes the Green's function at every
+        momentum, :math:`G^{\mathrm{k}}_{12} = G^{\mathrm{k}}_{\pi(2)\pi(1)}` on the fermionic frequencies
+        ``[-niv_window, niv_window)``, to ``1e-6`` relative to the largest :math:`|G|` there, or to 64 units of
+        rounding of the storage precision when that is finer (complex128): the identity for a symmetric Green's
+        function, else ``involution`` if it does. Time reversal with an inversion that permutes the orbitals gives
+        such a relation. Collective over ``comm``: every rank checks its share of the momenta in blocks of rows, so
+        no copy of its share is held, and all ranks return the same answer.
+
+        :param giwk: The momentum-dependent :class:`GreensFunction`; only read.
+        :param niv_window: Number of positive fermionic frequencies checked.
+        :param involution: The permutation tried after the identity (an index array, its own inverse), or ``None``.
+        :param comm: The MPI communicator, or ``None`` for a single rank.
+        :return: The permutation as an index array; None for one band or when neither candidate holds.
+        """
+        nb = giwk.n_bands
+        if nb == 1:
+            return None
+        candidates = [np.arange(nb)] + ([] if involution is None else [np.asarray(involution)])
+        mat = np.reshape(giwk.mat, (-1, nb, nb, giwk.mat.shape[-1]), copy=False)
+        mat = mat[..., giwk.niv - niv_window : giwk.niv + niv_window]
+        size, rank = (comm.size, comm.rank) if comm is not None else (1, 0)
+        first, last = rank * len(mat) // size, (rank + 1) * len(mat) // size
+        diffs, scale = [0.0] * len(candidates), 0.0
+        for r0 in range(first, last, 64):
+            rows = mat[r0 : min(r0 + 64, last)]
+            scale = max(scale, float(np.abs(rows).max()))
+            for c, pi in enumerate(candidates):
+                diffs[c] = max(diffs[c], float(np.abs(rows.swapaxes(1, 2) - rows[:, pi][:, :, pi]).max()))
+        if size > 1:
+            gathered = comm.allgather((diffs, scale))
+            diffs = [max(values) for values in zip(*(d for d, _ in gathered))]
+            scale = max(sc for _, sc in gathered)
+        bound = min(1e-6, 64 * np.finfo(mat.dtype).eps) * scale
+        return next((pi for pi, diff in zip(candidates, diffs) if diff <= bound), None)
 
     @staticmethod
     def _crossing_columns(wn: np.ndarray, niv: int) -> tuple[np.ndarray, np.ndarray]:
@@ -508,7 +629,7 @@ class BubbleGenerator:
         n_w: int,
         n_v: int,
         n_parts: int,
-        nb: int,
+        comp_shape: tuple,
         dtype: np.dtype,
         fill: Callable[[np.ndarray, int, int, int], None],
         deliver: Callable[[slice | np.ndarray, np.ndarray], None],
@@ -534,10 +655,10 @@ class BubbleGenerator:
         :param n_w: Number of bosonic frequencies of the columns.
         :param n_v: Number of fermionic frequencies of the columns.
         :param n_parts: Number of products per column.
-        :param nb: Number of orbitals.
+        :param comp_shape: Shape of the orbital axes of a column, ``(nb, nb, nb, nb)`` or a flat count of components.
         :param dtype: Storage dtype of the products.
         :param fill: Writes the R-space product ``part`` of the column ``(iw, iv)`` into ``out``
-            ``[x, y, z, o1, o2, o3, o4]``.
+            ``[x, y, z, *comp_shape]``.
         :param deliver: Receives every column block of this rank's momenta.
         :param columns: The flat columns to compute, ascending, or ``None`` for all of them.
         :return: None.
@@ -552,7 +673,8 @@ class BubbleGenerator:
         col_bounds = np.linspace(0, total_cols, size + 1).astype(int)
         ncols_max = int(np.max(np.diff(col_bounds)))
         sub_cols = max(1, ncols_max * nk_irr // (6 * nk_tot), min(ncols_max, n_v // max(1, size)))
-        sub_cols = max(1, min(sub_cols, ROUND_BUFFER_BYTES // (nk_tot * nb**4 * np.dtype(dtype).itemsize)))
+        n_comp = int(np.prod(comp_shape))
+        sub_cols = max(1, min(sub_cols, ROUND_BUFFER_BYTES // (nk_tot * n_comp * np.dtype(dtype).itemsize)))
         n_rounds = -(-ncols_max // sub_cols) if ncols_max else 0
 
         my_q_slice = mpi_dist_irrk.slices[rank]
@@ -566,7 +688,7 @@ class BubbleGenerator:
             """The flat columns of the round positions ``[c0, c1)``."""
             return slice(c0, c1) if columns is None else columns[c0:c1]
 
-        buf = np.empty((*k_grid.nk, nb, nb, nb, nb, sub_cols), dtype=dtype)
+        buf = np.empty((*k_grid.nk, *comp_shape, sub_cols), dtype=dtype)
         for rnd in range(n_rounds):
             c0, c1 = round_cols(rank, rnd)
             n_mine = max(0, c1 - c0)
@@ -580,7 +702,7 @@ class BubbleGenerator:
                     # scipy.fft keeps complex64 in place; numpy.fft would upcast to complex128 (double work + 2x buffer)
                     transformed = sp.fft.ifftn(buf_v, axes=(0, 1, 2), overwrite_x=True)
                     pieces.append(
-                        np.ascontiguousarray(transformed.reshape(nk_tot, nb, nb, nb, nb, n_mine)[k_grid.irrk_ind])
+                        np.ascontiguousarray(transformed.reshape(nk_tot, *comp_shape, n_mine)[k_grid.irrk_ind])
                     )
                     transformed = None
                 chunk_irr = pieces[0] if n_parts == 1 else np.concatenate(pieces, axis=-1)
@@ -600,7 +722,7 @@ class BubbleGenerator:
 
                 s0, s1 = round_cols(src, rnd)
                 if my_nq and s1 > s0:
-                    staging = np.empty((my_nq, nb, nb, nb, nb, n_parts * (s1 - s0)), dtype=dtype)
+                    staging = np.empty((my_nq, *comp_shape, n_parts * (s1 - s0)), dtype=dtype)
                     reqs += mpi_utils._irecv_rows_into(comm, staging, src, base_tag=500 + step)
 
                 if reqs:

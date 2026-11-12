@@ -1085,6 +1085,26 @@ def _rotating_auto_grid(nq, phase=0.0):
     return grid
 
 
+def _sheared_auto_grid(nq):
+    """Builds an auto-symmetry grid of a p_x/p_y model on the triangular lattice; its rotations shear the grid axes."""
+    k1, k2, _ = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nq), indexing="ij")
+    h_k = np.zeros(nq + (2, 2), dtype=complex)
+    for phase, angle in ((k1, 0.0), (k2, np.pi / 3), (k2 - k1, 2 * np.pi / 3)):
+        d = np.array([np.cos(angle), np.sin(angle)])
+        h_k += 2.0 * np.cos(phase)[..., None, None] * (0.3 * np.eye(2) + 0.7 * np.outer(d, d))
+    grid = bz.KGrid(nk=nq, symmetries=[bz.KnownSymmetries.AUTO])
+    grid.specify_auto_symmetries(h_k)
+    return grid
+
+
+def test_wedge_orbits_follow_the_operations_that_shear_the_grid_axes():
+    """On the triangular lattice every operation of the group merges real-space stars: they are the irreducible zone."""
+    grid = _sheared_auto_grid((6, 6, 1))
+    points, _, _, us = es._wedge_orbits(grid)
+    assert len(grid._auto_group) == 12 and len(points) == grid.nk_irr
+    assert all(np.allclose(us[point], np.eye(2)) for point in points)
+
+
 def test_wedge_window_points_shrink_only_under_point_like_operations():
     """Point-like operations shrink the window below the grid; a symmetry-free grid keeps every point."""
     nq = (4, 4, 1)
@@ -1108,7 +1128,7 @@ def test_wedge_orbits_partition_the_grid_by_star():
 
 
 @pytest.mark.parametrize("size", [1, 3])
-@pytest.mark.parametrize("grid_kind", ["explicit", "auto", "auto-complex"])
+@pytest.mark.parametrize("grid_kind", ["explicit", "auto", "auto-complex", "auto-sheared"])
 def test_wedge_team_matvec_matches_the_single_rank_matvec_to_rounding(monkeypatch, size, grid_kind):
     """Star-grouped contractions on the real-space wedge reproduce the full-grid sector matvec to rounding."""
     nq, niv_pp, o = (4, 4, 1), 2, 2
@@ -1116,6 +1136,9 @@ def test_wedge_team_matvec_matches_the_single_rank_matvec_to_rounding(monkeypatc
     if grid_kind == "explicit":
         symmetries = [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV, bz.KnownSymmetries.X_Y_SYM]
         grid = bz.KGrid(nq, symmetries=symmetries)
+    elif grid_kind == "auto-sheared":
+        grid = _sheared_auto_grid(nq)
+        assert len(es._wedge_orbits(grid)[0]) == grid.nk_irr
     else:
         grid = _rotating_auto_grid(nq, phase=np.pi / 4 if grid_kind == "auto-complex" else 0.0)
         assert not np.allclose(grid._auto_us, np.eye(2))

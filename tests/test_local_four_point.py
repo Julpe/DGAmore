@@ -175,6 +175,16 @@ def test_orbital_pairs_without_vertex_are_the_inter_atom_pairs_of_an_atom_by_ato
     assert gamma.orbital_pairs_without_vertex(LocalInteraction(u, SpinChannel.DENS)).tolist() == [3, 6, 7, 8, 9, 12, 13]
 
 
+def test_nonzero_orbital_components_marks_the_components_holding_a_non_zero_entry():
+    """A single non-zero entry marks its orbital component; every component of zeros stays unmarked."""
+    mat = np.zeros((2, 2, 2, 2, 3, 4, 4), dtype=complex)
+    mat[0, 1, 1, 0, 2, 3, 1] = 1e-30
+    mat[1, 1, 0, 0] = 1.0
+    marked = LocalFourPoint(mat, SpinChannel.DENS, 1, 2, True, True).nonzero_orbital_components()
+    assert marked.shape == (2, 2, 2, 2) and marked.dtype == bool
+    assert np.argwhere(marked).tolist() == [[0, 1, 1, 0], [1, 1, 0, 0]]
+
+
 def test_sums_over_orbitals_correctly_1():
     """sum_over_orbitals contracts the orbital indices correctly (variant 1)."""
     mat = np.random.rand(2, 2, 2, 2, 5, 3)

@@ -475,6 +475,45 @@ def test_distributed_mu_fallback_search_is_bit_identical_to_the_serial_search(mo
     assert np.allclose(serial[0], 0.4, atol=1e-5) and serial[1] == 0.1 and np.array_equal(res, [serial] * size)
 
 
+@pytest.mark.parametrize("size", [1, 3])
+def test_mu_search_on_the_star_weighted_wedge_matches_the_search_on_the_whole_grid(monkeypatch, size):
+    """For a dispersion and self-energy obeying the point group the irreducible momenta give the grid's filling, mu."""
+    from dgamore import brillouin_zone as bz
+
+    nk, beta = (4, 4, 1), 8.0
+    kx, ky, _ = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nk), indexing="ij")
+    ek = np.zeros(nk + (2, 2), dtype=complex)
+    ek[..., 0, 0] = -2.0 * np.cos(kx) - 0.6 * np.cos(ky)
+    ek[..., 1, 1] = -2.0 * np.cos(ky) - 0.6 * np.cos(kx)
+    ek[..., 0, 1] = ek[..., 1, 0] = 0.3 * np.sin(kx) * np.sin(ky)
+    grid = bz.KGrid(nk, [bz.KnownSymmetries.AUTO])
+    grid.specify_auto_symmetries(ek)
+    s0 = 0.7 * np.eye(2)
+    h = ek.reshape(-1, 2, 2)
+    sig = (s0[..., None] + 0.2 * (h @ h)[..., None] / (1j * MFHelper.vn(24, beta))).astype(np.complex64)
+    wedge = (grid.irrk_ind, grid.irrk_count)
+    fill = get_total_fill(0.4, ek, sig, beta, s0)
+    mu = update_mu(0.1, fill, ek, sig, beta, s0)
+    inverted, invert = [], GreensFunction._invert_last_orbital_block
+    monkeypatch.setattr(
+        GreensFunction, "_invert_last_orbital_block", staticmethod(lambda m: inverted.append(m.shape[0]) or invert(m))
+    )
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=grid.nk_irr, comm=comm)
+        rows = sig[grid.irrk_ind[d.my_slice]]
+        return get_total_fill(0.4, ek, rows, beta, s0, d, wedge=wedge), update_mu(
+            0.1, fill, ek, rows, beta, s0, mpi_dist=d, wedge=wedge
+        )
+
+    _, res = run_parallel(size, fn)
+    assert grid.nk_irr < grid.nk_tot and max(inverted) <= grid.nk_irr
+    assert np.allclose([r[0] for r in res], fill, rtol=0, atol=1e-6) and np.allclose(
+        [r[1] for r in res], mu, rtol=0, atol=1e-6
+    )
+    assert np.isclose(get_total_fill(0.4, ek, sig[grid.irrk_ind], beta, s0, wedge=wedge), fill, rtol=0, atol=1e-6)
+
+
 def test_model_epot_chunked_matches_unchunked_reference(monkeypatch):
     """_model_epot with a tiny chunk budget equals the single-pass reference: bounding temporaries keeps the tail."""
     import dgamore.greens_function as gf_module
@@ -510,6 +549,27 @@ def _chunking_inputs(complex_ek: bool, local_sigma: bool, nk=(3, 4, 2), nb=3, ni
     sigma = SelfEnergy(0.5 * (mat + mat.swapaxes(-2, -3)), shape, beta=7.3)
     h = rng.standard_normal((*nk, nb, nb)) + (1j * rng.standard_normal((*nk, nb, nb)) if complex_ek else 0)
     return sigma, (0.5 * (h + h.conj().swapaxes(-1, -2))).astype(np.complex128)
+
+
+def test_energies_with_momentum_weights_are_those_of_every_momentum_repeated_by_its_weight():
+    """Kinetic and potential energy sums weighted per momentum equal the sums over the momenta repeated by weight."""
+    sigma, ek = _chunking_inputs(complex_ek=True, local_sigma=False, nk=(4, 1, 1), nb=2)
+    weights, mu, beta = np.array([1, 3, 2, 1]), 0.37, 7.3
+    repeated = np.repeat(np.arange(4), weights)
+
+    def energy_sums(rows, momentum_weights):
+        part = SelfEnergy(sigma.mat[rows].copy(), (len(rows), 1, 1), beta=beta)
+        part._smom0, part._smom1 = sigma.smom  # one pair of moments, as the ranks of a distributed evaluation share
+        g = GreensFunction.get_g_full(part, mu, ek[rows], beta)
+        g.get_fill_nonlocal()
+        return np.array([g.get_ekin(momentum_weights), g.get_epot(200, momentum_weights)]) * len(rows)
+
+    plain = energy_sums(np.arange(4), None)
+    weighted = energy_sums(np.arange(4), weights)
+    # to the rounding of the complex64 traces, which the weights promote to double precision
+    assert np.allclose(weighted, energy_sums(repeated, None), rtol=1e-6, atol=0.0)
+    assert not np.allclose(weighted, plain, rtol=1e-3, atol=0.0)
+    assert np.allclose(energy_sums(np.arange(4), np.ones(4)), plain, rtol=1e-6, atol=0.0)
 
 
 @pytest.mark.parametrize("complex_ek", [True, False])

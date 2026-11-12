@@ -1503,15 +1503,17 @@ def test_kernel_step_writes_the_eliashberg_intermediates_only_when_asked(monkeyp
 def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_sde(
     monkeypatch, tmp_path, ek, involution
 ):
-    """The post-loop pass hands each channel the dump flag and involution, skips the dc kernel and SDE, returns None."""
+    """The post-loop pass hands the bubble and each channel the involution, skips dc kernel and SDE, returns None."""
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
     config.output.output_path = str(tmp_path)
     config.sys.beta = 10.0
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: ek)
-    bubble = MagicMock()
+    bubble, bubble_kwargs = MagicMock(), []
     monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, None))
     monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
-    monkeypatch.setattr(nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: bubble)
+    monkeypatch.setattr(
+        nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: bubble_kwargs.append(k) or bubble
+    )
     monkeypatch.setattr(nonlocal_sde, "_cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
     loaded, saves, involutions = [], [], []
 
@@ -1547,6 +1549,8 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
     assert result is None
     assert loaded == ["gamma_dens_loc.npy", "gamma_magn_loc.npy"] and saves == [True, True]
     assert involutions == [involution, involution]
+    for_bubble = bubble_kwargs[0]["involution"]
+    assert (None if for_bubble is None else for_bubble.tolist()) == involution
     assert bubble.cut_niv.return_value.invert.return_value.save.call_args.kwargs["name"] == "gchi0_q_inv_rank_0"
 
 
@@ -2068,8 +2072,8 @@ def test_warm_start_and_loop_solve_mu_on_every_rank_with_its_momenta(monkeypatch
         mixed.append(out.mat.reshape(3, 1, 1, -1).copy())
         return out
 
-    def solve(mu0, n, ek, sigma_mat, beta, smom0, logger=None, mpi_dist=None, orbitals=None):
-        seen.append((threading.current_thread().name, mpi_dist, sigma_mat.copy(), smom0))
+    def solve(mu0, n, ek, sigma_mat, beta, smom0, logger=None, mpi_dist=None, orbitals=None, wedge=None):
+        seen.append((threading.current_thread().name, mpi_dist, sigma_mat.copy(), smom0, wedge))
         return 0.42
 
     monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", mix)
@@ -2079,7 +2083,40 @@ def test_warm_start_and_loop_solve_mu_on_every_rank_with_its_momenta(monkeypatch
     assert [(c[0], c[1].ntasks) for c in calls] == [("rank0", 3)] * 2 + [("rank1", 3)] * 2 and len(mixed) == 1
     assert calls[0][1].my_slice.stop == calls[2][1].my_slice.start > 0
     assert all(np.array_equal(c[2], (start.mat, mixed[0])[i % 2][c[1].my_slice]) for i, c in enumerate(calls))
-    assert all(np.array_equal(c[3], calls[i % 2][3]) for i, c in enumerate(calls))
+    assert all(np.array_equal(c[3], calls[i % 2][3]) and c[4] is None for i, c in enumerate(calls))
+
+
+def test_loop_sums_mu_and_the_occupation_over_the_momenta_picked_for_its_mixed_iterate(monkeypatch, tmp_path):
+    """The loop's mu search and occupation take the rows, distributor and star weights picked for the mixed iterate."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0)
+    config.lattice.k_grid = bz.KGrid((4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((4, 4, 1, 1, 1)))
+    mat = np.full((16, 1, 1, 16), 1.0 + 0.1j, dtype=np.complex64)
+    start = SelfEnergy(mat, (4, 4, 1), has_compressed_q_dimension=True, beta=10.0)
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3, True))
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda warm_start: [0.7])
+    picked, solved, occupied = [], [], []
+
+    def pick(sigma, donor, d_irr, d_full, comm):
+        picked.append((type(sigma), donor.nq, d_irr.ntasks, d_full.ntasks))
+        return "rows", d_irr, "wedge"
+
+    def occupy(sigma, donor, d_full, mu, d_irr=None):
+        occupied.append((mu, d_full.ntasks, None if d_irr is None else d_irr.ntasks))
+        return 1.0, np.zeros((1, 1)), np.zeros((1, 1, 1, 1, 1)), 0.0, 0.0
+
+    def solve(mu0, n, ek, sigma_mat, beta, smom0, logger=None, mpi_dist=None, orbitals=None, wedge=None):
+        solved.append((sigma_mat, mpi_dist.ntasks, wedge))
+        return 0.42
+
+    monkeypatch.setattr(nonlocal_sde, "_lattice_sum_momenta", pick)
+    monkeypatch.setattr(nonlocal_sde, "update_mu", solve)
+    monkeypatch.setattr(nonlocal_sde, "_update_occ_and_energies_distributed", occupy)
+    run()
+    assert picked == [(SelfEnergy, (1, 1, 1), 6, 16)] and occupied == [(0.42, 16, 6)]
+    assert solved[1:] == [("rows", 6, "wedge")]  # after the warm start's search
 
 
 def test_loop_concatenates_the_previous_iterate_on_rank0_only(monkeypatch, tmp_path):
@@ -3182,6 +3219,45 @@ def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(mon
         assert np.allclose([ekin, epot], [ekin_ref, epot_ref], atol=1e-5)
 
 
+@pytest.mark.parametrize("size", [1, 3])
+def test_update_occ_and_energies_on_the_irreducible_momenta_match_those_of_the_whole_grid(size, monkeypatch):
+    """With the irreducible distributor only those momenta are evaluated, and occupation and energies are unchanged."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
+    _point_group_sde_setup("square")
+    grid, h_k = config.lattice.k_grid, config.lattice.hamiltonian.get_ek()
+    niv, niv_dmft, mu, beta = 3, 8, 0.4, config.sys.beta
+    config.sys.mu, config.sys.correlated_orbitals = mu, None
+    iv, iv_dmft = (1j * np.pi / beta * (2 * np.arange(-n, n) + 1) for n in (niv, niv_dmft))
+    # obeys the group: a function of H(k); the donor is a multiple of the identity
+    sig_mat = 0.05 * (h_k @ h_k).reshape(grid.nk_tot, 2, 2)[..., None] / iv + 0.3 * np.eye(2)[..., None]
+    dmft_mat = np.eye(2)[..., None] * (0.3 + 0.2 / iv_dmft)
+    sigma_new = SelfEnergy(sig_mat, grid.nk, has_compressed_q_dimension=True, beta=beta)
+    sigma_dmft_full = SelfEnergy(dmft_mat[None, None, None], (1, 1, 1), beta=beta)
+    evaluate, rows = nonlocal_sde._slice_occupation_and_energies, []
+    monkeypatch.setattr(
+        nonlocal_sde, "_slice_occupation_and_energies", lambda s, *a: rows.append(s.mat.shape[0]) or evaluate(s, *a)
+    )
+
+    def run(on_wedge):
+        sigmas = [(sigma_new.copy(), sigma_dmft_full.copy()) for _ in range(size)]
+
+        def fn(comm, rank):
+            d_full = mpi_utils.MpiDistributor(ntasks=grid.nk_tot, comm=comm)
+            d_irr = mpi_utils.MpiDistributor(ntasks=grid.nk_irr, comm=comm) if on_wedge else None
+            return nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu, d_irr)
+
+        return run_parallel(size, fn)[1]
+
+    whole, n_whole = run(False), sum(rows)
+    wedge, n_wedge = run(True), sum(rows) - n_whole
+    assert (n_whole, n_wedge) == (grid.nk_tot, grid.nk_irr) and len(set(grid.irrk_count.tolist())) > 2
+    for (n, occ, occ_k, ekin, epot), (n_w, occ_w, occ_k_w, ekin_w, epot_w) in zip(whole, wedge):
+        assert np.allclose([n_w, ekin_w, epot_w], [n, ekin, epot], rtol=0.0, atol=1e-10)
+        assert np.allclose(occ_w, occ, rtol=0.0, atol=1e-10) and np.allclose(occ_k_w, occ_k, rtol=0.0, atol=1e-10)
+        assert occ_k_w.shape == occ_k.shape and np.abs(occ_k - occ).max() > 1e-3
+
+
 def test_update_occ_and_energies_distributed_carries_the_shell_offset_of_the_mixed_sigma(monkeypatch):
     """A momentum-dependent constant in sigma's shell is carried into the DMFT-box extension on every rank."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
@@ -3540,15 +3616,16 @@ def _column_sde_setup(auto: bool, nk=(4, 4, 2), o=2, niw=3, niv=2, seed=41):
     return kernel, GreensFunction(g_mat, calc_filling=False, nk=nk, beta=config.sys.beta)
 
 
-def _run_column_sde_parallel(size, kernel, giwk, chunk_bytes=None, hostnames=None):
+def _run_column_sde_parallel(size, kernel, giwk, chunk_bytes=None, hostnames=None, symmetric=False):
     """Runs the column-distributed contraction on fake ranks and returns rank 0's real-space result."""
+    flags = {"symmetric": True} if symmetric else {}
 
     def fn(comm, rank):
         d_irr = mpi_utils.MpiDistributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
         g_r, win = nonlocal_sde._build_rspace_giwk_window(giwk, node_comm)
         kern = FourPoint(kernel[d_irr.my_slice].copy(), SpinChannel.NONE, config.lattice.nk, 1, 1, False, True, True)
-        sigma = nonlocal_sde._run_column_sde(kern, d_irr, g_r, giwk.niv, chunk_bytes)
+        sigma = nonlocal_sde._run_column_sde(kern, d_irr, g_r, giwk.niv, chunk_bytes, **flags)
         g_r = None
         nonlocal_sde._free_shared_window(win, node_comm)
         return None if sigma is None else sigma.mat.copy()
@@ -3672,6 +3749,200 @@ def test_column_sde_with_monomial_rotations_keeps_the_bits_of_the_einsum_unfold(
         mp.setattr(bz.KGrid, "auto_monomial_map", MagicMock(return_value=None))
         einsum = _run_column_sde_parallel(size, kernel, giwk)
     assert np.array_equal(gathered, einsum)
+
+
+def _point_group_sde_setup(lattice, niw=2, niv=2, covariant=True, dtype=np.complex64):
+    """Configures an auto grid of a p_x/p_y model (the triangular one's operations shear the axes); kernel and G."""
+    nk = (4, 4, 1) if lattice == "square" else (6, 6, 1)
+    k1, k2, _ = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nk), indexing="ij")
+    h_k = np.zeros(nk + (2, 2), dtype=complex)
+    if lattice == "square":
+        h_k[..., 0, 0] = -2.0 * np.cos(k1) - 0.6 * np.cos(k2)
+        h_k[..., 1, 1] = -2.0 * np.cos(k2) - 0.6 * np.cos(k1)
+        h_k[..., 0, 1] = h_k[..., 1, 0] = 0.3 * np.sin(k1) * np.sin(k2)
+    else:
+        for phase, angle in ((k1, 0.0), (k2, np.pi / 3), (k2 - k1, 2 * np.pi / 3)):
+            d = np.array([np.cos(angle), np.sin(angle)])
+            h_k += 2.0 * np.cos(phase)[..., None, None] * (0.3 * np.eye(2) + 0.7 * np.outer(d, d))
+    grid = bz.KGrid(nk, [bz.KnownSymmetries.AUTO])
+    grid.specify_auto_symmetries(h_k)
+    config.lattice.nk, config.lattice.k_grid = nk, grid
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: h_k)
+    config.box.niw_core, config.box.niv_core = niw, niv
+    config.sys.n_bands, config.sys.beta = 2, 12.5
+    config.logger = MagicMock()
+    rng, n_v = np.random.default_rng(11), 2 * (niv + niw)
+    k_shape, g_shape = (grid.nk_irr, 2, 2, 2, 2, niw + 1, 2 * niv), (*nk, 2, 2, n_v)
+    if covariant:
+        # G = (iv + mu - H)^-1, and per column K_{aijd}(q) = sum_k G_{ai}(k, v1) G_{jd}(k - q, v2)
+        iv = 1j * np.pi / config.sys.beta * (2 * np.arange(-n_v // 2, n_v // 2) + 1)
+        g_mat = np.moveaxis(np.linalg.inv((iv[:, None, None] + 0.4) * np.eye(2) - h_k[..., None, :, :]), 3, -1)
+        g_r = np.fft.fftn(g_mat, axes=(0, 1, 2))
+        g_rev = np.roll(np.flip(g_r, axis=(0, 1, 2)), 1, axis=(0, 1, 2))
+        kernel = np.empty(k_shape, dtype=complex)
+        for w, v in np.ndindex(niw + 1, 2 * niv):
+            product = g_r[..., :, :, None, None, w + v] * g_rev[..., None, None, :, :, (2 * w + v + 1) % n_v]
+            full = np.fft.ifftn(product, axes=(0, 1, 2)).reshape(grid.nk_tot, 2, 2, 2, 2)
+            kernel[..., w, v] = full[grid.irrk_ind]
+    else:
+        kernel = rng.standard_normal(k_shape) + 1j * rng.standard_normal(k_shape)
+        g_mat = rng.standard_normal(g_shape) + 1j * rng.standard_normal(g_shape)
+    return kernel.astype(dtype), GreensFunction(g_mat.astype(dtype), calc_filling=False, nk=nk, beta=config.sys.beta)
+
+
+def _point_group_average(mat):
+    """The average of a full-BZ two-index array ``[k, o1, o2, v]`` over the configured grid's discovered group."""
+    from dgamore import symmetry_reduction as sr
+
+    group, nk = config.lattice.k_grid._auto_group, tuple(config.lattice.nk)
+    average = np.zeros(mat.shape, dtype=complex)
+    for g in group:
+        average[sr._g_action_on_kgrid(g, nk)] += np.einsum("ab,kbcv,dc->kadv", g.U, mat, g.U.conj())
+    return average / len(group)
+
+
+@pytest.mark.parametrize("lattice", ["square", "triangular"])
+@pytest.mark.parametrize("size", [1, 3])
+def test_column_sde_projects_its_result_onto_the_point_group(lattice, size, monkeypatch):
+    """On a multi-orbital auto grid the contraction of a random kernel is the group average of the q-loop sum."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _point_group_sde_setup(lattice, covariant=False)
+    ref = _point_group_average(_time_reversed_qloop_sigma(kernel, giwk).mat)
+
+    mat = _run_column_sde_parallel(size, kernel, giwk, hostnames=["n0"] * size)
+    sigma = SelfEnergy(mat, config.lattice.nk, False, True, calc_smom=False, beta=config.sys.beta)
+    assert np.allclose(sigma.ifft().to_full_niv_range().mat, ref, atol=1e-5)
+
+
+@pytest.mark.parametrize("lattice", ["square", "triangular"])
+@pytest.mark.parametrize("size", [1, 3])
+def test_column_sde_on_star_weighted_rows_matches_the_unfolded_contraction(lattice, size, monkeypatch):
+    """With a covariant kernel and Green's function the star-weighted route never unfolds and agrees to rounding."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
+    kernel, giwk = _point_group_sde_setup(lattice, dtype=np.complex128)
+    unfolded = _run_column_sde_parallel(size, kernel, giwk)
+    unfolds, unfold = [], FourPoint.map_to_full_bz
+    monkeypatch.setattr(FourPoint, "map_to_full_bz", lambda self, *a, **k: unfolds.append(1) or unfold(self, *a, **k))
+    weighted = _run_column_sde_parallel(size, kernel, giwk, symmetric=True)
+    assert not unfolds
+    assert np.allclose(weighted, unfolded, atol=1e-11 * np.abs(unfolded).max())
+
+
+def _transposed_shapes(monkeypatch):
+    """Records the orbital shape of every column block the transpose hands to the contraction."""
+    shapes, transpose = [], mpi_utils.transpose_columns
+
+    def spy(*args, **kwargs):
+        out = transpose(*args, **kwargs)
+        shapes.append(out.shape[1:-1])
+        return out
+
+    monkeypatch.setattr(mpi_utils, "transpose_columns", spy)
+    return shapes
+
+
+@pytest.mark.parametrize("size", [1, 3])
+def test_column_sde_carries_only_the_orbital_blocks_of_the_kernels_last_pair(size, monkeypatch):
+    """A kernel whose last orbital pair stays inside orbital blocks is transposed and contracted on those blocks."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
+    dense, giwk = _point_group_sde_setup("square", dtype=np.complex128)
+    kernel = dense * np.eye(2)[None, None, None, :, :, None, None]  # o3 = o4: two blocks of one orbital each
+    shapes = _transposed_shapes(monkeypatch)
+    unfolded = _run_column_sde_parallel(size, kernel, giwk)  # the unfold rotates the orbitals: every component
+    assert shapes and all(shape == (2, 2, 2, 2) for shape in shapes)
+    shapes.clear()
+    weighted = _run_column_sde_parallel(size, kernel, giwk, symmetric=True)
+    assert shapes and all(shape == (8,) for shape in shapes)  # 2 blocks of (2 x 1) x (2 x 1) of the 16 components
+    assert np.allclose(weighted, unfolded, atol=1e-11 * np.abs(unfolded).max())
+    shapes.clear()
+    _run_column_sde_parallel(size, dense, giwk, symmetric=True)
+    assert shapes and all(shape == (2, 2, 2, 2) for shape in shapes)
+
+
+def test_column_sde_on_orbital_blocks_matches_the_qloop_without_orbital_rotations(monkeypatch):
+    """Without orbital rotations the unfold carries the blocks of the last pair, with the q-loop's result."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _column_sde_setup(auto=False, o=3)
+    pairs = np.zeros((3, 3))
+    pairs[np.ix_([0, 2], [0, 2])] = pairs[1, 1] = 1  # the blocks {0, 2} and {1}
+    kernel = (kernel * pairs[None, None, None, :, :, None, None]).astype(np.complex64)
+    ref = _time_reversed_qloop_sigma(kernel, giwk)
+    shapes = _transposed_shapes(monkeypatch)
+    mat = _run_column_sde_parallel(3, kernel, giwk)
+    sigma = SelfEnergy(mat, config.lattice.nk, False, True, calc_smom=False, beta=config.sys.beta)
+    assert shapes and all(shape == (3 * 2 * 3 * 2 + 3 * 1 * 3 * 1,) for shape in shapes)  # 45 of 81 components
+    assert np.allclose(sigma.ifft().to_full_niv_range().mat, ref.mat, atol=1e-5)
+
+
+@pytest.mark.parametrize("size", [1, 3])
+def test_point_group_covariance_of_the_greens_function_decides_the_star_weighted_route(size, monkeypatch):
+    """A covariant G passes on every rank; a random G, one changed momentum or a grid that does not project fail."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    _, covariant = _point_group_sde_setup("triangular")
+    _, random = _point_group_sde_setup("triangular", covariant=False)
+    changed = covariant.mat.copy()
+    changed[5, 2, 0, 0, 1, 3] *= 1.001
+
+    def check(mat, bound=None):
+        return run_parallel(size, lambda comm, rank: nonlocal_sde._has_point_group_covariance(mat, comm, bound))[1]
+
+    assert check(covariant.mat) == [True] * size and check(random.mat) == [False] * size
+    assert check(changed) == [False] * size and check(changed, 1e-2) == [True] * size
+    config.lattice.k_grid = bz.KGrid(config.lattice.nk, symmetries=[])
+    assert check(covariant.mat) == [False] * size
+
+
+def test_point_group_covariance_in_double_precision_holds_to_the_accuracy_of_the_rotations(monkeypatch):
+    """In complex128 the bound is 1e-12 of the largest entry: a covariant array passes, one off by 1e-9 fails."""
+    monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
+    _, covariant = _point_group_sde_setup("triangular", dtype=np.complex128)
+    changed = covariant.mat.copy()
+    changed[np.unravel_index(np.abs(changed).argmax(), changed.shape)] *= 1 + 1e-9
+    assert covariant.mat.dtype == np.complex128 and nonlocal_sde._has_point_group_covariance(covariant.mat)
+    assert not nonlocal_sde._has_point_group_covariance(changed)
+    assert nonlocal_sde._has_point_group_covariance(changed.astype(np.complex64))
+
+
+@pytest.mark.parametrize("size", [1, 3])
+def test_lattice_sums_take_the_irreducible_momenta_where_every_input_obeys_the_point_group(size, monkeypatch):
+    """Dispersion, self-energy and shell donor obeying the group give the star-weighted irreducible rows; else all."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    _, giwk = _point_group_sde_setup("square")
+    grid, rng = config.lattice.k_grid, np.random.default_rng(3)
+    h_k, n_v = config.lattice.hamiltonian.get_ek(), giwk.mat.shape[-1]
+    shape = (grid.nk_tot, 2, 2, n_v)
+    obeying = SelfEnergy(giwk.mat.reshape(shape).copy(), grid.nk, True, True, calc_smom=False, beta=config.sys.beta)
+    random = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    random = SelfEnergy(random, grid.nk, True, True, calc_smom=False, beta=config.sys.beta)
+    donors = [np.eye(2)[..., None] * np.arange(1.0, 9.0), np.diag([1.0, 2.0])[..., None] * np.arange(1.0, 9.0)]
+    donors = [SelfEnergy(d[None, None, None], (1, 1, 1), calc_smom=False, beta=config.sys.beta) for d in donors]
+    skewed = h_k.copy()
+    skewed[1, 2, 0, 0, 0] += 1e-3
+
+    def pick(sigma, donor):
+        def fn(comm, rank):
+            d_irr = mpi_utils.MpiDistributor(ntasks=grid.nk_irr, comm=comm)
+            d_full = mpi_utils.MpiDistributor(ntasks=grid.nk_tot, comm=comm)
+            rows, dist, wedge = nonlocal_sde._lattice_sum_momenta(sigma, donor, d_irr, d_full, comm)
+            return rows.copy(), dist is d_irr, wedge
+
+        return run_parallel(size, fn)[1]
+
+    found = pick(obeying, donors[0])
+    assert np.array_equal(np.concatenate([rows for rows, _, _ in found]), obeying.mat[grid.irrk_ind])
+    assert all(on_wedge and np.array_equal(wedge[0], grid.irrk_ind) for _, on_wedge, wedge in found)
+    assert all(np.array_equal(wedge[1], grid.irrk_count) for _, _, wedge in found)
+    found = pick(random, donors[0])
+    assert np.array_equal(np.concatenate([rows for rows, _, _ in found]), random.mat)
+    assert all(not on_wedge and wedge is None for _, on_wedge, wedge in found)
+    assert all(not on_wedge and wedge is None for _, on_wedge, wedge in pick(obeying, donors[1]))
+    monkeypatch.setattr(config.lattice, "hamiltonian", SimpleNamespace(get_ek=lambda: skewed))
+    assert all(not on_wedge and wedge is None for _, on_wedge, wedge in pick(obeying, donors[0]))
+    monkeypatch.setattr(config.lattice, "hamiltonian", SimpleNamespace(get_ek=lambda: h_k))
+    monkeypatch.setattr(config.sys, "correlated_orbitals", np.array([0, 1]), raising=False)
+    assert all(not on_wedge and wedge is None for _, on_wedge, wedge in pick(obeying, donors[0]))
 
 
 def test_column_sde_unfolds_batches_of_columns_into_one_buffer_with_the_values_of_one_column_batches(monkeypatch):
@@ -4869,6 +5140,41 @@ def test_finish_on_node_builds_the_proposal_with_the_bits_of_rank_0_alone(monkey
     mat, nq, moments, compressed, removed = res[0]
     assert np.array_equal(mat, ref.mat) and nq == nk and compressed and removed == ref_removed
     assert all(np.array_equal(a, b) for a, b in zip(moments, ref_moments)) and all(r is None for r in res[1:])
+
+
+@pytest.mark.parametrize("hostnames", [["n0"], ["n0", "n0", "n0"]])
+def test_finish_on_node_unfolds_the_proposal_from_its_irreducible_momenta_before_the_average(monkeypatch, hostnames):
+    """A core obeying the group to rounding is unfolded from its irreducible momenta, then averaged; another is kept."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    _point_group_sde_setup("square")
+    grid, rng = config.lattice.k_grid, np.random.default_rng(14)
+    h_k = config.lattice.hamiltonian.get_ek().reshape(16, 2, 2)
+    obeying = (h_k @ h_k)[..., None] / (1j * np.array([-1.0, 1.0])) + h_k[..., None]
+    obeying = (obeying * (1 + 2e-7 * rng.standard_normal(obeying.shape))).astype(np.complex64)
+    random = (rng.standard_normal((16, 2, 2, 2)) + 1j * rng.standard_normal((16, 2, 2, 2))).astype(np.complex64)
+    donor_mat = (rng.standard_normal((1, 1, 1, 2, 2, 8)) + 0.2j).astype(np.complex64)
+    offset = rng.standard_normal((16, 2, 2))
+
+    def make(core_mat):
+        core = SelfEnergy(core_mat.copy(), grid.nk, True, True, calc_smom=False, beta=10.0)
+        return core, SelfEnergy(donor_mat.copy(), (1, 1, 1), calc_smom=False, beta=10.0)
+
+    def finish(core_mat, unfold):
+        def fn(comm, rank):
+            node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+            core, donor = make(core_mat) if rank == 0 else (None, None)
+            args = (offset, True) if rank == 0 else (None, False)
+            sigma, _ = nonlocal_sde._finish_proposal_on_node(core, donor, *args, node_comm, unfold=unfold and rank == 0)
+            return None if sigma is None else sigma.mat.copy()
+
+        return run_parallel(len(hostnames), fn, hostnames=hostnames)[1][0]
+
+    core, donor = make(obeying)
+    ref = core.concatenate_self_energies(donor, shell_offset=offset)
+    ref.unfold_irreducible_momenta(grid, frequencies=slice(3, 5))  # the two core frequencies of the eight
+    ref.symmetrize_time_reversal()
+    assert np.array_equal(finish(obeying, True), ref.mat) and not np.array_equal(finish(obeying, False), ref.mat)
+    assert np.array_equal(finish(random, True), finish(random, False))
 
 
 @pytest.mark.parametrize(

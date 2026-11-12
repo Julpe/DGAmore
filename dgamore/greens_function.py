@@ -123,6 +123,7 @@ def get_total_fill(
     smom0: np.ndarray,
     mpi_dist: MpiDistributor | None = None,
     orbitals: np.ndarray | None = None,
+    wedge: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> float:
     r"""
     Returns the total filling for a given :math:`\mu`, self-energy and kinetic Hamiltonian. A local model Green's
@@ -135,6 +136,11 @@ def get_total_fill(
     continues from rank to rank in momentum order (:meth:`MpiDistributor.ordered_sum`); rank 0's filling is broadcast,
     so every rank returns the filling of the whole grid, bit-identical to the single-process evaluation.
 
+    With ``wedge`` the momentum sum runs over the irreducible momenta only, each weighted by the size of its star:
+    the trace of the Green's function is the same on every momentum of a star when the dispersion and the
+    self-energy obey the grid's operations, so this is the filling of the whole grid up to rounding, from fewer
+    Dyson inversions. ``sigma_mat`` and ``mpi_dist`` then hold and distribute the irreducible momenta.
+
     :param mu: Chemical potential :math:`\mu`.
     :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})` on the whole grid, shape ``[kx, ky, kz, o1, o2]``.
     :param sigma_mat: Self-energy array, shape ``[k, o1, o2, v]``; with ``mpi_dist`` only this rank's momenta.
@@ -144,6 +150,8 @@ def get_total_fill(
         whole grid on this process.
     :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
         when it acts on every orbital.
+    :param wedge: The flat grid indices of the irreducible momenta and the sizes of their stars, or ``None`` for
+        every momentum of the grid.
     :return: The total filling (electron number) :math:`n`, over every orbital of the dispersion.
     """
     n_bands = ek.shape[-1]
@@ -157,12 +165,23 @@ def get_total_fill(
     mat = iv_bands + mu_bands[..., None] - hloc[..., None] - smom0[..., None]
     g_model_mat = GreensFunction._invert_last_orbital_block(mat)
 
-    ek = ek.reshape(np.prod(ek.shape[:3]), n_bands, n_bands)  # sigma will always enter with shape (k,o1,o2,v)
+    n_k = int(np.prod(ek.shape[:3]))
+    ek = ek.reshape(n_k, n_bands, n_bands)  # sigma will always enter with shape (k,o1,o2,v)
+    stars = None
+    if wedge is not None:
+        ek, stars = ek[wedge[0]], wedge[1]
     if mpi_dist is not None:
         ek = ek[mpi_dist.my_slice]
+        stars = None if stars is None else stars[mpi_dist.my_slice]
     mat = iv_bands[None, ...] + mu_bands[None, ..., None] - ek[..., None]
     g_full_mat = GreensFunction._invert_last_orbital_block(_subtract_self_energy(mat, sigma_mat, orbitals))
-    g_loc_mat = np.mean(g_full_mat, axis=0) if mpi_dist is None else mpi_dist.ordered_sum(g_full_mat) / mpi_dist.ntasks
+    if stars is not None:
+        g_full_mat *= stars[:, None, None, None]
+        g_loc_mat = (np.sum(g_full_mat, axis=0) if mpi_dist is None else mpi_dist.ordered_sum(g_full_mat)) / n_k
+    else:
+        g_loc_mat = (
+            np.mean(g_full_mat, axis=0) if mpi_dist is None else mpi_dist.ordered_sum(g_full_mat) / mpi_dist.ntasks
+        )
 
     rho_loc = _fermi_dirac_density(hloc.real + smom0 - mu_bands, beta)
     occ = rho_loc + np.sum(g_loc_mat.real - g_model_mat.real, axis=-1) / beta
@@ -179,6 +198,7 @@ def root_fun(
     smom0: np.ndarray,
     mpi_dist: MpiDistributor | None = None,
     orbitals: np.ndarray | None = None,
+    wedge: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> float:
     r"""
     Residual function used to find a new chemical potential :math:`\mu` via Newton's method: the difference between
@@ -194,9 +214,10 @@ def root_fun(
         whole grid on this process.
     :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
         when it acts on every orbital.
+    :param wedge: The irreducible momenta and the sizes of their stars (see :func:`get_total_fill`), or ``None``.
     :return: The signed filling residual ``filling(mu) - target_filling``.
     """
-    return get_total_fill(mu, ek, sigma_mat, beta, smom0, mpi_dist, orbitals) - target_filling
+    return get_total_fill(mu, ek, sigma_mat, beta, smom0, mpi_dist, orbitals, wedge) - target_filling
 
 
 # Largest filling residual accepted from a "converged" Newton result; genuine roots sit orders of magnitude below
@@ -239,6 +260,7 @@ def update_mu(
     tol: float = 1e-6,
     mpi_dist: MpiDistributor | None = None,
     orbitals: np.ndarray | None = None,
+    wedge: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> float:
     r"""
     Updates the chemical potential to match the target filling by using Newton's method to find the optimal
@@ -263,11 +285,12 @@ def update_mu(
         whole grid on this process.
     :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
         when it acts on every orbital.
+    :param wedge: The irreducible momenta and the sizes of their stars (see :func:`get_total_fill`), or ``None``.
     :return: The updated (real) chemical potential, or ``mu0`` if no root was found.
     :raises ValueError: If the converged chemical potential has a non-negligible imaginary part.
     """
     mu = mu0
-    args = (target_filling, ek, sigma_mat, beta, smom0, mpi_dist, orbitals)
+    args = (target_filling, ek, sigma_mat, beta, smom0, mpi_dist, orbitals, wedge)
     try:
         mu = opt.newton(root_fun, mu, args=args, tol=tol)
         # the secant step criterion can also "converge" inside a flat filling region far from any root, so the
@@ -694,16 +717,21 @@ class GreensFunction(TwoPoint):
         occ_mean.real[np.abs(occ_mean) < 1e-12] = 0.0
         return 2.0 * np.trace(occ_mean).real, occ_mean, occ_k
 
-    def get_ekin(self) -> float:
+    def get_ekin(self, weights: np.ndarray | None = None) -> float:
         r"""
         Returns the kinetic energy from the band dispersion and the k-resolved occupation, :math:`E_{\mathrm{kin}} =
         \sum_{\sigma \mathbf{k} ab} \varepsilon_{ab}(\mathbf{k})\, n_{ba}(\mathbf{k})`.
 
+        :param weights: A weight per momentum that multiplies its term of the momentum sum (the size of the star of
+            an irreducible momentum), or None for the plain sum.
         :return: The kinetic energy per site.
         """
-        return 2 * np.sum(self._ek * self._occ_k.swapaxes(-1, -2)).real / self.nq_tot
+        terms = self._ek * self._occ_k.swapaxes(-1, -2)
+        if weights is not None:
+            terms = terms * np.reshape(weights, (*terms.shape[:3], 1, 1))
+        return 2 * np.sum(terms).real / self.nq_tot
 
-    def get_epot(self, niv_asympt: int = 50000) -> float:
+    def get_epot(self, niv_asympt: int = 50000, weights: np.ndarray | None = None) -> float:
         r"""
         Computes the moment-corrected Galitskii-Migdal potential energy,
 
@@ -723,13 +751,19 @@ class GreensFunction(TwoPoint):
         joins the chunk before it), each momentum's trace bit for bit the one of all momenta at once.
 
         :param niv_asympt: Number of positive fermionic frequencies used for the asymptotic ("big") tail sum.
+        :param weights: A weight per momentum that multiplies its term of every momentum sum (the size of the star of
+            an irreducible momentum), or None for the plain sums.
         :return: The potential energy per site.
         """
         smom0, smom1 = self._sigma.smom  # Sigma_inf, first tail coeff; both [o1, o2]
 
         # 1) Hartree: physical (tail-corrected) occupation, convergence factor exact.
         occ_k = orbital_block(self._occ_k, self._orbitals)
-        e_hartree = np.sum(smom0[None, None, None] * occ_k.swapaxes(-1, -2)).real
+        hartree_k = smom0[None, None, None] * occ_k.swapaxes(-1, -2)
+        if weights is not None:
+            weights = np.reshape(weights, hartree_k.shape[:3])
+            hartree_k = hartree_k * weights[..., None, None]
+        e_hartree = np.sum(hartree_k).real
 
         # 2) In-box correlation Tr[(Sigma - Sigma_inf) G] (Sigma_inf counted above): contract the orbital trace with
         # einsum (g orbital-transposed) to avoid the transpose_orbitals deepcopy of _ek/_sigma; per momentum chunk, so
@@ -747,16 +781,18 @@ class GreensFunction(TwoPoint):
             k = slice(start, stop)
             sigma = sigma_mat if sigma_mat.shape[0] == 1 else sigma_mat[k]
             trace_k[k] = np.einsum("...abv,...bav->...", sigma - smom0[..., None], g[k])
+        if weights is not None:
+            trace_k = trace_k * weights
         e_corr = trace_k.sum().real / self._beta
 
         # 3) Analytic 1/v^2 model tail: replace the truncated box value by the large-box one.
-        e_tail = self._model_epot(smom0, smom1, niv_asympt, self._beta) - self._model_epot(
-            smom0, smom1, self.niv, self._beta
+        e_tail = self._model_epot(smom0, smom1, niv_asympt, self._beta, weights) - self._model_epot(
+            smom0, smom1, self.niv, self._beta, weights
         )
 
         return (e_hartree + e_corr + e_tail) / self.nq_tot
 
-    def _model_epot(self, smom0, smom1, niv, beta):
+    def _model_epot(self, smom0, smom1, niv, beta, weights=None):
         r"""
         Evaluates the analytic :math:`1/\nu^2` model potential-energy tail :math:`\frac{1}{\beta}\sum_{\mathrm{k}}
         \mathrm{Tr}[(-\Sigma_1/\imath\nu) G_{\mathrm{mod}}]` over a frequency box of half width ``niv`` (used as the
@@ -766,6 +802,7 @@ class GreensFunction(TwoPoint):
         :param smom1: First self-energy tail coefficient :math:`\Sigma_1`, shape ``[o1, o2]``.
         :param niv: Number of positive fermionic frequencies.
         :param beta: Inverse temperature :math:`\beta`.
+        :param weights: A weight per momentum that multiplies its term of the momentum sum, or None.
         :return: The model tail contribution to the potential energy (real scalar, not yet divided by ``nk_tot``).
         """
         n = self.n_bands if self._orbitals is None else self._ek.shape[-1]
@@ -774,6 +811,8 @@ class GreensFunction(TwoPoint):
         lam, u = np.linalg.eig(h)  # once per k
         u_inv = np.linalg.inv(u)
         smom1_rot = u_inv @ smom1 @ u  # rotate tail coeff into eigenbasis
+        if weights is not None:
+            smom1_rot = smom1_rot * np.reshape(weights, (-1, 1, 1))
 
         # the frequency sum is evaluated in bounded v-chunks: the single-pass form materialized several
         # [k, band, 2*niv] complex temporaries, which for the default niv_asympt = 50000 spikes to many GB

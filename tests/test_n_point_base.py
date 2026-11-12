@@ -1290,6 +1290,23 @@ def test_map_to_full_bz_plain_symmetry_kgrid_pure_replication(c128_storage):
     assert np.array_equal(obj.mat, expected)
 
 
+def test_scatter_to_full_bz_places_the_star_weighted_rows_at_their_representatives(c128_storage):
+    """Every irreducible row lands at its representative times its star size, the rest of the zone stays zero."""
+    grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    payload = (np.arange(grid.nk_irr) + 1.0).astype(np.complex128).reshape(grid.nk_irr, 1, 1)
+    out = np.full((16, 1, 1), np.nan, dtype=np.complex128)
+    obj = IAmNonLocal(mat=payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True)
+    assert obj.scatter_to_full_bz(grid, out=out) is obj and obj.mat is out
+    expected = np.zeros((16, 1, 1), dtype=np.complex128)
+    expected[grid.irrk_ind] = payload * grid.irrk_count[:, None, None]
+    assert np.array_equal(out, expected) and np.isclose(out.sum(), payload[grid.irrk_inv.ravel()].sum())
+    fresh = IAmNonLocal(mat=payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True).scatter_to_full_bz(grid)
+    assert np.array_equal(fresh.mat, expected)
+    decompressed = IAmNonLocal(mat=np.zeros((4, 4, 1, 1, 1)), nq=(4, 4, 1), has_compressed_q_dimension=False)
+    with pytest.raises(ValueError):
+        decompressed.scatter_to_full_bz(grid)
+
+
 def test_map_to_full_bz_auto_2idx_reconstructs_H_exactly(c128_storage):
     """End-to-end: pick auto IBZ slice of H, _map_to_full_bz should reproduce H."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)

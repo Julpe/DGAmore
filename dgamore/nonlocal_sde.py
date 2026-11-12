@@ -27,6 +27,7 @@ import mpi4py.MPI as MPI
 import numpy as np
 import scipy as sp
 from scipy import optimize as opt
+from scipy.sparse.csgraph import connected_components
 
 import dgamore.config as config
 import dgamore.mpi_utils as mpi_utils
@@ -46,7 +47,7 @@ from dgamore.jacobian_stabilization import (
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.lambda_ops import LambdaAnnealer, LambdaCorrection, MultiOrbitalLambdaCorrection
 from dgamore.matsubara_frequencies import MFHelper
-from dgamore import memory_estimator
+from dgamore import memory_estimator, symmetry_reduction
 from dgamore.memory_estimator import SLICE_CHUNK_BYTES
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import DTYPE, SpinChannel, deferred_collection
@@ -1544,10 +1545,25 @@ class _ColumnSdeStream:
     the fixed rank order of the schedule. With ``by_frequency`` every block holds one stored frequency and the groups
     pass the blocks in the schedule's order whatever their sizes, so an output depends on the box, the rank count and
     its own terms only, never on the groups, ``chunk_bytes`` or the other outputs beyond the rounding of the batched
-    unfold, whose batch widths they set; without it the only group is the whole bosonic range. Beyond the read-only
+    unfold, whose batch widths they set; without it the only group is the whole bosonic range.
+
+    On a grid with a discovered point group of real orbital rotations
+    (:meth:`~dgamore.brillouin_zone.KGrid.auto_point_group`) :meth:`finish` averages every result over the group
+    before it is gathered (:func:`~dgamore.symmetry_reduction.project_onto_point_group`), so an output is the part of
+    the contraction that obeys the group, to which the contraction of an invariant kernel with an invariant Green's
+    function is equal. With invariant Green's functions that average is all the unfold contributes: a group passed
+    as ``symmetric`` scatters its columns instead (:meth:`FourPoint.scatter_to_full_bz`: the irreducible rows
+    weighted by their stars, no rotation), and a time-reversed column stays the conjugate at fixed
+    :math:`\mathbf{R}`, which then sums the mirrored wedge. Both routes agree to rounding. Beyond the read-only
     kernels and windows a rank holds one round of irreducible columns of every kernel, under two batches of full-BZ
     columns, and per output its owned results, at most one running sum of a frequency another rank owns and the partial
     sums of the tasks of a batch.
+
+    A kernel whose last orbital pair never leaves an orbital block (an atom-diagonal interaction gives
+    :math:`K_{a12b} = 0` unless :math:`2` and :math:`b` lie on one atom) is transposed, transformed and contracted on
+    the components of those blocks alone (:meth:`_last_pair_layout`), wherever the columns reach the full BZ without
+    an orbital rotation: on a grid without orbital rotations, and for scattered columns. The other components are zero
+    everywhere, so only the order of the contraction's sum, and with it the rounding, differs from all components.
     """
 
     _TRANSPOSE_TAG, _PARTIAL_TAG = 1200, 1300  # base MPI tags of the column transpose and the partial sums
@@ -1582,9 +1598,14 @@ class _ColumnSdeStream:
         self._results = [np.empty((self._my_v.size, n_r, nb, nb), dtype=dtype) for _ in range(n_out)]
         self._sums = [{} for _ in range(n_out)]
         self._w_next = 0
+        self._actions = config.lattice.k_grid.auto_point_group(real_space=True)
 
     def add_group(
-        self, w_window: tuple[int, int], kernels: list[FourPoint], terms: list[tuple[int, int, np.ndarray, int]]
+        self,
+        w_window: tuple[int, int],
+        kernels: list[FourPoint],
+        terms: list[tuple[int, int, np.ndarray, int]],
+        symmetric: bool = False,
     ) -> None:
         r"""
         Contracts the columns of the group's tasks into the running sums (collective; every rank passes the same
@@ -1597,6 +1618,8 @@ class _ColumnSdeStream:
         :param terms: The terms as ``(kernel index, output index, g_r, giwk_niv)``: the frequency-first real-space
             Green's function (see :func:`_build_rspace_giwk_window`) and its central fermionic-frequency index; only
             read.
+        :param symmetric: Whether every kernel and Green's function of the group obeys the grid's point group, so
+            the columns are scattered instead of unfolded; read only where the results are averaged over the group.
         :return: None.
         :raises ValueError: If the window does not continue the previous group inside the bosonic range (without
             ``by_frequency``: is not the whole range), or a kernel does not hold the window's frequencies.
@@ -1612,6 +1635,10 @@ class _ColumnSdeStream:
         if any(kernel.mat.shape[-2] != w1 - w0 for kernel in kernels):
             raise ValueError(f"A kernel does not hold the {w1 - w0} bosonic frequencies of the group ({w0}, {w1}).")
         self._w_next = w1
+        # the unfold of an auto grid rotates the orbitals and needs every component of a column
+        scattered = symmetric and self._actions is not None
+        layouts = [self._last_pair_layout(kernel) if scattered or not k_grid.is_auto else None for kernel in kernels]
+        shapes = [(nb,) * 4 if layout is None else (len(layout[1][0]), 1, 1, 1) for layout in layouts]
         blocks, bounds, n_b = self._blocks, self._bounds, len(self._blocks)
         in_group = np.array([w0 <= ws[0] < w1 for _, ws in blocks])
         tasks_of = [np.flatnonzero(in_group[np.arange(lo, hi) % n_b]) + lo for lo, hi in zip(bounds[:-1], bounds[1:])]
@@ -1665,8 +1692,10 @@ class _ColumnSdeStream:
                 round_of = [tasks[k * per_round : (k + 1) * per_round] for tasks in tasks_of]
                 index_of = [columns(tasks) for tasks in round_of]
                 received = [
-                    mpi_utils.transpose_columns(kernel.mat, self._dist, index_of, self._TRANSPOSE_TAG)
-                    for kernel in kernels
+                    mpi_utils.transpose_columns(
+                        kernel.mat, self._dist, index_of, self._TRANSPOSE_TAG, None if layout is None else layout[1]
+                    )
+                    for kernel, layout in zip(kernels, layouts)
                 ]
                 # this rank's columns as (task, bosonic frequency), in the order of its received blocks
                 mine = [(t, w) for t in round_of[rank] for w in blocks[t % n_b][1]]
@@ -1676,11 +1705,16 @@ class _ColumnSdeStream:
                     for t, _ in chunk:
                         if t not in partials:
                             partials[t] = [np.zeros((n_r, nb, nb), dtype=self._dtype) for _ in self._sums]
-                    out_buf = buffer[: len(chunk) * n_column].reshape(n_r, nb, nb, nb, nb, len(chunk))
                     for i, block in enumerate(received):
-                        src = block[..., c0 : c0 + len(chunk)]
+                        n_values = len(chunk) * n_r * int(np.prod(shapes[i]))
+                        out_buf = buffer[:n_values].reshape(n_r, *shapes[i], len(chunk))
+                        src = block[..., c0 : c0 + len(chunk)].reshape(-1, *shapes[i], len(chunk))
                         cols = FourPoint(src, SpinChannel.NONE, config.lattice.nk, 1, 0, False, True, True)
-                        cols = cols.map_to_full_bz(k_grid, out=out_buf).fft(copy=False, axes=(2, 1, 0))
+                        if scattered:
+                            cols = cols.scatter_to_full_bz(k_grid, out=out_buf)
+                        else:
+                            cols = cols.map_to_full_bz(k_grid, out=out_buf)
+                        cols = cols.fft(copy=False, axes=(2, 1, 0))
                         for j, (t, w) in enumerate(chunk):
                             v, negative = t // n_b, blocks[t % n_b][0]
                             col = FourPoint(
@@ -1692,14 +1726,17 @@ class _ColumnSdeStream:
                             k_mat = col.mat[..., 0]
                             for _, out, g_r, giwk_niv in (term for term in terms if term[0] == i):
                                 g_slab = g_r[giwk_niv + (w if negative else -w) + v]
-                                for r0 in range(0, n_r, rows):
-                                    np.einsum(
-                                        "Rad,Raijd->Rij",
-                                        g_slab[r0 : r0 + rows],
-                                        k_mat[r0 : r0 + rows],
-                                        out=acc[r0 : r0 + rows],
-                                        optimize=path,
-                                    )
+                                if layouts[i] is not None:
+                                    self._contract_blocks(g_slab, k_mat, layouts[i][0], acc, rows)
+                                else:
+                                    for r0 in range(0, n_r, rows):
+                                        np.einsum(
+                                            "Rad,Raijd->Rij",
+                                            g_slab[r0 : r0 + rows],
+                                            k_mat[r0 : r0 + rows],
+                                            out=acc[r0 : r0 + rows],
+                                            optimize=path,
+                                        )
                                 np.add(partials[t][out], acc, out=partials[t][out])
                         cols.free()
                     # every task except one continuing into the next batch is complete
@@ -1710,10 +1747,62 @@ class _ColumnSdeStream:
                 if k + 1 in report_at:
                     config.logger.info(f"Self-energy contraction: {k + 1} of {n_rounds} column rounds done.")
 
+    def _last_pair_layout(self, kernel: FourPoint) -> tuple[list[np.ndarray], tuple[np.ndarray, ...]] | None:
+        r"""
+        Returns the orbital blocks of a kernel's last orbital pair (collective): the finest partition of the orbitals
+        such that every component :math:`K_{a12b}` that is non-zero on any rank has :math:`2` and :math:`b` in one
+        block. An atom-diagonal interaction leaves the atoms as blocks.
+
+        :param kernel: The rank-local kernel ``[q, o1, o2, o3, o4, w, v]``; only read.
+        :return: The tuple of the blocks (orbital index arrays) and the kernel indices ``(o1, o2, o3, o4)`` of their
+            components, block after block and within a block in the order :math:`(1, 2, a, b)`; None when the
+            orbitals form a single block.
+        """
+        pairs = kernel.nonzero_orbital_components().any(axis=(0, 1))
+        if self._dist.mpi_size > 1:
+            pairs = np.logical_or.reduce(self._dist.comm.allgather(pairs))
+        n_blocks, labels = connected_components(pairs, directed=False)
+        if n_blocks == 1:
+            return None
+        everyone = np.arange(len(pairs))
+        orbital_blocks = [np.flatnonzero(labels == b) for b in range(n_blocks)]
+        grids = [np.meshgrid(everyone, block, everyone, block, indexing="ij") for block in orbital_blocks]
+        o2, o3, o1, o4 = (np.concatenate([grid[axis].ravel() for grid in grids]) for axis in range(4))
+        return orbital_blocks, (o1, o2, o3, o4)
+
+    @staticmethod
+    def _contract_blocks(
+        g_slab: np.ndarray, k_mat: np.ndarray, orbital_blocks: list[np.ndarray], acc: np.ndarray, rows: int
+    ) -> None:
+        r"""
+        Writes the contraction :math:`\sum_{ab} K_{a12b} G_{ab}` of one column stored on the orbital blocks of its
+        last pair (see :meth:`_last_pair_layout`) into ``acc``: per block and real-space point one matrix-vector
+        product over :math:`(a, b)`, in chunks of real-space rows.
+
+        :param g_slab: The Green's function slab ``[R, a, b]``; only read.
+        :param k_mat: The transformed column, its components along the first axis after ``R``; only read.
+        :param orbital_blocks: The orbital blocks of the layout.
+        :param acc: The contraction ``[R, 1, 2]``; every entry is written.
+        :param rows: Number of real-space rows of a chunk.
+        :return: None.
+        """
+        n_r, nb = acc.shape[:2]
+        k_mat = k_mat.reshape(n_r, -1)
+        offset = 0
+        for block in orbital_blocks:
+            m = nb * len(block)
+            for r0 in range(0, n_r, rows):
+                kernel_rows = k_mat[r0 : r0 + rows, offset : offset + m * m].reshape(-1, m, m)  # [R, (1 2), (a b)]
+                g_rows = g_slab[r0 : r0 + rows][:, :, block].reshape(-1, m)
+                product = np.einsum("Rpc,Rc->Rp", kernel_rows, g_rows)
+                acc[r0 : r0 + rows, :, block] = product.reshape(-1, nb, len(block))
+            offset += m * m
+
     def finish(self, out: int) -> SelfEnergy | None:
         r"""
         Reduces output ``out`` after the last group (collective): the owner of :math:`\nu` folds the other ranks' sums
-        in rank order, rank 0 gathers the result, and the output's slabs are released.
+        in rank order and, on a grid with a point group, averages the result over it; rank 0 gathers the result, and
+        the output's slabs are released.
 
         :param out: The output index.
         :return: The real-space self-energy :class:`SelfEnergy` of the output for :math:`\nu \geq 0` (compressed
@@ -1741,6 +1830,8 @@ class _ColumnSdeStream:
             for r in ranks_of(v):
                 if r != rank:
                     result[i] += next(received)
+            if self._actions is not None:
+                result[i] = symmetry_reduction.project_onto_point_group(result[i], *self._actions)
         del sends, sums
 
         full = MpiDistributor(ntasks=config.box.niv_core, comm=comm, sizes=np.bincount(owner, minlength=size)).gather(
@@ -1764,6 +1855,7 @@ def _run_column_sde(
     g_r: np.ndarray,
     giwk_niv: int,
     chunk_bytes: int | None = None,
+    symmetric: bool = False,
 ) -> SelfEnergy | None:
     r"""
     Contracts the self-energy kernel with the Green's function,
@@ -1783,13 +1875,87 @@ def _run_column_sde(
     :param g_r: The frequency-first real-space Green's function from :func:`_build_rspace_giwk_window`.
     :param giwk_niv: The central fermionic-frequency index of ``g_r`` (``giwk.niv``).
     :param chunk_bytes: Byte budget of one round of transposed irreducible columns (``None`` uses the floor).
+    :param symmetric: Whether the kernel and the Green's function obey the grid's point group, so the columns are
+        scattered instead of unfolded (see :class:`_ColumnSdeStream`).
     :return: The real-space self-energy :class:`SelfEnergy` for :math:`\nu \geq 0` (compressed momentum axis, moments
         not fitted) on rank 0; ``None`` elsewhere. Transform it back with :meth:`SelfEnergy.ifft` and complete it
         with :meth:`SelfEnergy.to_full_niv_range`.
     """
     stream = _ColumnSdeStream(mpi_dist_irrk, 1, kernel_irr.mat.dtype, chunk_bytes)
-    stream.add_group((0, config.box.niw_core + 1), [kernel_irr], [(0, 0, g_r, giwk_niv)])
+    stream.add_group((0, config.box.niw_core + 1), [kernel_irr], [(0, 0, g_r, giwk_niv)], symmetric)
     return stream.finish(0)
+
+
+def _has_point_group_covariance(mat: np.ndarray, comm: MPI.Comm | None = None, bound: float | None = None) -> bool:
+    r"""
+    Returns whether a momentum-resolved orbital matrix (a dispersion, Green's function or self-energy) obeys the
+    grid's point group, :math:`G^{(g\mathbf{k},\nu)} = U_g G^{(\mathbf{k},\nu)} U_g^\dagger` for every element, to
+    ``bound`` relative to its largest entry; False on a grid whose contraction does not average its results over a
+    group (see :class:`_ColumnSdeStream`). A momentum-local matrix (a single momentum) obeys it when every rotation
+    leaves it unchanged. Collective over ``comm``: every rank checks its share of the momenta in blocks of rows
+    against the rows of their images, so no copy of its share is held, and all ranks return the same answer.
+
+    :param mat: The matrix ``[k..., o1, o2, v]`` on the whole grid or on a single momentum, whole on every rank; only
+        read.
+    :param comm: The MPI communicator, or ``None`` for a single rank.
+    :param bound: The relative bound; ``None`` takes ``1e-6`` for single and ``1e-12`` for double precision, above
+        the rounding of the storage and of the rotations, which are known to about ``1e-14``.
+    :return: Whether the matrix obeys every element on every momentum and frequency.
+    """
+    actions = config.lattice.k_grid.auto_point_group()
+    if actions is None:
+        return False
+    nb = mat.shape[-2]
+    mat = np.reshape(mat, (-1, nb, nb, mat.shape[-1]), copy=False)
+    if bound is None:
+        bound = 1e-6 if mat.dtype == np.complex64 else 1e-12
+    maps, us = actions[0][1:], actions[1][1:].astype(mat.real.dtype)
+    size, rank = (comm.size, comm.rank) if comm is not None else (1, 0)
+    first, last = rank * len(mat) // size, (rank + 1) * len(mat) // size
+    diff = scale = 0.0
+    for r0 in range(first, last, 64):
+        rows = mat[r0 : min(r0 + 64, last)]
+        scale = max(scale, float(np.abs(rows).max()))
+        for idx, u in zip(maps, us):
+            rotated = np.einsum("ab,kbcv,dc->kadv", u, rows, u, optimize=True)
+            diff = max(diff, float(np.abs(mat[idx[r0 : r0 + len(rows)]] - rotated).max()))
+    if size > 1:
+        diff, scale = (max(values) for values in zip(*comm.allgather((diff, scale))))
+    return diff <= bound * scale
+
+
+def _lattice_sum_momenta(
+    sigma: SelfEnergy,
+    donor: SelfEnergy,
+    mpi_dist_irrk: MpiDistributor,
+    mpi_dist_fullbz: MpiDistributor,
+    comm: MPI.Comm,
+) -> tuple[np.ndarray, MpiDistributor, tuple[np.ndarray, np.ndarray] | None]:
+    r"""
+    Returns the momenta the lattice sums of the chemical-potential search and of the occupation run over, as the
+    ``sigma_mat``, ``mpi_dist`` and ``wedge`` of :func:`~dgamore.greens_function.update_mu`: the irreducible momenta
+    with the sizes of their stars when the self-energy acts on every orbital of the dispersion and the dispersion,
+    the self-energy and its momentum-local shell donor obey the grid's point group (see
+    :func:`_has_point_group_covariance`; the dispersion to the bound of the self-energy's precision), every momentum
+    of the grid otherwise. Collective over ``comm``.
+
+    :param sigma: The self-energy ``[k, o1, o2, v]`` (compressed momentum axis), whole on every rank; only read.
+    :param donor: The momentum-local self-energy of the frequencies beyond those of ``sigma``; only read.
+    :param mpi_dist_irrk: MPI distributor over the irreducible momenta (see :class:`MpiDistributor`).
+    :param mpi_dist_fullbz: MPI distributor over the momenta of the whole grid.
+    :param comm: The MPI communicator.
+    :return: This rank's rows of the self-energy (a copy of its irreducible rows, or a view of its share of the
+        grid), the distributor of those rows and the irreducible indices with their star sizes (``None`` for the
+        whole grid).
+    """
+    k_grid = config.lattice.k_grid
+    if config.sys.correlated_orbitals is None and k_grid.auto_point_group() is not None:
+        bound = 1e-6 if sigma.mat.dtype == np.complex64 else 1e-12
+        inputs = ((config.lattice.hamiltonian.get_ek()[..., None], bound), (donor.mat, None), (sigma.mat, None))
+        if all(_has_point_group_covariance(mat, comm, bound) for mat, bound in inputs):
+            wedge = (k_grid.irrk_ind, k_grid.irrk_count)
+            return sigma.mat[k_grid.irrk_ind[mpi_dist_irrk.my_slice]], mpi_dist_irrk, wedge
+    return sigma.mat[mpi_dist_fullbz.my_slice], mpi_dist_fullbz, None
 
 
 def _sde_tail_moment(kernel: FourPoint, mpi_dist_irrk: MpiDistributor) -> np.ndarray | None:
@@ -2228,7 +2394,10 @@ def _share_sigma_per_node(
 
 
 def _occupation_self_energy(
-    sigma_new: SelfEnergy, sigma_dmft_full: SelfEnergy, mpi_dist_fullbz: MpiDistributor
+    sigma_new: SelfEnergy,
+    sigma_dmft_full: SelfEnergy,
+    mpi_dist_fullbz: MpiDistributor,
+    rows: np.ndarray | None = None,
 ) -> SelfEnergy:
     r"""
     Returns this rank's momentum slice of the self-energy the occupation is evaluated with: ``sigma_new`` on its own
@@ -2239,19 +2408,16 @@ def _occupation_self_energy(
     :param sigma_new: The mixed :class:`SelfEnergy` (full BZ, identical on every rank; compressed in place).
     :param sigma_dmft_full: The DMFT :class:`SelfEnergy` supplying the shell frequencies (momentum-local).
     :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
+    :param rows: The flat grid indices of this rank's momenta, or ``None`` for its slice of ``mpi_dist_fullbz``.
     :return: The concatenated :class:`SelfEnergy` of this rank's momenta (compressed momentum axis, moments set).
     """
+    rows = mpi_dist_fullbz.my_slice if rows is None else rows
+    mat = sigma_new.compress_q_dimension().mat[rows]
     sigma_slice = SelfEnergy(
-        sigma_new.compress_q_dimension().mat[mpi_dist_fullbz.my_slice],
-        (mpi_dist_fullbz.my_size, 1, 1),
-        has_compressed_q_dimension=True,
-        calc_smom=False,
-        beta=config.sys.beta,
+        mat, (len(mat), 1, 1), has_compressed_q_dimension=True, calc_smom=False, beta=config.sys.beta
     )
     shell_offset = sigma_new.shell_offset_from(sigma_dmft_full)
-    sigma_occ = sigma_slice.concatenate_self_energies(
-        sigma_dmft_full, shell_offset=shell_offset[mpi_dist_fullbz.my_slice]
-    )
+    sigma_occ = sigma_slice.concatenate_self_energies(sigma_dmft_full, shell_offset=shell_offset[rows])
 
     # the full-box moments come from the k-mean fit window of the replicated sigma_new, so rank 0 fits them once
     # (the fit window is a full-BZ array) and broadcasts; the fit equals the momentum-resolved concatenation's fit
@@ -2265,7 +2431,7 @@ def _occupation_self_energy(
 
 
 def _slice_occupation_and_energies(
-    sigma_occ: SelfEnergy, mu: float, mpi_dist_fullbz: MpiDistributor
+    sigma_occ: SelfEnergy, mu: float, rows: slice | np.ndarray, weights: np.ndarray | None = None
 ) -> tuple[np.ndarray, float, float]:
     r"""
     Returns the k-resolved occupation and the kinetic and potential energies of this rank's momentum slice, which
@@ -2274,26 +2440,30 @@ def _slice_occupation_and_energies(
 
     :param sigma_occ: This rank's concatenated self-energy slice (see :func:`_occupation_self_energy`).
     :param mu: Chemical potential :math:`\mu`.
-    :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
+    :param rows: The flat grid indices of this rank's momenta.
+    :param weights: A weight per momentum of the slice in its energy sums (the size of the star of an irreducible
+        momentum), or ``None`` for the plain sums.
     :return: The tuple ``(occ_k_slice, ekin, epot)`` of this rank's k-resolved occupation ``[k, 1, 1, o1, o2]`` on
-        every orbital of H(k) and its momentum-averaged kinetic and potential energies.
+        every orbital of H(k) and its kinetic and potential energy sums divided by its number of momenta.
     """
-    nk_tot, n_my = config.lattice.k_grid.nk_tot, mpi_dist_fullbz.my_size
     ek = config.lattice.hamiltonian.get_ek()
     n_orbitals = ek.shape[-1]
-    ek_slice = ek.reshape(nk_tot, n_orbitals, n_orbitals)[mpi_dist_fullbz.my_slice]
-    ek_slice = ek_slice.reshape(n_my, 1, 1, n_orbitals, n_orbitals)
+    ek_slice = ek.reshape(-1, n_orbitals, n_orbitals)[rows].reshape(-1, 1, 1, n_orbitals, n_orbitals)
     giwk_occ = GreensFunction.get_g_full(
         sigma_occ, mu, ek_slice, config.sys.beta, orbitals=config.sys.correlated_orbitals
     )
     _, _, occ_k_slice = giwk_occ.get_fill_nonlocal(real_dispersion=np.isrealobj(np.real_if_close(ek)))
-    ekin, epot = giwk_occ.get_ekin(), giwk_occ.get_epot()
+    ekin, epot = giwk_occ.get_ekin(weights), giwk_occ.get_epot(weights=weights)
     giwk_occ.free()
     return occ_k_slice, ekin, epot
 
 
 def _update_occ_and_energies_distributed(
-    sigma_new: SelfEnergy, sigma_dmft_full: SelfEnergy, mpi_dist_fullbz: MpiDistributor, mu: float
+    sigma_new: SelfEnergy,
+    sigma_dmft_full: SelfEnergy,
+    mpi_dist_fullbz: MpiDistributor,
+    mu: float,
+    mpi_dist_irrk: MpiDistributor | None = None,
 ) -> tuple[float, np.ndarray, np.ndarray, float, float]:
     r"""
     Computes the occupation and the kinetic and potential energies of the mixed self-energy on the DMFT frequency
@@ -2308,36 +2478,47 @@ def _update_occ_and_energies_distributed(
     momentum-dependent constant the mixed self-energy carries in its shell (see
     :meth:`SelfEnergy.shell_offset_from`) is carried into the DMFT-box extension and its moment fit.
 
+    With ``mpi_dist_irrk`` the ranks evaluate the irreducible momenta only, for a dispersion and a self-energy that
+    obey the grid's point group (see :func:`_lattice_sum_momenta`): the energy sums weight every irreducible
+    momentum with the size of its star, and the k-resolved occupation is unfolded from the irreducible momenta (see
+    :func:`_assemble_occupation`).
+
     :param sigma_new: The mixed :class:`SelfEnergy` (full BZ, compressed momenta, identical on every rank).
     :param sigma_dmft_full: The DMFT :class:`SelfEnergy` supplying the shell frequencies (momentum-local).
     :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
     :param mu: Chemical potential :math:`\mu`.
+    :param mpi_dist_irrk: MPI distributor over the irreducible momenta, or ``None`` to evaluate every momentum.
     :return: The tuple ``(n, occ, occ_k, ekin, epot)``: total filling over every orbital, k-averaged ``[o1, o2]``
         and k-resolved ``[kx, ky, kz, o1, o2]`` occupation of the correlated orbitals, and the kinetic and potential
         energies per site.
     """
-    nk_tot = config.lattice.k_grid.nk_tot
+    k_grid = config.lattice.k_grid
     n_orbitals = config.lattice.hamiltonian.get_ek().shape[-1]
-    n_my = mpi_dist_fullbz.my_size
+    dist, rows, weights = mpi_dist_fullbz, mpi_dist_fullbz.my_slice, None
+    if mpi_dist_irrk is not None:
+        dist = mpi_dist_irrk
+        rows, weights = k_grid.irrk_ind[dist.my_slice], k_grid.irrk_count[dist.my_slice]
+    n_my = dist.my_size
 
-    sigma_occ = _occupation_self_energy(sigma_new, sigma_dmft_full, mpi_dist_fullbz)
+    sigma_occ = _occupation_self_energy(sigma_new, sigma_dmft_full, mpi_dist_fullbz, rows)
 
     # a rank without momenta (more ranks than momenta) adds nothing to the reductions below
     occ_k_slice, ekin, epot = np.zeros((0, 1, 1, n_orbitals, n_orbitals)), 0.0, 0.0
     if n_my:
-        occ_k_slice, ekin, epot = _slice_occupation_and_energies(sigma_occ, mu, mpi_dist_fullbz)
+        occ_k_slice, ekin, epot = _slice_occupation_and_energies(sigma_occ, mu, rows, weights)
     sigma_occ.free()
 
-    n_el, occ, occ_k = _assemble_occupation(occ_k_slice, mpi_dist_fullbz, config.sys.correlated_orbitals)
+    unfold = mpi_dist_irrk is not None
+    n_el, occ, occ_k = _assemble_occupation(occ_k_slice, dist, config.sys.correlated_orbitals, unfold)
     scalars = np.array([ekin, epot]) * n_my
-    if mpi_dist_fullbz.mpi_size > 1:
-        scalars = mpi_dist_fullbz.comm.allreduce(scalars)
-    ekin, epot = scalars / nk_tot
+    if dist.mpi_size > 1:
+        scalars = dist.comm.allreduce(scalars)
+    ekin, epot = scalars / k_grid.nk_tot
     return n_el, occ, occ_k, float(ekin), float(epot)
 
 
 def _assemble_occupation(
-    occ_k_slice: np.ndarray, mpi_dist_fullbz: MpiDistributor, orbitals: np.ndarray | None = None
+    occ_k_slice: np.ndarray, mpi_dist: MpiDistributor, orbitals: np.ndarray | None = None, unfold: bool = False
 ) -> tuple[float, np.ndarray, np.ndarray]:
     r"""
     Assembles the k-resolved occupation from the momentum slices the ranks evaluated and derives the k-averaged
@@ -2347,19 +2528,28 @@ def _assemble_occupation(
     fill's dtype is value-dependent (a real-matrix eigendecomposition returns float when a slice's eigenvalues are
     all real) and ranks entering a collective with different element types abort with truncated messages.
 
+    With ``unfold`` the slices are those of the irreducible momenta, and the occupation of the whole grid is their
+    unfold under the grid's point group, every momentum the image of its irreducible one (see
+    :func:`~dgamore.symmetry_reduction.project_onto_point_group`).
+
     :param occ_k_slice: This rank's k-resolved occupation ``[kx, ky, kz, o1, o2]`` on its momentum slice.
-    :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
+    :param mpi_dist: MPI distributor over the full BZ q-points, with ``unfold`` over the irreducible ones.
     :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals); None
         when it acts on every orbital.
+    :param unfold: Whether the slices hold the irreducible momenta.
     :return: A tuple of the total filling :math:`n` over every orbital, and the k-averaged ``[o1, o2]`` and the
         k-resolved ``[kx, ky, kz, o1, o2]`` occupation of the correlated orbitals on the full grid.
     """
-    nk_tot, n_bands, n_my = config.lattice.k_grid.nk_tot, occ_k_slice.shape[-1], mpi_dist_fullbz.my_size
-    occ_k = np.zeros((nk_tot, n_bands, n_bands), dtype=np.complex128)
-    occ_k[mpi_dist_fullbz.my_slice] = occ_k_slice.reshape(n_my, n_bands, n_bands)
-    if mpi_dist_fullbz.mpi_size > 1:
-        occ_k = mpi_dist_fullbz.allreduce(occ_k)
-    occ_k = occ_k.reshape(*config.lattice.k_grid.nk, n_bands, n_bands)
+    k_grid, n_bands, n_my = config.lattice.k_grid, occ_k_slice.shape[-1], mpi_dist.my_size
+    occ_k = np.zeros((k_grid.nk_irr if unfold else k_grid.nk_tot, n_bands, n_bands), dtype=np.complex128)
+    occ_k[mpi_dist.my_slice] = occ_k_slice.reshape(n_my, n_bands, n_bands)
+    if mpi_dist.mpi_size > 1:
+        occ_k = mpi_dist.allreduce(occ_k)
+    if unfold:
+        occ_k *= k_grid.irrk_count[:, None, None]
+        actions = k_grid.auto_point_group()
+        occ_k = symmetry_reduction.project_onto_point_group(occ_k, *actions, rows=k_grid.irrk_ind)
+    occ_k = occ_k.reshape(*k_grid.nk, n_bands, n_bands)
     occ = np.mean(occ_k, axis=(0, 1, 2))
     occ.real[np.abs(occ) < 1e-12] = 0.0
     return 2.0 * np.trace(occ).real, orbital_block(occ, orbitals), orbital_block(occ_k, orbitals)
@@ -2421,14 +2611,21 @@ def _orbital_involution(ek: np.ndarray, orbitals: np.ndarray | None = None) -> n
 
 
 def _finish_proposal_on_node(
-    core: SelfEnergy | None, donor: SelfEnergy | None, shell_offset: np.ndarray | None, average: bool, node_comm
+    core: SelfEnergy | None,
+    donor: SelfEnergy | None,
+    shell_offset: np.ndarray | None,
+    average: bool,
+    node_comm,
+    unfold: bool = False,
 ) -> tuple[SelfEnergy | None, float | None]:
     r"""
-    Concatenates rank 0's core-box proposal with its shell donor (see :meth:`SelfEnergy.concatenate_self_energies`)
-    and, with ``average``, averages it with its time-reversed partner (see
-    :meth:`SelfEnergy.symmetrize_time_reversal`), every rank of rank 0's node building its own contiguous share of the
-    result's frequencies in one shared-memory window. Every frequency is built on its own, so the result holds the bits
-    of rank 0 building it alone. The other ranks sleep while rank 0 finishes the core (see
+    Concatenates rank 0's core-box proposal with its shell donor (see :meth:`SelfEnergy.concatenate_self_energies`),
+    with ``unfold`` overwrites core frequencies that obey the grid's point group to rounding (see
+    :func:`_has_point_group_covariance`) with the unfold of their irreducible momenta (see
+    :meth:`SelfEnergy.unfold_irreducible_momenta`) and, with ``average``, averages it with its time-reversed partner
+    (see :meth:`SelfEnergy.symmetrize_time_reversal`), every rank of rank 0's node building its own contiguous share
+    of the result's frequencies in one shared-memory window. Every frequency is built on its own, so the result holds
+    the bits of rank 0 building it alone. The other ranks sleep while rank 0 finishes the core (see
     :func:`dgamore.mpi_utils.idle_barrier`). Collective over ``node_comm``, whose root is rank 0.
 
     :param core: The core-box proposal on rank 0; ignored elsewhere.
@@ -2437,6 +2634,10 @@ def _finish_proposal_on_node(
         ignored elsewhere.
     :param average: Whether the proposal is averaged with its time-reversed partner; only read on rank 0.
     :param node_comm: The node-local communicator of rank 0's node.
+    :param unfold: Whether core frequencies (the contraction's own) that obey the grid's point group to rounding
+        are unfolded from their irreducible momenta before the average, so they obey it without rounding on every
+        momentum; a core that does not obey the group, e.g. through a local term that breaks it, is kept. Only read
+        on rank 0.
     :return: The tuple ``(sigma, removed)`` of rank 0's private full-box proposal (compressed momentum axis) and the
         largest change of the average (``None`` without it); ``(None, None)`` on every other rank.
     """
@@ -2446,8 +2647,8 @@ def _finish_proposal_on_node(
     if root:
         core = core.compress_q_dimension()
         mat, core.mat = core.mat, None
-    blob = pickle.dumps((core, donor, shell_offset, average, mat.shape, mat.dtype)) if root else None
-    core, donor, shell_offset, average, shape, dtype = pickle.loads(node_comm.bcast(blob, root=0))
+    blob = pickle.dumps((core, donor, shell_offset, average, unfold, mat.shape, mat.dtype)) if root else None
+    core, donor, shell_offset, average, unfold, shape, dtype = pickle.loads(node_comm.bcast(blob, root=0))
     core_mat, core_win = mpi_utils.allocate_node_shared_array(node_comm, shape, dtype)
     if root and core_win is None:
         core_mat = mat
@@ -2468,6 +2669,11 @@ def _finish_proposal_on_node(
     if root:
         sigma = SelfEnergy(out, sigma.nq, sigma.full_niv_range, True, False, beta=sigma._beta)
     mpi_utils.idle_barrier(node_comm)
+    # the contraction's own frequencies; the shell is its donor's, which no contraction has averaged
+    core_lo, core_hi = (n_v - shape[-1]) // 2, (n_v + shape[-1]) // 2
+    if unfold and _has_point_group_covariance(out[..., core_lo:core_hi], node_comm if out_win is not None else None):
+        inside = slice(max(mine.start, core_lo), min(mine.stop, core_hi))
+        sigma.unfold_irreducible_momenta(config.lattice.k_grid, frequencies=inside)
     removed = sigma.symmetrize_time_reversal(frequencies=mine) if average else None
     removed = node_comm.allgather(removed)
     removed = max(removed) if average else None
@@ -2509,8 +2715,11 @@ def calculate_sigma_proposal(
     :meth:`~dgamore.self_energy.SelfEnergy.symmetrize_time_reversal`): the Schwinger-Dyson equation is one-sided,
     with the three-leg vertex on the first external orbital and the interaction on the second, time reversal maps it
     onto the mirrored form, and the average is the two-sided equation. One band needs no average, its one-sided
-    equation already obeys time reversal. An orbital permutation that transposes the dispersion (see
-    :func:`_orbital_involution`) reaches the Bethe-Salpeter slices of both channels. In the bare-vertex modes
+    equation already obeys time reversal. On a grid with a discovered point group of real orbital rotations the
+    contraction averages its result over the group and, where the Green's function obeys the group, scatters its
+    kernel columns instead of unfolding them (see :class:`_ColumnSdeStream`). An orbital permutation that transposes
+    the dispersion (see :func:`_orbital_involution`) reaches the bubble and the Bethe-Salpeter slices of both
+    channels. In the bare-vertex modes
     (``config.misc.do_flex``, ``config.misc.do_rpa``) no local vertex is loaded and no Bethe-Salpeter slice is solved:
     the double-counting kernel takes the bare vertex (see :func:`calculate_bare_dc_kernel`) and each channel the RPA
     kernel of its RPA susceptibility (see :func:`calculate_rpa_kernel_r_q`), treated like the ladder's (see
@@ -2563,6 +2772,9 @@ def calculate_sigma_proposal(
     # giwk lives in one shared window per node, so the job holds one copy per node - not one per rank
     logger.log_memory_usage("giwk", giwk_full, mpi_utils.count_nodes(comm, shared_node_comm), per="node")
 
+    # an orbital permutation that transposes the dispersion halves the bubble's orbital components and reaches the
+    # Bethe-Salpeter slices of both channels
+    involution = _orbital_involution(config.lattice.hamiltonian.get_ek(), config.sys.correlated_orbitals)
     gchi0_q = BubbleGenerator.create_generalized_chi0_q_fft(
         mpi_dist_irrk,
         giwk_full,
@@ -2571,6 +2783,7 @@ def calculate_sigma_proposal(
         config.lattice.k_grid,
         config.sys.beta,
         node_comm=shared_node_comm,
+        involution=involution,
     )
 
     logger.log_memory_usage("Gchi0_q_full", gchi0_q, comm.size)
@@ -2656,7 +2869,6 @@ def calculate_sigma_proposal(
         if save_eliashberg:
             gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
 
-        involution = _orbital_involution(config.lattice.hamiltonian.get_ek(), config.sys.correlated_orbitals)
         if involution is not None and current_iter == 1:
             logger.info(
                 f"The orbital permutation {involution.tolist()} transposes the dispersion: Bethe-Salpeter slices that "
@@ -2725,6 +2937,11 @@ def calculate_sigma_proposal(
 
     logger.info("Starting calculation of DGA self-energy.")
 
+    # the kernel columns are scattered instead of unfolded where the Green's function obeys the point group
+    symmetric = _has_point_group_covariance(giwk_full.mat, comm)
+    if not symmetric and config.lattice.k_grid.auto_point_group() is not None:
+        logger.info("The Green's function obeys the point group only approximately: the kernel columns are unfolded.")
+
     # Column-distributed real-space contraction (the q-loop variant peaks HIGHER, see calculate_sigma_from_kernel);
     # the k-space giwk window is released once the R-space window is built, only giwk's dispersion is read later.
     g_r, g_r_win = _build_rspace_giwk_window(giwk_full, shared_node_comm)
@@ -2733,7 +2950,7 @@ def calculate_sigma_proposal(
         giwk_full.mat = None
     _free_shared_window(giwk_win, shared_node_comm)
 
-    sigma_prop = _run_column_sde(kernel, mpi_dist_irrk, g_r, giwk_niv, chunk_bytes)
+    sigma_prop = _run_column_sde(kernel, mpi_dist_irrk, g_r, giwk_niv, chunk_bytes, symmetric)
     kernel.free()
     g_r = None
     _free_shared_window(g_r_win, shared_node_comm)
@@ -2767,7 +2984,10 @@ def calculate_sigma_proposal(
             donor, shell_offset = _rpa_shell_donor(tail_moment, sigma_dmft.niv), (hartree + fock)[..., 0]
         # the one-sided SDE breaks Sigma(-k) = Sigma(k)^T for several orbitals; the average is the two-sided SDE
         average = sigma_prop.n_bands > 1 and _has_time_reversal(config.lattice.hamiltonian.get_ek())
-    sigma_prop, removed = _finish_proposal_on_node(sigma_prop, donor, shell_offset, average, shared_node_comm)
+    # a grid whose contraction averages over a point group gets the core of a proposal that obeys the group unfolded
+    # from its irreducible momenta, which removes the rounding of the transforms and of the terms added on rank 0
+    unfold = comm.rank == 0 and config.lattice.k_grid.auto_point_group() is not None
+    sigma_prop, removed = _finish_proposal_on_node(sigma_prop, donor, shell_offset, average, shared_node_comm, unfold)
     shared_node_comm.Free()
     if comm.rank != 0:
         return None
@@ -3561,25 +3781,28 @@ def calculate_self_energy_q(
         old_mu = mu_history[-1]
         n_freq = 1 if config.misc.do_rpa else None
         smom0, smom1 = comm.bcast(sigma_new.fit_smom(n_freq) if comm.rank == 0 else None, root=0)
+        donor = _rpa_shell_donor(smom1, sigma_dmft_full.niv) if config.misc.do_rpa else sigma_dmft_full
+        sigma_rows, mu_dist, wedge = _lattice_sum_momenta(sigma_new, donor, mpi_dist_irrk, mpi_dist_fullbz, comm)
         config.sys.mu = update_mu(
             old_mu,
             config.sys.n,
             config.lattice.hamiltonian.get_ek(),
-            sigma_new.mat[mpi_dist_fullbz.my_slice],
+            sigma_rows,
             config.sys.beta,
             smom0,
             logger=logger,
-            mpi_dist=mpi_dist_fullbz,
+            mpi_dist=mu_dist,
             orbitals=config.sys.correlated_orbitals,
+            wedge=wedge,
         )
+        del sigma_rows
         mu_history.append(config.sys.mu)
         logger.info(f"Updated mu from {old_mu} to {config.sys.mu}.")
 
         # new occupation matrix and energies from the new Green's function (outside the asympt region its shell is the
         # donor's: DMFT, or RPA mode's own tail); k-distributed, so no rank builds the whole DMFT-box Green's function
-        donor = _rpa_shell_donor(smom1, sigma_dmft_full.niv) if config.misc.do_rpa else sigma_dmft_full
         n_current, config.sys.occ, config.sys.occ_k, ekin, epot = _update_occ_and_energies_distributed(
-            sigma_new, donor, mpi_dist_fullbz, config.sys.mu
+            sigma_new, donor, mpi_dist_fullbz, config.sys.mu, mpi_dist_irrk if wedge is not None else None
         )
         logger.info(f"Filling of the updated Green's function: {n_current:.6f} (target {config.sys.n:.6f}).")
         logger.info(f"Kinetic energy: {ekin:.4f} [t or eV].")

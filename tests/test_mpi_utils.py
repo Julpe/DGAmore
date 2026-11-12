@@ -172,6 +172,25 @@ def test_transpose_columns_delivers_all_rows_of_each_ranks_columns(size, limit, 
         assert np.array_equal(out, full[..., cols_of[rank][0], cols_of[rank][1]])
 
 
+@pytest.mark.parametrize("size", [1, 3])
+def test_transpose_columns_gathers_only_the_given_components_of_the_middle_axes(size):
+    """With components the middle axes become one axis of the given index tuples, in the given order."""
+    rng = np.random.default_rng(size)
+    full = rng.standard_normal((7, 2, 3, 3, 4)) + 1j * rng.standard_normal((7, 2, 3, 3, 4))
+    components = (np.array([1, 0, 1]), np.array([2, 2, 0]))
+    order = rng.permutation(12)
+    cols_of = [(part // 4, part % 4) for part in np.array_split(order, size)]
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=7, comm=comm)
+        return mu.transpose_columns(full[d.my_slice].copy(), d, cols_of, base_tag=5, components=components)
+
+    _, res = run_parallel(size, fn)
+    for rank, out in enumerate(res):
+        expected = full[:, components[0], components[1]][..., cols_of[rank][0], cols_of[rank][1]]
+        assert out.shape == (7, 3, len(cols_of[rank][0])) and np.array_equal(out, expected)
+
+
 def test_exchange_blocks_matches_blocks_between_one_pair_in_posting_order():
     """Several blocks from one source arrive in the order both sides list them; one rank exchanges nothing."""
     blocks = [np.full((3, 2), float(i)) for i in range(4)]

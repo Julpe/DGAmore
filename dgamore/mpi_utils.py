@@ -842,7 +842,11 @@ class MpiDistributor:
 # ====================================================================================================================
 # Higher-level data-movement routines (column transpose, ordered block exchange).
 def transpose_columns(
-    local: np.ndarray, mpi_dist: MpiDistributor, cols_of: list[np.ndarray], base_tag: int = 0
+    local: np.ndarray,
+    mpi_dist: MpiDistributor,
+    cols_of: list[np.ndarray],
+    base_tag: int = 0,
+    components: tuple[np.ndarray, ...] | None = None,
 ) -> np.ndarray:
     r"""
     Transposes a row-distributed array into a column-distributed one. ``local`` holds this rank's rows
@@ -853,22 +857,35 @@ def transpose_columns(
     distance per step (the step's single send copy is freed before the next step), straight into the result, so no
     staging buffer is held.
 
+    With ``components`` only those index tuples of the middle axes travel: the result is
+    ``[n_rows, n_components, n_cols]``, gathered from ``local`` in the one copy a step sends.
+
     :param local: This rank's rows of the array; only read.
     :param mpi_dist: MPI distributor of the rows (its communicator and per-rank row slices).
     :param cols_of: The column index rows of every rank (identical on every rank).
     :param base_tag: Base MPI tag; successive chunks use ``base_tag + chunk_index``.
+    :param components: One index array per middle axis, all of one length: the index tuples of the middle axes to
+        transpose, in this order; ``None`` transposes every entry of the middle axes.
     :return: All rows of this rank's columns.
     """
     comm, rank, size = mpi_dist.comm, mpi_dist.my_rank, mpi_dist.mpi_size
     slices = mpi_dist.slices
     mine = cols_of[rank]
-    out = np.empty((mpi_dist.ntasks, *local.shape[1:-2], len(mine[0])), dtype=local.dtype)
-    out[slices[rank]] = local[..., mine[0], mine[1]]
+    middle = local.shape[1:-2] if components is None else (len(components[0]),)
+
+    def columns(cols: np.ndarray) -> np.ndarray:
+        """This rank's rows of the given columns (a copy)."""
+        if components is None:
+            return local[..., cols[0], cols[1]]
+        return local[(slice(None), *(c[:, None] for c in components), cols[0][None, :], cols[1][None, :])]
+
+    out = np.empty((mpi_dist.ntasks, *middle, len(mine[0])), dtype=local.dtype)
+    out[slices[rank]] = columns(mine)
     for step in range(1, size):
         dst, src = (rank + step) % size, (rank - step) % size
         reqs, send = [], None
         if local.shape[0] and len(cols_of[dst][0]):
-            send = np.ascontiguousarray(local[..., cols_of[dst][0], cols_of[dst][1]])
+            send = np.ascontiguousarray(columns(cols_of[dst]))
             reqs += _isend_rows(comm, send, dst, base_tag=base_tag, limit=MAX_MPI_BYTES)
         if slices[src].stop > slices[src].start and len(mine[0]):
             reqs += _irecv_rows_into(comm, out[slices[src]], src, base_tag=base_tag, limit=MAX_MPI_BYTES)

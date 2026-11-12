@@ -1073,6 +1073,46 @@ def test_contract_first_pair_with_local_vertex_matches_the_einsum(rng, o):
     assert np.array_equal(out_view.mat, out.mat)
 
 
+@pytest.mark.parametrize("compressed", [True, False])
+def test_nonzero_orbital_components_of_a_momentum_dependent_object_scan_every_momentum(compressed):
+    """A non-zero entry at any momentum marks its orbital component, in either momentum layout."""
+    nq = (2, 3, 1)
+    mat = np.zeros((6, 2, 2, 2, 2, 3, 4), dtype=np.complex64)
+    mat[5, 0, 1, 1, 0, 2, 3] = 1e-30
+    mat[0, 1, 1, 0, 0] = 1.0
+    mat = mat if compressed else mat.reshape(*nq, *mat.shape[1:])
+    marked = FourPoint(mat, SpinChannel.NONE, nq, 1, 1, False, True, compressed).nonzero_orbital_components()
+    assert marked.shape == (2, 2, 2, 2) and marked.dtype == bool
+    assert np.argwhere(marked).tolist() == [[0, 1, 1, 0], [1, 1, 0, 0]]
+
+
+@pytest.mark.parametrize("stored_as_view", [False, True])
+def test_contract_first_pair_with_local_vertex_never_reads_the_pairs_without_vertex(rng, stored_as_view):
+    """Non-finite bubble entries of first pairs an atom-by-atom vertex does not couple leave the contraction exact."""
+    o, nq, nw, niv_full, niv_core = 4, 3, 2, 4, 2
+    f_shape, b_shape = (o, o, o, o, nw, 2 * niv_full, 2 * niv_full), (nq, o, o, o, o, nw, 2 * niv_full)
+    f_mat = np.zeros(f_shape, dtype=np.complex64)
+    for x, y in ((0, 1), (1, 0), (2, 3), (3, 2)):  # the density-density, exchange and pair-hopping components per atom
+        for component in ((x, x, x, x), (x, x, y, y), (x, y, x, y), (x, y, y, x)):
+            f_mat[component] = rng.standard_normal(f_shape[4:]) + 1j * rng.standard_normal(f_shape[4:])
+    b_mat = (rng.standard_normal(b_shape) + 1j * rng.standard_normal(b_shape)).astype(np.complex64)
+    finite = b_mat.copy()
+    inter_atom = np.arange(o)[:, None] // 2 != np.arange(o)[None, :] // 2
+    b_mat[:, inter_atom] = np.inf
+    finite[:, inter_atom] = 0.0
+    axes = (4, 0, 1, 5, 2, 3, 6)
+    stored = np.ascontiguousarray(f_mat.transpose(axes)).transpose(np.argsort(axes)) if stored_as_view else f_mat
+    f_loc = LocalFourPoint(stored, SpinChannel.MAGN, 1, 2, False, True)
+    bubble = FourPoint(b_mat, SpinChannel.NONE, (nq, 1, 1), 1, 1, False, True, has_compressed_q_dimension=True)
+
+    out = bubble.contract_first_pair_with_local_vertex(f_loc, niv_core)
+
+    window = slice(niv_full - niv_core, niv_full + niv_core)
+    ref = np.einsum("efgiwvp,qefdcwv->qigdcwp", f_mat, finite, optimize=True)[..., window]
+    assert np.isfinite(out.mat).all()
+    assert np.allclose(out.mat, ref, atol=1e-5)
+
+
 def test_invert_and_sum_v2_symmetry_decision_is_taken_per_slice(rng, monkeypatch):
     """Mixed input: symmetric slices skip the LU and asymmetric ones use it, each judged from its own data."""
     fp = _random_compound_fourpoint(rng, 2, symmetric=True)
