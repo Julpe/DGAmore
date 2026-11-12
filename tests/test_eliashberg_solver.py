@@ -2607,7 +2607,7 @@ def test_solve_sectors_in_memory_solves_both_channels_in_turn_on_the_single_rank
         np.zeros(shape, dtype=np.complex64), SpinChannel.TRIP, nq, 0, 2, True, True, True, FrequencyNotation.PP
     )
     giwk = GreensFunction(np.zeros(nq + (o, o, 10), dtype=np.complex64), nk=nq)
-    results = es._solve_sectors_in_memory(_make_single_rank_distributor(), gsing, gtrip, giwk, niv_pp, ["even", "odd"])
+    results = es._solve_sectors_in_memory(gsing, gtrip, giwk, niv_pp, ["even", "odd"])
 
     assert built == [niv_pp]
     assert solved == [(SpinChannel.SING, (0,), ("even", "odd")), (SpinChannel.TRIP, (0,), ("even", "odd"))]
@@ -3571,7 +3571,7 @@ def _rpa_solve_capturing_vertices(
     monkeypatch.setattr(
         es,
         "_solve_sectors_in_memory",
-        lambda dist, sing, trip, *a: captured.update(sing=sing.mat.copy(), trip=trip.mat.copy()) or {},
+        lambda sing, trip, *a: captured.update(sing=sing.mat.copy(), trip=trip.mat.copy()) or {},
     )
     v_nonloc = Interaction(np.zeros(nk + (no,) * 4), SpinChannel.NONE, nk)
     es.solve(None, None, u_loc, v_nonloc, conftest.create_comm_mock())
@@ -3942,7 +3942,7 @@ def test_streaming_fq_multi_rank_writes_disjoint_slabs_matching_single_rank(setu
     results = [None, None]
 
     def worker(comm, rank):
-        mpi_dist = MpiDistributor.create_distributor(ntasks=N_Q, comm=comm, name="Qs", output_path=None)
+        mpi_dist = MpiDistributor.create_distributor(ntasks=N_Q, comm=comm)
         local_v = Interaction(v_nonloc.mat[rank : rank + 1].copy(), SpinChannel.NONE, (1, 1, 1), True)
         results[rank] = es.create_pairing_vertex_streaming_fq(u_loc, local_v, deepcopy(gamma_r), niv_pp, mpi_dist)
 
@@ -3977,7 +3977,7 @@ def test_pairing_vertex_gather_scatter_round_trip_preserves_rank_shares(setup, m
         np.save(f"{config.output.output_path}/{name}_rank_0.npy", whole[:1])
 
     def worker(comm, rank):
-        mpi_dist = MpiDistributor.create_distributor(ntasks=N_Q, comm=comm, name="Qg", output_path=None)
+        mpi_dist = MpiDistributor.create_distributor(ntasks=N_Q, comm=comm)
         local_v = Interaction(v_nonloc.mat[rank : rank + 1].copy(), SpinChannel.NONE, (1, 1, 1), True)
         vertex = es.create_pairing_vertex_slice_q_r(u_loc, local_v, deepcopy(gamma_r), niv_pp, mpi_dist)
         own = vertex.mat.copy()

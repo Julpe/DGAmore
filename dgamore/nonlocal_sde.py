@@ -2806,7 +2806,7 @@ def interpolate_sigma(sigma: SelfEnergy, beta_target: float, niv_target: int, co
         interpolated = sigma_irr.interpolate(beta_target, niv_target)
     flagged = comm.bcast(flagged, root=0)
     if flagged.size > 0:
-        dist = MpiDistributor.create_distributor(ntasks=flagged.size, comm=comm, name="PoleFit")
+        dist = MpiDistributor.create_distributor(ntasks=flagged.size, comm=comm)
         # every rank re-grids only the momenta it fits; reduce_q keeps the order of the irreducible list
         mine = sigma.reduce_q(irrq_list[flagged[dist.my_slice]])
         reference = mine.interpolate(beta_target, niv_target) if dist.my_size else mine
@@ -3259,15 +3259,11 @@ def calculate_self_energy_q(
     logger.info("Initializing MPI distributor.")
 
     # MPI distributor for the irreducible BZ
-    mpi_dist_irrk = MpiDistributor.create_distributor(
-        ntasks=config.lattice.k_grid.nk_irr, comm=comm, name="Q", output_path=config.output.output_path
-    )
+    mpi_dist_irrk = MpiDistributor.create_distributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
     irrk_q_list = config.lattice.k_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrk.my_slice]
 
-    mpi_dist_fullbz = MpiDistributor.create_distributor(
-        ntasks=config.lattice.k_grid.nk_tot, comm=comm, name="FBZ", output_path=config.output.output_path
-    )
+    mpi_dist_fullbz = MpiDistributor.create_distributor(ntasks=config.lattice.k_grid.nk_tot, comm=comm)
 
     # the loop's full-BZ self-energy is held once per NODE (mixed on rank 0, broadcast to the node roots, then
     # window-shared read-only); a single-rank run keeps rank 0's own array
@@ -3766,9 +3762,6 @@ def calculate_self_energy_q(
     if sc_node_comm is not None:
         sc_roots_comm.Free()
         sc_node_comm.Free()
-
-    mpi_dist_irrk.delete_file()
-    mpi_dist_fullbz.delete_file()
 
     np.save(os.path.join(config.output.output_path, "mu_history.npy"), mu_history)
     logger.info("Saved mu history as numpy array.")

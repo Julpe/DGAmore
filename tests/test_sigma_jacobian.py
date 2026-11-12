@@ -134,8 +134,8 @@ def _loop_state(monkeypatch, lattice: str = "fixture", tmp_path=None) -> types.S
         config.lattice.k_grid = bz.KGrid(config.lattice.nk, symmetries=[bz.KnownSymmetries.AUTO])
         config.lattice.k_grid.specify_auto_symmetries(config.lattice.hamiltonian.get_ek())
     k_grid = config.lattice.k_grid
-    dist_irrk = MpiDistributor.create_distributor(ntasks=k_grid.nk_irr, comm=comm, name="Q")
-    dist_fullbz = MpiDistributor.create_distributor(ntasks=k_grid.nk_tot, comm=comm, name="FBZ")
+    dist_irrk = MpiDistributor.create_distributor(ntasks=k_grid.nk_irr, comm=comm)
+    dist_fullbz = MpiDistributor.create_distributor(ntasks=k_grid.nk_tot, comm=comm)
     niv_cut = min(config.box.niw_core + config.box.niv_full + 10, config.box.niv_dmft)
     ek = config.lattice.hamiltonian.get_ek()
     start = s_dmft.concatenate_self_energies(s_dmft)
@@ -381,8 +381,8 @@ def test_exact_jacobian_products_agree_across_rank_layouts(hostnames, loop_state
     k_grid = config.lattice.k_grid
 
     def fn(comm, rank):
-        dist_irrk = MpiDistributor.create_distributor(ntasks=k_grid.nk_irr, comm=comm, name="Q")
-        dist_fullbz = MpiDistributor.create_distributor(ntasks=k_grid.nk_tot, comm=comm, name="FBZ")
+        dist_irrk = MpiDistributor.create_distributor(ntasks=k_grid.nk_irr, comm=comm)
+        dist_fullbz = MpiDistributor.create_distributor(ntasks=k_grid.nk_tot, comm=comm)
         jac = _rank_jacobian(loop_state, base, mu0, budgets, comm, dist_irrk, dist_fullbz)
         held = (jac._dn_dmu, jac._kappa)
         out = (jac.matvec(ys[:, 0] if rank == 0 else None), jac.matvec_block(ys if rank == 0 else None))
@@ -1134,8 +1134,8 @@ def test_exact_jacobian_recomputing_three_leg_vertices_per_window_gives_the_held
     monkeypatch.setattr(LocalFourPoint, "orbital_pairs_without_vertex", scan)
 
     def fn(comm, rank):
-        dist_irrk = MpiDistributor.create_distributor(ntasks=k_grid.nk_irr, comm=comm, name="Q")
-        dist_fullbz = MpiDistributor.create_distributor(ntasks=k_grid.nk_tot, comm=comm, name="FBZ")
+        dist_irrk = MpiDistributor.create_distributor(ntasks=k_grid.nk_irr, comm=comm)
+        dist_fullbz = MpiDistributor.create_distributor(ntasks=k_grid.nk_tot, comm=comm)
         products, held = [], []
         for per_window in (False, True):
             budgets = memory_estimator.ChunkBudgets(exact_block=2, exact_window=4, exact_vrg_per_window=per_window)
@@ -1167,8 +1167,8 @@ def test_exact_jacobian_solves_recomputed_three_leg_vertices_fused_or_in_two_pas
     monkeypatch.setattr(ExactJacobian, "_response_rhs", hooks)
 
     def fn(comm, rank):
-        dist_irrk = MpiDistributor.create_distributor(ntasks=k_grid.nk_irr, comm=comm, name="Q")
-        dist_fullbz = MpiDistributor.create_distributor(ntasks=k_grid.nk_tot, comm=comm, name="FBZ")
+        dist_irrk = MpiDistributor.create_distributor(ntasks=k_grid.nk_irr, comm=comm)
+        dist_fullbz = MpiDistributor.create_distributor(ntasks=k_grid.nk_tot, comm=comm)
         budgets = memory_estimator.ChunkBudgets(exact_block=2, exact_window=4, exact_vrg_per_window=True)
         jac = _rank_jacobian(loop_state, base, mu0, budgets, comm, dist_irrk, dist_fullbz)
         products = jac.matvec_block(ys if rank == 0 else None)
@@ -1284,8 +1284,8 @@ def test_exact_jacobian_products_on_any_rank_layout_do_not_depend_on_the_window_
     specs.append({"exact_block": 3, "exact_window": 1, "exact_vertices_per_window": True})
 
     def fn(comm, rank):
-        dist_irrk = MpiDistributor.create_distributor(ntasks=k_grid.nk_irr, comm=comm, name="Q")
-        dist_fullbz = MpiDistributor.create_distributor(ntasks=k_grid.nk_tot, comm=comm, name="FBZ")
+        dist_irrk = MpiDistributor.create_distributor(ntasks=k_grid.nk_irr, comm=comm)
+        dist_fullbz = MpiDistributor.create_distributor(ntasks=k_grid.nk_tot, comm=comm)
         products = []
         for spec in specs:
             budgets = memory_estimator.ChunkBudgets(**spec)
@@ -1320,8 +1320,8 @@ def test_rank_jacobians_clone_no_interaction_the_fake_ranks_share(loop_state, mo
     monkeypatch.setattr(npb.IHaveMat, "_clone_without_mat", clone)
 
     def fn(comm, rank):
-        dist_irrk = MpiDistributor.create_distributor(ntasks=k_grid.nk_irr, comm=comm, name="Q")
-        dist_fullbz = MpiDistributor.create_distributor(ntasks=k_grid.nk_tot, comm=comm, name="FBZ")
+        dist_irrk = MpiDistributor.create_distributor(ntasks=k_grid.nk_irr, comm=comm)
+        dist_fullbz = MpiDistributor.create_distributor(ntasks=k_grid.nk_tot, comm=comm)
         jac = _rank_jacobian(loop_state, base, mu0, memory_estimator.ChunkBudgets(), comm, dist_irrk, dist_fullbz)
         jac.matvec(ys if rank == 0 else None)
         jac.free()
