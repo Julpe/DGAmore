@@ -3501,7 +3501,7 @@ def test_scattered_interaction_is_each_ranks_reduction_of_the_full_grid_bit_for_
     irrq = config.lattice.k_grid.get_irrq_list()
 
     def fn(comm, rank):
-        dist = mpi_utils.MpiDistributor.create_distributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm, name="Q")
+        dist = mpi_utils.MpiDistributor.create_distributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
         v_full = Interaction(mat.copy(), SpinChannel.NONE, nk)
         scattered = nonlocal_sde.scatter_irreducible_interaction(v_full if rank == 0 else None, dist)
         return scattered, v_full.reduce_q(irrq[dist.my_slice])

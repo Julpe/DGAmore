@@ -3138,7 +3138,6 @@ def dispatch_full_vertex_calculation(
 
 
 def _solve_sectors_in_memory(
-    mpi_dist_irrk: MpiDistributor,
     gamma_sing_pp: FourPoint,
     gamma_trip_pp: FourPoint,
     giwk_dga: GreensFunction,
@@ -3152,7 +3151,6 @@ def _solve_sectors_in_memory(
     through :func:`solve_eliashberg_lanczos` one after the other, each over the requested parity sectors. Both
     pairing vertices are **consumed**.
 
-    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param gamma_sing_pp: The singlet pairing vertex (the whole irreducible BZ; consumed).
     :param gamma_trip_pp: The triplet pairing vertex (the whole irreducible BZ; consumed).
     :param giwk_dga: The DGA Green's function (used to build the bubble).
@@ -3167,7 +3165,6 @@ def _solve_sectors_in_memory(
     for gamma_pp in (gamma_sing_pp, gamma_trip_pp):
         sectors = solve_eliashberg_lanczos(gamma_pp, gchi0_q_pp, (0,), parities, u)
         results.update({(gamma_pp.channel, parity): sectors[parity] for parity in parities})
-    mpi_dist_irrk.delete_file()
     return results
 
 
@@ -3209,9 +3206,7 @@ def solve(
     logger = config.logger
     import psutil
 
-    mpi_dist_irrk = MpiDistributor.create_distributor(
-        ntasks=config.lattice.k_grid.nk_irr, comm=comm, name="Q", output_path=config.output.output_path
-    )
+    mpi_dist_irrk = MpiDistributor.create_distributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
     v_nonloc = nonlocal_sde.scatter_irreducible_interaction(v_nonloc, mpi_dist_irrk)
 
     # the check may switch the sectors off, so it runs before they are fixed
@@ -3294,8 +3289,6 @@ def solve(
 
     delete_files(config.output.eliashberg_path, f"gchi0_q_inv_rank_{comm.rank}.npy")
 
-    mpi_dist_irrk.delete_file()
-
     gamma_sing_pp = f_dens_pp.scale(0.5).sub(f_magn_pp.scale(1.5, copy=True), copy=False)
     del f_dens_pp
     gamma_sing_pp.channel = SpinChannel.SING
@@ -3371,9 +3364,7 @@ def solve(
                 results[(channel, parity)] = (lambdas, local[1] if comm.rank == 0 else [])
             sectors = None
     elif rounds is None:
-        results = _solve_sectors_in_memory(
-            mpi_dist_irrk, gamma_sing_pp, gamma_trip_pp, giwk_dga, niv_pp, parities, inversion
-        )
+        results = _solve_sectors_in_memory(gamma_sing_pp, gamma_trip_pp, giwk_dga, niv_pp, parities, inversion)
     else:
         results = _solve_sectors_in_teams(
             mpi_dist_irrk, comm, node_comm, gamma_sing_pp, gamma_trip_pp, giwk_dga, niv_pp, rounds, inversion

@@ -153,7 +153,7 @@ def perform_maxent_giwk(giwk: GreensFunction | None, name: str, comm: MPI.Comm):
 
     logger.info(f"Starting analytic continuation of the {name} Green's function using the maximum entropy method.")
     irrq_list = config.lattice.k_grid.get_irrq_list()
-    mpi_dist = MpiDistributor(ntasks=len(irrq_list), comm=comm, name="Maxent_G", output_path=config.output.output_path)
+    mpi_dist = MpiDistributor(ntasks=len(irrq_list), comm=comm)
 
     # The full-BZ preparation runs on rank 0 only: every rank used to build the identical core-cut, band-rotated,
     # irr-reduced Green's function just to keep its own scatter slice - multi-GB transients times the rank count.
@@ -271,7 +271,6 @@ def perform_maxent_giwk(giwk: GreensFunction | None, name: str, comm: MPI.Comm):
             f"negative ones were cut and the rest rescaled to the trace."
         )
 
-    mpi_dist.delete_file()
     return spectral_function
 
 

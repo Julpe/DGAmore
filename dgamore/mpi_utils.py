@@ -12,8 +12,7 @@ Multiprocessing (MPI) utilities for the non-local step - a single module coverin
   the caller's preallocated contiguous buffer (no per-chunk staging copy);
 * the **work distributor** :class:`MpiDistributor`, which splits a number of tasks (typically the q-points of the
   irreducible Brillouin zone) into per-rank contiguous slices and wraps the collective/point-to-point communication
-  (scatter, gather, all-gather, all-reduce, broadcast, object send/recv); each rank owns a private HDF5 file for
-  spilling intermediate results without write conflicts;
+  (scatter, gather, all-gather, all-reduce, broadcast, object send/recv);
 * higher-level **data-movement routines** built on top: the per-node shared-memory windows, the ring transpose that
   turns a row-distributed array into a column-distributed one (the kernel columns of the self-energy contraction),
   and the ordered point-to-point delivery of numbered blocks.
@@ -29,7 +28,6 @@ import pickle
 import socket
 import time
 
-import h5py
 import mpi4py.MPI as MPI
 import psutil
 import numpy as np
@@ -404,72 +402,26 @@ def recv_bytes(comm, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES)
 class MpiDistributor:
     """
     Distributes tasks among all available cores. Uses the first (q) dimension to slice the vertex data into chunks
-    and sends it to all active MPI processes. Saves intermediate computational results in rank files. Each rank
-    has its own instance of an MPI distributor and hdf5-file to avoid write conflicts.
+    and sends it to all active MPI processes. Each rank has its own instance of an MPI distributor.
     """
 
-    def __init__(
-        self,
-        ntasks: int = 1,
-        comm: MPI.Comm = None,
-        name: str = "",
-        output_path: str = None,
-        sizes: np.ndarray | None = None,
-    ):
+    def __init__(self, ntasks: int = 1, comm: MPI.Comm = None, sizes: np.ndarray | None = None):
         """
-        Distributes the tasks across the communicator and opens this rank's HDF5 spill file.
+        Distributes the tasks across the communicator.
 
         :param ntasks: Total number of tasks to distribute (e.g. the number of irreducible q-points).
         :param comm: The MPI communicator across which the tasks are distributed.
-        :param name: Prefix for this rank's HDF5 spill file.
-        :param output_path: Directory the per-rank HDF5 spill file is created in; if None, no spill file is opened.
         :param sizes: Optional per-rank task counts (contiguous runs in rank order, summing to ``ntasks``) replacing
             the default as-even-as-possible split.
         """
         self._comm = comm
         self._ntasks = ntasks
-        self._file = None
         self._my_slice = None
         self._sizes = None
         self._my_size = None
         self._slices = None
 
         self._distribute_tasks(sizes)
-
-        if output_path is not None:
-            # creates rank file if it does not exist
-            self._fname = os.path.join(output_path, f"{name}_Rank{self.my_rank:05d}.hdf5")
-            self._file = h5py.File(self._fname, "a")
-            self._file.close()
-
-    def __del__(self):
-        """
-        Destructor to close the hdf5 file if it is still open.
-        """
-        if self._file is not None:
-            try:
-                self.close_file()
-            except (OSError, AttributeError):
-                pass
-
-    def __enter__(self):
-        """
-        Context manager to open the hdf5 file.
-        """
-        self.open_file()
-        return self._file
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        """
-        Context manager exit; closes the hdf5 file (see :meth:`close_file`).
-
-        :param exc_type: Exception type if one was raised in the ``with`` block, else None.
-        :param exc_value: Exception instance if one was raised, else None.
-        :param traceback: Traceback if an exception was raised, else None.
-        :return: None.
-        """
-        if self._file:
-            self.close_file()
 
     @property
     def comm(self) -> MPI.Comm:
@@ -560,39 +512,6 @@ class MpiDistributor:
         :return: The ``slice`` object selecting the current rank's portion of the full task list.
         """
         return self._my_slice
-
-    def open_file(self):
-        """
-        Opens this rank's hdf5 file for read/write. Silently does nothing if the file is missing.
-
-        :return: None.
-        """
-        try:
-            self._file = h5py.File(self._fname, "r+")
-        except (OSError, AttributeError):
-            pass
-
-    def close_file(self):
-        """
-        Closes this rank's hdf5 file. Silently does nothing if it is not open.
-
-        :return: None.
-        """
-        try:
-            self._file.close()
-        except (OSError, AttributeError):
-            pass
-
-    def delete_file(self):
-        """
-        Deletes this rank's hdf5 spill file. Silently does nothing if it does not exist.
-
-        :return: None.
-        """
-        try:
-            os.remove(self._fname)
-        except (OSError, AttributeError):
-            pass
 
     def barrier(self):
         """
@@ -882,21 +801,17 @@ class MpiDistributor:
         return self.comm.bcast(total, root=self.mpi_size - 1)
 
     @staticmethod
-    def create_distributor(
-        ntasks: int, comm: MPI.Comm = None, name: str = "", output_path: str = None
-    ) -> "MpiDistributor":
+    def create_distributor(ntasks: int, comm: MPI.Comm = None) -> "MpiDistributor":
         """
         Factory that creates an :class:`MpiDistributor`, defaulting to ``MPI.COMM_WORLD`` if no communicator is given.
 
         :param ntasks: Total number of tasks to distribute.
         :param comm: The MPI communicator (``MPI.COMM_WORLD`` if None).
-        :param name: Prefix for the per-rank HDF5 spill file.
-        :param output_path: Directory the per-rank HDF5 spill file is created in; if None, no spill file is opened.
         :return: The created :class:`MpiDistributor`.
         """
         if comm is None:
             comm = MPI.COMM_WORLD
-        return MpiDistributor(ntasks=ntasks, comm=comm, name=name, output_path=output_path)
+        return MpiDistributor(ntasks=ntasks, comm=comm)
 
     def _distribute_tasks(self, sizes: np.ndarray | None = None):
         """
