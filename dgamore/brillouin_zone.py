@@ -416,6 +416,7 @@ class KGrid:
         self._auto_group = None  # the closed group of discovered operations
         self._auto_groups: dict = {}  # cached k-point groups of the orbital transformation, see auto_orbital_groups
         self._auto_monomials: dict = {}  # cached gather form of monomial transformations, see auto_monomial_map
+        self._auto_point_groups: dict = {}  # cached actions of the discovered point group, see auto_point_group
 
         self.nk = nk
         self.set_k_axes()
@@ -608,6 +609,33 @@ class KGrid:
             result = (group_of_k, perm, phase) if changes else None
         self._auto_monomials[key] = (groups, result)
         return result
+
+    def auto_point_group(self, real_space: bool = False) -> tuple[np.ndarray, np.ndarray] | None:
+        r"""
+        Returns the actions of the discovered point group on the grid (see
+        :func:`dgamore.symmetry_reduction.point_group_actions`) for a grid of several orbitals whose group has more
+        than one point-like element, all with real orbital unitaries; None otherwise. A contraction that pairs two
+        orbital indices rotating alike is covariant under such a group only. The unitaries come back real, and
+        those of a group that only permutes the orbitals and flips their signs as the exact signed permutations,
+        without the rounding of their discovery, so that such a group rotates stored values without rounding. The
+        actions are computed once per grid and ``real_space`` and recomputed when the group is replaced.
+
+        :param real_space: Whether the maps act on the real-space grid instead of the momentum grid.
+        :return: ``(maps, us)`` of shapes ``(n_g, nk_tot)`` and ``(n_g, nb, nb)``, or None.
+        """
+        if not self.is_auto or self._auto_group is None:
+            return None
+        cached = self._auto_point_groups.get(real_space)
+        if cached is None or cached[0] is not self._auto_group:
+            from dgamore import symmetry_reduction
+
+            maps, us = symmetry_reduction.point_group_actions(self._auto_group, tuple(self.nk), real_space)
+            several = len(maps) > 1 and us.shape[-1] > 1 and np.allclose(us.imag, 0.0, atol=1e-8)
+            us = us.real
+            if np.allclose(us, np.round(us), rtol=0.0, atol=1e-8):
+                us = np.round(us)
+            cached = self._auto_point_groups[real_space] = (self._auto_group, (maps, us) if several else None)
+        return cached[1]
 
     @property
     def is_auto(self) -> bool:

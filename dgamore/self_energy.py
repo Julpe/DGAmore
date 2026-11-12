@@ -20,6 +20,7 @@ import numpy as np
 from scipy.interpolate import PchipInterpolator, interp1d
 from mini_pole import MiniPole
 
+from dgamore import symmetry_reduction
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore.two_point import TwoPoint
 
@@ -354,6 +355,34 @@ class SelfEnergy(TwoPoint):
             removed = max(removed, float(np.abs(average - block).max()))
             block[...] = average
         return removed
+
+    def unfold_irreducible_momenta(self, k_grid: "KGrid", frequencies: slice | None = None) -> None:
+        r"""
+        Enforces the point group of the grid (see :meth:`~dgamore.brillouin_zone.KGrid.auto_point_group`) in place by
+        overwriting every momentum with the image of its irreducible representative, averaged over the elements that
+        take the representative there (see :func:`~dgamore.symmetry_reduction.project_onto_point_group`), so the
+        result obeys the group on every momentum, those an element maps to themselves included; a self-energy that
+        already obeys it changes by rounding only. The average is taken in double precision, so rotations that only
+        permute the orbitals and flip their signs leave no rounding behind. It runs over chunks of the fermionic axis
+        whose transient (the irreducible rows and their unfold in double precision) stays below ``_TR_CHUNK_BYTES``.
+        Every frequency is unfolded on its own, so contiguous ranges of ``frequencies`` unfolded one by one hold the
+        bits of the whole unfold.
+
+        :param k_grid: The momentum grid carrying the irreducible momenta, their stars and the point group.
+        :param frequencies: The contiguous range of frequency indices to unfold, or ``None`` for all.
+        :raises ValueError: If the momentum axis is not compressed.
+        """
+        if not self.has_compressed_q_dimension:
+            raise ValueError("The unfold of the irreducible momenta needs a compressed momentum axis.")
+        mat = self.mat
+        maps, us = k_grid.auto_point_group()
+        stars = k_grid.irrk_count[:, None, None, None].astype(np.float64)
+        width = max(1, int(self._TR_CHUNK_BYTES // (3 * mat[..., :1].nbytes)))
+        lo, hi = (0, mat.shape[-1]) if frequencies is None else (frequencies.start, frequencies.stop)
+        for start in range(lo, hi, width):
+            block = mat[..., start : min(start + width, hi)]
+            weighted = block[k_grid.irrk_ind] * stars  # complex128
+            block[...] = symmetry_reduction.project_onto_point_group(weighted, maps, us, rows=k_grid.irrk_ind)
 
     def fit_smom_concatenated(
         self, other: "SelfEnergy", shell_offset: np.ndarray | None = None

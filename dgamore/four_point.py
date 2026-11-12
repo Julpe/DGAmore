@@ -1527,6 +1527,19 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         self.update_original_shape()
         return self
 
+    def nonzero_orbital_components(self) -> np.ndarray:
+        r"""
+        Returns which orbital components :math:`(o_1, o_2, o_3, o_4)` hold a non-zero entry at any stored momentum.
+        Any non-zero entry counts, and the object is scanned one orbital component at a time, so no temporary of its
+        size is made.
+
+        :return: The boolean array ``[o1, o2, o3, o4]``.
+        """
+        o = self.n_bands
+        momenta = (slice(None),) * (1 if self.has_compressed_q_dimension else 3)
+        nonzero = [bool(self.mat[momenta + idx].any()) for idx in np.ndindex(o, o, o, o)]
+        return np.array(nonzero).reshape(o, o, o, o)
+
     def contract_first_pair_with_local_vertex(self, f_loc: LocalFourPoint, niv_out: int) -> "FourPoint":
         r"""
         Contracts the first orbital pair and the fermionic frequency of this one-fermion bubble with the first
@@ -1534,10 +1547,14 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
 
         .. math:: T^{\mathrm{q}\nu'}_{1234} = \sum_{ab\nu} F^{\omega\nu\nu'}_{ab21}\,\chi^{\mathrm{q}\nu}_{0;ab34},
 
-        as one matrix product per momentum, ``[w, (34), (ab nu)] @ [w, (ab nu), (21 nu')]``, and keeps only the
-        window ``|nu'| < niv_out`` of the vertex's second frequency. The vertex operand is a view when the vertex
-        array is stored in the axis order ``(4, 0, 1, 5, 2, 3, 6)``, i.e. ``[w, o1, o2, nu, o3, o4, nu']``, and a
-        single copy otherwise; the per-momentum product never materializes the vertex again.
+        and keeps only the window ``|nu'| < niv_out`` of the vertex's second frequency. A vertex whose orbital
+        components all hold a non-zero entry takes one matrix product per momentum, ``[w, (34), (ab nu)] @
+        [w, (ab nu), (21 nu')]``; its operand is a view when the vertex array is stored in the axis order
+        ``(4, 0, 1, 5, 2, 3, 6)``, i.e. ``[w, o1, o2, nu, o3, o4, nu']``, and a single copy otherwise. A vertex with
+        zero components (see :meth:`LocalFourPoint.nonzero_orbital_components`), e.g. one built atom by atom, takes
+        one product per momentum and non-zero component instead, ``[w, (34), nu] @ [w, nu, nu']`` on the kept window,
+        both operands views in either storage order: the zero components are never multiplied, and the bubble of a
+        first pair :math:`(a, b)` no component holds is never read. Neither path materializes the vertex again.
 
         :param f_loc: The local two-fermion vertex ``[o1, o2, o3, o4, w, nu, nu']`` (half niw range) whose stored
             first frequency is summed.
@@ -1547,11 +1564,23 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         """
         nq, nb, n_w = self.current_shape[0], self.n_bands, self.mat.shape[-2]
         window = f_loc.vn_slice(f_loc.niv_second, niv_out)
-        f_pair = f_loc.mat.transpose(4, 0, 1, 5, 2, 3, 6).reshape(n_w, nb * nb * f_loc.mat.shape[-2], -1)
-        out = np.empty((nq, nb, nb, nb, nb, n_w, 2 * niv_out), dtype=self.mat.dtype)
-        for q in range(nq):
-            bubble = self.mat[q].transpose(4, 2, 3, 0, 1, 5).reshape(n_w, nb * nb, -1)
-            out[q] = (bubble @ f_pair).reshape(n_w, nb, nb, nb, nb, -1).transpose(4, 3, 1, 2, 0, 5)[..., window]
+        shape = (nq, nb, nb, nb, nb, n_w, 2 * niv_out)
+        components = f_loc.nonzero_orbital_components() if nq else np.ones((nb,) * 4, dtype=bool)
+        if components.all():
+            f_pair = f_loc.mat.transpose(4, 0, 1, 5, 2, 3, 6).reshape(n_w, nb * nb * f_loc.mat.shape[-2], -1)
+            out = np.empty(shape, dtype=self.mat.dtype)
+            for q in range(nq):
+                bubble = self.mat[q].transpose(4, 2, 3, 0, 1, 5).reshape(n_w, nb * nb, -1)
+                out[q] = (bubble @ f_pair).reshape(n_w, nb, nb, nb, nb, -1).transpose(4, 3, 1, 2, 0, 5)[..., window]
+        else:
+            # component (a, b, 2, 1) of the vertex takes the bubble's first pair (a, b) to the output pair (1, 2)
+            terms = [(a, b, c, d, f_loc.mat[a, b, c, d][..., window]) for a, b, c, d in np.argwhere(components)]
+            out = np.zeros(shape, dtype=self.mat.dtype)
+            for q in range(nq):
+                pairs = self.mat[q].reshape(nb, nb, nb * nb, n_w, -1)  # [a, b, (34), w, nu]
+                for a, b, c, d, f_block in terms:
+                    product = pairs[a, b].transpose(1, 0, 2) @ f_block  # [w, (34), nu']
+                    out[q, d, c] += product.transpose(1, 0, 2).reshape(nb, nb, n_w, -1)
         return FourPoint(
             out, SpinChannel.NONE, self.nq, 1, 1, self.full_niw_range, True, has_compressed_q_dimension=True
         )

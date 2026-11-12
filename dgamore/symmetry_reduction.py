@@ -723,30 +723,104 @@ def _g_action_on_kgrid(g, nk):
     return _translate_kgrid(idx, tuple(g.q), nk)
 
 
+def _point_like_elements(group, nk: tuple) -> list:
+    r"""
+    Lists the point-like elements of a closed symmetry group, the identity first (see :func:`_ordered`): the
+    unitary, sign-free (``sigma = +1``) elements without translation whose integer matrix :math:`M` is unimodular on
+    the axes with more than one point.
+
+    :param group: The closed symmetry group (iterable of group elements).
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+    :return: The point-like elements.
+    """
+    active = [axis for axis in range(3) if nk[axis] > 1]
+
+    def point_like(g) -> bool:
+        translation_free = all(int(g.q[axis]) % nk[axis] == 0 for axis in active)
+        unimodular = abs(round(np.linalg.det(g.M[np.ix_(active, active)]))) == 1
+        return not g.conj and g.sigma == 1 and translation_free and unimodular
+
+    return _ordered([g for g in group if point_like(g)], nk)
+
+
+def _real_space_action(g, nk: tuple) -> np.ndarray:
+    r"""
+    Returns the flat-index map of a point-like element on the real-space grid, :math:`\mathbf{R} \to
+    M^{-T}\mathbf{R}` on the axes with more than one point: the action under which the Fourier transform of a tensor
+    the element leaves invariant transforms with the element's orbital unitary. It is the element's momentum action
+    only for a signed permutation of the axes.
+
+    :param g: The group element.
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+    :return: The flat index of the image of every flat grid index.
+    """
+    active = [axis for axis in range(3) if nk[axis] > 1]
+    block = np.ix_(active, active)
+    m_inv = np.eye(3, dtype=np.int64)
+    m_inv[block] = np.rint(np.linalg.inv(g.M[block])).astype(np.int64)
+    return np.ravel_multi_index(tuple((_grid_index_stack(nk).reshape(-1, 3) @ m_inv % nk).T), nk)
+
+
+def point_group_actions(group, nk: tuple, real_space: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    r"""
+    Returns the actions of the point-like elements of a closed symmetry group (see :func:`_point_like_elements`),
+    the identity first: per element the flat index its action takes every flat grid index to, on the momentum grid
+    (:math:`\mathbf{k} \to M\mathbf{k}`) or, with ``real_space``, on the real-space grid (see
+    :func:`_real_space_action`), and its orbital unitary. A two-index tensor the group leaves invariant obeys
+    :math:`T(g\,\mathbf{x}) = U_g T(\mathbf{x}) U_g^\dagger` under either action.
+
+    :param group: The closed symmetry group (iterable of group elements).
+    :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
+    :param real_space: Whether the maps act on the real-space grid instead of the momentum grid.
+    :return: ``(maps, us)`` of shapes ``(n_g, nktot)`` and ``(n_g, nb, nb)``.
+    """
+    elements = _point_like_elements(group, nk)
+    action = _real_space_action if real_space else _g_action_on_kgrid
+    return np.stack([action(g, nk) for g in elements]), np.stack([g.U for g in elements])
+
+
+def project_onto_point_group(
+    mat: np.ndarray, maps: np.ndarray, us: np.ndarray, rows: np.ndarray | None = None
+) -> np.ndarray:
+    r"""
+    Returns the average of a two-index tensor over the actions of a point group (see :func:`point_group_actions`),
+    :math:`\frac{1}{n_g} \sum_g U_g T(g^{-1}\mathbf{x}) U_g^\dagger`: the part of the tensor that obeys
+    :math:`T(g\,\mathbf{x}) = U_g T(\mathbf{x}) U_g^\dagger`, which an invariant tensor equals.
+
+    With ``rows`` the tensor is zero outside those grid points and ``mat`` holds them alone. Irreducible points
+    weighted by the sizes of their stars then give the unfold of an invariant tensor: every point of a star holds the
+    image of its irreducible point, averaged over the elements that take the irreducible point there (its stabilizer).
+
+    :param mat: The tensor ``[x, o1, o2, ...]`` over the flat grid, or over ``rows``.
+    :param maps: The flat-index maps of the elements, shape ``(n_g, nktot)``.
+    :param us: The orbital unitaries of the elements, shape ``(n_g, nb, nb)``.
+    :param rows: The flat grid indices of the points ``mat`` holds, or ``None`` for the whole grid.
+    :return: The average over the whole grid, a new array of the dtype of ``mat``.
+    """
+    out = np.zeros((maps.shape[1], *mat.shape[1:]), dtype=mat.dtype)
+    # the orbital axes last, so that the rotations broadcast over any trailing axes
+    source, target = np.moveaxis(mat, (1, 2), (-2, -1)), np.moveaxis(out, (1, 2), (-2, -1))
+    for idx, u in zip(maps, us.astype(mat.dtype)):
+        target[idx if rows is None else idx[rows]] += u @ source @ u.conj().T
+    out /= len(maps)
+    return out
+
+
 def point_group_orbits(group, nk: tuple) -> tuple[np.ndarray, np.ndarray]:
     r"""
-    Collapses the grid into the orbits of the point-like part of a closed symmetry group: the unitary, sign-free
-    (``sigma = +1``) elements whose action on the axes with more than one point is a signed permutation without
-    translation, i.e. the elements that
-    act on the real-space grid exactly as on the momentum grid. Returns, per flat grid index, the smallest flat index
-    of its orbit and the orbital unitary of the element carrying that representative onto the index, so that
-    :math:`T(\mathbf{k}) = U_{\mathbf{k}} T(\mathbf{k}_{\mathrm{rep}}) U^\dagger_{\mathbf{k}}` for a two-index tensor
-    (four-index tensors transform with the same unitary on every leg pair).
+    Collapses the real-space grid into the orbits of the point-like part of a closed symmetry group (see
+    :func:`_point_like_elements`), each element acting as in :func:`_real_space_action`. Returns, per flat grid
+    index, the smallest flat index of its orbit and the orbital unitary of the element carrying that representative
+    onto the index, so that :math:`T(\mathbf{R}) = U_{\mathbf{R}} T(\mathbf{R}_{\mathrm{rep}})
+    U^\dagger_{\mathbf{R}}` for a two-index tensor (four-index tensors transform with the same unitary on every leg
+    pair).
 
     :param group: The closed symmetry group (iterable of group elements).
     :param nk: Number of k-points per spatial direction ``(nx, ny, nz)``.
     :return: ``(rep, us)`` of shapes ``(nktot,)`` and ``(nktot, nb, nb)``.
     """
-    active = [axis for axis in range(3) if nk[axis] > 1]
-
-    def point_like(g) -> bool:
-        m = g.M[np.ix_(active, active)]
-        signed_permutation = np.array_equal(m.T @ m, np.eye(len(active), dtype=np.int64))
-        translation_free = all(int(g.q[axis]) % nk[axis] == 0 for axis in active)
-        return not g.conj and g.sigma == 1 and signed_permutation and translation_free
-
-    elements = _ordered([g for g in group if point_like(g)], nk)
-    idx_maps = np.stack([_g_action_on_kgrid(g, nk) for g in elements])
+    elements = _point_like_elements(group, nk)
+    idx_maps = np.stack([_real_space_action(g, nk) for g in elements])
     carriers = [_inverse(g, nk).U for g in elements]
     us = np.asarray(carriers)[idx_maps.argmin(axis=0)]
     return idx_maps.min(axis=0), us

@@ -827,10 +827,19 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         :param u_r: The channel-projected local interaction :math:`U_{r}`.
         :return: The sorted flat indices of the pairs without vertex.
         """
-        o = self.n_bands
-        in_vertex = [np.count_nonzero(self.mat[idx]) > 0 for idx in np.ndindex(o, o, o, o)]
-        occupied = np.array(in_vertex).reshape(o, o, o, o) | (u_r.mat != 0)
+        occupied = self.nonzero_orbital_components() | (u_r.mat != 0)
         return np.flatnonzero(~occupied.any(axis=(2, 3)) & ~occupied.any(axis=(0, 1)).T)
+
+    def nonzero_orbital_components(self) -> np.ndarray:
+        r"""
+        Returns which orbital components :math:`(o_1, o_2, o_3, o_4)` hold a non-zero entry. Any non-zero entry
+        counts, and the object is scanned one orbital component at a time, so no temporary of its size is made.
+
+        :return: The boolean array ``[o1, o2, o3, o4]``.
+        """
+        o = self.n_bands
+        nonzero = [np.count_nonzero(self.mat[idx]) > 0 for idx in np.ndindex(o, o, o, o)]
+        return np.array(nonzero).reshape(o, o, o, o)
 
     def permute_orbitals(self, permutation: str = "abcd->abcd", copy: bool = True) -> "LocalFourPoint":
         """

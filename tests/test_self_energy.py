@@ -984,3 +984,67 @@ def test_symmetrize_time_reversal_rejects_an_uncompressed_momentum_axis():
     """symmetrize_time_reversal needs the compressed momentum axis."""
     with pytest.raises(ValueError):
         _se(mat_decompressed.copy(), nk=nk, has_compressed_q_dimension=False).symmetrize_time_reversal()
+
+
+def _rotated_grid(nk=(4, 4, 1)):
+    """An auto grid of a p_x/p_y model whose mirrors swap and flip the orbitals, with its dispersion."""
+    kx, ky, _ = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nk), indexing="ij")
+    hk = np.zeros(nk + (2, 2), dtype=complex)
+    hk[..., 0, 0] = -2.0 * np.cos(kx) - 0.6 * np.cos(ky)
+    hk[..., 1, 1] = -2.0 * np.cos(ky) - 0.6 * np.cos(kx)
+    hk[..., 0, 1] = hk[..., 1, 0] = 0.3 * np.sin(kx) * np.sin(ky)
+    grid = bz.KGrid(nk, [bz.KnownSymmetries.AUTO])
+    grid.specify_auto_symmetries(hk)
+    return grid, hk
+
+
+def _rotate(mat, u):
+    """U mat U^dagger on the orbital axes of [k, o1, o2, v]."""
+    return np.einsum("ab,kbcv,dc->kadv", u, mat, u.conj())
+
+
+def test_unfold_irreducible_momenta_overwrites_every_momentum_with_the_image_of_its_representative():
+    """Every momentum becomes the rotated value of its representative, averaged over the representative's stabilizer."""
+    grid, hk = _rotated_grid((6, 6, 1))
+    maps, us = grid.auto_point_group()
+    signed = np.round(us.real).astype(np.complex64)  # the rotations swap and flip the orbitals
+    rng = np.random.default_rng(8)
+    mat = (rng.standard_normal((36, 2, 2, 6)) + 1j * rng.standard_normal((36, 2, 2, 6))).astype(np.complex64)
+    se = _se(mat.copy(), nk=(6, 6, 1), has_compressed_q_dimension=True)
+    se.unfold_irreducible_momenta(grid)
+    unfolded = se.mat.copy()
+    free = grid.irrk_ind[grid.irrk_count == len(maps)]  # representatives no operation but the identity keeps
+    assert 0 < len(free) < grid.nk_irr < 36 and np.allclose(us, signed, atol=1e-12)
+    assert not np.allclose(unfolded, mat, atol=1e-3) and np.array_equal(unfolded[free], mat[free])
+    assert all(np.array_equal(unfolded[idx], _rotate(unfolded, u)) for idx, u in zip(maps, signed))
+    se.unfold_irreducible_momenta(grid)
+    assert np.array_equal(se.mat, unfolded)
+    obeying = ((hk @ hk).reshape(36, 2, 2)[..., None] / (1j * np.arange(1, 7))).astype(np.complex64)
+    covariant = _se(obeying.copy(), nk=(6, 6, 1), has_compressed_q_dimension=True)
+    covariant.unfold_irreducible_momenta(grid)
+    assert np.allclose(covariant.mat, obeying, atol=1e-5)
+
+
+def test_unfold_irreducible_momenta_in_frequency_slabs_and_chunks_reproduces_the_whole_unfold(monkeypatch):
+    """Contiguous frequency slabs unfolded one by one, and one-frequency chunks, hold the bits of the whole unfold."""
+    grid, _ = _rotated_grid()
+    rng = np.random.default_rng(9)
+    mat = (rng.standard_normal((16, 2, 2, 10)) + 1j * rng.standard_normal((16, 2, 2, 10))).astype(np.complex64)
+    whole = _se(mat.copy(), nk=(4, 4, 1), has_compressed_q_dimension=True)
+    whole.unfold_irreducible_momenta(grid)
+    slabs = _se(mat.copy(), nk=(4, 4, 1), has_compressed_q_dimension=True)
+    for lo, hi in ((0, 3), (3, 3), (3, 8), (8, 10)):
+        slabs.unfold_irreducible_momenta(grid, frequencies=slice(lo, hi))
+    monkeypatch.setattr(SelfEnergy, "_TR_CHUNK_BYTES", 1)
+    chunked = _se(mat.copy(), nk=(4, 4, 1), has_compressed_q_dimension=True)
+    chunked.unfold_irreducible_momenta(grid)
+    assert np.array_equal(slabs.mat, whole.mat) and np.array_equal(chunked.mat, whole.mat)
+    assert not np.array_equal(whole.mat, mat)
+
+
+def test_unfold_irreducible_momenta_rejects_an_uncompressed_momentum_axis():
+    """unfold_irreducible_momenta needs the compressed momentum axis."""
+    with pytest.raises(ValueError):
+        _se(mat_decompressed.copy(), nk=nk, has_compressed_q_dimension=False).unfold_irreducible_momenta(
+            _rotated_grid()[0]
+        )

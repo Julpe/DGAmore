@@ -1799,6 +1799,69 @@ def test_point_group_orbits_ignores_anti_symmetries():
     assert len(np.unique(rep)) == 16
 
 
+def test_point_group_orbits_act_on_real_space_with_the_inverse_transpose():
+    """An element that shears the grid axes merges real-space stars through its inverse transpose, not through M."""
+    nk = (4, 4, 1)
+    shear = np.array([[1, 1, 0], [0, -1, 0], [0, 0, 1]], dtype=np.int64)
+    swap = np.array([[0.0, 1.0], [1.0, 0.0]])
+    group = {
+        sr._GroupElement.identity(2, nk),
+        sr._GroupElement(shear, np.zeros(3, dtype=np.int64), swap, +1, False, nk),
+    }
+
+    rep, us = sr.point_group_orbits(group, nk)
+
+    # R = (1, 1) maps to (1, 1 - 1) = (1, 0) under M^-T = M^T, while M itself leaves (1, 0) fixed
+    assert len(np.unique(rep)) == 10 and rep[5] == 4 and rep[4] == 4
+    assert np.allclose(us[5], swap) and np.allclose(us[4], np.eye(2))
+
+
+def _sheared_swap_group(nk):
+    """The identity and one element that shears the grid axes and swaps two orbitals."""
+    shear = np.array([[1, 1, 0], [0, -1, 0], [0, 0, 1]], dtype=np.int64)
+    swap = np.array([[0.0, 1.0], [1.0, 0.0]])
+    return {sr._GroupElement.identity(2, nk), sr._GroupElement(shear, np.zeros(3, dtype=np.int64), swap, +1, False, nk)}
+
+
+def test_point_group_actions_map_momenta_through_m_and_real_space_through_its_inverse_transpose():
+    """The identity comes first; a shear keeps k = (1, 0) but takes R = (1, 0) to (1, 1), with its own unitary."""
+    nk = (4, 4, 1)
+    k_maps, us = sr.point_group_actions(_sheared_swap_group(nk), nk)
+    r_maps, _ = sr.point_group_actions(_sheared_swap_group(nk), nk, real_space=True)
+    assert np.array_equal(k_maps[0], np.arange(16)) and np.array_equal(r_maps[0], np.arange(16))
+    assert np.allclose(us, [np.eye(2), [[0.0, 1.0], [1.0, 0.0]]])
+    assert k_maps[1][4] == 4 and r_maps[1][4] == 5
+
+
+def test_project_onto_point_group_returns_the_invariant_part_of_a_tensor():
+    """The average obeys the group, is left unchanged by a second average and keeps the dtype of its input."""
+    nk = (4, 4, 1)
+    maps, us = sr.point_group_actions(_sheared_swap_group(nk), nk, real_space=True)
+    rng = np.random.default_rng(0)
+    tensor = (rng.standard_normal((16, 2, 2)) + 1j * rng.standard_normal((16, 2, 2))).astype(np.complex64)
+    average = sr.project_onto_point_group(tensor, maps, us)
+    assert average.dtype == np.complex64 and not np.allclose(average, tensor, atol=1e-3)
+    assert np.allclose(average[maps[1]], us[1] @ average @ us[1].conj().T, atol=1e-6)
+    assert np.allclose(sr.project_onto_point_group(average, maps, us), average, atol=1e-6)
+
+
+def test_project_onto_point_group_unfolds_star_weighted_rows_into_a_tensor_obeying_the_group():
+    """Star-weighted irreducible rows unfold to their images: a row is kept, or averaged over its stabilizer."""
+    nk = (4, 4, 1)
+    maps, us = sr.point_group_actions(_sheared_swap_group(nk), nk)
+    reps, stars = np.unique(np.minimum(np.arange(16), maps[1]), return_counts=True)
+    rng = np.random.default_rng(1)
+    rows = (rng.standard_normal((len(reps), 2, 2, 3)) + 1j * rng.standard_normal((len(reps), 2, 2, 3))).astype(
+        np.complex64
+    )
+    swapped = rows[:, ::-1, ::-1]  # U rows U^dagger for the orbital swap
+    unfolded = sr.project_onto_point_group(rows * stars[:, None, None, None], maps, us, rows=reps)
+    assert unfolded.shape == (16, 2, 2, 3) and sorted(stars.tolist()) == [1] * 4 + [2] * 6
+    assert np.array_equal(unfolded[maps[1]], unfolded[:, ::-1, ::-1])
+    assert np.array_equal(unfolded[reps[stars == 2]], rows[stars == 2])
+    assert np.allclose(unfolded[reps[stars == 1]], (rows + swapped)[stars == 1] / 2, atol=1e-6)
+
+
 def test_group_element_keeps_small_unitary_entries():
     """The stored unitary is the validated one; entries below 1e-5 are rounded only inside the hash key."""
     u = _rot2(1e-6)

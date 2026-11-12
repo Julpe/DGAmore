@@ -933,6 +933,29 @@ class IAmNonLocal(IHaveMat, ABC):
         self.update_original_shape()
         return self
 
+    def scatter_to_full_bz(self, k_grid: "KGrid", out: np.ndarray | None = None):
+        r"""
+        Places every irreducible row, multiplied by the number of momenta of its star, at its representative in the
+        full Brillouin zone and zeros everywhere else. A sum over the full zone of the result times a function of the
+        momentum equals that sum for the unfolded object (see :meth:`map_to_full_bz`) once it is averaged over the
+        grid's operations, provided the object and the function obey them. Nothing is rotated.
+
+        :param k_grid: The momentum grid carrying the irreducible representatives and the sizes of their stars.
+        :param out: Optional array of the full-BZ shape and the object's dtype that receives the result instead of a
+            fresh allocation; it must not overlap the object's array, and its content is overwritten.
+        :return: ``self`` on the full BZ (compressed momentum axis).
+        :raises ValueError: If the object does not have a compressed momentum dimension.
+        """
+        if not self.has_compressed_q_dimension:
+            raise ValueError("Scattering to the full BZ only possible for compressed momentum dimension.")
+        full = np.empty((np.prod(self.nq), *self.current_shape[1:]), dtype=self.mat.dtype) if out is None else out
+        full[...] = 0
+        stars = k_grid.irrk_count.astype(self.mat.real.dtype).reshape(-1, *[1] * (self.mat.ndim - 1))
+        full[k_grid.irrk_ind] = self.mat * stars
+        self.mat = full
+        self.update_original_shape()
+        return self
+
     def fft(self, copy: bool = True, axes: tuple[int, int, int] = (0, 1, 2)):
         """
         Performs a discrete forward Fourier transform over the momentum dimension and returns a copy if specified.

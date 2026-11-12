@@ -500,6 +500,77 @@ def test_bubble_of_a_hermitian_g_without_time_reversal_transforms_every_column(r
     assert np.array_equal(result, bubble(ranks))
 
 
+def _make_transposed_g(nk: tuple, niv: int, pi: list, seed: int = 0) -> GreensFunction:
+    """Builds a crossing Green's function that also obeys G(k)_12 = G(k)_{pi(2) pi(1)} bit for bit at every k."""
+    g = _make_crossing_g(nk, len(pi), niv, seed, hermitian=False)
+    g.mat[...] = (g.mat + g.mat.swapaxes(-2, -3)[..., pi, :, :][..., :, pi, :]) / 2  # commutative: same bits
+    g.mat[..., :niv] = np.conj(g.mat[..., niv:][..., ::-1].swapaxes(-2, -3))
+    return g
+
+
+@pytest.mark.parametrize("pi, ranks", [([0, 1], 1), ([0, 1], 3), ([1, 0], 3), ([2, 3, 0, 1], 1), ([2, 3, 0, 1], 2)])
+def test_bubble_of_a_transposed_g_transforms_only_its_independent_orbital_components(pi, ranks, monkeypatch):
+    """With G_12 = G_pi(2)pi(1) one of each pair of components (1234), (pi4 pi3 pi2 pi1) is transformed and copied."""
+    import scipy as sp
+
+    from tests.conftest import create_comm_mock
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta, p = (4, 2, 1), len(pi), 3, 2, 2.5, np.array(pi)
+    g = _make_transposed_g(nk, niv + niw + 2, pi, seed=90 + nb)
+    q_grid = bz.KGrid(nk, symmetries=[])
+    involution = None if pi == sorted(pi) else p
+    o = np.indices((nb,) * 4).reshape(4, -1)
+    flat, partner = np.ravel_multi_index(o, (nb,) * 4), np.ravel_multi_index(
+        (p[o[3]], p[o[2]], p[o[1]], p[o[0]]), (nb,) * 4
+    )
+    n_independent = np.count_nonzero(flat <= partner)
+    g_ranks = [g.copy() for _ in range(ranks)]
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
+        return BubbleGenerator.create_generalized_chi0_q_fft(
+            dist, g_ranks[rank], niw, niv, q_grid, beta, involution=involution
+        ).mat
+
+    def bubble():
+        return np.concatenate(run_parallel(ranks, fn)[1], axis=0) if ranks > 1 else fn(create_comm_mock(), 0)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(BubbleGenerator, "_orbital_transpose_permutation", staticmethod(lambda *args, **kwargs: None))
+        every = bubble()
+    shapes, ifftn = [], sp.fft.ifftn
+    monkeypatch.setattr(sp.fft, "ifftn", lambda x, **kwargs: shapes.append(x.shape) or ifftn(x, **kwargs))
+    independent = bubble()
+    assert shapes and all(int(np.prod(shape[3:-1])) == n_independent < nb**4 for shape in shapes)
+    assert np.allclose(independent, every, atol=1e-6 * np.abs(every).max())
+    assert np.array_equal(
+        independent, independent.transpose(0, 4, 3, 2, 1, 5, 6)[:, p][:, :, p][:, :, :, p][:, :, :, :, p]
+    )
+
+
+@pytest.mark.parametrize("ranks", [1, 3])
+def test_orbital_transpose_permutation_is_the_identity_or_the_involution_the_g_obeys(ranks, monkeypatch):
+    """A symmetric G gives the identity, a G transposed by a swap that swap; a random, broken or one-band G None."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, n, swap = (4, 2, 1), 5, np.array([1, 0])
+    broken = _make_transposed_g(nk, n, [0, 1], seed=3)
+    broken.mat[1, 0, 0, 0, 1, 2] += 1e-4 * np.abs(broken.mat).max()
+    cases = [
+        (_make_transposed_g(nk, n, [0, 1], seed=3), swap, [0, 1]),
+        (_make_transposed_g(nk, n, [1, 0], seed=4), swap, [1, 0]),
+        (_make_transposed_g(nk, n, [1, 0], seed=4), None, None),
+        (_make_crossing_g(nk, 2, n, seed=5), swap, None),
+        (_make_crossing_g(nk, 1, n, seed=6), None, None),
+        (broken, swap, None),
+    ]
+    for g, involution, expected in cases:
+        found = run_parallel(
+            ranks, lambda comm, rank: BubbleGenerator._orbital_transpose_permutation(g, n, involution, comm)
+        )[1]
+        assert all((f is None) if expected is None else np.array_equal(f, expected) for f in found)
+
+
 @pytest.mark.parametrize("crossing", [False, True])
 @pytest.mark.parametrize("size", [1, 2])
 def test_fft_bubble_subtracted_in_place_has_the_bits_of_the_difference_of_both_bubbles(size, crossing, monkeypatch):
@@ -625,7 +696,9 @@ def test_column_pass_peak_does_not_grow_with_the_number_of_rounds():
     def peak(n_w: int) -> int:
         def run():
             fill = lambda out, part, iw, iv: out.fill(1.0)
-            BubbleGenerator._run_columns(dist, q_grid, n_w, n_v, 1, nb, np.complex64, fill, lambda where, b: None)
+            BubbleGenerator._run_columns(
+                dist, q_grid, n_w, n_v, 1, (nb,) * 4, np.complex64, fill, lambda where, b: None
+            )
 
         return traced_peak(run)[1]
 

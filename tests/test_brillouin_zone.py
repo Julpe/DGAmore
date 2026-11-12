@@ -897,3 +897,49 @@ def test_auto_symmetries_with_uncorrelated_orbitals_reduce_the_zone_of_the_corre
     assert grid.nk_irr == 15 and grid._auto_us.shape == (*nk, 1, 1)
     g = np.linalg.inv((1j * np.pi / 10 + 0.3) * np.eye(3) - hk)[..., 0, 0].reshape(-1)
     assert np.allclose(g, g[grid.irrk_ind][grid.irrk_inv.reshape(-1)], rtol=0, atol=1e-12)
+
+
+@pytest.mark.parametrize("phase, bands, expected", [(0.0, 2, True), (np.pi / 4, 2, False), (0.0, 1, False)])
+def test_auto_point_group_exists_for_real_rotations_of_several_orbitals_only(phase, bands, expected):
+    """Real rotations of two orbitals give cached actions on both grids; complex ones, one band or no group: None."""
+    nk = (4, 4, 1)
+    kx, ky, _ = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nk), indexing="ij")
+    hk = np.zeros(nk + (2, 2), dtype=complex)
+    hk[..., 0, 0] = -2.0 * np.cos(kx) - 0.6 * np.cos(ky)
+    hk[..., 1, 1] = -2.0 * np.cos(ky) - 0.6 * np.cos(kx)
+    hk[..., 0, 1] = 0.3 * np.exp(1j * phase) * np.sin(kx) * np.sin(ky)
+    hk[..., 1, 0] = np.conj(hk[..., 0, 1])
+    grid = bz.KGrid(nk, symmetries=[bz.KnownSymmetries.AUTO])
+    assert grid.auto_point_group() is None
+    grid.specify_auto_symmetries(hk[..., :bands, :bands])
+    for real_space in (False, True):
+        actions = grid.auto_point_group(real_space)
+        assert (actions is not None) == expected
+        if expected:
+            assert actions[0].shape == (len(grid._auto_group), 16) and actions[1].shape[1:] == (2, 2)
+            assert grid.auto_point_group(real_space) is actions
+    assert bz.KGrid(nk, symmetries=bz.two_dimensional_square_symmetries()).auto_point_group() is None
+
+
+def test_auto_point_group_holds_rotations_that_permute_and_flip_the_orbitals_exactly(monkeypatch):
+    """Discovered unitaries within rounding of signed permutations come back as those; other rotations are kept."""
+    import dgamore.symmetry_reduction as sr
+
+    nk = (4, 4, 1)
+    kx, ky, _ = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nk), indexing="ij")
+    hk = np.zeros(nk + (2, 2), dtype=complex)
+    hk[..., 0, 0] = -2.0 * np.cos(kx) - 0.6 * np.cos(ky)
+    hk[..., 1, 1] = -2.0 * np.cos(ky) - 0.6 * np.cos(kx)
+    hk[..., 0, 1] = hk[..., 1, 0] = 0.3 * np.sin(kx) * np.sin(ky)
+    grid = bz.KGrid(nk, symmetries=[bz.KnownSymmetries.AUTO])
+    grid.specify_auto_symmetries(hk)
+    actions, noise = sr.point_group_actions, 6e-13 * (1 + 1j)
+    signed = np.round(actions(grid._auto_group, nk)[1].real)
+    monkeypatch.setattr(sr, "point_group_actions", lambda *a: (actions(*a)[0], actions(*a)[1] * (1 + noise) + noise))
+    us = grid.auto_point_group()[1]
+    assert np.array_equal(us, signed) and np.abs(signed).sum(axis=-1).max() == 1.0
+    rotated = signed.copy()
+    rotated[1] = [[0.6, 0.8], [-0.8, 0.6]]
+    grid._auto_point_groups.clear()
+    monkeypatch.setattr(sr, "point_group_actions", lambda *a: (actions(*a)[0], rotated * (1 + noise)))
+    assert np.array_equal(grid.auto_point_group()[1], (rotated * (1 + noise)).real)
