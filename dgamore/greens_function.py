@@ -415,11 +415,13 @@ class GreensFunction(TwoPoint):
     ):
         r"""
         Builds the full momentum-dependent Green's function :math:`G^{\mathrm{k}} = [(\imath\nu + \mu) -
-        \varepsilon(\mathbf{k}) - \Sigma^{\mathrm{k}}]^{-1}`. The Dyson matrix is assembled and inverted in bounded
-        fermionic-frequency chunks, so beyond the result only one chunk-sized transient is alive at a time (large
-        boxes such as the full DMFT one would otherwise triple the peak). With ``orbitals`` the self-energy acts on
-        those orbitals of the dispersion only, the inversion runs over every orbital and the result holds the rows and
-        columns ``orbitals``.
+        \varepsilon(\mathbf{k}) - \Sigma^{\mathrm{k}}]^{-1}`. The Dyson matrix is assembled and inverted on the positive
+        fermionic frequencies in bounded chunks, so beyond the result only one chunk-sized transient is alive at a time
+        (large boxes such as the full DMFT one would otherwise triple the peak). The negative frequencies follow from
+        the Matsubara Hermiticity :math:`G^{(\mathbf{k},-\nu)}_{12} = [G^{(\mathbf{k},\nu)}_{21}]^*`, which the result
+        therefore obeys bit for bit; the self-energy's negative frequencies are not read. With ``orbitals`` the
+        self-energy acts on those orbitals of the dispersion only, the inversion runs over every orbital and the result
+        holds the rows and columns ``orbitals``.
 
         :param siw: The :class:`SelfEnergy` :math:`\Sigma`.
         :param mu: Chemical potential :math:`\mu`.
@@ -436,8 +438,11 @@ class GreensFunction(TwoPoint):
         mat = out
         if mat is None:
             mat = np.empty((*ek.shape[:3], siw.n_bands, siw.n_bands, 2 * siw.niv), dtype=sigma_mat.dtype)
-        for start, stop, inverse in GreensFunction._dyson_chunks(sigma_mat, siw.niv, mu, ek, beta, orbitals):
-            mat[..., start:stop] = orbital_block(inverse, orbitals, frequency_last=True)
+        niv = siw.niv
+        for start, stop, inverse in GreensFunction._dyson_chunks(sigma_mat, niv, mu, ek, beta, orbitals, first=niv):
+            block = orbital_block(inverse, orbitals, frequency_last=True)
+            mat[..., start:stop] = block
+            np.conjugate(block[..., ::-1].swapaxes(-3, -2), out=mat[..., 2 * niv - stop : 2 * niv - start])
         return GreensFunction(
             mat, siw, ek, siw.full_niv_range, False, False, nk=ek.shape[:3], beta=beta, mu=mu, orbitals=orbitals
         )
@@ -468,12 +473,19 @@ class GreensFunction(TwoPoint):
 
     @staticmethod
     def _dyson_chunks(
-        sigma_mat: np.ndarray, niv: int, mu: float, ek: np.ndarray, beta: float, orbitals: np.ndarray | None
+        sigma_mat: np.ndarray,
+        niv: int,
+        mu: float,
+        ek: np.ndarray,
+        beta: float,
+        orbitals: np.ndarray | None,
+        first: int = 0,
     ) -> Iterator[tuple[int, int, np.ndarray]]:
         r"""
         Yields the inverse Dyson matrix :math:`[(\imath\nu + \mu) - \varepsilon(\mathbf{k}) -
         \Sigma^{\mathrm{k}}]^{-1}` on every orbital of ``ek``, one fermionic-frequency chunk of
-        :data:`_MODEL_EPOT_CHUNK_ELEMENTS` entries per momentum and orbital pair at a time.
+        :data:`_MODEL_EPOT_CHUNK_ELEMENTS` entries per momentum and orbital pair at a time, from the frequency index
+        ``first`` to the end of the axis.
 
         :param sigma_mat: The uncompressed self-energy array ``[kx, ky, kz, o1, o2, 2 niv]`` (or momentum-local).
         :param niv: Number of positive fermionic frequencies.
@@ -482,6 +494,8 @@ class GreensFunction(TwoPoint):
         :param beta: Inverse temperature :math:`\beta`.
         :param orbitals: Indices of the orbitals of the dispersion the self-energy acts on (the correlated orbitals);
             None when it acts on every orbital.
+        :param first: Index of the first frequency on the axis of ``2 niv`` frequencies (``niv`` is the first positive
+            one).
         :return: An iterator of ``(start, stop, inverse)`` with ``inverse`` of shape ``[kx, ky, kz, n, n, stop -
             start]``.
         """
@@ -490,7 +504,7 @@ class GreensFunction(TwoPoint):
         iv = 1j * MFHelper.vn(niv, beta)
         static_bands = (mu * eye_bands)[None, None, None, :, :, None] - ek[..., None]
         step = max(1, _MODEL_EPOT_CHUNK_ELEMENTS // (int(np.prod(ek.shape[:3])) * n_orbitals**2))
-        for start in range(0, 2 * niv, step):
+        for start in range(first, 2 * niv, step):
             stop = min(2 * niv, start + step)
             dyson = (iv[start:stop][None, None, :] * eye_bands[..., None])[None, None, None, ...] + static_bands
             _subtract_self_energy(dyson, sigma_mat[..., start:stop], orbitals)
