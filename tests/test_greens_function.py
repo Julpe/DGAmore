@@ -168,6 +168,34 @@ def test_get_g_full_stores_beta_mu_and_does_not_read_config(monkeypatch):
     assert g._mu == mu
 
 
+@pytest.mark.parametrize("orbitals", [None, np.array([0, 2])])
+def test_get_g_full_mirrors_the_negative_frequencies_from_the_positive_ones_bit_for_bit(orbitals):
+    """G(k, -v) = G(k, v)^dagger bit for bit, with G(k, v) the inverse Dyson matrix of the positive frequencies, so a
+    self-energy whose negative frequencies break its Hermiticity leaves G unchanged."""
+    nk, nb, niv, beta, mu = (3, 2, 1), 3, 5, 5.0, 0.3
+    rng = np.random.default_rng(7)
+    ek = rng.standard_normal((*nk, nb, nb)) + 1j * rng.standard_normal((*nk, nb, nb))
+    ek = 0.5 * (ek + np.conj(ek.swapaxes(-1, -2)))
+    ns = nb if orbitals is None else len(orbitals)
+    shape = (int(np.prod(nk)), ns, ns, 2 * niv)
+    sig_mat = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    broken = sig_mat.copy()
+    broken[..., :niv] += 1e-3
+
+    def build(mat):
+        sig = SelfEnergy(mat, nk=nk, has_compressed_q_dimension=True, beta=beta)
+        return GreensFunction.get_g_full(sig, mu, ek, beta, orbitals=orbitals).mat
+
+    g = build(sig_mat)
+    assert np.array_equal(g[..., :niv], np.conj(g[..., niv:][..., ::-1].swapaxes(-3, -2)))
+    assert np.array_equal(build(broken), g)
+    dyson = (1j * MFHelper.vn(niv, beta)[niv:] * np.eye(nb)[..., None]) + (mu * np.eye(nb) - ek)[..., None]
+    rows = (slice(None), slice(None)) if orbitals is None else (orbitals[:, None], orbitals)
+    dyson[(..., *rows, slice(None))] -= sig_mat.reshape(*nk, ns, ns, 2 * niv)[..., niv:]
+    inverse = GreensFunction._invert_last_orbital_block(dyson)[(..., *rows, slice(None))]
+    assert np.allclose(g[..., niv:], inverse, rtol=0, atol=1e-6)
+
+
 def test_get_fill_nonlocal_caches_and_does_not_write_config(monkeypatch):
     """get_fill_nonlocal caches filling on the object and leaves config.sys untouched."""
     nk, ek, sig, beta, mu = _toy_inputs()
