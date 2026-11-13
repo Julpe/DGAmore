@@ -4,7 +4,10 @@
 # DGAmore - Multi-Orbital Ladder Dynamical Vertex Approximation (LDGA) &
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
+import ctypes
 import itertools
+import platform
+import sys
 import tracemalloc
 from copy import deepcopy
 from unittest.mock import MagicMock
@@ -1587,6 +1590,232 @@ def test_invert_with_local_kernel_and_sum_permuted_solve_stays_within_the_modele
     assert peak - out.mat.nbytes <= memory_estimator._chiq_aux_transient(16 * 64, 4)
 
 
+def test_pair_groups_are_the_coupled_sets_of_pairs_smallest_first():
+    """Pairs coupled directly or through others form one group; groups come smallest first, a single one as None."""
+    coupled = np.zeros((6, 6), dtype=bool)
+    coupled[[0, 4, 4, 1], [5, 2, 3, 1]] = True
+    assert [g.tolist() for g in four_point._pair_groups(coupled)] == [[1], [0, 5], [2, 3, 4]]
+    coupled[[1, 5], [0, 2]] = True
+    assert four_point._pair_groups(coupled) is None
+
+
+def _grouped_slice(rng, sizes, vn, first=1.0):
+    """(A, frequency-diagonal blocks, groups, M) of a complex64 slice whose pairs, in random order, form groups of
+    ``sizes``; ``first`` scales the block of the group that is eliminated first."""
+    n_p = sum(sizes)
+    order, v = rng.permutation(n_p), np.arange(vn)
+    a_buf = np.zeros((n_p * vn, n_p * vn), dtype=np.complex64, order="F")
+    a_view = four_point._pair_view(a_buf, n_p)
+    for pairs in (order[a - s : a] for a, s in zip(np.cumsum(sizes), sizes)):
+        shape = (pairs.size, pairs.size, vn, vn)
+        a_view[pairs[:, None], :, pairs, :] = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    a_view[:, v, :, v] = 0
+    blocks = (rng.standard_normal((vn, n_p, n_p)) + 1j * rng.standard_normal((vn, n_p, n_p))).astype(np.complex64)
+    blocks[:, np.arange(n_p), np.arange(n_p)] += 4 * n_p * vn
+    every = range(n_p)
+    groups = four_point._pair_groups(np.array([[bool(a_view[r, :, c, :].any()) for c in every] for r in every]))
+    a_view[groups[0][:, None], :, groups[0], :] *= first
+    blocks[:, groups[0][:, None], groups[0]] *= first
+    m = a_buf.copy(order="F")
+    four_point._pair_view(m, n_p)[:, v, :, v] = blocks
+    return a_buf, blocks, groups, m
+
+
+def _backward_error(m: np.ndarray, x: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Per right-hand side, the complex128 residual over eps32 times the largest entries of M and of the solution."""
+    r = rhs - m.astype(np.complex128) @ x.astype(np.complex128)
+    return np.abs(r).max(axis=0) / (np.finfo(np.float32).eps * np.abs(m).max() * np.abs(x).max(axis=0))
+
+
+@pytest.mark.parametrize("sizes", [(1, 1), (2, 2), (2, 2, 2, 2), (1, 2, 3), (2, 2, 2, 2, 2, 3)])
+def test_grouped_solve_eliminates_over_any_number_of_pair_groups(rng, monkeypatch, sizes):
+    """The elimination over the pair groups solves the slice to a stable backward error without any LU of it."""
+    a_buf, blocks, groups, m = _grouped_slice(rng, sizes, 6)
+    rhs = (rng.standard_normal((m.shape[0], 3)) + 1j * rng.standard_normal((m.shape[0], 3))).astype(np.complex64)
+    monkeypatch.setattr(four_point, "_factorization", MagicMock(side_effect=AssertionError("no LU of the slice")))
+    solve = four_point._grouped_solve(np.empty_like(m, order="F"), a_buf, blocks, groups, np.abs(m).max())
+    x, ref = solve(rhs), np.linalg.solve(m.astype(np.complex128), rhs)
+    assert sorted(g.size for g in groups) == sorted(sizes) and x.dtype == np.complex64
+    assert np.all(_backward_error(m, x, rhs) <= 1.0)
+    assert np.allclose(x, ref, rtol=0, atol=ten_times_the_floor(ref, np.complex64))
+    assert np.all(_backward_error(m, solve(2 * rhs[:, :1]), 2 * rhs[:, :1]) <= 1.0)
+
+
+def test_grouped_solve_corrects_the_growth_of_a_small_group_or_takes_the_lu(rng, monkeypatch):
+    """A first group 1e-8 of the others needs complex128 residual corrections; without them the slice takes the LU."""
+    a_buf, blocks, groups, m = _grouped_slice(rng, (2, 2), 6, first=1e-8)
+    rhs = (rng.standard_normal((m.shape[0], 3)) + 1j * rng.standard_normal((m.shape[0], 3))).astype(np.complex64)
+    factorizations = _spy_factorizations_of_slices(monkeypatch)
+    x = four_point._grouped_solve(np.empty_like(m, order="F"), a_buf, blocks, groups, np.abs(m).max())(rhs)
+    corrected = list(factorizations)
+    monkeypatch.setattr(four_point, "_REFINEMENT_CORRECTIONS", 0)
+    stalled = four_point._grouped_solve(np.empty_like(m, order="F"), a_buf, blocks, groups, np.abs(m).max())
+    lu = sp.linalg.lu_solve(sp.linalg.lu_factor(m), rhs)
+    assert corrected == [] and np.all(_backward_error(m, x, rhs) <= 1.0)
+    assert np.array_equal(stalled(rhs), lu) and np.array_equal(stalled(rhs), lu) and factorizations == [False]
+
+
+def _split_pair_groups(gamma: LocalFourPoint, u_r: LocalInteraction) -> None:
+    """Zeroes vertex and U between the orbital pairs (a, a) and (a, b != a) in place: two pair groups per atom."""
+    same = np.eye(gamma.n_bands, dtype=bool)
+    keep = same[:, :, None, None] == same[None, None, :, :]
+    gamma.mat[~keep], u_r.mat[~keep] = 0.0, 0.0
+
+
+def _spy_grouped_solves(monkeypatch) -> list[int]:
+    """Records the number of pair groups of every slice that takes the elimination over them."""
+    calls, real = [], four_point._grouped_solve
+    monkeypatch.setattr(four_point, "_grouped_solve", lambda *a: calls.append(len(a[3])) or real(*a))
+    return calls
+
+
+def _complex128_sum_reference(gamma, chi0, u_r, inactive, beta, monkeypatch) -> np.ndarray:
+    """The summed solve of the same complex64 slices in complex128."""
+    assembled = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r)
+    monkeypatch.setattr(npb, "DTYPE", np.complex128)
+    assembled.mat = assembled.mat
+    return assembled.invert_and_sum_over_last_vn_v2(beta, inactive).mat
+
+
+@pytest.mark.parametrize("two_atoms", [False, True])
+def test_invert_with_local_kernel_and_sum_eliminates_over_pair_groups_where_a_slice_is_not_symmetric(
+    rng, monkeypatch, two_atoms
+):
+    """Asymmetric slices of a vertex with pair groups take the elimination; symmetric ones keep ?sytrf and its bits."""
+    beta = config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, 4 if two_atoms else 2, niv=4, two_atoms=two_atoms)
+    _split_pair_groups(gamma, u_r)
+    kernel = (gamma, u_r, 1.0 / beta**2, beta, inactive)
+    dense = chi0.invert_with_local_kernel_and_sum_over_last_vn(*kernel)
+    monkeypatch.setattr(four_point, "_GROUPED_ROWS_PER_PAIR", 0)
+    flags, grouped = _spy_factorizations(monkeypatch), _spy_grouped_solves(monkeypatch)
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(*kernel)
+    taken = (list(grouped), list(flags))
+    ref = _complex128_sum_reference(gamma, chi0, u_r, inactive, beta, monkeypatch)
+    symmetric = (np.arange(3)[:, None] + np.arange(3)) % 2 == 0  # [q, w]
+    assert taken == ([4 if two_atoms else 2] * 4, [True] * 5) and out.mat.dtype == np.complex64
+    assert np.array_equal(np.moveaxis(out.mat, 5, 1)[symmetric], np.moveaxis(dense.mat, 5, 1)[symmetric])
+    assert not np.array_equal(out.mat, dense.mat)
+    assert np.allclose(out.mat, ref, rtol=0, atol=ten_times_the_floor(ref, np.complex64))
+
+
+def test_invert_with_local_kernel_and_sum_finds_the_pair_groups_of_every_bosonic_frequency(rng, monkeypatch):
+    """A coupling between two groups at one bosonic frequency merges them for that frequency's slices only."""
+    monkeypatch.setattr(four_point, "_GROUPED_ROWS_PER_PAIR", 0)
+    beta = config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, 4, niv=4, two_atoms=True)
+    _split_pair_groups(gamma, u_r)
+    gamma.mat[0, 0, 0, 1, 1] = rng.standard_normal((8, 8))  # pairs (0, 0) and (1, 0) at w = 1: no slice symmetric
+    grouped = _spy_grouped_solves(monkeypatch)
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / beta**2, beta, inactive)
+    taken = list(grouped)
+    ref = _complex128_sum_reference(gamma, chi0, u_r, inactive, beta, monkeypatch)
+    assert taken == [4, 3, 3, 3, 4] and np.allclose(out.mat, ref, rtol=0, atol=ten_times_the_floor(ref, np.complex64))
+
+
+@pytest.mark.parametrize("niv, groups", [(20, []), (24, [4])])
+def test_invert_with_local_kernel_and_sum_eliminates_over_pair_groups_from_48_rows_per_pair(
+    rng, monkeypatch, niv, groups
+):
+    """A box of 20 fermionic frequencies keeps the LU of its asymmetric slice, one of 24 takes the elimination."""
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, 4, niv=niv, nq=2, nw=1, two_atoms=True)
+    _split_pair_groups(gamma, u_r)
+    grouped = _spy_grouped_solves(monkeypatch)
+    chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / 64.0, 8.0, inactive)
+    assert grouped == groups
+
+
+@pytest.mark.parametrize("case", ["small", "complex128", "one group"])
+def test_invert_with_local_kernel_and_sum_keeps_the_bits_below_the_group_gate_in_complex128_and_for_one_group(
+    rng, monkeypatch, case
+):
+    """Below the size gate, in complex128, or with every pair in one group, no slice takes the elimination."""
+    if case == "complex128":
+        monkeypatch.setattr(npb, "DTYPE", np.complex128)
+    beta = config.sys.beta = np.float64(8.0)
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, 2, niv=4)
+    if case != "one group":
+        _split_pair_groups(gamma, u_r)
+    ref = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r).invert_and_sum_over_last_vn_v2(beta, inactive)
+    if case != "small":
+        monkeypatch.setattr(four_point, "_GROUPED_ROWS_PER_PAIR", 0)
+    grouped = _spy_grouped_solves(monkeypatch)
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / beta**2, beta, inactive)
+    assert grouped == [] and np.array_equal(out.mat, ref.mat)
+
+
+def test_invert_with_local_kernel_and_sum_prefers_the_pair_groups_to_the_permuted_factorization(rng, monkeypatch):
+    """A layer-swapped slice whose pairs form groups takes the elimination over them, not ?sytrf on M P."""
+    monkeypatch.setattr(four_point, "_PERMUTED_ROWS_PER_PAIR", 0)
+    monkeypatch.setattr(four_point, "_GROUPED_ROWS_PER_PAIR", 0)
+    beta = config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _layer_swap_inputs(rng, 4)
+    permuted, grouped = _spy_refined_solves(monkeypatch), _spy_grouped_solves(monkeypatch)
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(
+        gamma, u_r, 1.0 / beta**2, beta, inactive, orbital_involution=_LAYER_SWAP
+    )
+    taken = (list(permuted), list(grouped))
+    ref = _complex128_sum_reference(gamma, chi0, u_r, inactive, beta, monkeypatch)
+    assert taken == ([], [2] * 4) and np.allclose(out.mat, ref, rtol=0, atol=ten_times_the_floor(ref, np.complex64))
+
+
+@pytest.mark.parametrize("mode", ["rhs", "slice_rhs"])
+def test_invert_with_local_kernel_with_right_hand_sides_never_eliminates_over_pair_groups(rng, monkeypatch, mode):
+    """With given or per-slice right-hand sides every slice keeps the dense solve and its bits."""
+    beta = config.sys.beta = np.float64(8.0)
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, 4, niv=4, two_atoms=True)
+    _split_pair_groups(gamma, u_r)
+    shape, meta = chi0.current_shape, (SpinChannel.NONE, (3, 1, 1), 1, 1, False, True, True)
+    mixer = FourPoint(rng.standard_normal(shape) + 1j * rng.standard_normal(shape), *meta)
+    kernel = (gamma, u_r, 1.0 / beta**2, beta, inactive)
+    total = chi0.invert_with_local_kernel_and_sum_over_last_vn(*kernel)
+
+    def slice_rhs(i: int, w: int, slice_total: FourPoint) -> list[FourPoint]:
+        """The member mixer @ total, from the slice's sum."""
+        return [mixer.take_q_index_slice(i, i + 1, copy=False).take_wn_slice(w, w + 1, copy=False) @ slice_total]
+
+    def solutions() -> list[FourPoint]:
+        """The solutions for the right-hand side mixer @ total, in one pass or fused with the sum."""
+        if mode == "rhs":
+            return chi0.invert_with_local_kernel_and_sum_over_last_vn(*kernel, rhs=[mixer @ total])
+        return chi0.invert_with_local_kernel_and_sum_over_last_vn(*kernel, slice_rhs=slice_rhs)[1]
+
+    dense = solutions()
+    monkeypatch.setattr(four_point, "_GROUPED_ROWS_PER_PAIR", 0)
+    grouped = _spy_grouped_solves(monkeypatch)
+    out = solutions()
+    assert grouped == [] and len(out) == 1 and np.array_equal(out[0].mat, dense[0].mat)
+
+
+def test_invert_with_local_kernel_band_and_whole_box_solves_never_eliminate_over_pair_groups(rng, monkeypatch):
+    """The band solve and the whole-box inverse read the filled buffer: none of their slices takes the elimination."""
+    monkeypatch.setattr(four_point, "_GROUPED_ROWS_PER_PAIR", 0)
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, 4, niv=4, two_atoms=True)
+    _split_pair_groups(gamma, u_r)
+    grouped = _spy_grouped_solves(monkeypatch)
+    chi0.invert_with_local_kernel_on_anti_diagonal(gamma, u_r, 1.0 / 64.0, 8.0, 2, 0, inactive)
+    chi0.invert_with_local_kernel(gamma, u_r, 1.0 / 64.0)
+    assert grouped == []
+
+
+def test_invert_with_local_kernel_and_sum_eliminates_over_pair_groups_inside_the_factorization_buffer(rng, monkeypatch):
+    """With every pair solved, the elimination holds no more than the two compound slices of the dense solve."""
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, inactive = _kernel_inputs(rng, 2, niv=64, nq=2, nw=1)
+    _split_pair_groups(gamma, u_r)
+    grouped = _spy_grouped_solves(monkeypatch)
+    slice_bytes = (2 * 2 * 128) ** 2 * np.dtype(np.complex64).itemsize
+    tracemalloc.start()
+    out = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / 8.0**2, 8.0, inactive)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert inactive.size == 0 and grouped == [2]
+    assert 2 * slice_bytes < peak - out.mat.nbytes < 2.5 * slice_bytes
+    assert peak - out.mat.nbytes <= memory_estimator._chiq_aux_transient(2 * 2 * 128, 2)
+
+
 def _band_and_first_sum_reference(fp: FourPoint, niv_band: int, beta: float) -> tuple[np.ndarray, np.ndarray]:
     """The full inverse of every half-range slice, kept on the anti-diagonal of the box, and its first-frequency sum."""
     half = deepcopy(fp).to_half_niw_range()
@@ -1639,6 +1868,81 @@ def test_invert_on_anti_diagonal_takes_no_lu_on_symmetric_and_half_size_ones_on_
     assert sizes == []
     deepcopy(_random_compound_fourpoint(rng, 2, symmetric=False, niv=4)).invert_on_anti_diagonal(2, 1, 8.0)
     assert sizes and max(sizes) == 2 * 2 * 4
+
+
+def _mxcsr() -> int:
+    """The MXCSR register of the calling thread, read through glibc on x86-64 Linux."""
+    env = (ctypes.c_ubyte * 32)()
+    ctypes.CDLL("libm.so.6").fegetenv(env)
+    return int.from_bytes(bytes(env[28:32]), "little")
+
+
+_ON_X86_64_LINUX = sys.platform.startswith("linux") and platform.machine() == "x86_64"
+_FLUSH_BITS = 0x8040
+
+
+@pytest.mark.skipif(not _ON_X86_64_LINUX, reason="the MXCSR register exists on x86-64 only")
+def test_subnormals_flushed_zeroes_subnormal_products_inside_the_block_only():
+    """Inside the block a float32 product below the normal range is exactly zero; outside it is subnormal."""
+    tiny = np.full(8, 1e-20, dtype=np.float32)
+    before = tiny * tiny
+    with four_point._subnormals_flushed():
+        inside, mode = tiny * tiny, _mxcsr()
+    assert np.all(before > 0) and np.all(inside == 0) and np.array_equal(tiny * tiny, before)
+    assert mode & _FLUSH_BITS == _FLUSH_BITS and _mxcsr() & _FLUSH_BITS == 0
+
+
+@pytest.mark.skipif(not _ON_X86_64_LINUX, reason="the MXCSR register exists on x86-64 only")
+def test_subnormals_flushed_restores_the_mode_when_the_block_raises():
+    """An exception inside the block leaves the calling thread with its own floating-point mode."""
+    with pytest.raises(ValueError):
+        with four_point._subnormals_flushed():
+            raise ValueError
+    assert _mxcsr() & _FLUSH_BITS == 0
+
+
+def test_subnormals_flushed_runs_the_block_unchanged_where_the_mode_cannot_be_set(monkeypatch):
+    """Without glibc on x86-64 the block still runs, with its subnormal results as they are."""
+    monkeypatch.setattr(four_point, "_LIBM", None)
+    tiny = np.full(8, 1e-20, dtype=np.float32)
+    with four_point._subnormals_flushed():
+        inside = tiny * tiny
+    assert np.all(inside > 0)
+
+
+def _spy_modes(monkeypatch) -> list[int]:
+    """Records the MXCSR register at the start of every slice solve (where the solvers split the orbital pairs)."""
+    modes, real = [], four_point._split_pairs
+    monkeypatch.setattr(four_point, "_split_pairs", lambda *a: modes.append(_mxcsr()) or real(*a))
+    return modes
+
+
+@pytest.mark.skipif(not _ON_X86_64_LINUX, reason="the MXCSR register exists on x86-64 only")
+@pytest.mark.parametrize("symmetric", [True, False])
+def test_slice_solvers_run_with_subnormals_flushed(rng, monkeypatch, symmetric):
+    """The summed solve and the band solve flush subnormal numbers while they run, and only then."""
+    fp = _random_compound_fourpoint(rng, 2, symmetric=symmetric, niv=4)
+    modes = _spy_modes(monkeypatch)
+    deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0)
+    deepcopy(fp).invert_on_anti_diagonal(2, 1, 8.0)
+    assert len(modes) == 2 and all(mode & _FLUSH_BITS == _FLUSH_BITS for mode in modes)
+    assert _mxcsr() & _FLUSH_BITS == 0
+
+
+def _weakly_coupled_fourpoint(rng, coupling: float) -> FourPoint:
+    """A complex-symmetric two-band FourPoint whose pairs (a, a) and (a, b != a) only ``coupling`` connects."""
+    fp = _random_compound_fourpoint(rng, 2, symmetric=True, niv=8)
+    same = np.eye(2, dtype=bool)
+    fp.mat[:, same[:, :, None, None] != same[None, None, :, :]] *= coupling
+    return fp
+
+
+def test_invert_and_sum_v2_keeps_the_bits_of_symmetric_slices_whose_products_underflow(rng, monkeypatch):
+    """Couplings of 1e-20 send ?sytrf into subnormal products; flushing them leaves the sum bit for bit."""
+    fp = _weakly_coupled_fourpoint(rng, 1e-20)
+    flushed = deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0).mat
+    monkeypatch.setattr(four_point, "_LIBM", None)
+    assert np.array_equal(deepcopy(fp).invert_and_sum_over_last_vn_v2(8.0).mat, flushed)
 
 
 def _assembled_window(gamma: LocalFourPoint, chi0: FourPoint, u_r: LocalInteraction, w_start: int) -> FourPoint:

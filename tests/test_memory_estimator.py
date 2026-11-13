@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Unit tests for the pure peak-memory estimator (no MPI, no psutil)."""
 
+import types
 from dataclasses import replace
 
 import numpy as np
@@ -938,6 +939,14 @@ def test_exact_solve_transient_bounds_the_traced_peak_of_the_right_hand_side_sol
     solved, peak = traced_peak(lambda: nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=rhs))
     above = peak - sum(x.mat.nbytes for x in solved)
     assert 2 * n**2 * DTYPE_BYTES < above <= memory_estimator._exact_solve_transient(n, o, n_rhs)
+
+
+def test_traced_peak_leaves_out_the_bytes_that_code_of_the_coverage_package_keeps():
+    """A megabyte that a function of a coverage file allocates and keeps during the call is no part of the peak."""
+    code = (lambda kept: kept.append(bytearray(1 << 20))).__code__.replace(co_filename="/lib/coverage/sysmon.py")
+    kept, keep = [], types.FunctionType(code, {})
+    peak = traced_peak(lambda: (keep(kept), np.empty(1 << 16)))[1]
+    assert 8 << 16 <= peak < 9 << 16
 
 
 def test_exact_jacobian_branch_grows_with_its_window_up_to_the_whole_range():
