@@ -288,6 +288,13 @@ At the start of the cycle, the predecessor's result becomes the rung's starting 
   onto it, exactly by striding when the new grid is a sub-lattice of the old one and by band-limited Fourier
   interpolation otherwise, so the grid may be refined along the ladder. Beyond the core box, the rung's own DMFT
   self-energy supplies the tail, as in any cold run.
+* On a grid with automatically discovered symmetries whose point group the DMFT self-energy obeys, a starting
+  self-energy that obeys the group less accurately than its rotations are known, ``1e-12`` of its largest entry, is
+  unfolded from its irreducible momenta, and the log says "The starting self-energy obeys the point group only
+  approximately: it is unfolded." The Fourier interpolation does not commute with operations that shear the grid
+  axes (those of a face-centered cell, for instance), and the cycle takes its symmetry-reduced routes for the bubble,
+  the self-energy contraction and the lattice sums only while the self-energy obeys the group. A start that already
+  obeys it, such as the last iterate of a predecessor on the same grid, is used bit for bit.
 * The chemical potential starts at the last entry of the predecessor's ``mu_history.npy`` and is re-solved before
   the first iteration, so that the starting self-energy has the filling of the rung's DMFT lattice Green's function.
   Every later iteration holds that same filling. The predecessor's own filling at its chemical potential is never

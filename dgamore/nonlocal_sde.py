@@ -2034,7 +2034,16 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int, bool
     interpolated file with ``use_interpolated_sigma``, with a warning: its iteration count is unknown, so the loop
     starts at iteration 1. Without a usable file the DMFT self-energy is returned.
 
-    :param default_sigma: The fallback (DMFT) :class:`SelfEnergy` used when no previous result is found.
+    Where the DMFT self-energy obeys the grid's point group (see :func:`_has_point_group_covariance`), a starting
+    self-energy that does not obey it to the accuracy of the rotations, ``1e-12`` of its largest entry in either
+    precision, is unfolded from its irreducible momenta (see :meth:`SelfEnergy.unfold_irreducible_momenta`), so the
+    self-energy contraction and the lattice sums run over the irreducible momenta from the first iteration on (see
+    :func:`_run_column_sde` and :func:`_lattice_sum_momenta`). Such a start is, for example, one interpolated onto a
+    grid whose point group shears the grid axes: the Fourier interpolation along each axis does not commute with those
+    operations. A start that obeys the group to that accuracy keeps its bits.
+
+    :param default_sigma: The fallback (DMFT) :class:`SelfEnergy` used when no previous result is found; whether it
+        obeys the grid's point group decides the unfold of the starting self-energy.
     :return: A tuple of the starting :class:`SelfEnergy` (cut to the core box and interpolated onto the k-grid), the
         iteration number it was taken from (0 if none found) and whether it comes from the previous run (a warm
         start).
@@ -2075,7 +2084,13 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int, bool
     config.logger.info(f"Starting the self-consistency from {max_file} (iteration {max_iter}).")
     mat = np.load(max_file)
     sigma = SelfEnergy(mat, mat.shape[:3], True, False, beta=config.sys.beta).cut_niv(config.box.niv_core)
-    return sigma.interpolate_q_grid(config.lattice.k_grid.nk, False), max_iter, True
+    sigma = sigma.interpolate_q_grid(config.lattice.k_grid.nk, False)
+    if _has_point_group_covariance(default_sigma.mat):
+        if not _has_point_group_covariance(sigma.compress_q_dimension().mat, bound=1e-12):
+            config.logger.info("The starting self-energy obeys the point group only approximately: it is unfolded.")
+            sigma.unfold_irreducible_momenta(config.lattice.k_grid)
+        sigma.decompress_q_dimension()
+    return sigma, max_iter, True
 
 
 def _init_mu_history(warm_start: bool) -> list[float]:

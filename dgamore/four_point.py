@@ -13,18 +13,59 @@ mirrors the thesis (Chapters 3 & 4).
 """
 
 import contextlib
+import ctypes
 import gc
+import platform
+import sys
 import warnings
 from collections.abc import Callable, Iterator
 
 import numpy as np
 import scipy as sp
 from scipy.linalg import LinAlgWarning
+from scipy.sparse.csgraph import connected_components
 
 from dgamore.brillouin_zone import KGrid
 from dgamore.interaction import Interaction, LocalInteraction
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.n_point_base import IAmNonLocal, SpinChannel, FrequencyNotation, DTYPE, deferred_collection
+
+# the MXCSR bits that flush subnormal results to zero (FTZ) and read subnormal operands as zero (DAZ)
+_FLUSH_SUBNORMALS = 0x8040
+# glibc's libm on x86-64 Linux, whose fegetenv/fesetenv carry the MXCSR in the last 4 of their 32 bytes; else None
+try:
+    _LIBM = ctypes.CDLL("libm.so.6") if sys.platform.startswith("linux") and platform.machine() == "x86_64" else None
+except OSError:
+    _LIBM = None
+
+
+@contextlib.contextmanager
+def _subnormals_flushed():
+    r"""
+    Context manager, also a function decorator, that runs its block with subnormal floating-point numbers flushed to
+    zero in the calling thread: a result below the normal range becomes zero and a subnormal operand counts as zero
+    (the MXCSR bits FTZ and DAZ, set through glibc's ``fegetenv``/``fesetenv`` and restored when the block ends, also
+    by an exception). An x86-64 processor handles every operation on a subnormal number by a microcode assist, so a
+    factorization whose intermediate products underflow runs at less than half its speed: ``?sytrf`` on a
+    complex-symmetric slice whose frequency-diagonal couplings sit at rounding level where the symmetry of its
+    momentum forbids them. The flushed values lie below 1.2e-38 in single and 2.2e-308 in double precision. Off
+    x86-64 Linux with glibc the block runs unchanged, and threads other than the calling one keep their own mode.
+
+    :return: A context manager (no value is bound).
+    """
+    if _LIBM is None:
+        yield
+        return
+    saved = (ctypes.c_ubyte * 32)()
+    _LIBM.fegetenv(saved)
+    flushed = (ctypes.c_ubyte * 32).from_buffer_copy(saved)
+    flushed[28] |= _FLUSH_SUBNORMALS & 0xFF
+    flushed[29] |= _FLUSH_SUBNORMALS >> 8
+    _LIBM.fesetenv(flushed)
+    try:
+        yield
+    finally:
+        _LIBM.fesetenv(saved)
 
 
 def _is_complex_symmetric(buf: np.ndarray) -> bool:
@@ -104,6 +145,9 @@ _REFINEMENT_CORRECTIONS = 4
 # compound rows per orbital pair from which ?sytrf on a permuted slice saves more than the refinement of its o^2
 # right-hand sides costs (per slice, one BLAS thread: 0.87x at 40 rows per pair, 1.11x at 75, 1.31x at 150)
 _PERMUTED_ROWS_PER_PAIR = 64
+# compound rows per solved orbital pair from which the elimination over pair groups clearly beats the LU of the
+# slice (per slice, one BLAS thread, groups of two pairs: 0.92x at 32 rows, 1.08x at 40, 1.24x at 48, 1.50x at 80)
+_GROUPED_ROWS_PER_PAIR = 48
 
 
 def _refined_solve(
@@ -154,6 +198,196 @@ def _refined_solve(
                 return x
         np.copyto(buf, off)
         _pair_view(buf, n_p)[:, np.arange(vn), :, np.arange(vn)] = blocks
+        lu = _factorization(buf, False)
+        return lu(rhs)
+
+    return solve
+
+
+def _pair_groups(coupled: np.ndarray) -> list[np.ndarray] | None:
+    """
+    Returns the groups of orbital pairs that a slice couples off its frequency diagonal: two pairs belong to one
+    group if ``coupled`` links them directly or through other pairs.
+
+    :param coupled: Whether the pair block ``[p, p']`` of the slice has a non-zero entry off the frequency diagonal.
+    :return: The positions of the pairs of every group, the smallest group first (the one with the lowest pair first
+        among equal sizes), or None if all pairs form a single group.
+    """
+    n_groups, labels = connected_components(coupled, directed=False)
+    if n_groups == 1:
+        return None
+    return sorted((np.flatnonzero(labels == g) for g in range(n_groups)), key=lambda g: (g.size, g[0]))
+
+
+def _leading_groups(groups: list[np.ndarray]) -> int:
+    """
+    Returns how many of the first ``groups`` together hold at most half of all their pairs: at least one group, and
+    never all of them.
+
+    :param groups: The pair groups, at least two.
+    :return: The number of leading groups.
+    """
+    sizes = np.cumsum([g.size for g in groups])
+    return int(np.clip(np.searchsorted(sizes, sizes[-1] // 2, side="right"), 1, len(groups) - 1))
+
+
+def _grouped_solve(
+    buf: np.ndarray, a_buf: np.ndarray, blocks: np.ndarray, groups: list[np.ndarray], m_max: np.floating
+) -> Callable[[np.ndarray], np.ndarray]:
+    r"""
+    Returns the solve ``rhs -> x`` of :math:`M x = b` for the compound slice :math:`M = A + D` over the solved
+    orbital pairs (addressed as in :func:`_pair_view`). :math:`A`, held in ``a_buf`` with a zero frequency diagonal,
+    couples only pairs of the same group of ``groups`` (see :func:`_pair_groups`); :math:`D`, the frequency-diagonal
+    ``blocks``, couples every pair at equal fermionic frequency. With :math:`F` the leading groups (see
+    :func:`_leading_groups`) and :math:`R` the other ones, the slice is solved by block elimination,
+
+    .. math:: S = M_{RR} - D_{RF} W D_{FR}, \qquad W = M_{FF}^{-1}, \qquad x_R = S^{-1} (b_R - D_{RF} W b_F), \qquad
+        x_F = W (b_F - D_{FR} x_R),
+
+    where :math:`W` comes from the same elimination among the groups of :math:`F`, down to the explicit inverse of
+    the block of a single group, and :math:`S` is factorized with an LU. Every product with :math:`D` is a matrix
+    product per fermionic frequency. The inverses, :math:`S` and every other array of the size of a matrix block
+    are views of ``buf``, which serves as work space: beyond them the call holds arrays of the size of the
+    right-hand sides, of ``blocks`` and of one pair block, and the workspace of LAPACK's inverse of one block.
+
+    No pivot is taken between the groups, so every solve is checked and, where needed, corrected as in
+    :func:`_refined_solve`: the residual :math:`r = b - M x` is formed in complex128, and the elimination's solution
+    of :math:`M \delta = r` is added, until every right-hand side's residual is at most the dtype's machine epsilon
+    times ``m_max`` times its largest solution entry. A solve that does not get there within
+    ``_REFINEMENT_CORRECTIONS`` corrections fills ``buf`` with :math:`M`, and it and every later one take an LU.
+    ``a_buf`` and ``blocks`` must stay unchanged and ``buf`` untouched while the solve is in use.
+
+    :param buf: The square Fortran-order slice buffer; overwritten.
+    :param a_buf: :math:`A`, Fortran-order like ``buf``, zero on its frequency diagonal.
+    :param blocks: The frequency-diagonal blocks ``[v, p, p']`` of :math:`M`.
+    :param groups: The pair groups of :math:`A`, at least two.
+    :param m_max: The largest absolute entry of :math:`M`.
+    :return: The solve.
+    """
+    vn, n_p, dtype = blocks.shape[0], blocks.shape[1], buf.dtype
+    a_view, v, minus = _pair_view(a_buf, n_p), np.arange(vn), -blocks
+    group_of = np.empty(n_p, dtype=int)
+    for g, members in enumerate(groups):
+        group_of[members] = g
+    getrf, getri, getri_lwork = sp.linalg.get_lapack_funcs(("getrf", "getri", "getri_lwork"), dtype=dtype)
+    # work matrices are C-ordered with rows and columns (v, pair), taken from the buffer's memory like from a stack
+    arena, used = buf.T.reshape(-1), 0
+
+    def take(rows: int, cols: int) -> np.ndarray:
+        """The next ``rows * cols`` entries of the work space as a matrix."""
+        nonlocal used
+        used += rows * cols
+        return arena[used - rows * cols : used].reshape(rows, cols)
+
+    def coupling(d: np.ndarray, rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
+        """The blocks ``d`` between the pairs ``rows`` and ``cols``, ``[v, row, col]``."""
+        return np.ascontiguousarray(d[:, rows[:, None], cols])
+
+    def scale_rows(d: np.ndarray, mat: np.ndarray, out: np.ndarray) -> None:
+        """Writes ``D mat`` for the couplings ``d`` ``[v, x, y]`` and ``mat`` with rows ``(v, y)``."""
+        np.matmul(d, mat.reshape(vn, d.shape[2], -1), out=out.reshape(vn, d.shape[1], -1))
+
+    def scale_columns(mat: np.ndarray, d: np.ndarray, out: np.ndarray) -> None:
+        """Writes ``mat D`` for ``mat`` with columns ``(v, x)`` and the couplings ``d`` ``[v, x, y]``."""
+        stack, target = mat.reshape(-1, vn, d.shape[1]), out.reshape(-1, vn, d.shape[2])
+        np.matmul(stack.transpose(1, 0, 2), d, out=target.transpose(1, 0, 2))
+
+    def add_slice(out: np.ndarray, pairs: np.ndarray) -> None:
+        """Adds :math:`M` over ``pairs`` to ``out``."""
+        out4 = out.reshape(vn, pairs.size, vn, pairs.size)
+        for i, p in enumerate(pairs):
+            for j, q in enumerate(pairs):
+                if group_of[p] == group_of[q]:
+                    out4[:, i, :, j] += a_view[p, :, q, :]
+        out4[v, :, v, :] += blocks[:, pairs[:, None], pairs]
+
+    def invert(mat: np.ndarray) -> None:
+        """Overwrites ``mat`` by its inverse; its transposed view is Fortran-contiguous, so LAPACK works in place."""
+        lu, piv, _ = getrf(mat.T, overwrite_a=1)
+        np.copyto(mat, getri(lu, piv, lwork=int(getri_lwork(mat.shape[0])[0].real), overwrite_lu=1)[0].T)
+
+    def inverse(members: list[np.ndarray]) -> np.ndarray:
+        """The inverse of :math:`M` over the pairs of the groups ``members``, in their order."""
+        nonlocal used
+        pairs = np.concatenate(members)
+        out = take(pairs.size * vn, pairs.size * vn)
+        if len(members) == 1:
+            out[...] = 0
+            add_slice(out, pairs)
+            invert(out)
+            return out
+        mark, n_1 = used, _leading_groups(members)
+        p_1, p_2 = np.concatenate(members[:n_1]), np.concatenate(members[n_1:])
+        m_1, m_2 = p_1.size * vn, p_2.size * vn
+        w_1 = inverse(members[:n_1])
+        minus_x, minus_y, w_s = take(m_1, m_2), take(m_2, m_1), take(m_2, m_2)
+        scale_columns(w_1, coupling(minus, p_1, p_2), minus_x)  # -W_1 D_12
+        scale_rows(coupling(minus, p_2, p_1), w_1, minus_y)  # -D_21 W_1
+        scale_rows(coupling(blocks, p_2, p_1), minus_x, w_s)  # -D_21 W_1 D_12
+        add_slice(w_s, p_2)
+        invert(w_s)  # the inverse of the second part's Schur complement
+        w_12, w_21, w_11 = take(m_1, m_2), take(m_2, m_1), take(m_1, m_1)
+        np.matmul(minus_x, w_s, out=w_12)
+        np.matmul(w_s, minus_y, out=w_21)
+        np.matmul(w_12, minus_y, out=w_11)
+        w_11 += w_1
+        out4 = out.reshape(vn, pairs.size, vn, pairs.size)
+        for r0, c0, part in ((0, 0, w_11), (0, p_1.size, w_12), (p_1.size, 0, w_21), (p_1.size, p_1.size, w_s)):
+            part4 = part.reshape(vn, part.shape[0] // vn, vn, part.shape[1] // vn)
+            for i in range(part4.shape[1]):
+                for j in range(part4.shape[3]):
+                    out4[:, r0 + i, :, c0 + j] = part4[:, i, :, j]
+        used = mark  # the parts are copied: their work space is free again
+        return out
+
+    n_f = _leading_groups(groups)
+    p_f, p_r = np.concatenate(groups[:n_f]), np.sort(np.concatenate(groups[n_f:]))
+    m_f, m_r = p_f.size * vn, p_r.size * vn
+    w = inverse(groups[:n_f])
+    lowered, schur = take(m_r, m_f), take(m_r, m_r)
+    scale_rows(coupling(minus, p_r, p_f), w, lowered)  # -D_RF W
+    scale_columns(lowered, coupling(blocks, p_f, p_r), schur)  # -D_RF W D_FR
+    add_slice(schur, p_r)
+    schur_lu = sp.linalg.lu_factor(schur.T, overwrite_a=True, check_finite=False)  # of S^T, in place
+    d_rf, d_fr, blocks128 = coupling(minus, p_r, p_f), coupling(minus, p_f, p_r), blocks.astype(np.complex128)
+    coupled = [(p, q) for members in groups for p in members for q in members]
+    tol, lu = np.finfo(dtype).eps * m_max, None
+
+    def scaled(d: np.ndarray, mat: np.ndarray) -> np.ndarray:
+        """``D mat`` for the couplings ``d`` ``[v, x, y]`` and ``mat`` with rows ``(v, y)``."""
+        return np.matmul(d, mat.reshape(vn, d.shape[2], -1)).reshape(vn * d.shape[1], -1)
+
+    def eliminate(rhs: np.ndarray) -> np.ndarray:
+        """The elimination's solution of ``M x = rhs`` in the storage precision."""
+        b = rhs.reshape(n_p, vn, -1)
+        b_f = np.ascontiguousarray(b[p_f].transpose(1, 0, 2)).reshape(m_f, -1)
+        b_r = np.ascontiguousarray(b[p_r].transpose(1, 0, 2)).reshape(m_r, -1)
+        b_r += scaled(d_rf, w @ b_f)
+        x_r = sp.linalg.lu_solve(schur_lu, b_r, trans=1, check_finite=False)
+        b_f += scaled(d_fr, x_r)
+        x = np.empty(b.shape, dtype=dtype)
+        x[p_f] = (w @ b_f).reshape(vn, p_f.size, -1).transpose(1, 0, 2)
+        x[p_r] = x_r.reshape(vn, p_r.size, -1).transpose(1, 0, 2)
+        return x.reshape(rhs.shape)
+
+    def solve(rhs: np.ndarray) -> np.ndarray:
+        """The corrected solution of ``M x = rhs``, or the LU's once the corrections have failed."""
+        nonlocal lu
+        if lu is not None:
+            return lu(rhs)
+        x, r = np.zeros_like(rhs), np.array(rhs, dtype=np.complex128)
+        r3 = r.reshape(n_p, vn, -1)
+        for _ in range(_REFINEMENT_CORRECTIONS + 1):
+            step = eliminate(r.astype(dtype))
+            x += step
+            step3 = step.reshape(n_p, vn, -1)
+            r3 -= np.matmul(blocks128, step3.transpose(1, 0, 2)).transpose(1, 0, 2)
+            for p, q in coupled:  # r -= A step, one pair block cast at a time
+                r3[p] -= a_view[p, :, q, :].astype(np.complex128) @ step3[q]
+            if np.all(np.abs(r).max(axis=0) <= tol * np.abs(x).max(axis=0)):
+                return x
+        np.copyto(buf, a_buf)
+        _pair_view(buf, n_p)[:, v, :, v] = blocks
         lu = _factorization(buf, False)
         return lu(rhs)
 
@@ -224,6 +458,7 @@ def _pair_view(buf: np.ndarray, n_p: int) -> np.ndarray:
     return buf.T.reshape(n_p, vn, n_p, vn).transpose(2, 3, 0, 1)
 
 
+@_subnormals_flushed()
 def _summed_slice_solver(
     slices: Callable[
         [np.ndarray, np.ndarray],
@@ -245,16 +480,18 @@ def _summed_slice_solver(
     (see :func:`_pair_view`): ``fill(blocks)`` fills it with the slice, writes ``blocks`` ``[v, p, p']`` onto its
     frequency diagonal and returns ``(symmetric, solve)``: whether it counts as complex-symmetric, which selects the
     factorization (see :func:`_factorize_and_solve`), and None, or the slice's solve when ``fill`` has factorized
-    the buffer itself (see :func:`_refined_solve`), which then serves every right-hand side. When no pair is
-    inactive (``inactive_pairs`` empty or None) or every pair is, all pairs are solved and ``blocks`` are the slice's
-    own. Otherwise the inactive pairs, which couple only at equal :math:`\nu`, are eliminated one fermionic frequency
-    at a time: ``blocks`` then carry the matrix over the active pairs :math:`S = M_{aa} - M_{ai} M_{ii}^{-1} M_{ia}`
-    and the eliminated pairs follow by back-substitution. With right-hand-side arrays ``rhs_mats`` (see
-    :func:`_slice_right_hand_sides`) they replace the frequency-sum selector, every member is solved against the
-    slice's one factorization and member ``k`` goes to ``outs[k]``. With ``slice_rhs`` each slice is solved for the
-    selector into ``outs[0]`` first; ``slice_rhs(i, w)``, called right after, returns the slice's own right-hand sides
-    as arrays ``[1, o1, o2, o3, o4, 1, v]``, which are solved against the same factorization, member ``k`` into
-    ``outs[k + 1]`` (appended at the first slice that returns members).
+    the slice itself (see :func:`_refined_solve` and :func:`_grouped_solve`), which then serves every right-hand
+    side. When no pair is inactive (``inactive_pairs`` empty or None) or every pair is, all pairs are solved and
+    ``blocks`` are the slice's own. Otherwise the inactive pairs, which couple only at equal :math:`\nu`, are
+    eliminated one fermionic frequency at a time: ``blocks`` then carry the matrix over the active pairs
+    :math:`S = M_{aa} - M_{ai} M_{ii}^{-1} M_{ia}` and the eliminated pairs follow by back-substitution. With
+    right-hand-side arrays ``rhs_mats`` (see :func:`_slice_right_hand_sides`) they replace the frequency-sum
+    selector, every member is solved against the slice's one factorization and member ``k`` goes to ``outs[k]``.
+    With ``slice_rhs`` each slice is solved for the selector into ``outs[0]`` first; ``slice_rhs(i, w)``, called
+    right after, returns the slice's own right-hand sides as arrays ``[1, o1, o2, o3, o4, 1, v]``, which are solved
+    against the same factorization, member ``k`` into ``outs[k + 1]`` (appended at the first slice that returns
+    members). The slices are built and solved, and ``slice_rhs`` is called, with subnormal numbers flushed to zero
+    (see :func:`_subnormals_flushed`).
 
     :param slices: The slice generator, called once with ``(buf, pairs)``.
     :param src: The array the slices are built from, ``[q, o1, o2, o3, o4, w, v, ...]``; it fixes the band count,
@@ -416,6 +653,7 @@ def _local_kernel_slices(
     pairs: np.ndarray,
     whole: bool = False,
     involution: np.ndarray | None = None,
+    grouped: bool = False,
 ) -> Iterator[
     tuple[int, int, np.ndarray, Callable[[np.ndarray], tuple[bool, Callable[[np.ndarray], np.ndarray] | None]]]
 ]:
@@ -428,7 +666,9 @@ def _local_kernel_slices(
     :meth:`FourPoint.invert_with_local_kernel_and_sum_over_last_vn`, and so is, with an ``involution``, the
     permuted factorization of a slice that is complex-symmetric only with its orbital pairs permuted: ``fill`` then
     returns the slice's solve (see :func:`_refined_solve`), valid until the next ``fill``, which overwrites the
-    factorization it reads.
+    factorization it reads. With ``grouped`` the same holds for the elimination over the pair groups of a slice
+    that is not complex-symmetric (see :func:`_grouped_solve`), which takes precedence over the permuted
+    factorization.
 
     :param diagonal: The frequency-diagonal part :math:`D`.
     :param kernel: The momentum-independent kernel :math:`K` on the fermionic box of ``diagonal``, from
@@ -446,6 +686,10 @@ def _local_kernel_slices(
         permutation may make the slices complex-symmetric, or None; read only for complex64 slices of at least
         ``_PERMUTED_ROWS_PER_PAIR`` times :math:`o^2` rows and without ``whole``, and ignored if it maps a solved
         orbital pair onto an eliminated one.
+    :param grouped: Whether the consumer takes the solve ``fill`` returns for a slice that is not complex-symmetric
+        and whose solved orbital pairs fall into more than one group (see :func:`_pair_groups`, found once per
+        bosonic frequency); read only for complex64 slices of at least ``_GROUPED_ROWS_PER_PAIR`` rows per solved
+        pair and without ``whole``.
     :return: An iterator over ``(i, w, diag, fill)``.
     """
     o, vn = diagonal.shape[1], diagonal.shape[-1]
@@ -467,6 +711,8 @@ def _local_kernel_slices(
         position[pairs] = np.arange(pairs.size)
         perm = position[involution[x] * o + involution[y]]
         perm = perm if np.all(perm >= 0) else None
+    grouped = grouped and not whole and buf.dtype == np.complex64 and vn >= _GROUPED_ROWS_PER_PAIR
+    coupled, groups = None, None
 
     for w in range(diagonal.shape[-2] if diagonal.shape[0] else 0):  # a rank without momenta builds no buffer
         k_w = k_mat[:, :, :, :, w]  # [o1, o2, o3, o4, v, v']
@@ -478,6 +724,12 @@ def _local_kernel_slices(
         a_view[:, v, :, v] = 0  # the frequency diagonal is written per slice
         if not whole:
             a_max, a_asym = _abs_and_asymmetry_max(a_buf)
+        if grouped:
+            pattern = np.empty((pairs.size, pairs.size), dtype=bool)
+            for c in range(pairs.size):  # which pair blocks of A hold a non-zero entry, one column pair at a time
+                pattern[:, c] = a_buf[:, c * vn : (c + 1) * vn].any(axis=1).reshape(-1, vn).any(axis=1)
+            if coupled is None or not np.array_equal(pattern, coupled):
+                coupled, groups = pattern, _pair_groups(pattern)
         if perm is not None:  # the asymmetry of A P, laid out in the factorization buffer
             for c in range(pairs.size):
                 np.copyto(buf[:, c * vn : (c + 1) * vn], a_buf[:, perm[c] * vn : (perm[c] + 1) * vn])
@@ -492,6 +744,8 @@ def _local_kernel_slices(
                     m_max = np.maximum(a_max, np.abs(blocks).max())
                     bound = tol * m_max
                     symmetric = np.maximum(a_asym, np.abs(blocks - blocks.transpose(0, 2, 1)).max()) <= bound
+                    if not symmetric and groups is not None:
+                        return False, _grouped_solve(buf, a_buf, blocks, groups, m_max)
                     if not symmetric and perm is not None:
                         blocks_p = blocks[:, :, perm]
                         # up to 16 times the bound: the refinement against M absorbs an asymmetry this small
@@ -512,6 +766,7 @@ def _local_kernel_slices(
             yield i, w, np.subtract(k_diag + diagonal[i, :, :, :, :, w], shift_scaled[..., None]), fill
 
 
+@_subnormals_flushed()
 def _solve_on_anti_diagonal(
     slices: Callable[
         [np.ndarray, np.ndarray],
@@ -533,7 +788,8 @@ def _solve_on_anti_diagonal(
     ``pairs``; ``fill`` returns whether the filled buffer counts as complex-symmetric, which selects ``?sysv`` for
     the band columns on one side of the anti-diagonal or the Schur reduction onto the box, and no solve of its own
     (no generator here gets an orbital involution). With inactive orbital pairs, ``fill`` receives the
-    frequency-diagonal blocks of the active pairs after their elimination.
+    frequency-diagonal blocks of the active pairs after their elimination. The slices are built and solved with
+    subnormal numbers flushed to zero (see :func:`_subnormals_flushed`).
 
     :param slices: The slice generator, called once with ``(buf, pairs)``.
     :param src: The array the slices are built from, ``[q, o1, o2, o3, o4, w, v, ...]`` (compressed momenta, half
@@ -1602,7 +1858,9 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         slice takes the LU (``scipy.linalg.lu_factor``/``lu_solve``). Both agree with
         :meth:`invert_and_sum_over_last_vn` up to numerical precision. A matrix that is a frequency-diagonal part plus
         a momentum-independent kernel need not be assembled: :meth:`invert_with_local_kernel_and_sum_over_last_vn`
-        gives this method's bits on it from its parts.
+        gives this method's bits on it from its parts. While the slices are solved, subnormal floating-point numbers
+        are flushed to zero in the calling thread (on x86-64 Linux): couplings at rounding level would otherwise send
+        ``?sytrf`` into subnormal products, at less than half its speed.
 
         Orbital pairs without vertex (``inactive_pairs``, see :meth:`LocalFourPoint.orbital_pairs_without_vertex`)
         label compound rows and columns that couple only at equal :math:`\nu`, through the inverse bubble. They are
@@ -1686,18 +1944,32 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         in :meth:`invert_and_sum_over_last_vn_v2`, and both buffers then span only the other pairs. Beyond the result
         the call holds two compound slices.
 
+        A complex64 slice of at least ``_GROUPED_ROWS_PER_PAIR`` rows per solved orbital pair that is not
+        complex-symmetric, and whose solved pairs fall into groups that :math:`A^{\omega}` does not couple (the
+        orbital pairs of two atoms, or the pairs :math:`(a, a)` and :math:`(a, b \neq a)` of a vertex of the Kanamori
+        form), is solved by block elimination over those groups instead of an LU of the whole slice. Only the
+        frequency-diagonal blocks couple the groups, so the leading groups are inverted block by block and the
+        Schur complement on the other groups takes the one remaining LU (see :func:`_grouped_solve`): with four
+        groups of :math:`m` rows each about :math:`15 m^3` instead of :math:`43 m^3` flops. The elimination works
+        inside the factorized buffer. Every solve is checked against :math:`M` with residuals formed in complex128
+        and corrected where needed, to the backward error stated for the permuted factorization below; a slice that
+        does not get there is refilled and solved with an LU. Such a slice is not solved with the LU's bits, and
+        every other slice keeps its bits. Only the sum takes this route: with ``rhs`` or ``slice_rhs`` every slice
+        keeps its factorization.
+
         An ``orbital_involution`` :math:`\pi` (an orbital permutation that is its own inverse) with
         :math:`M^{\mathrm{q}\nu\nu'}_{1234} = M^{\mathrm{q}\nu'\nu}_{\pi(4)\pi(3)\pi(2)\pi(1)}` makes :math:`B = M P`
         complex-symmetric, :math:`P` the permutation it induces on the orbital pairs, where :math:`M` is not. A
-        complex64 slice of at least ``_PERMUTED_ROWS_PER_PAIR`` times :math:`o^2` rows that fails the test above is
-        tested as :math:`B`, with its maxima split the same way (those of :math:`A^{\omega} P` found once per bosonic
-        frequency) against 16 times the bound, which leaves room for slices that obey the relation only to complex64
-        precision. A slice that passes has the lower triangle of :math:`B` factorized with ``?sytrf``, and
-        every solve is refined against :math:`M` itself, with residuals formed in complex128, until its backward error
-        is below that of a stable complex64 solve, usually after one correction; a slice that does not get there
-        within a few corrections is refilled and solved with an LU (see :func:`_refined_solve`). Such a slice is
-        solved more accurately than by the LU, not with its bits, and every other slice keeps its bits. On smaller
-        slices the refinement of the :math:`o^2` right-hand sides costs more than ``?sytrf`` saves.
+        complex64 slice of at least ``_PERMUTED_ROWS_PER_PAIR`` times :math:`o^2` rows that fails the test above and
+        does not take the elimination over pair groups is tested as :math:`B`, with its maxima split the same way
+        (those of :math:`A^{\omega} P` found once per bosonic frequency) against 16 times the bound, which leaves
+        room for slices that obey the relation only to complex64 precision. A slice that passes has the lower
+        triangle of :math:`B` factorized with ``?sytrf``, and every solve is refined against :math:`M` itself, with
+        residuals formed in complex128, until its backward error is below that of a stable complex64 solve, usually
+        after one correction; a slice that does not get there within a few corrections is refilled and solved with
+        an LU (see :func:`_refined_solve`). Such a slice is solved more accurately than by the LU, not with its
+        bits, and every other slice keeps its bits. On smaller slices the refinement of the :math:`o^2` right-hand
+        sides costs more than ``?sytrf`` saves.
 
         With ``rhs`` every slice solves the system for those right-hand sides instead, :math:`x = M^{-1} b` without
         the :math:`1/\beta` of the sum, all members against the slice's one factorization, bit for bit what
@@ -1736,6 +2008,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         rhs_mats = [] if rhs is None else [b.to_half_niw_range().compress_q_dimension().mat for b in rhs]
         # this object's memory layout, which fixes the bits of later frequency sums
         outs = [np.empty_like(diagonal) for _ in range(max(len(rhs_mats), 1))]
+        summed = rhs is None and slice_rhs is None  # only the sum may take the elimination over pair groups
 
         def hook(i: int, w: int) -> list[np.ndarray]:
             """Scales the slice's selector solution into its sum and returns the arrays of its right-hand sides."""
@@ -1747,7 +2020,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         with deferred_collection() if slice_rhs else contextlib.nullcontext():
             _summed_slice_solver(
                 lambda buf, pairs: _local_kernel_slices(
-                    diagonal, kernel, shift, scale, 0, buf, pairs, involution=orbital_involution
+                    diagonal, kernel, shift, scale, 0, buf, pairs, involution=orbital_involution, grouped=summed
                 ),
                 diagonal,
                 outs,
@@ -1790,7 +2063,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         pairs without vertex (``inactive_pairs``, see :meth:`LocalFourPoint.orbital_pairs_without_vertex`) couple only
         at equal :math:`\nu`: they are eliminated one fermionic frequency at a time as in
         :meth:`invert_and_sum_over_last_vn_v2`, the band of the reduced matrix is solved as above, and the blocks of
-        the eliminated pairs follow from the equal-frequency couplings.
+        the eliminated pairs follow from the equal-frequency couplings. Subnormal numbers are flushed to zero while
+        the slices are solved, as in :meth:`invert_and_sum_over_last_vn_v2`.
 
         :param niv_band: Number of positive fermionic frequencies of the centered box the band lives on.
         :param w_start: Bosonic index of the object's first frequency (the object holds ``w >= 0``).

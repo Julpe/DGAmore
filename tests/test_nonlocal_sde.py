@@ -5177,6 +5177,64 @@ def test_finish_on_node_unfolds_the_proposal_from_its_irreducible_momenta_before
     assert np.array_equal(finish(random, True), finish(random, False))
 
 
+def _previous_iterate(tmp_path, monkeypatch, mat: np.ndarray) -> None:
+    """Configures a predecessor run whose last raw iterate, iteration 3, np.load returns as ``mat``."""
+    config.self_consistency.previous_sc_path = str(tmp_path)
+    config.self_consistency.use_interpolated_sigma = False
+    (tmp_path / "sigma_dga_iteration_3.npy").touch()
+    monkeypatch.setattr(np, "load", lambda path, *args, **kwargs: mat.copy())
+
+
+def _local_sigma(diagonal) -> SelfEnergy:
+    """A momentum-local self-energy with the given orbital diagonal on four frequencies."""
+    mat = np.diag(diagonal).astype(np.complex64)[None, None, None, :, :, None] * (1 - 0.5j) * np.ones(4)
+    return SelfEnergy(mat, (1, 1, 1), calc_smom=False, beta=config.sys.beta)
+
+
+@pytest.mark.parametrize("dmft_obeys", [True, False])
+def test_get_starting_sigma_unfolds_a_regridded_start_only_where_the_dmft_self_energy_obeys_the_point_group(
+    dmft_obeys, monkeypatch, tmp_path
+):
+    """A start interpolated onto a grid whose group shears its axes is unfolded if DMFT obeys the group, else kept."""
+    _point_group_sde_setup("triangular")  # 6 x 6 x 1, two orbitals, niv_core 2
+    rng, shape = np.random.default_rng(23), (3, 3, 1, 2, 2, 8)
+    source = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    _previous_iterate(tmp_path, monkeypatch, source)
+    plain = SelfEnergy(source, (3, 3, 1), True, False, beta=config.sys.beta).cut_niv(2).interpolate_q_grid((6, 6, 1))
+    plain.compress_q_dimension()
+    unfolded = plain.copy()
+    unfolded.unfold_irreducible_momenta(config.lattice.k_grid)
+
+    start, iteration, warm_start = nonlocal_sde.get_starting_sigma(_local_sigma([1.0, 1.0 if dmft_obeys else 2.0]))
+
+    assert (iteration, warm_start) == (3, True) and not start.has_compressed_q_dimension
+    assert not nonlocal_sde._has_point_group_covariance(plain.mat)
+    assert nonlocal_sde._has_point_group_covariance(unfolded.mat)
+    assert np.array_equal(start.compress_q_dimension().mat, (unfolded if dmft_obeys else plain).mat)
+
+
+@pytest.mark.parametrize("residue", [1e-30, 1e-7])
+def test_get_starting_sigma_keeps_only_a_start_that_obeys_the_point_group_to_the_accuracy_of_the_rotations(
+    residue, monkeypatch, tmp_path
+):
+    """A start off the group by 1e-30 keeps its bits, residue included; one off by 1e-7 (single precision) unfolds."""
+    _point_group_sde_setup("square")  # 4 x 4 x 1, the rotations signed permutations
+    grid, rng = config.lattice.k_grid, np.random.default_rng(29)
+    orbits = rng.standard_normal((grid.nk_irr, 4)) + 1j * rng.standard_normal((grid.nk_irr, 4))
+    source = orbits[grid.irrk_inv.ravel()][:, None, None, :] * np.eye(2)[None, :, :, None]
+    source = source.reshape(4, 4, 1, 2, 2, 4).astype(np.complex64)
+    source[1, 2, 0, 0, 1, 0] = residue  # where the group puts a zero; an unfold averages it away
+    _previous_iterate(tmp_path, monkeypatch, source)
+    unfolded = SelfEnergy(source.copy(), (4, 4, 1), True, False, beta=config.sys.beta).compress_q_dimension()
+    unfolded.unfold_irreducible_momenta(grid)
+    unfolded = unfolded.mat.reshape(source.shape)
+
+    start = nonlocal_sde.get_starting_sigma(_local_sigma([1.0, 1.0]))[0]
+
+    assert not np.array_equal(unfolded, source) and np.abs(source).max() > 1.0
+    assert np.array_equal(start.mat, source if residue < 1e-12 else unfolded)
+
+
 @pytest.mark.parametrize(
     "hostnames, niv_window", [(["n0", "n0"], None), (["n0", "n0", "n0", "n1"], None), (["n0"] * 3, 1)]
 )

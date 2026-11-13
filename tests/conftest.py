@@ -517,16 +517,21 @@ def patch_mini_pole_with_exact_single_pole_fit(monkeypatch, x: float):
 
 
 def traced_peak(fn):
-    """Runs fn under tracemalloc and returns its result and the peak bytes traced above the level at its start."""
+    """
+    Runs fn under tracemalloc and returns its result and the peak bytes traced above the level at its start, less
+    the bytes that code of the coverage package allocated during the call and still holds: its tracer keeps tables
+    of the code it has seen, and one that grows inside the call would count as memory of fn.
+    """
     tracemalloc.start()
     tracemalloc.reset_peak()
     try:
         entry = tracemalloc.get_traced_memory()[0]
         result = fn()
         peak = tracemalloc.get_traced_memory()[1] - entry
+        tracer = tracemalloc.take_snapshot().filter_traces([tracemalloc.Filter(True, "*/coverage/*")])
     finally:
         tracemalloc.stop()
-    return result, peak
+    return result, peak - sum(trace.size for trace in tracer.traces)
 
 
 def write_hk(path, ek: np.ndarray, kpoints: np.ndarray) -> None:
