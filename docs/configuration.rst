@@ -186,11 +186,12 @@ work, what they have in common and when to reach for which is discussed on the :
      use_exact_jacobian: False         # bool
 
 Setting ``use_lambda_correction`` to ``True`` applies the lambda correction to the physical susceptibilities
-in every iteration of the cycle. The correction is dispatched by the band count (and the choice is logged):
-single-band data uses the scalar Moriya correction with the scheme taken from the ``type`` field of the
-:ref:`lambda correction section <lambda-correction>`. The Moriya lambda correction has formally only been derived
-for single-band models; for multi-band data the code therefore applies the similar, heuristic scheme described
-below purely to stabilize convergence (it always corrects both channels). In both cases the correction acts as a
+in every iteration of the cycle. The correction is dispatched by the band count (and the choice is logged), and
+both branches take their scheme from the ``type`` field of the
+:ref:`lambda correction section <lambda-correction>`. Single-band data uses the scalar Moriya correction. The Moriya
+lambda correction has formally only been derived for single-band models; for multi-band data the code therefore
+applies the similar, heuristic scheme described below purely to stabilize convergence. In both cases the correction
+acts as a
 *releasing scaffold*: the loop converges at a relaxed
 (tenfold) threshold with the correction on, then automatically disables it, resets the mixing history and converges
 the *uncorrected* self-consistent solution to the full ``epsilon``, so the corrected susceptibilities never enter
@@ -385,9 +386,12 @@ When ``perform_lambda_correction`` is ``True``, the code performs a one-shot DΓ
 count exactly like ``stabilization.use_lambda_correction`` (over which it takes precedence when both are enabled);
 recall that for multi-band data this is the heuristic stabilization scheme of the
 :ref:`stabilization section <stabilization>`, not a derived lambda correction.
-For single-band data the ``type`` field selects the correction scheme: ``spch`` corrects both the density and the
-magnetic susceptibility, whereas ``sp`` corrects only the magnetic one; the multi-band scheme always
-corrects both channels.
+The ``type`` field selects the correction scheme for any number of bands: ``spch`` corrects both the density and the
+magnetic susceptibility, each against its own local sum rule, whereas ``sp`` corrects only the magnetic one, against
+the sum rule of both channels together, and leaves the density susceptibility as the ladder gives it. The multi-band
+correction returns a mass only at a root of its sum rule: if its Newton iteration ends without one, the run stops with
+``Multi-orbital lambda correction did not converge`` instead of applying the unconverged mass (see
+:ref:`the cooldown chapter <cooldown>`).
 
 .. _misc:
 

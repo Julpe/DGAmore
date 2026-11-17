@@ -28,8 +28,8 @@ self_consistency:
 
 stabilization:
   use_lambda_correction: False # If True, applies the Moriya lambda correction in every iteration as a releasing scaffold (correction on until convergence at 10x epsilon,
-  # then disabled so the run converges the uncorrected solution). Dispatched by the band count: single-band input uses the scalar correction (honoring lambda_correction.type
-  # below), multi-band input the multi-orbital matrix correction (always both channels). Mutually exclusive with use_chi_phys_restriction and use_lambda_annealing;
+  # then disabled so the run converges the uncorrected solution). Dispatched by the band count: single-band input uses the scalar correction, multi-band input the multi-orbital
+  # matrix correction, both honoring lambda_correction.type below. Mutually exclusive with use_chi_phys_restriction and use_lambda_annealing;
   # the one-shot perform_lambda_correction below takes precedence when both are enabled.
   use_chi_phys_restriction: False # If True, the physical susceptibilities are restricted to the bounds of a bosonic susceptibility during the self-consistency cycle (releasing scaffold):
   # static compound blocks positive-semidefinite (a crossed mode pinned at twice the largest healthy static value), finite-frequency blocks clipped to the static maximum per momentum.
@@ -45,7 +45,8 @@ stabilization:
 lambda_correction:
   perform_lambda_correction: False # If True, the code will perform a one-shot DGA with lambda correction: max_iter is overridden to 1 and mixing to 1.0. Dispatched by the
   # band count like stabilization.use_lambda_correction above, over which it takes precedence.
-  type: "spch" # available types of the single-band scalar lambda correction: 'spch' (both density and magnetic channel) or 'sp' (magnetic channel only)
+  type: "spch" # available types of the lambda correction (single- and multi-band): 'spch' (density and magnetic channel, each against its own sum rule) or
+  # 'sp' (magnetic channel only, against the sum rule of both channels together; the density channel stays uncorrected)
 
 misc:
   do_flex: False # If True, particle-hole FLEX started from DMFT: the bare interaction is the local irreducible vertex, the self-energy kernel and the Eliashberg
