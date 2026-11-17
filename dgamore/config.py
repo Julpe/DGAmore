@@ -148,9 +148,9 @@ class StabilizationConfig:
 
     :ivar bool use_lambda_correction: Whether the self-consistency loop applies the Moriya lambda correction to the
         physical susceptibility in every iteration, dispatched by the band count: single-band input uses the scalar
-        correction (:class:`~dgamore.lambda_ops.LambdaCorrection`, honoring ``lambda_correction.type``), multi-band
-        input the matrix correction (:class:`~dgamore.lambda_ops.MultiOrbitalLambdaCorrection`, always both
-        channels). Wired as a releasing scaffold: the loop converges at ten times epsilon with the correction on,
+        correction (:class:`~dgamore.lambda_ops.LambdaCorrection`), multi-band input the matrix correction
+        (:class:`~dgamore.lambda_ops.MultiOrbitalLambdaCorrection`), both honoring ``lambda_correction.type``. Wired
+        as a releasing scaffold: the loop converges at ten times epsilon with the correction on,
         disables it and converges the pure map to full epsilon. Independent of the one-shot
         ``lambda_correction.perform_lambda_correction``, which takes precedence when both are enabled.
     :ivar bool use_chi_phys_restriction: Whether to restrict the physical susceptibility to the bounds of a bosonic
@@ -237,8 +237,9 @@ class LambdaCorrectionConfig:
     ``stabilization.use_lambda_correction`` and takes precedence when both are enabled.
 
     :ivar bool perform_lambda_correction: Whether to apply the one-shot Moriya lambda correction.
-    :ivar str type: Correction type for the single-band scalar correction: ``"sp"`` (magnetic channel only) or
-        ``"spch"`` (density and magnetic channels). The multi-band matrix correction always corrects both channels.
+    :ivar str type: Correction type of the single-band scalar and the multi-band matrix correction alike: ``"spch"``
+        (density and magnetic channels, each against its own sum rule) or ``"sp"`` (magnetic channel only, against
+        the sum rule of both channels together).
     """
 
     def __init__(self):

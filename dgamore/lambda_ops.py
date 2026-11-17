@@ -369,7 +369,8 @@ class MultiOrbitalLambdaCorrection:
     (:meth:`_tail_coefficient`). Unknowns and matched sum-rule components span the same space (a well-posed matrix root
     problem, not a rugged optimization). The single-site AIM carries no inter-atom correlation, so those components of
     the target are not matched, and the corrected susceptibility carries them from the lattice through the matrix
-    inverse. With ``spch`` both channels are corrected with independent :math:`\Lambda_d, \Lambda_m`.
+    inverse. With ``spch`` both channels are corrected with independent :math:`\Lambda_d, \Lambda_m`; with ``sp`` only
+    the magnetic channel is, against the sum rule of both channels together (see :meth:`perform`).
 
     The calibration is done in complex128 (the near-singular static inversions that dominate the sum rule are
     least trustworthy in the object's native complex64). Since the mass commutes with the site group, the converged
@@ -737,7 +738,12 @@ class MultiOrbitalLambdaCorrection:
         slices to the full BZ on the fly (:meth:`_expand_compound_slice_to_full_bz`) - same result, ``nq/nq_irr``
         times less resident memory. On convergence the on-site residual left outside the allowed masses (the entries
         the tail constraint excludes, and any symmetry breaking of the susceptibility or the target) is logged. When the
-        start is infeasible its offset above the feasibility bound is doubled until the static gap opens.
+        start is infeasible its offset above the feasibility bound is doubled until the static gap opens. Before the
+        iteration the feasibility bound and the smallest and largest number of negative eigenvalues of the static
+        on-site susceptibility over the momenta are logged. A mass is returned only at a root: an iteration that ends
+        without one (out of steps, or pinned to the feasibility boundary with no admissible step left) raises, as
+        happens when an eigenvalue of the static on-site susceptibility passes through zero between momenta, where
+        :math:`\chi_{RR}^{-1}` is unbounded and the feasibility bound follows the momentum grid.
 
         :param chi_qw: Compound susceptibility, shape ``[nq, nw, no^2, no^2]`` (complex128) over the full BZ, or
             over the irreducible wedge when ``q_grid`` is given.
@@ -756,6 +762,7 @@ class MultiOrbitalLambdaCorrection:
         :return: The converged mass matrix :math:`\Lambda_r`, shape ``[no^2, no^2]``, complex Hermitian.
         :raises ValueError: If the start leaves the static gap non-positive, i.e. a static pole in a sector no allowed
             mass lifts (a crystal-field-split (polarized) inter-orbital sector with ``tail``).
+        :raises RuntimeError: If the Newton iteration ends without a sum-rule root.
         """
         delta = MultiOrbitalLambdaCorrection._DELTA if delta is None else delta
         eps = MultiOrbitalLambdaCorrection._EPS if eps is None else eps
@@ -776,8 +783,16 @@ class MultiOrbitalLambdaCorrection:
             # the static feasibility/gap machinery keeps seeing the full BZ (one small slice, resident once)
             chi_static = MultiOrbitalLambdaCorrection._expand_compound_slice_to_full_bz(chi_static, q_grid)
         on_site_pairs = np.ix_(pair_atom >= 0, pair_atom >= 0)  # the pairs the interaction contracts
-        chi_inv_static = np.linalg.inv(chi_static[(slice(None), *on_site_pairs)])
+        chi_on_site = chi_static[(slice(None), *on_site_pairs)]
+        chi_inv_static = np.linalg.inv(chi_on_site)
         start = MultiOrbitalLambdaCorrection.get_lambda_start_matrix(chi_inv_static)
+        hermitian = 0.5 * (chi_on_site + np.conj(np.swapaxes(chi_on_site, -1, -2)))
+        negative = (np.linalg.eigvalsh(hermitian) < 0.0).sum(axis=1)
+        inertia = (
+            f"the static on-site susceptibility has {negative.min()} to {negative.max()} negative eigenvalues across "
+            "the momenta"
+        )
+        config.logger.info(f"Multi-orbital lambda correction: feasibility bound {start:.6f}; {inertia}.")
         identity = (basis @ coords(np.diag(pair_atom >= 0).astype(np.complex128))).reshape(no2, no2)
         offset = delta
         for _ in range(MultiOrbitalLambdaCorrection._MAX_START_DOUBLINGS):
@@ -831,8 +846,17 @@ class MultiOrbitalLambdaCorrection:
                 break  # no admissible step (feasible and residual-decreasing) was found
             lambda_mat = lambda_mat + step_length * d_lambda
 
-        config.logger.warning(f"Multi-orbital lambda correction did not converge within {maxiter} iterations.")
-        return lambda_mat
+        gap = MultiOrbitalLambdaCorrection._static_gap(chi_inv_static, lambda_mat[on_site_pairs])
+        hint = (
+            " If one of them changes sign through zero between momenta, the bound follows the momentum grid and no "
+            "mass restores the sum rule."
+            if negative.min() != negative.max()
+            else ""
+        )
+        raise RuntimeError(
+            f"Multi-orbital lambda correction did not converge: last sum-rule residual {res:.3e} (tolerance {eps:.1e}) "
+            f"at a static gap of {gap:.3e} (feasibility bound {start:.6f}); {inertia}.{hint} No mass is applied."
+        )
 
     @staticmethod
     def apply_lambda_matrix(chi_compound: np.ndarray, lambda_mat: np.ndarray) -> np.ndarray:
@@ -903,22 +927,14 @@ class MultiOrbitalLambdaCorrection:
         return chi_r.to_full_indices().to_half_niw_range(), lambda_r
 
     @staticmethod
-    def perform(chi_phys_q_r: FourPoint, quiet: bool = False) -> FourPoint:
+    def _local_sum_rule(channel: SpinChannel) -> np.ndarray:
         r"""
-        Performs the multi-orbital ('spch') matrix :math:`\lambda`-correction on the physical susceptibility of the
-        object's channel, calibrating against that channel's local susceptibility sum rule. The determined mass's
-        Frobenius norm is appended to a text file (unless ``quiet``). Unlike the single-band
-        :meth:`LambdaCorrection.perform` this works for any number of orbitals.
+        Returns the local (AIM) sum-rule target :math:`S_r = \beta^{-1}\sum_\omega \chi^{\omega}_{r,\mathrm{loc}}` of a
+        channel from the saved local susceptibility.
 
-        :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` to correct.
-        :param quiet: If ``True``, the determined mass is not appended to the lambda text file (no file writes
-            outside the run's regular per-iteration output).
-        :return: The :math:`\lambda`-corrected physical susceptibility.
+        :param channel: Spin channel of the susceptibility, i.e. density or magnetic.
+        :return: The target as a compound matrix, shape ``[no^2, no^2]``, complex128.
         """
-        logger = config.logger
-        channel = chi_phys_q_r.channel
-        logger.info(f"Performing multi-orbital lambda correction for {channel.value} channel.")
-
         chi_r_loc = LocalFourPoint.load(
             os.path.join(config.output.output_path, f"chi_{channel.value}_loc.npy"),
             channel,
@@ -926,6 +942,59 @@ class MultiOrbitalLambdaCorrection:
         ).to_full_niw_range()
         s_r = chi_r_loc.to_compound_indices().mat.astype(np.complex128).sum(axis=0) / config.sys.beta
         chi_r_loc.free()
+        return s_r
+
+    @staticmethod
+    def perform(chi_phys_q_r: FourPoint, quiet: bool = False) -> FourPoint:
+        r"""
+        Performs the multi-orbital matrix :math:`\lambda`-correction on the physical susceptibility of the object's
+        channel, in the scheme of the configured lambda-correction type. With 'spch' each channel is calibrated
+        against its own local susceptibility sum rule. With 'sp' only the magnetic channel is corrected, against the
+        sum rule of both channels together: its target is the local magnetic sum rule minus the sum-rule residual of
+        the saved, uncorrected density susceptibility, :math:`S_m - \big((\beta n_{\mathbf{q}})^{-1}
+        \sum_{\mathrm{q}} \chi^{\mathrm{q}}_{d} - S_d\big)`, and the density susceptibility is returned unchanged. The
+        determined mass's Frobenius norm is appended to a text file (unless ``quiet``). Unlike the single-band
+        :meth:`LambdaCorrection.perform` this works for any number of orbitals.
+
+        :param chi_phys_q_r: The momentum-dependent physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` to correct.
+        :param quiet: If ``True``, the determined mass is not appended to the lambda text file (no file writes
+            outside the run's regular per-iteration output). The 'sp' type reads the saved density susceptibility
+            from file, so quiet evaluations use the last saved one.
+        :return: The :math:`\lambda`-corrected physical susceptibility (unchanged for 'sp' in the density channel).
+        :raises ValueError: If the configured lambda-correction type is neither 'spch' nor 'sp'.
+        """
+        logger = config.logger
+        channel = chi_phys_q_r.channel
+        lambda_type = config.lambda_correction.type.lower()
+        if lambda_type not in ["spch", "sp"]:
+            raise ValueError("Lambda correction type must be either 'spch' or 'sp'.")
+        if lambda_type == "sp" and channel != SpinChannel.MAGN:
+            logger.info(f"Lambda correction type 'sp': the {channel.value} channel stays uncorrected.")
+            return chi_phys_q_r
+
+        logger.info(f"Performing multi-orbital lambda correction for {channel.value} channel.")
+        s_r = MultiOrbitalLambdaCorrection._local_sum_rule(channel)
+        if lambda_type == "sp":
+            chi_dens = FourPoint.load(
+                os.path.join(config.output.output_path, "chi_phys_q_dens.npy"),
+                SpinChannel.DENS,
+                num_vn_dimensions=0,
+                has_compressed_q_dimension=True,
+                nq=chi_phys_q_r.nq,
+            )
+            chi_dens = chi_dens.to_full_niw_range().to_compound_indices()
+            q_grid = config.lattice.k_grid
+            # ponytail: the density residual at zero mass reuses _residual (one needless batched inverse per
+            # frequency); sum the expanded slices directly if that shows up in a profile
+            s_r -= MultiOrbitalLambdaCorrection._residual(
+                chi_dens.mat,
+                np.zeros_like(s_r),
+                MultiOrbitalLambdaCorrection._local_sum_rule(SpinChannel.DENS),
+                config.sys.beta,
+                q_grid.nk_tot,
+                q_grid,
+            )
+            chi_dens.free()
 
         chi_phys_q_r, lambda_r = MultiOrbitalLambdaCorrection.perform_single(chi_phys_q_r, s_r)
         lambda_norm = float(np.linalg.norm(lambda_r))
@@ -969,9 +1038,9 @@ class MultiOrbitalLambdaCorrection:
         (spin-summed) DMFT orbital occupation (:data:`config.sys.occ_dmft_per_ineq`, per inequivalent atom - the
         assembled ``occ_dmft`` is only the last atom's). This is a lattice-vs-AIM density (chemical-potential)
         consistency cross-check - a drift flags a mu problem, not a solver failure (see the design note) - so it is
-        a log only, never a constraint. Called once, on the magnetic channel, where the corrected density
-        susceptibility has already been saved. Skipped when the occupation metadata or the saved density
-        susceptibility is unavailable.
+        a log only, never a constraint. Called once, on the magnetic channel, where the density susceptibility
+        (corrected for type 'spch', uncorrected for 'sp') has already been saved. Skipped when the occupation metadata
+        or the saved density susceptibility is unavailable.
 
         :param chi_magn: The freshly corrected magnetic susceptibility :math:`\chi^{\mathrm{q}}_{m}` (irreducible BZ).
         :return: None.

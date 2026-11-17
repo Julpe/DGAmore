@@ -978,10 +978,25 @@ real-symmetric :math:`n_{\mathrm{o}}^2 \times n_{\mathrm{o}}^2`
 matrix :math:`\Lambda_{\mathrm{r}}` per channel that matches the sum rule component by component on the orbital
 pairs of each atom. Between atoms the mass is zero: the single-site impurity holds no inter-atom correlation, so those
 components follow from the lattice instead of being pinned to the impurity's zero. It comes from a
-damped Newton iteration whose line search keeps the static susceptibility gap positive; both channels are always
-corrected, and the momentum sum runs over the full Brillouin zone because symmetry-related momenta carry orbitally
+damped Newton iteration whose line search keeps the static susceptibility gap positive; the ``type`` field applies
+to it as well, and the momentum sum runs over the full Brillouin zone because symmetry-related momenta carry orbitally
 rotated susceptibility matrices. The single-band scheme is the derived Moriya correction. The matrix scheme is a
 heuristic that mimics it, and inside the cycle both do the same job of stabilizing the iteration.
+
+The matrix scheme applies a mass only at a root of its sum rule. Before the Newton iteration starts, the log reports
+the feasibility bound and how many eigenvalues of the static on-site susceptibility are negative, as the smallest and
+the largest count over the momenta:
+
+.. code-block:: text
+
+   Multi-orbital lambda correction: feasibility bound <bound>; the static on-site susceptibility has <min> to <max> negative eigenvalues across the momenta.
+
+If the iteration ends without a root, the run stops with ``Multi-orbital lambda correction did not converge`` and no
+mass is applied. This is what happens when an eigenvalue of the static on-site susceptibility passes through zero
+between momenta: the inverse susceptibility is unbounded there, so the feasibility bound is set by the momentum that
+happens to lie closest to the crossing and grows with the momentum grid, and the mass it demands suppresses the
+susceptibility too far for the sum rule to be met. When this happens in the density channel, ``sp`` corrects the
+magnetic channel alone and leaves the density susceptibility as the ladder gives it.
 
 The schedule has two phases. The correction is applied in every iteration until the cycle converges at the relaxed
 threshold. At that point the log announces

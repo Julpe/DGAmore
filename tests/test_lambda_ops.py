@@ -331,18 +331,28 @@ def test_find_lambda_matrix_converges_when_the_target_breaks_exchange():
     assert np.allclose(lam_broken, MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, s_r, beta, nq), atol=1e-10)
 
 
-def test_find_lambda_matrix_warns_on_non_convergence():
-    """An unreachable target makes the Newton solver exhaust its steps, warn and return a finite symmetric mass."""
-    config.logger = MagicMock()
+@pytest.mark.parametrize("maxiter", [5, None], ids=["out_of_iterations", "pinned_to_the_feasibility_boundary"])
+def test_find_lambda_matrix_raises_instead_of_returning_an_unconverged_mass(maxiter):
+    """A target above every feasible susceptibility sum leaves the Newton solver without a root: it raises."""
     beta, nq, nw, n_bands = 5.0, 6, 5, 2
     chi_qw = _synthetic_chi_qw(n_bands, nq, nw)
-    no2 = n_bands**2
-    s_r = 1e6 * np.eye(no2)  # far above any achievable susceptibility sum
+    s_r = 1e6 * np.eye(n_bands**2)  # far above any achievable susceptibility sum
 
-    lam = MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, s_r, beta, nq, maxiter=5)
+    with pytest.raises(RuntimeError, match="did not converge"):
+        MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, s_r, beta, nq, maxiter=maxiter)
 
-    assert np.all(np.isfinite(lam)) and np.allclose(lam, lam.conj().T)
-    assert config.logger.warning.called
+
+def test_find_lambda_matrix_logs_the_feasibility_bound_and_the_static_negative_eigenvalue_range():
+    """Before the Newton search the bound and the range of negative static on-site eigenvalues are logged."""
+    beta, lambda_star = 5.0, 5.0
+    chi_qw = np.array([2.0, 0.5, -0.25], dtype=np.complex128).reshape(3, 1, 1, 1)  # one static pole past its bound 4
+    s_r = (1.0 / (1.0 / chi_qw + lambda_star)).sum(axis=(0, 1)) / (beta * 3)
+
+    lam = MultiOrbitalLambdaCorrection.find_lambda_matrix(chi_qw, s_r, beta, 3)
+
+    messages = [call.args[0] for call in config.logger.info.call_args_list]
+    assert np.allclose(lam, lambda_star, atol=1e-6)
+    assert any("feasibility bound 4.000000" in m and "0 to 1 negative eigenvalues" in m for m in messages)
 
 
 def test_find_lambda_matrix_falls_back_to_lstsq_on_singular_hessian(monkeypatch):
@@ -676,6 +686,79 @@ def test_multiorbital_perform_loads_target_writes_lambda_and_corrects(tmp_path):
     lambda_file = tmp_path / "lambda_trial.txt"
     assert lambda_file.exists()
     assert "lambda_magn_fro" in lambda_file.read_text()
+
+
+def test_multiorbital_perform_type_sp_returns_the_density_channel_unchanged(monkeypatch):
+    """With type 'sp' the density susceptibility passes through uncorrected, with nothing loaded for it."""
+    config.lambda_correction.type = "sp"
+    chi = _multiorbital_chi_fourpoint(2, (4, 4, 1), 2, seed=1)
+    before = chi.mat.copy()
+    load = MagicMock()
+
+    with monkeypatch.context() as mp:
+        mp.setattr(LocalFourPoint, "load", load)
+        result = MultiOrbitalLambdaCorrection.perform(chi)
+
+    assert result is chi and np.array_equal(result.mat, before)
+    load.assert_not_called()
+
+
+def test_multiorbital_perform_type_sp_matches_the_single_band_sp_reference():
+    """For one band the 'sp' matrix correction reproduces the scalar 'sp' reference of the magnetic channel."""
+    config.lattice.k_grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    config.sys.beta = 12.5
+    config.sys.n_bands = 1
+    config.lambda_correction.type = "sp"
+    config.output.output_path = f"{os.path.dirname(os.path.abspath(__file__))}/test_data/lambda_correction/sp"
+
+    chi_before = load_four_point("sp", "chi_phys_q_magn_before_lambda", SpinChannel.MAGN)
+    corrected = MultiOrbitalLambdaCorrection.perform(chi_before, quiet=True)
+
+    assert np.allclose(corrected.mat, load_four_point("sp", "chi_phys_q_magn", SpinChannel.MAGN).mat, atol=1e-4)
+
+
+def _local_chi_with_sum(s_r: np.ndarray, channel: SpinChannel, beta: float) -> LocalFourPoint:
+    """A static-only local susceptibility whose frequency sum over beta is the compound matrix s_r."""
+    n_bands = int(round(np.sqrt(s_r.shape[0])))
+    mat = (beta * s_r).reshape(n_bands, n_bands, n_bands, n_bands).transpose(0, 1, 3, 2)[..., None]
+    return LocalFourPoint(mat.astype(np.complex128), channel, num_wn_dimensions=1, num_vn_dimensions=0)
+
+
+def test_multiorbital_perform_type_sp_takes_up_the_sum_rule_residual_of_the_density_channel(monkeypatch):
+    """With type 'sp' the magnetic target takes up the sum-rule residual of the uncorrected density susceptibility."""
+    beta = config.sys.beta = 8.0
+    config.sys.n_bands = 2
+    config.lambda_correction.type = "sp"
+    chi_dens = _multiorbital_chi_fourpoint(2, (4, 4, 1), 3, seed=8)
+    chi_magn = _multiorbital_chi_fourpoint(2, (4, 4, 1), 3, seed=7).set_channel(SpinChannel.MAGN)
+    q_grid = config.lattice.k_grid
+    a = np.random.default_rng(9).standard_normal((4, 4))
+    lambda_star, offset = _exchange_even(0.2 * 0.5 * (a + a.T)), _exchange_even(0.01 * (a @ a.T))
+
+    def lattice_sum(chi: FourPoint, mass: np.ndarray) -> np.ndarray:
+        chi_inv = np.linalg.inv(chi.copy().map_to_full_bz(q_grid).to_compound_indices().mat.astype(np.complex128))
+        return np.linalg.inv(chi_inv + mass).sum(axis=(0, 1)) / (beta * q_grid.nk_tot)
+
+    targets = {
+        SpinChannel.DENS: lattice_sum(chi_dens, np.zeros((4, 4))) + offset,
+        SpinChannel.MAGN: lattice_sum(chi_magn, lambda_star) - offset,
+    }
+    expected = np.linalg.inv(np.linalg.inv(chi_magn.copy().to_compound_indices().mat) + lambda_star)
+
+    with monkeypatch.context() as mp:
+        local = MagicMock(side_effect=lambda path, channel, **kw: _local_chi_with_sum(targets[channel], channel, beta))
+        mp.setattr(LocalFourPoint, "load", local)
+        mp.setattr(FourPoint, "load", MagicMock(return_value=chi_dens.copy()))
+        corrected = MultiOrbitalLambdaCorrection.perform(chi_magn, quiet=True)
+
+    assert np.allclose(corrected.to_full_niw_range().to_compound_indices().mat, expected, atol=1e-5)
+
+
+def test_multiorbital_perform_raises_on_unknown_type():
+    """MultiOrbitalLambdaCorrection.perform rejects a lambda-correction type that is neither 'spch' nor 'sp'."""
+    config.lambda_correction.type = "bogus"
+    with pytest.raises(ValueError, match="'spch' or 'sp'"):
+        MultiOrbitalLambdaCorrection.perform(_multiorbital_chi_fourpoint(2, (4, 4, 1), 2, seed=1))
 
 
 def test_density_diagonal_sum_reduces_to_frequency_sum_for_q_constant_chi():
