@@ -25,6 +25,24 @@ from dgamore.n_point_base import SpinChannel
 from dgamore.self_energy import SelfEnergy
 
 
+def replace_non_finite(mat: np.ndarray, name: str, ineq: int) -> None:
+    """
+    Sets the NaN and infinite entries of a DMFT input array to zero in place and logs one warning with their count,
+    so a broken DMFT input is reported instead of spreading silently into the vertices and susceptibilities.
+
+    :param mat: The array to check, modified in place.
+    :param name: The name of the quantity used in the warning.
+    :param ineq: The index of the inequivalent atom (for multi-site DMFT).
+    :return: None.
+    """
+    bad = np.isfinite(mat)
+    np.logical_not(bad, out=bad)
+    count = np.count_nonzero(bad)
+    if count:
+        mat[bad] = 0
+        config.logger.warning(f"{count} non-finite entries (NaN or inf) of {name} for atom {ineq} set to 0.")
+
+
 class DMFTInterface(ABC):
     """
     Abstract interface for DMFT calculations. Reads the quantities needed for a DGA calculation
@@ -321,6 +339,7 @@ class W2dynInterface(DMFTInterface):
         """
         giw = self.file_1p[self._ineq_group(ineq, dmft_iter) + "/giw/value"][()]  # [band, spin, niv]
         giw = np.mean(giw, axis=1)  # mean over spin
+        replace_non_finite(giw, "the DMFT Green's function", ineq)
         return GreensFunction(self._extend_orbital(giw)[None, None, None, ...], beta=config.sys.beta)
 
     def get_siw(self, ineq: int = 1, dmft_iter: str = "dmft-last") -> SelfEnergy:
@@ -334,6 +353,8 @@ class W2dynInterface(DMFTInterface):
         """
         siw = self.file_1p[self._ineq_group(ineq, dmft_iter) + "/siw/value"][()]  # [band, spin, niv]
         siw = np.mean(siw, axis=1)  # mean over spin
+        # zeroed before the construction below fits the tail moments and the core box from it
+        replace_non_finite(siw, "the DMFT self-energy", ineq)
         siw = self._extend_orbital(siw)[None, None, None, ...]
         siw_dc = np.mean(self.get_dc(ineq, dmft_iter), axis=-1)  # from [band, spin] to spin-mean
         siw_dc = self._extend_orbital(siw_dc)[None, None, None, ..., None]

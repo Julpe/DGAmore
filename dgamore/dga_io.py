@@ -16,7 +16,7 @@ import numpy as np
 
 import dgamore.brillouin_zone as bz
 import dgamore.config as config
-from dgamore.dmft_interface import W2dynInterface, TriqsInterface
+from dgamore.dmft_interface import W2dynInterface, TriqsInterface, replace_non_finite
 from dgamore.greens_function import GreensFunction
 from dgamore.hamiltonian import Hamiltonian
 from dgamore.local_four_point import LocalFourPoint
@@ -69,8 +69,9 @@ def load_from_dmft_file_and_update_config() -> (
     r"""
     Loads the per-inequivalent-atom DMFT quantities (1- and 2-particle) and updates the global config: inverse
     temperature, interaction parameters, chemical potential, filling, frequency boxes, band count, Hamiltonian and
-    output paths. Also cuts the two-particle Green's functions to the core box and applies the requested orbital and
-    :math:`(\nu, \nu')` symmetrizations.
+    output paths. Also cuts the two-particle Green's functions to the core box, sets their NaN and infinite entries
+    there to zero with a warning (as the interface does for the one-particle inputs) and applies the requested orbital
+    and :math:`(\nu, \nu')` symmetrizations.
 
     :return: A tuple of per-inequivalent-atom lists ``(g_per_ineq, sigma_per_ineq, g2_dens_per_ineq,
         g2_magn_per_ineq)`` of Green's functions, self-energies and density/magnetic two-particle Green's functions.
@@ -158,6 +159,8 @@ def load_from_dmft_file_and_update_config() -> (
     for i in range(len(g2_dens_per_ineq)):
         g2_dens_per_ineq[i] = g2_dens_per_ineq[i].cut_niw_and_niv(config.box.niw_core, config.box.niv_core)
         g2_magn_per_ineq[i] = g2_magn_per_ineq[i].cut_niw_and_niv(config.box.niw_core, config.box.niv_core)
+        replace_non_finite(g2_dens_per_ineq[i].mat, "the density G2 in the core box", i + 1)
+        replace_non_finite(g2_magn_per_ineq[i].mat, "the magnetic G2 in the core box", i + 1)
 
         if config.dmft.symmetrize_orbitals:
             g2_dens_per_ineq[i] = g2_dens_per_ineq[i].symmetrize_orbitals(config.dmft.symmetrize_orbitals)

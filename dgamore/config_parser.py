@@ -33,6 +33,7 @@ class ConfigParser:
         Initializes an empty parser; the YAML content is loaded later by :meth:`parse_config`.
         """
         self._config_file = None
+        self._read_keys = {}
 
     def parse_config(self, comm: MPI.Comm = None, path: str = "./", name: str = "dga_config.yaml"):
         """
@@ -74,7 +75,8 @@ class ConfigParser:
 
     def _build_config_from_file(self, config_file):
         """
-        Populates every global config singleton from the parsed YAML content.
+        Populates every global config singleton from the parsed YAML content and logs a warning for every section and
+        key of the file that no builder reads.
 
         :param config_file: The parsed YAML mapping.
         :return: None.
@@ -91,6 +93,17 @@ class ConfigParser:
         config.self_energy_interpolation = self._build_self_energy_interpolation_config(config_file)
         config.sys = self._build_system_config(config_file)
         config.ana_cont = self._build_ana_cont_config(config_file)
+
+        for name, section in config_file.items():
+            if section is None:
+                continue
+            read_keys = self._read_keys.get(id(section))
+            if read_keys is None:
+                config.logger.warning(f"Unknown config section '{name}' is ignored.")
+                continue
+            for key in section:
+                if key not in read_keys:
+                    config.logger.warning(f"Unknown key '{key}' in config section '{name}' is ignored.")
 
     def _build_box_config(self, config_file) -> BoxConfig:
         """
@@ -139,7 +152,7 @@ class ConfigParser:
         conf.k_grid = bz.KGrid(conf.nk, conf.symmetries)
 
         conf.type = self._try_parse(section, "type", conf.type)
-        conf.er_input = section["hr_input"]  # can be multiple types
+        conf.er_input = self._try_parse(section, "hr_input", None)  # can be multiple types
 
         conf.interaction_type = self._try_parse(section, "interaction_type", conf.interaction_type)
         conf.interaction_input = self._try_parse(section, "interaction_input", conf.interaction_input)
@@ -371,20 +384,35 @@ class ConfigParser:
 
     def _try_parse(self, config_section, key: str, default_value):
         """
-        Reads ``key`` from a config section and coerces it to the type of ``default_value``, returning the default if
-        the key is missing or cannot be coerced.
+        Reads ``key`` from a config section and coerces it to the type of ``default_value``. A missing key, an empty
+        value or an empty section returns the default; a ``None`` default returns the value unconverted. A bool key
+        takes a YAML boolean or one of the strings ``true``/``false``, ``yes``/``no``, ``on``/``off`` (any case); an
+        int key rejects a number with a fractional part. The key is recorded as read for the unknown-key warning.
 
         :param config_section: The YAML sub-mapping to read from.
         :param key: The key to look up.
         :param default_value: The fallback value (its type also determines the coercion target).
-        :return: The parsed value, or ``default_value`` on a missing key or coercion failure.
+        :return: The parsed value, or ``default_value`` if the key is missing or empty.
+        :raises ValueError: If the value cannot be coerced to the type of ``default_value``.
         """
-        if key not in config_section:
+        self._read_keys.setdefault(id(config_section), set()).add(key)
+        if not config_section or config_section.get(key) is None:
             return default_value
+
+        value = config_section[key]
+        if default_value is None:
+            return value
 
         value_type = type(default_value)
         try:
-            return value_type(config_section[key])
-        except ValueError:
-            config.logger.info(f"Could not parse value for {key}. Using default value: {default_value}.")
-            return default_value
+            if value_type is bool and not isinstance(value, bool):
+                parsed = {"true": True, "yes": True, "on": True, "false": False, "no": False, "off": False}[
+                    str(value).lower()
+                ]
+            else:
+                parsed = value_type(value)
+            if value_type is int and isinstance(value, float) and parsed != value:
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"Could not parse '{key}' = {value!r} as {value_type.__name__}.") from None
+        return parsed

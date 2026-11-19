@@ -248,7 +248,8 @@ def extract_g2_general(group_string: str, indices: list, file: h5py.File, n_band
     Extracts the two-particle Green's function components from the vertex file for given indices and group string.
     Returns the components :math:`G2_{\uparrow\uparrow\uparrow\uparrow}, G2_{\downarrow\downarrow\downarrow\downarrow}`,
     :math:`G2_{\downarrow\downarrow\uparrow\uparrow}, G2_{\uparrow\uparrow\downarrow\downarrow}`,
-    :math:`G2_{\uparrow\downarrow\downarrow\uparrow}` and :math:`G2_{\downarrow\uparrow\uparrow\downarrow}`.
+    :math:`G2_{\uparrow\downarrow\downarrow\uparrow}` and :math:`G2_{\downarrow\uparrow\uparrow\downarrow}`. NaN and
+    infinite entries of a worm component are set to zero with a printed warning naming the component.
 
     :param group_string: The HDF5 group path holding the worm components.
     :param indices: The component indices to read.
@@ -261,6 +262,11 @@ def extract_g2_general(group_string: str, indices: list, file: h5py.File, n_band
     print(f"Nonzero number of elements of G2 in dataset: {len(indices)} / {n_bands ** 4 * 2**4}")
 
     elements = np.array([file[f"{group_string}/{idx}/value"] for idx in indices])
+    for idx, element in zip(indices, elements):
+        bad = ~np.isfinite(element)
+        if bad.any():
+            print(f"WARNING: {np.count_nonzero(bad)} non-finite entries (NaN or inf) of component {idx} set to 0.")
+            element[bad] = 0
     elements = elements.transpose(0, -1, 1, 2)
 
     # for some reason, the elements are stored transposed in vv' in symmetrize_old.py

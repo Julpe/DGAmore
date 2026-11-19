@@ -11,6 +11,12 @@ the predefined defaults listed below alongside the variable type the code expect
 file does not matter for parsing; the sections are discussed here in the order in which they appear in the default
 ``dga_config.yaml``.
 
+A key left empty (``output_path:``) or an empty section is treated as not set and takes the default. A boolean
+setting takes ``True``/``False`` or one of ``yes``/``no``, ``on``/``off`` (in any case). A value that cannot be
+converted to the expected type, such as a number with a fractional part for an integer setting, stops the run with an
+error naming the key. Sections and keys that DGAmore does not know are ignored with a warning in the log, which
+catches typos and outdated entries.
+
 Matsubara frequencies
 ---------------------
 

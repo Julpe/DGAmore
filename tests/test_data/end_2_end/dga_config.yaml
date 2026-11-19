@@ -42,14 +42,7 @@ eliashberg:
   n_eig: 4 # Number of eigenvalues and eigenvectors to be calculated. Default: 4
   epsilon: 1e-12 # Convergence criterion for the eigenvalues and eigenvectors
   symmetry: random   # Symmetry of the gap function that will be used as a starting point for the power iteration. Available: p-wave-x, p-wave-y, d-wave, random
-  include_local_part: false # If True, the local part of the pairing vertex is included in the Eliashberg calculation. This is only relevant if one might expect s-wave symmetry.
-  # setting this to True will reduce the frequency box of the pairing vertex slightly due to an additional frequency shift that is necessary.
   subfolder_name: Eliashberg   # name for the subfolder where certain outputs are generated
-
-poly_fitting:
-  do_poly_fitting: false # If True, the code will perform a polynomial fit of the non-local self-energy and the Green's function
-  n_fit: -1 # Number of Matsubara frequencies used for fit; default: -1 (niv_core + 40)
-  o_fit: 8 # Polynomial order used for the fit; default: 8
 
 output:
   output_path: ''   # Path, where the DGA output folders are created. If not specified, the output is created in the input folder directory of the DMFT files
