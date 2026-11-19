@@ -1088,7 +1088,9 @@ def calculate_and_save_chi_q_r_rpa(
     :math:`\chi^{\mathrm{q}}_{0} = \frac{1}{\beta^2} \sum_{\nu} \chi^{\mathrm{q}\nu}_{0}`,
     :math:`\chi^{\mathrm{q}}_{r;\mathrm{RPA}} = \chi^{\mathrm{q}}_{0} (1 + (U_{r} + V^{\mathbf{q}}_{r})
     \chi^{\mathrm{q}}_{0})^{-1}` (see :func:`create_rpa_susceptibility`). The result is gathered to rank 0 and written
-    to file.
+    to file. The file is a diagnostic only, so a channel whose :math:`1 + (U_{r} + V^{\mathbf{q}}_{r})
+    \chi^{\mathrm{q}}_{0}` is singular at any momentum on any rank (an exact Stoner pole) is skipped with a warning
+    instead of aborting the run.
 
     :param gchi0_q_full_sum: The frequency-summed bare bubble over the full box.
     :param u_loc: The bare local interaction :math:`U`.
@@ -1097,7 +1099,20 @@ def calculate_and_save_chi_q_r_rpa(
     :return: None.
     """
     for channel in [SpinChannel.DENS, SpinChannel.MAGN]:
-        chi_rpa_q_r = create_rpa_susceptibility(gchi0_q_full_sum, u_loc, v_nonloc, channel)
+        try:
+            chi_rpa_q_r = create_rpa_susceptibility(gchi0_q_full_sum, u_loc, v_nonloc, channel)
+        except np.linalg.LinAlgError:
+            chi_rpa_q_r = None
+        # every rank has to agree on the skip, else the others would block in the gather
+        singular = chi_rpa_q_r is None
+        if mpi_dist_irrk.comm.size > 1:
+            singular = mpi_dist_irrk.comm.allreduce(singular, op=MPI.MAX)
+        if singular:
+            config.logger.warning(
+                f"The RPA susceptibility ({channel.value}) is singular at a momentum, an exact pole of "
+                f"chi_0 (1 + (U_r + V_r(q)) chi_0)^-1; chi_rpa_q_{channel.value} is not written."
+            )
+            continue
         chi_rpa_q_r.mat = mpi_dist_irrk.gather(chi_rpa_q_r.mat)
 
         if mpi_dist_irrk.my_rank == 0:
@@ -2102,7 +2117,8 @@ def _init_mu_history(warm_start: bool) -> list[float]:
     previous run's :math:`\mu`, and any quantity computed from the global (e.g. the lattice filling in
     :meth:`GreensFunction.get_fill_nonlocal`, which now reads ``self._mu``) would use an inconsistent chemical potential.
     That value is only the starting guess: :func:`calculate_self_energy_q` re-solves it so the starting self-energy has
-    the DMFT lattice filling.
+    the DMFT lattice filling. A previous run without ``mu_history.npy`` seeds the history with the current
+    :math:`\mu`, with a warning.
 
     :param warm_start: Whether the loop starts from a previous run's self-energy (see :func:`get_starting_sigma`).
     :return: The single-element chemical-potential history list.
@@ -2110,7 +2126,11 @@ def _init_mu_history(warm_start: bool) -> list[float]:
     if not warm_start:
         return [config.sys.mu]
 
-    previous_mu = float(np.load(os.path.join(config.self_consistency.previous_sc_path, "mu_history.npy"))[-1])
+    path = os.path.join(config.self_consistency.previous_sc_path, "mu_history.npy")
+    if not os.path.isfile(path):
+        config.logger.warning(f"No {path}; the chemical potential search starts from mu = {config.sys.mu}.")
+        return [config.sys.mu]
+    previous_mu = float(np.load(path)[-1])
     config.sys.mu = previous_mu
     return [previous_mu]
 
@@ -3813,6 +3833,9 @@ def calculate_self_energy_q(
         del sigma_rows
         mu_history.append(config.sys.mu)
         logger.info(f"Updated mu from {old_mu} to {config.sys.mu}.")
+        if comm.rank == 0:
+            # rewritten every iteration, so a run killed while iterating can still be resumed from its last mu
+            np.save(os.path.join(config.output.output_path, "mu_history.npy"), mu_history)
 
         # new occupation matrix and energies from the new Green's function (outside the asympt region its shell is the
         # donor's: DMFT, or RPA mode's own tail); k-distributed, so no rank builds the whole DMFT-box Green's function
@@ -4001,8 +4024,9 @@ def calculate_self_energy_q(
         sc_roots_comm.Free()
         sc_node_comm.Free()
 
-    np.save(os.path.join(config.output.output_path, "mu_history.npy"), mu_history)
-    logger.info("Saved mu history as numpy array.")
+    if comm.rank == 0:
+        np.save(os.path.join(config.output.output_path, "mu_history.npy"), mu_history)
+        logger.info("Saved mu history as numpy array.")
 
     if tracker is not None and comm.rank == 0:
         _save_jacobian_spectrum(tracker, pure_converged, rows_lam, rows_res, rows_damping)

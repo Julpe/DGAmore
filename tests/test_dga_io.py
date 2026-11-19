@@ -235,3 +235,80 @@ def test_two_inequivalent_atoms_with_different_uncorrelated_orbitals_load_their_
     assert config.dmft.n_p_bands_per_ineq == [1, 2]
     assert config.sys.correlated_orbitals.tolist() == [0, 1, 3, 4]
     assert np.allclose(np.einsum("iiii->i", u), 8.0)
+
+
+def _load_end_2_end_copy(path, edit_g2=None, edit_1p=None, niw_core: int = -1):
+    """Copies the end_2_end DMFT input to path, lets edit_g2 / edit_1p modify the open HDF5 files and loads it without
+    orbital symmetrization; returns the loaded (G, Sigma, G2_dens, G2_magn) of the one atom."""
+    for name in ("1p-data.hdf5", "g4iw_sym.hdf5", "wannier.hk"):
+        shutil.copyfile(f"{TEST_DATA}/end_2_end/{name}", path / name)
+    for name, edit in (("g4iw_sym.hdf5", edit_g2), ("1p-data.hdf5", edit_1p)):
+        if edit is not None:
+            with h5py.File(path / name, "r+") as file:
+                edit(file)
+    config.logger = MagicMock()
+    conftest.create_default_config(config, str(path))
+    config.dmft.symmetrize_orbitals = []
+    config.box.niw_core = niw_core
+    g, sigma, g2_dens, g2_magn = load_from_dmft_file_and_update_config()
+    return g[0], sigma[0], g2_dens[0], g2_magn[0]
+
+
+def _warnings() -> list[str]:
+    """The messages of every warning logged through the mocked config logger."""
+    return [call.args[0] for call in config.logger.warning.call_args_list]
+
+
+def _set_g2_component(file, channel: str, value: complex, wn_groups: range = range(41)) -> None:
+    """Overwrites the orbital component 1111 of the given G2 channel at the given bosonic frequency groups."""
+    for wn in wn_groups:
+        file[f"ineq-001/{channel}/{wn:05}/00001/value"][...] = value
+
+
+def test_non_finite_g2_entries_in_the_core_box_are_set_to_zero_with_one_warning_per_channel(tmp_path):
+    """NaN in the density and inf in the magnetic 1111 component load as zeros, each channel logging its count once."""
+    _, _, clean_dens, clean_magn = _load_end_2_end_copy(tmp_path)
+
+    _, _, g2_dens, g2_magn = _load_end_2_end_copy(
+        tmp_path,
+        edit_g2=lambda f: (_set_g2_component(f, "dens", np.nan), _set_g2_component(f, "magn", np.inf)),
+    )
+
+    for g2, clean in ((g2_dens, clean_dens), (g2_magn, clean_magn)):
+        assert np.all(g2.mat[0, 0, 0, 0] == 0)
+        assert np.array_equal(g2.mat.reshape(16, -1)[1:], clean.mat.reshape(16, -1)[1:])
+    assert _warnings() == [
+        f"{41 * 40 * 40} non-finite entries (NaN or inf) of the density G2 in the core box for atom 1 set to 0.",
+        f"{41 * 40 * 40} non-finite entries (NaN or inf) of the magnetic G2 in the core box for atom 1 set to 0.",
+    ]
+
+
+def test_non_finite_g2_entries_outside_the_core_box_are_cut_away_without_a_warning(tmp_path):
+    """A NaN at the outermost bosonic frequency is dropped by the core cut and logs nothing."""
+    _, _, g2_dens, _ = _load_end_2_end_copy(
+        tmp_path, edit_g2=lambda f: _set_g2_component(f, "dens", np.nan, range(1)), niw_core=10
+    )
+
+    assert np.all(np.isfinite(g2_dens.mat))
+    assert _warnings() == []
+
+
+def test_non_finite_one_particle_entries_are_set_to_zero_with_one_warning_each(tmp_path):
+    """NaN in the DMFT G and Sigma of both spins of one band at one frequency loads as zero (Sigma keeps the dc)."""
+
+    def poison(file):
+        for name in ("giw", "siw"):
+            file[f"dmft-last/ineq-001/{name}/value"][0, :, 7] = np.nan
+
+    g, sigma, _, _ = _load_end_2_end_copy(tmp_path, edit_1p=poison)
+
+    with h5py.File(tmp_path / "1p-data.hdf5", "r") as file:
+        dc = np.mean(file["dmft-last/ineq-001/dc/value"][()], axis=-1)
+    assert g.mat[0, 0, 0, 0, 0, 7] == 0
+    assert np.isclose(sigma.mat[0, 0, 0, 0, 0, 7], dc[0])
+    assert np.all(np.isfinite(g.mat)) and np.all(np.isfinite(sigma.mat))
+    assert np.all(np.isfinite(sigma.smom[0])) and np.all(np.isfinite(sigma.smom[1]))
+    assert _warnings() == [
+        "1 non-finite entries (NaN or inf) of the DMFT Green's function for atom 1 set to 0.",
+        "1 non-finite entries (NaN or inf) of the DMFT self-energy for atom 1 set to 0.",
+    ]

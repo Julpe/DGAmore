@@ -46,10 +46,10 @@ A rung needs three things before it can start.
    filling; only the temperature changes.
 
 2. **A converged previous rung.** The warm start is only as good as its source. Chaining from a rung that stopped at
-   ``max_iter`` throws away the advantage the procedure is built on. The technical minimum is lower: the predecessor
-   must have completed its cycle, because the chemical potential is read from its ``mu_history.npy``, and that file
-   is only written when the cycle ends, whether by convergence or by exhausting ``max_iter``. A run that was killed
-   while iterating cannot serve as a predecessor at all.
+   ``max_iter`` throws away the advantage the procedure is built on. The technical minimum is lower: a run that was
+   killed while iterating still holds its raw iterates and its ``mu_history.npy``, which is rewritten after every
+   iteration, so the same rung resumes from its last iterate. It cannot hand over to the next rung, though, because
+   the interpolated self-energy (item 3) is only written when the cycle ends.
 
 3. **The predecessor's self-energy on this rung's grid.** The hand-over reads the interpolated self-energy the
    previous rung wrote, and that file only exists if the predecessor ran with the interpolation switched on and aimed
@@ -295,8 +295,9 @@ At the start of the cycle, the predecessor's result becomes the rung's starting 
   axes (those of a face-centered cell, for instance), and the cycle takes its symmetry-reduced routes for the bubble,
   the self-energy contraction and the lattice sums only while the self-energy obeys the group. A start that already
   obeys it, such as the last iterate of a predecessor on the same grid, is used bit for bit.
-* The chemical potential starts at the last entry of the predecessor's ``mu_history.npy`` and is re-solved before
-  the first iteration, so that the starting self-energy has the filling of the rung's DMFT lattice Green's function.
+* The chemical potential starts at the last entry of the predecessor's ``mu_history.npy`` (at the DMFT value, with a
+  warning, if that file is missing) and is re-solved before the first iteration, so that the starting self-energy has
+  the filling of the rung's DMFT lattice Green's function.
   Every later iteration holds that same filling. The predecessor's own filling at its chemical potential is never
   the target: it drifts along a chain of rungs.
 * The mixing history starts empty, so the first steps of an accelerated scheme are damped steps. With

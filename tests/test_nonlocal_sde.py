@@ -78,12 +78,27 @@ def test_init_mu_history_from_previous_syncs_global_mu(monkeypatch, tmp_path):
     config.sys.mu = 0.3
     config.self_consistency.previous_sc_path = str(tmp_path)
     previous_mu = 1.5
+    (tmp_path / "mu_history.npy").touch()
     monkeypatch.setattr(np, "load", lambda *args, **kwargs: np.array([0.9, 1.2, previous_mu]))
 
     mu_history = _init_mu_history(True)
 
     assert mu_history == [previous_mu]
     assert config.sys.mu == previous_mu
+
+
+def test_init_mu_history_without_previous_file_keeps_current_mu(monkeypatch, tmp_path):
+    """A previous run killed before writing mu_history.npy seeds the history with the current mu, with a warning."""
+    logger = MagicMock()
+    monkeypatch.setattr(config, "logger", logger, raising=False)
+    config.sys.mu = 0.3
+    config.self_consistency.previous_sc_path = str(tmp_path)
+
+    mu_history = _init_mu_history(True)
+
+    assert mu_history == [0.3]
+    assert config.sys.mu == 0.3
+    assert "mu_history.npy" in logger.warning.call_args.args[0]
 
 
 def _previous_run_folder(tmp_path, monkeypatch, names, beta=25.0):
@@ -387,6 +402,24 @@ def test_rpa_susceptibility_vanishes_where_the_bubble_does_instead_of_inverting_
     for channel in (SpinChannel.DENS, SpinChannel.MAGN):
         expected = chi0_mat.reshape(2, 2) / (1.0 + u_loc.as_channel(channel).mat.ravel()[0] * chi0_mat.reshape(2, 2))
         assert np.allclose(saved[f"chi_rpa_q_{channel.value}"].reshape(2, 2), expected, atol=1e-6)
+
+
+def test_rpa_susceptibility_skips_a_channel_singular_at_a_stoner_pole_with_a_warning(monkeypatch):
+    """With U = 2 and chi0 = 0.5, 1 + U_magn chi0 vanishes: the magnetic file is skipped, the density one written."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    saved = {}
+    monkeypatch.setattr(FourPoint, "save", lambda self, name, output_dir: saved.__setitem__(name, self.mat.copy()))
+    chi0 = FourPoint(np.full((2, 1, 1, 1, 1, 1), 0.5 + 0.0j), SpinChannel.NONE, (2, 1, 1), 1, 0, False, True, True)
+    u_loc = LocalInteraction(np.full((1, 1, 1, 1), 2.0), SpinChannel.NONE)
+    v_nonloc = Interaction(np.zeros((2, 1, 1, 1, 1)), SpinChannel.NONE, (2, 1, 1), True)
+    dist = mpi_utils.MpiDistributor(ntasks=2, comm=create_comm_mock())
+
+    nonlocal_sde.calculate_and_save_chi_q_r_rpa(chi0, u_loc, v_nonloc, dist)
+
+    assert set(saved) == {"chi_rpa_q_dens"}
+    assert np.allclose(saved["chi_rpa_q_dens"], 0.5 / (1.0 + 2.0 * 0.5))
+    config.logger.warning.assert_called_once()
+    assert "chi_rpa_q_magn is not written" in config.logger.warning.call_args.args[0]
 
 
 def test_bubble_tail_completes_the_box_sum_of_a_band_at_the_chemical_potential(monkeypatch):
@@ -1676,6 +1709,28 @@ def test_loop_reads_the_first_frequency_local_vertex_only_for_the_ladder(monkeyp
     run()
 
     assert len(reads) == (1 if mode is None else 0)
+
+
+@pytest.mark.parametrize("n_ranks", [1, 2])
+def test_loop_rewrites_the_mu_history_on_rank0_every_iteration(monkeypatch, tmp_path, n_ranks):
+    """Rank 0 alone writes the whole mu history after every iteration and once more after the loop."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0)
+    monkeypatch.setattr(nonlocal_sde, "update_mu", lambda mu0, *a, **k: mu0 + 0.1)
+    writes = []
+    monkeypatch.setattr(
+        np, "save", lambda f, arr, **k: writes.append((f, list(arr))) if f.endswith("mu_history.npy") else None
+    )
+
+    if n_ranks == 1:
+        run()
+    else:
+        run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
+
+    assert {f for f, _ in writes} == {os.path.join(str(tmp_path), "mu_history.npy")}
+    assert [len(mus) for _, mus in writes] == [2, 3, 4, 4]
+    np.testing.assert_allclose(writes[-1][1], [0.5, 0.6, 0.7, 0.8])
 
 
 def _run_loop_on_two_node_ranks(monkeypatch, tmp_path, spied_name, spied_owner):

@@ -293,7 +293,8 @@ separate momentum axes.
      - ``[nq_irr, no, no, no, no, niw_core + 1]``
    * - ``chi_rpa_q_dens.npy``, ``chi_rpa_q_magn.npy``
      - RPA susceptibility, written once in the first iteration: of the bubble summed over all frequencies with
-       ``misc.do_flex`` or ``misc.do_rpa``, of the box sum otherwise
+       ``misc.do_flex`` or ``misc.do_rpa``, of the box sum otherwise; a channel singular at some momentum (an exact
+       Stoner pole) is not written, with a warning
      - ``[nq_irr, no, no, no, no, niw_core + 1]``
    * - ``f_irrq_dens.npy``, ``f_irrq_magn.npy``
      - Full ladder vertex :math:`F^{\mathrm{q}\nu\nu'}_{\mathrm{r}}` (only written with ``save_fq``)
