@@ -10,6 +10,8 @@ import os
 import tracemalloc
 from unittest.mock import MagicMock
 
+# imported before the autouse logger mock: the matplotlib that mini_pole loads compares its logger's level on import
+import mini_pole
 import mpi4py.MPI as MPI
 import numpy as np
 import pytest
@@ -206,12 +208,15 @@ def create_comm_mock():
     return comm_mock
 
 
+import contextvars as _contextvars
 import queue as _queue
 import threading as _threading
 import traceback as _traceback
 import types as _types
 
-_tls = _threading.local()
+# a fake rank's identity lives in its thread's context, which a helper thread started with the caller's context keeps
+_rank = _contextvars.ContextVar("fake_mpi_rank", default=0)
+_hostname = _contextvars.ContextVar("fake_mpi_hostname", default="node0")
 # a deadlock guard, not a timing check: one rank of the 7-rank Jacobian tests can trail the others by more than 20 s
 # on a slow CI runner under coverage
 _BARRIER_TIMEOUT = _QUEUE_TIMEOUT = 120.0
@@ -227,11 +232,11 @@ REQUEST_NULL = object()
 
 
 def Get_processor_name():
-    return getattr(_tls, "hostname", "node0")
+    return _hostname.get()
 
 
 def gethostname():
-    return getattr(_tls, "hostname", "node0")
+    return _hostname.get()
 
 
 class _Request:
@@ -258,6 +263,12 @@ class Request:
             if r is not None:
                 r.wait()
 
+    @staticmethod
+    def Testall(reqs):
+        # the fake completes requests when they are tested
+        Request.Waitall(reqs)
+        return True
+
 
 def _assign(buf, data):
     try:
@@ -277,7 +288,7 @@ class Comm:
         self._split_cache = {}
 
     def Get_rank(self):
-        return self._members.index(getattr(_tls, "rank", 0))
+        return self._members.index(_rank.get())
 
     def Get_size(self):
         return self._size
@@ -302,7 +313,7 @@ class Comm:
     def Split_type(self, split_type, key=0, info=None):
         # Group ranks by host (COMM_TYPE_SHARED -> one sub-communicator per node). Threads share memory, so same-node
         # ranks receive the SAME cached Comm (shared barrier/store), which makes the shared-memory window shared.
-        host = getattr(_tls, "hostname", "node0")
+        host = _hostname.get()
         hosts = list(self._collective(host))
         group = tuple(self._members[i] for i in range(self._size) if hosts[i] == host)
         with self._lock:
@@ -455,6 +466,9 @@ FAKE_MPI = _types.SimpleNamespace(
     COMM_TYPE_SHARED=1,
     COMM_WORLD=COMM_WORLD,
     Get_processor_name=Get_processor_name,
+    THREAD_SERIALIZED=2,
+    THREAD_MULTIPLE=3,
+    Query_thread=lambda: 3,
 )
 
 FAKE_SOCKET = _types.SimpleNamespace(gethostname=gethostname)
@@ -465,8 +479,8 @@ def run_parallel(size, fn, hostnames=None):
     results, errors = [None] * size, [None] * size
 
     def worker(r):
-        _tls.rank = r
-        _tls.hostname = hostnames[r] if hostnames is not None else f"node{r}"
+        _rank.set(r)
+        _hostname.set(hostnames[r] if hostnames is not None else f"node{r}")
         try:
             results[r] = fn(comm, r)
         except BaseException as exc:
@@ -504,16 +518,15 @@ def ten_times_the_floor(reference: np.ndarray, dtype=None) -> float:
 
 def patch_mini_pole_with_exact_single_pole_fit(monkeypatch, x: float):
     """Replaces SelfEnergy's MiniPole by an exact single-pole fitter at x; the real cal_G_vector is kept."""
-    from dgamore import self_energy as self_energy_module
 
     def fit(G_w, w, **kwargs):
         return _types.SimpleNamespace(
             pole_location=np.array([x + 0.0j]), pole_weight=np.array([[[G_w[0] * (1j * w[0] - x)]]])
         )
 
-    mini_pole = MagicMock(side_effect=fit)
-    mini_pole.cal_G_vector = self_energy_module.MiniPole.cal_G_vector
-    monkeypatch.setattr(self_energy_module, "MiniPole", mini_pole)
+    mock = MagicMock(side_effect=fit)
+    mock.cal_G_vector = mini_pole.MiniPole.cal_G_vector
+    monkeypatch.setattr(mini_pole, "MiniPole", mock)
 
 
 def traced_peak(fn):

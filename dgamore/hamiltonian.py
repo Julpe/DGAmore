@@ -17,7 +17,6 @@ import itertools as it
 import logging
 
 import numpy as np
-import pandas as pd
 
 import dgamore.brillouin_zone as bz
 from dgamore.interaction import LocalInteraction, Interaction
@@ -329,6 +328,9 @@ class Hamiltonian:
         :param filename: Path to the ``wannier_hr.dat`` file.
         :return: ``self`` (for chaining).
         """
+        # deferred: pandas is needed only by the file readers, not at import
+        import pandas as pd
+
         er_file = pd.read_csv(filename, skiprows=1, names=np.arange(15), sep=r"\s+", dtype=float, engine="python")
         n_bands = er_file.values[0][0].astype(int)
         nr = er_file.values[1][0].astype(int)
@@ -518,6 +520,9 @@ class Hamiltonian:
         :raises ValueError: If the number of distinct lattice vectors in the entries differs from the header, or an
             entry is listed twice.
         """
+        # deferred: pandas is needed only by the file readers, not at import
+        import pandas as pd
+
         umatrix_file = pd.read_csv(filename, skiprows=0, names=np.arange(15), sep=r"\s+", dtype=float, engine="python")
         values = umatrix_file.values
 

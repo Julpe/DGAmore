@@ -780,7 +780,11 @@ def point_group_actions(group, nk: tuple, real_space: bool = False) -> tuple[np.
 
 
 def project_onto_point_group(
-    mat: np.ndarray, maps: np.ndarray, us: np.ndarray, rows: np.ndarray | None = None
+    mat: np.ndarray,
+    maps: np.ndarray,
+    us: np.ndarray,
+    rows: np.ndarray | None = None,
+    targets: np.ndarray | None = None,
 ) -> np.ndarray:
     r"""
     Returns the average of a two-index tensor over the actions of a point group (see :func:`point_group_actions`),
@@ -790,18 +794,31 @@ def project_onto_point_group(
     With ``rows`` the tensor is zero outside those grid points and ``mat`` holds them alone. Irreducible points
     weighted by the sizes of their stars then give the unfold of an invariant tensor: every point of a star holds the
     image of its irreducible point, averaged over the elements that take the irreducible point there (its stabilizer).
+    With ``targets`` only those grid points of the average are returned; they must hold every image of ``rows`` (the
+    stars of irreducible points), and each holds the bits of the same point of the whole average.
 
     :param mat: The tensor ``[x, o1, o2, ...]`` over the flat grid, or over ``rows``.
     :param maps: The flat-index maps of the elements, shape ``(n_g, nktot)``.
     :param us: The orbital unitaries of the elements, shape ``(n_g, nb, nb)``.
     :param rows: The flat grid indices of the points ``mat`` holds, or ``None`` for the whole grid.
-    :return: The average over the whole grid, a new array of the dtype of ``mat``.
+    :param targets: The flat grid indices of the points to return, or ``None`` for the whole grid.
+    :return: The average over the whole grid (over ``targets``, in their order), a new array of the dtype of ``mat``.
+    :raises ValueError: If an image of ``rows`` lies outside ``targets``.
     """
-    out = np.zeros((maps.shape[1], *mat.shape[1:]), dtype=mat.dtype)
+    position = None
+    if targets is not None:
+        position = np.full(maps.shape[1], -1)
+        position[targets] = np.arange(len(targets))
+    out = np.zeros((maps.shape[1] if targets is None else len(targets), *mat.shape[1:]), dtype=mat.dtype)
     # the orbital axes last, so that the rotations broadcast over any trailing axes
     source, target = np.moveaxis(mat, (1, 2), (-2, -1)), np.moveaxis(out, (1, 2), (-2, -1))
     for idx, u in zip(maps, us.astype(mat.dtype)):
-        target[idx if rows is None else idx[rows]] += u @ source @ u.conj().T
+        images = idx if rows is None else idx[rows]
+        if position is not None:
+            images = position[images]
+            if np.any(images < 0):
+                raise ValueError("An image of the rows lies outside the targets.")
+        target[images] += u @ source @ u.conj().T
     out /= len(maps)
     return out
 

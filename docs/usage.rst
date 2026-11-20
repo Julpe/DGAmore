@@ -76,8 +76,9 @@ On a SLURM-based cluster, a typical job submission script looks as follows:
    mpirun -np $SLURM_NTASKS DGAmore -p "<path to config>" -c "<name of config>.yaml"
 
 The ``-o`` and ``-e`` options set the files for the job output and errors; here both are written to the same file,
-but separate files may be used instead. Should any rank fail, it writes its traceback to the error stream and
-aborts the whole job, so the remaining ranks never wait for it indefinitely. Before the heavy steps start, DGAmore
+but separate files may be used instead. Should any rank fail, it writes its traceback to the error stream, deletes
+the per-rank intermediates of every rank from the Eliashberg folder (see :doc:`output`) and aborts the whole job, so
+the remaining ranks never wait for it indefinitely. Before the heavy steps start, DGAmore
 verifies that the run fits the memory of every node it received; on a batch system this check honors the job's
 cgroup memory limit (e.g. slurm's ``--mem``), so request as much memory as the job may actually use rather than
 relying on the node total. The results of a completed run are written to a subdirectory of the output
@@ -102,19 +103,22 @@ folder, whose name encodes run-specific parameters such as the momentum-grid siz
    single-rank run the sectors are solved in turn on that rank with scipy's eigensolver, with the matrix-vector
    products threaded over the rank's CPU affinity mask. Every solve forms the crossed (exchange) term of the pairing
    kernel from the direct one by an index permutation, so each matrix-vector product needs one vertex contraction.
-   When no node
-   holds even one channel's window, the solver instead distributes the vertex over a two-dimensional
-   frequency-block grid spanning all ranks: the sectors then run sequentially on the whole grid, every rank holds
-   and contracts one vertex block, and the eigensolver iterates in lockstep with one block-sized reduction and one
-   gap-sized gather per iteration.
+   When no node holds even one channel's window, one team of all ranks solves the sectors one after the other,
+   with everything split over the nodes: every node holds the vertex at the stars of its share of the real-space
+   wedge (or its range of the grid), and the basis vectors and the bubble at its share of the fermionic frequencies,
+   in whole pairs :math:`(\nu, -\nu)`. Each matrix-vector product then exchanges the gap
+   twice between the nodes (to the nodes that contract its momenta, and back to the nodes that own its
+   frequencies), and the window of a channel is built by the ranks of every node at once, so no rank ever holds a
+   whole vertex. The memory per node falls with the number of nodes.
 
 Memory is managed automatically: every heavy step runs a single chunk-bounded or distributed algorithm, and before
 the heavy part of a run begins, DGAmore verifies from the memory available on every node together with an analytic
 estimate of each step's peak (as a node total over all ranks placed there) that the run fits, and sizes the chunks
 of the self-energy contraction and the pairing-vertex build from the memory that estimate leaves free on the
 tightest node - the runtime choices left are the Eliashberg solver's automatic fallback from its in-memory solve to
-the block-distributed grid and whether a node holds every vertex window of its sectors at once or one channel at a
-time.
+the node-distributed one, whether a node holds every vertex window of its sectors at once or one channel at a
+time, and whether the ranks of a node share the column work of the self-energy contraction, which they do only
+where some rank would have no column task of its own or where each rank alone does not fit.
 Replicated full-grid objects are always deduplicated into one shared-memory window per node. There are no memory
 switches in the configuration file; if some step does not fit, the run stops upfront with a :class:`MemoryError`
 recommending more nodes, fewer ranks per node, or a smaller box.

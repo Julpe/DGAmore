@@ -295,6 +295,13 @@ At the start of the cycle, the predecessor's result becomes the rung's starting 
   axes (those of a face-centered cell, for instance), and the cycle takes its symmetry-reduced routes for the bubble,
   the self-energy contraction and the lattice sums only while the self-energy obeys the group. A start that already
   obeys it, such as the last iterate of a predecessor on the same grid, is used bit for bit.
+* For several orbitals on a lattice with real hoppings, where the cycle averages every self-energy proposal with its
+  time-reversed partner, a starting self-energy that obeys time reversal less accurately than ``1e-12`` of its largest
+  entry is then averaged with its time-reversed partner too, and the log says "The starting self-energy obeys time
+  reversal only approximately: it is averaged with its time-reversed partner." The unfold above carries an error of
+  the start in an inversion that permutes the orbitals (the layer swap of a bilayer, for instance) into time
+  reversal, and the bubble takes its orbital-transpose and crossing routes only while the Green's function obeys time
+  reversal. A start that already obeys it is used bit for bit.
 * The chemical potential starts at the last entry of the predecessor's ``mu_history.npy`` (at the DMFT value, with a
   warning, if that file is missing) and is re-solved before the first iteration, so that the starting self-energy has
   the filling of the rung's DMFT lattice Green's function.

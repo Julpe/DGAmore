@@ -852,7 +852,12 @@ class IAmNonLocal(IHaveMat, ABC):
         return self._map_to_full_bz(k_grid, 4, nq)
 
     def _map_to_full_bz(
-        self, k_grid: "KGrid", num_orbital_dimensions: int, nq: tuple = None, out: np.ndarray | None = None
+        self,
+        k_grid: "KGrid",
+        num_orbital_dimensions: int,
+        nq: tuple = None,
+        out: np.ndarray | None = None,
+        rows: slice | None = None,
     ):
         r"""
         Maps the object from the irreducible to the full Brillouin zone.
@@ -882,6 +887,8 @@ class IAmNonLocal(IHaveMat, ABC):
         :param nq: Optional override for the number of momenta; if None the object's own ``nq`` is used.
         :param out: Optional C-contiguous array of the unfolded shape and the object's dtype that receives the result
             instead of a fresh allocation; it must not overlap the object's array, and its content is overwritten.
+        :param rows: A slice of the full-BZ momenta: only these rows of the result are written, with the bits of the
+            whole unfold (every momentum maps and rotates on its own); ``None`` for every row.
         :return: ``self`` expanded to the full BZ.
         :raises ValueError: If the object does not have a compressed momentum dimension.
         """
@@ -896,23 +903,35 @@ class IAmNonLocal(IHaveMat, ABC):
         flat_inv = k_grid.irrk_inv.ravel()
         out_shape = (np.prod(self.nq), *self.current_shape[1:])
         expanded = np.empty(out_shape, dtype=self.mat.dtype) if out is None else out
+        first, last = (0, out_shape[0]) if rows is None else rows.indices(out_shape[0])[:2]
         monomial = k_grid.auto_monomial_map(self.mat.dtype, num_orbital_dimensions) if k_grid.is_auto else None
         if monomial is None:
-            # plain IBZ -> FBZ copy; mode="clip" writes straight into out (the default "raise" buffers a second
-            # output-sized array) and never acts, since the indices of irrk_inv are valid by construction
-            np.take(self.mat, flat_inv, axis=0, out=expanded, mode="clip")
+            # plain IBZ -> FBZ copy: take with mode="clip" (valid indices) skips the output-sized buffer of "raise" and
+            # writes into out, but copies a strided source whole: indexing gathers from one, a chunk of rows at a time
+            if self.mat.flags.c_contiguous:
+                np.take(self.mat, flat_inv[first:last], axis=0, out=expanded[first:last], mode="clip")
+            else:
+                rows_per_chunk = max(1, self._UNFOLD_CHUNK_BYTES // max(1, self.mat[:1].nbytes))
+                for start in range(first, last, rows_per_chunk):
+                    part = slice(start, min(start + rows_per_chunk, last))
+                    expanded[part] = self.mat[flat_inv[part]]
             self.mat = expanded
         else:
             group_of_k, perm, phase = monomial
             n_comp, trailing = perm.shape[1], int(np.prod(self.current_shape[1 + num_orbital_dimensions :]))
-            # one source row per (irreducible momentum, orbital component); a strided view is copied once here
-            source = np.ascontiguousarray(self.mat).reshape(self.current_shape[0] * n_comp, trailing)
+            # one source row per (irreducible momentum, orbital component), a view where the layout allows; take
+            # copies a strided source whole, so indexing gathers from one and reads only the rows the chunk needs
+            source = np.reshape(self.mat, (self.current_shape[0] * n_comp, trailing))
             target = expanded.reshape(out_shape[0], n_comp, trailing)
-            rows = max(1, self._UNFOLD_CHUNK_BYTES // max(1, n_comp * trailing * target.itemsize))
-            for start in range(0, out_shape[0], rows):
-                part = slice(start, start + rows)
+            rows_per_chunk = max(1, self._UNFOLD_CHUNK_BYTES // max(1, n_comp * trailing * target.itemsize))
+            for start in range(first, last, rows_per_chunk):
+                part = slice(start, min(start + rows_per_chunk, last))
                 groups = group_of_k[part]
-                np.take(source, flat_inv[part, None] * n_comp + perm[groups], axis=0, out=target[part], mode="clip")
+                index = flat_inv[part, None] * n_comp + perm[groups]
+                if source.flags.c_contiguous:
+                    np.take(source, index, axis=0, out=target[part], mode="clip")
+                else:
+                    target[part] = source[index]
                 target[part] *= phase[groups][..., None]
             self.mat = target.reshape(out_shape)
 
@@ -921,19 +940,24 @@ class IAmNonLocal(IHaveMat, ABC):
             from dgamore import symmetry_reduction
 
             us = k_grid._auto_us.reshape(np.prod(k_grid.nk), *k_grid._auto_us.shape[3:])
-            self.mat = symmetry_reduction.apply_auto_orbital_transform(
-                self.mat,
-                us=us,
-                sigmas=k_grid._auto_sigmas.reshape(-1),
-                conjs=k_grid._auto_conjs.reshape(-1),
+            groups = k_grid.auto_orbital_groups(self.mat.dtype, num_orbital_dimensions)
+            if rows is not None:
+                # the groups' momenta inside the rows, counted from the first row
+                groups = [g[(g >= first) & (g < last)] - first for g in groups]
+                groups = [g for g in groups if g.size]
+            symmetry_reduction.apply_auto_orbital_transform(
+                self.mat[first:last],
+                us=us[first:last],
+                sigmas=k_grid._auto_sigmas.reshape(-1)[first:last],
+                conjs=k_grid._auto_conjs.reshape(-1)[first:last],
                 num_orbital_dimensions=num_orbital_dimensions,
-                groups=k_grid.auto_orbital_groups(self.mat.dtype, num_orbital_dimensions),
+                groups=groups,
             )
 
         self.update_original_shape()
         return self
 
-    def scatter_to_full_bz(self, k_grid: "KGrid", out: np.ndarray | None = None):
+    def scatter_to_full_bz(self, k_grid: "KGrid", out: np.ndarray | None = None, rows: slice | None = None):
         r"""
         Places every irreducible row, multiplied by the number of momenta of its star, at its representative in the
         full Brillouin zone and zeros everywhere else. A sum over the full zone of the result times a function of the
@@ -943,15 +967,18 @@ class IAmNonLocal(IHaveMat, ABC):
         :param k_grid: The momentum grid carrying the irreducible representatives and the sizes of their stars.
         :param out: Optional array of the full-BZ shape and the object's dtype that receives the result instead of a
             fresh allocation; it must not overlap the object's array, and its content is overwritten.
+        :param rows: A slice of the full-BZ momenta: only these rows of the result are written; ``None`` for every row.
         :return: ``self`` on the full BZ (compressed momentum axis).
         :raises ValueError: If the object does not have a compressed momentum dimension.
         """
         if not self.has_compressed_q_dimension:
             raise ValueError("Scattering to the full BZ only possible for compressed momentum dimension.")
         full = np.empty((np.prod(self.nq), *self.current_shape[1:]), dtype=self.mat.dtype) if out is None else out
-        full[...] = 0
+        first, last = (0, full.shape[0]) if rows is None else rows.indices(full.shape[0])[:2]
+        full[first:last] = 0
         stars = k_grid.irrk_count.astype(self.mat.real.dtype).reshape(-1, *[1] * (self.mat.ndim - 1))
-        full[k_grid.irrk_ind] = self.mat * stars
+        inside = np.flatnonzero((k_grid.irrk_ind >= first) & (k_grid.irrk_ind < last))
+        full[k_grid.irrk_ind[inside]] = self.mat[inside] * stars[inside]
         self.mat = full
         self.update_original_shape()
         return self

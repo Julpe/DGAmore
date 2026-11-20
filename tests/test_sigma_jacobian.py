@@ -166,8 +166,9 @@ def _loop_state(monkeypatch, lattice: str = "fixture", tmp_path=None) -> types.S
 
 
 def _proposal(state, sigma, mu: float):
-    """The raw proposal at the occupations held in config.sys."""
-    return nonlocal_sde.calculate_sigma_proposal(
+    """The raw proposal at the occupations held in config.sys: its finished core padded with its tail and averaged
+    with its time-reversed partner as the loop builds it (the average leaves the averaged core as it is)."""
+    proposal = nonlocal_sde.calculate_sigma_proposal(
         sigma.copy(),
         mu,
         state.u_loc,
@@ -179,7 +180,11 @@ def _proposal(state, sigma, mu: float):
         state.dist_irrk,
         state.comm,
         2,
-    ).compress_q_dimension()
+    )
+    whole = proposal.core.concatenate_self_energies(proposal.donor, shell_offset=proposal.shell_offset)
+    if proposal.average:
+        whole.symmetrize_time_reversal()
+    return whole.compress_q_dimension()
 
 
 def _mu_and_occupations(state, sigma, mu_start: float, fixed: bool = False) -> float:

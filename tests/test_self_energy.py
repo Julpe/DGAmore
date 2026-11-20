@@ -8,6 +8,7 @@ import warnings
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import mini_pole
 import numpy as np
 import pytest
 from scipy.integrate import IntegrationWarning
@@ -15,7 +16,6 @@ from scipy.integrate import IntegrationWarning
 from dgamore import brillouin_zone as bz
 from dgamore import config
 from dgamore.matsubara_frequencies import MFHelper
-from dgamore import self_energy as self_energy_module
 from dgamore.self_energy import SelfEnergy
 from dgamore.config import sys
 from tests.conftest import patch_mini_pole_with_exact_single_pole_fit
@@ -422,13 +422,13 @@ def test_pole_extrapolate_silences_the_warnings_of_the_mini_pole_fit(monkeypatch
     mat = (1.5 + 1.0 / (1j * vn - x))[None, None, None, None, None]
     self_energy = _se(mat, nk=(1, 1, 1), has_compressed_q_dimension=False, beta=beta)
     patch_mini_pole_with_exact_single_pole_fit(monkeypatch, x)
-    exact_fit = self_energy_module.MiniPole.side_effect
+    exact_fit = mini_pole.MiniPole.side_effect
 
     def warning_fit(*args, **kwargs):
         warnings.warn("The occurrence of roundoff error is detected", IntegrationWarning)
         return exact_fit(*args, **kwargs)
 
-    self_energy_module.MiniPole.side_effect = warning_fit
+    mini_pole.MiniPole.side_effect = warning_fit
     reference = self_energy.interpolate(2.0 * beta, niv)
 
     with warnings.catch_warnings(record=True) as caught:
@@ -447,9 +447,9 @@ def test_pole_extrapolate_rejects_upper_half_plane_poles_failed_fits_and_implaus
         Exception("Could not find controlled approximation!"),
         SimpleNamespace(pole_location=np.array([-0.2 + 0.0j]), pole_weight=np.array([[[50.0]]])),
     ]
-    mini_pole = MagicMock(side_effect=[fits[0]] * 4 + [fits[1]] * 4 + [fits[2]] * 4)
-    mini_pole.cal_G_vector = self_energy_module.MiniPole.cal_G_vector
-    monkeypatch.setattr(self_energy_module, "MiniPole", mini_pole)
+    mock = MagicMock(side_effect=[fits[0]] * 4 + [fits[1]] * 4 + [fits[2]] * 4)
+    mock.cal_G_vector = mini_pole.MiniPole.cal_G_vector
+    monkeypatch.setattr(mini_pole, "MiniPole", mock)
     reference = self_energy.interpolate(2.0, 6)
 
     values, accepted = self_energy.pole_extrapolate(2.0, 6, np.array([0, 0, 0]), reference)
@@ -457,6 +457,24 @@ def test_pole_extrapolate_rejects_upper_half_plane_poles_failed_fits_and_implaus
     assert np.array_equal(accepted, [False, False, False])
     assert np.allclose(values[:2], 0.0)
     assert not np.allclose(values[2], 0.0)
+
+
+def test_pole_extrapolate_without_momenta_returns_empty_fits_without_calling_mini_pole(monkeypatch):
+    """pole_extrapolate on no momenta, as on a rank without fits, returns empty values and flags and never fits."""
+    beta, niv = 10.0, 200
+    vn = MFHelper.vn(niv, beta)
+    mat = (1.5 + np.array([[1.0, 0.5], [0.5, 2.0]])[..., None] / (1j * vn + 0.3))[None, None, None]
+    self_energy = _se(mat, nk=(1, 1, 1), has_compressed_q_dimension=False, beta=beta)
+    mock = MagicMock()
+    monkeypatch.setattr(mini_pole, "MiniPole", mock)
+    reference = self_energy.interpolate(2.0 * beta, niv)
+
+    values, accepted = self_energy.pole_extrapolate(2.0 * beta, niv, np.arange(0), reference)
+
+    n_inner = np.count_nonzero(np.abs(MFHelper.vn(niv, 2.0 * beta)) < vn[niv])
+    assert mock.call_count == 0
+    assert np.array_equal(values, np.zeros((0, 2, 2, n_inner))) and values.dtype == np.complex128
+    assert np.array_equal(accepted, np.ones(0, dtype=bool)) and accepted.dtype == bool
 
 
 def test_pole_extrapolate_accepts_a_noisy_non_causal_three_pole_self_energy_with_the_real_mini_pole():
@@ -980,6 +998,17 @@ def test_symmetrize_time_reversal_in_frequency_slabs_reproduces_the_whole_averag
     assert np.array_equal(slabs.mat, whole.mat) and max(parts) == removed
 
 
+def test_symmetrize_time_reversal_in_momentum_slices_reproduces_the_whole_average():
+    """Averaging the pairs (k, -k) by the slice holding their smaller index gives the whole average's bits."""
+    rng = np.random.default_rng(8)
+    mat = (rng.standard_normal((24, 3, 3, 5)) + 1j * rng.standard_normal((24, 3, 3, 5))).astype(np.complex64)
+    whole = _se(mat.copy(), nk=(4, 3, 2), has_compressed_q_dimension=True)
+    removed = whole.symmetrize_time_reversal()
+    slices = _se(mat.copy(), nk=(4, 3, 2), has_compressed_q_dimension=True)
+    parts = [slices.symmetrize_time_reversal(momenta=slice(lo, hi)) for lo, hi in ((0, 5), (5, 5), (5, 17), (17, 24))]
+    assert np.array_equal(slices.mat, whole.mat) and max(parts) == removed
+
+
 def test_symmetrize_time_reversal_rejects_an_uncompressed_momentum_axis():
     """symmetrize_time_reversal needs the compressed momentum axis."""
     with pytest.raises(ValueError):
@@ -1040,6 +1069,36 @@ def test_unfold_irreducible_momenta_in_frequency_slabs_and_chunks_reproduces_the
     chunked.unfold_irreducible_momenta(grid)
     assert np.array_equal(slabs.mat, whole.mat) and np.array_equal(chunked.mat, whole.mat)
     assert not np.array_equal(whole.mat, mat)
+
+
+def _bilayer_rotated_grid(nk=(6, 6, 2)):
+    """An auto grid of two coupled p_x/p_y layers (four orbitals) whose mirrors swap and flip the orbitals."""
+    kx, ky, kz = np.meshgrid(*(2 * np.pi * np.arange(n) / n for n in nk), indexing="ij")
+    hk = np.zeros(nk + (4, 4), dtype=complex)
+    for o in (0, 2):
+        hk[..., o, o] = -2.0 * np.cos(kx) - 0.6 * np.cos(ky) - 0.3 * np.cos(kz)
+        hk[..., o + 1, o + 1] = -2.0 * np.cos(ky) - 0.6 * np.cos(kx) - 0.3 * np.cos(kz)
+        hk[..., o, o + 1] = hk[..., o + 1, o] = 0.3 * np.sin(kx) * np.sin(ky)
+    for o in (0, 1):
+        hk[..., o, o + 2] = hk[..., o + 2, o] = -0.5
+    grid = bz.KGrid(nk, [bz.KnownSymmetries.AUTO])
+    grid.specify_auto_symmetries(hk)
+    return grid
+
+
+@pytest.mark.parametrize("bilayer", [False, True])
+def test_unfold_irreducible_momenta_by_blocks_of_irreducible_momenta_reproduces_the_whole_unfold(bilayer):
+    """Blocks of irreducible momenta, each overwriting the stars of its block, give the whole unfold's bits."""
+    grid = _bilayer_rotated_grid() if bilayer else _rotated_grid((6, 6, 1))[0]
+    nb, n_k, n_irr = (4, 72, grid.nk_irr) if bilayer else (2, 36, grid.nk_irr)
+    rng = np.random.default_rng(10)
+    mat = (rng.standard_normal((n_k, nb, nb, 7)) + 1j * rng.standard_normal((n_k, nb, nb, 7))).astype(np.complex64)
+    whole = _se(mat.copy(), nk=grid.nk, has_compressed_q_dimension=True)
+    whole.unfold_irreducible_momenta(grid, frequencies=slice(2, 6))
+    blocks = _se(mat.copy(), nk=grid.nk, has_compressed_q_dimension=True)
+    for lo, hi in ((0, 3), (3, 3), (3, n_irr - 1), (n_irr - 1, n_irr)):
+        blocks.unfold_irreducible_momenta(grid, frequencies=slice(2, 6), irreducible=slice(lo, hi))
+    assert 4 < n_irr < n_k and np.array_equal(blocks.mat, whole.mat)
 
 
 def test_unfold_irreducible_momenta_rejects_an_uncompressed_momentum_axis():

@@ -5,8 +5,8 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 """
 Pure, side-effect-free estimator of the peak host-memory of the memory-sensitive DGAmore operations. Every step runs a single
-code path (the Eliashberg solver alone falls back from its in-memory to its block-distributed grid variant when a
-sector does not fit on one rank); this module estimates the peak bytes of the dominant arrays so the driver can
+code path (the Eliashberg solver alone falls back from its node-shared team solve to its node-distributed one when no
+node holds one channel's vertex windows); this module estimates the peak bytes of the dominant arrays so the driver can
 verify upfront that a run fits its nodes. Apart from the global storage precision :data:`dgamore.n_point_base.DTYPE` (the single
 source of truth for the per-element size), it pulls in no run-state from the package -- no MPI, no ``psutil``, no
 config singleton: every input is passed as an argument, which keeps the formulas unit-testable in isolation.
@@ -14,8 +14,7 @@ config singleton: every input is passed as an argument, which keeps the formulas
 All heavy quantities are backed by a single :data:`~dgamore.n_point_base.DTYPE` array, and q-points are distributed
 across MPI ranks, so per-rank arrays scale with the per-rank q-count rather than the total. Only the dominant large
 arrays of each branch are modeled; a single global ``OVERHEAD_FACTOR`` scales every estimate to absorb un-modeled
-transients (known un-modeled cost: the mixing history of ``apply_mixing_strategy``, dominated by the modeled branch
-peaks). It defaults to ``1.0`` (no extra margin); the residual headroom for OS/allocator overhead lives in the
+transients. It defaults to ``1.0`` (no extra margin); the residual headroom for OS/allocator overhead lives in the
 driver's node-memory fraction (``NODE_MEMORY_FRACTION`` in :mod:`dgamore.DGAmore`), so the two margins do not compound.
 
 The chunk budgets of the two chunked builds are sized from this estimate: the driver hands
@@ -49,6 +48,10 @@ OVERHEAD_FACTOR: float = 1.0
 # Per-rank footprint outside the modeled arrays (interpreter, numpy/scipy/MPI libraries and buffers, the DMFT input),
 # ~170 MB per rank measured on a single-band run; counted in every branch's baseline.
 RANK_BASELINE_BYTES: int = 2**28
+
+# Modules of the MiniPole fallback, which the self-energy interpolation may load after the loop on every rank
+# (~37 MiB measured per rank).
+MINI_POLE_IMPORT_BYTES: int = 64 * 2**20
 
 # Consecutive bosonic frequencies one task of the column-distributed self-energy contraction sums; the bosonic sum is
 # associated in these fixed blocks, so the chunk budget never changes the result (the rank count moves the fold).
@@ -102,6 +105,8 @@ EXACT_VRG_RECOMPUTE_COST: float = 0.02
 # Bytes of full-grid columns one round of the window bubble fills (bubble_gen.ROUND_BUFFER_BYTES); a column above it
 # runs alone
 BUBBLE_ROUND_BYTES: int = 4 * 1024**2
+# Bytes of received one-column blocks the distributed bubble hands to one deliver call (bubble_gen.DELIVER_BATCH_BYTES)
+BUBBLE_DELIVER_BYTES: int = 2 * 1024**2
 
 # Momentum groups of a channel's three-leg vertex and kernel (bits do not depend on it) and one group's blocks alive
 # beside the stage's residents: the in-place vertex's copies (measured 2.0 to 3.6), the kernel's products (3.2 to 3.6).
@@ -119,6 +124,10 @@ TEAM_MATVEC_TRANSIENT_VECTORS: int = 6
 # channel's full-BZ vertex window from the node-shared irreducible source.
 TEAM_BUILD_CHUNK_BYTES: int = 64 * 1024**2
 
+# Node-shared gap shares of one node-distributed matvec (the input, the transformed and the crossed term at the node's
+# frequencies, the transformed gap and the direct term at the node's star members).
+DISTRIBUTED_SCRATCH_VECTORS: int = 5
+
 
 # Floor and cap of the per-chunk byte budget of the chunked builds (self-energy contraction and pairing vertex):
 # the floor keeps per-chunk Python and dispatch overhead negligible, the cap bounds the transient on fat nodes.
@@ -127,6 +136,9 @@ MAX_SLICE_CHUNK_BYTES: int = 2**32
 
 # A budget at or above this value walks a build in a single chunk per rank block (upper bound of the budget search).
 MAX_CHUNK_BUDGET_BYTES: int = 2**40
+
+# Real rows per chunk of the double-precision Gram matrices and norms of the loop's accelerated mixing.
+GRAM_ROWS: int = 2**20
 
 
 @dataclass(frozen=True)
@@ -150,6 +162,8 @@ class ChunkBudgets:
     :ivar exact_vrg_per_window: Whether the exact Jacobian recomputes both channels' three-leg vertices for each window
         of its Bethe-Salpeter pass, against the factorization that solves the window's responses, instead of holding
         them between products.
+    :ivar sde_node: Whether the ranks of a node share the column work of the self-energy contraction
+        (:class:`dgamore.nonlocal_sde._ColumnSdeStream`) instead of each rank contracting its own column tasks alone.
     """
 
     sde: int = SLICE_CHUNK_BYTES
@@ -159,6 +173,7 @@ class ChunkBudgets:
     exact_window: int | None = None
     exact_vertices_per_window: bool = False
     exact_vrg_per_window: bool = False
+    sde_node: bool = True
 
 
 def dynamic_chunk_budget(total_bytes: float, node_ranks: int) -> int:
@@ -253,22 +268,6 @@ def exact_jacobian_budgets(
     return replace(shape, exact=max_chunk_budget(lambda exact: fits(replace(shape, exact=exact))))
 
 
-def solver_grid_shape(n_ranks: int, n_freq: int) -> tuple[int, int]:
-    r"""
-    Chooses the ``(rows, cols)`` block grid of the distributed Eliashberg solver: frequency rows :math:`\nu` first
-    (up to one row per frequency), then whole-divisor column blocks of the :math:`\nu'` axis, so every column block
-    has the same width. A 1x1 grid degenerates into the in-memory matvec.
-
-    :param n_ranks: Number of available MPI ranks.
-    :param n_freq: Number of fermionic frequencies ``2 niv_pp`` of the pp box.
-    :return: ``(rows, cols)`` with ``rows * cols <= n_ranks`` and ``cols`` dividing ``n_freq``.
-    """
-    rows = min(n_ranks, n_freq)
-    budget = min(n_ranks // rows, n_freq)
-    cols = max(d for d in range(1, budget + 1) if n_freq % d == 0)
-    return rows, cols
-
-
 def lanczos_ncv(n_eig: int) -> int:
     """
     Returns the Lanczos basis size ``ncv`` for ``n_eig`` requested eigenpairs, ``max(2 n_eig + 1, LANCZOS_NCV_FLOOR)``
@@ -282,40 +281,31 @@ def lanczos_ncv(n_eig: int) -> int:
 
 def lanczos_solver_bytes(
     n_bands: int, nk_tot: int, nk_irr: int, niv_pp: int, n_eig: int, n_ranks: int, overhead: float = OVERHEAD_FACTOR
-) -> tuple[float, float]:
+) -> float:
     r"""
-    Per-rank host-memory residency of the two Eliashberg solver variants, in bytes: the in-memory solve (one full-BZ
-    sector residency - the matmul-layout vertex and its build copy, the pp bubble and the ARPACK Lanczos basis) and
-    the block-distributed grid solve (this rank's vertex block plus the bubble transient, basis and gather buffer).
-    The single shared formula that both :func:`estimate_peaks` and the single-rank solve consume, so the two can
-    never drift apart; a multi-rank job's team solve is planned per node from :func:`lanczos_team_bytes` instead.
+    Host-memory residency of the single-rank Eliashberg solve, in bytes: one full-BZ sector residency (the
+    matmul-layout vertex and its build copy, the pp bubble and the ARPACK Lanczos basis) and, on a single-rank run,
+    the waiting channel's irreducible vertex. The single shared formula that both :func:`estimate_peaks` and the
+    single-rank solve consume, so the two can never drift apart; a multi-rank job's solve is planned per node from
+    :func:`lanczos_team_bytes` and :func:`lanczos_distributed_bytes` instead.
 
     :param n_bands: Number of bands :math:`B`.
     :param nk_tot: Total number of momentum points (full BZ).
     :param nk_irr: Number of momentum points in the irreducible BZ.
     :param niv_pp: Number of positive fermionic frequencies of the pp (Eliashberg) box.
     :param n_eig: Number of requested eigenpairs (sets the ARPACK basis size).
-    :param n_ranks: Number of MPI ranks (sets the solver grid of the distributed variant).
+    :param n_ranks: Number of MPI ranks (a single rank holds the waiting channel's vertex as well).
     :param overhead: Safety factor multiplied onto the raw byte counts.
-    :return: ``(per_sector_bytes, grid_per_rank_bytes)``.
+    :return: The bytes.
     """
-    scale = DTYPE_BYTES * overhead
     vpp = 2 * niv_pp
     vertex_pp_full = _two_fermion_block(nk_tot, n_bands, 1, vpp)
     chi0_pp_full = _bubble_block(nk_tot, n_bands, 1, vpp)
-    ncv = lanczos_ncv(n_eig)
-    arpack_ws = (ncv + ARPACK_EXTRA_VECTORS) * _giwk_rspace(nk_tot, n_bands, vpp)
+    arpack_ws = (lanczos_ncv(n_eig) + ARPACK_EXTRA_VECTORS) * _giwk_rspace(nk_tot, n_bands, vpp)
     per_sector = LANCZOS_VERTEX_FACTOR * vertex_pp_full + chi0_pp_full + arpack_ws
     if n_ranks == 1:
         per_sector += _two_fermion_block(nk_irr, n_bands, 1, vpp)  # the waiting channel's vertex
-    rows, cols = solver_grid_shape(n_ranks, vpp)
-    grid_share = (
-        LANCZOS_VERTEX_FACTOR * vertex_pp_full / (rows * cols)
-        + chi0_pp_full
-        + arpack_ws
-        + 2 * _giwk_rspace(nk_tot, n_bands, vpp)
-    )
-    return scale * per_sector, scale * grid_share
+    return DTYPE_BYTES * overhead * per_sector
 
 
 def column_sde_schedule(
@@ -367,17 +357,17 @@ def sde_unfold_batch(column_bytes: int, partial_bytes: int, n_columns: int) -> i
     return max(1, min(n_columns, SDE_UNFOLD_BATCH_BYTES // (column_bytes + partial_bytes)))
 
 
-def column_sde_slabs(
+def column_sde_rank_slabs(
     niw: int, niv: int, n_ranks: int, n_out: int = 1, by_frequency: bool = False, carried: bool = False
-) -> int:
+) -> np.ndarray:
     r"""
-    Returns the largest number of real-space self-energy slabs ``[nk_tot, nb, nb]`` one rank holds in the
+    Returns the number of real-space self-energy slabs ``[nk_tot, nb, nb]`` every rank holds in the
     column-distributed self-energy contraction of ``n_out`` outputs (see :func:`column_sde_schedule`): per output the
     reduced result of every owned frequency and the running sum of the one frequency another rank owns (only the first
     frequency of a rank's run can have begun on another rank), the partial buffer of every output and the contraction
     buffer of the task in flight, and the receive buffers for the other ranks' sums of its owned frequencies (one
     output at a time). With ``carried`` only the results and running sums are counted, which a contraction fed in
-    bosonic groups holds from its first group to its end.
+    bosonic groups holds from its first group to its end. A rank without tasks holds none.
 
     :param niw: Number of positive bosonic frequencies.
     :param niv: Number of positive fermionic frequencies.
@@ -385,7 +375,7 @@ def column_sde_slabs(
     :param n_out: Number of outputs.
     :param by_frequency: Whether every block holds one bosonic frequency (see :func:`column_sde_schedule`).
     :param carried: Whether to count only the slabs held across the groups.
-    :return: The slab count of the busiest rank.
+    :return: The slab count of every rank.
     """
     blocks, bounds, owner = column_sde_schedule(niw, niv, n_ranks, by_frequency)
     n_b = len(blocks)
@@ -397,7 +387,33 @@ def column_sde_slabs(
         if owner[first_v] != rank:
             held[rank] += 1  # the running sum handed to the owner
             work[owner[first_v]] += 1  # the owner's receive buffer for it
-    return int(np.max(n_out * held + (0 if carried else work)))
+    return n_out * held + (0 if carried else work)
+
+
+def column_sde_slabs(
+    niw: int,
+    niv: int,
+    n_ranks: int,
+    n_out: int = 1,
+    by_frequency: bool = False,
+    carried: bool = False,
+    rank: int | None = None,
+) -> int:
+    r"""
+    Returns the number of real-space self-energy slabs one rank holds in the column-distributed self-energy
+    contraction (see :func:`column_sde_rank_slabs`): the busiest rank's, or ``rank``'s own.
+
+    :param niw: Number of positive bosonic frequencies.
+    :param niv: Number of positive fermionic frequencies.
+    :param n_ranks: Number of MPI ranks.
+    :param n_out: Number of outputs.
+    :param by_frequency: Whether every block holds one bosonic frequency (see :func:`column_sde_schedule`).
+    :param carried: Whether to count only the slabs held across the groups.
+    :param rank: The rank, or ``None`` for the busiest rank.
+    :return: The slab count.
+    """
+    slabs = column_sde_rank_slabs(niw, niv, n_ranks, n_out, by_frequency, carried)
+    return int(np.max(slabs) if rank is None else slabs[rank])
 
 
 def column_sde_stream_bytes(
@@ -442,6 +458,33 @@ def column_sde_stream_bytes(
     work = column_sde_slabs(niw, niv, n_ranks, n_out, by_frequency=True) - carried + (batch - 1) * n_out
     columns = SDE_COLUMN_FACTOR * batch * full_column + min(SDE_CONTRACTION_CHUNK_BYTES, full_column)
     return carried * slab, per_round * column * (n_kernels + q_rank / nk_irr) + columns + work * slab
+
+
+def bubble_column_bytes(nk_tot: int, nk_irr: int, n_bands: int, n_cols: int, n_q: int) -> int:
+    r"""
+    Returns the per-rank bytes of the column work of the column-distributed bubble
+    (:meth:`~dgamore.bubble_gen.BubbleGenerator._create_generalized_chi0_q_fft_distributed`) beside its result: the
+    two factors of a column gathered orbital-major (``2 nb^2`` full-grid rows), the reversed-momentum index, one group
+    of orbital components of at most :data:`BUBBLE_ROUND_BYTES` (one component when a component is larger), the
+    irreducible rows of two rounds of columns held for the ring (a round's exchange may run behind the next round's
+    columns), the rank's own rows of a round received from it and completed to every orbital component, and the
+    staged blocks of one deliver call with their two expanded copies (three :data:`BUBBLE_DELIVER_BYTES`). The node
+    root's private copy
+    of the real-space window while it builds the window precedes all of this and is not counted.
+
+    :param nk_tot: Total number of momentum points (full BZ).
+    :param nk_irr: Number of momentum points in the irreducible BZ.
+    :param n_bands: Number of bands :math:`B`.
+    :param n_cols: Number of columns of the rank (bounds the columns of a round).
+    :param n_q: Number of the rank's irreducible momenta.
+    :return: The bytes.
+    """
+    full = DTYPE_BYTES * nk_tot
+    n_comp = n_bands**4
+    group = min(n_comp, max(1, BUBBLE_ROUND_BYTES // full))
+    round_cols = max(1, min(n_cols, BUBBLE_ROUND_BYTES // (n_comp * full)))
+    rows = (2 * nk_irr + 2 * n_q) * n_comp * round_cols
+    return 2 * n_bands**2 * full + 8 * nk_tot + group * full + DTYPE_BYTES * rows + 3 * BUBBLE_DELIVER_BYTES
 
 
 def team_build_columns(nk_tot: int, n_bands: int, npp: int) -> int:
@@ -517,6 +560,59 @@ def lanczos_team_bytes(
     )
 
 
+def lanczos_distributed_bytes(
+    n_bands: int,
+    nk_tot: int,
+    nk_irr: int,
+    niv_pp: int,
+    n_eig: int,
+    n_nodes: int,
+    n_sectors: int,
+    nk_window: int | None = None,
+    block: int = 1,
+    builders: int = 1,
+    holds_rank_zero: bool = False,
+    overhead: float = OVERHEAD_FACTOR,
+) -> float:
+    r"""
+    Node-peak host memory of the node-distributed team solve of the Eliashberg equation, in bytes, for a node with an
+    even share: one channel's window of ``nk_window`` momentum points split over ``n_nodes`` nodes, each node owning
+    the pairs :math:`(\nu, -\nu)` of a contiguous range of the ``niv_pp`` pairs. It is the larger of the window build
+    (the window share, three irreducible shares: the channel's momentum rows, its transposed frequency columns and the
+    waiting channel's momentum rows, and per builder one full-BZ column twice plus the window rows of one column it
+    sends and the ones it receives) and the solve (the window share, the waiting channel's momentum rows, the node's
+    frequency share of the pp bubble and of the Krylov basis, scratch shares and transients, and the gap-sized seeds
+    of the node root). On rank 0's node the full pp bubble it builds before the solve, or every sector's gaps it
+    collects after it, come on top.
+
+    :param n_bands: Number of bands :math:`B`.
+    :param nk_tot: Total number of momentum points (full BZ).
+    :param nk_irr: Number of momentum points in the irreducible BZ.
+    :param niv_pp: Number of positive fermionic frequencies of the pp (Eliashberg) box.
+    :param n_eig: Number of requested eigenpairs (sets the Krylov basis size).
+    :param n_nodes: Number of nodes the solve spans.
+    :param n_sectors: Number of (channel x parity) sectors whose gaps rank 0 collects.
+    :param nk_window: Number of momentum points of a channel's window; ``None`` means the full BZ.
+    :param block: Number of starting vectors of the eigensolver's block iteration (1 for the plain one).
+    :param builders: Number of a node's ranks that expand vertex columns at once while a window is built.
+    :param holds_rank_zero: Whether the node holds rank 0.
+    :param overhead: Safety factor multiplied onto the raw byte counts.
+    :return: The node-peak bytes.
+    """
+    vpp = 2 * niv_pp
+    points = nk_tot if nk_window is None else nk_window
+    share = 2 * _ceil_div(niv_pp, n_nodes) / vpp
+    gap = _giwk_rspace(nk_tot, n_bands, vpp)
+    bubble = _bubble_block(nk_tot, n_bands, 1, vpp)
+    window = _ceil_div(_two_fermion_block(points, n_bands, 1, vpp), n_nodes)
+    irr = _ceil_div(_two_fermion_block(nk_irr, n_bands, 1, vpp), n_nodes)
+    build = window + 3 * irr + builders * 2 * (nk_tot + points) * n_bands**4
+    vectors = lanczos_ncv(n_eig) + block - 1 + DISTRIBUTED_SCRATCH_VECTORS + TEAM_MATVEC_TRANSIENT_VECTORS
+    solve = window + irr + share * (bubble + vectors * gap) + (5 + block) * gap
+    rank_zero = max(bubble, (n_sectors + 1) * n_eig * gap) if holds_rank_zero else 0
+    return DTYPE_BYTES * overhead * (max(build, solve) + rank_zero)
+
+
 @dataclass(frozen=True)
 class BranchPeak:
     """
@@ -562,17 +658,52 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
-def rank_tasks(n_tasks: int, n_ranks: int, rank: int) -> int:
+def rank_tasks(n_tasks: int, n_ranks: int, rank: int, spread: bool = False) -> int:
     """
     Returns the number of tasks :class:`~dgamore.mpi_utils.MpiDistributor` gives ``rank``: an even split with the
-    excess on the highest ranks.
+    excess on the highest ranks, or with ``spread`` the larger counts spread evenly over the ranks (the split of
+    :func:`~dgamore.mpi_utils.even_bounds`).
 
     :param n_tasks: Total number of tasks (e.g. the irreducible q-points).
     :param n_ranks: Number of MPI ranks.
     :param rank: The rank.
+    :param spread: Whether the larger counts spread evenly over the ranks instead of going to the highest ranks.
     :return: The rank's task count.
     """
+    if spread:
+        return (rank + 1) * n_tasks // n_ranks - rank * n_tasks // n_ranks
     return n_tasks // n_ranks + int(rank >= n_ranks - n_tasks % n_ranks)
+
+
+def rank_counts(nk_irr: int, nk_tot: int, n_ranks: int, rank: int) -> tuple[int, int]:
+    """
+    Returns a rank's task counts as the distributors of the non-local step give them: its irreducible momenta of the
+    spread split (see :func:`~dgamore.nonlocal_sde.irreducible_momentum_distributor`) and its share of the full BZ of
+    the default split (see :func:`rank_tasks`).
+
+    :param nk_irr: Number of momentum points in the irreducible BZ.
+    :param nk_tot: Total number of momentum points (full BZ).
+    :param n_ranks: Number of MPI ranks.
+    :param rank: The rank.
+    :return: The pair ``(irreducible count, full-BZ count)``.
+    """
+    return rank_tasks(nk_irr, n_ranks, rank, spread=True), rank_tasks(nk_tot, n_ranks, rank)
+
+
+def rank_input_bytes(nk_tot: int, nk_irr: int, n_bands: int, n_orbitals: int) -> int:
+    r"""
+    Returns the bytes of the inputs every rank holds a private copy of for the whole run: from the broadcast
+    configuration the dispersion :math:`\varepsilon_{12}(\mathbf{k})` ``[nk, no, no]`` and the auto-symmetry rotations
+    of the correlated orbitals ``[nk, nb, nb]`` (both complex128) with the int64 momentum maps, and the complex128
+    k-resolved occupation of the correlated orbitals ``occ_k`` ``[nk, nb, nb]``.
+
+    :param nk_tot: Total number of momentum points (full BZ).
+    :param nk_irr: Number of momentum points in the irreducible BZ.
+    :param n_bands: Number of bands :math:`B`.
+    :param n_orbitals: Number of orbitals of the dispersion, the bands included.
+    :return: The bytes.
+    """
+    return 16 * nk_tot * (n_orbitals**2 + 2 * n_bands**2) + 33 * nk_tot + 40 * nk_irr
 
 
 def interaction_bytes(n_bands: int, nk_tot: int, overhead: float = OVERHEAD_FACTOR) -> float:
@@ -870,34 +1001,41 @@ def estimate_peaks(
     together with the per-rank persistent baseline live at that branch's peak.
 
     The returned dict maps a branch key to a :class:`BranchPeak`. Every branch is single-path with identical off
-    and on slots, except ``"lanczos"``, which carries the in-memory solve in its off slots and the block-distributed
-    grid fallback in its on slots. ``"fq"`` and ``"lanczos"`` are present only when ``with_eliashberg`` is True,
-    ``"exact_jacobian"`` only when ``with_exact_jacobian`` is. The distributed terms take ``rank``'s irreducible and
-    full-BZ task counts (:func:`rank_tasks`; the busiest rank's when ``rank`` is None) and depend on ``rank`` through
-    nothing else, so ranks with equal counts share one estimate; the self-energy contraction's column schedule (its
-    round cap and real-space slabs, in ``sde`` and ``exact_jacobian``) stays the busiest rank's. :func:`node_total`
+    and on slots, except ``"lanczos"``, which carries the single-rank solve in its off slots and rank 0's share of a
+    multi-rank solve (the gathered pairing vertices, the DGA Green's function) in its on slots; the multi-rank solve
+    itself is checked per node from :func:`lanczos_team_bytes` and :func:`lanczos_distributed_bytes`. ``"fq"`` and
+    ``"lanczos"`` are present only when ``with_eliashberg`` is True, ``"exact_jacobian"`` only when
+    ``with_exact_jacobian`` is. The distributed terms take ``rank``'s irreducible and full-BZ task counts
+    (:func:`rank_counts`; the busiest rank's when ``rank`` is None) and, in ``sde``, its column tasks and real-space
+    slabs of the self-energy contraction (:func:`column_sde_schedule`, :func:`column_sde_rank_slabs`; a rank without
+    column tasks holds no column, round or slab), and depend on ``rank`` through nothing else, so ranks with equal
+    counts share one estimate; in ``exact_jacobian`` the column schedule stays the busiest rank's. :func:`node_total`
     assembles a node's total from the estimates of its ranks.
 
     The per-branch baselines track the actual giwk window of ``nonlocal_sde.calculate_self_energy_q``: the bubble
-    (``chi0q``) runs on the ``niv_cut`` window, after which giwk is cut (and re-shared) to the
-    ``niv_core + niw_core`` window for the kernel/SDE section (``chiq_aux``, ``sde``). The loop's self-energy stays
-    node-shared at the ``niv_cut`` window through the whole proposal, and rank 0 holds the accelerated-mixing history
-    (``mixing_pairs`` core-box (iterate, proposal) pairs) in the single-rank slots of all three branches. The ``sde``
+    (``chi0q``) reads the ``niv_cut`` window, which is cut (and re-shared) to the ``niv_core + niw_core`` window of
+    the kernel/SDE section (``chiq_aux``, ``sde``) as soon as the bubble has read it for the last time, before its
+    columns (the one-rank estimate keeps the ``niv_cut`` window, an upper bound). The loop's self-energy stays
+    node-shared at the ``niv_cut`` window through the whole proposal, and every rank holds the accelerated-mixing
+    history (``mixing_pairs`` core-box (iterate, proposal) pairs) of the momentum rows it mixes in the distributed
+    slots of all three branches, rank 0 every row in the single-rank slots with the tracker. The ``sde``
     baseline additionally holds the R-space Green's-function copy, which is node-shared like giwk itself when the
-    shared window is active (its ``giwk_shareable`` covers the node-shared arrays). The Eliashberg branches run after
-    the self-consistency loop with ``sigma_dga`` freed and ``giwk_dga`` on rank 0 only, so their baseline is the
+    shared window is active, and the node's one batch of full-BZ kernel columns with the partial sums of its tasks,
+    which the node's ranks share by real-space rows (its ``giwk_shareable`` covers the node-shared arrays). The
+    Eliashberg branches run after the self-consistency loop with ``sigma_dga`` freed and ``giwk_dga`` on rank 0 only,
+    so their baseline is the
     per-rank footprint, plus for ``fq`` the node-shared local vertex the Bethe-Salpeter slices are built from (its
     ``giwk_shareable``, absent with ``bare_vertex``); the surviving copy is counted in their single-rank slots. The
-    ``sigma_loop`` branch is the loop's mixing step after the SDE, which runs on rank 0 alone: the history plus the
-    proposal and the rebuilt previous iterate with the three linear-mixing copies or the accelerated least-squares
-    solve, which dominate the proposal tail and the hand-over; the other node roots hold at most their received array
-    and window then, their ``remote_single``. The ``mu_update`` branch is the
-    chemical-potential update after it: every rank holds two complex128 Green's-function arrays on its share of the
-    full-BZ momenta, next to rank 0's history and previous iterate and the node's new window (the window alone on a
-    node without rank 0). The ``energies`` branch
+    ``sigma_loop`` branch is the loop's step from the proposal to the next iterate: every node holds the windows of the
+    previous and of the next iterate, the core rows of the proposal and its shell offset, every rank the history of
+    its rows and the linear-mixing copies or the accelerated step's copies on them, rank 0 all of these over every
+    row with the tracker. The ``mu_update`` branch is the chemical-potential update after it: every rank holds two
+    complex128 Green's-function arrays on its share of the full-BZ momenta, next to the history and the node's window
+    of the iterate. The ``energies`` branch
     is the occupation and energy step after it: every rank holds its share's self-energy and Green's function on the
     DMFT box and the largest of the Dyson, occupation and energy-tail transients of :mod:`dgamore.greens_function`
-    (bounded by its chunk sizes), next to the same rank-0 residents. The ``occupation`` branch is the start of the
+    (bounded by its chunk sizes), next to the same residents and rank 0's whole-grid moment-fit window. The
+    ``occupation`` branch is the start of the
     non-local routine: every rank's fresh-start occupation on its share of the DMFT box (on a warm start its mu
     search), with ``do_spectrum_dmft`` rank 0's DMFT lattice Green's function of the whole grid on that box (built
     there, and reloaded with its core-box cut after the loop next to ``giwk_dga`` and ``sigma_dga``), and on a warm
@@ -908,9 +1046,11 @@ def estimate_peaks(
     larger of the second channel's inversions (three core blocks next to the first channel's outputs and its own
     generalized susceptibility) and its full vertex (next to both channels' irreducible vertices and generalized
     susceptibilities and the first full vertex), plus the orbital symmetrization's copy of one full vertex with
-    ``symmetrize_orbitals``. Every branch's baseline includes the per-rank :data:`RANK_BASELINE_BYTES`, and every
+    ``symmetrize_orbitals``. Every branch's baseline includes the per-rank :data:`RANK_BASELINE_BYTES` and the inputs
+    every rank copies (:func:`rank_input_bytes`), and every
     single-rank slot the full-grid non-local interaction (:func:`interaction_bytes`) rank 0 holds from the driver's
-    build to the end of the Eliashberg solve.
+    build to the end of the Eliashberg solve, those of the loop's branches also its two real-space transforms of the
+    Hartree-Fock terms.
 
     :param n_bands: Number of bands :math:`B`.
     :param nk_tot: Total number of momentum points (full BZ).
@@ -925,22 +1065,24 @@ def estimate_peaks(
     :param niv_pp: Number of positive fermionic frequencies of the pp (Eliashberg) box.
     :param n_ranks: Number of MPI ranks the q-points are distributed over.
     :param with_eliashberg: Whether the Eliashberg step runs (adds the ``"fq"`` and ``"lanczos"`` branches).
-    :param rank: The rank whose irreducible and full-BZ task counts (see :func:`rank_tasks`) the distributed terms
-        take, or ``None`` for the busiest rank's; the column schedule of the self-energy contraction stays the busiest
-        rank's.
+    :param rank: The rank whose irreducible (spread) and full-BZ task counts (see :func:`rank_counts`) the distributed
+        terms take, or ``None`` for the busiest rank's; the column schedule of the self-energy contraction stays the
+        busiest rank's.
     :param save_pairing_vertex: Whether both pp pairing vertices are gathered on one rank for saving
         (``config.eliashberg.save_pairing_vertex``); a single-rank peak of the ``lanczos`` branch.
     :param save_fq: Whether the full ladder vertex is streamed to disk (``config.eliashberg.save_fq``), which
         inverts every whole Bethe-Salpeter slice instead of its pp band.
     :param n_eig: Number of requested eigenpairs (``config.eliashberg.n_eig``); sets the ARPACK Lanczos basis size
         ``ncv`` of :func:`lanczos_ncv` held per solving rank.
-    :param mixing_pairs: Number of (iterate, proposal) pairs rank 0's accelerated-mixing history reaches, i.e.
+    :param mixing_pairs: Number of (iterate, proposal) pairs the accelerated-mixing history reaches, i.e.
         ``min(mixing_history_length + 1, max_iter)`` for Pulay or Anderson mixing and 0 for linear mixing; the
         least-squares solve is modeled over ``mixing_pairs - 1`` secant columns, of the tracker's sector length when
         the tracker runs.
     :param niv_interp: Number of positive fermionic frequencies of the final self-energy interpolation's target grid
         (``config.self_energy_interpolation.niv_target``), or 0 when the run does not interpolate (no
-        ``"sigma_interp"`` branch).
+        ``"sigma_interp"`` branch). The interpolation may load MiniPole on every rank, so when it runs
+        :data:`MINI_POLE_IMPORT_BYTES` joins the baseline of ``sigma_interp``, ``fq``, ``lanczos`` and, with
+        ``do_spectrum_dmft``, ``occupation``, whose DMFT lattice Green's function rank 0 reloads after the loop.
     :param symmetrize_orbitals: Whether the local vertices are symmetrized over orbitals
         (``config.dmft.symmetrize_orbitals`` is not empty), which copies one full vertex at a time.
     :param do_spectrum_dmft: Whether the DMFT spectrum is continued (``config.ana_cont.do_spectrum_dmft``), for which
@@ -949,8 +1091,8 @@ def estimate_peaks(
         (``config.self_consistency.previous_sc_path`` is set), which rank 0 extends onto the DMFT box on the whole
         grid while every rank re-solves mu on its momenta.
     :param previous_proposal: Whether the loop runs more than one iteration (``config.self_consistency.max_iter`` above
-        one), so rank 0 keeps the positive core window of the previous proposal for the convergence test; it joins
-        the single-rank slots of every branch that holds the mixing history.
+        one), so every rank keeps its rows of the positive core window of the previous proposal for the convergence
+        test (rank 0 every row with the tracker); it joins the mixing history in every branch that holds it.
     :param with_jacobian_tracker: Whether the tracker runs (``config.stabilization.use_jacobian_stabilization``): its
         residents (:func:`jacobian_tracker_bytes`) join the single-rank slots of the loop's branches (``chi0q``,
         ``chiq_aux``, ``sde``, ``sigma_loop``, ``mu_update``, ``energies``), of ``exact_jacobian`` (its in-loop check)
@@ -985,8 +1127,10 @@ def estimate_peaks(
     niv_sde = niv_core + niw_core  # giwk window through the kernel/SDE section (post-bubble cut/re-share)
 
     # the rank's irreducible-BZ q-count and full-BZ momentum share
-    qi = _ceil_div(nk_irr, n_ranks) if rank is None else rank_tasks(nk_irr, n_ranks, rank)
-    share_k = _ceil_div(nk_tot, n_ranks) if rank is None else rank_tasks(nk_tot, n_ranks, rank)
+    if rank is None:
+        qi, share_k = _ceil_div(nk_irr, n_ranks), _ceil_div(nk_tot, n_ranks)
+    else:
+        qi, share_k = rank_counts(nk_irr, nk_tot, n_ranks, rank)
 
     scale = DTYPE_BYTES * overhead
 
@@ -1001,19 +1145,28 @@ def estimate_peaks(
     baseline_kernel_section = giwk_sde + sigma_shared
     baseline_sde = baseline_kernel_section + giwk_sde  # + the (node-shareable) R-space Green's-function copy
     giwk_dga_single = scale * sigma_full  # the single surviving giwk_dga copy
-    # interpreter, libraries and buffers of every rank (rank 0's full-grid interaction joins the single slots below)
-    rank_base = overhead * RANK_BASELINE_BYTES
-    # rank 0's accelerated-mixing history of core-box (iterate, proposal) pairs, the tracker's real sector vectors
-    # when it runs, and the tracker's residents, alive through every loop branch; the history is freed after the loop
+    # interpreter, libraries, buffers and the replicated inputs of every rank (rank 0's full-grid interaction joins
+    # the single slots below)
+    rank_base = overhead * (RANK_BASELINE_BYTES + rank_input_bytes(nk_tot, nk_irr, nb, n_orb))
+    # the MiniPole fallback's modules, which the interpolation may load on every rank for the rest of the run
+    mini_pole = overhead * MINI_POLE_IMPORT_BYTES if niv_interp else 0.0
+    # the accelerated-mixing history of core-box (iterate, proposal) pairs and the previous proposal's positive core
+    # window (which the convergence test compares the next proposal with), alive through every loop branch and freed
+    # after it: every rank holds the momentum rows it mixes, rank 0 every row with the tracker, which keeps its
+    # pairs as real sector vectors beside its own residents
     tracker_resident, tracker_transient = (
         jacobian_tracker_bytes(nk_irr, nb, vc, with_exact_jacobian) if with_jacobian_tracker else (0, 0)
     )
     sector_rows = nk_irr * nb**2 * vc
-    history_entry = overhead * (DTYPE_BYTES // 2) * sector_rows if with_jacobian_tracker else scale * sigma_core
-    mixing_history = 2 * mixing_pairs * history_entry + overhead * tracker_resident
-    if previous_proposal:
-        # the previous proposal's positive core window, which the convergence test compares the next proposal with
-        mixing_history += scale * sigma_core / 2
+    row_core = _giwk_rspace(share_k, nb, vc)  # this rank's mixed rows of a core window
+    previous = 0.5 if previous_proposal else 0.0
+    # rank 0 also keeps the real-space interactions of both Hartree-Fock terms through the loop
+    history_single, history_rows = 2 * interaction_bytes(nb, nk_tot, overhead), 0.0
+    if with_jacobian_tracker:
+        history_single += 2 * mixing_pairs * overhead * (DTYPE_BYTES // 2) * sector_rows + overhead * tracker_resident
+        history_single += previous * scale * sigma_core
+    else:
+        history_rows = (2 * mixing_pairs + previous) * scale * row_core
     # the reflected proposal and the raw residual the stabilized damped step and the guard of an accelerated step read
     tracker_step = scale * 2 * sigma_core if with_jacobian_tracker else 0.0
 
@@ -1033,18 +1186,22 @@ def estimate_peaks(
             + _giwk_rspace(nk_tot, nb, vf)
         )
     else:
-        g_r_windows = scale * 2 * _giwk_rspace(nk_tot, nb, gf_window_bubble)  # node-shared like giwk itself
-        chi0q_baseline = baseline_bubble + g_r_windows
-        chi0q_shareable = giwk_bubble + sigma_shared + g_r_windows
-        chi0q_off_distributed = scale * 1.5 * _bubble_block(qi, nb, wp, vf)
+        g_r_windows = scale * _giwk_rspace(nk_tot, nb, gf_window_bubble)  # node-shared like giwk itself
+        # the columns read only the real-space window, giwk is cut to the SDE box before them
+        chi0q_baseline = giwk_sde + sigma_shared + g_r_windows
+        chi0q_shareable = chi0q_baseline
+        n_cols = _ceil_div(wp * vf, n_ranks)
+        chi0q_off_distributed = scale * _bubble_block(qi, nb, wp, vf) + overhead * bubble_column_bytes(
+            nk_tot, nk_irr, nb, n_cols, qi
+        )
         chi0q_off_single = 0.0
     peaks["chi0q"] = BranchPeak(
         baseline=chi0q_baseline + rank_base,
         giwk_shareable=chi0q_shareable,
-        off_distributed=chi0q_off_distributed,
-        off_single=chi0q_off_single + mixing_history,
-        on_distributed=chi0q_off_distributed,
-        on_single=chi0q_off_single + mixing_history,
+        off_distributed=chi0q_off_distributed + history_rows,
+        off_single=chi0q_off_single + history_single,
+        on_distributed=chi0q_off_distributed + history_rows,
+        on_single=chi0q_off_single + history_single,
         remote_single=0.0,
     )
 
@@ -1052,10 +1209,14 @@ def estimate_peaks(
     # attachment beside the cut, the aux sum's solve, or the grouped in-place three-leg vertex and kernel.
     core_block = _bubble_block(qi, nb, wp, vc)
     group_block = _bubble_block(kernel_momentum_group(qi), nb, wp, vc)
+    # the cut and the dc contraction beside the full-box bubble: several ranks take them one bosonic frequency at a
+    # time and free it (see nonlocal_sde._bubble_box_parts), one rank holds the bubble whole
+    box_parts = 2 * (core_block if n_ranks == 1 else _bubble_block(qi, nb, 1, vc))
     chiq_aux_distributed = max(
-        scale * (_bubble_block(qi, nb, wp, vf) + 2 * core_block),
+        scale * (_bubble_block(qi, nb, wp, vf) + box_parts),
         scale * 4 * core_block,
-        scale * 3 * core_block + overhead * _chiq_aux_transient(nb * nb * vc, nb),
+        # the aux sum's solve: the node windows of shared Bethe-Salpeter slices hold one more block per rank
+        scale * 4 * core_block + overhead * _chiq_aux_transient(nb * nb * vc, nb),
         scale * (3 * core_block + KERNEL_GROUP_TRANSIENT * group_block),
     )
     # One node-shared local vertex resident: f_dc_loc is niv_full x niv_core (summed index on the full box), the
@@ -1064,32 +1225,51 @@ def estimate_peaks(
     peaks["chiq_aux"] = BranchPeak(
         baseline=baseline_kernel_section + local_vertex_shared + rank_base,
         giwk_shareable=giwk_sde + sigma_shared + local_vertex_shared,
-        off_distributed=chiq_aux_distributed,
-        off_single=mixing_history,
-        on_distributed=chiq_aux_distributed,
-        on_single=mixing_history,
+        off_distributed=chiq_aux_distributed + history_rows,
+        off_single=history_single,
+        on_distributed=chiq_aux_distributed + history_rows,
+        on_single=history_single,
         remote_single=0.0,
     )
 
     # Column-distributed contraction: the irr kernel, one round of irr columns (whole tasks) with the ring's send
     # copy, an unfold batch of full-BZ columns with the operand chunk and partials, the busiest rank's real-space slabs.
+    # the rank's own column tasks (the busiest rank's without a rank): a rank without tasks holds no column, round or
+    # slab, but sends its rows of the other ranks' rounds
     _, sde_bounds, _ = column_sde_schedule(niw_core, niv_core, n_ranks)
+    sde_load = np.diff(sde_bounds)
     sde_task = DTYPE_BYTES * _bubble_block(nk_irr, nb, 1, SDE_W_BLOCK)
-    sde_tasks = min(max(1, chunk_budgets.sde // sde_task), int(np.max(np.diff(sde_bounds))))
-    sde_round = sde_tasks * sde_task
+    sde_tasks_most = min(max(1, chunk_budgets.sde // sde_task), int(np.max(sde_load)))
+    sde_tasks = sde_tasks_most if rank is None else min(sde_tasks_most, int(sde_load[rank]))
     sde_column = DTYPE_BYTES * _bubble_block(nk_tot, nb, 1, 1)
     sde_slab = DTYPE_BYTES * _giwk_rspace(nk_tot, nb, 1)
-    sde_batch = sde_unfold_batch(sde_column, sde_slab, sde_tasks * SDE_W_BLOCK)
-    sde_columns = SDE_COLUMN_FACTOR * sde_batch * sde_column + min(SDE_CONTRACTION_CHUNK_BYTES, sde_column)
-    sde_slabs = (column_sde_slabs(niw_core, niv_core, n_ranks) + sde_batch - 1) * sde_slab
+
+    def column_work(n_tasks: int) -> float:
+        """A batch of full-BZ columns of ``n_tasks`` tasks per round with the operand chunk, the batch's partial sums
+        and the contraction buffer."""
+        batch = sde_unfold_batch(sde_column, sde_slab, n_tasks * SDE_W_BLOCK)
+        return overhead * (
+            SDE_COLUMN_FACTOR * batch * sde_column
+            + min(SDE_CONTRACTION_CHUNK_BYTES, sde_column)
+            + (batch + 1) * sde_slab
+        )
+
+    # the node's ranks share one batch of the busiest rank and, split by rows, its sums; alone each rank holds its own
+    sde_node_work = column_work(sde_tasks_most) if chunk_budgets.sde_node else 0.0
+    # every rank's results, running sums and receive buffers, without the task buffers of its column work
+    held = column_sde_rank_slabs(niw_core, niv_core, n_ranks) - 2 * (sde_load > 0)
+    sde_slabs = (np.max(held) if rank is None else held[rank]) * sde_slab
     sde_distributed = scale * _bubble_block(qi, nb, wp, vc) + overhead * (
-        sde_round * (1 + qi / nk_irr) + sde_columns + sde_slabs
+        (sde_tasks + sde_tasks_most * qi / nk_irr) * sde_task + sde_slabs
     )
+    if not chunk_budgets.sde_node and sde_tasks > 0:
+        sde_distributed += column_work(sde_tasks)
     # rank-0 single: the sigma finalize buffers
-    sde_single = scale * 2 * sigma_core + mixing_history
+    sde_single = scale * 2 * sigma_core + history_single
+    sde_distributed += history_rows
     peaks["sde"] = BranchPeak(
-        baseline=baseline_sde + rank_base,
-        giwk_shareable=2 * giwk_sde + sigma_shared,
+        baseline=baseline_sde + sde_node_work + rank_base,
+        giwk_shareable=2 * giwk_sde + sigma_shared + sde_node_work,
         off_distributed=sde_distributed,
         off_single=sde_single,
         on_distributed=sde_distributed,
@@ -1122,7 +1302,7 @@ def estimate_peaks(
             # the local vertex the slices are built from, node-shared (counted once per node)
             local_vertex_fq = scale * _two_fermion_block(1, nb, wp, vc)
         peaks["fq"] = BranchPeak(
-            baseline=rank_base + local_vertex_fq,
+            baseline=rank_base + local_vertex_fq + mini_pole,
             giwk_shareable=local_vertex_fq,
             off_distributed=fq_distributed,
             off_single=giwk_dga_single,
@@ -1131,70 +1311,82 @@ def estimate_peaks(
             remote_single=0.0,
         )
 
-        # In-memory Lanczos solver in the off slots, block-distributed grid fallback in the on slots; both from the
-        # one shared formula the solver dispatch reads as well (see lanczos_solver_bytes).
-        solver_single, solver_grid = lanczos_solver_bytes(nb, nk_tot, nk_irr, niv_pp, n_eig, n_ranks, overhead)
+        # The single-rank Lanczos solve in the off slots (from the one shared formula the solver dispatch reads as
+        # well, see lanczos_solver_bytes), rank 0's share of a multi-rank solve in the on slots.
+        solver_single = lanczos_solver_bytes(nb, nk_tot, nk_irr, niv_pp, n_eig, n_ranks, overhead)
         pairing_gather = scale * (2 * _two_fermion_block(nk_irr, nb, 1, vpp)) if save_pairing_vertex else 0.0
         peaks["lanczos"] = BranchPeak(
-            baseline=rank_base,
+            baseline=rank_base + mini_pole,
             giwk_shareable=0.0,
             off_distributed=0.0,
             off_single=max(solver_single, pairing_gather) + giwk_dga_single,
-            on_distributed=solver_grid,
+            on_distributed=0.0,
             on_single=pairing_gather + giwk_dga_single,
             remote_single=0.0,
         )
 
-    # Rank-0 loop step (verify-only): the history + two niv_cut Sigmas with 3 linear-mix copies or the accelerated
-    # solve (measured: 9 m + 10 complex64 core copies bound Anderson and Pulay in both precisions).
+    # Loop step from the proposal to the next iterate (verify-only): every node holds the previous iterate's window and
+    # the new one, the core rows and the shell offset (complex128); every rank the history of its rows and the copies
+    # of the step on them (measured: 2 m + 8 real rows of 4 bytes and the float64 Gram block of one chunk of rows
+    # bound the steps of Pulay and Anderson), rank 0 every row with the tracker, beside the tracker's secant step and
+    # its reflected proposal and raw residual
     solve_width = mixing_pairs - 1
-    # the solve's copies at 4 B per real row: two rows per complex core entry, or the sector rows with the tracker
-    solve_rows = sector_rows if with_jacobian_tracker else 2 * sigma_core
-    mixing_solve = overhead * 4 * solve_rows * (9 * solve_width + 10) if solve_width > 0 else 0.0
-    sigma_loop_single = mixing_history + scale * 2 * sigma_full + max(scale * 3 * sigma_full, mixing_solve)
-    # the Jacobian tracker's secant step when it outgrows the mixing step, beside its reflected proposal and residual
-    tracker_loop = mixing_history + scale * 2 * sigma_full + overhead * tracker_transient
-    sigma_loop_single = max(sigma_loop_single, tracker_loop) + tracker_step
+
+    def solve_bytes(rows: float) -> float:
+        """The accelerated step's copies over ``rows`` real rows (two per complex core entry, or sector rows) and the
+        float64 Gram block of its ``solve_width`` columns and right-hand side over one chunk of them."""
+        if solve_width <= 0:
+            return 0.0
+        return overhead * (4 * rows * (2 * solve_width + 8) + 8 * min(GRAM_ROWS, rows) * (solve_width + 1))
+
+    loop_windows = 2 * sigma_shared + scale * sigma_core + overhead * 16 * nk_tot * nb**2
+    loop_distributed = history_rows + max(scale * 3 * row_core, solve_bytes(2 * row_core))
+    loop_single = history_single
+    if with_jacobian_tracker:
+        loop_distributed = 0.0
+        loop_single = history_single + tracker_step
+        loop_single += max(scale * 3 * sigma_core, solve_bytes(sector_rows), overhead * tracker_transient)
     peaks["sigma_loop"] = BranchPeak(
-        baseline=rank_base,
-        giwk_shareable=0.0,
-        off_distributed=0.0,
-        off_single=sigma_loop_single,
-        on_distributed=0.0,
-        on_single=sigma_loop_single,
-        remote_single=2 * sigma_shared,
+        baseline=loop_windows + rank_base,
+        giwk_shareable=loop_windows,
+        off_distributed=loop_distributed,
+        off_single=loop_single,
+        on_distributed=loop_distributed,
+        on_single=loop_single,
+        remote_single=0.0,
     )
 
     # Chemical-potential update (verify-only): every rank's two complex128 Green's-function arrays on its share of the
-    # full-BZ momenta, next to rank 0's history, previous iterate and the node's window.
-    mu_update_distributed = overhead * 16 * 2 * _giwk_rspace(share_k, n_orb, 2 * niv_cut)
-    mu_update_single = mixing_history + scale * 2 * sigma_full
+    # full-BZ momenta, next to the history and the node's window of the iterate.
+    mu_update_distributed = overhead * 16 * 2 * _giwk_rspace(share_k, n_orb, 2 * niv_cut) + history_rows
     peaks["mu_update"] = BranchPeak(
-        baseline=rank_base,
-        giwk_shareable=0.0,
+        baseline=sigma_shared + rank_base,
+        giwk_shareable=sigma_shared,
         off_distributed=mu_update_distributed,
-        off_single=mu_update_single,
+        off_single=history_single,
         on_distributed=mu_update_distributed,
-        on_single=mu_update_single,
-        remote_single=sigma_shared,
+        on_single=history_single,
+        remote_single=0.0,
     )
 
     # Occupation and energy step of every iteration (verify-only): every rank's self-energy and Green's function on its
-    # momenta of the DMFT box and the largest of the Dyson, occupation and energy-tail transients, next to rank 0's
-    # history, previous iterate and the node's window and its whole-grid moment-fit window (top fifth of the box).
+    # momenta of the DMFT box and the largest of the Dyson, occupation and energy-tail transients, next to the history
+    # and the node's window of the iterate, and on rank 0 its whole-grid moment-fit window (top fifth of the box).
     dmft_box = 2 * niv_dmft
-    energies_distributed = scale * 2 * _giwk_rspace(share_k, nb, dmft_box) + overhead * max(
-        _green_function_transients(share_k, n_orb, dmft_box)
+    energies_distributed = (
+        scale * 2 * _giwk_rspace(share_k, nb, dmft_box)
+        + overhead * max(_green_function_transients(share_k, n_orb, dmft_box))
+        + history_rows
     )
-    energies_single = mu_update_single + scale * _giwk_rspace(nk_tot, nb, max(int(0.2 * niv_dmft), 4))
+    energies_single = history_single + scale * _giwk_rspace(nk_tot, nb, max(int(0.2 * niv_dmft), 4))
     peaks["energies"] = BranchPeak(
-        baseline=rank_base,
-        giwk_shareable=0.0,
+        baseline=sigma_shared + rank_base,
+        giwk_shareable=sigma_shared,
         off_distributed=energies_distributed,
         off_single=energies_single,
         on_distributed=energies_distributed,
         on_single=energies_single,
-        remote_single=sigma_shared,
+        remote_single=0.0,
     )
 
     # Start of the non-local routine (verify-only): every rank's fresh-start occupation on its momenta of the DMFT box,
@@ -1214,7 +1406,7 @@ def estimate_peaks(
     warm_single = scale * (whole_box + sigma_full) + overhead * _green_function_transients(nk_tot, n_orb, dmft_box)[1]
     occupation_single = max(spectrum_single if do_spectrum_dmft else 0.0, warm_single if warm_start else 0.0)
     peaks["occupation"] = BranchPeak(
-        baseline=rank_base,
+        baseline=rank_base + (mini_pole if do_spectrum_dmft else 0.0),
         giwk_shareable=0.0,
         off_distributed=occupation_distributed,
         off_single=occupation_single,
@@ -1268,12 +1460,12 @@ def estimate_peaks(
         arpack = (2 * (EXACT_JACOBIAN_NCV + 1) + 3 * EXACT_JACOBIAN_MODES + 11) * vector
         # a product's unfolded window change or its finalize (two core windows each), the real-space u_loc + V(q)
         product = scale * (2 * sigma_core + nk_tot * nb**4)
-        # an in-loop check meets the history, the whole tracker and rank 0's private proposal; the end-of-rung solve
-        # comes after the loop, which drops the history and what the tracker reads only in the loop
+        # an in-loop check meets the history, the whole tracker and the core window of the proposal on rank 0's node;
+        # the end-of-rung solve comes after the loop, which drops the history and what the tracker reads only in it
         tracker_after_loop = (
             jacobian_tracker_bytes(nk_irr, nb, vc, True, after_loop=True)[0] if with_jacobian_tracker else 0
         )
-        in_loop = mixing_history + scale * sigma_full + overhead * check
+        in_loop = history_single + scale * sigma_core + overhead * check
         exact_single = product + max(in_loop, overhead * (tracker_after_loop + arpack))
         # another node's root holds a product's unfolding (two core windows) or its unfolded change beside one momentum
         # chunk of its dG build, which never exceeds the loop-box Green's function
@@ -1306,7 +1498,7 @@ def estimate_peaks(
             )
         )
         peaks["sigma_interp"] = BranchPeak(
-            baseline=rank_base,
+            baseline=rank_base + mini_pole,
             giwk_shareable=0.0,
             off_distributed=interp_distributed,
             off_single=interp_single,
