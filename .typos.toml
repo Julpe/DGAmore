@@ -14,6 +14,8 @@ extend-ignore-words-re = [
     "mis",
     # the gap's sector parity T O_U (frequency flip times orbital exchange), labeled TOU in gap_parity.txt
     "TOU",
+    # the node-distributed Eliashberg matvec's direct-term output array, beside its input gin
+    "dout",
     # numpy exposes the array flag as ``arr.flags.writeable``; not a typo.
     "writeable"
 ]

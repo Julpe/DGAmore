@@ -18,7 +18,6 @@ import warnings
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator, interp1d
-from mini_pole import MiniPole
 
 from dgamore import symmetry_reduction
 from dgamore.matsubara_frequencies import MFHelper
@@ -319,7 +318,7 @@ class SelfEnergy(TwoPoint):
             beta=self._beta,
         )
 
-    def symmetrize_time_reversal(self, frequencies: slice | None = None) -> float:
+    def symmetrize_time_reversal(self, frequencies: slice | None = None, momenta: slice | None = None) -> float:
         r"""
         Enforces the time-reversal relation of real hoppings, :math:`\Sigma^{(\mathbf{k},\nu)}_{12} =
         \Sigma^{(-\mathbf{k},\nu)}_{21}`, in place by averaging every momentum with its time-reversed partner,
@@ -330,11 +329,14 @@ class SelfEnergy(TwoPoint):
         The average keeps the Matsubara Hermiticity and the causality of the input. It runs over chunks of the
         fermionic axis whose transient (the gathered partners and their average) stays below ``_TR_CHUNK_BYTES``.
         Every frequency is averaged on its own, so contiguous ranges of ``frequencies`` averaged one by one hold the
-        bits of the whole average.
+        bits of the whole average. With ``momenta`` only the pairs :math:`(\mathbf{k}, -\mathbf{k})` whose smaller
+        flat index lies in that range are averaged, both partners at once; the partner's average is the transpose of
+        the other one with the bits of the whole average, so disjoint ranges covering the grid give its bits too.
 
         :param frequencies: The contiguous range of frequency indices to average, or ``None`` for all.
+        :param momenta: The contiguous range of flat momentum indices whose pairs are averaged, or ``None`` for all.
         :return: The largest change of an element, i.e. half the largest time-reversal asymmetry of the input (of the
-            averaged frequencies).
+            averaged frequencies and pairs).
         :raises ValueError: If the momentum axis is not compressed.
         """
         if not self.has_compressed_q_dimension:
@@ -342,6 +344,10 @@ class SelfEnergy(TwoPoint):
         grid = np.array(self.nq)
         k = np.array(np.unravel_index(np.arange(grid.prod()), self.nq))
         minus = np.ravel_multi_index(tuple(-k % grid[:, None]), self.nq)
+        if momenta is not None:
+            ks = np.arange(*momenta.indices(len(minus)))
+            ks = ks[ks <= minus[ks]]
+            partners = minus[ks]
 
         mat = self.mat
         width = max(1, int(self._TR_CHUNK_BYTES // (2 * mat[..., :1].nbytes)))
@@ -349,14 +355,28 @@ class SelfEnergy(TwoPoint):
         removed = 0.0
         for start in range(lo, hi, width):
             block = mat[..., start : min(start + width, hi)]
-            average = block[minus].swapaxes(1, 2)
-            average += block
+            if momenta is None:
+                average = block[minus].swapaxes(1, 2)
+                average += block
+                average *= 0.5
+                removed = max(removed, float(np.abs(average - block).max()))
+                block[...] = average
+                continue
+            average = block[partners].swapaxes(1, 2)
+            average += block[ks]
             average *= 0.5
-            removed = max(removed, float(np.abs(average - block).max()))
-            block[...] = average
+            change = max(
+                np.abs(average - block[ks]).max(initial=0.0),
+                np.abs(average.swapaxes(1, 2) - block[partners]).max(initial=0.0),
+            )
+            removed = max(removed, float(change))
+            block[ks] = average
+            block[partners] = average.swapaxes(1, 2)
         return removed
 
-    def unfold_irreducible_momenta(self, k_grid: "KGrid", frequencies: slice | None = None) -> None:
+    def unfold_irreducible_momenta(
+        self, k_grid: "KGrid", frequencies: slice | None = None, irreducible: slice | None = None
+    ) -> None:
         r"""
         Enforces the point group of the grid (see :meth:`~dgamore.brillouin_zone.KGrid.auto_point_group`) in place by
         overwriting every momentum with the image of its irreducible representative, averaged over the elements that
@@ -366,23 +386,37 @@ class SelfEnergy(TwoPoint):
         permute the orbitals and flip their signs leave no rounding behind. It runs over chunks of the fermionic axis
         whose transient (the irreducible rows and their unfold in double precision) stays below ``_TR_CHUNK_BYTES``.
         Every frequency is unfolded on its own, so contiguous ranges of ``frequencies`` unfolded one by one hold the
-        bits of the whole unfold.
+        bits of the whole unfold. With ``irreducible`` only the stars of those irreducible momenta are overwritten,
+        each from its own representative, so disjoint ranges covering the irreducible momenta give the whole unfold's
+        bits too.
 
         :param k_grid: The momentum grid carrying the irreducible momenta, their stars and the point group.
         :param frequencies: The contiguous range of frequency indices to unfold, or ``None`` for all.
+        :param irreducible: The contiguous range of irreducible momenta (positions in the irreducible list) whose stars
+            are overwritten, or ``None`` for all.
         :raises ValueError: If the momentum axis is not compressed.
         """
         if not self.has_compressed_q_dimension:
             raise ValueError("The unfold of the irreducible momenta needs a compressed momentum axis.")
         mat = self.mat
         maps, us = k_grid.auto_point_group()
-        stars = k_grid.irrk_count[:, None, None, None].astype(np.float64)
+        block_irr, targets = slice(None), None
+        if irreducible is not None:
+            block_irr = slice(*irreducible.indices(k_grid.nk_irr)[:2])
+            inverse = k_grid.irrk_inv.reshape(-1)
+            targets = np.flatnonzero((inverse >= block_irr.start) & (inverse < block_irr.stop))
+        rows = k_grid.irrk_ind[block_irr]
+        stars = k_grid.irrk_count[block_irr, None, None, None].astype(np.float64)
         width = max(1, int(self._TR_CHUNK_BYTES // (3 * mat[..., :1].nbytes)))
         lo, hi = (0, mat.shape[-1]) if frequencies is None else (frequencies.start, frequencies.stop)
         for start in range(lo, hi, width):
             block = mat[..., start : min(start + width, hi)]
-            weighted = block[k_grid.irrk_ind] * stars  # complex128
-            block[...] = symmetry_reduction.project_onto_point_group(weighted, maps, us, rows=k_grid.irrk_ind)
+            weighted = block[rows] * stars  # complex128
+            unfolded = symmetry_reduction.project_onto_point_group(weighted, maps, us, rows=rows, targets=targets)
+            if targets is None:
+                block[...] = unfolded
+            else:
+                block[targets] = unfolded
 
     def fit_smom_concatenated(
         self, other: "SelfEnergy", shell_offset: np.ndarray | None = None
@@ -573,7 +607,7 @@ class SelfEnergy(TwoPoint):
         (such a fit is an artifact there), or its value departs from ``reference`` by more than the source step
         :math:`|\Sigma_{12}(i\nu_0) - \Sigma_{12}(i\nu_1)|` (a fit reproducing the grid points through canceling
         poles). Positive :math:`\mathrm{Im}\,\Sigma` in the data is no reason for rejection; poles in the lower half
-        plane with negative weights represent it.
+        plane with negative weights represent it. MiniPole is imported only when there is a momentum to fit.
 
         :param beta_target: Inverse temperature :math:`\beta` of the target grid.
         :param niv_target: Number of positive fermionic frequencies of the target grid.
@@ -588,6 +622,10 @@ class SelfEnergy(TwoPoint):
         vn_out = MFHelper.vn(niv_target, float(beta_target))
         z_pos = 1j * vn_out[(vn_out > 0) & (vn_out < vn_pos[0])]
         n_pos = z_pos.size
+        if len(k_indices) == 0:  # a rank without fits: the empty result, without the MiniPole import
+            return np.zeros((0, self.n_bands, self.n_bands, 2 * n_pos), dtype=np.complex128), np.ones(0, dtype=bool)
+        # deferred: mini_pole loads matplotlib and scipy.signal through kneed
+        from mini_pole import MiniPole
 
         mat = self.mat.reshape(-1, self.n_bands, self.n_bands, 2 * self.niv)[k_indices].astype(np.complex128)
         # the static part per momentum: the k-averaged moment would leave the k-dependent remainder in the fit input

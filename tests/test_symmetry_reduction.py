@@ -1862,6 +1862,25 @@ def test_project_onto_point_group_unfolds_star_weighted_rows_into_a_tensor_obeyi
     assert np.allclose(unfolded[reps[stars == 1]], (rows + swapped)[stars == 1] / 2, atol=1e-6)
 
 
+def test_project_onto_point_group_gives_the_rows_of_the_targets_with_the_bits_of_the_whole_unfold():
+    """The unfold of a block of irreducible rows into the rows of their stars equals those rows of the whole unfold."""
+    nk = (4, 4, 1)
+    maps, us = sr.point_group_actions(_sheared_swap_group(nk), nk)
+    reps, inverse = np.unique(np.minimum(np.arange(16), maps[1]), return_inverse=True)
+    stars = np.bincount(inverse)
+    rng = np.random.default_rng(2)
+    rows = (rng.standard_normal((len(reps), 2, 2, 3)) + 1j * rng.standard_normal((len(reps), 2, 2, 3))) * stars[
+        :, None, None, None
+    ]
+    whole = sr.project_onto_point_group(rows, maps, us, rows=reps)
+    for block in (slice(0, 4), slice(4, 4), slice(4, len(reps))):
+        targets = np.flatnonzero(np.isin(inverse, np.arange(len(reps))[block]))
+        part = sr.project_onto_point_group(rows[block], maps, us, rows=reps[block], targets=targets)
+        assert part.shape == (len(targets), 2, 2, 3) and np.array_equal(part, whole[targets])
+    with pytest.raises(ValueError):  # a star cut short leaves an image outside the targets
+        sr.project_onto_point_group(rows, maps, us, rows=reps, targets=np.arange(15))
+
+
 def test_group_element_keeps_small_unitary_entries():
     """The stored unitary is the validated one; entries below 1e-5 are rounded only inside the hash key."""
     u = _rot2(1e-6)

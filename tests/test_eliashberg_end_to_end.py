@@ -244,8 +244,8 @@ def test_eliashberg_gap_functions_carry_sector_parity_and_match_reference(setup)
             assert np.allclose(*spans, atol=1e-4)
 
 
-def test_eliashberg_grid_solver_matches_reference(setup, monkeypatch):
-    """The forced block-distributed solver reproduces the reference eigenvalues of the in-memory solve."""
+def test_eliashberg_distributed_solver_matches_reference(setup, monkeypatch):
+    """The forced node-distributed solver reproduces the reference eigenvalues of the in-memory solve."""
     folder, comm_mock = setup
 
     config.box.niw_core = 20
@@ -258,7 +258,8 @@ def test_eliashberg_grid_solver_matches_reference(setup, monkeypatch):
     config.output.output_path = folder
     config.output.eliashberg_path = config.output.output_path
     config.eliashberg.resolve_parity_sectors = True
-    monkeypatch.setattr(eliashberg_solver, "FORCE_GRID_SOLVER", True)
+    monkeypatch.setattr(eliashberg_solver, "FORCE_DISTRIBUTED_SOLVER", True)
+    comm_mock.allreduce.side_effect = lambda obj, op=None: obj
 
     u_loc = config.lattice.hamiltonian.get_local_u()
     v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)

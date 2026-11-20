@@ -147,6 +147,32 @@ def test_distributor_takes_explicit_task_counts_and_gathers_them_in_rank_order()
         MpiDistributor(ntasks=7, comm=MPI.Comm(3), sizes=[3, 3, 3])
 
 
+def test_even_bounds_spread_the_excess():
+    """5456 items over 3584 parts: every part holds 1 or 2 items, every 112 consecutive parts 170 or 171."""
+    bounds = mu.even_bounds(5456, 3584)
+    assert bounds.dtype == np.int64 and len(bounds) == 3585 and bounds[0] == 0 and bounds[-1] == 5456
+    assert set(np.diff(bounds)) == {1, 2}
+    assert set(bounds[112:] - bounds[:-112]) <= {170, 171}
+
+
+def test_spread_distributor_node_totals_within_one():
+    """The spread split of 5456 tasks over 32 nodes of 112 ranks gives every rank 1 or 2 and every node 170 or 171."""
+    sizes = MpiDistributor.create_distributor(5456, MPI.Comm(3584), spread=True).sizes
+    assert set(sizes) == {1, 2} and sizes.sum() == 5456
+    assert set(sizes.reshape(32, 112).sum(axis=1)) <= {170, 171}
+
+
+@pytest.mark.parametrize("n_rows, n_w, n_parts", [(6, 3, 4), (3, 41, 112), (2, 2, 7), (0, 3, 2)])
+def test_node_slice_runs_cover_every_slice_once(n_rows, n_w, n_parts):
+    """The parts in order hold every slice once, frequency-major, in non-empty runs of rising w; sizes within one."""
+    parts = [mu.node_slice_runs(n_rows, n_w, part, n_parts) for part in range(n_parts)]
+    slices = [(w, i) for runs in parts for w, start, stop in runs for i in range(start, stop)]
+    sizes = [sum(stop - start for _, start, stop in runs) for runs in parts]
+    assert slices == [(w, i) for w in range(n_w) for i in range(n_rows)] and max(sizes) - min(sizes) <= 1
+    assert all(start < stop for runs in parts for _, start, stop in runs)
+    assert all(np.all(np.diff([w for w, _, _ in runs]) > 0) for runs in parts)
+
+
 @pytest.mark.parametrize("size", [1, 3, 4])
 @pytest.mark.parametrize("limit", [None, 64])
 def test_transpose_columns_delivers_all_rows_of_each_ranks_columns(size, limit, monkeypatch):
@@ -189,6 +215,23 @@ def test_transpose_columns_gathers_only_the_given_components_of_the_middle_axes(
     for rank, out in enumerate(res):
         expected = full[:, components[0], components[1]][..., cols_of[rank][0], cols_of[rank][1]]
         assert out.shape == (7, 3, len(cols_of[rank][0])) and np.array_equal(out, expected)
+
+
+@pytest.mark.parametrize("size", [1, 3])
+def test_transpose_columns_receives_into_a_given_buffer(size):
+    """With out every rank's rows of its columns land in the buffer it passes, the array it gets back."""
+    rng = np.random.default_rng(size)
+    full = rng.standard_normal((7, 2, 3, 4)) + 1j * rng.standard_normal((7, 2, 3, 4))
+    cols_of = [(part // 4, part % 4) for part in np.array_split(rng.permutation(12), size)]
+
+    def fn(comm, rank):
+        d = MpiDistributor(ntasks=7, comm=comm)
+        out = np.empty((7, 2, len(cols_of[rank][0])), dtype=full.dtype)
+        return out, mu.transpose_columns(full[d.my_slice].copy(), d, cols_of, base_tag=5, out=out)
+
+    _, res = run_parallel(size, fn)
+    for rank, (out, got) in enumerate(res):
+        assert got is out and np.array_equal(out, full[..., cols_of[rank][0], cols_of[rank][1]])
 
 
 def test_exchange_blocks_matches_blocks_between_one_pair_in_posting_order():
@@ -903,6 +946,18 @@ def test_idle_barrier_sleeps_between_polls_until_every_rank_arrived(monkeypatch)
     mu.idle_barrier(comm, interval=0.25)
 
     assert comm.Ibarrier.call_count == 1 and sleeps == [0.25, 0.25]
+
+
+def test_wait_idle_tests_the_requests_with_growing_sleeps_until_they_complete(monkeypatch):
+    """wait_idle tests the requests until they complete, sleeping longer between tests up to the longest pause."""
+    testall, sleeps = MagicMock(side_effect=[False] * 8 + [True]), []
+    monkeypatch.setattr(mu, "MPI", SimpleNamespace(Request=SimpleNamespace(Testall=testall)))
+    monkeypatch.setattr(mu.time, "sleep", sleeps.append)
+
+    mu.wait_idle(["request"], longest=1e-4)
+
+    assert testall.call_count == 9 and len(sleeps) == 8
+    assert sleeps == sorted(sleeps) and sleeps[0] < sleeps[-1] == 1e-4
 
 
 def test_idle_barrier_returns_at_once_on_a_single_rank():

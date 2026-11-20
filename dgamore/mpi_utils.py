@@ -22,11 +22,14 @@ argument (read at call time by the callers), so monkeypatching ``mpi_utils.MAX_M
 chunked path.
 """
 
+import contextvars
 import gc
 import os
 import pickle
 import socket
+import threading
 import time
+from collections.abc import Callable
 
 import mpi4py.MPI as MPI
 import psutil
@@ -58,6 +61,51 @@ def idle_barrier(comm, interval: float = 0.005) -> None:
     request = comm.Ibarrier()
     while not request.Test():
         time.sleep(interval)
+
+
+def wait_idle(reqs: list, longest: float = 5e-4) -> None:
+    r"""
+    Completes the requests like ``MPI.Request.Waitall``, but tests them with sleeps between the tests, 10 microseconds
+    doubling up to ``longest`` seconds, instead of waiting inside MPI. A helper thread that waits for transfers this
+    way leaves the rank's core to the computation running beside it.
+
+    :param reqs: The MPI requests.
+    :param longest: The longest sleep between two tests, in seconds.
+    :return: None.
+    """
+    pause = min(longest, 1e-5)
+    while not MPI.Request.Testall(reqs):
+        time.sleep(pause)
+        pause = min(longest, 2 * pause)
+
+
+def in_background(fn: Callable, *args) -> Callable[[], None]:
+    r"""
+    Runs ``fn(*args)`` on a helper thread in a copy of the caller's context (:mod:`contextvars`) and returns a function
+    that waits for it and raises its exception, if it raised one. The helper may call MPI only while the calling thread
+    does not, which needs at least ``MPI.THREAD_SERIALIZED``; it is a daemon, so it never keeps a failed run alive.
+
+    :param fn: The function to run.
+    :param args: Its arguments.
+    :return: The function that joins the helper.
+    """
+    errors = []
+
+    def run():
+        try:
+            fn(*args)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=contextvars.copy_context().run, args=(run,), daemon=True)
+    thread.start()
+
+    def join():
+        thread.join()
+        if errors:
+            raise errors[0]
+
+    return join
 
 
 def build_node_shared_array(node_comm, compute_fn, dtype=None):
@@ -399,10 +447,46 @@ def recv_bytes(comm, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES)
 
 # ====================================================================================================================
 # Work distribution.
+def even_bounds(n_items: int, n_parts: int) -> np.ndarray:
+    """
+    Returns the boundaries of ``n_items`` items split into ``n_parts`` contiguous parts in order, part ``i`` holding
+    the items ``[bounds[i], bounds[i + 1])``: the parts differ by at most one item, and the larger ones are spread
+    evenly over the parts, so any run of consecutive parts holds its share of the items to within one.
+
+    :param n_items: Number of items.
+    :param n_parts: Number of parts.
+    :return: The ``n_parts + 1`` boundaries (int64), from 0 to ``n_items``.
+    """
+    return np.arange(n_parts + 1, dtype=np.int64) * n_items // n_parts
+
+
+def node_slice_runs(n_rows: int, n_w: int, part: int, n_parts: int) -> list[tuple[int, int, int]]:
+    """
+    Returns part ``part`` of the ``n_rows * n_w`` slices ``(i, w)`` of ``n_rows`` momenta and ``n_w`` frequencies,
+    listed frequency-major (slice ``w * n_rows + i``) and cut into ``n_parts`` contiguous parts at :func:`even_bounds`,
+    as the runs ``(w, i_start, i_stop)`` of the slices ``(i, w)``, ``i_start <= i < i_stop``: no run is empty and the
+    frequencies of the runs rise, so every frequency appears at most once.
+
+    :param n_rows: Number of momenta (rows).
+    :param n_w: Number of frequencies.
+    :param part: Index of the part.
+    :param n_parts: Number of parts.
+    :return: The runs of the part, empty when it holds no slice.
+    """
+    lo, hi = (int(bound) for bound in even_bounds(n_rows * n_w, n_parts)[part : part + 2])
+    if lo == hi:
+        return []
+    return [
+        (w, max(lo - w * n_rows, 0), min(hi - w * n_rows, n_rows)) for w in range(lo // n_rows, (hi - 1) // n_rows + 1)
+    ]
+
+
 class MpiDistributor:
     """
     Distributes tasks among all available cores. Uses the first (q) dimension to slice the vertex data into chunks
-    and sends it to all active MPI processes. Each rank has its own instance of an MPI distributor.
+    and sends it to all active MPI processes. Each rank has its own instance of an MPI distributor. By default every
+    rank gets ``ntasks // size`` tasks and the excess goes to the highest ranks; :meth:`create_distributor` with
+    ``spread`` spreads the larger counts evenly over the ranks instead (see :func:`even_bounds`).
     """
 
     def __init__(self, ntasks: int = 1, comm: MPI.Comm = None, sizes: np.ndarray | None = None):
@@ -801,17 +885,20 @@ class MpiDistributor:
         return self.comm.bcast(total, root=self.mpi_size - 1)
 
     @staticmethod
-    def create_distributor(ntasks: int, comm: MPI.Comm = None) -> "MpiDistributor":
+    def create_distributor(ntasks: int, comm: MPI.Comm = None, spread: bool = False) -> "MpiDistributor":
         """
         Factory that creates an :class:`MpiDistributor`, defaulting to ``MPI.COMM_WORLD`` if no communicator is given.
 
         :param ntasks: Total number of tasks to distribute.
         :param comm: The MPI communicator (``MPI.COMM_WORLD`` if None).
+        :param spread: Whether the larger counts spread evenly over the ranks (see :func:`even_bounds`) instead of
+            going to the highest ranks.
         :return: The created :class:`MpiDistributor`.
         """
         if comm is None:
             comm = MPI.COMM_WORLD
-        return MpiDistributor(ntasks=ntasks, comm=comm)
+        sizes = np.diff(even_bounds(ntasks, comm.size)) if spread else None
+        return MpiDistributor(ntasks=ntasks, comm=comm, sizes=sizes)
 
     def _distribute_tasks(self, sizes: np.ndarray | None = None):
         """
@@ -847,6 +934,7 @@ def transpose_columns(
     cols_of: list[np.ndarray],
     base_tag: int = 0,
     components: tuple[np.ndarray, ...] | None = None,
+    out: np.ndarray | None = None,
 ) -> np.ndarray:
     r"""
     Transposes a row-distributed array into a column-distributed one. ``local`` holds this rank's rows
@@ -866,7 +954,9 @@ def transpose_columns(
     :param base_tag: Base MPI tag; successive chunks use ``base_tag + chunk_index``.
     :param components: One index array per middle axis, all of one length: the index tuples of the middle axes to
         transpose, in this order; ``None`` transposes every entry of the middle axes.
-    :return: All rows of this rank's columns.
+    :param out: A C-contiguous array of the result's shape and dtype that receives the result (e.g. this rank's block
+        of a node-shared window), or ``None`` for a fresh one.
+    :return: All rows of this rank's columns (``out`` when given).
     """
     comm, rank, size = mpi_dist.comm, mpi_dist.my_rank, mpi_dist.mpi_size
     slices = mpi_dist.slices
@@ -879,7 +969,7 @@ def transpose_columns(
             return local[..., cols[0], cols[1]]
         return local[(slice(None), *(c[:, None] for c in components), cols[0][None, :], cols[1][None, :])]
 
-    out = np.empty((mpi_dist.ntasks, *middle, len(mine[0])), dtype=local.dtype)
+    out = np.empty((mpi_dist.ntasks, *middle, len(mine[0])), dtype=local.dtype) if out is None else out
     out[slices[rank]] = columns(mine)
     for step in range(1, size):
         dst, src = (rank + step) % size, (rank - step) % size

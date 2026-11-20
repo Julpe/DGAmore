@@ -847,7 +847,7 @@ def test_plan_lanczos_teams_budgets_the_windows_with_their_real_point_count(monk
 
 
 def test_plan_lanczos_teams_is_none_when_no_node_holds_one_channel(monkeypatch):
-    """When even one channel's windows exceed a node's memory the plan is None and the grid solver takes over."""
+    """When even one channel's windows exceed a node's memory the plan is None and the distributed solve takes over."""
     _grid_test_config((4, 2, 1), 2)
     monkeypatch.setattr(es, "lanczos_team_bytes", lambda *args: 1000 * args[5])
     assert _team_plan(["n0"] * 4, available=900 / es.NODE_MEMORY_FRACTION) is None
@@ -872,6 +872,61 @@ def test_plan_lanczos_teams_hands_a_short_node_several_sectors_per_team():
     assert round_one[2].sectors == ((SpinChannel.TRIP, "even"),)
     (lone,) = _team_plan(["n0"])
     assert lone[0].ranks == (0,) and len(lone[0].sectors) == 4
+
+
+def _distributed_plan(hostnames, available=10**15, niv_pp=2):
+    """Plans the node-distributed solve for fake ranks on the given hosts; ``available`` is one figure or per host."""
+    comm, node_comm = MagicMock(), MagicMock()
+    free = available if isinstance(available, dict) else {host: available for host in hostnames}
+    comm.allgather.side_effect = lambda payload: [(hostnames.index(host), host, free[host]) for host in hostnames]
+    return es.plan_distributed_solve(comm, node_comm, 0, niv_pp)
+
+
+def test_plan_distributed_solve_gives_every_node_mirrored_frequency_pairs_and_a_momentum_range():
+    """Three nodes own the frequency pairs (3, 4)+(2, 5), (1, 6) and (0, 7) of an 8-frequency box and 2-3-3 momenta."""
+    _grid_test_config((4, 2, 1), 4)
+    layout = _distributed_plan(["a", "a", "b", "b", "c", "c"], niv_pp=4)
+    assert layout.nodes == ((0, 1), (2, 3), (4, 5)) and layout.stars is None
+    assert [f.tolist() for f in layout.freqs] == [[2, 3, 4, 5], [1, 6], [0, 7]]
+    assert [p.tolist() for p in layout.points] == [[0, 1], [2, 3, 4], [5, 6, 7]]
+
+
+def test_plan_distributed_solve_leaves_the_nodes_beyond_the_frequency_pairs_without_frequencies():
+    """With one frequency pair and three nodes the first node owns both frequencies, the others none but momenta."""
+    _grid_test_config((4, 2, 1), 1)
+    layout = _distributed_plan(["a", "b", "c"], niv_pp=1)
+    assert [f.tolist() for f in layout.freqs] == [[0, 1], [], []]
+    assert sum(len(p) for p in layout.points) == 8 and all(len(p) for p in layout.points)
+
+
+def test_plan_distributed_solve_splits_the_wedge_by_whole_stars():
+    """On a wedge grid every node owns a contiguous run of whole stars; together their members cover the grid once."""
+    _grid_test_config((4, 4, 1), 2)
+    grid = bz.KGrid((4, 4, 1), symmetries=[bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV])
+    config.lattice.k_grid = grid
+    _, offsets, order, _ = es._wedge_orbits(grid)
+    layout = _distributed_plan(["a", "b"])
+    (s0, s1), (t0, t1) = layout.stars
+    assert s0 == 0 and s1 == t0 and t1 == len(offsets) - 1
+    assert sorted(np.concatenate(layout.points).tolist()) == list(range(16))
+    assert layout.points[1].tolist() == order[offsets[t0] : offsets[t1]].tolist()
+
+
+def test_plan_distributed_solve_takes_as_many_builders_as_every_node_holds(monkeypatch):
+    """Rank 0's node holds three builders of 100 bytes beside its 50-byte extra in 400 bytes, the other node four."""
+    _grid_test_config((4, 2, 1), 4)
+    monkeypatch.setattr(es, "lanczos_distributed_bytes", lambda *args: 100 * args[9] + (50 if args[10] else 0))
+    layout = _distributed_plan(["a"] * 4 + ["b"] * 4, available=400 / es.NODE_MEMORY_FRACTION, niv_pp=4)
+    assert layout.builders == 3
+    assert _distributed_plan(["a"] * 2 + ["b"] * 2, niv_pp=4).builders == 2
+
+
+def test_plan_distributed_solve_raises_when_one_builder_per_node_does_not_fit(monkeypatch):
+    """When even one builder per node exceeds a node's memory the solve stops with a MemoryError."""
+    _grid_test_config((4, 2, 1), 2)
+    monkeypatch.setattr(es, "lanczos_distributed_bytes", lambda *args: 1000)
+    with pytest.raises(MemoryError, match="distributed Eliashberg solve"):
+        _distributed_plan(["a", "b"], available=900 / es.NODE_MEMORY_FRACTION)
 
 
 def _single_rank_matmul_layout(gamma, norm):
@@ -1156,6 +1211,254 @@ def test_wedge_team_matvec_matches_the_single_rank_matvec_to_rounding(monkeypatc
             assert np.max(np.abs(got - ref)) <= 1e-5 * np.max(np.abs(ref))
 
 
+def _distributed_shares(comm, niv_pp, builders=None):
+    """The node communicator, the node-distributed layout (optionally with a fixed builder count) and the distributor
+    of the irreducible momenta, for one fake rank."""
+    node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+    layout = es.plan_distributed_solve(comm, node_comm, 10**15, niv_pp)
+    if builders is not None:
+        layout = es.DistributedLayout(layout.nodes, layout.freqs, layout.points, layout.stars, builders)
+    return node_comm, layout, MpiDistributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
+
+
+@pytest.mark.parametrize("hostnames", [["a"], ["a", "a", "b", "b"], ["a", "b", "c"]])
+@pytest.mark.parametrize("kind", ["full", "auto", "wedge", "wedge-auto-complex"])
+@pytest.mark.parametrize("builders", [None, 1])
+def test_distributed_window_holds_the_rows_of_the_single_rank_layout(monkeypatch, hostnames, kind, builders):
+    """Every node's window holds its rows of the single-rank scaled matmul layout bit for bit; the vertex is used up."""
+    monkeypatch.setattr("dgamore.mpi_utils.MPI", FAKE_MPI)
+    monkeypatch.setattr(es, "MPI", FAKE_MPI)
+    monkeypatch.setattr(es, "socket", conftest.FAKE_SOCKET)
+    monkeypatch.setattr("dgamore.memory_estimator.TEAM_BUILD_CHUNK_BYTES", 2048)
+    nq, o, niv_pp = ((4, 2, 1) if kind in ("full", "auto") else (4, 4, 1)), 2, 2
+    _grid_test_config(nq, niv_pp)
+    if kind == "full":
+        gamma = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)[0]
+    elif kind == "auto":
+        gamma = _auto_symmetry_vertex(nq, o, niv_pp, 3)
+    else:
+        grid = (
+            _rotating_auto_grid(nq, phase=np.pi / 4)
+            if kind == "wedge-auto-complex"
+            else bz.KGrid(nq, symmetries=[bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV])
+        )
+        gamma = _wedge_vertex(nq, o, niv_pp, 3, grid)
+    k_grid = config.lattice.k_grid
+    norm = 0.5 / k_grid.nk_tot / config.sys.beta
+    rows = o * o * 2 * niv_pp
+    expected = _single_rank_matmul_layout(gamma, norm).reshape(k_grid.nk_tot, rows, rows)
+
+    def fn(comm, rank):
+        node_comm, layout, dist = _distributed_shares(comm, niv_pp, builders)
+        share = FourPoint(
+            gamma.mat[dist.my_slice].copy(), gamma.channel, nq, 0, 2, False, True, True, FrequencyNotation.PP
+        )
+        window, win = es._build_distributed_window(share, dist, node_comm, layout, norm)
+        seen = np.array(window)
+        node = es._node_index(layout, rank)
+        points = (
+            layout.points[node] if layout.stars is None else es._wedge_orbits(k_grid)[0][slice(*layout.stars[node])]
+        )
+        node_comm.Barrier()
+        if win is not None:
+            win.Free()
+        return seen, points, share.mat is None
+
+    _, res = run_parallel(len(hostnames), fn, hostnames=hostnames)
+    assert all(np.array_equal(seen, expected[points]) and consumed for seen, points, consumed in res)
+
+
+def _node_matvec_outputs(hostnames, gamma, chi0, gap_shape, o, references, probes, u=None):
+    """Runs the node-distributed matvec of both channels on fake ranks of the given hosts and returns, per rank, its
+    output blocks per sector with its momentum rows and frequencies."""
+    nq, nv = gap_shape[:3], gap_shape[-1]
+    nk = int(np.prod(nq))
+    norm = 0.5 / config.lattice.k_grid.nk_tot / config.sys.beta
+
+    def fn(comm, rank):
+        node_comm, layout, dist = _distributed_shares(comm, nv // 2)
+        freqs = layout.freqs[es._node_index(layout, rank)]
+        chi0_share, chi0_win = mu.build_node_shared_array(
+            node_comm, lambda: np.ascontiguousarray(deepcopy(chi0).decompress_q_dimension().mat[..., freqs])
+        )
+        arrays, wins = es._distributed_scratch(node_comm, layout, rank, gap_shape, np.complex64)
+        outputs = {}
+        for channel in (SpinChannel.SING, SpinChannel.TRIP):
+            share = FourPoint(
+                gamma.mat[dist.my_slice].copy(), channel, nq, 0, 2, False, True, True, FrequencyNotation.PP
+            )
+            window, win = es._build_distributed_window(share, dist, node_comm, layout, norm)
+            apply_block, _, _, (k0, k1) = es._node_team_matvec(
+                comm, node_comm, layout, window, chi0_share, arrays, gap_shape, o, u
+            )
+            for key in [key for key in references if key[0] == channel]:
+                eps_t = key[1]
+                eps_p = None if eps_t is None else (1 if channel == SpinChannel.SING else -1) * eps_t
+                blocks = [x.reshape(nk, o, o, nv)[k0:k1][..., freqs].reshape(-1) for x in probes]
+                outputs[key] = [apply_block(channel, eps_t, eps_p, block) for block in blocks]
+            del apply_block, window
+            nonlocal_sde._free_shared_window(win, node_comm)
+        del arrays, chi0_share
+        for win in wins + [chi0_win]:
+            nonlocal_sde._free_shared_window(win, node_comm)
+        return outputs, (k0, k1), freqs
+
+    return run_parallel(len(hostnames), fn, hostnames=hostnames)[1]
+
+
+def _assemble_node_blocks(res, key, i, gap_shape):
+    """Joins every rank's momentum-and-frequency block of one node-matvec output into the flattened gap vector."""
+    nk, o, nv = int(np.prod(gap_shape[:3])), gap_shape[3], gap_shape[-1]
+    full = np.zeros((nk, o, o, nv), dtype=np.complex64)
+    for outputs, (k0, k1), freqs in res:
+        full[k0:k1, ..., freqs] = outputs[key][i].reshape(k1 - k0, o, o, len(freqs))
+    return full.reshape(-1)
+
+
+def _node_matvec_setup(monkeypatch, nq, o, niv_pp, projected):
+    """Patches the fake MPI into the solver and installs the test config of the node-distributed matvec tests."""
+    monkeypatch.setattr("dgamore.mpi_utils.MPI", FAKE_MPI)
+    monkeypatch.setattr(es, "MPI", FAKE_MPI)
+    monkeypatch.setattr(es, "socket", conftest.FAKE_SOCKET)
+    _grid_test_config(nq, niv_pp)
+    config.eliashberg.resolve_parity_sectors = projected
+
+
+@pytest.mark.parametrize("hostnames", [["a"], ["a", "a"], ["a", "b"], ["a", "a", "b"], ["a", "b", "c"]])
+@pytest.mark.parametrize("o", [1, 2])
+@pytest.mark.parametrize("projected", [False, True])
+def test_node_team_matvec_matches_the_single_rank_matvec_bit_for_bit(monkeypatch, hostnames, o, projected):
+    """Spread over nodes by momentum and frequency pairs, the matvec equals the single-rank one bit for bit."""
+    nq, niv_pp = (4, 2, 1), 2
+    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)
+    gap_shape = nq + (o, o, 2 * niv_pp)
+    _node_matvec_setup(monkeypatch, nq, o, niv_pp, projected)
+    probes, references = _matvec_references(monkeypatch, gamma, chi0, gap_shape, (1, -1) if projected else (None,))
+    res = _node_matvec_outputs(hostnames, gamma, chi0, gap_shape, o, references, probes)
+    for key, expected in references.items():
+        for i, ref in enumerate(expected):
+            assert np.array_equal(_assemble_node_blocks(res, key, i, gap_shape), ref)
+
+
+@pytest.mark.parametrize("hostnames", [["a", "b"], ["a", "a", "b"]])
+@pytest.mark.parametrize("action", ["swap", "momentum-dependent"])
+def test_node_team_matvec_with_an_orbital_action_matches_the_single_rank_matvec_to_rounding(
+    monkeypatch, hostnames, action
+):
+    """With an orbital action of the inversion the projected node matvec equals the single-rank one to rounding."""
+    nq, niv_pp, o = (4, 2, 1), 2, 2
+    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)
+    gap_shape = nq + (o, o, 2 * niv_pp)
+    u = _orbital_actions(nq)[action]
+    _node_matvec_setup(monkeypatch, nq, o, niv_pp, True)
+    probes, references = _matvec_references(monkeypatch, gamma, chi0, gap_shape, (1, -1), u)
+    res = _node_matvec_outputs(hostnames, gamma, chi0, gap_shape, o, references, probes, u)
+    for key, expected in references.items():
+        for i, ref in enumerate(expected):
+            got = _assemble_node_blocks(res, key, i, gap_shape)
+            assert np.max(np.abs(got - ref)) <= 1e-5 * np.max(np.abs(ref))
+
+
+@pytest.mark.parametrize("hostnames", [["a", "b"], ["a", "a", "b", "b", "c"]])
+@pytest.mark.parametrize("grid_kind", ["explicit", "auto", "auto-complex"])
+def test_node_team_matvec_on_wedge_windows_matches_the_single_rank_matvec_to_rounding(
+    monkeypatch, hostnames, grid_kind
+):
+    """With every node holding the wedge rows of its stars the matvec reproduces the full-grid one to rounding."""
+    nq, niv_pp, o = (4, 4, 1), 2, 2
+    _node_matvec_setup(monkeypatch, nq, o, niv_pp, True)
+    if grid_kind == "explicit":
+        symmetries = [bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV, bz.KnownSymmetries.X_Y_SYM]
+        grid = bz.KGrid(nq, symmetries=symmetries)
+    else:
+        grid = _rotating_auto_grid(nq, phase=np.pi / 4 if grid_kind == "auto-complex" else 0.0)
+    gamma = _wedge_vertex(nq, o, niv_pp, 3, grid)
+    _, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 5)
+    gap_shape = nq + (o, o, 2 * niv_pp)
+    probes, references = _matvec_references(monkeypatch, gamma, chi0, gap_shape, (1, -1))
+    res = _node_matvec_outputs(hostnames, gamma, chi0, gap_shape, o, references, probes)
+    for key, expected in references.items():
+        for i, ref in enumerate(expected):
+            got = _assemble_node_blocks(res, key, i, gap_shape)
+            assert np.max(np.abs(got - ref)) <= 1e-5 * np.max(np.abs(ref))
+
+
+@pytest.mark.parametrize("hostnames", [["a"], ["a", "a", "b"], ["a", "b", "c"]])
+@pytest.mark.parametrize("symmetry", ["random", "d-wave"])
+@pytest.mark.parametrize("n_block", [1, 2])
+def test_node_seed_blocks_are_the_single_rank_seeds(monkeypatch, hostnames, symmetry, n_block):
+    """Every rank's seed block is its share of the single-rank seeds, a collapsed d-wave projection included."""
+    nq, niv_pp, o = (4, 2, 1), 2, 1
+    _, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)
+    gap_shape = nq + (o, o, 2 * niv_pp)
+    nk, nv = 8, 2 * niv_pp
+    _node_matvec_setup(monkeypatch, nq, o, niv_pp, True)
+    config.eliashberg.symmetry = symmetry
+    sectors = (
+        (SpinChannel.SING, 1, 1),
+        (SpinChannel.SING, -1, -1),
+        (SpinChannel.TRIP, -1, 1),
+        (SpinChannel.TRIP, None, None),
+    )
+    expected = [
+        es._sector_seeds(get_initial_gap_function(gap_shape, ch).flatten(), gap_shape, et, ep, n_block)
+        for ch, et, ep in sectors
+    ]
+
+    def fn(comm, rank):
+        node_comm, layout, _ = _distributed_shares(comm, niv_pp)
+        freqs = layout.freqs[es._node_index(layout, rank)]
+        arrays, wins = es._distributed_scratch(node_comm, layout, rank, gap_shape, np.complex64)
+        chi0_share = np.ascontiguousarray(deepcopy(chi0).decompress_q_dimension().mat[..., freqs])
+        window = np.zeros((len(layout.points[es._node_index(layout, rank)]), nv * o * o, nv * o * o), np.complex64)
+        _, seed_block, _, (k0, k1) = es._node_team_matvec(
+            comm, node_comm, layout, window, chi0_share, arrays, gap_shape, o
+        )
+        blocks = [seed_block(ch, et, ep, n_block) for ch, et, ep in sectors]
+        del arrays
+        for win in wins:
+            nonlocal_sde._free_shared_window(win, node_comm)
+        return blocks, (k0, k1), freqs
+
+    _, res = run_parallel(len(hostnames), fn, hostnames=hostnames)
+    for i, seeds in enumerate(expected):
+        for b in range(n_block):
+            full = np.zeros((nk, o, o, nv), dtype=np.complex64)
+            for blocks, (k0, k1), freqs in res:
+                full[k0:k1, ..., freqs] = blocks[i][b]
+            assert np.array_equal(full.reshape(-1), seeds[b])
+
+
+@pytest.mark.parametrize("hostnames", [["a"], ["a", "a", "b"], ["a", "b", "c"]])
+def test_node_collect_assembles_every_vector_on_rank_0_alone(monkeypatch, hostnames):
+    """The node shares of a vector reach rank 0's destination in their places; no other rank receives anything."""
+    nq, niv_pp, o = (4, 2, 1), 2, 2
+    gap_shape = nq + (o, o, 2 * niv_pp)
+    nk, nv = 8, 2 * niv_pp
+    _node_matvec_setup(monkeypatch, nq, o, niv_pp, True)
+    vector = (np.arange(nk * o * o * nv) + 1j).astype(np.complex64)
+
+    def fn(comm, rank):
+        node_comm, layout, _ = _distributed_shares(comm, niv_pp)
+        node = es._node_index(layout, rank)
+        freqs = layout.freqs[node]
+        arrays, wins = es._distributed_scratch(node_comm, layout, rank, gap_shape, np.complex64)
+        chi0_share = np.zeros(nq + (o,) * 4 + (len(freqs),), np.complex64)
+        window = np.zeros((len(layout.points[node]), nv * o * o, nv * o * o), np.complex64)
+        _, _, collect, (k0, k1) = es._node_team_matvec(
+            comm, node_comm, layout, window, chi0_share, arrays, gap_shape, o
+        )
+        out = np.zeros((vector.size, 2), dtype=np.complex64)[:, 1] if rank == 0 else None
+        collect(vector.reshape(nk, o, o, nv)[k0:k1][..., freqs].reshape(-1), out)
+        del arrays
+        for win in wins:
+            nonlocal_sde._free_shared_window(win, node_comm)
+        return out
+
+    _, res = run_parallel(len(hostnames), fn, hostnames=hostnames)
+    assert np.array_equal(res[0], vector) and all(out is None for out in res[1:])
+
+
 def _power_loop_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
     """Deterministic stand-in for eigsh: a short power iteration over the real matvec."""
     vec = v0.astype(np.complex64)
@@ -1218,6 +1521,31 @@ def test_team_arnoldi_finds_the_eigenpairs_of_largest_real_part_on_distributed_b
         assert np.allclose(lambdas, expected, atol=1e-7) and n_matvec < 4 * n
         for lam, vec in zip(lambdas, vectors):
             assert np.linalg.norm(h @ vec - lam * vec) <= 1e-6 * abs(lam) and abs(np.linalg.norm(vec) - 1) < 1e-8
+
+
+def test_team_arnoldi_follows_the_lead_where_the_ranks_small_eigensolves_differ(monkeypatch):
+    """The Ritz pairs come from the team lead, so a rank whose LAPACK rounds differently keeps the lead's iteration."""
+    n, n_eig = 60, 3
+    h = _test_matrix(n, 1, False)
+    seed = np.random.default_rng(2).standard_normal(n) + 0j
+    real_eig = np.linalg.eig
+
+    def skewed_eig(a):
+        theta, ritz = real_eig(a)
+        return (theta, ritz * (1 + 1e-6)) if conftest._rank.get() == 1 else (theta, ritz)
+
+    monkeypatch.setattr(np.linalg, "eig", skewed_eig)
+
+    def fn(comm, rank):
+        bounds = np.linspace(0, n, comm.Get_size() + 1).astype(int)
+        s0, s1 = int(bounds[rank]), int(bounds[rank + 1])
+        apply_block = lambda block: (h @ np.concatenate(comm.allgather(block)))[s0:s1]
+        lambdas, ritz, _, n_matvec, _ = es._team_arnoldi(apply_block, seed[s0:s1], n_eig, 12, 1e-10, 300, comm)
+        return lambdas, ritz, n_matvec
+
+    _, res = run_parallel(3, fn)
+    for lambdas, ritz, n_matvec in res[1:]:
+        assert np.array_equal(lambdas, res[0][0]) and np.array_equal(ritz, res[0][1]) and n_matvec == res[0][2]
 
 
 @pytest.mark.parametrize("size", [1, 3])
@@ -1426,6 +1754,88 @@ def test_solve_sectors_in_teams_reproduces_the_single_rank_sectors_and_delivers_
     _, results = run_parallel(len(hostnames), fn, hostnames=hostnames)
     for rank, res in enumerate(results):
         _sectors_match(res, expected, rank)
+
+
+def _distributed_solve_operands(nq, o, niv_pp, wedge):
+    """The singlet and triplet pairing vertices and the pp bubble of the distributed-solve tests."""
+    if wedge:
+        grid = bz.KGrid(nq, symmetries=[bz.KnownSymmetries.X_INV, bz.KnownSymmetries.Y_INV])
+        gamma_sing, gamma_trip = _wedge_vertex(nq, o, niv_pp, 3, grid), _wedge_vertex(nq, o, niv_pp, 5, grid)
+        _, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 7)
+    else:
+        gamma_sing, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)
+        gamma_trip, _ = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 5)
+    gamma_trip.channel = SpinChannel.TRIP
+    return gamma_sing, gamma_trip, chi0
+
+
+def _run_distributed_solve(hostnames, nq, o, niv_pp, gamma_sing, gamma_trip, chi0, u=None):
+    """Runs the node-distributed sector solve on fake ranks of the given hosts and returns every rank's results."""
+    ntasks = config.lattice.k_grid.nk_irr
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        dist = MpiDistributor(ntasks=ntasks, comm=comm)
+        shares = [
+            FourPoint(gamma.mat[dist.my_slice].copy(), gamma.channel, nq, 0, 2, False, True, True, FrequencyNotation.PP)
+            for gamma in (gamma_sing, gamma_trip)
+        ]
+        giwk = GreensFunction(np.zeros(nq + (o, o, 10), dtype=np.complex64), nk=nq)
+        layout = es.plan_distributed_solve(comm, node_comm, 10**15, niv_pp)
+        return es._solve_sectors_distributed(dist, comm, node_comm, shares[0], shares[1], giwk, niv_pp, layout, u)
+
+    return run_parallel(len(hostnames), fn, hostnames=hostnames)[1]
+
+
+@pytest.mark.parametrize(
+    "hostnames, wedge",
+    [(h, False) for h in (["a"], ["a", "a", "b", "b"], ["a", "b", "c"], ["a", "a", "b"])] + [(["a", "b", "b"], True)],
+)
+def test_solve_sectors_distributed_reproduces_the_single_rank_sectors_and_delivers_the_gaps_to_rank_0(
+    monkeypatch, hostnames, wedge
+):
+    """Every sector solved across the nodes matches the single-rank solve; the gaps land on rank 0 alone."""
+    monkeypatch.setattr(es, "threadpool_limits", lambda *args, **kwargs: nullcontext())
+    _node_matvec_setup(monkeypatch, (4, 4, 1) if wedge else (4, 2, 1), 1, 2, True)
+    monkeypatch.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", _power_loop_eigsh)
+    monkeypatch.setattr(es, "_team_arnoldi", _power_loop_team_arnoldi)
+    nq, o, niv_pp = config.lattice.nk, 1, 2
+    gamma_sing, gamma_trip, chi0 = _distributed_solve_operands(nq, o, niv_pp, wedge)
+    monkeypatch.setattr(BubbleGenerator, "create_generalized_chi0_q_pp_w0", lambda giwk, niv, k_grid: deepcopy(chi0))
+    expected = {}
+    for gamma in (gamma_sing, gamma_trip):
+        for parity, value in solve_eliashberg_lanczos(deepcopy(gamma), deepcopy(chi0), (0, 0)).items():
+            expected[(gamma.channel, parity)] = value
+    for rank, res in enumerate(_run_distributed_solve(hostnames, nq, o, niv_pp, gamma_sing, gamma_trip, chi0)):
+        _sectors_match(res, expected, rank)
+
+
+@pytest.mark.parametrize(
+    "hostnames, action, n_block",
+    [(["a", "b"], "none", 1), (["a", "a", "b", "c"], "swap", 1), (["a", "b", "b"], "none", 2)],
+)
+def test_distributed_solve_finds_the_single_rank_eigenvalues_within_the_solver_tolerance(
+    monkeypatch, hostnames, action, n_block
+):
+    """With the real eigensolvers, the block iteration included, every sector's eigenvalues agree with the
+    single-rank solve to its tolerance."""
+    monkeypatch.setattr(es, "threadpool_limits", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(es, "block_size", lambda k_grid, parity=None: n_block)
+    nq, niv_pp = (4, 2, 1), 2
+    o = 1 if action == "none" else 2
+    _node_matvec_setup(monkeypatch, nq, o, niv_pp, True)
+    config.eliashberg.epsilon = 1e-8
+    u = _orbital_actions(nq)[action]
+    gamma_sing, gamma_trip, chi0 = _distributed_solve_operands(nq, o, niv_pp, False)
+    monkeypatch.setattr(BubbleGenerator, "create_generalized_chi0_q_pp_w0", lambda giwk, niv, k_grid: deepcopy(chi0))
+    expected = {}
+    for gamma in (gamma_sing, gamma_trip):
+        for parity, value in solve_eliashberg_lanczos(deepcopy(gamma), deepcopy(chi0), (0, 0), u=u).items():
+            expected[(gamma.channel, parity)] = value[0]
+    for res in _run_distributed_solve(hostnames, nq, o, niv_pp, gamma_sing, gamma_trip, chi0, u):
+        assert set(res) == set(expected)
+        for key, lambdas in expected.items():
+            assert np.allclose(res[key][0], lambdas, rtol=1e-5, atol=1e-6)
 
 
 def _make_p_wave_doublet(nk: int = 6, n2: int = 4) -> tuple[np.ndarray, np.ndarray, tuple]:
@@ -1881,13 +2291,42 @@ def test_team_solve_logs_the_matvecs_of_every_attempt(monkeypatch):
 
     def fn(comm, rank):
         team = es.LanczosTeam("h", 0, (0,), ((SpinChannel.SING, "none"),))
-        gap_w = np.zeros(gap_shape, dtype=np.complex64)
-        return es._solve_team_sectors(comm, team, MagicMock(), (0, 2 * niv_pp), gap_w, gap_shape)
+        seed_block = lambda channel, eps_t, eps_p, n_block: vector[:n_block]
+        return es._solve_team_sectors(comm, team, MagicMock(), seed_block, lambda block, out: None, gap_shape)
 
     monkeypatch.setattr(es, "_team_arnoldi", fake_arnoldi)
     run_parallel(1, fn)
 
     assert any("14 matvecs, 1.0 s in the matvec" in c.args[0] for c in config.logger.info.call_args_list)
+
+
+def test_team_seed_block_is_built_on_the_lead_alone(monkeypatch):
+    """Only the team lead draws and projects a sector's seeds; every rank receives its frequency block of them."""
+    monkeypatch.setattr("dgamore.mpi_utils.MPI", FAKE_MPI)
+    nq, niv_pp, size = (4, 2, 1), 2, 3
+    _grid_test_config(nq, niv_pp)
+    gap_shape = nq + (1, 1, 2 * niv_pp)
+    sectors = ((SpinChannel.SING, 1, 1), (SpinChannel.SING, -1, -1), (SpinChannel.TRIP, 1, -1))
+    expected = [
+        es._sector_seeds(es.get_initial_gap_function(gap_shape, channel).flatten(), gap_shape, eps_t, eps_p, 1)
+        for channel, eps_t, eps_p in sectors
+    ]
+    callers = []
+    real_seeds = es._sector_seeds
+    monkeypatch.setattr(
+        es, "_sector_seeds", lambda *a, **k: callers.append(conftest._rank.get()) or real_seeds(*a, **k)
+    )
+    bounds = np.linspace(0, 2 * niv_pp, size + 1).astype(int)
+
+    def fn(comm, rank):
+        span = (bounds[rank], bounds[rank + 1])
+        return [es._team_seed_block(comm, gap_shape, span, None, *sector, 1) for sector in sectors]
+
+    _, res = run_parallel(size, fn, hostnames=["h"] * size)
+    assert callers == [0] * len(sectors)
+    for rank, blocks in enumerate(res):
+        for got, seeds in zip(blocks, expected):
+            assert np.array_equal(got, seeds.reshape((1,) + gap_shape)[..., bounds[rank] : bounds[rank + 1]])
 
 
 def _inversion_symmetric_kernel(monkeypatch, channel, perm):
@@ -2109,6 +2548,22 @@ def test_inversion_check_finds_no_inversion_in_a_d_p_chain_without_it_in_any_ene
     u, reason = es._inversion_action()
 
     assert u is None and reason.startswith("inversion is no symmetry of H(k)")
+
+
+def test_irreducible_distributors_share_the_spread_split(monkeypatch):
+    """The loop writing the per-rank files and the Eliashberg step reading them build one spread irreducible split."""
+    config.lattice.k_grid = SimpleNamespace(nk_irr=6)
+    assert list(nonlocal_sde.irreducible_momentum_distributor(FAKE_MPI.Comm(4)).sizes) == [1, 2, 1, 2]
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    built = MagicMock(side_effect=RuntimeError("irreducible distributor built"))
+    monkeypatch.setattr(nonlocal_sde, "irreducible_momentum_distributor", built)
+    comm = conftest.create_comm_mock()
+    # the stub stops each site where it builds its distributor
+    with pytest.raises(RuntimeError, match="irreducible distributor built"):
+        nonlocal_sde.calculate_self_energy_q(comm, None, None, None, None)
+    with pytest.raises(RuntimeError, match="irreducible distributor built"):
+        es.solve(None, None, None, None, comm)
+    assert [call.args for call in built.call_args_list] == [(comm,), (comm,)]
 
 
 @pytest.mark.parametrize("perform_eliashberg", [True, False])
@@ -3734,17 +4189,6 @@ def test_rpa_pairing_vertices_of_kanamori_orbitals_give_the_graser_gap_equation(
     assert np.allclose(direct @ (np.eye(len(exchange)) + exchange), graser, atol=1e-10 * np.abs(graser).max())
 
 
-def test_solver_grid_shape_degenerates_and_caps():
-    """The solver grid uses row-only splitting up to the frequency count, then widens by divisor columns."""
-    assert es.solver_grid_shape(1, 80) == (1, 1)
-    assert es.solver_grid_shape(12, 80) == (12, 1)
-    assert es.solver_grid_shape(80, 80) == (80, 1)
-    assert es.solver_grid_shape(81, 80) == (80, 1)
-    assert es.solver_grid_shape(200, 80) == (80, 2)
-    assert es.solver_grid_shape(400, 80) == (80, 5)
-    assert es.solver_grid_shape(13, 6) == (6, 2)
-
-
 def _random_pairing_vertex_and_bubble(nq, o, niv_pp, seed):
     """Builds a random compressed pairing vertex and diagonal pp bubble on a symmetry-free grid."""
     rng = np.random.default_rng(seed)
@@ -3766,176 +4210,6 @@ def _grid_test_config(nq, niv_pp):
     config.eliashberg.resolve_parity_sectors = True
     config.eliashberg.symmetrize_degenerate_gaps = False
     config.logger = MagicMock()
-
-
-def test_grid_solver_on_one_rank_matches_in_memory_solver():
-    """A 1x1 grid reproduces the in-memory solver's eigenvalues and gaps for every parity sector."""
-    from copy import deepcopy
-
-    nq, o, niv_pp = (4, 2, 1), 1, 2
-    _grid_test_config(nq, niv_pp)
-    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 3)
-
-    np.random.seed(0)
-    reference = solve_eliashberg_lanczos(deepcopy(gamma), deepcopy(chi0), (0,))
-
-    comm = conftest.create_comm_mock()
-    comm.allgather.side_effect = lambda obj: [obj]
-    np.random.seed(0)
-    result = es.solve_eliashberg_lanczos_grid(deepcopy(gamma), deepcopy(chi0), comm, 0)
-
-    assert set(result) == set(reference)
-    for parity in reference:
-        assert np.allclose(result[parity][0], reference[parity][0], atol=1e-5)
-        for gap_ref, gap_new in zip(reference[parity][1], result[parity][1]):
-            assert np.allclose(np.abs(gap_new.mat), np.abs(gap_ref.mat), atol=1e-4)
-
-
-def test_grid_solver_ships_the_bubble_inside_the_grid_only(monkeypatch):
-    """With idle ranks beyond the solver grid, the pp bubble broadcast runs over the grid communicator only."""
-    from copy import deepcopy
-
-    monkeypatch.setattr(es, "MPI", conftest.FAKE_MPI)
-
-    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
-        # thread-unsafe ARPACK is densified via n identical matvecs per rank, keeping the lockstep collectives aligned
-        n = op.shape[0]
-        dense = np.column_stack([op.matvec(np.eye(n, dtype=np.complex64)[:, i]) for i in range(n)])
-        lam, vec = np.linalg.eig(dense)
-        order = np.argsort(lam.real)[::-1][:k]
-        return lam.real[order], vec[:, order]
-
-    monkeypatch.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
-    seen = []
-    real_bcast = mu.bcast_rows
-    monkeypatch.setattr(
-        es.mpi_utils,
-        "bcast_rows",
-        lambda comm, arr, root, **k: seen.append(comm.Get_size()) or real_bcast(comm, arr, root, **k),
-    )
-    nq, o, niv_pp, size = (4, 2, 1), 1, 1, 3
-    _grid_test_config(nq, niv_pp)
-    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 5)
-    nq_tot = int(np.prod(nq))
-    bounds = np.linspace(0, nq_tot, size + 1).astype(int)
-
-    def worker(comm, rank):
-        _grid_test_config(nq, niv_pp)
-        local = FourPoint(
-            gamma.mat[bounds[rank] : bounds[rank + 1]].copy(),
-            SpinChannel.SING,
-            nq,
-            0,
-            2,
-            False,
-            True,
-            True,
-            FrequencyNotation.PP,
-        )
-        return es.solve_eliashberg_lanczos_grid(local, deepcopy(chi0) if rank == 0 else None, comm, 0)
-
-    conftest.run_parallel(size, worker)
-    # the vertex-slice gather is 3 sources x 3 participants; the bubble must add grid-sized (2) calls, never full (3)
-    assert sum(1 for s in seen if s == size) == size * size
-    assert sum(1 for s in seen if s == 2) == 2
-
-
-@pytest.mark.parametrize(
-    "size, niv_pp, o, action",
-    [(2, 2, 1, "none"), (4, 1, 1, "none"), (3, 2, 1, "none"), (3, 1, 1, "none"), (3, 2, 2, "momentum-dependent")],
-)
-def test_grid_solver_multi_rank_matches_in_memory_solver(monkeypatch, size, niv_pp, o, action):
-    """Row-split, 2x2, uneven-row and idle-rank grids, one with an orbital action, match the in-memory eigenvalues."""
-    from copy import deepcopy
-
-    monkeypatch.setattr(es, "MPI", conftest.FAKE_MPI)
-
-    def fake_eigsh(op, k, tol, v0, which, maxiter, ncv=None):
-        # thread-unsafe ARPACK is densified via n identical matvecs per rank, keeping the lockstep collectives aligned
-        n = op.shape[0]
-        dense = np.column_stack([op.matvec(np.eye(n, dtype=np.complex64)[:, i]) for i in range(n)])
-        lam, vec = np.linalg.eig(dense)
-        order = np.argsort(lam.real)[::-1][:k]
-        return lam.real[order], vec[:, order]
-
-    monkeypatch.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", fake_eigsh)
-
-    nq = (4, 2, 1)
-    _grid_test_config(nq, niv_pp)
-    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 5)
-    u = _orbital_actions(nq)[action]
-
-    np.random.seed(0)
-    reference = solve_eliashberg_lanczos(deepcopy(gamma), deepcopy(chi0), (0,), u=u)
-
-    nq_tot = int(np.prod(nq))
-    bounds = np.linspace(0, nq_tot, size + 1).astype(int)
-
-    def worker(comm, rank):
-        _grid_test_config(nq, niv_pp)
-        local = FourPoint(
-            gamma.mat[bounds[rank] : bounds[rank + 1]].copy(),
-            SpinChannel.SING,
-            nq,
-            0,
-            2,
-            False,
-            True,
-            True,
-            FrequencyNotation.PP,
-        )
-        bubble = deepcopy(chi0) if rank == 0 else None
-        np.random.seed(0)
-        return es.solve_eliashberg_lanczos_grid(local, bubble, comm, 0, u)
-
-    _, results = conftest.run_parallel(size, worker)
-
-    rows, cols = es.solver_grid_shape(size, 2 * niv_pp)
-    for rank, res in enumerate(results):
-        if rank >= rows * cols:
-            assert res is None
-            continue
-        assert set(res) == set(reference)
-        for parity in reference:
-            assert np.allclose(res[parity][0], reference[parity][0], atol=1e-5)
-
-
-@pytest.mark.parametrize("size", [2, 3])
-def test_grid_solver_runs_the_block_iteration_in_lockstep_where_the_symmetry_forces_multiplets(monkeypatch, size):
-    """With a forced block size every grid rank runs the block iteration in lockstep and matches in memory."""
-    from copy import deepcopy
-
-    monkeypatch.setattr(es, "MPI", conftest.FAKE_MPI)
-    monkeypatch.setattr(es, "block_size", lambda k_grid, parity=None: 2)
-    nq, o, niv_pp = (4, 2, 1), 2, 2
-    _grid_test_config(nq, niv_pp)
-    gamma, chi0 = _random_pairing_vertex_and_bubble(nq, o, niv_pp, 5)
-    np.random.seed(0)
-    reference = solve_eliashberg_lanczos(deepcopy(gamma), deepcopy(chi0), (0,))
-    monkeypatch.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", MagicMock(side_effect=AssertionError))
-    bounds = np.linspace(0, int(np.prod(nq)), size + 1).astype(int)
-
-    def worker(comm, rank):
-        _grid_test_config(nq, niv_pp)
-        local = FourPoint(
-            gamma.mat[bounds[rank] : bounds[rank + 1]].copy(),
-            SpinChannel.SING,
-            nq,
-            0,
-            2,
-            False,
-            True,
-            True,
-            FrequencyNotation.PP,
-        )
-        np.random.seed(0)
-        return es.solve_eliashberg_lanczos_grid(local, deepcopy(chi0) if rank == 0 else None, comm, 0)
-
-    _, results = conftest.run_parallel(size, worker)
-    rows, cols = es.solver_grid_shape(size, 2 * niv_pp)
-    for res in results[: rows * cols]:
-        for parity in reference:
-            assert np.allclose(res[parity][0], reference[parity][0], atol=1e-5)
 
 
 def test_streaming_fq_multi_rank_writes_disjoint_slabs_matching_single_rank(setup, monkeypatch):
@@ -4088,3 +4362,55 @@ def test_gap_orbital_mirrors_warn_when_the_correlated_probe_fails(monkeypatch):
     monkeypatch.setattr(es, "find_coordinate_mirror_orbital_unitaries", MagicMock(side_effect=ValueError("probe")))
     assert es._gap_orbital_mirrors(2) == {}
     assert config.logger.warning.call_count == 1 and config.logger.debug.call_count == 0
+
+
+def test_delete_rank_files_removes_a_folder_of_rank_files_so_a_later_write_fails(monkeypatch, tmp_path):
+    """A folder holding only rank files is removed with them, so a rank still writing afterwards cannot add one."""
+    monkeypatch.setattr(os, "remove", os.unlink)
+    folder = tmp_path / "Eliashberg"
+    folder.mkdir()
+    config.output.eliashberg_path = str(folder)
+    for name in ["gchi0_q_inv_rank_0.npy", "vrg_q_dens_rank_3.npy", "vrg_middle_q_magn_rank_11.npy"]:
+        (folder / name).touch()
+    es.delete_rank_files()
+    with pytest.raises(FileNotFoundError):
+        (folder / "vrg_q_magn_rank_1.npy").touch()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_delete_rank_files_keeps_the_other_files_in_the_folder_renamed_to_aborted(monkeypatch, tmp_path):
+    """Every rank file is removed and the other files stay, in the folder renamed to <folder>_aborted."""
+    monkeypatch.setattr(os, "remove", os.unlink)
+    folder = tmp_path / "Eliashberg"
+    folder.mkdir()
+    config.output.eliashberg_path = str(folder)
+    for name in ["gchi0_q_inv_rank_0.npy", "chi_phys_q_dens_rank_2.npy", "f_ud_loc_pp_w0.npy"]:
+        (folder / name).touch()
+    es.delete_rank_files()
+    assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")) == [
+        "Eliashberg_aborted",
+        "Eliashberg_aborted/f_ud_loc_pp_w0.npy",
+    ]
+
+
+def test_delete_rank_files_leaves_a_folder_without_rank_files_as_it_is(monkeypatch, tmp_path):
+    """A failure after the Eliashberg step, whose folder holds results but no rank files, changes nothing."""
+    monkeypatch.setattr(os, "remove", os.unlink)
+    folder = tmp_path / "Eliashberg"
+    folder.mkdir()
+    config.output.eliashberg_path = str(folder)
+    (folder / "eigenvalues.txt").touch()
+    es.delete_rank_files()
+    assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")) == [
+        "Eliashberg",
+        "Eliashberg/eigenvalues.txt",
+    ]
+
+
+def test_delete_rank_files_removes_nothing_without_an_eliashberg_folder(monkeypatch, tmp_path):
+    """A run that fails before its Eliashberg folder exists removes nothing."""
+    remove = MagicMock()
+    monkeypatch.setattr(os, "remove", remove)
+    config.output.eliashberg_path = str(tmp_path / "Eliashberg")
+    es.delete_rank_files()
+    assert remove.call_count == 0

@@ -418,8 +418,10 @@ vertex to ``eliashberg_path``, one file per MPI rank, so that the vertex can be 
 written once: in the last scheduled iteration or, when the loop converges earlier, by one more kernel pass on the
 converged self-energy, whose Green's function the particle-particle bubble of the Eliashberg step uses as well. Their
 leading axis holds only the irreducible momenta of the writing rank, and they are deleted once the vertex has been
-built. Ladder runs write the first three files of the table; with ``misc.do_flex`` or ``misc.do_rpa`` only the
-physical susceptibilities are written.
+built. A rank that fails deletes them before it aborts the job: it first renames the folder to
+``<eliashberg_path>_aborted``, so the writes the other ranks still attempt fail instead of adding files (their errors
+follow the first one in the log), and removes it once empty. Ladder runs write the first three files of the table;
+with ``misc.do_flex`` or ``misc.do_rpa`` only the physical susceptibilities are written.
 
 .. list-table::
    :header-rows: 1

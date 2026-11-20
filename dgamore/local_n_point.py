@@ -467,6 +467,32 @@ class LocalNPoint(IHaveMat):
         result.update_original_shape()
         return result
 
+    @staticmethod
+    def join_wn(parts: list):
+        r"""
+        Returns one half (positive) bosonic range object from ``parts``, objects of consecutive bosonic windows (see
+        :meth:`take_wn_slice`), joined along the bosonic axis. ``parts`` is consumed: every part is popped, copied
+        into the result and freed in turn, so the parts and the result are never held twice over.
+
+        :param parts: The objects of the windows in bosonic order, alike in every other axis; emptied.
+        :return: A new object holding every window of ``parts``.
+        """
+        first = parts[0]
+        axis = first.mat.ndim - (first.num_wn_dimensions + first.num_vn_dimensions)
+        shape = list(first.mat.shape)
+        shape[axis] = sum(part.mat.shape[axis] for part in parts)
+        result = first._clone_without_mat()
+        result.mat = np.empty(shape, dtype=first.mat.dtype)
+        start = 0
+        while parts:
+            part = parts.pop(0)
+            window = (slice(None),) * axis + (slice(start, start + part.mat.shape[axis]),)
+            result.mat[window] = part.mat
+            start += part.mat.shape[axis]
+            part.free()
+        result.update_original_shape()
+        return result
+
     def to_negative_niw_range(self):
         r"""
         Returns a **new** object holding the negative bosonic frequency block :math:`\omega = 0, -1, \ldots, -niw`

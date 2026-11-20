@@ -15,6 +15,7 @@ chemical-potential adjustment and self-energy mixing (linear / Pulay / Anderson)
 master's thesis (Chapters 3 & 4).
 """
 
+import functools
 import glob
 import os
 import pickle
@@ -22,6 +23,7 @@ import re
 import zipfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import mpi4py.MPI as MPI
 import numpy as np
@@ -45,10 +47,11 @@ from dgamore.jacobian_stabilization import (
     to_vec,
 )
 from dgamore.local_four_point import LocalFourPoint
+from dgamore.local_n_point import LocalNPoint
 from dgamore.lambda_ops import LambdaAnnealer, LambdaCorrection, MultiOrbitalLambdaCorrection
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore import memory_estimator, symmetry_reduction
-from dgamore.memory_estimator import SLICE_CHUNK_BYTES
+from dgamore.memory_estimator import GRAM_ROWS, SLICE_CHUNK_BYTES
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import DTYPE, SpinChannel, deferred_collection
 from dgamore.self_energy import SelfEnergy
@@ -58,6 +61,21 @@ _JACOBIAN_ROW_WIDTH = TRACKER_PAIRS - 1  # Ritz values per row of the traces: ev
 _FIRST_FREQUENCY_RATIO = 2.0  # w_1 over static compound norm of chi_phys above which the loop warns of a pole
 _RESTRICTION_PIN_FACTOR = 2.0  # pin of a crossed mode, in units of the largest healthy static eigenvalue of the channel
 _RESTRICTION_FALLBACK_FLOOR = 1e-2  # floor of the inverse static eigenvalues when no static block is healthy
+_SHELL_ROWS = 64  # momenta per chunk of a damped step's padded rows: 2.5 MB of complex64 at four bands, 300 frequencies
+_PROPOSAL_ROWS_TAG = 1500  # base MPI tag of the proposal's core rows sent to the other nodes
+NODE_SHARED_SLICE_GAIN = 0.03  # least cut of the busiest rank's Bethe-Salpeter slices for which a node shares them
+
+
+def real_space_interaction(u_loc: LocalInteraction, v_nonloc: Interaction) -> np.ndarray:
+    r"""
+    Returns the real-space interaction :math:`\mathcal{F}[U + V^{\mathbf{q}}]` the Fock term of
+    :func:`get_hartree_fock` contracts with the transformed occupation.
+
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` on the full q-grid.
+    :return: The array ``[kx, ky, kz, o1, o2, o3, o4]``.
+    """
+    return (u_loc + v_nonloc).fft(copy=False).decompress_q_dimension().mat
 
 
 def get_hartree_fock(
@@ -111,7 +129,7 @@ def get_hartree_fock(
     # Fourier the interaction and the occupation to R-space, contract the summed orbitals pointwise per R and
     # transform back: convolution theorem for the n^{k-q} sum.
     if w_r_mat is None:
-        w_r_mat = (u_loc + v_nonloc).fft(copy=False).decompress_q_dimension().mat  # [kx, ky, kz, a, b, c, d]
+        w_r_mat = real_space_interaction(u_loc, v_nonloc)  # [kx, ky, kz, a, b, c, d]
     occ_r = sp.fft.fftn(occ_k.astype(w_r_mat.dtype, copy=False), axes=(0, 1, 2))  # [kx, ky, kz, d, c]
 
     fock_r = np.einsum("xyzadcb,xyzdc->xyzab", w_r_mat, occ_r, optimize=True)
@@ -208,6 +226,7 @@ def create_auxiliary_chi_r_q_sum(
     slice_rhs: Callable[[int, int, FourPoint], list[FourPoint]] | None = None,
     involution: np.ndarray | None = None,
     subtract_u: bool = True,
+    node_comm: MPI.Comm | None = None,
 ) -> FourPoint | list[FourPoint] | tuple[FourPoint, list[FourPoint]]:
     r"""
     Returns the sum over the auxiliary susceptibility, see Eq. (3.60) in my master's thesis,
@@ -226,6 +245,11 @@ def create_auxiliary_chi_r_q_sum(
     With ``subtract_u`` False the shift is zero and the sum is that of the ladder of :math:`\Gamma_{r}` alone,
     :math:`\sum_{\nu'}((\chi^{\mathrm{q}\nu}_{0;1234})^{-1} + \Gamma^{\omega\nu\nu'}_{r;1234}/\beta^2)^{-1}`, whose
     matrix stays regular where the shifted one has a near-zero eigenvalue the physical susceptibility does not have.
+
+    With a ``node_comm`` and neither ``rhs`` nor ``slice_rhs``, the ranks of the node gather their momentum counts and,
+    where sharing cuts the slice count of the node's busiest rank enough (see :func:`_share_slices_on_node`), share
+    the slices of their momenta (see :func:`_solve_slices_on_node`), which rank 0's node logs. Every slice keeps its
+    bits either way.
 
     :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` (full or half bosonic range).
     :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box).
@@ -248,6 +272,8 @@ def create_auxiliary_chi_r_q_sum(
         factorization (see
         :meth:`~dgamore.four_point.FourPoint.invert_with_local_kernel_and_sum_over_last_vn`), or None.
     :param subtract_u: Whether the shift is :math:`U_{r}` (the auxiliary susceptibility) or zero.
+    :param node_comm: The node-local communicator, over which the call is then collective and whose ranks may share
+        their slices, or None to solve rank by rank.
     :return: The frequency-summed auxiliary susceptibility :math:`\sum_{\nu'}\chi^{*;\mathrm{q}}_{r}` (with
         ``subtract_u`` False that of the ladder of :math:`\Gamma_{r}` alone) as a :class:`FourPoint` (half niw range,
         one fermionic dimension), the solutions for ``rhs`` as a list, or with ``slice_rhs`` the tuple
@@ -259,9 +285,88 @@ def create_auxiliary_chi_r_q_sum(
         inactive = _inactive_orbital_pairs(gamma_half, u_r)
     beta = config.sys.beta
     shift = u_r if subtract_u else u_r.scale(0.0, copy=True)
+    if node_comm is not None and rhs is None and slice_rhs is None:
+        rows = gchi0_q_inv.to_half_niw_range().compress_q_dimension().mat  # [q, o1, o2, o3, o4, w, v]
+        counts, n_w = np.array(node_comm.allgather(rows.shape[0])), rows.shape[-2]
+        if _share_slices_on_node(counts, n_w):
+            config.logger.info(
+                f"Bethe-Salpeter slices ({gamma_r.channel.value}) shared by the {counts.size} ranks of each node: at "
+                f"most {-(-counts.sum() * n_w // counts.size)} instead of {counts.max() * n_w} per rank."
+            )
+            return _solve_slices_on_node(gchi0_q_inv, counts, node_comm, gamma_half, shift, inactive, involution)
     return gchi0_q_inv.invert_with_local_kernel_and_sum_over_last_vn(
         gamma_half, shift, 1.0 / beta**2, beta, inactive, rhs, slice_rhs, involution
     )
+
+
+def _share_slices_on_node(counts: np.ndarray, n_w: int) -> bool:
+    """
+    Returns whether the ranks of a node share the Bethe-Salpeter slices of their momenta (see
+    :func:`_solve_slices_on_node`): when equal parts of the node's slices cut the slice count of its busiest rank by
+    at least the fraction ``NODE_SHARED_SLICE_GAIN``. A single rank and a node without momenta never share.
+
+    :param counts: The momentum counts of the node's ranks.
+    :param n_w: Number of bosonic frequencies, i.e. slices, of a momentum.
+    :return: Whether the node shares its slices.
+    """
+    slices = int(counts.sum()) * n_w
+    if counts.size < 2 or slices == 0:
+        return False
+    return -(-slices // counts.size) <= (1 - NODE_SHARED_SLICE_GAIN) * int(counts.max()) * n_w
+
+
+def _solve_slices_on_node(
+    gchi0_q_inv: FourPoint,
+    counts: np.ndarray,
+    node_comm: MPI.Comm,
+    gamma_half: LocalFourPoint,
+    shift: LocalInteraction,
+    inactive: np.ndarray,
+    involution: np.ndarray | None,
+) -> FourPoint:
+    r"""
+    Returns this rank's sum of :func:`create_auxiliary_chi_r_q_sum` with the Bethe-Salpeter slices of the node's
+    momenta shared by its ranks. Every rank copies its rows of the inverse bubble into a node window
+    ``[q_node, o1, o2, o3, o4, w, v]`` (the ranks' rows in their node order) and solves its part of the node's slices
+    in frequency-major order (see :func:`~dgamore.mpi_utils.node_slice_runs`) into a node result window, building
+    :math:`A^{\omega\nu\nu'}` once per frequency of its part. Once the input window is freed, it copies its own rows
+    of the result into an array of its inverse bubble's memory layout, which fixes the bits of later frequency sums.
+    Every slice is solved as without the node, so the sum has the bits of the per-rank call. The two windows, and
+    then the result window beside the rank's own result, hold one block per rank more than that call's result.
+    Collective over ``node_comm`` only.
+
+    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` (core box, half niw range,
+        compressed momenta).
+    :param counts: The momentum counts of the node's ranks, in their node order.
+    :param node_comm: The node-local communicator.
+    :param gamma_half: The local irreducible vertex :math:`\Gamma_{r}` on the half bosonic range.
+    :param shift: The frequency-independent shift, :math:`U_{r}` or zero.
+    :param inactive: The orbital pairs without vertex of ``gamma_half``.
+    :param involution: The orbital permutation that transposes the dispersion (see :func:`_orbital_involution`), or
+        None.
+    :return: This rank's frequency-summed auxiliary susceptibility as a :class:`FourPoint` (half niw range, one
+        fermionic dimension).
+    """
+    beta, diagonal = config.sys.beta, gchi0_q_inv.mat
+    start = int(counts[: node_comm.rank].sum())
+    own, shape = slice(start, start + diagonal.shape[0]), (int(counts.sum()), *diagonal.shape[1:])
+    rows, rows_win = mpi_utils.allocate_node_shared_array(node_comm, shape, diagonal.dtype)
+    sums, sums_win = mpi_utils.allocate_node_shared_array(node_comm, shape, diagonal.dtype)
+    rows[own] = diagonal
+    node_comm.Barrier()
+    window = FourPoint(rows, gchi0_q_inv.channel, (shape[0], 1, 1), 1, 1, False, gchi0_q_inv.full_niv_range, True)
+    window.frequency_notation = gchi0_q_inv.frequency_notation
+    runs = mpi_utils.node_slice_runs(shape[0], shape[-2], node_comm.rank, node_comm.size)
+    window.invert_with_local_kernel_and_sum_over_last_vn(
+        gamma_half, shift, 1.0 / beta**2, beta, inactive, orbital_involution=involution, runs=runs, out=sums
+    )
+    window = rows = None
+    _free_shared_window(rows_win, node_comm)  # its barrier: every rank has solved its part
+    mine = np.empty_like(diagonal)
+    mine[...] = sums[own]
+    sums = None
+    _free_shared_window(sums_win, node_comm)
+    return FourPoint(mine, gamma_half.channel, gchi0_q_inv.nq, 1, 1, False, has_compressed_q_dimension=True)
 
 
 def create_vrg_r_q(gchi_aux_q_r_sum: FourPoint, gchi0_q_inv: FourPoint, copy: bool = True) -> FourPoint:
@@ -798,7 +903,9 @@ def calculate_sigma_dc_kernel(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, u_lo
     return _attach_dc_interaction(_contract_dc_vertex(f_dc_loc, gchi0_q), u_loc)
 
 
-def _contract_dc_vertex(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint) -> FourPoint:
+def _contract_dc_vertex(
+    f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, components: np.ndarray | None = None
+) -> FourPoint:
     r"""
     Returns the vertex contraction of the double-counting kernel (see :func:`calculate_sigma_dc_kernel`): the bubble
     summed with the local vertex over its stored full-box first frequency (see
@@ -806,13 +913,51 @@ def _contract_dc_vertex(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint) -> FourPoi
     the bubble is only read.
 
     :param f_dc_loc: The local double-counting vertex :math:`F_{\mathrm{dc}}` (see
-        :func:`~dgamore.local_sde.double_counting_vertex`).
+        :func:`~dgamore.local_sde.double_counting_vertex`), or its window of the bubble's bosonic frequencies.
     :param gchi0_q: The momentum-dependent bare bubble :math:`\chi^{\mathrm{q}\nu}_{0}` (full fermionic box).
+    :param components: The non-zero orbital components of the whole vertex, or ``None`` to find them in ``f_dc_loc``.
     :return: The contraction as a :class:`FourPoint` on the core fermionic box.
     """
     # the stored full-box first index supplies the summed v' via F_{1dfe}(v,v') = F_{efd1}(v',v): the stored slots
     # (e,f,d,1) then pair directly with chi0's row pair (e,f) - the standard-product reversal F_{..fe} chi0_{ef..}
-    return gchi0_q.contract_first_pair_with_local_vertex(f_dc_loc, min(f_dc_loc.niv_second, config.box.niv_core))
+    niv_out = min(f_dc_loc.niv_second, config.box.niv_core)
+    return gchi0_q.contract_first_pair_with_local_vertex(f_dc_loc, niv_out, components)
+
+
+def _bubble_box_parts(
+    blocks: list[FourPoint], f_dc_loc: LocalFourPoint | None, with_core: bool
+) -> tuple[FourPoint, FourPoint | None, FourPoint | None]:
+    r"""
+    Returns what the kernel section reads of the full-box bubble, from the bubble given as consecutive bosonic
+    windows: its frequency sum :math:`\frac{1}{\beta^2} \sum_{\nu} \chi^{\mathrm{q}\nu}_{0}` over the full box, the
+    vertex contraction of the double-counting kernel (see :func:`_contract_dc_vertex`) and the core-box cut. The
+    windows are consumed in turn: each is freed once its parts are taken, so the whole full-box bubble never sits
+    beside the whole core box; every part is the window of the whole bubble's result, bit for bit.
+
+    :param blocks: The bubble's bosonic windows in order (see
+        :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_q_fft`); emptied.
+    :param f_dc_loc: The local double-counting vertex, or ``None`` for no contraction.
+    :param with_core: Whether to cut the core box.
+    :return: The tuple ``(full_sum, dc_contraction, core)``; ``None`` for the parts not asked for.
+    """
+    beta = config.sys.beta
+    components = None if f_dc_loc is None else f_dc_loc.nonzero_orbital_components()
+    sums, contractions, cores = [], [], []
+    w0 = 0
+    with deferred_collection():
+        while blocks:
+            block = blocks.pop(0)
+            w1 = w0 + block.current_shape[-2]
+            sums.append(block.sum_over_all_vn(beta).scale(1.0 / beta))
+            if f_dc_loc is not None:
+                window = f_dc_loc.take_wn_slice(w0, w1, copy=False)
+                contractions.append(_contract_dc_vertex(window, block, components))
+            if with_core:
+                cores.append(block.cut_niv(config.box.niv_core))
+            block.free()
+            w0 = w1
+        parts = [LocalNPoint.join_wn(part) if part else None for part in (sums, contractions, cores)]
+    return tuple(parts)
 
 
 def _attach_dc_interaction(contraction: FourPoint, u_loc: LocalInteraction, per_wn: bool = False) -> FourPoint:
@@ -1261,6 +1406,7 @@ def calculate_sigma_kernel_r_q(
     involution: np.ndarray | None = None,
     static_magn: list | None = None,
     last_chi: dict | None = None,
+    node_comm: MPI.Comm | None = None,
 ) -> FourPoint | None:
     r"""
     Adds the kernel for the self-energy calculation in a specific spin channel, times ``weight``, to ``kernel`` in
@@ -1303,12 +1449,14 @@ def calculate_sigma_kernel_r_q(
         :func:`_finish_physical_susceptibility`), or ``None``.
     :param last_chi: Holder of the loop's latest physical susceptibility per channel (see
         :func:`_finish_physical_susceptibility`), or ``None``.
+    :param node_comm: The node-local communicator whose ranks may share the Bethe-Salpeter slices (see
+        :func:`create_auxiliary_chi_r_q_sum`), or None.
     :return: ``kernel``.
     """
     logger = config.logger
 
     gchi_ladder_q_r_sum = create_auxiliary_chi_r_q_sum(
-        gamma_r, gchi0_q_inv, u_loc, involution=involution, subtract_u=False
+        gamma_r, gchi0_q_inv, u_loc, involution=involution, subtract_u=False, node_comm=node_comm
     )
 
     mpi_dist_irrq.barrier()
@@ -1569,10 +1717,19 @@ class _ColumnSdeStream:
     function is equal. With invariant Green's functions that average is all the unfold contributes: a group passed
     as ``symmetric`` scatters its columns instead (:meth:`FourPoint.scatter_to_full_bz`: the irreducible rows
     weighted by their stars, no rotation), and a time-reversed column stays the conjugate at fixed
-    :math:`\mathbf{R}`, which then sums the mirrored wedge. Both routes agree to rounding. Beyond the read-only
-    kernels and windows a rank holds one round of irreducible columns of every kernel, under two batches of full-BZ
-    columns, and per output its owned results, at most one running sum of a frequency another rank owns and the partial
-    sums of the tasks of a batch.
+    :math:`\mathbf{R}`, which then sums the mirrored wedge. Both routes agree to rounding.
+
+    With a ``node_comm`` the ranks of a node share the column work of all their tasks: every rank receives its rounds
+    into its block of a node-shared window, and for every batch of every rank of the node, in node order, each rank
+    of the node unfolds its own contiguous run of real-space rows into one node-shared buffer, the node transforms
+    the buffer in two passes (z and y over slabs of x planes, then x over slabs of y planes, the lines split among the
+    ranks) and each rank contracts and folds its rows. Partial and running sums are held per rank of the node and
+    per frequency, split by rows; :meth:`finish` assembles them in a node-shared window before the reduction. Every
+    momentum unfolds, every line transforms and every row contracts on its own, so the node shares the work with
+    the bits of each rank doing its own (a single-rank node, or no ``node_comm``). Beyond the read-only kernels and
+    windows a node holds one round of irreducible columns of its ranks' tasks of every kernel and one batch of
+    full-BZ columns, and per output the running sums and results of its ranks; a rank holds its rows of the partial
+    sums of a batch.
 
     A kernel whose last orbital pair never leaves an orbital block (an atom-diagonal interaction gives
     :math:`K_{a12b} = 0` unless :math:`2` and :math:`b` lie on one atom) is transposed, transformed and contracted on
@@ -1590,9 +1747,10 @@ class _ColumnSdeStream:
         dtype,
         chunk_bytes: int | None = None,
         by_frequency: bool = False,
+        node_comm=None,
     ):
         r"""
-        Lays out the tasks and allocates every output's results of the owned fermionic frequencies.
+        Lays out the tasks and the real-space rows this rank contracts of every column of its node.
 
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
         :param n_out: Number of outputs.
@@ -1601,19 +1759,66 @@ class _ColumnSdeStream:
             the floor).
         :param by_frequency: Whether every block holds one stored frequency, so the kernels can arrive in groups of
             any size (see :func:`~dgamore.memory_estimator.column_sde_schedule`).
+        :param node_comm: The node-local communicator whose ranks share the column work of their tasks, or ``None``
+            for a rank working alone.
         """
         niw, niv = config.box.niw_core, config.box.niv_core
-        n_r, nb = config.lattice.k_grid.nk_tot, config.sys.n_bands
+        n_r = config.lattice.k_grid.nk_tot
         self._dist, self._dtype, self._by_frequency = mpi_dist_irrk, np.dtype(dtype), by_frequency
         self._chunk = SLICE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
         self._blocks, self._bounds, self._owner = memory_estimator.column_sde_schedule(
             niw, niv, mpi_dist_irrk.mpi_size, by_frequency
         )
         self._my_v = np.flatnonzero(self._owner == mpi_dist_irrk.my_rank)
-        self._results = [np.empty((self._my_v.size, n_r, nb, nb), dtype=dtype) for _ in range(n_out)]
+        shared = node_comm is not None and node_comm.Get_size() > 1
+        self._node = node_comm if shared else None
+        # the ranks of the node in node order, and this rank's run of real-space rows of every column
+        self._members = node_comm.allgather(mpi_dist_irrk.my_rank) if shared else [mpi_dist_irrk.my_rank]
+        share, n_share = (node_comm.Get_rank(), node_comm.Get_size()) if shared else (0, 1)
+        self._rows = slice(share * n_r // n_share, (share + 1) * n_r // n_share)
+        # per output this rank's rows of every running sum of the node, keyed by (rank, fermionic frequency)
         self._sums = [{} for _ in range(n_out)]
         self._w_next = 0
         self._actions = config.lattice.k_grid.auto_point_group(real_space=True)
+
+    def _barrier(self) -> None:
+        """
+        Waits for every rank of the node (a no-op for a rank working alone).
+
+        :return: None.
+        """
+        if self._node is not None:
+            self._node.Barrier()
+
+    def _transform(self, out_buf: np.ndarray) -> None:
+        r"""
+        Fourier transforms the node-shared full-BZ columns over the momentum axes in the order z, y, x, in place: a rank
+        working alone in one call, the ranks of a node in two passes (z and y over slabs of x planes, then x over slabs
+        of y planes), each rank its share of the planes and of the trailing components, every line on its own.
+
+        :param out_buf: The columns ``[n_R, ...]`` in the momentum order of the grid; transformed in place.
+        :return: None.
+        """
+        nk = config.lattice.k_grid.nk
+        grid = out_buf.reshape(*nk, -1)
+        if self._node is None:
+            transformed = sp.fft.fftn(grid, axes=(2, 1, 0), overwrite_x=True)
+            if not np.shares_memory(transformed, grid):
+                grid[...] = transformed
+            return
+        share, n_share = self._node.Get_rank(), self._node.Get_size()
+        n_c = grid.shape[-1]
+        for axis, axes in ((0, (2, 1)), (1, (0,))):
+            parts = -(-n_share // nk[axis])
+            units = [(p, c) for p in range(nk[axis]) for c in range(parts)]
+            for p, c in units[share * len(units) // n_share : (share + 1) * len(units) // n_share]:
+                index = [slice(None)] * 4
+                index[axis], index[3] = slice(p, p + 1), slice(c * n_c // parts, (c + 1) * n_c // parts)
+                view = grid[tuple(index)]
+                transformed = sp.fft.fftn(view, axes=axes, overwrite_x=True)
+                if not np.shares_memory(transformed, view):
+                    view[...] = transformed
+            self._barrier()
 
     def add_group(
         self,
@@ -1675,92 +1880,124 @@ class _ColumnSdeStream:
         scale = -0.5 / config.sys.beta / n_r
 
         n_column = n_r * nb**4
-        n_mine = [
-            sum(len(blocks[t % n_b][1]) for t in tasks_of[rank][k * per_round : (k + 1) * per_round])
-            for k in range(n_rounds)
-        ]
-        batch = memory_estimator.sde_unfold_batch(
-            n_column * self._dtype.itemsize,
-            len(self._sums) * n_r * nb**2 * self._dtype.itemsize,
-            max(n_mine, default=0),
+
+        def batch_of(r: int) -> int:
+            """The unfold batch of rank ``r``: as many of its columns of a round as fit with their partial sums."""
+            n_mine = [
+                sum(len(blocks[t % n_b][1]) for t in tasks_of[r][k * per_round : (k + 1) * per_round])
+                for k in range(n_rounds)
+            ]
+            partial_bytes = len(self._sums) * n_r * nb**2 * self._dtype.itemsize
+            return memory_estimator.sde_unfold_batch(
+                n_column * self._dtype.itemsize, partial_bytes, max(n_mine, default=0)
+            )
+
+        batches = {r: batch_of(r) for r in self._members}
+        mine_rows = self._rows
+        n_rows = mine_rows.stop - mine_rows.start
+        acc = np.empty((n_rows, nb, nb), dtype=self._dtype)
+        # every batch of columns of the node is unfolded into this one buffer
+        buffer, buffer_win = mpi_utils.allocate_node_shared_array(
+            self._node, (max(batches.values()) * n_column,), self._dtype
         )
-        acc = np.empty((n_r, nb, nb), dtype=self._dtype)
-        buffer = np.empty(batch * n_column, dtype=self._dtype)  # every batch of columns is unfolded into this buffer
         report_at = {-(-n_rounds // 2), n_rounds} if whole else set()
 
-        def fold(t: int, partials: list[np.ndarray]) -> None:
-            """Scales a finished task's partial sums and folds them into the running sums of its frequency."""
+        def fold(r: int, t: int, partials: list[np.ndarray]) -> None:
+            """Scales a finished task's partial sums (this rank's rows) and folds them into the running sums of its
+            rank and frequency."""
             v = t // n_b
             for out, partial in enumerate(partials):
                 partial *= scale
                 sums = self._sums[out]
-                if v not in sums:
-                    mine = self._owner[v] == rank
-                    sums[v] = self._results[out][v - self._my_v[0]] if mine else np.empty_like(partial)
-                    np.copyto(sums[v], partial)
+                if (r, v) not in sums:
+                    sums[(r, v)] = partial
                 else:
-                    sums[v] += partial
+                    sums[(r, v)] += partial
 
         # deferred_collection batches the gc pass of the per-batch object releases into one collection at the end
         with deferred_collection():
             for k in range(n_rounds):
                 round_of = [tasks[k * per_round : (k + 1) * per_round] for tasks in tasks_of]
                 index_of = [columns(tasks) for tasks in round_of]
-                received = [
+                # every rank receives its columns into its block of a node-shared window, read by the whole node
+                received, windows = [], []
+                for kernel, layout in zip(kernels, layouts):
+                    middle = kernel.mat.shape[1:-2] if layout is None else (len(layout[1][0]),)
+                    sizes = [k_grid.nk_irr * int(np.prod(middle)) * len(index_of[r][0]) for r in self._members]
+                    flat, win = mpi_utils.allocate_node_shared_array(self._node, (sum(sizes),), self._dtype)
+                    starts = np.concatenate(([0], np.cumsum(sizes)))
+                    views = {
+                        r: flat[starts[m] : starts[m + 1]].reshape(k_grid.nk_irr, *middle, len(index_of[r][0]))
+                        for m, r in enumerate(self._members)
+                    }
                     mpi_utils.transpose_columns(
-                        kernel.mat, self._dist, index_of, self._TRANSPOSE_TAG, None if layout is None else layout[1]
+                        kernel.mat,
+                        self._dist,
+                        index_of,
+                        self._TRANSPOSE_TAG,
+                        None if layout is None else layout[1],
+                        out=views[rank],
                     )
-                    for kernel, layout in zip(kernels, layouts)
-                ]
-                # this rank's columns as (task, bosonic frequency), in the order of its received blocks
-                mine = [(t, w) for t in round_of[rank] for w in blocks[t % n_b][1]]
-                partials = {}
-                for c0 in range(0, len(mine), batch):
-                    chunk = mine[c0 : c0 + batch]
-                    for t, _ in chunk:
-                        if t not in partials:
-                            partials[t] = [np.zeros((n_r, nb, nb), dtype=self._dtype) for _ in self._sums]
-                    for i, block in enumerate(received):
-                        n_values = len(chunk) * n_r * int(np.prod(shapes[i]))
-                        out_buf = buffer[:n_values].reshape(n_r, *shapes[i], len(chunk))
-                        src = block[..., c0 : c0 + len(chunk)].reshape(-1, *shapes[i], len(chunk))
-                        cols = FourPoint(src, SpinChannel.NONE, config.lattice.nk, 1, 0, False, True, True)
-                        if scattered:
-                            cols = cols.scatter_to_full_bz(k_grid, out=out_buf)
-                        else:
-                            cols = cols.map_to_full_bz(k_grid, out=out_buf)
-                        cols = cols.fft(copy=False, axes=(2, 1, 0))
-                        for j, (t, w) in enumerate(chunk):
-                            v, negative = t // n_b, blocks[t % n_b][0]
-                            col = FourPoint(
-                                cols[..., j : j + 1], SpinChannel.NONE, config.lattice.nk, 1, 0, False, True, True
-                            )
-                            # time reversal of real hoppings conjugates at fixed R: K^{-w,v}(R) = conj(K^{w,-v}(R))
-                            if negative:
-                                col = col.conj(copy=False)
-                            k_mat = col.mat[..., 0]
-                            for _, out, g_r, giwk_niv in (term for term in terms if term[0] == i):
-                                g_slab = g_r[giwk_niv + (w if negative else -w) + v]
-                                if layouts[i] is not None:
-                                    self._contract_blocks(g_slab, k_mat, layouts[i][0], acc, rows)
-                                else:
-                                    for r0 in range(0, n_r, rows):
-                                        np.einsum(
-                                            "Rad,Raijd->Rij",
-                                            g_slab[r0 : r0 + rows],
-                                            k_mat[r0 : r0 + rows],
-                                            out=acc[r0 : r0 + rows],
-                                            optimize=path,
-                                        )
-                                np.add(partials[t][out], acc, out=partials[t][out])
-                        cols.free()
-                    # every task except one continuing into the next batch is complete
-                    following = mine[c0 + len(chunk)][0] if c0 + len(chunk) < len(mine) else None
-                    for t in [t for t in partials if t != following]:
-                        fold(t, partials.pop(t))
+                    received.append(views)
+                    windows.append(win)
+                self._barrier()
+                for r in self._members:
+                    # rank r's columns as (task, bosonic frequency), in the order of its received blocks
+                    mine = [(t, w) for t in round_of[r] for w in blocks[t % n_b][1]]
+                    partials = {}
+                    for c0 in range(0, len(mine), batches[r]):
+                        chunk = mine[c0 : c0 + batches[r]]
+                        for t, _ in chunk:
+                            if t not in partials:
+                                partials[t] = [np.zeros((n_rows, nb, nb), dtype=self._dtype) for _ in self._sums]
+                        for i, views in enumerate(received):
+                            n_values = len(chunk) * n_r * int(np.prod(shapes[i]))
+                            out_buf = buffer[:n_values].reshape(n_r, *shapes[i], len(chunk))
+                            src = views[r][..., c0 : c0 + len(chunk)].reshape(-1, *shapes[i], len(chunk))
+                            cols = FourPoint(src, SpinChannel.NONE, config.lattice.nk, 1, 0, False, True, True)
+                            if scattered:
+                                cols.scatter_to_full_bz(k_grid, out=out_buf, rows=mine_rows)
+                            else:
+                                cols.map_to_full_bz(k_grid, out=out_buf, rows=mine_rows)
+                            self._barrier()
+                            self._transform(out_buf)
+                            for j, (t, w) in enumerate(chunk):
+                                v, negative = t // n_b, blocks[t % n_b][0]
+                                k_mat = out_buf[mine_rows, ..., j]
+                                # time reversal of real hoppings conjugates at fixed R: K^{-w,v}(R) = conj(K^{w,-v}(R))
+                                if negative:
+                                    np.conjugate(k_mat, out=k_mat)
+                                for _, out, g_r, giwk_niv in (term for term in terms if term[0] == i):
+                                    g_slab = g_r[giwk_niv + (w if negative else -w) + v, mine_rows]
+                                    if layouts[i] is not None:
+                                        self._contract_blocks(g_slab, k_mat, layouts[i][0], acc, rows)
+                                    else:
+                                        for r0 in range(0, n_rows, rows):
+                                            np.einsum(
+                                                "Rad,Raijd->Rij",
+                                                g_slab[r0 : r0 + rows],
+                                                k_mat[r0 : r0 + rows],
+                                                out=acc[r0 : r0 + rows],
+                                                optimize=path,
+                                            )
+                                    np.add(partials[t][out], acc, out=partials[t][out])
+                            # every rank of the node is done with the buffer before the next batch is unfolded into it
+                            self._barrier()
+                            cols.free()
+                        # every task except one continuing into the next batch is complete
+                        following = mine[c0 + len(chunk)][0] if c0 + len(chunk) < len(mine) else None
+                        for t in [t for t in partials if t != following]:
+                            fold(r, t, partials.pop(t))
                 del received
+                self._barrier()
+                for win in windows:
+                    if win is not None:
+                        win.Free()
                 if k + 1 in report_at:
                     config.logger.info(f"Self-energy contraction: {k + 1} of {n_rounds} column rounds done.")
+        buffer = None
+        if buffer_win is not None:
+            buffer_win.Free()
 
     def _last_pair_layout(self, kernel: FourPoint) -> tuple[list[np.ndarray], tuple[np.ndarray, ...]] | None:
         r"""
@@ -1815,9 +2052,10 @@ class _ColumnSdeStream:
 
     def finish(self, out: int) -> SelfEnergy | None:
         r"""
-        Reduces output ``out`` after the last group (collective): the owner of :math:`\nu` folds the other ranks' sums
-        in rank order and, on a grid with a point group, averages the result over it; rank 0 gathers the result, and
-        the output's slabs are released.
+        Reduces output ``out`` after the last group (collective): the running sums of the node's ranks are assembled
+        from the rows every rank of the node holds of them, the owner of :math:`\nu` folds the other ranks' sums in
+        rank order and, on a grid with a point group, averages the result over it; rank 0 gathers the result, and the
+        output's slabs are released.
 
         :param out: The output index.
         :return: The real-space self-energy :class:`SelfEnergy` of the output for :math:`\nu \geq 0` (compressed
@@ -1830,28 +2068,43 @@ class _ColumnSdeStream:
         comm, rank, size = self._dist.comm, self._dist.my_rank, self._dist.mpi_size
         n_r, nb = config.lattice.k_grid.nk_tot, config.sys.n_bands
         n_b, bounds, owner, my_v = len(self._blocks), self._bounds, self._owner, self._my_v
-        sums, result = self._sums[out], self._results[out]
-        self._sums[out] = self._results[out] = None
+        sums = self._sums[out]
+        self._sums[out] = None
+
+        # every rank of the node holds the same keys, its rows of every sum; a rank's own sums are whole after this
+        keys = sorted(sums)
+        slabs, win = mpi_utils.allocate_node_shared_array(self._node, (len(keys), n_r, nb, nb), self._dtype)
+        for i, key in enumerate(keys):
+            slabs[i, self._rows] = sums.pop(key)
+        self._barrier()
+        own = {v: i for i, (r, v) in enumerate(keys) if r == rank}
 
         # every rank's run starts inside at most one foreign frequency; its owner folds the sums in rank order
         def ranks_of(v: int) -> list[int]:
             """The ranks holding blocks of frequency ``v`` (a nonempty overlap of task runs), in rank order."""
             return [r for r in range(size) if max(bounds[r], v * n_b) < min(bounds[r + 1], (v + 1) * n_b)]
 
-        sends = [(int(owner[v]), sums[v]) for v in sums if owner[v] != rank]
+        sends = [(int(owner[v]), slabs[i]) for v, i in own.items() if owner[v] != rank]
         sources = [r for v in my_v for r in ranks_of(v) if r != rank]
         received = iter(mpi_utils.exchange_blocks(comm, sends, sources, (n_r, nb, nb), self._dtype, self._PARTIAL_TAG))
+        # the owned frequencies are consecutive keys of this rank, so their slabs are one block of the window
+        result = slabs[own[my_v[0]] : own[my_v[0]] + my_v.size] if my_v.size else slabs[:0]
         for i, v in enumerate(my_v):
             for r in ranks_of(v):
                 if r != rank:
                     result[i] += next(received)
             if self._actions is not None:
                 result[i] = symmetry_reduction.project_onto_point_group(result[i], *self._actions)
-        del sends, sums
+        del sends
 
         full = MpiDistributor(ntasks=config.box.niv_core, comm=comm, sizes=np.bincount(owner, minlength=size)).gather(
             result
         )
+        # the node's other ranks may still read their slabs of the window
+        result = slabs = None
+        self._barrier()
+        if win is not None:
+            win.Free()
         if rank != 0:
             return None
         return SelfEnergy(
@@ -1871,6 +2124,7 @@ def _run_column_sde(
     giwk_niv: int,
     chunk_bytes: int | None = None,
     symmetric: bool = False,
+    node_comm=None,
 ) -> SelfEnergy | None:
     r"""
     Contracts the self-energy kernel with the Green's function,
@@ -1892,11 +2146,13 @@ def _run_column_sde(
     :param chunk_bytes: Byte budget of one round of transposed irreducible columns (``None`` uses the floor).
     :param symmetric: Whether the kernel and the Green's function obey the grid's point group, so the columns are
         scattered instead of unfolded (see :class:`_ColumnSdeStream`).
+    :param node_comm: The node-local communicator whose ranks share the column work of their tasks (see
+        :class:`_ColumnSdeStream`), or ``None`` for every rank working alone.
     :return: The real-space self-energy :class:`SelfEnergy` for :math:`\nu \geq 0` (compressed momentum axis, moments
         not fitted) on rank 0; ``None`` elsewhere. Transform it back with :meth:`SelfEnergy.ifft` and complete it
         with :meth:`SelfEnergy.to_full_niv_range`.
     """
-    stream = _ColumnSdeStream(mpi_dist_irrk, 1, kernel_irr.mat.dtype, chunk_bytes)
+    stream = _ColumnSdeStream(mpi_dist_irrk, 1, kernel_irr.mat.dtype, chunk_bytes, node_comm=node_comm)
     stream.add_group((0, config.box.niw_core + 1), [kernel_irr], [(0, 0, g_r, giwk_niv)], symmetric)
     return stream.finish(0)
 
@@ -1936,6 +2192,25 @@ def _has_point_group_covariance(mat: np.ndarray, comm: MPI.Comm | None = None, b
             diff = max(diff, float(np.abs(mat[idx[r0 : r0 + len(rows)]] - rotated).max()))
     if size > 1:
         diff, scale = (max(values) for values in zip(*comm.allgather((diff, scale))))
+    return diff <= bound * scale
+
+
+def _has_time_reversal_covariance(mat: np.ndarray, bound: float) -> bool:
+    r"""
+    Returns whether a self-energy on the whole grid obeys the time reversal of real hoppings,
+    :math:`\Sigma^{(\mathbf{k},\nu)}_{12} = \Sigma^{(-\mathbf{k},\nu)}_{21}`, to ``bound`` relative to its largest
+    entry. It checks blocks of rows against the rows of their time-reversed partners, so no copy of it is held.
+
+    :param mat: The self-energy ``[k, o1, o2, v]`` (compressed momentum axis) on the configured grid; only read.
+    :param bound: The relative bound.
+    :return: Whether the self-energy obeys the relation on every momentum and frequency.
+    """
+    partners = BubbleGenerator._reversed_momenta(config.lattice.k_grid.nk)
+    diff = scale = 0.0
+    for r0 in range(0, len(mat), 64):
+        rows = mat[r0 : r0 + 64]
+        scale = max(scale, float(np.abs(rows).max()))
+        diff = max(diff, float(np.abs(rows - mat[partners[r0 : r0 + 64]].swapaxes(1, 2)).max()))
     return diff <= bound * scale
 
 
@@ -2057,6 +2332,16 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int, bool
     grid whose point group shears the grid axes: the Fourier interpolation along each axis does not commute with those
     operations. A start that obeys the group to that accuracy keeps its bits.
 
+    Where the cycle averages its proposals with their time-reversed partners (several orbitals and a dispersion with
+    real hoppings, see :func:`_has_time_reversal` and :func:`calculate_sigma_proposal`), a starting self-energy that
+    does not obey time reversal to ``1e-12`` of its largest entry (see :func:`_has_time_reversal_covariance`) is then
+    averaged with its time-reversed partner as well (see :meth:`SelfEnergy.symmetrize_time_reversal`), so the bubble
+    takes its orbital-transpose and crossing routes from the first iteration on (see
+    :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_q_fft`). Such a start is, for example, one in
+    which an inversion that permutes the orbitals, such as the layer swap of a bilayer, holds only to rounding: the
+    unfold onto the point group carries that rounding into time reversal. A start that obeys time reversal to that
+    accuracy keeps its bits.
+
     :param default_sigma: The fallback (DMFT) :class:`SelfEnergy` used when no previous result is found; whether it
         obeys the grid's point group decides the unfold of the starting self-energy.
     :return: A tuple of the starting :class:`SelfEnergy` (cut to the core box and interpolated onto the k-grid), the
@@ -2104,6 +2389,14 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int, bool
         if not _has_point_group_covariance(sigma.compress_q_dimension().mat, bound=1e-12):
             config.logger.info("The starting self-energy obeys the point group only approximately: it is unfolded.")
             sigma.unfold_irreducible_momenta(config.lattice.k_grid)
+        sigma.decompress_q_dimension()
+    if sigma.n_bands > 1 and _has_time_reversal(config.lattice.hamiltonian.get_ek()):
+        if not _has_time_reversal_covariance(sigma.compress_q_dimension().mat, bound=1e-12):
+            config.logger.info(
+                "The starting self-energy obeys time reversal only approximately: it is averaged with its "
+                "time-reversed partner."
+            )
+            sigma.symmetrize_time_reversal()
         sigma.decompress_q_dimension()
     return sigma, max_iter, True
 
@@ -2366,6 +2659,18 @@ def _free_shared_window(win, node_comm) -> None:
     win.Free()
 
 
+def irreducible_momentum_distributor(comm: MPI.Comm) -> MpiDistributor:
+    """
+    Returns the distributor of the irreducible momenta, its larger counts spread evenly over the ranks (see
+    :func:`~dgamore.mpi_utils.even_bounds`). The self-consistency loop and the Eliashberg step both build it here, so
+    the Eliashberg step reads the per-rank files of the loop with the split that wrote them.
+
+    :param comm: The MPI communicator.
+    :return: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    """
+    return MpiDistributor.create_distributor(config.lattice.k_grid.nk_irr, comm, spread=True)
+
+
 def scatter_irreducible_interaction(v_nonloc: Interaction | None, mpi_dist_irrk: MpiDistributor) -> Interaction:
     r"""
     Returns this rank's irreducible momenta of the non-local interaction :math:`V^{\mathbf{q}}`, which only rank 0
@@ -2386,17 +2691,47 @@ def scatter_irreducible_interaction(v_nonloc: Interaction | None, mpi_dist_irrk:
     return Interaction(mpi_dist_irrk.scatter(rows), channel, config.lattice.k_grid.nk, has_compressed_q_dimension=True)
 
 
+def _share_array_per_node(
+    arr: np.ndarray | None, comm: MPI.Comm, node_comm, roots_comm
+) -> tuple[np.ndarray, MPI.Win | None]:
+    r"""
+    Hands rank 0's array to every rank as a view of one MPI shared-memory window per node: every node allocates its
+    window (see :func:`dgamore.mpi_utils.allocate_node_shared_array`), the other node roots receive the array straight
+    into theirs through a chunked broadcast over ``roots_comm`` while rank 0 sends from its own array, which it copies
+    into its window afterwards, and the rest of each node sleeps (see :func:`dgamore.mpi_utils.idle_barrier`). Every
+    other rank must treat the buffer as read-only.
+
+    :param arr: The array to share; only read on rank 0.
+    :param comm: The MPI communicator.
+    :param node_comm: The node-local (shared-memory) communicator, or ``None`` on a single rank.
+    :param roots_comm: Communicator over exactly the node-root ranks (global rank 0 first), or ``None`` on a single
+        rank.
+    :return: The tuple ``(array, win)`` of this rank's view of its node's buffer and the MPI shared-memory window
+        (``None`` for a single-rank node); free the window via :func:`_free_shared_window` once no rank reads it.
+    """
+    shape, dtype = comm.bcast((arr.shape, arr.dtype) if comm.rank == 0 else None, root=0)
+    shared, win = mpi_utils.allocate_node_shared_array(node_comm, shape, dtype)
+    arr = np.ascontiguousarray(arr) if comm.rank == 0 else None
+    if node_comm is not None and node_comm.rank == 0:
+        mpi_utils.bcast_rows_into(roots_comm, arr if comm.rank == 0 else shared, root=0)
+    # rank 0 sends from its own array first, so the other roots never wait for its copy into the window
+    if comm.rank == 0 and win is None:
+        shared = arr
+    elif comm.rank == 0:
+        shared[...] = arr
+    if node_comm is not None:
+        mpi_utils.idle_barrier(node_comm)
+    return shared, win
+
+
 def _share_sigma_per_node(
     sigma: SelfEnergy | None, comm: MPI.Comm, node_comm, roots_comm
 ) -> tuple[SelfEnergy, MPI.Win | None]:
     r"""
     Hands rank 0's full-BZ self-energy to every rank as a view of one per-node MPI shared-memory window: rank 0
-    compresses the momenta and broadcasts the object without its array (a small pickled blob), every node allocates its
-    window (see :func:`dgamore.mpi_utils.allocate_node_shared_array`), rank 0 copies the array into its own and the
-    other node roots receive it straight into theirs through a chunked broadcast over ``roots_comm``, while the rest of
-    each node sleeps (see :func:`dgamore.mpi_utils.idle_barrier`). The self-consistency loop thereby holds the full-BZ
-    self-energy **once per node instead of once per rank**, and only the node roots ever receive it. Every rank gets
-    its own :class:`SelfEnergy` object; only the buffer is shared and must be treated as read-only (every consumer
+    compresses the momenta and broadcasts the object without its array (a small pickled blob), and the array reaches
+    every node's window once (see :func:`_share_array_per_node`), so only the node roots ever receive it. Every rank
+    gets its own :class:`SelfEnergy` object; only the buffer is shared and must be treated as read-only (every consumer
     copies via ``cut_niv``/``copy``/``concatenate`` before writing).
 
     :param sigma: The :class:`SelfEnergy` to share; only read on rank 0.
@@ -2411,21 +2746,173 @@ def _share_sigma_per_node(
     if comm.rank == 0:
         sigma = sigma.compress_q_dimension()
         mat, sigma.mat = sigma.mat, None
-    blob = (pickle.dumps(sigma), mat.shape, mat.dtype) if comm.rank == 0 else None
-    blob, shape, dtype = comm.bcast(blob, root=0)
-    sigma = pickle.loads(blob)
-    shared, win = mpi_utils.allocate_node_shared_array(node_comm, shape, dtype)
-    mat = np.ascontiguousarray(mat) if comm.rank == 0 else None
-    if node_comm.rank == 0:
-        mpi_utils.bcast_rows_into(roots_comm, mat if comm.rank == 0 else shared, root=0)
-    # rank 0 sends from its own array first, so the other roots never wait for its copy into the window
-    if comm.rank == 0 and win is None:
-        shared = mat
-    elif comm.rank == 0:
-        shared[...] = mat
-    mpi_utils.idle_barrier(node_comm)
-    sigma.mat = shared
+    sigma = pickle.loads(comm.bcast(pickle.dumps(sigma) if comm.rank == 0 else None, root=0))
+    sigma.mat, win = _share_array_per_node(mat, comm, node_comm, roots_comm)
     return sigma, win
+
+
+@dataclass
+class _RowLayout:
+    r"""
+    The momentum rows of the loop's mixing: every rank owns the contiguous block ``rows`` of the flat momenta for the
+    whole run (its rows of the mixing history), and every node the contiguous block ``bounds[n]:bounds[n + 1]`` of
+    the rows of its ranks, nodes numbered as their roots in ``roots_comm`` (rank 0's node first).
+
+    :ivar rows: This rank's rows.
+    :ivar owners: The communicator over the ranks that own rows, in the order of their rows (``None`` on a rank
+        without rows).
+    :ivar bounds: The first row of every node and the number of rows, shape ``[n_nodes + 1]``.
+    :ivar node: The number of this rank's node.
+    :ivar node_comm: The node-local communicator, or ``None`` on a single rank.
+    :ivar roots_comm: The communicator over the node roots, or ``None`` on a single rank.
+    """
+
+    rows: slice
+    owners: MPI.Comm | None
+    bounds: np.ndarray
+    node: int
+    node_comm: MPI.Comm | None
+    roots_comm: MPI.Comm | None
+
+
+def _row_layout(comm: MPI.Comm, node_comm, roots_comm, n_rows: int, one_owner: bool) -> _RowLayout:
+    r"""
+    Lays the momentum rows of the loop's mixing out over the ranks: ordered node by node, every rank a contiguous
+    block, the larger blocks first so rank 0 owns rows whenever any rank does, or every row on rank 0 with
+    ``one_owner``. Collective over ``comm``.
+
+    :param comm: The MPI communicator.
+    :param node_comm: The node-local communicator, or ``None`` on a single rank.
+    :param roots_comm: The communicator over the node roots, or ``None`` on a single rank.
+    :param n_rows: Number of momentum rows.
+    :param one_owner: Whether rank 0 owns every row (the Jacobian tracker reads the whole core).
+    :return: The :class:`_RowLayout` of this rank.
+    """
+    if node_comm is None:
+        return _RowLayout(slice(0, n_rows), comm, np.array([0, n_rows]), 0, None, None)
+    node = node_comm.bcast(roots_comm.rank if node_comm.rank == 0 else None, root=0)
+    ordered = comm.Split(0, node * comm.size + node_comm.rank)
+    sizes = np.zeros(comm.size, dtype=int)
+    if one_owner:
+        sizes[0] = n_rows
+    else:
+        sizes += n_rows // comm.size
+        sizes[: n_rows % comm.size] += 1
+    first, position = np.cumsum(sizes) - sizes, ordered.rank
+    rows = slice(int(first[position]), int(first[position] + sizes[position]))
+    nodes = ordered.allgather(node)
+    bounds = np.array([first[nodes.index(n)] for n in range(max(nodes) + 1)] + [n_rows])
+    owners = ordered.Split(0 if sizes[position] else 1)
+    ordered.Free()
+    if not sizes[position]:
+        owners.Free()
+        owners = None
+    return _RowLayout(rows, owners, bounds, node, node_comm, roots_comm)
+
+
+def _scatter_proposal_rows(core: np.ndarray, layout: _RowLayout) -> None:
+    r"""
+    Hands every node its block of the proposal's core rows: rank 0, which holds every row in the shared window of its
+    node, sends each other node root its node's block (one chunked message per node) into that node's shared window;
+    the other ranks of each node sleep meanwhile (see :func:`dgamore.mpi_utils.idle_barrier`). Collective over the
+    ranks of ``layout``.
+
+    :param core: This node's shared core window ``[k, o1, o2, v]`` (on rank 0's node the proposal's).
+    :param layout: The row layout of the mixing (see :func:`_row_layout`).
+    :return: None.
+    """
+    if layout.node_comm is None:
+        return
+    bounds = layout.bounds
+    if layout.node_comm.rank == 0 and layout.node == 0:
+        for n in range(1, len(bounds) - 1):
+            mpi_utils.send_rows(layout.roots_comm, core[bounds[n] : bounds[n + 1]], n, _PROPOSAL_ROWS_TAG)
+    elif layout.node_comm.rank == 0:
+        block = core[bounds[layout.node] : bounds[layout.node + 1]]
+        mpi_utils.recv_rows_into(layout.roots_comm, block, 0, _PROPOSAL_ROWS_TAG)
+    mpi_utils.idle_barrier(layout.node_comm)
+
+
+def _gather_mixed_rows(core: np.ndarray, layout: _RowLayout) -> None:
+    r"""
+    Completes every node's shared core window with the mixed rows of the other nodes: once the owners of a node have
+    written their rows, its root broadcasts the node's block to the other roots, node by node, straight into their
+    windows, while the other ranks of each node sleep (see :func:`dgamore.mpi_utils.idle_barrier`). Collective over
+    the ranks of ``layout``.
+
+    :param core: This node's shared core window ``[k, o1, o2, v]``, holding the mixed rows of its node's owners.
+    :param layout: The row layout of the mixing (see :func:`_row_layout`).
+    :return: None.
+    """
+    if layout.node_comm is None:
+        return
+    mpi_utils.idle_barrier(layout.node_comm)
+    if layout.node_comm.rank == 0:
+        for n in range(len(layout.bounds) - 1):
+            mpi_utils.bcast_rows_into(layout.roots_comm, core[layout.bounds[n] : layout.bounds[n + 1]], root=n)
+    mpi_utils.idle_barrier(layout.node_comm)
+
+
+def _build_iterate_window(
+    core: np.ndarray,
+    sigma_old: SelfEnergy,
+    shell: tuple,
+    node_comm,
+    beta: float,
+) -> tuple[SelfEnergy, MPI.Win | None, float]:
+    r"""
+    Builds the next iterate of the loop in a new shared window of every node, every rank of the node a contiguous
+    share of the momenta: the mixed core of the node's core window padded with the proposal's shell (see
+    :meth:`SelfEnergy.concatenate_self_energies`), whose frequencies are averaged with their time-reversed partners
+    when the proposal's core was (see :meth:`SelfEnergy.symmetrize_time_reversal`). After a damped step every row is
+    mixed over every frequency with the previous iterate, cut to the core and padded again from its outermost
+    frequency (see :meth:`SelfEnergy.shell_offset_from`), and takes the mixed core again. Every element holds the bits
+    of the mixing of the whole concatenated self-energies. Collective over ``node_comm``.
+
+    :param core: This node's shared core window ``[k, o1, o2, 2 niv_core]`` of the mixed rows.
+    :param sigma_old: The previous iterate (compressed momentum axis), on the whole grid or momentum-local.
+    :param shell: The tuple ``(donor, offset, average, donor_old, damped, alpha)`` of the proposal's shell donor, its
+        shell offset ``[k, o1, o2]`` (every momentum), whether its shell is averaged with its time-reversed partner,
+        the shell donor of the previous iterate, whether the step was damped and its mixing parameter.
+    :param node_comm: The node-local communicator, or ``None`` on a single rank.
+    :param beta: Inverse temperature :math:`\beta`.
+    :return: The tuple ``(sigma, win, removed)`` of this rank's :class:`SelfEnergy` viewing its node's new window
+        (moments not fitted), the window (``None`` for a single-rank node) and the largest change of the shell's
+        time-reversal average (zero without it).
+    """
+    donor, offset, average, donor_old, damped, alpha = shell
+    n_q, n_core, n_v = core.shape[0], core.shape[-1], 2 * donor.niv
+    window, win = mpi_utils.allocate_node_shared_array(node_comm, (*core.shape[:-1], n_v), core.dtype)
+    size, rank = (node_comm.Get_size(), node_comm.Get_rank()) if win is not None else (1, 0)
+    mine, every = slice(rank * n_q // size, (rank + 1) * n_q // size), slice(0, n_v)
+    view = lambda mat: SelfEnergy(mat, (len(mat), 1, 1), True, True, calc_smom=False, beta=beta)
+    padding = offset[mine] if len(offset) > 1 else offset
+    view(core[mine]).concatenate_self_energies(donor, shell_offset=padding, out=window[mine], frequencies=every)
+    sigma = SelfEnergy(window, config.lattice.k_grid.nk, True, True, calc_smom=False, beta=beta)
+    removed = 0.0
+    if average:
+        # the partners' rows are other ranks' padding
+        if win is not None:
+            node_comm.Barrier()
+        lo, hi = (n_v - n_core) // 2, (n_v + n_core) // 2
+        removed = max(
+            sigma.symmetrize_time_reversal(frequencies=f, momenta=mine) for f in (slice(0, lo), slice(hi, n_v))
+        )
+        if win is not None:
+            node_comm.Barrier()
+    if damped:
+        old_mat = sigma_old.compress_q_dimension().mat
+        for start in range(mine.start, mine.stop, _SHELL_ROWS):
+            chunk = slice(start, min(start + _SHELL_ROWS, mine.stop))
+            old = view(old_mat[chunk] if len(old_mat) > 1 else old_mat)
+            old_offset = old.shell_offset_from(donor_old)
+            old = old.cut_niv(n_core // 2).concatenate_self_energies(donor_old, shell_offset=old_offset)
+            mixed = alpha * view(window[chunk]) + (1 - alpha) * old
+            view(core[chunk]).concatenate_self_energies(mixed, out=window[chunk], frequencies=every)
+    if win is not None:
+        node_comm.Barrier()
+        removed = max(node_comm.allgather(removed))
+    return sigma, win, removed
 
 
 def _occupation_self_energy(
@@ -2645,36 +3132,62 @@ def _orbital_involution(ek: np.ndarray, orbitals: np.ndarray | None = None) -> n
     return restricted if np.any(restricted != np.arange(len(orbitals))) else None
 
 
+@dataclass
+class _Proposal:
+    r"""
+    The raw self-energy proposal of one iteration as a rank of rank 0's node holds it: the finished core window
+    ``[k, o1, o2, 2 niv_core]`` (compressed momentum axis) in a shared window of the node, and on rank 0 the
+    momentum-local donor of the shell frequencies, the shell offset ``[k, o1, o2]``, whether the shell is averaged
+    with its time-reversed partner and the largest change of the core's average. The shell frequencies are never
+    held: every node builds them for the next iterate (see :func:`_build_iterate_window`).
+
+    :ivar core: The finished core of the proposal, viewing the node's shared window.
+    :ivar win: The shared window of the core (``None`` on a single-rank node).
+    :ivar donor: The momentum-local self-energy of the shell frequencies (rank 0 only).
+    :ivar shell_offset: The momentum-dependent constant added to the shell frequencies (rank 0 only).
+    :ivar average: Whether the shell is averaged with its time-reversed partner (rank 0 only).
+    :ivar removed: The largest change of the core's time-reversal average (rank 0 only, ``None`` without it).
+    """
+
+    core: SelfEnergy
+    win: MPI.Win | None
+    donor: SelfEnergy | None = None
+    shell_offset: np.ndarray | None = None
+    average: bool = False
+    removed: float | None = None
+
+
 def _finish_proposal_on_node(
     core: SelfEnergy | None,
-    donor: SelfEnergy | None,
-    shell_offset: np.ndarray | None,
+    terms: list[np.ndarray] | None,
     average: bool,
     node_comm,
     unfold: bool = False,
-) -> tuple[SelfEnergy | None, float | None]:
+) -> tuple[SelfEnergy, MPI.Win | None, float | None]:
     r"""
-    Concatenates rank 0's core-box proposal with its shell donor (see :meth:`SelfEnergy.concatenate_self_energies`),
-    with ``unfold`` overwrites core frequencies that obey the grid's point group to rounding (see
-    :func:`_has_point_group_covariance`) with the unfold of their irreducible momenta (see
-    :meth:`SelfEnergy.unfold_irreducible_momenta`) and, with ``average``, averages it with its time-reversed partner
-    (see :meth:`SelfEnergy.symmetrize_time_reversal`), every rank of rank 0's node building its own contiguous share
-    of the result's frequencies in one shared-memory window. Every frequency is built on its own, so the result holds
-    the bits of rank 0 building it alone. The other ranks sleep while rank 0 finishes the core (see
-    :func:`dgamore.mpi_utils.idle_barrier`). Collective over ``node_comm``, whose root is rank 0.
+    Finishes the core of rank 0's proposal on rank 0's node: rank 0 copies the core into a shared window of the node,
+    and every rank of the node adds ``terms`` to its contiguous share of the momenta, in their order (each term
+    broadcast over the core or holding every momentum, see :meth:`SelfEnergy.add`); with ``unfold`` overwrites a core
+    that obeys the grid's point group to rounding (see :func:`_has_point_group_covariance`) with the unfold of its
+    irreducible momenta, every rank the stars of its share of them (see :meth:`SelfEnergy.unfold_irreducible_momenta`);
+    and with ``average`` averages the core with its time-reversed partner, every rank the pairs whose smaller momentum
+    is its own (see :meth:`SelfEnergy.symmetrize_time_reversal`). The core holds the bits of rank 0 finishing the
+    concatenated proposal alone; its shell is every node's to build (see :func:`_build_iterate_window`). The other
+    ranks sleep while rank 0 arrives (see :func:`dgamore.mpi_utils.idle_barrier`). Collective over ``node_comm``,
+    whose root is rank 0.
 
-    :param core: The core-box proposal on rank 0; ignored elsewhere.
-    :param donor: The momentum-local shell donor on rank 0; ignored elsewhere.
-    :param shell_offset: The shell offset ``[q, o1, o2]`` on rank 0 (see :meth:`SelfEnergy.concatenate_self_energies`);
-        ignored elsewhere.
+    :param core: The core proposal on rank 0 (full fermionic range); ignored elsewhere.
+    :param terms: The arrays added to the core on rank 0, each ``[1, o1, o2, ...]`` or ``[k, o1, o2, ...]`` in the
+        compressed momentum layout; ignored elsewhere.
     :param average: Whether the proposal is averaged with its time-reversed partner; only read on rank 0.
     :param node_comm: The node-local communicator of rank 0's node.
-    :param unfold: Whether core frequencies (the contraction's own) that obey the grid's point group to rounding
-        are unfolded from their irreducible momenta before the average, so they obey it without rounding on every
-        momentum; a core that does not obey the group, e.g. through a local term that breaks it, is kept. Only read
-        on rank 0.
-    :return: The tuple ``(sigma, removed)`` of rank 0's private full-box proposal (compressed momentum axis) and the
-        largest change of the average (``None`` without it); ``(None, None)`` on every other rank.
+    :param unfold: Whether a core that obeys the grid's point group to rounding is unfolded from its irreducible
+        momenta before the average, so it obeys the group without rounding on every momentum; a core that does not
+        obey the group, e.g. through a local term that breaks it, is kept. Only read on rank 0.
+    :return: The tuple ``(core, win, removed)`` on every rank of the node: the finished core (compressed momentum
+        axis) viewing the node's shared window, the window (``None`` on a single-rank node; free it with
+        :func:`_free_shared_window` once no rank reads the core) and the largest change of the core's average
+        (``None`` without it).
     """
     mpi_utils.idle_barrier(node_comm)
     root = node_comm.Get_rank() == 0
@@ -2682,42 +3195,39 @@ def _finish_proposal_on_node(
     if root:
         core = core.compress_q_dimension()
         mat, core.mat = core.mat, None
-    blob = pickle.dumps((core, donor, shell_offset, average, unfold, mat.shape, mat.dtype)) if root else None
-    core, donor, shell_offset, average, unfold, shape, dtype = pickle.loads(node_comm.bcast(blob, root=0))
+    blob = pickle.dumps((core, average, unfold, len(terms), mat.shape, mat.dtype)) if root else None
+    core, average, unfold, n_terms, shape, dtype = pickle.loads(node_comm.bcast(blob, root=0))
     core_mat, core_win = mpi_utils.allocate_node_shared_array(node_comm, shape, dtype)
     if root and core_win is None:
         core_mat = mat
     elif root:
         core_mat[...] = mat
     mat = None
-    mpi_utils.idle_barrier(node_comm)
+    shared = [mpi_utils.build_node_shared_array(node_comm, lambda i=i: terms[i]) for i in range(n_terms)]
     core.mat = core_mat
 
-    n_v = 2 * donor.niv
-    out, out_win = mpi_utils.allocate_node_shared_array(node_comm, (*shape[:-1], n_v), dtype)
-    size, rank = (node_comm.Get_size(), node_comm.Get_rank()) if out_win is not None else (1, 0)
-    mine = slice(rank * n_v // size, (rank + 1) * n_v // size)
-    sigma = core.concatenate_self_energies(donor, shell_offset=shell_offset, out=out, frequencies=mine)
-    if out_win is not None:
+    size, rank = (node_comm.Get_size(), node_comm.Get_rank()) if core_win is not None else (1, 0)
+    n_q, n_irr = shape[0], config.lattice.k_grid.nk_irr
+    mine = slice(rank * n_q // size, (rank + 1) * n_q // size)
+    rows = SelfEnergy(core_mat[mine], (mine.stop - mine.start, 1, 1), True, True, calc_smom=False, beta=config.sys.beta)
+    for term, _ in shared:
+        rows.add(term[mine] if len(term) > 1 else term, copy=False)
+    if core_win is not None:
         node_comm.Barrier()
-    # rank 0 fits the moments on the whole concatenation, before the average changes it, as a single build does
-    if root:
-        sigma = SelfEnergy(out, sigma.nq, sigma.full_niv_range, True, False, beta=sigma._beta)
-    mpi_utils.idle_barrier(node_comm)
-    # the contraction's own frequencies; the shell is its donor's, which no contraction has averaged
-    core_lo, core_hi = (n_v - shape[-1]) // 2, (n_v + shape[-1]) // 2
-    if unfold and _has_point_group_covariance(out[..., core_lo:core_hi], node_comm if out_win is not None else None):
-        inside = slice(max(mine.start, core_lo), min(mine.stop, core_hi))
-        sigma.unfold_irreducible_momenta(config.lattice.k_grid, frequencies=inside)
-    removed = sigma.symmetrize_time_reversal(frequencies=mine) if average else None
-    removed = node_comm.allgather(removed)
-    removed = max(removed) if average else None
+    if unfold and _has_point_group_covariance(core_mat, node_comm if core_win is not None else None):
+        irreducible = slice(rank * n_irr // size, (rank + 1) * n_irr // size)
+        core.unfold_irreducible_momenta(config.lattice.k_grid, irreducible=irreducible)
+        if core_win is not None:
+            node_comm.Barrier()
+    removed = None
+    if average:
+        removed = max(node_comm.allgather(core.symmetrize_time_reversal(momenta=mine)))
 
-    sigma = (sigma.copy() if out_win is not None else sigma) if root else None
-    core = core_mat = out = None
-    _free_shared_window(out_win, node_comm)
-    _free_shared_window(core_win, node_comm)
-    return sigma, removed if root else None
+    wins = [win for _, win in shared]
+    shared = term = rows = None
+    for win in wins:
+        _free_shared_window(win, node_comm)
+    return core, core_win, removed
 
 
 def calculate_sigma_proposal(
@@ -2739,14 +3249,17 @@ def calculate_sigma_proposal(
     lambda_previous: dict | None = None,
     static_magn: list | None = None,
     last_chi: dict | None = None,
-) -> SelfEnergy | None:
+    w_r_full: list | None = None,
+) -> _Proposal | None:
     r"""
     Returns the raw (un-mixed) DGA self-energy proposal :math:`S(\Sigma_{\mathrm{in}})` at chemical potential
     :math:`\mu`: Hartree/Fock, the Dyson Green's function, the bubble, the double-counting, density and magnetic
     kernels, and the FFT Schwinger-Dyson contraction, finished with the noise-removal term and the DMFT tail. The
     tail carries the momentum-dependent part of the Hartree-Fock term, i.e. the contribution of
-    :math:`V^{\mathbf{q}}`, which the impurity self-energy does not contain. For several orbitals on a lattice with
-    real hoppings the proposal is finally averaged with its time-reversed partner (see
+    :math:`V^{\mathbf{q}}`, which the impurity self-energy does not contain. The core frequencies are finished on rank
+    0's node by momentum rows (see :func:`_finish_proposal_on_node`) and returned in its shared window; the tail is
+    returned as its donor and its offset, from which every node builds the shell of the next iterate. For several
+    orbitals on a lattice with real hoppings the proposal is finally averaged with its time-reversed partner (see
     :meth:`~dgamore.self_energy.SelfEnergy.symmetrize_time_reversal`): the Schwinger-Dyson equation is one-sided,
     with the three-leg vertex on the first external orbital and the interaction on the second, time reversal maps it
     onto the mirrored form, and the average is the two-sided equation. One band needs no average, its one-sided
@@ -2754,7 +3267,7 @@ def calculate_sigma_proposal(
     contraction averages its result over the group and, where the Green's function obeys the group, scatters its
     kernel columns instead of unfolding them (see :class:`_ColumnSdeStream`). An orbital permutation that transposes
     the dispersion (see :func:`_orbital_involution`) reaches the bubble and the Bethe-Salpeter slices of both
-    channels. In the bare-vertex modes
+    channels, which the ranks of a node may share (see :func:`create_auxiliary_chi_r_q_sum`). In the bare-vertex modes
     (``config.misc.do_flex``, ``config.misc.do_rpa``) no local vertex is loaded and no Bethe-Salpeter slice is solved:
     the double-counting kernel takes the bare vertex (see :func:`calculate_bare_dc_kernel`) and each channel the RPA
     kernel of its RPA susceptibility (see :func:`calculate_rpa_kernel_r_q`), treated like the ladder's (see
@@ -2795,8 +3308,11 @@ def calculate_sigma_proposal(
         :func:`_finish_physical_susceptibility`), or ``None``.
     :param last_chi: Holder of the loop's latest physical susceptibility per channel (see
         :func:`_finish_physical_susceptibility`), or ``None``.
-    :return: The raw full-BZ proposal :class:`SelfEnergy` (DMFT tail attached) on rank 0; ``None`` on every other rank,
-        since only rank 0 mixes it, and on every rank with ``eliashberg_only``.
+    :param w_r_full: Holder of the real-space interactions of the two Hartree-Fock terms, :math:`U + V^{\mathbf{q}}`
+        and :math:`V^{\mathbf{q}}` alone (see :func:`real_space_interaction`), which rank 0 transforms into an empty
+        holder and reads from a filled one, or ``None`` to transform them every time; only read on rank 0.
+    :return: The proposal (see :class:`_Proposal`): its core on every rank of rank 0's node, with the donor and the
+        offset of its tail on rank 0; ``None`` on the other nodes, and on every rank with ``eliashberg_only``.
     """
     logger = config.logger
 
@@ -2810,7 +3326,17 @@ def calculate_sigma_proposal(
     # an orbital permutation that transposes the dispersion halves the bubble's orbital components and reaches the
     # Bethe-Salpeter slices of both channels
     involution = _orbital_involution(config.lattice.hamiltonian.get_ek(), config.sys.correlated_orbitals)
-    gchi0_q = BubbleGenerator.create_generalized_chi0_q_fft(
+    niv_sde, cut = config.box.niv_core + config.box.niw_core, []
+
+    def release() -> None:
+        """Cuts giwk to the box of the kernels and the SDE into a smaller node window and frees the full one, as
+        soon as the bubble has read giwk for the last time (its columns read only the real-space window)."""
+        cut.extend(_cut_and_reshare_giwk(giwk_full, giwk_win, shared_node_comm, niv_sde))
+        if giwk_win is not None:
+            giwk_full.mat = None
+        _free_shared_window(giwk_win, shared_node_comm)
+
+    blocks = BubbleGenerator.create_generalized_chi0_q_fft(
         mpi_dist_irrk,
         giwk_full,
         config.box.niw_core,
@@ -2819,21 +3345,18 @@ def calculate_sigma_proposal(
         config.sys.beta,
         node_comm=shared_node_comm,
         involution=involution,
+        blocks=True,
+        release=release,
     )
+    # the cut giwk stays one copy per node through the SDE
+    giwk_full, giwk_win = cut
 
-    logger.log_memory_usage("Gchi0_q_full", gchi0_q, comm.size)
-    # Cut giwk to the core box for the self-energy step. When node-shared, the node root cuts into a new, smaller
-    # per-node window and the large full-niv window is freed; the cut giwk stays one copy per node through the SDE.
-    old_giwk_win = giwk_win
-    giwk_full, giwk_win = _cut_and_reshare_giwk(
-        giwk_full, giwk_win, shared_node_comm, config.box.niv_core + config.box.niw_core
-    )
-    _free_shared_window(old_giwk_win, shared_node_comm)
+    logger.log_memory_usage("Gchi0_q_full", blocks, comm.size)
 
     # the local vertices are identical on every rank, so they are loaded once per node into shared windows; the
     # double-counting kernel only enters the SDE, which the Eliashberg-only pass skips
     bare_vertex = config.misc.bare_vertex
-    dc_contraction = tail_moment = None
+    tail_moment = f_dc_loc = None
     if not eliashberg_only and not bare_vertex:
         f_dc_loc, f_dc_win = _load_node_shared_local_vertex(
             shared_node_comm,
@@ -2841,16 +3364,16 @@ def calculate_sigma_proposal(
             SpinChannel.MAGN,
             axes=(4, 0, 1, 5, 2, 3, 6),  # the order contract_first_pair_with_local_vertex reads as a view
         )
-        dc_contraction = _contract_dc_vertex(f_dc_loc, gchi0_q)
+    # the full-box bubble is consumed bosonic window by bosonic window, so it never sits beside the whole core box
+    gchi0_q_full_sum, dc_contraction, gchi0_q_core = _bubble_box_parts(blocks, f_dc_loc, not bare_vertex)
+    if f_dc_loc is not None:
         f_dc_loc.mat = None
         if f_dc_win is None:
             f_dc_loc.free()
         _free_shared_window(f_dc_win, shared_node_comm)
 
-    gchi0_q_full_sum = gchi0_q.sum_over_all_vn(config.sys.beta).scale(1.0 / config.sys.beta)
     chunk_bytes = _sde_chunk_budget(comm, shared_node_comm) if chunk_budgets is None else chunk_budgets.sde
     if bare_vertex:
-        gchi0_q.free()
         # the RPA susceptibility needs the whole frequency sum of the bubble, so the box sum gets its tail
         tail = create_bubble_tail(gchi0_q_full_sum.n_bands, config.box.niw_core, config.box.niv_full, config.sys.beta)
         gchi0_q_full_sum.add(tail, copy=False)
@@ -2881,8 +3404,6 @@ def calculate_sigma_proposal(
         if kernel is not None:
             kernel = kernel.repeat_over_vn(config.box.niv_core, 1)
     else:
-        gchi0_q_core = gchi0_q.cut_niv(config.box.niv_core)
-        gchi0_q.free()
         logger.log_memory_usage("Gchi0_q_core", gchi0_q_core, comm.size)
 
         # the interaction is attached once the full-box bubble is freed, so its operand copy never sits beside the
@@ -2927,6 +3448,7 @@ def calculate_sigma_proposal(
             kernel=kernel,
             involution=involution,
             last_chi=last_chi,
+            node_comm=shared_node_comm,
         )
         gamma_dens.mat = None
         if gamma_dens_win is None:
@@ -2954,6 +3476,7 @@ def calculate_sigma_proposal(
             involution=involution,
             static_magn=static_magn,
             last_chi=last_chi,
+            node_comm=shared_node_comm,
         )
         gchi0_q_core_inv.free()
         gchi0_q_full_sum.free()
@@ -2985,34 +3508,36 @@ def calculate_sigma_proposal(
         giwk_full.mat = None
     _free_shared_window(giwk_win, shared_node_comm)
 
-    sigma_prop = _run_column_sde(kernel, mpi_dist_irrk, g_r, giwk_niv, chunk_bytes, symmetric)
+    # the node's ranks share the column work only where the budgets say so; each rank alone is faster where it fits
+    sde_node = shared_node_comm if chunk_budgets is None or chunk_budgets.sde_node else None
+    sigma_prop = _run_column_sde(kernel, mpi_dist_irrk, g_r, giwk_niv, chunk_bytes, symmetric, sde_node)
     kernel.free()
     g_r = None
     _free_shared_window(g_r_win, shared_node_comm)
 
-    # only rank 0 mixes, so only rank 0's node finishes the proposal; the others receive the mixed iterate once per node
+    # rank 0's node finishes the core of the proposal; every node builds the shell of the next iterate on its own
     if not shared_node_comm.bcast(comm.rank == 0, root=0):
         shared_node_comm.Free()
         return None
 
-    donor = shell_offset = None
+    terms = donor = shell_offset = None
     average = False
     if comm.rank == 0:
         sigma_prop = sigma_prop.ifft().to_full_niv_range()
         logger.info("Self-energy calculated from kernel.")
         logger.log_memory_usage("Non-local sigma", sigma_prop)
 
-        hartree, fock = get_hartree_fock(u_loc, v_nonloc_full)
+        zero_u = LocalInteraction(np.zeros_like(u_loc.mat))
+        if w_r_full is not None and not w_r_full:
+            w_r_full[:] = real_space_interaction(u_loc, v_nonloc_full), real_space_interaction(zero_u, v_nonloc_full)
+        w_r, w_r_v = w_r_full if w_r_full else (None, None)
+        hartree, fock = get_hartree_fock(u_loc, v_nonloc_full, w_r_mat=w_r)
         # the V^q part of Hartree-Fock is absent from the impurity self-energy padding the shell, so it is re-added
-        hartree_v, fock_v = get_hartree_fock(LocalInteraction(np.zeros_like(u_loc.mat)), v_nonloc_full)
+        hartree_v, fock_v = get_hartree_fock(zero_u, v_nonloc_full, w_r_mat=w_r_v)
         logger.info("Calculated Hartree and Fock terms.")
 
-        sigma_prop = sigma_prop + hartree + fock
-        logger.info("Full non-local self-energy calculated.")
-
-        # This is done to minimize noise. We remove some fluctuations from dmft that are included in the local
-        # self-energy calculated in this code and add the smooth dmft self-energy
-        sigma_prop += delta_sigma
+        # the noise-removal term takes the fluctuations of the local self-energy out and the smooth DMFT one in
+        terms = [hartree, fock, delta_sigma.mat.reshape(1, *delta_sigma.mat.shape[-3:])]
         donor, shell_offset = sigma_dmft, (hartree_v + fock_v)[..., 0]
         if config.misc.do_rpa:
             # RPA mode carries no DMFT self-energy: its shell is the whole Hartree-Fock term and the kernels' 1/iv tail
@@ -3022,15 +3547,14 @@ def calculate_sigma_proposal(
     # a grid whose contraction averages over a point group gets the core of a proposal that obeys the group unfolded
     # from its irreducible momenta, which removes the rounding of the transforms and of the terms added on rank 0
     unfold = comm.rank == 0 and config.lattice.k_grid.auto_point_group() is not None
-    sigma_prop, removed = _finish_proposal_on_node(sigma_prop, donor, shell_offset, average, shared_node_comm, unfold)
+    core, win, removed = _finish_proposal_on_node(sigma_prop, terms, average, shared_node_comm, unfold)
     shared_node_comm.Free()
     if comm.rank != 0:
-        return None
-    if average:
-        logger.info(f"Time-reversal average of the self-energy proposal: largest change {removed:.3e}.")
-    elif sigma_prop.n_bands > 1:
+        return _Proposal(core, win)
+    logger.info("Full non-local self-energy calculated.")
+    if not average and core.n_bands > 1:
         logger.info("The dispersion breaks time reversal (complex hoppings); the self-energy proposal is not averaged.")
-    return sigma_prop
+    return _Proposal(core, win, donor, shell_offset, average, removed)
 
 
 def interpolate_sigma(sigma: SelfEnergy, beta_target: float, niv_target: int, comm: MPI.Comm) -> SelfEnergy | None:
@@ -3091,7 +3615,7 @@ def _positive_core(sigma: SelfEnergy) -> np.ndarray:
     return core.reshape(-1, *core.shape[-3:])
 
 
-def _relative_core_residual(new_core: np.ndarray, old_core: np.ndarray) -> float:
+def _relative_core_residual(new_core: np.ndarray, old_core: np.ndarray, comm: MPI.Comm | None = None) -> float:
     r"""
     Returns the larger of the relative L2 residuals of the real and the imaginary part of two positive core windows
     (:func:`_positive_core`), :math:`\max\big(\lVert\mathrm{Re}\,(\Sigma_{\mathrm{new}} - \Sigma_{\mathrm{old}})\rVert
@@ -3100,25 +3624,27 @@ def _relative_core_residual(new_core: np.ndarray, old_core: np.ndarray) -> float
     frequencies of the window. Each part is measured against its own norm, so a change in the smaller part is not
     hidden by the larger one; a part whose norm vanishes is measured against :math:`\lVert\Sigma_{\mathrm{old}}\rVert`
     instead, and a vanishing old window has no relative residual (infinite). A local (single-k) old window is
-    broadcast against a full-BZ new one.
+    broadcast against a full-BZ new one. The norms are accumulated in double precision (see :func:`_squared_norm`);
+    with ``comm`` the windows hold this rank's momentum rows and the norms cover the rows of every rank in it.
 
     :param new_core: The positive core window of the new self-energy.
     :param old_core: The positive core window the residual is measured against.
+    :param comm: The communicator over the owners of the momentum rows, or ``None`` when the windows hold every row.
     :return: The larger of the two relative residuals as a float.
     """
     if old_core.shape[0] != new_core.shape[0]:
         old_core = np.broadcast_to(old_core, new_core.shape)
     diff = new_core - old_core
-    old_re, old_im = np.linalg.norm(old_core.real), np.linalg.norm(old_core.imag)
+    diff_re, diff_im, old_re, old_im = (
+        np.sqrt(_squared_norm(part, comm)) for part in (diff.real, diff.imag, old_core.real, old_core.imag)
+    )
     old_full = np.hypot(old_re, old_im)
     if not old_full:
         return float("inf")
-    return float(
-        max(np.linalg.norm(diff.real) / (old_re or old_full), np.linalg.norm(diff.imag) / (old_im or old_full))
-    )
+    return float(max(diff_re / (old_re or old_full), diff_im / (old_im or old_full)))
 
 
-def _relative_sigma_residual(sigma_new: SelfEnergy, sigma_old: SelfEnergy) -> float:
+def _relative_sigma_residual(sigma_new: SelfEnergy, sigma_old: SelfEnergy, comm: MPI.Comm | None = None) -> float:
     r"""
     Returns the relative residual of :func:`_relative_core_residual` between the positive fermionic core frequencies
     of two self-energies. Evaluated on the raw proposal it measures the mixing-independent distance to the fixed
@@ -3129,11 +3655,13 @@ def _relative_sigma_residual(sigma_new: SelfEnergy, sigma_old: SelfEnergy) -> fl
 
     :param sigma_new: The new self-energy (raw proposal or mixed iterate).
     :param sigma_old: The previous iterate the residual is measured against.
+    :param comm: The communicator over the owners of the momentum rows, or ``None`` when the self-energies hold every
+        row (see :func:`_relative_core_residual`).
     :return: The larger of the real-part and the imaginary-part relative residual as a float.
     """
     # both windows come in the compressed layout: mismatched layouts (rank 0's iterate is left decompressed by the
     # save path) would pair wrong momenta
-    return _relative_core_residual(_positive_core(sigma_new), _positive_core(sigma_old))
+    return _relative_core_residual(_positive_core(sigma_new), _positive_core(sigma_old), comm)
 
 
 def _jacobian_expander(state: dict) -> Callable[[np.ndarray], np.ndarray] | None:
@@ -3514,17 +4042,24 @@ def calculate_self_energy_q(
     logger.info("Initializing MPI distributor.")
 
     # MPI distributor for the irreducible BZ
-    mpi_dist_irrk = MpiDistributor.create_distributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
+    mpi_dist_irrk = irreducible_momentum_distributor(comm)
     irrk_q_list = config.lattice.k_grid.get_irrq_list()
     my_irr_q_list = irrk_q_list[mpi_dist_irrk.my_slice]
 
     mpi_dist_fullbz = MpiDistributor.create_distributor(ntasks=config.lattice.k_grid.nk_tot, comm=comm)
 
-    # the loop's full-BZ self-energy is held once per NODE (mixed on rank 0, broadcast to the node roots, then
-    # window-shared read-only); a single-rank run keeps rank 0's own array
+    # the loop's full-BZ self-energy is held once per NODE, window-shared read-only; a single-rank run keeps rank 0's
+    # own array. Every rank mixes a fixed block of momentum rows, rank 0 every row when the tracker reads the core
     sc_node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED) if comm.size > 1 else None
     sc_roots_comm = comm.Split(0 if sc_node_comm.rank == 0 else 1) if sc_node_comm is not None else None
     sigma_win = None
+    layout = _row_layout(
+        comm,
+        sc_node_comm,
+        sc_roots_comm,
+        config.lattice.k_grid.nk_tot,
+        one_owner=config.stabilization.use_jacobian_stabilization,
+    )
 
     # only rank 0 reads a previous run's iterate; the other ranks receive it below, once per node
     sigma_old, starting_iter, warm_start = get_starting_sigma(sigma_dmft) if comm.rank == 0 else (sigma_dmft, 0, False)
@@ -3536,16 +4071,16 @@ def calculate_self_energy_q(
 
     mu_history = _init_mu_history(warm_start)
 
-    # rank 0 keeps the accelerated-mixing (iterate, proposal) pair history in memory; the saved sigma files hold
-    # only post-mixing iterates (no proposals), so resumed runs start empty and re-arm as pairs accumulate
+    # every owner of momentum rows keeps the accelerated-mixing (iterate, proposal) pairs of its rows in memory; the
+    # saved sigma files hold only post-mixing iterates (no proposals), so resumed runs start empty and re-arm
     mixing_history = None
-    if comm.rank == 0 and config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson"):
+    if layout.owners is not None and config.self_consistency.mixing_strategy.lower() in ("pulay", "anderson"):
         mixing_history = []
 
-    # the tracker is built on every rank (a few floats) but only rank 0, which holds the proposal, ever feeds it; it
+    # the tracker is built on every rank (a few floats) but only rank 0, which owns every row then, ever feeds it; it
     # keeps its vectors, the recorded pair window included, on the weighted symmetry sector of the core window
     tracker = tracker_window = rows_lam = rows_res = rows_damping = stab_event_iter = None
-    # rank 0's positive core window of the previous proposal, refilled in place every iteration
+    # every owner's rows of the positive core window of the previous proposal, refilled in place every iteration
     previous_proposal = None
     if config.stabilization.use_jacobian_stabilization:
         from dgamore.sigma_jacobian import tracker_sector_maps
@@ -3671,8 +4206,10 @@ def calculate_self_energy_q(
     reference = sigma_dmft if config.misc.bare_vertex else sigma_local
     delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - reference.cut_niv(config.box.niv_core)
 
-    # only rank 0 finishes the proposal with the Hartree-Fock term, which reads the full q-grid interaction
+    # only rank 0 finishes the proposal with the Hartree-Fock term, which reads the full q-grid interaction; the first
+    # proposal transforms the interactions of both terms for the whole loop
     v_nonloc_full = v_nonloc if comm.rank == 0 else None
+    w_r_full = []
     if config.stabilization.use_jacobian_stabilization and comm.rank == 0 and np.any(v_nonloc.mat):
         held = " and the exact Jacobian holds the offset fixed" if config.stabilization.use_exact_jacobian else ""
         logger.warning(
@@ -3722,7 +4259,7 @@ def calculate_self_energy_q(
                     "do not move this threshold."
                 )
 
-        sigma_new = calculate_sigma_proposal(
+        proposal = calculate_sigma_proposal(
             sigma_old,
             mu_history[-1],
             u_loc,
@@ -3740,24 +4277,16 @@ def calculate_self_energy_q(
             lambda_previous=lambda_previous,
             static_magn=static_magn,
             last_chi=last_chi,
+            w_r_full=w_r_full,
         )
-        # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
-        # the map's own distance from a fixed point and the change of the proposal, read before the mixing overwrites it
-        map_residual = proposal_residual = None
-        if comm.rank == 0:
-            map_residual = _relative_sigma_residual(sigma_new, sigma_old)
-            if previous_proposal is not None:
-                proposal_residual = _relative_core_residual(_positive_core(sigma_new), previous_proposal)
-                previous_proposal[...] = _positive_core(sigma_new)
-            elif current_iter < last_iter:
-                previous_proposal = _positive_core(sigma_new).copy()
+        mpi_utils.idle_barrier(comm)  # the other nodes sleep while rank 0's node finishes the proposal
 
-        # the tracker decides on this iteration's pair before its step, while every rank still holds the iterate; it
-        # records sector vectors, so the core windows are read in place
+        # the tracker decides on this iteration's pair before its step, while every rank still holds the iterate and
+        # before the core rows leave rank 0's node; it records sector vectors, so the core windows are read in place
         if tracker is not None:
             request = None
             if comm.rank == 0:
-                tracker_window.append(tracker.record(*_core_pair(sigma_new, sigma_old, copy=False)))
+                tracker_window.append(tracker.record(*_core_pair(proposal.core, sigma_old, copy=False)))
                 del tracker_window[:-TRACKER_PAIRS]
                 if _update_jacobian_tracker(
                     tracker, tracker_window, current_iter, release_iter, anneal_reset_iter, annealer
@@ -3772,50 +4301,93 @@ def calculate_self_energy_q(
             if comm.rank == 0:
                 _append_jacobian_eigenvalues(tracker, rows_lam, rows_res, rows_damping)
 
-        # only rank 0 mixes and measures the residual, so only rank 0 keeps a private copy of the previous iterate
-        # (the cut copies everything still needed from the previous iteration's shared sigma buffer)
-        donor = sigma_dmft
-        if comm.rank == 0 and config.misc.do_rpa:
-            # RPA mode pads with its own tail again, whose moments the outermost frequency holds exactly
-            donor = _rpa_shell_donor(sigma_old.fit_smom(n_freq=1)[1], sigma_dmft.niv)
-        shell_offset = sigma_old.shell_offset_from(donor) if comm.rank == 0 else None
-        sigma_old = sigma_old.cut_niv(config.box.niv_core) if comm.rank == 0 else None
-        if saving is not None:
-            saving.result()
-        mpi_utils.idle_barrier(comm)  # the other ranks sleep while rank 0 finishes the proposal and its residuals
-        _free_shared_window(sigma_win, sc_node_comm)
-        sigma_win = None
+        # every node holds the proposal's shell inputs and its block of the core rows: rank 0's node every row in the
+        # proposal's window, every other node its block in a window of its own (the mixing overwrites both)
+        meta = None
+        if comm.rank == 0:
+            meta = proposal.core.mat.shape, proposal.core.mat.dtype, proposal.donor, proposal.average
+        core_shape, core_dtype, donor_new, average = comm.bcast(meta, root=0)
+        offset = proposal.shell_offset if comm.rank == 0 else None
+        offset, offset_win = _share_array_per_node(offset, comm, sc_node_comm, sc_roots_comm)
+        if proposal is not None:
+            core, core_win = proposal.core.mat, proposal.win
+        else:
+            core, core_win = mpi_utils.allocate_node_shared_array(sc_node_comm, core_shape, core_dtype)
+        core_removed = proposal.removed if comm.rank == 0 else None
+        proposal = meta = None
+        _scatter_proposal_rows(core, layout)
+
+        # this rank's rows of the proposal's core and of the iterate's core, read in place
+        rows, owners, beta = layout.rows, layout.owners, config.sys.beta
+        old_mat = sigma_old.compress_q_dimension().mat
+        n_old = old_mat.shape[-1] // 2
+        old_core = old_mat[..., n_old - config.box.niv_core : n_old + config.box.niv_core]
+        new_rows = old_rows = None
+        if owners is not None:
+            new_rows = SelfEnergy(core[rows], (rows.stop - rows.start, 1, 1), True, True, calc_smom=False, beta=beta)
+            old_rows = old_core[rows] if len(old_core) > 1 else old_core
+            old_rows = SelfEnergy(old_rows, (len(old_rows), 1, 1), True, True, calc_smom=False, beta=beta)
+
+        # the map's own distance from a fixed point and the change of the proposal, read before the mixing overwrites it
+        map_residual = proposal_residual = relative_residual = None
+        if owners is not None:
+            map_residual = _relative_sigma_residual(new_rows, old_rows, owners)
+            if previous_proposal is not None:
+                proposal_residual = _relative_core_residual(_positive_core(new_rows), previous_proposal, owners)
+                previous_proposal[...] = _positive_core(new_rows)
+            elif current_iter < last_iter:
+                previous_proposal = _positive_core(new_rows).copy()
+
+        # the shell donor of the iterate, whose shell the next one mixes; RPA mode pads with its own tail, whose
+        # moments the outermost frequency holds exactly
+        donor_old = sigma_dmft
+        if config.misc.do_rpa:
+            donor_old = _rpa_shell_donor(sigma_old.fit_smom(n_freq=1)[1], sigma_dmft.niv) if comm.rank == 0 else None
+            donor_old = comm.bcast(donor_old, root=0)
 
         logger.info("Applying mixing strategy to the self-energy.")
         history_cap = _mixing_history_cap(current_iter, release_iter, anneal_reset_iter, stab_event_iter)
-        # mixing runs on rank 0 only, the only rank holding the proposal; the mixed Sigma then reaches the other
-        # ranks once per node through a shared window instead of once per rank
+        # every owner mixes its rows into its node's core window: the accelerated step in place, a damped step copied
         damped_step = False
-        if comm.rank == 0:
-            sigma_old = sigma_old.concatenate_self_energies(donor, shell_offset=shell_offset)
+        if owners is not None:
             if config.stabilization.use_jacobian_stabilization:
                 # the record of the pairs the tracker reads: the core window, the rest is the shell tail and its offset
-                _save_sigma_iteration(sigma_new.cut_niv(config.box.niv_core), "sigma_dga_proposal", current_iter)
+                view = SelfEnergy(core, config.lattice.k_grid.nk, True, True, calc_smom=False, beta=beta)
+                _save_sigma_iteration(view, "sigma_dga_proposal", current_iter)
+            mixed = apply_mixing_strategy(new_rows, old_rows, history_cap, mixing_history, tracker, owners)
+            damped_step = mixed is not new_rows
+            if damped_step:
+                core[rows] = mixed.compress_q_dimension().mat
+            # Post-mixing step residual (the historical convergence measure; shrinks with the mixing parameter)
+            positive = core[rows][..., config.box.niv_core :]
+            relative_residual = _relative_core_residual(positive, _positive_core(old_rows), owners)
+            mixed = new_rows = old_rows = None
+        alpha = tracker.p_eff if tracker is not None else config.self_consistency.mixing
+        mpi_utils.idle_barrier(comm)  # the other ranks sleep while the owners mix (rank 0 alone with the tracker)
+        damped_step, alpha = comm.bcast((damped_step, alpha) if comm.rank == 0 else None, root=0)
 
-            mixed = apply_mixing_strategy(sigma_new, sigma_old, history_cap, mixing_history, tracker)
-            # an accelerated step returns the proposal's object, a damped step a new one
-            damped_step, sigma_new, mixed = mixed is not sigma_new, mixed, None
-        mpi_utils.idle_barrier(comm)  # the other ranks sleep while rank 0 mixes
-        if sc_node_comm is not None:
-            sigma_new, sigma_win = _share_sigma_per_node(sigma_new, comm, sc_node_comm, sc_roots_comm)
-
-        sigma_new = sigma_new.compress_q_dimension()
-
-        # Post-mixing step residual (the historical convergence measure; shrinks with the mixing parameter)
-        relative_residual = (
-            _relative_sigma_residual(sigma_new, sigma_old.compress_q_dimension()) if comm.rank == 0 else None
-        )
+        # every node completes its core window with the other nodes' rows and builds the next iterate in a new window,
+        # the shell of every row its own; the background write of the previous iterate reads the old window
+        _gather_mixed_rows(core, layout)
+        if saving is not None:
+            saving.result()
+        shell = donor_new, offset, average, donor_old, damped_step, alpha
+        sigma_new, new_win, shell_removed = _build_iterate_window(core, sigma_old, shell, sc_node_comm, beta)
+        if comm.rank == 0 and average:
+            removed = max(core_removed, shell_removed)
+            logger.info(f"Time-reversal average of the self-energy proposal: largest change {removed:.3e}.")
+        # no view into the freed windows survives them (the tracker's proposal record, the previous iterate's write)
+        core = offset = shell = sigma_old = old_mat = old_core = positive = view = None
+        for win in (core_win, offset_win, sigma_win):
+            _free_shared_window(win, sc_node_comm)
+        sigma_win = new_win
 
         # every rank solves mu on its momenta of the shared sigma; the moments are fitted on rank 0 alone, in RPA mode
         # from the outermost frequency, where its shell holds them exactly however short the shell is
         old_mu = mu_history[-1]
         n_freq = 1 if config.misc.do_rpa else None
         smom0, smom1 = comm.bcast(sigma_new.fit_smom(n_freq) if comm.rank == 0 else None, root=0)
+        sigma_new._smom0, sigma_new._smom1 = smom0, smom1
         donor = _rpa_shell_donor(smom1, sigma_dmft_full.niv) if config.misc.do_rpa else sigma_dmft_full
         sigma_rows, mu_dist, wedge = _lattice_sum_momenta(sigma_new, donor, mpi_dist_irrk, mpi_dist_fullbz, comm)
         config.sys.mu = update_mu(
@@ -3964,7 +4536,7 @@ def calculate_self_energy_q(
         saver.shutdown()
         if saving is not None:
             saving.result()
-    mixing_history = tracker_window = previous_proposal = None  # nothing after the loop reads them
+    mixing_history = tracker_window = previous_proposal = w_r_full = None  # nothing after the loop reads them
     if comm.rank == 0 and not config.self_consistency.save_sigma_iterates:
         _prune_sigma_iterates(current_iter)
     if tracker is not None and comm.rank == 0:
@@ -4019,8 +4591,11 @@ def calculate_self_energy_q(
     # only rank 0 reads the result after the loop: it keeps a private copy, every other rank drops its window view
     if sigma_win is not None:
         sigma_old.mat = sigma_old.mat.copy() if comm.rank == 0 else None
+        view = None  # rank 0's view of the last iterate, whose write has finished
         _free_shared_window(sigma_win, sc_node_comm)
     if sc_node_comm is not None:
+        if layout.owners is not None:
+            layout.owners.Free()
         sc_roots_comm.Free()
         sc_node_comm.Free()
 
@@ -4079,6 +4654,88 @@ def _real_rows(values: np.ndarray) -> list[tuple[slice, np.ndarray]]:
     return [(slice(0, values.size), values)]
 
 
+def _row_sum(partial: np.ndarray, comm: MPI.Comm | None) -> np.ndarray:
+    """
+    Sums the partial sums of the ranks that own momentum rows in rank order, so every rank gets the same bits.
+
+    :param partial: This rank's partial sum.
+    :param comm: The communicator over the owners of the rows, or ``None`` when this rank owns every row.
+    :return: The sum over the ranks.
+    """
+    return partial if comm is None else functools.reduce(np.add, comm.allgather(partial))
+
+
+def _squared_norm(values: np.ndarray, comm: MPI.Comm | None) -> float:
+    """
+    Returns the squared norm of a row-distributed vector, accumulated in double precision (a float64 copy of real
+    entries, a complex128 one of complex entries) in chunks of :data:`~dgamore.memory_estimator.GRAM_ROWS` entries
+    and summed over the owners of the rows (see :func:`_row_sum`).
+
+    :param values: This rank's rows of the vector (real or complex).
+    :param comm: The communicator over the owners of the rows, or ``None`` when this rank owns every row.
+    :return: The squared norm of the whole vector.
+    """
+    flat, total = values.reshape(-1), 0.0
+    wide = np.complex128 if np.iscomplexobj(values) else np.float64
+    for start in range(0, flat.size, GRAM_ROWS):
+        chunk = flat[start : start + GRAM_ROWS].astype(wide).view(np.float64)
+        total += np.dot(chunk, chunk)
+    return float(_row_sum(np.array(total), comm))
+
+
+def _least_squares_coefficients(
+    columns: np.ndarray, rhs: np.ndarray, tikhonov: bool, comm: MPI.Comm | None
+) -> tuple[np.ndarray | None, float]:
+    r"""
+    Solves the least-squares problem :math:`\min_c \lVert A c - b \rVert` of row-distributed real columns from the
+    augmented Gram matrix :math:`[A\,b]^T [A\,b]`, accumulated in double precision in chunks of
+    :data:`~dgamore.memory_estimator.GRAM_ROWS` rows (one float64 block, which every chunk overwrites) and summed over
+    the owners of the rows (see :func:`_row_sum`): with the eigendecomposition
+    :math:`A^T A = V \mathrm{diag}(\lambda) V^T` and the singular values :math:`s = \sqrt{\lambda}` of :math:`A`, the
+    directions with :math:`s \leq 10^{-5} s_{\max}` are dropped and :math:`c = V \mathrm{diag}(1/\lambda) V^T A^T b`
+    over the others, or :math:`c = V \mathrm{diag}(1/(\lambda + s_{\mathrm{cut}}^2)) V^T A^T b` with ``tikhonov``,
+    which are the truncated and the regularized pseudoinverse of the thin SVD of :math:`A` written with its Gram
+    matrix. The first owner solves and broadcasts the coefficients, so every owner takes the same step.
+
+    :param columns: This rank's rows of :math:`A`, shape ``[rows, m]``.
+    :param rhs: This rank's rows of :math:`b`.
+    :param tikhonov: Whether the kept directions are regularized by the cutoff instead of inverted.
+    :param comm: The communicator over the owners of the rows, or ``None`` when this rank owns every row.
+    :return: The tuple ``(c, norm_b)`` of the coefficients (``None`` when no direction survives the cutoff or the
+        eigendecomposition fails) and :math:`\lVert b \rVert`.
+    """
+    gram = np.zeros((columns.shape[1] + 1,) * 2)
+    block = np.empty((min(len(rhs), GRAM_ROWS), columns.shape[1] + 1))
+    for start in range(0, len(rhs), GRAM_ROWS):
+        rows = block[: min(GRAM_ROWS, len(rhs) - start)]
+        rows[:, :-1], rows[:, -1] = columns[start : start + len(rows)], rhs[start : start + len(rows)]
+        gram += rows.T @ rows
+    gram = _row_sum(gram, comm)
+    coeffs = _gram_solution(gram, tikhonov) if comm is None or comm.rank == 0 else None
+    return (coeffs if comm is None else comm.bcast(coeffs, root=0)), float(np.sqrt(gram[-1, -1]))
+
+
+def _gram_solution(gram: np.ndarray, tikhonov: bool) -> np.ndarray | None:
+    r"""
+    Returns the least-squares coefficients of :func:`_least_squares_coefficients` from its augmented Gram matrix.
+
+    :param gram: The augmented Gram matrix :math:`[A\,b]^T [A\,b]`.
+    :param tikhonov: Whether the kept directions are regularized by the cutoff instead of inverted.
+    :return: The coefficients, or ``None`` when no direction survives the cutoff or the eigendecomposition fails.
+    """
+    try:
+        lam, v = np.linalg.eigh(gram[:-1, :-1])
+    except np.linalg.LinAlgError:
+        return None
+    s = np.sqrt(np.clip(lam, 0.0, None))
+    cutoff = 1e-5 * (s.max() if s.size else 1.0)
+    mask = s > cutoff
+    if not np.any(mask):
+        return None
+    denominator = lam[mask] + cutoff**2 if tikhonov else lam[mask]
+    return v[:, mask] @ ((v[:, mask].T @ gram[:-1, -1]) / denominator)
+
+
 def _step_core_window(core: np.ndarray, iterate: np.ndarray, p_config: float, correction: np.ndarray) -> None:
     r"""
     Overwrites a core window that holds the proposal :math:`S(x)` with :math:`x + p\,(S(x) - x) + c` in place.
@@ -4101,6 +4758,7 @@ def apply_mixing_strategy(
     history_cap: int | None = None,
     mixing_history: list | None = None,
     tracker: JacobianTracker | None = None,
+    comm: MPI.Comm | None = None,
 ) -> SelfEnergy:
     r"""
     Applies the self-energy mixing strategy for the self-consistency loop. Supports linear mixing as well as the
@@ -4131,19 +4789,29 @@ def apply_mixing_strategy(
     windows (:meth:`JacobianTracker.reflection_is_settled`), only the step's component on the reflected subspace is
     replaced (:meth:`JacobianTracker.replace_flipped_component`), with a warning, and the rest of the step stands.
 
-    :param sigma_new: The freshly computed self-energy proposal.
-    :param sigma_old: The previous iteration's self-energy.
+    The accelerated schemes solve their least-squares problem from the double-precision Gram matrix of their secant
+    columns (see :func:`_least_squares_coefficients`). The two self-energies may hold a block of the momentum rows of
+    the whole self-energies (compressed momentum axis), as every rank of the self-consistency loop holds its own:
+    every step acts on each row on its own, except the Gram matrix and the norms of the clamp, which are summed over
+    the owners of the rows in ``comm`` (the first owner solving the Gram matrix for all of them), so every rank takes
+    the same decisions and its rows hold the whole step to rounding: the grouping of those sums and of the products
+    over blocks of rows. A tracker needs every row on one rank.
+
+    :param sigma_new: The freshly computed self-energy proposal (this rank's momentum rows).
+    :param sigma_old: The previous iteration's self-energy (the same rows, or momentum-local).
     :param history_cap: Optional upper bound on the number of secant pairs used by the accelerated schemes
         (``None`` for no bound). Used to reset the mixing history after the susceptibility-restriction release, so
         the accelerated schemes never extrapolate across the restricted-to-unrestricted discontinuity. Pairs keep
         being recorded while capped, so the history re-arms from genuine post-release pairs.
     :param mixing_history: Mutable list of (iterate, proposal) pairs of core-cut decompressed arrays, or with a
         tracker of their real vectors in its coordinates, the proposal the reflected one while a reflector is
-        installed, oldest first, maintained across iterations by the caller (rank 0 of the self-consistency loop).
-        This function appends the current pair and trims the list to the configured history length plus one. ``None``
-        disables both the recording and the accelerated schemes.
+        installed, oldest first, maintained across iterations by the caller (every owner of momentum rows of the
+        self-consistency loop, its own rows). This function appends the current pair and trims the list to the
+        configured history length plus one. ``None`` disables both the recording and the accelerated schemes.
     :param tracker: The :class:`JacobianTracker` owning the flipped subspace and the damping bound, or ``None`` to
         mix the raw proposal with the configured mixing parameter.
+    :param comm: The communicator over the owners of the momentum rows, whose Gram matrices and norms are summed in
+        rank order (see :func:`_row_sum`); ``None`` when the self-energies hold every row.
     :return: The mixed :class:`SelfEnergy` for the next iteration: ``sigma_new`` itself, its core window
         overwritten, after an accelerated step, and a new object after a damped step.
     """
@@ -4239,27 +4907,22 @@ def apply_mixing_strategy(
         for rows, part in _real_rows(get_result(-1) - get_proposal(-1)):
             f_i[rows] = part
         del part
-        norm_f = np.linalg.norm(f_i)
 
-        # Solve min||F @ c - f_i|| via truncated-SVD pseudoinverse (drops collinear directions)
-        u, s, vh = np.linalg.svd(f_matrix, full_matrices=False)
-        cutoff = 1e-5 * (s[0] if s.size else 1.0)
-        mask = s > cutoff
-        if not np.any(mask):
-            logger.warning("Pulay SVD ill-conditioned - falling back to linear mixing.")
+        # Solve min||F @ c - f_i|| with the truncated pseudoinverse (drops collinear directions)
+        coeffs, norm_f = _least_squares_coefficients(f_matrix, f_i, False, comm)
+        if coeffs is None:
+            logger.warning("Pulay least-squares problem ill-conditioned - falling back to linear mixing.")
             return stabilize(alpha * sigma_new + (1 - alpha) * sigma_old)
-        coeffs = vh[mask].T @ ((u[:, mask].T @ f_i) / s[mask])
 
         # Pulay update at the configured parameter p: x_{n+1} = x_n + p*f_i - (R + p*F) @ c, with R + p*F formed in
         # place of F
-        del u
         f_matrix *= p_config
         for i in range(n_hist):
             for rows, part in _real_rows(get_proposal(-1 - i) - get_proposal(-2 - i)):
                 f_matrix[rows, i] += part
         del part
         update = p_config * f_i - f_matrix @ coeffs
-        norm_u = np.linalg.norm(update)
+        norm_u = np.sqrt(_squared_norm(update, comm))
         if norm_f > 0 and norm_u > 10.0 * norm_f:
             update *= 10.0 * norm_f / norm_u
             logger.warning(f"Pulay step clamped (norm_u={norm_u:.3e}, norm_f={norm_f:.3e}).")
@@ -4302,7 +4965,6 @@ def apply_mixing_strategy(
         f_curr = flat(last_results[-1]) - flat(last_proposals[-1])
         f_vec = np.concatenate([part for _, part in _real_rows(f_curr)])
         del f_curr
-        norm_f = np.linalg.norm(f_vec)
 
         # dF (n_hist columns, the row blocks of _real_rows): dF[:,i] = f_{n-i} - f_{n-i-1} (residual differences)
         df_matrix = np.empty((f_vec.size, n_hist), dtype=f_vec.dtype)
@@ -4314,27 +4976,15 @@ def apply_mixing_strategy(
                 df_matrix[rows, i] = part
         del df, part
 
-        # Anderson: solve min ||f_n - dF @ c||
-        try:
-            u, s, vh = np.linalg.svd(df_matrix, full_matrices=False)
-
-            s_max = s[0] if len(s) > 0 else 1.0
-            cutoff = 1e-5 * s_max
-            mask = s > cutoff
-
-            if not np.any(mask):
-                raise np.linalg.LinAlgError("All singular values below threshold.")
-
-            s_reg = s[mask] / (s[mask] ** 2 + cutoff**2)
-            coeffs = vh[mask].T @ (s_reg * (u[:, mask].T @ f_vec))
-
-        except np.linalg.LinAlgError:
-            logger.warning("Anderson SVD failed - falling back to linear mixing.")
+        # Anderson: solve min ||f_n - dF @ c|| with the regularized pseudoinverse; the update keeps the row precision
+        coeffs, norm_f = _least_squares_coefficients(df_matrix, f_vec, True, comm)
+        if coeffs is None:
+            logger.warning("Anderson least-squares problem ill-conditioned - falling back to linear mixing.")
             return stabilize(alpha * sigma_new + (1 - alpha) * sigma_old)
+        coeffs = coeffs.astype(df_matrix.dtype)
 
         # Undamped Anderson proposal: x_n + f_n - (dX + dF) @ c; the proposal differences
         # dX[:,i] = x_{n-i} - x_{n-i-1} are added into dF's columns once the solve no longer needs dF
-        del u
         for i in range(n_hist):
             dx = flat(last_proposals[-1 - i]) - flat(last_proposals[-2 - i])
             for rows, part in _real_rows(dx):
@@ -4350,7 +5000,7 @@ def apply_mixing_strategy(
 
         # Safety clamp
         update = candidate - x_n
-        norm_u = np.linalg.norm(update)
+        norm_u = np.sqrt(_squared_norm(update, comm))
         if norm_f > 0 and norm_u > 3.0 * norm_f:
             update = update * (3.0 * norm_f / norm_u)
             candidate = x_n + update

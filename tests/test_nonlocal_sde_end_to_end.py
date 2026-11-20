@@ -386,7 +386,7 @@ def test_rpa_mode_is_the_flex_proposal_on_the_non_interacting_lattice(setup_srvo
         flex = proposal(sigma_in.copy(), *args, **kwargs)
         config.misc.do_rpa, config.misc.do_flex = True, False
         rpa = proposal(sigma_in, *args, **kwargs)
-        seen.append((flex.cut_niv(config.box.niv_core).mat, rpa.cut_niv(config.box.niv_core).mat))
+        seen.append((flex.core.mat.copy(), rpa.core.mat.copy()))  # the proposals' core windows
         return rpa
 
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", flex_then_rpa)

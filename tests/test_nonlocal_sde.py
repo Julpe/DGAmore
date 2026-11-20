@@ -8,6 +8,7 @@ import contextlib
 import fnmatch
 import gc
 import os
+import sys
 import threading
 import tracemalloc
 import warnings
@@ -20,6 +21,7 @@ import scipy as sp
 
 import dgamore.brillouin_zone as bz
 import dgamore.config as config
+import dgamore.four_point as four_point
 import dgamore.memory_estimator as memory_estimator
 import dgamore.mpi_utils as mpi_utils
 import dgamore.nonlocal_sde as nonlocal_sde
@@ -32,6 +34,7 @@ from dgamore.jacobian_stabilization import JACOBIAN_FILE, JacobianTracker, load_
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.local_sde import get_local_hartree_fock
 from dgamore.n_point_base import DTYPE, SpinChannel
+from tests import conftest
 from tests.conftest import FAKE_MPI, emery_hk, run_parallel
 from dgamore.nonlocal_sde import (
     _build_giwk_full,
@@ -291,6 +294,28 @@ def test_hartree_fock_of_explicit_occupations_equals_the_config_path_and_is_line
     only_b = sum(get_hartree_fock(u_loc, v_nonloc, occ=occ_k_b.mean(axis=(0, 1, 2)), occ_k=occ_k_b))
     assert np.array_equal(explicit, via_config)
     assert np.allclose(both, explicit + only_b, atol=1e-5)
+
+
+def test_hartree_fock_with_the_held_real_space_interaction_keeps_the_bits_of_transforming_it_again():
+    """The real-space interaction transformed once and handed in gives the Hartree-Fock terms of transforming it anew,
+    also for the term of V^q alone, and leaves the interactions as they were."""
+    nb, nk = 2, (3, 2, 1)
+    config.lattice.nk = nk
+    config.sys.n_bands = nb
+    rng = np.random.default_rng(16)
+    u_loc = LocalInteraction(rng.standard_normal((nb, nb, nb, nb)), SpinChannel.NONE)
+    v_nonloc = Interaction(rng.standard_normal((6, nb, nb, nb, nb)), SpinChannel.NONE, nk, True)
+    config.sys.occ_k = rng.standard_normal((*nk, nb, nb)) + 1j * rng.standard_normal((*nk, nb, nb))
+    config.sys.occ = config.sys.occ_k.mean(axis=(0, 1, 2))
+    v_before = v_nonloc.mat.copy()
+    for u in (u_loc, LocalInteraction(np.zeros_like(u_loc.mat))):
+        held = nonlocal_sde.real_space_interaction(u, v_nonloc)
+        for _ in range(2):
+            assert all(
+                np.array_equal(a, b)
+                for a, b in zip(get_hartree_fock(u, v_nonloc, w_r_mat=held), get_hartree_fock(u, v_nonloc))
+            )
+    assert np.array_equal(v_nonloc.mat, v_before)
 
 
 def _constant_chi(mat: np.ndarray):
@@ -1520,12 +1545,15 @@ def test_kernel_step_writes_the_eliashberg_intermediates_only_when_asked(monkeyp
     args = [MagicMock() for _ in range(6)]
     args[1].current_shape = (1,)
 
-    involution = np.array([1, 0])
+    involution, node = np.array([1, 0]), MagicMock()
     assert (
-        nonlocal_sde.calculate_sigma_kernel_r_q(*args, dist, None, save_eliashberg=save, involution=involution) is None
+        nonlocal_sde.calculate_sigma_kernel_r_q(
+            *args, dist, None, save_eliashberg=save, involution=involution, node_comm=node
+        )
+        is None
     )
 
-    assert aux_kwargs == [{"involution": involution, "subtract_u": False}]
+    assert aux_kwargs == [{"involution": involution, "subtract_u": False, "node_comm": node}]
     assert [c.kwargs["name"] for c in vrg.save.call_args_list] == (["vrg_q_dens_rank_0"] if save else [])
     assert [c.kwargs["name"] for c in middle.save.call_args_list] == (["vrg_middle_q_dens_rank_0"] if save else [])
     names = [c.kwargs["name"] for c in chi.save.call_args_list]
@@ -1536,19 +1564,22 @@ def test_kernel_step_writes_the_eliashberg_intermediates_only_when_asked(monkeyp
 def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_sde(
     monkeypatch, tmp_path, ek, involution
 ):
-    """The post-loop pass hands the bubble and each channel the involution, skips dc kernel and SDE, returns None."""
+    """The post-loop pass hands on the involution and the node communicator, skips dc kernel and SDE, returns None."""
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
     config.output.output_path = str(tmp_path)
     config.sys.beta = 10.0
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: ek)
-    bubble, bubble_kwargs = MagicMock(), []
-    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, None))
+    core, bubble_kwargs, node = MagicMock(), [], MagicMock()
+    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, node))
     monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
     monkeypatch.setattr(
-        nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: bubble_kwargs.append(k) or bubble
+        nonlocal_sde.BubbleGenerator,
+        "create_generalized_chi0_q_fft",
+        lambda *a, **k: bubble_kwargs.append(k) or k["release"]() or [],
     )
+    monkeypatch.setattr(nonlocal_sde, "_bubble_box_parts", lambda blocks, f_dc, with_core: (MagicMock(), None, core))
     monkeypatch.setattr(nonlocal_sde, "_cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
-    loaded, saves, involutions = [], [], []
+    loaded, saves, involutions, nodes = [], [], [], []
 
     def load_vertex(node_comm, path, *a, **k):
         loaded.append(os.path.basename(path))
@@ -1557,9 +1588,10 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
     def forbidden(*a, **k):
         raise AssertionError("the Eliashberg-only pass must not reach the double-counting kernel or the SDE")
 
-    def kernel_step(*a, save_eliashberg=False, involution=None, **k):
+    def kernel_step(*a, save_eliashberg=False, involution=None, node_comm=None, **k):
         saves.append(save_eliashberg)
         involutions.append(None if involution is None else involution.tolist())
+        nodes.append(node_comm)
         return MagicMock()
 
     monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", load_vertex)
@@ -1581,10 +1613,11 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
 
     assert result is None
     assert loaded == ["gamma_dens_loc.npy", "gamma_magn_loc.npy"] and saves == [True, True]
-    assert involutions == [involution, involution]
+    assert involutions == [involution, involution] and nodes == [node, node]
     for_bubble = bubble_kwargs[0]["involution"]
     assert (None if for_bubble is None else for_bubble.tolist()) == involution
-    assert bubble.cut_niv.return_value.invert.return_value.save.call_args.kwargs["name"] == "gchi0_q_inv_rank_0"
+    assert bubble_kwargs[0]["blocks"]
+    assert core.invert.return_value.save.call_args.kwargs["name"] == "gchi0_q_inv_rank_0"
 
 
 @pytest.mark.parametrize("mode", ["do_flex", "do_rpa"])
@@ -1595,10 +1628,17 @@ def test_bare_vertex_eliashberg_only_proposal_dumps_both_channels_without_a_loca
     config.output.output_path = str(tmp_path)
     config.sys.beta = 10.0
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
-    bubble = MagicMock()
     monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, None))
     monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
-    monkeypatch.setattr(nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: bubble)
+    monkeypatch.setattr(
+        nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: k["release"]() or []
+    )
+    cores = []
+    monkeypatch.setattr(
+        nonlocal_sde,
+        "_bubble_box_parts",
+        lambda blocks, f_dc, with_core: cores.append(with_core) or (MagicMock(), None, None),
+    )
     monkeypatch.setattr(nonlocal_sde, "_cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
     steps = []
 
@@ -1635,15 +1675,36 @@ def test_bare_vertex_eliashberg_only_proposal_dumps_both_channels_without_a_loca
 
     assert result is None
     assert steps == [(SpinChannel.DENS, True), (SpinChannel.MAGN, True)]
-    assert "gchi0_q_inv" not in str(bubble.mock_calls)
+    assert cores == [False]
 
 
-def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, epsilon=1e-3, v=0.0):
-    """Minimal single-k single-band environment for calculate_self_energy_q: synthetic map, frozen mu, V^q = v."""
+def _finished_proposal(sigma: SelfEnergy, donor: SelfEnergy, comm) -> nonlocal_sde._Proposal | None:
+    """The proposal the real map hands the loop for rank 0's full-box sigma: its core finished on rank 0's node."""
+    node_comm = comm.Split_type(nonlocal_sde.MPI.COMM_TYPE_SHARED)
+    if not node_comm.bcast(comm.rank == 0, root=0):
+        return None
+    core = offset = None
+    if comm.rank == 0:
+        # the SDE hands over every momentum, also for the momentum-local start of a fresh run
+        n_k, mat = config.lattice.k_grid.nk_tot, sigma.compress_q_dimension().mat
+        mat = np.broadcast_to(mat, (n_k, *mat.shape[1:])).copy()
+        sigma = SelfEnergy(mat, config.lattice.k_grid.nk, sigma.full_niv_range, True, calc_smom=False, beta=10.0)
+        core, offset = sigma.cut_niv(config.box.niv_core), sigma.shell_offset_from(donor)
+    average = comm.rank == 0 and config.sys.n_bands > 1
+    core, win, removed = nonlocal_sde._finish_proposal_on_node(core, [], average, node_comm)
+    if comm.rank != 0:
+        return nonlocal_sde._Proposal(core, win)
+    return nonlocal_sde._Proposal(core, win, donor, offset, average, removed)
+
+
+def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, epsilon=1e-3, v=0.0, n_bands=1):
+    """Minimal single-k environment for calculate_self_energy_q: synthetic map, frozen mu, V^q = v, one band (or
+    ``n_bands``, the DMFT self-energy then breaking time reversal off the diagonal)."""
+    nb = n_bands
     config.lattice.k_grid = bz.KGrid((1, 1, 1), symmetries=[])
-    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, nb, nb)))
     config.box.niw_core, config.box.niv_core, config.box.niv_full, config.box.niv_dmft = 1, 2, 2, 8
-    config.sys.beta, config.sys.mu, config.sys.n, config.sys.n_bands = 10.0, 0.5, 1.0, 1
+    config.sys.beta, config.sys.mu, config.sys.n, config.sys.n_bands = 10.0, 0.5, 1.0, nb
     config.output.output_path = str(tmp_path)
     config.self_consistency.previous_sc_path = ""
     config.self_consistency.mixing_strategy = "linear"
@@ -1656,7 +1717,7 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     monkeypatch.setattr(gc, "collect", lambda *args, **kwargs: 0)
 
     gf_stub = SimpleNamespace(
-        get_fill_nonlocal=lambda: (1.0, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1))),
+        get_fill_nonlocal=lambda: (1.0, np.eye(nb, dtype=np.complex128), np.zeros((1, 1, 1, nb, nb))),
         get_ekin=lambda: 0.0,
         get_epot=lambda: 0.0,
         save=lambda *a, **k: None,
@@ -1671,7 +1732,7 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     monkeypatch.setattr(
         nonlocal_sde,
         "_update_occ_and_energies_distributed",
-        lambda *a: (1.0, np.zeros((1, 1)), np.zeros((1, 1, 1, 1, 1)), 0.0, 0.0),
+        lambda *a: (1.0, np.zeros((nb, nb)), np.zeros((1, 1, 1, nb, nb)), 0.0, 0.0),
     )
 
     calls = []
@@ -1679,11 +1740,14 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     def fake_proposal(sigma_in, *args, annealer=None, **kwargs):
         calls.append(len(calls) + 1)
         proposal = proposal_step(sigma_in, len(calls), annealer)
-        return proposal if args[-2].rank == 0 else None  # like the real map: comm precedes current_iter
+        # like the real map: sigma_dmft is its sixth argument, comm precedes current_iter
+        return None if kwargs.get("eliashberg_only") else _finished_proposal(proposal, args[4], args[-2])
 
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", fake_proposal)
 
-    mat = np.full((1, 1, 1, 16), 1.0 + 0.1j, dtype=np.complex64)
+    mat = np.full((1, nb, nb, 16), 1.0 + 0.1j, dtype=np.complex64)
+    if nb > 1:
+        mat[:, 0, 1], mat[:, 1, 0] = 0.2 + 0.05j, 0.3 - 0.02j
 
     def run(comm=None, **kwargs):
         comm = create_comm_mock() if comm is None else comm
@@ -1752,21 +1816,27 @@ def _run_loop_on_two_node_ranks(monkeypatch, tmp_path, spied_name, spied_owner):
 
 
 def test_loop_returns_sigma_on_rank0_only_after_interpolating_the_final_sigma_on_every_rank(monkeypatch, tmp_path):
-    """Only rank 0 gets the loop's result back, and the interpolation still reads the final sigma on every rank."""
+    """Only rank 0 gets the loop's result back and writes mu_history.npy; every rank interpolates the final sigma."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
     run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
     config.self_energy_interpolation.do_interpolation = True
-    seen = []
+    seen, writers = [], []
 
     def interpolate(sigma, beta_target, niv_target, comm):
         seen.append(sigma.mat.copy())
         return sigma.copy() if comm.rank == 0 else None
 
+    def save(path, *a, **k):
+        if "mu_history.npy" in str(path):
+            writers.append(conftest._rank.get())
+
     monkeypatch.setattr(nonlocal_sde, "interpolate_sigma", interpolate)
+    monkeypatch.setattr(np, "save", save)
     _, res = run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
     assert isinstance(res[0], SelfEnergy) and res[1] is None
     assert len(seen) == 2 and all(np.array_equal(m.reshape(-1), res[0].mat.reshape(-1)) for m in seen)
+    assert writers and set(writers) == {0}
 
 
 def test_loop_forwards_the_chunk_budgets_to_every_proposal(monkeypatch, tmp_path):
@@ -1830,24 +1900,47 @@ def test_loop_writes_each_iterate_in_the_background_before_its_window_is_freed(m
         events.append((name, current_iter, threading.current_thread() is threading.main_thread(), sigma.mat.copy()))
 
     monkeypatch.setattr(nonlocal_sde, "_save_sigma_iteration", slow_save)
-    monkeypatch.setattr(nonlocal_sde, "_free_shared_window", lambda win, comm: events.append("free") or free(win, comm))
+    proposal, inside = nonlocal_sde.calculate_sigma_proposal, []
+
+    def proposing(*args, **kwargs):
+        inside.append(True)
+        try:
+            return proposal(*args, **kwargs)
+        finally:
+            inside.pop()
+
+    def freeing(win, comm):
+        if not inside:  # the windows of the iterate, the core rows and the shell offset, not the proposal's own
+            events.append("free")
+        free(win, comm)
+
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", proposing)
+    monkeypatch.setattr(nonlocal_sde, "_free_shared_window", freeing)
     result = run()
 
     saves = [event for event in events if event != "free"]
-    assert [event if event == "free" else event[1] for event in events] == ["free", 1, "free", 2, "free", 3]
+    expected = ["free"] * 3 + [1] + ["free"] * 3 + [2] + ["free"] * 3 + [3]
+    assert [event if event == "free" else event[1] for event in events] == expected
     assert all(name == "sigma_dga" and not on_main for name, _, on_main, _ in saves)
     assert np.array_equal(saves[-1][3].reshape(result.mat.shape), result.mat)
 
 
-def test_loop_lets_the_other_ranks_sleep_through_the_serial_steps_of_rank_0(monkeypatch, tmp_path):
-    """Each iteration idles before its window is freed and before the mixed iterate is shared, the run at its end."""
-    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
-    events, free = [], nonlocal_sde._free_shared_window
+@pytest.mark.parametrize("tracker", [False, True])
+def test_loop_lets_the_other_ranks_sleep_through_the_serial_steps_of_rank_0(monkeypatch, tmp_path, tracker):
+    """Each iteration idles while rank 0's node finishes the proposal (its node in the finish, the others after it)
+    and while the owners mix (rank 0 alone with the tracker), before the windows are freed, and the run idles at its
+    end."""
+    step = _affine_core_step(_STABLE_GAINS)
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, step, max_iter=2, epsilon=0.0)
+    config.stabilization.use_jacobian_stabilization = tracker
+    events, free, mixing = [], nonlocal_sde._free_shared_window, nonlocal_sde.apply_mixing_strategy
     monkeypatch.setattr(mpi_utils, "idle_barrier", lambda comm, *a, **k: events.append("idle"))
     monkeypatch.setattr(nonlocal_sde, "_free_shared_window", lambda win, comm: events.append("free") or free(win, comm))
+    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", lambda *a, **k: events.append("mix") or mixing(*a, **k))
     monkeypatch.setattr(nonlocal_sde, "update_mu", lambda *a, **k: events.append("mu") or 0.5)
     run()
-    assert events == ["idle", "free", "idle", "mu"] * 2 + ["idle"]
+    # the finish idles first (no terms to free here); the loop then idles, mixes, idles and frees three windows
+    assert events == (["idle", "idle", "mix", "idle"] + ["free"] * 3 + ["mu"]) * 2 + ["idle"]
 
 
 def test_loop_raises_the_error_of_a_background_iterate_write(monkeypatch, tmp_path):
@@ -2120,18 +2213,19 @@ def test_warm_start_and_loop_solve_mu_on_every_rank_with_its_momenta(monkeypatch
     start = SelfEnergy(mat, (3, 1, 1), has_compressed_q_dimension=True, beta=10.0)
     monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3, True))
     monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda warm_start: [0.7])
-    mixing, mixed, seen = nonlocal_sde.apply_mixing_strategy, [], []
+    build, mixed, seen = nonlocal_sde._build_iterate_window, [], []
 
-    def mix(*args):
-        out = mixing(*args)
-        mixed.append(out.mat.reshape(3, 1, 1, -1).copy())
-        return out
+    def building(*args):
+        sigma, win, removed = build(*args)
+        if threading.current_thread().name == "rank0":
+            mixed.append(sigma.mat.reshape(3, 1, 1, -1).copy())
+        return sigma, win, removed
 
     def solve(mu0, n, ek, sigma_mat, beta, smom0, logger=None, mpi_dist=None, orbitals=None, wedge=None):
         seen.append((threading.current_thread().name, mpi_dist, sigma_mat.copy(), smom0, wedge))
         return 0.42
 
-    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", mix)
+    monkeypatch.setattr(nonlocal_sde, "_build_iterate_window", building)
     monkeypatch.setattr(nonlocal_sde, "update_mu", solve)
     run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
     calls = sorted(seen, key=lambda c: c[0])  # per rank: the warm-start search, then the loop's
@@ -2174,14 +2268,22 @@ def test_loop_sums_mu_and_the_occupation_over_the_momenta_picked_for_its_mixed_i
     assert solved[1:] == [("rows", 6, "wedge")]  # after the warm start's search
 
 
-def test_loop_concatenates_the_previous_iterate_on_rank0_only(monkeypatch, tmp_path):
-    """Only rank 0 rebuilds the previous iterate on the DMFT tail each iteration; the other ranks never copy it."""
-    seen = _run_loop_on_two_node_ranks(monkeypatch, tmp_path, "concatenate_self_energies", SelfEnergy)
-    assert seen == ["rank0"] * 3
+def test_loop_pads_only_the_rows_of_each_ranks_share_of_its_node(monkeypatch, tmp_path):
+    """No rank pads a whole self-energy with the DMFT tail: every rank of a node pads the rows of its share."""
+    concatenate, rows = SelfEnergy.concatenate_self_energies, []
+
+    def spy(self, *args, **kwargs):
+        rows.append(len(self.mat))
+        return concatenate(self, *args, **kwargs)
+
+    monkeypatch.setattr(SelfEnergy, "concatenate_self_energies", spy)
+    _loop_on_grid(monkeypatch, tmp_path, "linear", ["n0", "n0", "n1", "n1"])
+    assert rows and max(rows) == 2  # the 4 x 1 x 1 grid over two ranks per node
 
 
-def test_loop_measures_the_step_proposal_and_map_residuals_on_rank0_only(monkeypatch, tmp_path):
-    """The residuals only matter on rank 0: step and map every iteration, the proposal's from the second on."""
+def test_loop_measures_the_step_proposal_and_map_residuals_on_the_owners_of_rows(monkeypatch, tmp_path):
+    """The owners of momentum rows, here rank 0 with the one momentum, measure the step and map residuals every
+    iteration and the proposal's from the second on."""
     seen = _run_loop_on_two_node_ranks(monkeypatch, tmp_path, "_relative_core_residual", nonlocal_sde)
     assert seen == ["rank0"] * 8
 
@@ -2211,6 +2313,23 @@ def _affine_core_step(gains: np.ndarray):
         return sigma_out
 
     return step
+
+
+def _distinct_rows_step(sigma_in, n_call, annealer):
+    """A map whose momentum rows all differ: the core of every momentum contracts at its own rate to a k-dependent
+    fixed point, and a k-dependent constant (with two bands Hermitian and odd under time reversal off the diagonal)
+    shifts every frequency, so the shell offset of the proposal depends on the momentum as well."""
+    n_k, nb, niv_core = config.lattice.k_grid.nk_tot, config.sys.n_bands, config.box.niv_core
+    mat = sigma_in.compress_q_dimension().mat
+    mat = np.broadcast_to(mat, (n_k, *mat.shape[1:])).copy()
+    k = np.arange(n_k)[:, None, None, None]
+    shift = (1 + k) * np.array([[0.1, 0.05j], [-0.05j, -0.1]])[:nb, :nb, None]
+    niv = mat.shape[-1] // 2
+    window = mat[..., niv - niv_core : niv + niv_core]
+    target = _FIXED_POINT + 2.0 * shift
+    window[...] = target - (0.2 + 0.1 * k) * (window - target)
+    mat += shift
+    return SelfEnergy(mat, config.lattice.k_grid.nk, True, True, calc_smom=False, beta=10.0)
 
 
 def _core_distance(sigma):
@@ -2609,7 +2728,8 @@ def test_loop_tracker_runs_on_rank0_only_on_two_node_ranks(monkeypatch, tmp_path
     assert results[0] is not None and results[1] is None
     assert len(mixed) == 4 and len(inputs["rank0"]) == len(inputs["rank1"]) == 4
     assert all(np.array_equal(a, b) for a, b in zip(inputs["rank0"], inputs["rank1"]))
-    assert all(np.array_equal(m, x) for m, x in zip(mixed[:-1], inputs["rank1"][1:]))
+    core = slice(8 - config.box.niv_core, 8 + config.box.niv_core)  # the mixing's rows: the core of the 16 frequencies
+    assert all(np.array_equal(m, x[core]) for m, x in zip(mixed[:-1], inputs["rank1"][1:]))
     assert buffers["rank0"][1:] == buffers["rank1"][1:]
 
 
@@ -2680,7 +2800,7 @@ def test_loop_stabilizes_the_damped_step_of_every_strategy(monkeypatch, tmp_path
 
 @pytest.mark.parametrize(
     "strategy, warned",
-    [("pulay", "Pulay SVD ill-conditioned"), ("anderson", "Anderson SVD failed")],
+    [("pulay", "Pulay least-squares problem ill-conditioned"), ("anderson", "Anderson least-squares problem")],
 )
 def test_loop_stabilizes_the_mixed_step_of_an_ill_conditioned_accelerated_fallback(
     monkeypatch, tmp_path, strategy, warned
@@ -2690,16 +2810,8 @@ def test_loop_stabilizes_the_mixed_step_of_an_ill_conditioned_accelerated_fallba
     config.self_consistency.mixing_strategy = strategy
     config.self_consistency.mixing_history_length = 2
     monkeypatch.setattr(nonlocal_sde.JacobianTracker, "active", property(lambda self: True))
-    real_svd = np.linalg.svd
-
-    def rank_deficient_svd(matrix, *args, **kwargs):
-        """Returns an all-zero decomposition for the accelerated least-squares problem and the true one elsewhere."""
-        if kwargs.get("full_matrices") is False:
-            width = matrix.shape[1]
-            return np.zeros_like(matrix), np.zeros(width), np.zeros((width, width))
-        return real_svd(matrix, *args, **kwargs)
-
-    monkeypatch.setattr(np.linalg, "svd", rank_deficient_svd)
+    # no direction of the secant columns survives the cutoff
+    monkeypatch.setattr(nonlocal_sde, "_least_squares_coefficients", lambda columns, rhs, *a: (None, 1.0))
     spy = create_autospec(JacobianTracker.stabilize_step, wraps=JacobianTracker.stabilize_step)
     monkeypatch.setattr(nonlocal_sde.JacobianTracker, "stabilize_step", spy)
     run()
@@ -3078,6 +3190,137 @@ def test_create_auxiliary_chi_r_q_sum_takes_the_given_pairs_without_vertex_inste
     assert np.array_equal(given.mat, scanned.mat)
 
 
+def test_share_slices_on_node_gate():
+    """A node shares from a 3 % cut of its busiest rank's slices on; even counts, one rank or no momenta never share."""
+    share = nonlocal_sde._share_slices_on_node
+    assert share(np.array([2, 1, 2, 1]), 41) and share(np.array([52, 48]), 1) and not share(np.array([51, 49]), 1)
+    assert not share(np.array([25] * 112), 41) and not share(np.array([3]), 41) and not share(np.array([0, 0]), 41)
+
+
+_LAYER_SWAP = np.array([2, 3, 0, 1])
+
+
+def _layer_swapped_cell(n_q: int, nw: int = 3, niv: int = 2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Gamma, inverse-bubble rows and U of two atoms whose slices obey the layer swap but are not complex-symmetric."""
+    rng, p, i = np.random.default_rng(87), _LAYER_SWAP, np.arange(4)
+    c = lambda *s: rng.standard_normal(s) + 1j * rng.standard_normal(s)
+    atom = i[:, None, None, None] // 2
+    per_atom = (atom == i[:, None, None] // 2) & (atom == i[:, None] // 2) & (atom == i // 2)
+    gamma = c(4, 4, 4, 4, nw, 2 * niv, 2 * niv)
+    gamma = gamma + gamma.transpose(3, 2, 1, 0, 4, 6, 5)
+    gamma = (gamma + gamma[np.ix_(p, p, p, p)]) * per_atom[..., None, None, None]
+    chi0_inv = c(n_q, 4, 4, 4, 4, nw, 2 * niv)
+    chi0_inv = chi0_inv + chi0_inv[np.ix_(np.arange(n_q), p, p, p, p)].transpose(0, 4, 3, 2, 1, 5, 6)
+    chi0_inv[:, i[:, None], i, i, i[:, None]] += 30.0
+    return gamma, chi0_inv, 0.7 * per_atom
+
+
+def _node_test_setup(monkeypatch) -> list[str]:
+    """Patches the fake MPI, a logger and the permuted-slice size in, sets beta; returns the hosts of node windows."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    monkeypatch.setattr(four_point, "_PERMUTED_ROWS_PER_PAIR", 0)
+    config.sys.beta = np.float64(12.5)
+    hosts, allocate = [], mpi_utils.allocate_node_shared_array
+    monkeypatch.setattr(
+        mpi_utils,
+        "allocate_node_shared_array",
+        lambda *a, **k: hosts.append(FAKE_MPI.Get_processor_name()) or allocate(*a, **k),
+    )
+    return hosts
+
+
+def _node_and_rank_sums(counts: list[int], hostnames: list[str], extra=lambda inv: {}) -> list[tuple]:
+    """Every rank's results on its rows of the layer-swapped cell, solved with its node communicator and alone."""
+    gamma, chi0_inv, u = _layer_swapped_cell(sum(counts))
+    bounds = np.cumsum([0, *counts])
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+
+        def solve(node):
+            """The rank's solve from its own copies of the inputs, the inverse bubble in Fortran order."""
+            rows = np.asfortranarray(chi0_inv[bounds[rank] : bounds[rank + 1]])
+            inv = FourPoint(rows, SpinChannel.NONE, (int(bounds[-1]), 1, 1), 1, 1, False, True, True)
+            gamma_r = LocalFourPoint(gamma.copy(), SpinChannel.DENS, 1, 2, False, True)
+            u_loc = LocalInteraction(u.copy(), SpinChannel.NONE)
+            return nonlocal_sde.create_auxiliary_chi_r_q_sum(
+                gamma_r, inv, u_loc, involution=_LAYER_SWAP, node_comm=node, **extra(inv)
+            )
+
+        return solve(node_comm), solve(None)
+
+    return run_parallel(len(counts), fn, hostnames=hostnames)[1]
+
+
+def _shared_slice_lines() -> set[str]:
+    """The distinct log lines of slices shared on a node."""
+    return {c.args[0] for c in config.logger.info.call_args_list if "shared by" in c.args[0]}
+
+
+def _slices_per_rank(monkeypatch) -> dict[str, list[int]]:
+    """Records, per fake rank, the slice count of every summed solve over runs, i.e. the rank's part of its node."""
+    parts, solve = {}, FourPoint.invert_with_local_kernel_and_sum_over_last_vn
+
+    def spy(self, *args, runs=None, **kwargs):
+        """The summed solve, recording the slices of its runs first."""
+        if runs is not None:
+            parts.setdefault(threading.current_thread().name, []).append(sum(stop - start for _, start, stop in runs))
+        return solve(self, *args, runs=runs, **kwargs)
+
+    monkeypatch.setattr(FourPoint, "invert_with_local_kernel_and_sum_over_last_vn", spy)
+    return parts
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+def test_node_shared_sum_matches_per_rank_sum(monkeypatch, dtype):
+    """Four ranks of a node solve 4, 5, 4, 5 of its 18 slices and get the bits and layout of their per-rank sums."""
+    monkeypatch.setattr("dgamore.n_point_base.DTYPE", dtype)
+    monkeypatch.setattr(nonlocal_sde, "NODE_SHARED_SLICE_GAIN", -1.0)
+    hosts, permuted, refined = _node_test_setup(monkeypatch), [], four_point._refined_solve
+    monkeypatch.setattr(four_point, "_refined_solve", lambda *a: permuted.append(1) or refined(*a))
+    parts = _slices_per_rank(monkeypatch)
+    results = _node_and_rank_sums([2, 1, 2, 1], ["n0"] * 4)
+    assert hosts == ["n0"] * 8 and len(permuted) == (36 if dtype == np.complex64 else 0)
+    assert all(np.array_equal(s.mat, a.mat) and s.mat.strides == a.mat.strides for s, a in results)
+    line = "Bethe-Salpeter slices (dens) shared by the 4 ranks of each node: at most 5 instead of 6 per rank."
+    assert _shared_slice_lines() == {line}
+    assert parts == {f"rank{r}": [n] for r, n in enumerate([4, 5, 4, 5])}
+
+
+def test_node_shared_sum_with_a_rank_without_momenta(monkeypatch):
+    """A rank without momenta solves 3 of its node's 9 slices like the others; it gets an empty sum, they their bits."""
+    hosts = _node_test_setup(monkeypatch)
+    parts = _slices_per_rank(monkeypatch)
+    results = _node_and_rank_sums([0, 2, 1], ["n0"] * 3)
+    assert hosts == ["n0"] * 6 and results[0][0].mat.shape[0] == 0
+    assert all(np.array_equal(s.mat, a.mat) and s.mat.strides == a.mat.strides for s, a in results)
+    line = "Bethe-Salpeter slices (dens) shared by the 3 ranks of each node: at most 3 instead of 6 per rank."
+    assert _shared_slice_lines() == {line}
+    assert parts == {f"rank{r}": [3] for r in range(3)}
+
+
+def test_node_shared_sum_decides_per_node(monkeypatch):
+    """Each node decides alone: the uneven node shares through its windows, the even one solves rank by rank."""
+    hosts = _node_test_setup(monkeypatch)
+    results = _node_and_rank_sums([2, 1, 1, 1], ["n0", "n0", "n1", "n1"])
+    assert hosts == ["n0"] * 4
+    assert all(np.array_equal(s.mat, a.mat) and s.mat.strides == a.mat.strides for s, a in results)
+    line = "Bethe-Salpeter slices (dens) shared by the 2 ranks of each node: at most 5 instead of 6 per rank."
+    assert _shared_slice_lines() == {line}
+
+
+@pytest.mark.parametrize("given", ["rhs", "slice_rhs"])
+def test_node_shared_sum_ignores_right_hand_sides(monkeypatch, given):
+    """With right-hand sides, as the exact Jacobian passes them, every rank solves its own slices without a window."""
+    monkeypatch.setattr(nonlocal_sde, "NODE_SHARED_SLICE_GAIN", -1.0)
+    hosts = _node_test_setup(monkeypatch)
+    extra = {"rhs": lambda inv: {"rhs": [inv.copy()]}, "slice_rhs": lambda inv: {"slice_rhs": lambda i, w, t: []}}
+    results = _node_and_rank_sums([2, 1, 2, 1], ["n0"] * 4, extra[given])
+    assert hosts == [] and not _shared_slice_lines()
+    assert all(np.array_equal(s[0].mat, a[0].mat) for s, a in results)
+
+
 @pytest.mark.parametrize("o, niv, nw", [(3, 60, 1), (6, 20, 2)])
 def test_chiq_aux_transient_bounds_the_traced_peak_of_the_build(o, niv, nw):
     """The modeled transient covers the traced peak above the summed output, the next w's scan at six bands included."""
@@ -3210,19 +3453,26 @@ def test_kernel_step_holds_one_block_and_one_momentum_group_beside_its_inputs(mo
 
 
 def test_proposal_attaches_the_double_counting_interaction_once_the_full_box_bubble_is_freed(monkeypatch, tmp_path):
-    """The double-counting contraction reads the full-box bubble and its interaction is attached after the free."""
+    """The double-counting interaction is attached once the full-box bubble is consumed block by block."""
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
     config.output.output_path = str(tmp_path)
     config.sys.beta = 10.0
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
-    bubble, events = MagicMock(), []
-    bubble.free.side_effect = lambda: events.append("bubble freed")
+    events = []
     monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, None))
     monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
-    monkeypatch.setattr(nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: bubble)
+    monkeypatch.setattr(
+        nonlocal_sde.BubbleGenerator,
+        "create_generalized_chi0_q_fft",
+        lambda *a, **k: k["release"]() or events.append("giwk cut") or ["blocks"],
+    )
     monkeypatch.setattr(nonlocal_sde, "_cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
     monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", lambda *a, **k: (MagicMock(), None))
-    monkeypatch.setattr(nonlocal_sde, "_contract_dc_vertex", lambda f, b: events.append("contracted") or MagicMock())
+    monkeypatch.setattr(
+        nonlocal_sde,
+        "_bubble_box_parts",
+        lambda blocks, f_dc, with_core: events.append("bubble consumed") or (MagicMock(), MagicMock(), MagicMock()),
+    )
     monkeypatch.setattr(nonlocal_sde, "_attach_dc_interaction", lambda t, u: events.append("attached") or MagicMock())
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_kernel_r_q", lambda *a, kernel=None, **k: kernel)
     monkeypatch.setattr(nonlocal_sde, "_build_rspace_giwk_window", MagicMock(side_effect=RuntimeError("the SDE")))
@@ -3232,7 +3482,91 @@ def test_proposal_attaches_the_double_counting_interaction_once_the_full_box_bub
             MagicMock(), *[MagicMock() for _ in range(8)], create_comm_mock(), 2, memory_estimator.ChunkBudgets(1, 1)
         )
 
-    assert events == ["contracted", "bubble freed", "attached"]
+    assert events == ["giwk cut", "bubble consumed", "attached"]
+
+
+@pytest.mark.parametrize("sde_node", [True, False])
+def test_proposal_hands_the_node_to_the_contraction_only_where_its_ranks_share_the_column_work(
+    monkeypatch, tmp_path, sde_node
+):
+    """The self-energy contraction gets the node communicator where the budgets share its column work, else none."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    config.output.output_path = str(tmp_path)
+    config.sys.beta = 10.0
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
+    node, handed = MagicMock(), []
+    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, node))
+    monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
+    monkeypatch.setattr(
+        nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: k["release"]() or ["blocks"]
+    )
+    monkeypatch.setattr(nonlocal_sde, "_cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
+    monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", lambda *a, **k: (MagicMock(), None))
+    monkeypatch.setattr(nonlocal_sde, "_bubble_box_parts", lambda *a: (MagicMock(), MagicMock(), MagicMock()))
+    monkeypatch.setattr(nonlocal_sde, "_attach_dc_interaction", lambda t, u: MagicMock())
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_kernel_r_q", lambda *a, kernel=None, **k: kernel)
+    monkeypatch.setattr(nonlocal_sde, "_has_point_group_covariance", lambda *a: True)
+    monkeypatch.setattr(nonlocal_sde, "_build_rspace_giwk_window", lambda *a: (MagicMock(), None))
+
+    def contraction(*a):
+        handed.append(a[-1])
+        raise RuntimeError("the SDE")
+
+    monkeypatch.setattr(nonlocal_sde, "_run_column_sde", contraction)
+    budgets = memory_estimator.ChunkBudgets(1, 1, sde_node=sde_node)
+    with pytest.raises(RuntimeError, match="the SDE"):
+        nonlocal_sde.calculate_sigma_proposal(
+            MagicMock(), *[MagicMock() for _ in range(8)], create_comm_mock(), 2, chunk_budgets=budgets
+        )
+
+    assert handed == [node if sde_node else None]
+
+
+@pytest.mark.parametrize("with_dc, with_core", [(True, True), (False, True), (False, False)])
+def test_bubble_box_parts_from_bosonic_blocks_hold_the_bits_of_the_whole_bubble(with_dc, with_core):
+    """Box sum, dc contraction and core cut taken block by block equal the whole bubble's and consume the blocks."""
+    config.sys.beta, config.box.niv_core = 2.5, 2
+    rng = np.random.default_rng(11)
+    nq, o, nw, niv_full = 3, 2, 3, 4
+    b_shape, f_shape = (nq, o, o, o, o, nw, 2 * niv_full), (o, o, o, o, nw, 2 * niv_full, 2 * 2)
+    b_mat = (rng.standard_normal(b_shape) + 1j * rng.standard_normal(b_shape)).astype(np.complex64)
+    f_mat = (rng.standard_normal(f_shape) + 1j * rng.standard_normal(f_shape)).astype(np.complex64)
+    f_mat[1, 0, 0, 0, 1] = 0.0
+    whole = FourPoint(b_mat, SpinChannel.NONE, (nq, 1, 1), 1, 1, False, True, has_compressed_q_dimension=True)
+    f_dc = LocalFourPoint(f_mat, SpinChannel.MAGN, 1, 2, False, True) if with_dc else None
+    blocks = [whole.take_wn_slice(w, w + 1) for w in range(nw)]
+    kept = list(blocks)
+
+    full_sum, dc, core = nonlocal_sde._bubble_box_parts(blocks, f_dc, with_core)
+
+    assert np.array_equal(full_sum.mat, whole.sum_over_all_vn(2.5).scale(1 / 2.5).mat)
+    assert (dc is None) != with_dc and (core is None) != with_core
+    assert dc is None or np.array_equal(dc.mat, nonlocal_sde._contract_dc_vertex(f_dc, whole).mat)
+    assert core is None or np.array_equal(core.mat, whole.cut_niv(2).mat)
+    assert blocks == [] and all(block.mat is None for block in kept)
+
+
+def test_bubble_box_parts_never_hold_the_whole_core_box_beside_the_whole_full_box_bubble():
+    """Consuming the full-box bubble block by block peaks below the whole bubble held beside its two core boxes."""
+    config.sys.beta, config.box.niv_core = 2.5, 20
+    rng = np.random.default_rng(12)
+    nq, o, nw, niv_full = 16, 2, 8, 40
+    b_shape, f_shape = (nq, o, o, o, o, nw, 2 * niv_full), (o, o, o, o, nw, 2 * niv_full, 2 * 20)
+    b_mat = (rng.standard_normal(b_shape) + 1j * rng.standard_normal(b_shape)).astype(np.complex64)
+    f_mat = (rng.standard_normal(f_shape) + 1j * rng.standard_normal(f_shape)).astype(np.complex64)
+    whole = FourPoint(b_mat, SpinChannel.NONE, (nq, 1, 1), 1, 1, False, True, has_compressed_q_dimension=True)
+    axes = (4, 0, 1, 5, 2, 3, 6)  # the storage order the loader gives the vertex, read as a view
+    stored = np.ascontiguousarray(f_mat.transpose(axes)).transpose(np.argsort(axes))
+    f_dc = LocalFourPoint(stored, SpinChannel.MAGN, 1, 2, False, True)
+    core = nq * o**4 * nw * 2 * 20 * 8
+
+    def run():
+        blocks = [whole.take_wn_slice(w, w + 1) for w in range(nw)]
+        return nonlocal_sde._bubble_box_parts(blocks, f_dc, True)
+
+    _, peak = traced_peak(run)
+
+    assert peak < b_mat.nbytes + 1.5 * core
 
 
 def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(monkeypatch):
@@ -3671,8 +4005,8 @@ def _column_sde_setup(auto: bool, nk=(4, 4, 2), o=2, niw=3, niv=2, seed=41):
     return kernel, GreensFunction(g_mat, calc_filling=False, nk=nk, beta=config.sys.beta)
 
 
-def _run_column_sde_parallel(size, kernel, giwk, chunk_bytes=None, hostnames=None, symmetric=False):
-    """Runs the column-distributed contraction on fake ranks and returns rank 0's real-space result."""
+def _run_column_sde_parallel(size, kernel, giwk, chunk_bytes=None, hostnames=None, symmetric=False, node=False):
+    """Runs the column-distributed contraction on fake ranks (node=True: shared by a node's ranks), rank 0's result."""
     flags = {"symmetric": True} if symmetric else {}
 
     def fn(comm, rank):
@@ -3680,7 +4014,9 @@ def _run_column_sde_parallel(size, kernel, giwk, chunk_bytes=None, hostnames=Non
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
         g_r, win = nonlocal_sde._build_rspace_giwk_window(giwk, node_comm)
         kern = FourPoint(kernel[d_irr.my_slice].copy(), SpinChannel.NONE, config.lattice.nk, 1, 1, False, True, True)
-        sigma = nonlocal_sde._run_column_sde(kern, d_irr, g_r, giwk.niv, chunk_bytes, **flags)
+        sigma = nonlocal_sde._run_column_sde(
+            kern, d_irr, g_r, giwk.niv, chunk_bytes, node_comm=node_comm if node else None, **flags
+        )
         g_r = None
         nonlocal_sde._free_shared_window(win, node_comm)
         return None if sigma is None else sigma.mat.copy()
@@ -4041,6 +4377,75 @@ def test_column_sde_with_more_ranks_than_tasks_matches_one_rank(size, monkeypatc
     kernel, giwk = _column_sde_setup(True, niw=1, niv=1)
     one = _run_column_sde_parallel(1, kernel, giwk)
     assert np.allclose(_run_column_sde_parallel(size, kernel, giwk), one, atol=1e-5)
+
+
+@pytest.mark.parametrize("auto, symmetric", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(
+    "size, hostnames", [(3, ["n0", "n0", "n0"]), (4, ["n0", "n0", "n1", "n1"]), (5, ["n0", "n1", "n0", "n1", "n0"])]
+)
+def test_column_sde_shared_by_the_ranks_of_a_node_keeps_the_bits_of_the_per_rank_contraction(
+    auto, symmetric, size, hostnames, monkeypatch
+):
+    """Node ranks sharing every column's unfold, transform and contraction by real-space rows give the per-rank bits."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _column_sde_setup(auto)
+    per_rank = _run_column_sde_parallel(size, kernel, giwk, hostnames=hostnames, symmetric=symmetric)
+    shared = _run_column_sde_parallel(size, kernel, giwk, hostnames=hostnames, symmetric=symmetric, node=True)
+    assert np.array_equal(shared, per_rank)
+
+
+@pytest.mark.parametrize("chunk_bytes, batch_bytes", [(1, 1), (2**40, 2**40)])
+def test_column_sde_shared_by_node_ranks_keeps_the_bits_in_single_task_rounds_and_wide_unfold_batches(
+    chunk_bytes, batch_bytes, monkeypatch
+):
+    """The node-shared contraction keeps the per-rank bits with one-task rounds and with many-column unfold batches."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(memory_estimator, "SDE_UNFOLD_BATCH_BYTES", batch_bytes)
+    kernel, giwk = _column_sde_setup(True)
+    hosts = ["n0", "n0", "n1", "n1"]
+    per_rank = _run_column_sde_parallel(4, kernel, giwk, chunk_bytes=chunk_bytes, hostnames=hosts)
+    shared = _run_column_sde_parallel(4, kernel, giwk, chunk_bytes=chunk_bytes, hostnames=hosts, node=True)
+    assert np.array_equal(shared, per_rank)
+
+
+@pytest.mark.parametrize("symmetric", [False, True])
+def test_column_sde_shared_by_node_ranks_on_the_last_pairs_orbital_blocks_keeps_the_per_rank_bits(
+    symmetric, monkeypatch
+):
+    """A kernel carried on the orbital blocks of its last pair gives the per-rank bits when shared by node ranks."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    dense, giwk = _point_group_sde_setup("square")
+    kernel = (dense * np.eye(2)[None, None, None, :, :, None, None]).astype(dense.dtype)
+    hosts = ["n0", "n0", "n0"]
+    per_rank = _run_column_sde_parallel(3, kernel, giwk, hostnames=hosts, symmetric=symmetric)
+    shared = _run_column_sde_parallel(3, kernel, giwk, hostnames=hosts, symmetric=symmetric, node=True)
+    assert np.array_equal(shared, per_rank)
+
+
+def test_column_sde_shared_by_node_ranks_with_more_ranks_than_tasks_keeps_the_per_rank_bits(monkeypatch):
+    """Node ranks without tasks of their own still share the columns of the node and keep the per-rank bits."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _column_sde_setup(True, niw=1, niv=1)
+    hosts = ["n0"] * 4 + ["n1"] * 3
+    per_rank = _run_column_sde_parallel(7, kernel, giwk, hostnames=hosts)
+    assert np.array_equal(_run_column_sde_parallel(7, kernel, giwk, hostnames=hosts, node=True), per_rank)
+
+
+def test_column_sde_ranks_of_a_node_unfold_their_rows_into_one_shared_column_buffer(monkeypatch):
+    """Every rank of a node unfolds its own rows of each column into the one buffer the node shares."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    kernel, giwk = _column_sde_setup(True)
+    calls, unfold = [], FourPoint.map_to_full_bz
+    monkeypatch.setattr(
+        FourPoint,
+        "map_to_full_bz",
+        lambda self, *a, **k: calls.append((k["out"].__array_interface__["data"][0], k["rows"]))
+        or unfold(self, *a, **k),
+    )
+    _run_column_sde_parallel(2, kernel, giwk, hostnames=["n0", "n0"], node=True)
+    n_r = config.lattice.k_grid.nk_tot
+    assert len({address for address, _ in calls}) == 1
+    assert {rows for _, rows in calls} == {slice(0, n_r // 2), slice(n_r // 2, n_r)}
 
 
 def test_build_rspace_giwk_window_is_the_frequency_first_transform_in_one_buffer_per_node(monkeypatch):
@@ -4667,9 +5072,9 @@ def test_loop_saves_the_core_window_of_the_proposal_as_the_map_returned_it(monke
     produced, saved, mixed_in, mixed_out = [], [], [], []
 
     def proposal_spy(*args, **kwargs):
-        sigma = proposal_map(*args, **kwargs)
-        produced.append(sigma.mat.reshape(-1).copy())
-        return sigma
+        proposal = proposal_map(*args, **kwargs)
+        produced.append(proposal.core.mat.reshape(-1).copy())
+        return proposal
 
     def save_spy(sigma, base_name, current_iter):
         if base_name == "sigma_dga_proposal":
@@ -4690,11 +5095,10 @@ def test_loop_saves_the_core_window_of_the_proposal_as_the_map_returned_it(monke
     monkeypatch.setattr(nonlocal_sde.JacobianTracker, "reflect", reflect)
     monkeypatch.setattr(nonlocal_sde, "_save_jacobian_spectrum", lambda tracker, converged, *rows: None)
     run()
-    core = slice(config.box.niv_dmft - config.box.niv_core, config.box.niv_dmft + config.box.niv_core)
     assert len(saved) == 3 and len(produced) == 3 and reflect.call_count == 3
-    assert all(np.array_equal(s, p[core]) for s, p in zip(saved, produced))
-    assert all(np.array_equal(s, m[core]) for s, m in zip(saved, mixed_in))
-    assert not any(np.array_equal(s, m[core]) for s, m in zip(saved, mixed_out))
+    assert all(np.array_equal(s, p) for s, p in zip(saved, produced))
+    assert all(np.array_equal(s, m) for s, m in zip(saved, mixed_in))
+    assert not any(np.array_equal(s, m) for s, m in zip(saved, mixed_out))
 
 
 def test_get_starting_sigma_reads_the_iterates_subfolder_before_the_run_folder(monkeypatch, tmp_path):
@@ -5156,49 +5560,63 @@ def test_in_place_rspace_window_holds_the_bits_of_the_window_of_the_cut_green_fu
     assert win is None and np.array_equal(g_r, ref)
 
 
-@pytest.mark.parametrize("average", [True, False])
-@pytest.mark.parametrize(
-    "hostnames, niv_donor", [(["n0"], 4), (["n0", "n0", "n0", "n1"], 4), (["n0"] * 6, 2), (["n0", "n1"], 3)]
-)
-def test_finish_on_node_builds_the_proposal_with_the_bits_of_rank_0_alone(monkeypatch, average, hostnames, niv_donor):
-    """Rank 0's node concatenates and averages the proposal in frequency slabs with the bits of rank 0 building it."""
-    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
-    rng = np.random.default_rng(13)
-    nk, nb = (4, 2, 1), 2
-    core_mat = (rng.standard_normal((8, nb, nb, 2)) + 1j * rng.standard_normal((8, nb, nb, 2))).astype(np.complex64)
-    donor_mat = (rng.standard_normal((1, 1, 1, nb, nb, 2 * niv_donor)) + 0.2j).astype(np.complex64)
-    offset = rng.standard_normal((8, nb, nb))
+def _finish_inputs(nq: int, nb: int, n_core: int, seed: int) -> tuple:
+    """Random core and Hartree, Fock and noise terms in the dtypes of the proposal step."""
+    rng = np.random.default_rng(seed)
 
-    def make():
-        core = SelfEnergy(core_mat.copy(), nk, True, True, calc_smom=False, beta=10.0)
-        return core, SelfEnergy(donor_mat.copy(), (1, 1, 1), calc_smom=False, beta=10.0)
+    def cmat(shape):
+        return rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
 
-    core, donor = make()
-    ref = core.concatenate_self_energies(donor, shell_offset=offset)
-    ref_moments = ref.smom
-    ref_removed = ref.symmetrize_time_reversal() if average else None
+    terms = [cmat((1, nb, nb, 1)), cmat((nq, nb, nb, 1)), cmat((1, nb, nb, n_core)).astype(np.complex64)]
+    return cmat((nq, nb, nb, n_core)).astype(np.complex64), terms
+
+
+def _finished_whole(core_mat, terms, nk, average, unfold_grid=None) -> tuple:
+    """The finished core of one rank: the terms added as self-energies, unfolded and averaged whole."""
+    core = SelfEnergy(core_mat.copy(), nk, True, True, calc_smom=False, beta=10.0)
+    core = core + terms[0] + terms[1]
+    core += SelfEnergy(terms[2], (1, 1, 1), True, True, calc_smom=False, beta=10.0)
+    if unfold_grid is not None:
+        core.unfold_irreducible_momenta(unfold_grid)
+    removed = core.symmetrize_time_reversal() if average else None
+    return core.mat, removed
+
+
+def _finish_on_node(hostnames, core_mat, terms, nk, average, unfold=False) -> list:
+    """Runs the node finish on the ranks of rank 0's node and returns each one's core window and largest change."""
 
     def fn(comm, rank):
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
         if not node_comm.bcast(rank == 0, root=0):
             return None
-        core, donor = make() if rank == 0 else (None, None)
-        args = (offset, average) if rank == 0 else (None, False)
-        sigma, removed = nonlocal_sde._finish_proposal_on_node(core, donor, *args, node_comm)
-        return (
-            None
-            if sigma is None
-            else (sigma.mat.copy(), sigma.nq, sigma.smom, sigma.has_compressed_q_dimension, removed)
-        )
+        core = SelfEnergy(core_mat.copy(), nk, True, True, calc_smom=False, beta=10.0) if rank == 0 else None
+        args = (terms, average) if rank == 0 else (None, False)
+        sigma, win, removed = nonlocal_sde._finish_proposal_on_node(core, *args, node_comm, unfold=unfold and rank == 0)
+        mat = sigma.mat.copy()
+        node_comm.Barrier()
+        nonlocal_sde._free_shared_window(win, node_comm)
+        return mat, sigma.nq, sigma.has_compressed_q_dimension, removed
 
-    _, res = run_parallel(len(hostnames), fn, hostnames=hostnames)
-    mat, nq, moments, compressed, removed = res[0]
-    assert np.array_equal(mat, ref.mat) and nq == nk and compressed and removed == ref_removed
-    assert all(np.array_equal(a, b) for a, b in zip(moments, ref_moments)) and all(r is None for r in res[1:])
+    return run_parallel(len(hostnames), fn, hostnames=hostnames)[1]
+
+
+@pytest.mark.parametrize("average", [True, False])
+@pytest.mark.parametrize("hostnames", [["n0"], ["n0", "n0", "n0", "n1"], ["n0"] * 6, ["n0", "n1"]])
+def test_finish_on_node_builds_the_core_with_the_bits_of_the_whole_proposal(monkeypatch, average, hostnames):
+    """Rank 0's node adds the terms and averages the core by momentum rows with the bits of rank 0 building it whole."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, n_core = (4, 2, 1), 2, 2
+    inputs = _finish_inputs(8, nb, n_core, seed=13)
+    ref, ref_removed = _finished_whole(*inputs, nk, average)
+    results = _finish_on_node(hostnames, *inputs, nk, average)
+    on_node = [r for r in results if r is not None]
+    assert len(on_node) == hostnames.count("n0") and all(r is None for r in results[len(on_node) :])
+    for mat, nq, compressed, removed in on_node:
+        assert np.array_equal(mat, ref) and nq == nk and compressed and removed == ref_removed
 
 
 @pytest.mark.parametrize("hostnames", [["n0"], ["n0", "n0", "n0"]])
-def test_finish_on_node_unfolds_the_proposal_from_its_irreducible_momenta_before_the_average(monkeypatch, hostnames):
+def test_finish_on_node_unfolds_the_core_from_its_irreducible_momenta_before_the_average(monkeypatch, hostnames):
     """A core obeying the group to rounding is unfolded from its irreducible momenta, then averaged; another is kept."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     _point_group_sde_setup("square")
@@ -5207,29 +5625,268 @@ def test_finish_on_node_unfolds_the_proposal_from_its_irreducible_momenta_before
     obeying = (h_k @ h_k)[..., None] / (1j * np.array([-1.0, 1.0])) + h_k[..., None]
     obeying = (obeying * (1 + 2e-7 * rng.standard_normal(obeying.shape))).astype(np.complex64)
     random = (rng.standard_normal((16, 2, 2, 2)) + 1j * rng.standard_normal((16, 2, 2, 2))).astype(np.complex64)
-    donor_mat = (rng.standard_normal((1, 1, 1, 2, 2, 8)) + 0.2j).astype(np.complex64)
-    offset = rng.standard_normal((16, 2, 2))
-
-    def make(core_mat):
-        core = SelfEnergy(core_mat.copy(), grid.nk, True, True, calc_smom=False, beta=10.0)
-        return core, SelfEnergy(donor_mat.copy(), (1, 1, 1), calc_smom=False, beta=10.0)
+    zero = [np.zeros((1, 2, 2, 1)), np.zeros((16, 2, 2, 1)), np.zeros((1, 2, 2, 2), dtype=np.complex64)]
 
     def finish(core_mat, unfold):
-        def fn(comm, rank):
-            node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
-            core, donor = make(core_mat) if rank == 0 else (None, None)
-            args = (offset, True) if rank == 0 else (None, False)
-            sigma, _ = nonlocal_sde._finish_proposal_on_node(core, donor, *args, node_comm, unfold=unfold and rank == 0)
-            return None if sigma is None else sigma.mat.copy()
+        return _finish_on_node(hostnames, core_mat, zero, grid.nk, True, unfold)[0][0]
 
-        return run_parallel(len(hostnames), fn, hostnames=hostnames)[1][0]
-
-    core, donor = make(obeying)
-    ref = core.concatenate_self_energies(donor, shell_offset=offset)
-    ref.unfold_irreducible_momenta(grid, frequencies=slice(3, 5))  # the two core frequencies of the eight
-    ref.symmetrize_time_reversal()
-    assert np.array_equal(finish(obeying, True), ref.mat) and not np.array_equal(finish(obeying, False), ref.mat)
+    ref, _ = _finished_whole(obeying, zero, grid.nk, True, unfold_grid=grid)
+    assert np.array_equal(finish(obeying, True), ref) and not np.array_equal(finish(obeying, False), ref)
     assert np.array_equal(finish(random, True), finish(random, False))
+
+
+@pytest.mark.parametrize("one_owner", [False, True])
+@pytest.mark.parametrize(
+    "hostnames", [["n0"], ["n0", "n0", "n1", "n1"], ["n0", "n1", "n0", "n1"], ["n0", "n1", "n1", "n0", "n1"]]
+)
+def test_row_layout_gives_every_node_a_contiguous_block_with_rank_0_first(monkeypatch, hostnames, one_owner):
+    """Rows go node by node in contiguous blocks, rank 0 holding rows (all of them for one owner), owners split off."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED) if comm.size > 1 else None
+        roots_comm = comm.Split(0 if node_comm.rank == 0 else 1) if node_comm is not None else None
+        layout = nonlocal_sde._row_layout(comm, node_comm, roots_comm, 7, one_owner)
+        owners = None if layout.owners is None else layout.owners.size
+        return layout.rows, owners, layout.bounds.tolist(), layout.node
+
+    results = run_parallel(len(hostnames), fn, hostnames=hostnames)[1]
+    rows = [r[0] for r in results]
+    bounds = results[0][2]
+    assert all(r[2] == bounds for r in results) and bounds[0] == 0 and bounds[-1] == 7
+    assert sorted(i for r in rows for i in range(r.start, r.stop)) == list(range(7))
+    assert all(bounds[node] <= r.start <= r.stop <= bounds[node + 1] for r, _, _, node in results)
+    first = 7 if one_owner else 7 // len(hostnames) + (7 % len(hostnames) > 0)
+    assert results[0][3] == 0 and rows[0].start == 0 and rows[0].stop == first
+    owners = [r for r in rows if r.stop > r.start]
+    assert all(r[1] == len(owners) for r in results if r[0].stop > r[0].start)
+    assert all(r[1] is None for r in results if r[0].stop == r[0].start)
+
+
+@pytest.mark.parametrize("hostnames", [["n0", "n0", "n1", "n1"], ["n0", "n1", "n0", "n1"], ["n0", "n0", "n0"]])
+def test_scatter_and_gather_of_the_core_rows_hand_every_node_every_mixed_row(monkeypatch, hostnames):
+    """Every node receives its block of the proposal rows, and after the owners' writes every node holds every row."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    rng = np.random.default_rng(31)
+    proposal = (rng.standard_normal((9, 2, 2, 4)) + 1j * rng.standard_normal((9, 2, 2, 4))).astype(np.complex64)
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        roots_comm = comm.Split(0 if node_comm.rank == 0 else 1)
+        layout = nonlocal_sde._row_layout(comm, node_comm, roots_comm, 9, False)
+        core, win = mpi_utils.allocate_node_shared_array(node_comm, proposal.shape, proposal.dtype)
+        if layout.node == 0 and node_comm.rank == 0:
+            core[...] = proposal
+        node_comm.Barrier()
+        nonlocal_sde._scatter_proposal_rows(core, layout)
+        received = core[layout.rows].copy()
+        core[layout.rows] *= 2.0  # the owner's mixed rows
+        nonlocal_sde._gather_mixed_rows(core, layout)
+        gathered = core.copy()
+        nonlocal_sde._free_shared_window(win, node_comm)
+        return layout.rows, received, gathered
+
+    for rows, received, gathered in run_parallel(len(hostnames), fn, hostnames=hostnames)[1]:
+        assert np.array_equal(received, proposal[rows]) and np.array_equal(gathered, 2.0 * proposal)
+
+
+def _whole_iterate(core, sigma_old, donor, offset, average, donor_old, damped, alpha, nk) -> tuple:
+    """The next iterate as rank 0 built it from the whole self-energies (the proposal padded and its shell averaged,
+    the old iterate cut and padded again, mixed over every frequency after a damped step, the mixed core put in) and
+    the largest change of the shell's average."""
+    beta = 10.0
+    proposal = SelfEnergy(core.copy(), nk, True, True, calc_smom=False, beta=beta)
+    proposal = proposal.concatenate_self_energies(donor, shell_offset=offset)
+    lo, hi = donor.niv - core.shape[-1] // 2, donor.niv + core.shape[-1] // 2
+    shells = (slice(0, lo), slice(hi, 2 * donor.niv))
+    removed = max(proposal.symmetrize_time_reversal(frequencies=f) for f in shells) if average else 0.0
+    old = sigma_old.cut_niv(core.shape[-1] // 2).concatenate_self_energies(
+        donor_old, shell_offset=sigma_old.shell_offset_from(donor_old)
+    )
+    mixed = alpha * proposal + (1 - alpha) * old if damped else proposal
+    mixed.mat[..., lo:hi] = core
+    return mixed.compress_q_dimension().mat, removed
+
+
+@pytest.mark.parametrize("damped, average", [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("hostnames, local_old", [(["n0"], False), (["n0", "n0", "n0"], False), (["n0"] * 2, True)])
+def test_build_iterate_window_pads_every_row_as_the_mixing_of_the_whole_self_energies(
+    monkeypatch, damped, average, hostnames, local_old
+):
+    """Every node builds the next iterate with the bits of mixing the whole padded self-energies, shells included."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, n_core, niv = (4, 3, 1), 2, 4, 6
+    config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
+    rng = np.random.default_rng(37)
+
+    def cmat(*shape):
+        return (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+
+    core = cmat(12, nb, nb, n_core)
+    donor = SelfEnergy(cmat(1, nb, nb, 2 * niv), (1, 1, 1), True, True, calc_smom=False, beta=10.0)
+    donor_old = SelfEnergy(cmat(1, nb, nb, 2 * niv), (1, 1, 1), True, True, calc_smom=False, beta=10.0)
+    offset = rng.standard_normal((12, nb, nb)) + 1j * rng.standard_normal((12, nb, nb))
+    old_mat = cmat(1 if local_old else 12, nb, nb, 2 * niv)
+
+    def old():
+        return SelfEnergy(old_mat.copy(), (1, 1, 1) if local_old else nk, True, True, calc_smom=False, beta=10.0)
+
+    reference, ref_removed = _whole_iterate(core, old(), donor, offset, average, donor_old, damped, 0.3, nk)
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED) if comm.size > 1 else None
+        shell = (donor, offset, average, donor_old, damped, 0.3)
+        sigma, win, removed = nonlocal_sde._build_iterate_window(core, old(), shell, node_comm, 10.0)
+        mat = sigma.mat.copy()
+        nonlocal_sde._free_shared_window(win, node_comm)
+        return mat, sigma.nq, sigma.has_compressed_q_dimension, removed
+
+    for mat, nq, compressed, removed in run_parallel(len(hostnames), fn, hostnames=hostnames)[1]:
+        assert np.array_equal(mat, reference) and nq == nk and compressed and removed == ref_removed
+
+
+def _loop_on_grid(monkeypatch, tmp_path, strategy: str, hostnames: list, n_bands: int = 1) -> np.ndarray:
+    """Runs four iterations of the loop on a 4 x 1 x 1 grid with a map whose rows all differ and returns rank 0's
+    result."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    nb = n_bands
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, _distinct_rows_step, 4, 0.0, n_bands=nb)
+    config.lattice.k_grid = bz.KGrid((4, 1, 1), symmetries=[])
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((4, 1, 1, nb, nb)))
+    config.self_consistency.mixing_strategy, config.self_consistency.mixing_history_length = strategy, 2
+    occupy = lambda sigma, mu, ek, *a, **k: (1.0, np.eye(nb, dtype=np.complex128), np.zeros((*ek.shape[:3], nb, nb)))
+    greens = SimpleNamespace(get_g_full=nonlocal_sde.GreensFunction.get_g_full, get_occupation=occupy)
+    monkeypatch.setattr(nonlocal_sde, "GreensFunction", greens)
+    return run_parallel(len(hostnames), lambda comm, rank: run(comm), hostnames=hostnames)[1][0].mat.copy()
+
+
+@pytest.mark.parametrize("n_bands", [1, 2])
+@pytest.mark.parametrize("strategy", ["linear", "anderson", "pulay"])
+@pytest.mark.parametrize("hostnames", [["n0", "n0", "n1", "n1"], ["n0", "n1", "n0", "n1"]])
+def test_loop_on_two_nodes_returns_the_iterate_of_one_rank(monkeypatch, tmp_path, strategy, hostnames, n_bands):
+    """Four ranks on two nodes, in any order, return one rank's self-energy for momentum rows that all differ (two
+    bands: with the time-reversal average of the proposal and a momentum-dependent shell): linear mixing bit for bit,
+    the accelerated schemes to the rounding of their sums over the owners."""
+    one = _loop_on_grid(monkeypatch, tmp_path, strategy, ["n0"], n_bands)
+    four = _loop_on_grid(monkeypatch, tmp_path, strategy, hostnames, n_bands)
+    if strategy == "linear":
+        assert np.array_equal(four, one)
+    else:
+        assert np.allclose(four, one, rtol=0.0, atol=1e-6 * np.abs(one).max())
+
+
+def test_loop_logs_the_larger_time_reversal_change_of_the_core_and_the_shell_of_every_proposal(monkeypatch, tmp_path):
+    """With several bands every iteration logs the larger of the largest changes of the proposal core's average (rank
+    0's node) and of its shell's (every node)."""
+    finish, build, changes = nonlocal_sde._finish_proposal_on_node, nonlocal_sde._build_iterate_window, []
+
+    def finishing(*args, **kwargs):
+        result = finish(*args, **kwargs)
+        if threading.current_thread().name == "rank0":
+            changes.append([result[2]])
+        return result
+
+    def building(*args):
+        result = build(*args)
+        if threading.current_thread().name == "rank0":
+            changes[-1].append(result[2])
+        return result
+
+    monkeypatch.setattr(nonlocal_sde, "_finish_proposal_on_node", finishing)
+    monkeypatch.setattr(nonlocal_sde, "_build_iterate_window", building)
+    _loop_on_grid(monkeypatch, tmp_path, "linear", ["n0", "n0", "n1", "n1"], n_bands=2)
+    logged = [c.args[0] for c in config.logger.info.call_args_list if "Time-reversal average" in c.args[0]]
+    assert len(changes) == 4 and all(core > 0 and shell > 0 for core, shell in changes)
+    assert logged == [
+        f"Time-reversal average of the self-energy proposal: largest change {max(c):.3e}." for c in changes
+    ]
+
+
+def _holds_view(value, window: np.ndarray) -> bool:
+    """Whether a local is, or holds as its mat or as an item, an array inside the memory of a shared window."""
+    if isinstance(value, (list, tuple)):
+        return any(_holds_view(item, window) for item in value)
+    mat = value.mat if isinstance(value, SelfEnergy) else value
+    return isinstance(mat, np.ndarray) and np.may_share_memory(mat, window)
+
+
+def test_loop_drops_every_view_into_a_window_before_freeing_it(monkeypatch, tmp_path):
+    """No local of the function that frees a shared window of the loop still views the window's memory."""
+    allocate, build = mpi_utils.allocate_node_shared_array, mpi_utils.build_node_shared_array
+    free, windows, held = nonlocal_sde._free_shared_window, {}, []
+
+    def remembered(result):
+        if result[1] is not None:
+            windows[id(result[1])] = result[0]
+        return result
+
+    def checked_free(win, node_comm):
+        if win is not None:
+            frame = sys._getframe(1)
+            names = sorted(name for name, value in frame.f_locals.items() if _holds_view(value, windows[id(win)]))
+            held.extend((frame.f_code.co_name, name) for name in names)
+        return free(win, node_comm)
+
+    monkeypatch.setattr(mpi_utils, "allocate_node_shared_array", lambda *a, **k: remembered(allocate(*a, **k)))
+    monkeypatch.setattr(mpi_utils, "build_node_shared_array", lambda *a, **k: remembered(build(*a, **k)))
+    monkeypatch.setattr(nonlocal_sde, "_free_shared_window", checked_free)
+    _loop_on_grid(monkeypatch, tmp_path, "linear", ["n0", "n0", "n1", "n1"])
+    assert sorted(set(held)) == []
+
+
+def _recorded_splits(monkeypatch) -> tuple[threading.local, dict, dict]:
+    """Records, per rank, the communicators Split hands out while the thread-local flag ``on`` is set and every
+    communicator the rank frees."""
+    split, inside, made, freed = FAKE_MPI.Comm.Split, threading.local(), {}, {}
+
+    def recording(self, color, key=0):
+        new = split(self, color, key)
+        if getattr(inside, "on", False):
+            made.setdefault(threading.current_thread().name, []).append(new)
+        return new
+
+    monkeypatch.setattr(FAKE_MPI.Comm, "Split", recording)
+    monkeypatch.setattr(
+        FAKE_MPI.Comm, "Free", lambda self: freed.setdefault(threading.current_thread().name, []).append(self)
+    )
+    return inside, made, freed
+
+
+@pytest.mark.parametrize("hostnames", [["n0", "n0", "n1", "n1"], ["n0", "n1", "n1", "n0", "n1"]])
+def test_row_layout_frees_every_communicator_it_does_not_hand_out(monkeypatch, hostnames):
+    """Of the communicators the layout splits off, only an owner's communicator of the owners outlives it."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    inside, made, freed = _recorded_splits(monkeypatch)
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        roots_comm = comm.Split(0 if node_comm.rank == 0 else 1)
+        inside.on = True
+        layout = nonlocal_sde._row_layout(comm, node_comm, roots_comm, 3, False)
+        inside.on = False
+        return layout.owners
+
+    for rank, owners in enumerate(run_parallel(len(hostnames), fn, hostnames=hostnames)[1]):
+        name = f"rank{rank}"
+        left = [c for c in made[name] if not any(c is f for f in freed.get(name, []))]
+        assert len(left) == (owners is not None) and all(c is owners for c in left)
+
+
+def test_loop_frees_the_communicator_of_the_owners_of_rows_at_its_end(monkeypatch, tmp_path):
+    """Every owner of momentum rows frees the communicator of the owners once the loop is done."""
+    _, _, freed = _recorded_splits(monkeypatch)
+    layout_of, layouts = nonlocal_sde._row_layout, {}
+
+    def recorded_layout(*args, **kwargs):
+        layout = layout_of(*args, **kwargs)
+        layouts[threading.current_thread().name] = layout
+        return layout
+
+    monkeypatch.setattr(nonlocal_sde, "_row_layout", recorded_layout)
+    _loop_on_grid(monkeypatch, tmp_path, "linear", ["n0", "n0", "n1", "n1"])
+    owners = {name: layout.owners for name, layout in layouts.items() if layout.owners is not None}
+    assert len(owners) == 4 and all(any(c is comm for c in freed.get(name, [])) for name, comm in owners.items())
 
 
 def _previous_iterate(tmp_path, monkeypatch, mat: np.ndarray) -> None:
@@ -5250,7 +5907,7 @@ def _local_sigma(diagonal) -> SelfEnergy:
 def test_get_starting_sigma_unfolds_a_regridded_start_only_where_the_dmft_self_energy_obeys_the_point_group(
     dmft_obeys, monkeypatch, tmp_path
 ):
-    """A start interpolated onto a grid whose group shears its axes is unfolded if DMFT obeys the group, else kept."""
+    """A regridded start is unfolded where DMFT obeys the sheared group, else kept, then averaged over time reversal."""
     _point_group_sde_setup("triangular")  # 6 x 6 x 1, two orbitals, niv_core 2
     rng, shape = np.random.default_rng(23), (3, 3, 1, 2, 2, 8)
     source = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
@@ -5259,13 +5916,15 @@ def test_get_starting_sigma_unfolds_a_regridded_start_only_where_the_dmft_self_e
     plain.compress_q_dimension()
     unfolded = plain.copy()
     unfolded.unfold_irreducible_momenta(config.lattice.k_grid)
+    expected = (unfolded if dmft_obeys else plain).copy()
+    expected.symmetrize_time_reversal()
 
     start, iteration, warm_start = nonlocal_sde.get_starting_sigma(_local_sigma([1.0, 1.0 if dmft_obeys else 2.0]))
 
     assert (iteration, warm_start) == (3, True) and not start.has_compressed_q_dimension
     assert not nonlocal_sde._has_point_group_covariance(plain.mat)
     assert nonlocal_sde._has_point_group_covariance(unfolded.mat)
-    assert np.array_equal(start.compress_q_dimension().mat, (unfolded if dmft_obeys else plain).mat)
+    assert np.array_equal(start.compress_q_dimension().mat, expected.mat)
 
 
 @pytest.mark.parametrize("residue", [1e-30, 1e-7])
@@ -5288,6 +5947,61 @@ def test_get_starting_sigma_keeps_only_a_start_that_obeys_the_point_group_to_the
 
     assert not np.array_equal(unfolded, source) and np.abs(source).max() > 1.0
     assert np.array_equal(start.mat, source if residue < 1e-12 else unfolded)
+
+
+@pytest.mark.parametrize("case", ["real hoppings", "complex hopping", "one band"])
+def test_get_starting_sigma_averages_a_start_over_time_reversal_only_where_the_loop_averages_its_proposals(
+    case, monkeypatch, tmp_path
+):
+    """A start off time reversal is averaged, with a log line, only for several orbitals and real hoppings."""
+    _point_group_sde_setup("square")
+    if case == "complex hopping":
+        h_k = config.lattice.hamiltonian.get_ek() + 0.2j * np.array([[0.0, 1.0], [-1.0, 0.0]])
+        config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: h_k)
+    nb, rng, minus = 1 if case == "one band" else 2, np.random.default_rng(31), (-np.arange(4)) % 4
+    source = (rng.standard_normal((4, 4, 1, nb, nb, 4)) + 1j * rng.standard_normal((4, 4, 1, nb, nb, 4))).astype(
+        np.complex64
+    )
+    _previous_iterate(tmp_path, monkeypatch, source)
+
+    start = nonlocal_sde.get_starting_sigma(_local_sigma([1.0, 2.0]))[0]  # DMFT off the group: no unfold
+
+    averaged = (source + source[minus][:, minus].swapaxes(3, 4)) * np.float32(0.5)
+    logged = any("time reversal" in str(call) for call in config.logger.info.call_args_list)
+    assert np.array_equal(start.mat, averaged if case == "real hoppings" else source)
+    assert logged == (case == "real hoppings") and not np.array_equal(averaged, source)
+
+
+@pytest.mark.parametrize("residue", [1e-30, 1e-7])
+def test_get_starting_sigma_keeps_only_a_start_that_obeys_time_reversal_to_1e_12_of_its_largest_entry(
+    residue, monkeypatch, tmp_path
+):
+    """A start off time reversal by 1e-30 keeps its bits, residue included; one off by 1e-7 is averaged."""
+    _point_group_sde_setup("square")
+    rng, minus = np.random.default_rng(37), (-np.arange(4)) % 4
+    half = rng.standard_normal((4, 4, 1, 2, 2, 4)) + 1j * rng.standard_normal((4, 4, 1, 2, 2, 4))
+    source = (half + half[minus][:, minus].swapaxes(3, 4)).astype(np.complex64)
+    source[1, 2, 0, 0, 1, 0], source[3, 2, 0, 1, 0, 0] = residue, 0.0  # the pair (k, 12) and (-k, 21)
+    _previous_iterate(tmp_path, monkeypatch, source)
+
+    start = nonlocal_sde.get_starting_sigma(_local_sigma([1.0, 2.0]))[0]
+
+    averaged = source.copy()
+    averaged[1, 2, 0, 0, 1, 0] = averaged[3, 2, 0, 1, 0, 0] = source[1, 2, 0, 0, 1, 0] * np.float32(0.5)
+    assert np.array_equal(start.mat, source if residue < 1e-12 else averaged)
+
+
+def test_has_time_reversal_covariance_compares_every_block_of_momenta_with_its_partners():
+    """A 6 x 6 x 3 self-energy obeying Sigma(-k) = Sigma(k)^T passes; 1e-9 off at k and -k in the second block fails."""
+    nk, rng = (6, 6, 3), np.random.default_rng(41)
+    config.lattice.k_grid = SimpleNamespace(nk=nk)
+    mx, my, mz = ((-np.arange(n)) % n for n in nk)
+    half = rng.standard_normal((*nk, 2, 2, 4)) + 1j * rng.standard_normal((*nk, 2, 2, 4))
+    mat = (half + half[mx][:, my][:, :, mz].swapaxes(3, 4)).reshape(108, 2, 2, 4)
+    assert nonlocal_sde._has_time_reversal_covariance(mat, 1e-12)
+    mat[64, 0, 1, 2] += 1e-9  # k = (3, 3, 1), whose partner (3, 3, 2) is row 65
+    assert not nonlocal_sde._has_time_reversal_covariance(mat, 1e-12)
+    assert nonlocal_sde._has_time_reversal_covariance(mat, 1e-6)
 
 
 @pytest.mark.parametrize(

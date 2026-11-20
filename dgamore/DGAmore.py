@@ -28,10 +28,8 @@ import traceback
 # component-query and print a benign "OSC UCX component priority set inside component query failed" warning otherwise.
 os.environ.setdefault("OMPI_MCA_osc", "^ucx")
 
-import matplotlib.pyplot as plt
 import numpy as np
 import psutil
-from matplotlib import font_manager
 from mpi4py import MPI
 
 import dgamore.config as config
@@ -41,7 +39,6 @@ import dgamore.local_sde as local_sde
 import dgamore.memory_estimator as memory_estimator
 import dgamore.mpi_utils as mpi_utils
 import dgamore.nonlocal_sde as nonlocal_sde
-import dgamore.plotting as plotting
 from dgamore import max_ent
 from dgamore.brillouin_zone import is_auto_symmetries
 from dgamore.config_parser import ConfigParser
@@ -61,14 +58,27 @@ NODE_MEMORY_FRACTION: float = 0.95
 def main():
     """
     Console-script entry point. Runs :func:`run_dga_routine` on every rank and exits with its status; when any rank
-    leaves it through an exception, that rank logs its traceback, flushes the log and aborts the whole MPI job, so the
-    other ranks cannot block forever in a collective the failed rank never joins. The objects alive at entry (the
-    imported libraries) are frozen out of the garbage collector's sweeps first, so the ``gc.collect()`` of every
-    n-point release (see :meth:`~dgamore.n_point_base.IHaveMat.free`) walks only the objects the run creates.
+    leaves it through an exception, that rank logs its traceback, deletes the per-rank intermediates of every rank (see
+    :func:`~dgamore.eliashberg_solver.delete_rank_files`), flushes the log and aborts the whole MPI job, so the other
+    ranks cannot block forever in a collective the failed rank never joins. Rank 0, the only rank that plots or
+    reads the hr and umatrix files, first imports :mod:`dgamore.plotting` (with matplotlib) and pandas, and aborts the
+    job when that fails. The imported libraries are then frozen out of the garbage collector's sweeps, so the
+    ``gc.collect()`` of every n-point release (see :meth:`~dgamore.n_point_base.IHaveMat.free`) walks only the objects
+    the run creates.
 
     :return: None.
     """
     comm = MPI.COMM_WORLD
+    if comm.rank == 0:
+        # deferred: only rank 0 plots and reads the hr and umatrix files; a failed import aborts the job, since the
+        # other ranks would wait for rank 0 in the config broadcast forever
+        try:
+            import dgamore.plotting
+            import pandas
+        except BaseException:
+            traceback.print_exc()
+            sys.stderr.flush()
+            comm.Abort(1)
     gc.collect()
     gc.freeze()
     try:
@@ -77,6 +87,7 @@ def main():
         config.logger.error(
             f"Rank {comm.rank} failed, aborting all ranks.\n{traceback.format_exc()}", allowed_ranks=(comm.rank,)
         )
+        eliashberg_solver.delete_rank_files()
         sys.stdout.flush()
         logging.shutdown()
         comm.Abort(1)
@@ -163,7 +174,8 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         sigma_dmft_test = None if config.misc.do_rpa else sigma_dmft_per_ineq
         eliashberg_solver.check_parity_sectors(comm, sigma_dmft_test, log=False)
 
-    config_parser.save_config_file(path=config.output.output_path, name="dga_config.yaml")
+    if comm.rank == 0:
+        config_parser.save_config_file(path=config.output.output_path, name="dga_config.yaml")
 
     logger.info("Config init and folder setup done.")
     logger.info("Loaded data from w2dyn file.")
@@ -256,6 +268,8 @@ def run_dga_routine(comm: MPI.Comm) -> int:
                 g2.to_half_niw_range()
             g2_full = save_full_4pt_quantity(g2_per_ineq, f"g2_{channel}_loc")
             if config.output.do_plotting:
+                from dgamore import plotting
+
                 for omega in [0, -10, 10] if g2_full.niw >= 10 else [0]:
                     plotting.plot_nu_nup(
                         g2_full, omega=omega, name=f"G2_{channel}", output_dir=config.output.plotting_path
@@ -371,6 +385,8 @@ def run_dga_routine(comm: MPI.Comm) -> int:
             gchi_full = save_full_4pt_quantity(gchi_per_ineq, f"gchi_{channel}_loc")
             gchi_per_ineq.clear()
             if config.output.do_plotting:
+                from dgamore import plotting
+
                 plotting.plot_nu_nup(gchi_full, omega=0, name=f"Gchi_{channel}", output_dir=config.output.plotting_path)
             del gchi_full
         if config.output.do_plotting:
@@ -380,6 +396,8 @@ def run_dga_routine(comm: MPI.Comm) -> int:
             gamma_full = save_full_4pt_quantity(gamma_per_ineq, f"gamma_{channel}_loc")
             gamma_per_ineq.clear()
             if config.output.do_plotting:
+                from dgamore import plotting
+
                 gamma_plot = gamma_full.cut_niv(min(config.box.niv_core, 2 * int(config.sys.beta)))
                 for omega in [0, 10, -10] if gamma_plot.niw >= 10 else [0]:
                     plotting.plot_nu_nup(
@@ -408,6 +426,8 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         logger.info("Saved all relevant quantities as numpy files.")
 
     if config.output.do_plotting and comm.rank == 0:
+        from dgamore import plotting
+
         sigma_list = []
         sigma_names = []
         for i, j in it.product(range(config.sys.n_bands), repeat=2):
@@ -465,6 +485,8 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         spectrum = max_ent.perform_maxent_giwk(giwk_dga, "DGA", comm)
 
         if config.ana_cont.plot_spectrum and comm.rank == 0:
+            from dgamore import plotting
+
             plotting.plot_spectrum(
                 spectrum,
                 config.lattice.k_grid.kx,
@@ -491,6 +513,8 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         spectrum = max_ent.perform_maxent_giwk(g_latt, "DMFT", comm)
 
         if config.ana_cont.plot_spectrum and comm.rank == 0:
+            from dgamore import plotting
+
             plotting.plot_spectrum(
                 spectrum,
                 config.lattice.k_grid.kx,
@@ -514,6 +538,8 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         logger.info("Saved non-local Green's function as numpy file.")
 
     if config.output.do_plotting and comm.rank == 0:
+        from dgamore import plotting
+
         kx, ky = config.lattice.k_grid.kx_shift_closed, config.lattice.k_grid.ky_shift_closed
         plotting.plot_two_point_kx_ky(
             sigma_dga,
@@ -587,6 +613,8 @@ def run_dga_routine(comm: MPI.Comm) -> int:
             _write_gap_parity(results, ek, inversion)
 
         if config.output.do_plotting and comm.rank == 0:
+            from dgamore import plotting
+
             kx, ky = config.lattice.k_grid.kx_shift_closed, config.lattice.k_grid.ky_shift_closed
             for (channel, parity), (_lambdas, gaps) in results.items():
                 for i, gap in enumerate(gaps):
@@ -677,14 +705,15 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     Schwinger-Dyson contraction, the local Schwinger-Dyson pass, the occupation at the start of the non-local routine
     (fresh or warm start, and the DMFT lattice Green's function of the DMFT spectrum), the self-consistency mixing
     step, chemical-potential update and occupation and energy step, the final self-energy interpolation, the
-    pairing-vertex construction and the Eliashberg solver (which alone has two variants, in-memory versus its
-    block-distributed grid fallback), and sizes the chunk budgets of the two chunked builds from the same estimate.
+    pairing-vertex construction and the Eliashberg solver (which alone has two variants on a multi-rank job, the
+    node-shared team solve versus its node-distributed fallback), and sizes the chunk budgets of the two chunked builds
+    from the same estimate.
     Must be called only after the irreducible BZ is known (i.e. after auto-symmetry discovery), as the estimate depends on ``k_grid.nk_irr``.
 
     The budget is a **node total** (see :func:`dgamore.memory_estimator.node_total`): every rank of a node holds the
     branch's persistent baseline and its *distributed* transient at the rank's own task counts (ranks with equal
-    irreducible and full-BZ counts share one estimate; the Schwinger-Dyson contraction's column schedule stays the
-    busiest rank's), the node holding rank 0 adds the *single-rank* transient
+    irreducible and full-BZ counts and equal column tasks and slabs of the Schwinger-Dyson contraction share one
+    estimate), the node holding rank 0 adds the *single-rank* transient
     rank 0 builds while the others idle, every other node the branch's ``remote_single`` (all of the single-rank
     transient when the branch sets none), and the node-shared windows count once; this must not exceed
     ``NODE_MEMORY_FRACTION`` times the node budget - ``psutil.virtual_memory().available``, capped by the cgroup
@@ -725,11 +754,14 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         nodes[host][0].append(rank)
         nodes[host][1] = min(nodes[host][1], avail)
     nk_irr, nk_tot = config.lattice.k_grid.nk_irr, config.lattice.k_grid.nk_tot
+    niw, niv = config.box.niw_core, config.box.niv_core
+    sde_tasks = np.diff(memory_estimator.column_sde_schedule(niw, niv, comm.size)[1])
+    sde_slabs = memory_estimator.column_sde_rank_slabs(niw, niv, comm.size)
 
-    def counts(rank: int) -> tuple[int, int]:
-        """The rank's irreducible and full-BZ task counts, which alone set its distributed terms."""
-        irreducible = memory_estimator.rank_tasks(nk_irr, comm.size, rank)
-        return irreducible, memory_estimator.rank_tasks(nk_tot, comm.size, rank)
+    def counts(rank: int) -> tuple[int, int, int, int]:
+        """The rank's irreducible and full-BZ task counts and its self-energy column tasks and slabs, which alone set
+        its distributed terms."""
+        return *memory_estimator.rank_counts(nk_irr, nk_tot, comm.size, rank), sde_tasks[rank], sde_slabs[rank]
 
     # per node: [representative rank, number of ranks] per distinct pair of counts, whether it holds rank 0, its line
     node_groups = []
@@ -786,28 +818,32 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
             )
         return estimates[key]
 
-    def node_totals(key: str, chunk_budgets: memory_estimator.ChunkBudgets, grid: bool = False) -> list:
+    def node_totals(key: str, chunk_budgets: memory_estimator.ChunkBudgets) -> list:
         """The pairs ``(node total, line)`` of the branch ``key`` on every node (see
         :func:`dgamore.memory_estimator.node_total`)."""
         return [
             (
                 memory_estimator.node_total(
-                    [(n, rank_estimate(rank, chunk_budgets)[key]) for rank, n in groups], holds_rank_zero, grid
+                    [(n, rank_estimate(rank, chunk_budgets)[key]) for rank, n in groups], holds_rank_zero
                 ),
                 line,
             )
             for groups, holds_rank_zero, line in node_groups
         ]
 
-    def fits_everywhere(key: str, chunk_budgets: memory_estimator.ChunkBudgets, grid: bool = False) -> bool:
+    def fits_everywhere(key: str, chunk_budgets: memory_estimator.ChunkBudgets) -> bool:
         """Whether the branch ``key`` at ``chunk_budgets`` fits the node budget on every node."""
-        return all(total <= line for total, line in node_totals(key, chunk_budgets, grid))
+        return all(total <= line for total, line in node_totals(key, chunk_budgets))
 
     def worst(totals: list) -> float:
         """The node total of the node that overflows its line the most, from the pairs ``(node total, line)``."""
         return max(totals, key=lambda pair: pair[0] - pair[1])[0]
 
-    zero_budgets = memory_estimator.ChunkBudgets(0, 0)
+    # a node's ranks share the self-energy contraction's column work only where some rank would have no column task of
+    # its own, or where each rank alone does not fit even at one task per round
+    zero_budgets = memory_estimator.ChunkBudgets(0, 0, sde_node=bool((sde_tasks == 0).any()))
+    if "sde" in rank_estimate(0, zero_budgets) and not fits_everywhere("sde", zero_budgets):
+        zero_budgets = dataclasses.replace(zero_budgets, sde_node=True)
 
     def sized_budget(key: str) -> int:
         """Largest per-rank chunk budget of the chunked branch ``key`` that keeps every node inside its line of
@@ -818,7 +854,9 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
             lambda budget: fits_everywhere(key, dataclasses.replace(zero_budgets, **{key: budget}))
         )
 
-    budgets = memory_estimator.ChunkBudgets(sde=sized_budget("sde"), fq=sized_budget("fq"))
+    budgets = memory_estimator.ChunkBudgets(
+        sde=sized_budget("sde"), fq=sized_budget("fq"), sde_node=zero_budgets.sde_node
+    )
     if config.stabilization.use_exact_jacobian:
         budgets = memory_estimator.exact_jacobian_budgets(
             lambda trial: fits_everywhere("exact_jacobian", trial), budgets, config.box.niw_core + 1
@@ -847,6 +885,33 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
             )
         )
 
+    def distributed_need(n_ranks: int, holds_rank_zero: bool) -> float:
+        """Node peak of the node-distributed solve with one column builder per node, as its planner models it, with
+        rank 0's full-grid interaction and its share of the solve on rank 0's node."""
+        n_sectors = 4 if config.eliashberg.resolve_parity_sectors else 2
+        rank_zero = (
+            memory_estimator.interaction_bytes(config.sys.n_bands, nk_tot) + peaks["lanczos"].on_single
+            if holds_rank_zero
+            else 0.0
+        )
+        return (
+            n_ranks * peaks["lanczos"].baseline
+            + rank_zero
+            + memory_estimator.lanczos_distributed_bytes(
+                config.sys.n_bands,
+                nk_tot,
+                nk_irr,
+                niv_pp,
+                config.eliashberg.n_eig,
+                len(nodes),
+                n_sectors,
+                eliashberg_solver.wedge_window_points(config.lattice.k_grid),
+                eliashberg_solver.block_size(config.lattice.k_grid),
+                1,
+                holds_rank_zero,
+            )
+        )
+
     logger.info(f"Auto memory detection (node-total budget): {len(nodes)} node(s).")
 
     def budget_label(budget: int) -> str:
@@ -854,7 +919,8 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         return "whole block" if budget >= memory_estimator.MAX_CHUNK_BUDGET_BYTES else f"{budget / 1024**3:.3f} GB"
 
     logger.info(
-        f"Chunk budgets per rank: self-energy contraction {budget_label(budgets.sde)}, pairing vertex "
+        f"Chunk budgets per rank: self-energy contraction {budget_label(budgets.sde)}"
+        f"{' with its column work shared by each node' if budgets.sde_node else ''}, pairing vertex "
         f"{budget_label(budgets.fq)}."
     )
 
@@ -916,11 +982,14 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         if key not in peaks or (key == "chiq_aux" and config.misc.bare_vertex):
             continue
         totals = node_totals(key, budgets)
+        fits = all(total <= line for total, line in totals)
         if key == "lanczos" and comm.size > 1:
-            totals = [(team_need(len(ranks), 0 in ranks), a * NODE_MEMORY_FRACTION) for ranks, a in nodes.values()]
-        fits_in_memory = all(total <= line for total, line in totals)
-        fits_grid = key == "lanczos" and fits_everywhere(key, budgets, grid=True)
-        if not fits_in_memory and not fits_grid:
+            # the team solve when one node holds a channel's windows, else the node-distributed solve
+            lines = [(ranks, a * NODE_MEMORY_FRACTION) for ranks, a in nodes.values()]
+            fits = all(team_need(len(ranks), 0 in ranks) <= line for ranks, line in lines)
+            totals = [(distributed_need(len(ranks), 0 in ranks), line) for ranks, line in lines]
+            fits = fits or all(total <= line for total, line in totals)
+        if not fits:
             raise MemoryError(
                 f"The {label} needs {worst(totals) / 1024**3:.3f} GB on a node, which exceeds "
                 f"{NODE_MEMORY_FRACTION:.0%} of that node's available memory. Use more nodes, fewer ranks per node, "

@@ -10,11 +10,13 @@ both local and momentum-dependent. The non-local versions are evaluated either b
 direct momentum-shift einsum, distributed over MPI ranks.
 """
 
+import time
 from collections.abc import Callable, Sequence
 
 import numpy as np
 import scipy as sp
 
+import dgamore.config as config
 import dgamore.mpi_utils as mpi_utils
 from dgamore.brillouin_zone import KGrid
 from dgamore.four_point import FourPoint
@@ -24,8 +26,18 @@ from dgamore.matsubara_frequencies import MFHelper
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel, FrequencyNotation, zero_small_values
 
-# bytes of one sub-chunk round's full-grid buffer in the distributed bubble: about one rank's L3 share
+# bytes of the distributed bubble's full-grid buffer of one group of orbital components, and of the whole columns
+# of a round: about one rank's L3 share
 ROUND_BUFFER_BYTES = 4 * 1024**2
+
+# bytes of received one-column blocks the distributed bubble hands to one deliver call: consecutive ring sources hold
+# consecutive columns, so a call writes runs of whole cache lines, and its expanded copies stay within a few MiB
+DELIVER_BATCH_BYTES = 2 * 1024**2
+
+# seconds the steps of the first round's ring must wait for their transfers (a rank's lower quartile, the median over
+# the ranks) before the later rounds' exchanges move behind the next round's columns: the helper's sleeps between its
+# tests cost up to half a millisecond per step
+BEHIND_STEP_SECONDS = 2e-3
 
 
 class BubbleGenerator:
@@ -67,7 +79,9 @@ class BubbleGenerator:
         node_comm=None,
         subtract_from: FourPoint | None = None,
         involution: np.ndarray | None = None,
-    ) -> FourPoint:
+        blocks: bool = False,
+        release: Callable[[], None] | None = None,
+    ) -> FourPoint | list[FourPoint]:
         r"""
         Returns the momentum-dependent generalized bare susceptibility :math:`\chi^{\mathrm{q}\nu}_{0;1234} = -\beta
         \sum_{\mathbf{k}} G^{\mathrm{k}}_{14}\, G^{\mathrm{k}-\mathrm{q}}_{32}`, evaluated via an FFT over the BZ with
@@ -101,12 +115,17 @@ class BubbleGenerator:
             subtracted from in place, or ``None``.
         :param involution: An orbital permutation of order two that may transpose the Green's function (tried after
             the identity, see :meth:`_orbital_transpose_permutation`), or ``None``.
+        :param blocks: Whether to return the bubble as a list of objects of consecutive bosonic windows (one per stored
+            bosonic frequency on several ranks, the whole range on one rank), so a caller can consume and free it
+            window by window; not with ``subtract_from``.
+        :param release: Called once on every rank after the last read of ``giwk`` (its real-space transform and the
+            symmetry checks are done) and before the first column, so the caller can free ``giwk``; or ``None``.
         :return: The bubble as a :class:`FourPoint` over the irreducible BZ (compressed momentum, half niw range), or
-            ``subtract_from`` minus the bubble.
+            ``subtract_from`` minus the bubble; with ``blocks`` the list of its bosonic windows.
         """
         if mpi_dist_irrk.comm.size > 1:
             return BubbleGenerator._create_generalized_chi0_q_fft_distributed(
-                mpi_dist_irrk, giwk, niw, niv, k_grid, beta, node_comm, subtract_from, involution
+                mpi_dist_irrk, giwk, niw, niv, k_grid, beta, node_comm, subtract_from, involution, blocks, release
             )
 
         gchi0_q_mat = None
@@ -133,6 +152,8 @@ class BubbleGenerator:
             columns, partners = np.arange(len(wn) * 2 * niv), np.full(len(wn) * 2 * niv, -1)
             if BubbleGenerator._has_crossing_symmetries(giwk, niv + niw):
                 columns, partners = BubbleGenerator._crossing_columns(wn, niv)
+            if release is not None:
+                release()
 
             for iw, wn_i in enumerate(wn):
                 # the computed columns of a bosonic frequency are its first n_v fermionic ones
@@ -164,6 +185,8 @@ class BubbleGenerator:
         bubble = FourPoint(
             gchi0_q_mat, SpinChannel.NONE, k_grid.nk, 1, 1, full_niw_range=False, has_compressed_q_dimension=True
         ).filter_small_values()
+        if blocks:
+            return [bubble]
         return bubble if subtract_from is None else subtract_from.sub(bubble, copy=False)
 
     @staticmethod
@@ -232,8 +255,10 @@ class BubbleGenerator:
             np.take(window[f], rev, axis=0, out=slab, mode="clip")
             return slab.reshape(*nk, nb, nb).swapaxes(-1, -2)[:, :, :, None, :, :, None]
 
-        def fill(out: np.ndarray, part: int, iw: int, iv: int) -> None:
-            """Writes the R-space product of the column (w0 + iw, v): G with its partner, or the bilinear sum."""
+        def fill(out: np.ndarray, part: int, iw: int, iv: int, comps: slice) -> None:
+            """Writes the R-space product of the column (w0 + iw, v): G with its partner, or the bilinear sum; columns
+            run whole here, so ``comps`` holds every component."""
+            out = out.reshape(*nk, nb, nb, nb, nb)
             f = center - niv + iv
             g_left = g_r[f].reshape(*nk, nb, nb)[:, :, :, :, None, None, :]
             g_rev = partner(g_r, f - w0 - iw, slabs[0])
@@ -353,23 +378,27 @@ class BubbleGenerator:
         node_comm=None,
         subtract_from: FourPoint | None = None,
         involution: np.ndarray | None = None,
-    ) -> FourPoint:
+        blocks: bool = False,
+        release: Callable[[], None] | None = None,
+    ) -> FourPoint | list[FourPoint]:
         r"""
         Distributed evaluation of :meth:`create_generalized_chi0_q_fft`: the flattened bosonic-fermionic
         frequency columns :math:`(\omega, \nu)` are split across the ranks, each rank runs the R-space multiply and
-        the full-grid in-place ``scipy.fft.ifftn`` (bit-identical to the rank-0 path) only for its columns - reading
-        the R-space Green's function and its momentum-flipped, orbital-transposed partner from per-node shared-memory
-        windows - and the per-column irreducible-BZ results are ring-exchanged onto the irr-BZ q-distribution
-        (at most the bytes the former rank-0 scatter moved). The columns are processed in sub-chunks sized so
-        that a node's combined full-grid buffers stay well below the former rank-0 footprint and a sub-chunk's buffer
-        stays within ``ROUND_BUFFER_BYTES`` (its column-wise fill is a strided write, so a larger buffer would stream
-        every cache line through memory once per column; a column above the budget runs alone); the exchange is
-        pipelined per sub-chunk on a globally derived schedule, so no rank ever holds more than its final irr-BZ
-        slice plus one sub-chunk in flight. On a Green's function with both crossing symmetries only the crossing's
-        computed columns are transformed and exchanged, and every rank derives their partners on its own momenta as
-        the blocks arrive. With ``subtract_from`` every column block, computed or derived, is scaled and filtered as
-        the finished bubble is and subtracted from that bubble's columns as it arrives, so no slice of its own is
-        allocated (the same elementwise operations, hence the bits of ``subtract_from.sub(bubble)``).
+        the full-grid in-place ``scipy.fft.ifftn`` (bit-identical to the rank-0 path) only for its columns, and the
+        per-column irreducible-BZ results are ring-exchanged onto the irr-BZ q-distribution (at most the bytes the
+        former rank-0 scatter moved). The R-space Green's function is read from one per-node shared-memory window: per
+        column a rank gathers its two factors orbital-major, :math:`G_{14}(\mathbf{R})` at :math:`\nu` and the partner
+        :math:`G_{32}(-\mathbf{R})` at :math:`\nu - \omega` (the window at the reversed momenta, orbitals swapped), and
+        multiplies and transforms the column in groups of orbital components of at most ``ROUND_BUFFER_BYTES`` (one
+        component when a component is larger), so it never holds a whole full-grid column. The exchange runs per
+        sub-chunk round of columns on a globally derived schedule, so no rank ever holds more than its final irr-BZ
+        slice plus the rows of two rounds (see :meth:`_run_columns`). On a Green's function with both crossing
+        symmetries only the crossing's computed columns are transformed and exchanged, and every rank derives their
+        partners on its own momenta as the blocks arrive. With ``subtract_from`` every column block, computed or
+        derived, is scaled and filtered as the finished bubble is and subtracted from that bubble's columns as it
+        arrives, so no slice of its own is allocated (the same elementwise operations, hence the bits of
+        ``subtract_from.sub(bubble)``). With ``blocks`` every stored bosonic frequency is held in an array of its own,
+        with the same bits.
 
         On a Green's function an orbital permutation transposes, only the independent orbital components are
         multiplied (in blocks of momenta), transformed and exchanged, and every rank copies the others from them as
@@ -385,9 +414,14 @@ class BubbleGenerator:
         :param subtract_from: A bubble of the same box on this rank's irreducible q-points that the bubble is
             subtracted from in place, or ``None``.
         :param involution: An orbital permutation of order two that may transpose the Green's function, or ``None``.
+        :param blocks: Whether to return one object per stored bosonic frequency; not with ``subtract_from``.
+        :param release: Called once after the last read of ``giwk`` and before the first column, or ``None``.
         :return: The bubble as a :class:`FourPoint` over the irreducible BZ (compressed momentum, half niw range), or
-            ``subtract_from`` minus the bubble.
+            ``subtract_from`` minus the bubble; with ``blocks`` the list of its bosonic frequencies.
+        :raises ValueError: If both ``blocks`` and ``subtract_from`` are given.
         """
+        if blocks and subtract_from is not None:
+            raise ValueError("A bubble subtracted in place cannot be returned in bosonic blocks.")
         nb = giwk.n_bands
         nk_tot = k_grid.nk_tot
         wn = MFHelper.wn(niw, return_only_positive=True)
@@ -398,80 +432,112 @@ class BubbleGenerator:
         def build_g_r() -> np.ndarray:
             return giwk.cut_niv(niv + niw).fft(copy=False).decompress_q_dimension().mat
 
-        def build_g_r_rev() -> np.ndarray:
-            # flip_momentum_axis + transpose_orbitals of the R-space Green's function, on the raw array
-            return np.roll(np.flip(g_r_mat, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2)).swapaxes(3, 4)
-
         if node_comm is not None:
             g_r_mat, g_r_win = mpi_utils.build_node_shared_array(node_comm, build_g_r)
-            g_r_rev_mat, g_r_rev_win = mpi_utils.build_node_shared_array(node_comm, build_g_r_rev)
         else:
             g_r_mat, g_r_win = build_g_r(), None
-            g_r_rev_mat, g_r_rev_win = np.ascontiguousarray(build_g_r_rev()), None
 
-        giwk_niv = g_r_mat.shape[-1] // 2
-        start, end = giwk_niv - niv, giwk_niv + niv
+        start = g_r_mat.shape[-1] // 2 - niv
 
         my_q_slice = mpi_dist_irrk.slices[mpi_dist_irrk.comm.rank]
         my_nq = (my_q_slice.stop - my_q_slice.start) if my_q_slice is not None else 0
-        if subtract_from is None:
-            gchi0_q_mat = np.empty((my_nq, nb, nb, nb, nb, len(wn), vpos), dtype=g_r_mat.dtype)
+        if subtract_from is not None:
+            mats = [subtract_from.mat]
+        elif blocks:
+            mats = [np.empty((my_nq, nb, nb, nb, nb, 1, vpos), dtype=g_r_mat.dtype) for _ in wn]
         else:
-            gchi0_q_mat = subtract_from.mat
-        gchi0_cols = np.reshape(gchi0_q_mat, (my_nq, nb**4, len(wn) * vpos), copy=False)  # contiguous, columns w-major
+            mats = [np.empty((my_nq, nb, nb, nb, nb, len(wn), vpos), dtype=g_r_mat.dtype)]
+        # contiguous, columns w-major; one stored bosonic frequency per array with blocks
+        width = vpos if blocks else len(wn) * vpos
+        mat_cols = [np.reshape(mat, (my_nq, nb**4, width), copy=False) for mat in mats]
 
-        def fill(out: np.ndarray, part: int, iw: int, iv: int) -> None:
-            """Writes the R-space product of the column ``(w, v)``, the bubble's only part."""
-            left, right = g_r_mat[..., start + iv], g_r_rev_mat[..., start + iv - wn[iw]]
-            if components is None:
-                np.multiply(left[:, :, :, :, None, None, :], right[:, :, :, None, :, :, None], out=out)
+        # chi0_1234(R) = G_14(R) G_32(-R): the flat factor pairs of every transformed component, the orbital swap
+        # of the partner, and the column's two factors, orbital-major, gathered once per column
+        o1, o2, o3, o4 = np.unravel_index(np.arange(nb**4) if components is None else components[0], (nb,) * 4)
+        left_pair, right_pair = o1 * nb + o4, o2 * nb + o3
+        swapped = np.arange(nb * nb).reshape(nb, nb).T.ravel()
+        rev = BubbleGenerator._reversed_momenta(k_grid.nk)
+        factors = np.empty((2, nb * nb, nk_tot), dtype=g_r_mat.dtype)
+        gathered = [None]
+
+        def fill(out: np.ndarray, part: int, iw: int, iv: int, comps: slice) -> None:
+            """Writes the R-space products of the components ``comps`` of the column ``(w, v)``, the bubble's only part;
+            the column's factors are gathered from the window when its first group is filled."""
+            if gathered[0] != (iw, iv):
+                np.copyto(factors[0], g_r_mat[..., start + iv].reshape(nk_tot, nb * nb).T)
+                right = g_r_mat[..., start + iv - wn[iw]].reshape(nk_tot, nb * nb)
+                for pair, source in enumerate(swapped):
+                    np.take(right[:, source], rev, out=factors[1, pair], mode="clip")
+                gathered[0] = (iw, iv)
+            rows = np.reshape(out, (nk_tot, -1), copy=False)
+            for i, c in enumerate(range(comps.start, comps.stop)):
+                np.multiply(factors[0, left_pair[c]], factors[1, right_pair[c]], out=rows[:, i])
+
+        def put(target: slice, values: np.ndarray) -> None:
+            """Writes ``values [q, nb**4, n]`` into the columns ``target`` of one bosonic frequency, or subtracts them
+            (``subtract_from``)."""
+            b = target.start // width
+            local = slice(target.start - b * width, target.stop - b * width)
+            if subtract_from is None:
+                mat_cols[b][:, :, local] = values
             else:
-                BubbleGenerator._fill_components(out, left, right, components[0], nb)
+                mat_cols[b][:, :, local] -= values
 
         def deliver(where: slice | np.ndarray, block: np.ndarray) -> None:
-            """Writes a column block of this rank's momenta, the orbital components copied from its independent ones
-            and the crossing partners it derives, or subtracts all of them scaled and filtered (``subtract_from``)."""
+            """Writes the column block ``[q, *comp, 1, n]`` of this rank's momenta, the orbital components copied from
+            its independent ones and the crossing partners it derives, or subtracts all of them scaled and filtered
+            (``subtract_from``), one slice per run of consecutive columns of one bosonic frequency."""
+            block = block[..., 0, :]
+            n = block.shape[-1]
             if components is not None:
                 computed, derived, source = components
-                every = np.empty((my_nq, nb**4, block.shape[-1]), dtype=block.dtype)
+                every = np.empty((my_nq, nb**4, n), dtype=block.dtype)
                 every[:, computed], every[:, derived] = block, block[:, source]
-                block = every.reshape(my_nq, nb, nb, nb, nb, -1)
+                block = every
+            block = np.reshape(block, (my_nq, nb**4, n))
             if subtract_from is not None:
                 block *= -beta / nk_tot
                 zero_small_values(block)
-            parts = [(where, block)]
-            if partner_of is not None:
-                found = np.flatnonzero(partner_of[where] >= 0)
-                # the partner (w, w - v) of (w, v) at the same q: conjugated, orbital pairs 12 and 34 swapped
-                crossed = np.take(block.transpose(0, 3, 4, 1, 2, 5), found, axis=-1)
-                parts.append((partner_of[where][found], np.conjugate(crossed, out=crossed)))
-            for target, values in parts:
-                if subtract_from is None:
-                    gchi0_cols[:, :, target] = values.reshape(my_nq, nb**4, -1)
-                else:
-                    gchi0_cols[:, :, target] -= values.reshape(my_nq, nb**4, -1)
+            flat = np.arange(where.start, where.stop) if isinstance(where, slice) else where
+            ends = np.flatnonzero((np.diff(flat) != 1) | (np.diff(flat // vpos) != 0)) + 1
+            for o0, o1 in zip([0, *ends], [*ends, n]):
+                c0, c1 = flat[o0], flat[o0] + o1 - o0
+                put(slice(c0, c1), block[..., o0:o1])
+                found = np.flatnonzero(partner_of[c0:c1] >= 0) if partner_of is not None else ()
+                if len(found):
+                    # the partner (w, w - v) of (w, v) at the same q: conjugated, orbital pairs 12 and 34 swapped;
+                    # the partners of a run of one frequency form one descending run
+                    crossed = block.reshape(my_nq, nb, nb, nb, nb, n)[..., o0 + found[0] : o0 + found[-1] + 1]
+                    crossed = np.conjugate(crossed.transpose(0, 3, 4, 1, 2, 5)).reshape(my_nq, nb**4, -1)
+                    put(slice(partner_of[c0 + found[-1]], partner_of[c0 + found[0]] + 1), crossed[..., ::-1])
 
         columns = partner_of = None
         if BubbleGenerator._has_crossing_symmetries(giwk, niv + niw, mpi_dist_irrk.comm):
             columns, partners = BubbleGenerator._crossing_columns(wn, niv)
             partner_of = np.full(len(wn) * vpos, -1)
             partner_of[columns] = partners
+        if release is not None:
+            release()
         comp_shape = (nb,) * 4 if components is None else (len(components[0]),)
+        group = max(1, ROUND_BUFFER_BYTES // (nk_tot * g_r_mat.itemsize))
         BubbleGenerator._run_columns(
-            mpi_dist_irrk, k_grid, len(wn), vpos, 1, comp_shape, g_r_mat.dtype, fill, deliver, columns
+            mpi_dist_irrk, k_grid, len(wn), vpos, 1, comp_shape, g_r_mat.dtype, fill, deliver, columns, group
         )
-        g_r_mat = g_r_rev_mat = None
-        for win in (g_r_win, g_r_rev_win):
-            if win is not None:
-                node_comm.Barrier()
-                win.Free()
+        g_r_mat = None
+        if g_r_win is not None:
+            node_comm.Barrier()
+            g_r_win.Free()
 
         if subtract_from is not None:
             return subtract_from
-        gchi0_q_mat *= -beta / nk_tot
-        return FourPoint(
-            gchi0_q_mat, SpinChannel.NONE, k_grid.nk, 1, 1, full_niw_range=False, has_compressed_q_dimension=True
-        ).filter_small_values()
+        bubbles = []
+        for mat in mats:
+            mat *= -beta / nk_tot
+            bubbles.append(
+                FourPoint(mat, SpinChannel.NONE, k_grid.nk, 1, 1, full_niw_range=False, has_compressed_q_dimension=True)
+            )
+            bubbles[-1].filter_small_values()
+        return bubbles if blocks else bubbles[0]
 
     @staticmethod
     def _independent_components(nb: int, pi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
@@ -631,24 +697,32 @@ class BubbleGenerator:
         n_parts: int,
         comp_shape: tuple,
         dtype: np.dtype,
-        fill: Callable[[np.ndarray, int, int, int], None],
+        fill: Callable[[np.ndarray, int, int, int, slice], None],
         deliver: Callable[[slice | np.ndarray, np.ndarray], None],
         columns: np.ndarray | None = None,
+        group: int | None = None,
     ) -> None:
         r"""
         Runs the column evaluation of the distributed bubbles (collective). The flattened bosonic-fermionic columns
-        :math:`(\omega, \nu)`, ``iw * n_v + iv`` bosonic-major (all ``n_w * n_v`` of them, or ``columns``), are split
-        across the ranks in contiguous runs and processed in sub-chunk rounds of one full-grid buffer. Per round and
-        part, ``fill(out, part, iw, iv)`` writes the R-space product of each of the rank's columns into the buffer, the
-        in-place ``scipy.fft.ifftn`` transforms them and their irreducible-BZ rows are kept; the rows of all parts are
-        ring-exchanged onto the irr-BZ q-distribution and handed to ``deliver(where, block)``, ``block = [q, o1, o2,
-        o3, o4, n_parts * n]`` holding this rank's momenta of the ``n`` flat columns ``where`` (a slice, or an index
-        array with ``columns``), part-major. The buffer stays within ``ROUND_BUFFER_BYTES`` (the column-wise fill is a
-        strided write, so a larger buffer would stream every cache line through memory once per column; a column above
-        the budget runs alone). The schedule depends only on the column counts, the box and the rank count, so the
-        pipelined exchange stays collectively matched and no rank holds more than one round in flight. A column's
-        values do not depend on the schedule: its product is elementwise and the transform runs every momentum line of
-        every column on its own.
+        :math:`(\omega, \nu)`, ``iw * n_v + iv`` bosonic-major (all ``n_w * n_v`` of them, or ``columns``), are
+        processed in rounds, round-major: a round takes the next ``size * sub_cols`` positions of the column list, rank
+        ``k`` the ``k``-th run of ``sub_cols`` of them. Per round, part and column the flat orbital components run in
+        groups of at most ``group``: ``fill(out, part, iw, iv, comps)`` writes the R-space products of the components
+        ``comps`` (a slice of the flat components) into one full-grid buffer ``out`` ``[x, y, z, n]``, the in-place
+        ``scipy.fft.ifftn`` transforms them and their irreducible-BZ rows are kept, so a rank holds one group of one
+        column at a time. The rows of all parts are ring-exchanged onto the irr-BZ q-distribution, one rank distance in
+        flight per rank, and handed to ``deliver(where, block)``, ``block = [q, *comp_shape, n_parts, n]`` holding
+        this rank's momenta of the ``n`` flat columns ``where`` (a slice, or an ascending index array with
+        ``columns``). With one column per round the ring's consecutive sources hold consecutive columns, so their
+        blocks are staged and handed over together, up to ``DELIVER_BATCH_BYTES`` per call. A round holds at most
+        ``ROUND_BUFFER_BYTES`` of whole columns (a column above the budget runs alone). When MPI lets a helper thread
+        call it (``MPI.THREAD_SERIALIZED`` or more) and three quarters of the first round's ring steps waited longer
+        than ``BEHIND_STEP_SECONDS`` on most ranks (the median over the ranks of each rank's lower quartile: a slow
+        link, not a late or descheduled rank), the exchange of every later round but the last runs on a helper thread
+        while the next round is filled and transformed, so a rank then holds the irreducible rows of two rounds. The
+        schedule depends only on the column counts, the box and the rank count, so the exchange stays collectively
+        matched. A column's values depend neither on the schedule nor on the groups: its product is elementwise and
+        the transform runs every momentum line of every component on its own.
 
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
         :param k_grid: The :class:`KGrid` over which the BZ sum/FFT is performed.
@@ -657,63 +731,57 @@ class BubbleGenerator:
         :param n_parts: Number of products per column.
         :param comp_shape: Shape of the orbital axes of a column, ``(nb, nb, nb, nb)`` or a flat count of components.
         :param dtype: Storage dtype of the products.
-        :param fill: Writes the R-space product ``part`` of the column ``(iw, iv)`` into ``out``
-            ``[x, y, z, *comp_shape]``.
+        :param fill: Writes the R-space product ``part`` of the flat components ``comps`` of the column ``(iw, iv)``
+            into ``out`` ``[x, y, z, comps.stop - comps.start]``.
         :param deliver: Receives every column block of this rank's momenta.
         :param columns: The flat columns to compute, ascending, or ``None`` for all of them.
+        :param group: Number of flat components transformed at once, or ``None`` for whole columns.
         :return: None.
         """
         comm = mpi_dist_irrk.comm
         rank, size = comm.rank, comm.size
         nk_tot, nk_irr = k_grid.nk_tot, len(k_grid.irrk_ind)
+        itemsize = np.dtype(dtype).itemsize
 
-        # globally derived column schedule: contiguous (w, v)-column runs per rank, processed in equal-size
-        # sub-chunk rounds so the pipelined ring exchange stays collectively matched on every rank
+        # globally derived round-major schedule, so the ring exchange stays collectively matched on every rank
         total_cols = n_w * n_v if columns is None else len(columns)
-        col_bounds = np.linspace(0, total_cols, size + 1).astype(int)
-        ncols_max = int(np.max(np.diff(col_bounds)))
+        ncols_max = -(-total_cols // size)
         sub_cols = max(1, ncols_max * nk_irr // (6 * nk_tot), min(ncols_max, n_v // max(1, size)))
         n_comp = int(np.prod(comp_shape))
-        sub_cols = max(1, min(sub_cols, ROUND_BUFFER_BYTES // (nk_tot * n_comp * np.dtype(dtype).itemsize)))
-        n_rounds = -(-ncols_max // sub_cols) if ncols_max else 0
+        sub_cols = max(1, min(sub_cols, ROUND_BUFFER_BYTES // (nk_tot * n_comp * itemsize)))
+        n_rounds = -(-total_cols // (size * sub_cols))
 
         my_q_slice = mpi_dist_irrk.slices[rank]
         my_nq = (my_q_slice.stop - my_q_slice.start) if my_q_slice is not None else 0
 
         def round_cols(r: int, rnd: int) -> tuple[int, int]:
-            c0 = col_bounds[r] + rnd * sub_cols
-            return c0, min(col_bounds[r + 1], c0 + sub_cols)
+            c0 = min(total_cols, (rnd * size + r) * sub_cols)
+            return c0, min(total_cols, c0 + sub_cols)
 
         def targets(c0: int, c1: int) -> slice | np.ndarray:
             """The flat columns of the round positions ``[c0, c1)``."""
             return slice(c0, c1) if columns is None else columns[c0:c1]
 
-        buf = np.empty((*k_grid.nk, *comp_shape, sub_cols), dtype=dtype)
-        for rnd in range(n_rounds):
-            c0, c1 = round_cols(rank, rnd)
-            n_mine = max(0, c1 - c0)
-            chunk_irr = None
-            if n_mine:
-                buf_v = buf[..., :n_mine]
-                pieces = []
-                for part in range(n_parts):
-                    for col in range(c0, c1):  # fill column-wise: one (w, v) pair per column
-                        fill(buf_v[..., col - c0], part, *divmod(col if columns is None else columns[col], n_v))
-                    # scipy.fft keeps complex64 in place; numpy.fft would upcast to complex128 (double work + 2x buffer)
-                    transformed = sp.fft.ifftn(buf_v, axes=(0, 1, 2), overwrite_x=True)
-                    pieces.append(
-                        np.ascontiguousarray(transformed.reshape(nk_tot, *comp_shape, n_mine)[k_grid.irrk_ind])
-                    )
-                    transformed = None
-                chunk_irr = pieces[0] if n_parts == 1 else np.concatenate(pieces, axis=-1)
-                pieces = None
-                if my_nq:
-                    deliver(targets(c0, c1), chunk_irr[my_q_slice])
+        # one-column rounds receive into the slots of a staging buffer, handed to deliver a batch of slots at a time
+        slot_bytes = my_nq * n_comp * n_parts * itemsize
+        n_slots = max(1, min(size - 1, DELIVER_BATCH_BYTES // slot_bytes)) if slot_bytes else 1
+        staging = np.empty((n_slots, my_nq, *comp_shape, n_parts), dtype=dtype) if sub_cols == 1 else None
 
-            # ring exchange of this round's sub-chunks onto the irr-BZ q-distribution
+        def exchange(rnd: int, chunk_irr: np.ndarray | None, n_mine: int, wait: Callable[[list], None]) -> list:
+            """Ring exchange of round ``rnd``'s rows onto the irr-BZ q-distribution, one rank distance per step; returns
+            the seconds every step waited for its transfers."""
+            # the round positions of the staged blocks, descending as the ring's sources do
+            staged, waits = [], []
+
+            def hand_over():
+                if staged:
+                    # the staged blocks reversed are the consecutive columns staged[-1] .. staged[0]
+                    deliver(targets(staged[-1], staged[0] + 1), np.moveaxis(staging[len(staged) - 1 :: -1], 0, -1))
+                    staged.clear()
+
             for step in range(1, size):
                 dst, src = (rank + step) % size, (rank - step) % size
-                reqs, staging = [], None
+                reqs, block = [], None
 
                 dst_slice = mpi_dist_irrk.slices[dst]
                 n_dst = (dst_slice.stop - dst_slice.start) if dst_slice is not None else 0
@@ -722,13 +790,70 @@ class BubbleGenerator:
 
                 s0, s1 = round_cols(src, rnd)
                 if my_nq and s1 > s0:
-                    staging = np.empty((my_nq, *comp_shape, n_parts * (s1 - s0)), dtype=dtype)
-                    reqs += mpi_utils._irecv_rows_into(comm, staging, src, base_tag=500 + step)
+                    if staging is None:
+                        block = np.empty((my_nq, *comp_shape, n_parts * (s1 - s0)), dtype=dtype)
+                    else:
+                        block = staging[len(staged)]
+                    reqs += mpi_utils._irecv_rows_into(comm, block, src, base_tag=500 + step)
 
                 if reqs:
-                    mpi_utils.MPI.Request.Waitall(reqs)
-                if staging is not None:
-                    deliver(targets(s0, s1), staging)
+                    t0 = time.perf_counter()
+                    wait(reqs)
+                    waits.append(time.perf_counter() - t0)
+                if block is not None and staging is None:
+                    deliver(targets(s0, s1), block.reshape(my_nq, *comp_shape, n_parts, s1 - s0))
+                elif block is not None:
+                    staged.append(s0)
+                    # the next source holds the next lower column, unless the ring wraps around past rank 0
+                    if len(staged) == n_slots or src == 0:
+                        hand_over()
+            hand_over()
+            return waits
+
+        # from round 1 on, a round's exchange may run behind the next round's columns: when MPI lets a helper thread
+        # call it meanwhile and most steps of the first round waited long, i.e. on a slow link
+        behind = size > 1 and n_rounds > 2 and mpi_utils.MPI.Query_thread() >= mpi_utils.MPI.THREAD_SERIALIZED
+        join = None
+        group = n_comp if group is None else max(1, min(n_comp, group))
+        buf = np.empty(nk_tot * group, dtype=dtype)
+        for rnd in range(n_rounds):
+            c0, c1 = round_cols(rank, rnd)
+            n_mine = max(0, c1 - c0)
+            chunk_irr = None
+            if n_mine:
+                chunk_irr = np.empty((nk_irr, n_comp, n_parts * n_mine), dtype=dtype)
+                for part in range(n_parts):
+                    for col in range(c0, c1):  # one (w, v) pair per column, its components in groups
+                        iw, iv = divmod(col if columns is None else columns[col], n_v)
+                        for g0 in range(0, n_comp, group):
+                            comps = slice(g0, min(n_comp, g0 + group))
+                            out = buf[: nk_tot * (comps.stop - g0)].reshape(*k_grid.nk, comps.stop - g0)
+                            fill(out, part, iw, iv, comps)
+                            # scipy.fft keeps complex64 in place; numpy.fft would upcast to complex128
+                            transformed = sp.fft.ifftn(out, axes=(0, 1, 2), overwrite_x=True)
+                            rows = transformed.reshape(nk_tot, -1)[k_grid.irrk_ind]
+                            chunk_irr[:, comps, part * n_mine + col - c0] = rows
+                            transformed = rows = None
+                chunk_irr = chunk_irr.reshape(nk_irr, *comp_shape, n_parts * n_mine)
+                if my_nq:
+                    deliver(targets(c0, c1), chunk_irr[my_q_slice].reshape(my_nq, *comp_shape, n_parts, n_mine))
+
+            if join is not None:
+                join()
+            join = None
+            if behind and 0 < rnd < n_rounds - 1:
+                join = mpi_utils.in_background(exchange, rnd, chunk_irr, n_mine, mpi_utils.wait_idle)
+                continue
+            waits = exchange(rnd, chunk_irr, n_mine, mpi_utils.MPI.Request.Waitall)
+            if behind and rnd == 0:
+                # a late or descheduled rank lengthens a few steps; a slow link three quarters of them on most ranks
+                wait = float(np.median(comm.allgather(float(np.percentile(waits, 25)) if waits else 0.0)))
+                behind = wait > BEHIND_STEP_SECONDS
+                config.logger.info(
+                    f"Bubble column exchange: the first round's ring steps waited {1e3 * wait:.2f} ms (lower quartile, "
+                    f"median over the ranks), so the later rounds run {'behind' if behind else 'in front of'} the "
+                    f"next round's columns."
+                )
 
     @staticmethod
     def create_generalized_chi0_q_loop(

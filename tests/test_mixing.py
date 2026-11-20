@@ -5,6 +5,7 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import contextlib
+import threading
 from collections.abc import Callable
 from copy import deepcopy
 from unittest.mock import MagicMock, create_autospec
@@ -19,6 +20,7 @@ from dgamore.jacobian_stabilization import JacobianTracker, to_mat, to_vec
 from dgamore.self_energy import SelfEnergy
 from dgamore.nonlocal_sde import _core_pair, apply_mixing_strategy
 from dgamore.sigma_jacobian import tracker_sector_maps
+from tests.conftest import run_parallel, traced_peak
 
 BETA = 10.0
 NB = 1
@@ -563,30 +565,53 @@ def test_history_cap_zero_still_records_the_pair():
     assert np.allclose(history[-1][0], 1.0, atol=1e-6)
 
 
-def _anderson_step(pairs: list[tuple[np.ndarray, np.ndarray]], alpha: float) -> np.ndarray:
-    """Returns the Anderson core update of the plain column-stacked formulation, flattened."""
+def _svd_coefficients(columns: np.ndarray, rhs: np.ndarray, tikhonov: bool) -> tuple[np.ndarray, float]:
+    """The least-squares coefficients of the thin SVD of the stacked columns, cut at 1e-5 of the largest value."""
+    u, s, vh = np.linalg.svd(columns, full_matrices=False)
+    cutoff = 1e-5 * s[0]
+    mask = s > cutoff
+    weights = s[mask] / (s[mask] ** 2 + cutoff**2) if tikhonov else 1.0 / s[mask]
+    return vh[mask].T @ (weights * (u[:, mask].T @ rhs)), np.linalg.norm(rhs)
+
+
+def _gram_coefficients(columns: np.ndarray, rhs: np.ndarray, tikhonov: bool) -> tuple[np.ndarray, float]:
+    """The same coefficients from the eigendecomposition of the double-precision augmented Gram matrix."""
+    block = np.column_stack((columns, rhs)).astype(np.float64)
+    gram = np.zeros((block.shape[1],) * 2) + block.T @ block
+    lam, v = np.linalg.eigh(gram[:-1, :-1])
+    s = np.sqrt(np.clip(lam, 0.0, None))
+    cutoff = 1e-5 * s.max()
+    mask = s > cutoff
+    coeffs = v[:, mask] @ ((v[:, mask].T @ gram[:-1, -1]) / (lam[mask] + cutoff**2 if tikhonov else lam[mask]))
+    return coeffs, np.sqrt(gram[-1, -1])
+
+
+def _norm(values: np.ndarray) -> float:
+    """The norm of a vector, accumulated in double precision as the mixing's clamp does."""
+    values = values.astype(np.complex128 if np.iscomplexobj(values) else np.float64).view(np.float64)
+    return np.sqrt(np.dot(values, values))
+
+
+def _anderson_step(pairs: list[tuple[np.ndarray, np.ndarray]], alpha: float, solve: Callable) -> np.ndarray:
+    """Returns the Anderson core update of the plain column-stacked formulation with the given solver, flattened."""
     xs, fs = [x.reshape(-1) for x, _ in pairs], [f.reshape(-1) for _, f in pairs]
     m, n = len(pairs) - 1, xs[-1].size
     f_curr = fs[-1] - xs[-1]
     f_vec = np.concatenate([f_curr.real, f_curr.imag])
-    norm_f = np.linalg.norm(f_vec)
     diffs = [xs[-1 - i] - xs[-2 - i] for i in range(m)]
     dx = np.column_stack([np.concatenate([d.real, d.imag]) for d in diffs])
     diffs = [(fs[-1 - i] - xs[-1 - i]) - (fs[-2 - i] - xs[-2 - i]) for i in range(m)]
     df = np.column_stack([np.concatenate([d.real, d.imag]) for d in diffs])
-    u, s, vh = np.linalg.svd(df, full_matrices=False)
-    cutoff = 1e-5 * s[0]
-    mask = s > cutoff
-    coeffs = vh[mask].T @ (s[mask] / (s[mask] ** 2 + cutoff**2) * (u[:, mask].T @ f_vec))
-    x_anderson = np.concatenate([xs[-1].real, xs[-1].imag]) + f_vec - (dx + df) @ coeffs
+    coeffs, norm_f = solve(df, f_vec, True)
+    x_anderson = np.concatenate([xs[-1].real, xs[-1].imag]) + f_vec - (dx + df) @ coeffs.astype(df.dtype)
     candidate = (1 - alpha) * xs[-1] + alpha * (x_anderson[:n] + 1j * x_anderson[n:])
     update = candidate - xs[-1]
-    norm_u = np.linalg.norm(update)
+    norm_u = _norm(update)
     return xs[-1] + update * (3.0 * norm_f / norm_u) if norm_f > 0 and norm_u > 3.0 * norm_f else candidate
 
 
-def _pulay_step(pairs: list[tuple[np.ndarray, np.ndarray]], alpha: float) -> np.ndarray:
-    """Returns the Pulay core update of the plain formulation with a stored R matrix, flattened."""
+def _pulay_step(pairs: list[tuple[np.ndarray, np.ndarray]], alpha: float, solve: Callable) -> np.ndarray:
+    """Returns the Pulay core update of the plain formulation with a stored R matrix and the given solver, flattened."""
     xs, fs = [x.flatten() for x, _ in pairs], [f.flatten() for _, f in pairs]
     m, n = len(pairs) - 1, xs[-1].size
     r, f = np.zeros((2 * n, m)), np.zeros((2 * n, m))
@@ -595,21 +620,16 @@ def _pulay_step(pairs: list[tuple[np.ndarray, np.ndarray]], alpha: float) -> np.
         f[:n, i], f[n:, i] = (fs[-1 - i] - fs[-2 - i]).real, (fs[-1 - i] - fs[-2 - i]).imag
         f[:, i] -= r[:, i]
     f_i = np.concatenate([(fs[-1] - xs[-1]).real, (fs[-1] - xs[-1]).imag]).astype(np.float64)
-    norm_f = np.linalg.norm(f_i)
-    u, s, vh = np.linalg.svd(f, full_matrices=False)
-    mask = s > 1e-5 * s[0]
-    update = alpha * f_i - (r + alpha * f) @ (vh[mask].T @ ((u[:, mask].T @ f_i) / s[mask]))
-    norm_u = np.linalg.norm(update)
+    coeffs, norm_f = solve(f, f_i, False)
+    update = alpha * f_i - (r + alpha * f) @ coeffs
+    norm_u = _norm(update)
     if norm_f > 0 and norm_u > 10.0 * norm_f:
         update *= 10.0 * norm_f / norm_u
     return xs[-1] + (update[:n] + 1j * update[n:])
 
 
-@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
-@pytest.mark.parametrize("strategy, step", [("anderson", _anderson_step), ("pulay", _pulay_step)])
-def test_accelerated_mixing_reproduces_the_plain_least_squares_formulas_bit_for_bit(monkeypatch, dtype, strategy, step):
-    """Anderson and Pulay equal their plain column-stacked formulation bit for bit in both storage precisions."""
-    monkeypatch.setattr(n_point_base, "DTYPE", dtype)
+def _accelerated_case(dtype) -> tuple:
+    """A random three-pair history on a 3 x 3 x 2 grid with two bands and the new and old self-energies of the step."""
     rng = np.random.default_rng(7)
     nk, niv = (3, 3, 2), 8
     shape = (*nk, 2, 2)
@@ -620,10 +640,101 @@ def test_accelerated_mixing_reproduces_the_plain_least_squares_formulas_bit_for_
     history = [(random(2 * NIV_CORE), random(2 * NIV_CORE)) for _ in range(3)]
     sigma_new = SelfEnergy(random(2 * niv), nk, calc_smom=False, beta=BETA)
     sigma_old = SelfEnergy(random(2 * niv), nk, calc_smom=False, beta=BETA)
+    return history, sigma_new, sigma_old, niv
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+@pytest.mark.parametrize("strategy, step", [("anderson", _anderson_step), ("pulay", _pulay_step)])
+def test_accelerated_mixing_reproduces_the_plain_least_squares_formulas_bit_for_bit(monkeypatch, dtype, strategy, step):
+    """Anderson and Pulay equal their plain column-stacked formulation with the Gram solve bit for bit."""
+    monkeypatch.setattr(n_point_base, "DTYPE", dtype)
+    history, sigma_new, sigma_old, niv = _accelerated_case(dtype)
     with patch_config(strategy=strategy, mixing=0.3, n_hist=3):
         result = apply_mixing_strategy(sigma_new, sigma_old, None, history)
-    expected = step(history, 0.3).astype(dtype)
+    expected = step(history, 0.3, _gram_coefficients).astype(dtype)
     assert np.array_equal(result.mat[..., niv - NIV_CORE : niv + NIV_CORE].reshape(-1), expected)
+
+
+@pytest.mark.parametrize("dtype, rtol", [(np.complex64, 1e-5), (np.complex128, 1e-12)])
+@pytest.mark.parametrize("strategy, step", [("anderson", _anderson_step), ("pulay", _pulay_step)])
+def test_the_gram_solve_gives_the_svd_step_to_the_rounding_of_the_storage(monkeypatch, dtype, rtol, strategy, step):
+    """The Gram solve of the accelerated schemes takes the step of the SVD of the stacked rows to rounding."""
+    monkeypatch.setattr(n_point_base, "DTYPE", dtype)
+    history, sigma_new, sigma_old, niv = _accelerated_case(dtype)
+    with patch_config(strategy=strategy, mixing=0.3, n_hist=3):
+        result = apply_mixing_strategy(sigma_new, sigma_old, None, history)
+    svd = step(history, 0.3, _svd_coefficients).astype(dtype)
+    core = result.mat[..., niv - NIV_CORE : niv + NIV_CORE].reshape(-1)
+    assert np.allclose(core, svd, rtol=0.0, atol=rtol * np.abs(svd).max())
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_the_gram_matrix_reads_each_chunk_through_one_double_precision_block(dtype):
+    """The augmented Gram matrix of a chunk of rows is accumulated from one float64 copy of its columns and its
+    right-hand side, whatever the precision of the columns."""
+    m, n = 3, nonlocal_sde.GRAM_ROWS
+    columns, rhs = np.ones((n, m), dtype=dtype), np.ones(n, dtype=dtype)
+    _, peak = traced_peak(lambda: nonlocal_sde._least_squares_coefficients(columns, rhs, False, None))
+    assert peak <= 1.25 * np.dtype(np.float64).itemsize * (m + 1) * n
+
+
+def test_every_owner_takes_the_coefficients_of_the_first_owner(monkeypatch):
+    """Owners whose eigensolvers disagree, as different BLAS builds may, all take the first owner's coefficients."""
+    rng = np.random.default_rng(5)
+    columns, rhs = rng.standard_normal((9, 3)), rng.standard_normal(9)
+    blocks, eigh = (slice(0, 4), slice(4, 5), slice(5, 9)), np.linalg.eigh
+
+    def disagreeing(matrix):
+        lam, v = eigh(matrix)
+        # every other owner would find no direction above the cutoff and fall back to linear mixing
+        return (lam if threading.current_thread().name == "rank0" else 0.0 * lam), v
+
+    monkeypatch.setattr(np.linalg, "eigh", disagreeing)
+    solve = lambda comm, rank: nonlocal_sde._least_squares_coefficients(
+        columns[blocks[rank]], rhs[blocks[rank]], True, comm
+    )
+    results = run_parallel(3, solve)[1]
+    assert results[0][0] is not None
+    assert all(np.array_equal(coeffs, results[0][0]) and norm == results[0][1] for coeffs, norm in results)
+
+
+def test_the_squared_norm_of_real_rows_copies_each_chunk_in_double_precision_only():
+    """Real rows are summed from a float64 copy of each chunk, half the bytes of a complex128 one."""
+    values = np.full(nonlocal_sde.GRAM_ROWS, 2.0, dtype=np.float32)
+    total, peak = traced_peak(lambda: nonlocal_sde._squared_norm(values, None))
+    assert total == 4.0 * values.size
+    assert peak <= 1.25 * np.dtype(np.float64).itemsize * values.size
+
+
+@pytest.mark.parametrize("strategy", ["linear", "anderson", "pulay"])
+@pytest.mark.parametrize("case", ["plain", "clamped"])
+def test_mixing_of_momentum_rows_split_over_ranks_equals_one_owner_of_every_row(strategy, case):
+    """Rows split over three ranks mix as one owner of every row would: linear bit for bit."""
+    rng = np.random.default_rng(3)
+    shape = (9, 2, 2, 2 * NIV_CORE)
+
+    def random():
+        return (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+
+    iterates = [random() for _ in range(4)]
+    proposals = [random() for _ in range(4)] if case == "plain" else [x + 1e-3 * random() for x in iterates]
+    blocks = (slice(0, 4), slice(4, 5), slice(5, 9))
+
+    def mix(rows, comm):
+        history = [(x[rows].copy(), f[rows].copy()) for x, f in zip(iterates[:3], proposals[:3])]
+        sigma = lambda mat: SelfEnergy(mat[rows].copy(), (len(mat[rows]), 1, 1), True, True, calc_smom=False, beta=BETA)
+        return apply_mixing_strategy(sigma(proposals[3]), sigma(iterates[3]), None, history, comm=comm).mat
+
+    with patch_config(strategy=strategy, mixing=0.3, n_hist=3):
+        whole = mix(slice(0, 9), None)
+        split = np.concatenate(run_parallel(3, lambda comm, rank: mix(blocks[rank], comm))[1])
+        warned = [str(call.args[0]) for call in nonlocal_sde.config.logger.warning.call_args_list]
+    assert split.shape == whole.shape
+    if strategy == "linear":
+        assert np.array_equal(split, whole)
+    else:
+        assert np.allclose(split, whole, rtol=0.0, atol=1e-5 * np.abs(whole).max())
+        assert any("clamped" in line for line in warned) == (case == "clamped")
 
 
 def test_linear_mixing_records_pair_when_history_given():

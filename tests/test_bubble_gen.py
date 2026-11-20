@@ -9,7 +9,9 @@ independent, explicit hand-rolled reference of the documented formula (small ran
 which both validates correctness and locks the behavior of the memory-optimized methods.
 """
 
+import threading
 import types
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -25,6 +27,12 @@ from dgamore.matsubara_frequencies import MFHelper
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import FrequencyNotation
 from tests.conftest import FAKE_MPI, create_comm_mock, run_parallel, traced_peak
+
+
+@pytest.fixture(autouse=True)
+def _mock_config_logger(monkeypatch):
+    """Gives every test a mock ``config.logger``, which the column pass tells where its exchanges run."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
 
 
 def _make_local_g(nb: int, niv: int, seed: int = 0) -> GreensFunction:
@@ -282,14 +290,14 @@ def test_fft_bubble_distributed_matches_single_rank(monkeypatch):
     assert np.allclose(assembled, ref.mat, atol=1e-5)
 
 
-@pytest.mark.parametrize("one_column_budget", [False, True])
+@pytest.mark.parametrize("budget_components", [1, 3, None])
 @pytest.mark.parametrize(
     "nb, ranks, hostnames, compressed", [(1, 2, None, False), (2, 3, ["n0", "n0", "n1"], True), (3, 2, None, False)]
 )
-def test_fft_bubble_distributed_round_buffer_budget_keeps_the_rank0_path_bits(
-    nb, ranks, hostnames, compressed, one_column_budget, monkeypatch
+def test_fft_bubble_distributed_transforms_component_groups_within_the_round_buffer_and_keeps_the_rank0_bits(
+    nb, ranks, hostnames, compressed, budget_components, monkeypatch
 ):
-    """A round transforms several columns within the byte budget, one column above it, and keeps the rank-0 bits."""
+    """Each column is transformed in groups of orbital components within the byte budget and keeps the rank-0 bits."""
     import scipy as sp
 
     import dgamore.bubble_gen as bubble_gen
@@ -299,8 +307,8 @@ def test_fft_bubble_distributed_round_buffer_budget_keeps_the_rank0_path_bits(
 
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     nk, niv, niw, beta = (4, 4, 1), 4, 3, 2.5
-    if one_column_budget:
-        monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", int(np.prod(nk)) * nb**4 * 8)
+    if budget_components:
+        monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", int(np.prod(nk)) * budget_components * 8)
     g = _make_momentum_g(nk, nb, niv + niw + 2, seed=20 + nb)
     g = g.compress_q_dimension() if compressed else g
     q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
@@ -321,7 +329,110 @@ def test_fft_bubble_distributed_round_buffer_budget_keeps_the_rank0_path_bits(
 
     _, res = run_parallel(ranks, fn, hostnames=hostnames)
     assert np.array_equal(np.concatenate(res, axis=0), ref.mat)
-    assert (max(s[-1] for s in shapes) == 1) == one_column_budget and sum(s[-1] for s in shapes) == (niw + 1) * 2 * niv
+    group = nb**4 if budget_components is None else min(budget_components, nb**4)
+    assert all(len(s) == 4 for s in shapes) and max(s[-1] for s in shapes) == group
+    assert sum(s[-1] for s in shapes) == (niw + 1) * 2 * niv * nb**4
+
+
+def test_distributed_bubble_shares_one_real_space_window_per_node_and_no_reversed_copy(monkeypatch):
+    """The distributed bubble shares only the R-space Green's function per node; partners are read at -R from it."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 2, 2, 2.5
+    g = _make_momentum_g(nk, nb, niv + niw + 2, seed=13)
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    ref = _fft_bubble_reference(g, niw, niv, q_grid, beta)
+    g_ranks = [g.copy() for _ in range(2)]
+    calls, build = [], mpi_utils.build_node_shared_array
+    monkeypatch.setattr(
+        mpi_utils, "build_node_shared_array", lambda comm, fn, *a: calls.append(comm.Get_rank()) or build(comm, fn, *a)
+    )
+
+    def fn(comm, rank):
+        node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
+        return BubbleGenerator.create_generalized_chi0_q_fft(
+            dist, g_ranks[rank], niw, niv, q_grid, beta, node_comm=node_comm
+        ).mat
+
+    _, res = run_parallel(2, fn, hostnames=["n0", "n0"])
+    assert np.array_equal(np.concatenate(res, axis=0), ref.mat)
+    assert sorted(calls) == [0, 1]
+
+
+@pytest.mark.parametrize("ranks, kind", [(1, "plain"), (2, "plain"), (3, "crossing"), (2, "transposed")])
+def test_fft_bubble_in_bosonic_blocks_holds_the_bits_of_the_whole_bubble(ranks, kind, monkeypatch):
+    """With blocks the bubble comes as consecutive bosonic windows, one per frequency on several ranks, bit for bit."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 3, 2, 2.5
+    make = {"plain": _make_momentum_g, "crossing": _make_crossing_g}.get(kind)
+    g = make(nk, nb, niv + niw + 2, seed=95) if make else _make_transposed_g(nk, niv + niw + 2, [1, 0], seed=95)
+    q_grid = bz.KGrid(nk, symmetries=[])
+    g_ranks = [g.copy() for _ in range(2 * ranks)]
+
+    def fn(comm, rank, blocks=False):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
+        g_rank = g_ranks[rank + (ranks if blocks else 0)]
+        return BubbleGenerator.create_generalized_chi0_q_fft(
+            dist, g_rank, niw, niv, q_grid, beta, involution=np.array([1, 0]), blocks=blocks
+        )
+
+    whole = [fn(create_comm_mock(), 0).mat] if ranks == 1 else [b.mat for b in run_parallel(ranks, fn)[1]]
+    blocks = [fn(create_comm_mock(), 0, True)] if ranks == 1 else run_parallel(ranks, lambda c, r: fn(c, r, True))[1]
+    assert all(not block.full_niw_range for rank_blocks in blocks for block in rank_blocks)
+    assert all(len(rank_blocks) == (1 if ranks == 1 else niw + 1) for rank_blocks in blocks)
+    joined = [np.concatenate([block.mat for block in rank_blocks], axis=-2) for rank_blocks in blocks]
+    assert all(np.array_equal(a, b) for a, b in zip(joined, whole))
+
+
+@pytest.mark.parametrize("ranks", [1, 2])
+def test_bubble_calls_release_once_after_reading_the_greens_function_and_before_any_column(ranks, monkeypatch):
+    """The caller's release runs once per rank, after every read of the Green's function, before the first transform."""
+    import scipy as sp
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, nb, niv, niw, beta = (4, 4, 1), 2, 2, 2, 2.5
+    g = _make_momentum_g(nk, nb, niv + niw + 2, seed=14)
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    ref = _fft_bubble_reference(g, niw, niv, q_grid, beta)
+    g_ranks = [g.copy() for _ in range(ranks)]
+    events, ifftn = [], sp.fft.ifftn
+    me = threading.get_ident
+    monkeypatch.setattr(sp.fft, "ifftn", lambda x, **kwargs: events.append(("transform", me())) or ifftn(x, **kwargs))
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
+
+        def release():
+            events.append(("release", me()))
+            g_ranks[rank].mat = None  # the caller frees the Green's function here
+
+        return BubbleGenerator.create_generalized_chi0_q_fft(
+            dist, g_ranks[rank], niw, niv, q_grid, beta, release=release
+        ).mat
+
+    res = [fn(create_comm_mock(), 0)] if ranks == 1 else run_parallel(ranks, fn)[1]
+    assert np.array_equal(np.concatenate(res, axis=0), ref.mat)
+    threads = {thread for _, thread in events}
+    assert len(threads) == ranks and all(
+        [e for e, t in events if t == thread][0] == "release"
+        and [e for e, t in events if t == thread].count("release") == 1
+        for thread in threads
+    )
+
+
+def test_column_pass_holds_one_component_group_of_a_column_not_the_whole_column():
+    """With a one-component group a column pass peaks at its irreducible rows and one component, not at a column."""
+    nk, nb = (64, 64, 1), 2
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock())
+    fill = lambda out, part, iw, iv, comps: out.fill(1.0)
+
+    def run():
+        BubbleGenerator._run_columns(
+            dist, q_grid, 1, 1, 1, (nb,) * 4, np.complex64, fill, lambda where, b: None, group=1
+        )
+
+    assert traced_peak(run)[1] < q_grid.nk_tot * nb**4 * 8 / 2
 
 
 def test_fft_bubble_distributed_with_node_shared_greens_function(monkeypatch):
@@ -443,7 +554,7 @@ def test_crossing_bubble_of_a_crossing_g_transforms_only_the_computed_columns_an
 
     _, res = run_parallel(ranks, fn, hostnames=hostnames)
     assert np.array_equal(np.concatenate(res, axis=0), ref)
-    assert sum(s[-1] for s in shapes) == n_computed
+    assert sum(s[-1] for s in shapes) == n_computed * nb**4
 
 
 def test_crossing_bubble_exchanges_only_the_computed_columns(monkeypatch):
@@ -495,7 +606,7 @@ def test_bubble_of_a_hermitian_g_without_time_reversal_transforms_every_column(r
     shapes, ifftn = [], sp.fft.ifftn
     monkeypatch.setattr(sp.fft, "ifftn", lambda x, **kwargs: shapes.append(x.shape) or ifftn(x, **kwargs))
     result = bubble(0)
-    assert sum(s[-1] for s in shapes) == (niw + 1) * 2 * niv
+    assert sum(int(np.prod(s[3:])) for s in shapes) == (niw + 1) * 2 * niv * nb**4
     monkeypatch.setattr(BubbleGenerator, "_has_crossing_symmetries", staticmethod(lambda *args: False))
     assert np.array_equal(result, bubble(ranks))
 
@@ -542,7 +653,10 @@ def test_bubble_of_a_transposed_g_transforms_only_its_independent_orbital_compon
     shapes, ifftn = [], sp.fft.ifftn
     monkeypatch.setattr(sp.fft, "ifftn", lambda x, **kwargs: shapes.append(x.shape) or ifftn(x, **kwargs))
     independent = bubble()
-    assert shapes and all(int(np.prod(shape[3:-1])) == n_independent < nb**4 for shape in shapes)
+    wn = MFHelper.wn(niw, return_only_positive=True)
+    crossing = BubbleGenerator._has_crossing_symmetries(g, niv + niw)
+    n_columns = len(BubbleGenerator._crossing_columns(wn, niv)[0]) if crossing else len(wn) * 2 * niv
+    assert sum(int(np.prod(s[3:])) for s in shapes) == n_columns * n_independent and n_independent < nb**4
     assert np.allclose(independent, every, atol=1e-6 * np.abs(every).max())
     assert np.array_equal(
         independent, independent.transpose(0, 4, 3, 2, 1, 5, 6)[:, p][:, :, p][:, :, :, p][:, :, :, :, p]
@@ -695,7 +809,7 @@ def test_column_pass_peak_does_not_grow_with_the_number_of_rounds():
 
     def peak(n_w: int) -> int:
         def run():
-            fill = lambda out, part, iw, iv: out.fill(1.0)
+            fill = lambda out, part, iw, iv, comps: out.fill(1.0)
             BubbleGenerator._run_columns(
                 dist, q_grid, n_w, n_v, 1, (nb,) * 4, np.complex64, fill, lambda where, b: None
             )
@@ -704,6 +818,228 @@ def test_column_pass_peak_does_not_grow_with_the_number_of_rounds():
 
     one_round = peak(1)
     assert peak(4) <= 1.05 * one_round
+
+
+@pytest.mark.parametrize("n_parts", [1, 2])
+def test_column_ring_hands_the_columns_of_consecutive_sources_to_one_deliver_call(n_parts, monkeypatch):
+    """With one column per round a rank gets every column once, part by part, several sources per deliver call."""
+    import scipy as sp
+
+    import dgamore.bubble_gen as bubble_gen
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, comp, n_w, n_v, ranks = (4, 4, 2), (3,), 3, 10, 5
+    q_grid = bz.KGrid(nk, symmetries=[])
+    monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", q_grid.nk_tot * comp[0] * 8)
+    rng = np.random.default_rng(5)
+    pattern = (rng.standard_normal((n_parts, n_w * n_v, *nk, *comp)) + 0j).astype(np.complex64)
+    ref = np.empty((q_grid.nk_irr, *comp, n_parts, n_w * n_v), dtype=np.complex64)
+    for part in range(n_parts):
+        for c in range(n_w * n_v):
+            column = sp.fft.ifftn(pattern[part, c][..., None].copy(), axes=(0, 1, 2), overwrite_x=True)
+            ref[..., part, c] = column.reshape(q_grid.nk_tot, *comp, 1)[q_grid.irrk_ind][..., 0]
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
+        got, calls = np.zeros((dist.my_size, *comp, n_parts, n_w * n_v), dtype=np.complex64), []
+
+        def fill(out, part, iw, iv, comps):
+            out[...] = pattern[part, iw * n_v + iv][..., comps]
+
+        def deliver(where, block):
+            calls.append(where)
+            got[..., where] = block
+
+        BubbleGenerator._run_columns(dist, q_grid, n_w, n_v, n_parts, comp, np.complex64, fill, deliver)
+        return np.array_equal(got, ref[dist.my_slice]), len(calls)
+
+    results = run_parallel(ranks, fn)[1]
+    assert all(same for same, _ in results) and all(n_calls < n_w * n_v for _, n_calls in results)
+
+
+@pytest.mark.parametrize("subtract", [False, True])
+def test_bubble_of_a_transposed_crossing_g_in_one_column_rounds_keeps_the_one_rank_bits(subtract, monkeypatch):
+    """Batched blocks with orbital components and crossing partners give the one-rank bubble bit for bit."""
+    import dgamore.bubble_gen as bubble_gen
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, niv, niw, beta, ranks, pi = (4, 2, 1), 3, 2, 2.5, 4, np.array([1, 0])
+    greens = [_make_transposed_g(nk, niv + niw + 2, list(pi), seed=seed) for seed in (95, 96)]
+    assert all(BubbleGenerator._has_crossing_symmetries(g, niv + niw) for g in greens)
+    assert np.array_equal(BubbleGenerator._orbital_transpose_permutation(greens[0], niv + niw, pi), pi)
+    q_grid = bz.KGrid(nk, symmetries=[])
+    one_rank = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock())
+    a, b = (
+        BubbleGenerator.create_generalized_chi0_q_fft(one_rank, g.copy(), niw, niv, q_grid, beta, None, None, pi)
+        for g in greens
+    )
+    ref = a.sub(b, copy=False).mat if subtract else b.mat
+    monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", q_grid.nk_tot * 2**4 * 8)
+    g_ranks = [[g.copy() for g in greens] for _ in range(ranks)]
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
+        target = None
+        if subtract:
+            target = BubbleGenerator.create_generalized_chi0_q_fft(
+                dist, g_ranks[rank][0], niw, niv, q_grid, beta, None, None, pi
+            )
+        return BubbleGenerator.create_generalized_chi0_q_fft(
+            dist, g_ranks[rank][1], niw, niv, q_grid, beta, None, target, pi
+        ).mat
+
+    assert np.array_equal(np.concatenate(run_parallel(ranks, fn)[1], axis=0), ref)
+
+
+def test_column_ring_of_a_round_runs_behind_the_next_rounds_columns(monkeypatch):
+    """On a slow link round 1's blocks may arrive after round 2 is filled, so their delivery waits for every fill."""
+    import threading
+
+    import dgamore.bubble_gen as bubble_gen
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(bubble_gen, "BEHIND_STEP_SECONDS", -1.0)
+    nk, comp, n_w, ranks = (4, 2, 1), (2,), 3, 3
+    q_grid = bz.KGrid(nk, symmetries=[])
+    monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", q_grid.nk_tot * comp[0] * 8)
+    filled, lock, every_rank_filled = set(), threading.Lock(), threading.Event()
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
+
+        def fill(out, part, iw, iv, comps):
+            out.fill(1.0)
+            with lock:
+                filled.add((rank, iw))
+                if sum(w == 2 for _, w in filled) == ranks:
+                    every_rank_filled.set()
+
+        def deliver(where, block):
+            cols = np.arange(n_w * ranks)[where]
+            if np.any((cols // ranks == 1) & (cols != ranks + rank)) and not every_rank_filled.wait(timeout=5):
+                raise TimeoutError("round 1 arrived before every rank filled round 2")
+
+        BubbleGenerator._run_columns(dist, q_grid, n_w, ranks, 1, comp, np.complex64, fill, deliver)
+
+    run_parallel(ranks, fn)
+
+
+@pytest.mark.parametrize("thread_level, behind_step", [(1, -1.0), (3, float("inf"))])
+def test_column_ring_stays_on_the_calling_thread_below_serialized_mpi_or_on_a_fast_link(
+    thread_level, behind_step, monkeypatch
+):
+    """Below THREAD_SERIALIZED, or with ring steps that wait less than BEHIND_STEP_SECONDS, no round runs behind."""
+    import threading
+
+    import dgamore.bubble_gen as bubble_gen
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(FAKE_MPI, "Query_thread", lambda: thread_level)
+    monkeypatch.setattr(bubble_gen, "BEHIND_STEP_SECONDS", behind_step)
+    nk, comp, n_w, ranks = (4, 2, 1), (2,), 3, 3
+    q_grid = bz.KGrid(nk, symmetries=[])
+    monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", q_grid.nk_tot * comp[0] * 8)
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
+        caller, threads = threading.current_thread(), []
+        deliver = lambda where, block: threads.append(threading.current_thread())
+        fill = lambda out, part, iw, iv, comps: out.fill(1.0)
+        BubbleGenerator._run_columns(dist, q_grid, n_w, ranks, 1, comp, np.complex64, fill, deliver)
+        return len(threads) > 0 and all(t is caller for t in threads)
+
+    assert all(run_parallel(ranks, fn)[1])
+
+
+def test_column_ring_stays_on_the_calling_thread_when_one_late_rank_holds_up_one_step_of_the_others(monkeypatch):
+    """A rank late to round 0 makes every other rank wait in one ring step only, which leaves the exchanges in front."""
+    import threading
+    import time
+
+    import dgamore.bubble_gen as bubble_gen
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, comp, n_w, ranks = (4, 2, 1), (2,), 3, 5
+    q_grid = bz.KGrid(nk, symmetries=[])
+    monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", q_grid.nk_tot * comp[0] * 8)
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
+        caller, threads = threading.current_thread(), []
+        deliver = lambda where, block: threads.append(threading.current_thread())
+        fill = lambda out, part, iw, iv, comps: (time.sleep(0.2) if (rank, iw) == (0, 0) else None, out.fill(1.0))
+        BubbleGenerator._run_columns(dist, q_grid, n_w, ranks, 1, comp, np.complex64, fill, deliver)
+        return all(t is caller for t in threads)
+
+    assert all(run_parallel(ranks, fn)[1])
+
+
+def _step_clock(waits_ms: list) -> types.SimpleNamespace:
+    """A ``time`` stand-in whose ``perf_counter`` pairs on each thread lie ``waits_ms`` apart, then stand still."""
+    import itertools
+    import threading
+
+    state = threading.local()
+    stamps = list(itertools.accumulate(w / 1e3 for ms in waits_ms for w in (ms, 0.0)))
+
+    def perf_counter():
+        if not hasattr(state, "ticks"):
+            state.ticks = itertools.chain([0.0], stamps, itertools.repeat(stamps[-1]))
+        return next(state.ticks)
+
+    return types.SimpleNamespace(perf_counter=perf_counter)
+
+
+@pytest.mark.parametrize(
+    "waits_ms, behind", [([18.0, 6.0, 3.0, 2.5, 0.02, 0.02, 0.0], False), ([9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0], True)]
+)
+def test_column_ring_moves_behind_the_columns_only_when_most_steps_of_round_0_waited(waits_ms, behind, monkeypatch):
+    """Few long round-0 waits keep the exchanges in front, long waits throughout move them behind; the log names it."""
+    import threading
+
+    import dgamore.bubble_gen as bubble_gen
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(bubble_gen, "time", _step_clock(waits_ms))
+    nk, comp, n_w, ranks = (4, 2, 1), (2,), 3, len(waits_ms) + 1
+    q_grid = bz.KGrid(nk, symmetries=[])
+    monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", q_grid.nk_tot * comp[0] * 8)
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
+        caller, threads = threading.current_thread(), []
+        deliver = lambda where, block: threads.append(threading.current_thread())
+        fill = lambda out, part, iw, iv, comps: out.fill(1.0)
+        BubbleGenerator._run_columns(dist, q_grid, n_w, ranks, 1, comp, np.complex64, fill, deliver)
+        return any(t is not caller for t in threads)
+
+    assert run_parallel(ranks, fn)[1] == [behind] * ranks
+    assert any(("run behind" if behind else "run in front of") in c.args[0] for c in config.logger.info.call_args_list)
+
+
+def test_column_ring_raises_an_error_of_the_exchange_behind_the_columns(monkeypatch):
+    """An exception raised while a round's blocks arrive behind the next round's columns reaches the caller."""
+    import dgamore.bubble_gen as bubble_gen
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(bubble_gen, "BEHIND_STEP_SECONDS", -1.0)
+    nk, comp, n_w, ranks = (4, 2, 1), (2,), 3, 2
+    q_grid = bz.KGrid(nk, symmetries=[])
+    monkeypatch.setattr(bubble_gen, "ROUND_BUFFER_BYTES", q_grid.nk_tot * comp[0] * 8)
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
+
+        def deliver(where, block):
+            cols = np.arange(n_w * ranks)[where]
+            if np.any((cols // ranks == 1) & (cols != ranks + rank)):
+                raise ValueError("lost block")
+
+        fill = lambda out, part, iw, iv, comps: out.fill(1.0)
+        BubbleGenerator._run_columns(dist, q_grid, n_w, ranks, 1, comp, np.complex64, fill, deliver)
+
+    with pytest.raises(AssertionError, match="lost block"):
+        run_parallel(ranks, fn)
 
 
 def _on_ranks(ranks: int, fn, hostnames=None) -> list:

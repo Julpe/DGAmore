@@ -1136,6 +1136,22 @@ def test_take_wn_slice_without_copy_views_the_bosonic_window_of_the_parent(num_v
     assert np.array_equal(out.mat, mat[(..., slice(1, 3)) + (slice(None),) * num_vn])
 
 
+@pytest.mark.parametrize("num_vn", [0, 1, 2])
+def test_join_wn_joins_consecutive_bosonic_windows_and_consumes_the_parts(num_vn):
+    """join_wn rebuilds the object from its consecutive bosonic windows and frees every part it copied."""
+    nb, n_w, niv = 2, 5, 3
+    shape = (nb, nb, n_w) + (2 * niv,) * num_vn
+    mat = (np.random.rand(*shape) + 1j * np.random.rand(*shape)).astype(np.complex64)
+    obj = LocalNPoint(mat.copy(), 2, 1, num_vn, full_niw_range=False)
+    parts = [obj.take_wn_slice(w0, w1) for w0, w1 in ((0, 2), (2, 3), (3, 5))]
+    kept = list(parts)
+
+    out = LocalNPoint.join_wn(parts)
+
+    assert out.current_shape == shape and np.array_equal(out.mat, mat) and not out.full_niw_range
+    assert parts == [] and all(part.mat is None for part in kept)
+
+
 def test_take_wn_slice_rejects_a_full_bosonic_range_object():
     """take_wn_slice refuses a full-range object, whose bosonic index 0 is not omega = 0."""
     obj = LocalNPoint(np.zeros((2, 2, 5, 6)), 2, 1, 1, full_niw_range=True)

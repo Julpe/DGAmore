@@ -1076,6 +1076,30 @@ def test_contract_first_pair_with_local_vertex_matches_the_einsum(rng, o):
     assert np.array_equal(out_view.mat, out.mat)
 
 
+@pytest.mark.parametrize("sparse", [False, True])
+def test_contract_first_pair_with_local_vertex_per_bosonic_window_keeps_the_bits_of_the_whole(rng, sparse):
+    """Windows of the bubble contracted with the vertex's windows and its whole component map keep the whole's bits."""
+    o, nq, nw, niv_full, niv_core = 2, 3, 3, 4, 2
+    f_shape, b_shape = (o, o, o, o, nw, 2 * niv_full, 2 * niv_full), (nq, o, o, o, o, nw, 2 * niv_full)
+    f_mat = (rng.standard_normal(f_shape) + 1j * rng.standard_normal(f_shape)).astype(np.complex64)
+    f_mat[0, 1] = 0.0 if sparse else f_mat[0, 1]
+    f_mat[1, 0, 0, 0, 1] = 0.0  # zero in one window only: the window's own map would take the other path
+    b_mat = (rng.standard_normal(b_shape) + 1j * rng.standard_normal(b_shape)).astype(np.complex64)
+    f_loc = LocalFourPoint(f_mat, SpinChannel.MAGN, 1, 2, False, True)
+    bubble = FourPoint(b_mat, SpinChannel.NONE, (nq, 1, 1), 1, 1, False, True, has_compressed_q_dimension=True)
+    whole = bubble.contract_first_pair_with_local_vertex(f_loc, niv_core)
+    components = f_loc.nonzero_orbital_components()
+
+    parts = [
+        bubble.take_wn_slice(w, w + 1).contract_first_pair_with_local_vertex(
+            f_loc.take_wn_slice(w, w + 1, copy=False), niv_core, components
+        )
+        for w in range(nw)
+    ]
+
+    assert np.array_equal(np.concatenate([part.mat for part in parts], axis=-2), whole.mat)
+
+
 @pytest.mark.parametrize("compressed", [True, False])
 def test_nonzero_orbital_components_of_a_momentum_dependent_object_scan_every_momentum(compressed):
     """A non-zero entry at any momentum marks its orbital component, in either momentum layout."""
@@ -1814,6 +1838,51 @@ def test_invert_with_local_kernel_and_sum_eliminates_over_pair_groups_inside_the
     assert inactive.size == 0 and grouped == [2]
     assert 2 * slice_bytes < peak - out.mat.nbytes < 2.5 * slice_bytes
     assert peak - out.mat.nbytes <= memory_estimator._chiq_aux_transient(2 * 2 * 128, 2)
+
+
+_RUN_SETS = ([(0, 1, 3), (1, 0, 2)], [], [(0, 0, 1), (1, 2, 3), (2, 0, 3)])
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+@pytest.mark.parametrize("case", ["one band", "inactive pairs", "grouped", "permuted"])
+def test_summed_solve_over_runs_matches_whole_solve(rng, monkeypatch, dtype, case):
+    """Three disjoint run sets solved into one array touch only their slices and give the whole solve's bits."""
+    monkeypatch.setattr(npb, "DTYPE", dtype)
+    monkeypatch.setattr(four_point, "_PERMUTED_ROWS_PER_PAIR", 0)
+    beta = config.sys.beta = np.float64(8.0)
+    if case == "permuted":
+        gamma, chi0, u_r, inactive = _layer_swap_inputs(rng, 4, nq=3, nw=3)
+    else:
+        o = 1 if case == "one band" else 4
+        gamma, chi0, u_r, inactive = _kernel_inputs(rng, o, niv=24 if case == "grouped" else 3, two_atoms=o == 4)
+    if case == "grouped":
+        _split_pair_groups(gamma, u_r)
+    kernel, involution = (gamma, u_r, 1.0 / beta**2, beta, inactive), _LAYER_SWAP if case == "permuted" else None
+    whole = chi0.invert_with_local_kernel_and_sum_over_last_vn(*kernel, orbital_involution=involution)
+    grouped, permuted = _spy_grouped_solves(monkeypatch), _spy_refined_solves(monkeypatch)
+    out, untouched = np.full_like(whole.mat, np.nan), []
+    for runs in _RUN_SETS:
+        chi0.invert_with_local_kernel_and_sum_over_last_vn(*kernel, orbital_involution=involution, runs=runs, out=out)
+        untouched.append(int(np.isnan(out[:, 0, 0, 0, 0, :, 0]).sum()))
+    paths = {"grouped": (4, 0), "permuted": (0, 9)}.get(case, (0, 0)) if dtype == np.complex64 else (0, 0)
+    assert untouched == [5, 5, 0] and (len(grouped), len(permuted)) == paths
+    assert np.array_equal(out, whole.mat)
+
+
+@pytest.mark.parametrize("given", ["rhs", "slice_rhs", "runs alone", "out alone"])
+def test_summed_solve_rejects_runs_with_right_hand_sides(rng, given):
+    """Runs with rhs or slice_rhs, and runs or out without the other, raise a ValueError."""
+    config.sys.beta = 8.0
+    gamma, chi0, u_r, _ = _kernel_inputs(rng, 1)
+    runs, out = [(0, 0, 3)], np.empty_like(chi0.mat)
+    options = {
+        "rhs": {"runs": runs, "out": out, "rhs": [chi0]},
+        "slice_rhs": {"runs": runs, "out": out, "slice_rhs": lambda i, w, total: []},
+        "runs alone": {"runs": runs},
+        "out alone": {"out": out},
+    }[given]
+    with pytest.raises(ValueError):
+        chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / 64.0, 8.0, **options)
 
 
 def _band_and_first_sum_reference(fp: FourPoint, niv_band: int, beta: float) -> tuple[np.ndarray, np.ndarray]:

@@ -18,7 +18,6 @@ import glob
 import itertools as it
 import os
 import re
-import readline
 from pathlib import Path
 
 import h5py
@@ -373,6 +372,9 @@ def complete(text, state):
 def main():
     default_filename = "Vertex.hdf5"
     default_output_filename = "g4iw_sym.hdf5"
+
+    # deferred: only the interactive prompts below need readline, not the modules importing this one
+    import readline
 
     readline.parse_and_bind("tab: complete")
     readline.set_completer_delims(" \t\n;")

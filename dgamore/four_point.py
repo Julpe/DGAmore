@@ -654,6 +654,7 @@ def _local_kernel_slices(
     whole: bool = False,
     involution: np.ndarray | None = None,
     grouped: bool = False,
+    runs: list[tuple[int, int, int]] | None = None,
 ) -> Iterator[
     tuple[int, int, np.ndarray, Callable[[np.ndarray], tuple[bool, Callable[[np.ndarray], np.ndarray] | None]]]
 ]:
@@ -668,7 +669,8 @@ def _local_kernel_slices(
     returns the slice's solve (see :func:`_refined_solve`), valid until the next ``fill``, which overwrites the
     factorization it reads. With ``grouped`` the same holds for the elimination over the pair groups of a slice
     that is not complex-symmetric (see :func:`_grouped_solve`), which takes precedence over the permuted
-    factorization.
+    factorization. With ``runs`` it walks only the slices of those runs, run by run, and builds the per-frequency
+    buffer once per run; each slice comes out as in the walk over all slices.
 
     :param diagonal: The frequency-diagonal part :math:`D`.
     :param kernel: The momentum-independent kernel :math:`K` on the fermionic box of ``diagonal``, from
@@ -690,6 +692,8 @@ def _local_kernel_slices(
         and whose solved orbital pairs fall into more than one group (see :func:`_pair_groups`, found once per
         bosonic frequency); read only for complex64 slices of at least ``_GROUPED_ROWS_PER_PAIR`` rows per solved
         pair and without ``whole``.
+    :param runs: The runs ``(w, i_start, i_stop)`` of bosonic index and momentum range whose slices ``(i, w)``,
+        ``i_start <= i < i_stop``, are walked, or None for every slice.
     :return: An iterator over ``(i, w, diag, fill)``.
     """
     o, vn = diagonal.shape[1], diagonal.shape[-1]
@@ -713,8 +717,10 @@ def _local_kernel_slices(
         perm = perm if np.all(perm >= 0) else None
     grouped = grouped and not whole and buf.dtype == np.complex64 and vn >= _GROUPED_ROWS_PER_PAIR
     coupled, groups = None, None
+    if runs is None:  # a rank without momenta builds no buffer
+        runs = [(w, 0, diagonal.shape[0]) for w in range(diagonal.shape[-2])] if diagonal.shape[0] else []
 
-    for w in range(diagonal.shape[-2] if diagonal.shape[0] else 0):  # a rank without momenta builds no buffer
+    for w, i_start, i_stop in runs:
         k_w = k_mat[:, :, :, :, w]  # [o1, o2, o3, o4, v, v']
         for r in range(pairs.size):
             for c in range(pairs.size):
@@ -735,7 +741,7 @@ def _local_kernel_slices(
                 np.copyto(buf[:, c * vn : (c + 1) * vn], a_buf[:, perm[c] * vn : (perm[c] + 1) * vn])
             p_asym = _abs_and_asymmetry_max(buf)[1]
         np.multiply(np.diagonal(k_w, axis1=4, axis2=5), scale, out=k_diag)
-        for i in range(diagonal.shape[0]):
+        for i in range(i_start, i_stop):
 
             def fill(blocks: np.ndarray) -> tuple[bool, Callable[[np.ndarray], np.ndarray] | None]:
                 """Writes A or A P (lower triangle where symmetric) and the blocks; returns the decision and solve."""
@@ -1258,7 +1264,7 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         self.mat = np.einsum(permutation, self.mat, optimize=True)
         return self
 
-    def map_to_full_bz(self, k_grid: KGrid, nq: tuple = None, out: np.ndarray | None = None):
+    def map_to_full_bz(self, k_grid: KGrid, nq: tuple = None, out: np.ndarray | None = None, rows: slice | None = None):
         """
         Unfolds the object from the irreducible BZ to the full BZ using the grid's symmetry index map (see
         :meth:`IAmNonLocal._map_to_full_bz`), with four orbital dimensions.
@@ -1267,9 +1273,10 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         :param nq: Optional number of momenta per direction for the unfolded grid; defaults to the object's ``nq``.
         :param out: Optional C-contiguous array of the unfolded shape and the object's dtype that receives the result
             instead of a fresh allocation; it must not overlap the object's array, and its content is overwritten.
+        :param rows: A slice of the full-BZ momenta, the only rows of the result written; ``None`` for every row.
         :return: ``self`` defined on the full BZ.
         """
-        return self._map_to_full_bz(k_grid, 4, nq, out)
+        return self._map_to_full_bz(k_grid, 4, nq, out, rows)
 
     def add(self, other, copy: bool = True) -> "FourPoint":
         """
@@ -1796,7 +1803,9 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         nonzero = [bool(self.mat[momenta + idx].any()) for idx in np.ndindex(o, o, o, o)]
         return np.array(nonzero).reshape(o, o, o, o)
 
-    def contract_first_pair_with_local_vertex(self, f_loc: LocalFourPoint, niv_out: int) -> "FourPoint":
+    def contract_first_pair_with_local_vertex(
+        self, f_loc: LocalFourPoint, niv_out: int, components: np.ndarray | None = None
+    ) -> "FourPoint":
         r"""
         Contracts the first orbital pair and the fermionic frequency of this one-fermion bubble with the first
         orbital pair and the first fermionic frequency of a local two-fermion vertex,
@@ -1810,18 +1819,23 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         zero components (see :meth:`LocalFourPoint.nonzero_orbital_components`), e.g. one built atom by atom, takes
         one product per momentum and non-zero component instead, ``[w, (34), nu] @ [w, nu, nu']`` on the kept window,
         both operands views in either storage order: the zero components are never multiplied, and the bubble of a
-        first pair :math:`(a, b)` no component holds is never read. Neither path materializes the vertex again.
+        first pair :math:`(a, b)` no component holds is never read. Neither path materializes the vertex again. A
+        bosonic window of the bubble contracted with the same window of the vertex and the whole vertex's
+        ``components`` holds the bits of that window of the whole contraction (one product per bosonic frequency).
 
         :param f_loc: The local two-fermion vertex ``[o1, o2, o3, o4, w, nu, nu']`` (half niw range) whose stored
             first frequency is summed.
         :param niv_out: Number of positive fermionic frequencies kept of the vertex's second frequency.
+        :param components: The vertex's non-zero orbital components (see
+            :meth:`LocalFourPoint.nonzero_orbital_components`), or ``None`` to find them in ``f_loc``.
         :return: The contraction as a new one-fermion :class:`FourPoint` (half niw range, compressed momentum axis,
             channel ``NONE``).
         """
         nq, nb, n_w = self.current_shape[0], self.n_bands, self.mat.shape[-2]
         window = f_loc.vn_slice(f_loc.niv_second, niv_out)
         shape = (nq, nb, nb, nb, nb, n_w, 2 * niv_out)
-        components = f_loc.nonzero_orbital_components() if nq else np.ones((nb,) * 4, dtype=bool)
+        if components is None:
+            components = f_loc.nonzero_orbital_components() if nq else np.ones((nb,) * 4, dtype=bool)
         if components.all():
             f_pair = f_loc.mat.transpose(4, 0, 1, 5, 2, 3, 6).reshape(n_w, nb * nb * f_loc.mat.shape[-2], -1)
             out = np.empty(shape, dtype=self.mat.dtype)
@@ -1917,6 +1931,8 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         rhs: "list[FourPoint] | None" = None,
         slice_rhs: "Callable[[int, int, FourPoint], list[FourPoint]] | None" = None,
         orbital_involution: np.ndarray | None = None,
+        runs: list[tuple[int, int, int]] | None = None,
+        out: np.ndarray | None = None,
     ) -> "FourPoint | list[FourPoint] | tuple[FourPoint, list[FourPoint]]":
         r"""
         Returns the sum over the last fermionic frequency of the inverse of the matrix with this object on the
@@ -1985,6 +2001,11 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         are released without a garbage-collector sweep per slice (see
         :func:`~dgamore.n_point_base.deferred_collection`).
 
+        With ``runs``, the runs ``(w, i_start, i_stop)`` of bosonic index and momentum range, only their slices
+        ``(i, w)``, ``i_start <= i < i_stop``, are solved, :math:`A^{\omega\nu\nu'}` built once per run, and their sums
+        are written into ``out`` and divided by :math:`\beta` there. Nothing else of ``out`` is touched, so calls with
+        disjoint runs fill one array together, every slice with the bits of the call without ``runs``.
+
         :param kernel: The momentum-independent two-fermion kernel :math:`K` on the fermionic box of this object (full
             or half bosonic range; read via a half-range view).
         :param shift: The frequency-independent shift :math:`C`.
@@ -1999,15 +2020,23 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         :param orbital_involution: The orbital permutation :math:`\pi` as an index array, or None. It is ignored for
             complex128 slices, slices of fewer rows than above and if it maps a solved orbital pair onto an eliminated
             one.
+        :param runs: The runs ``(w, i_start, i_stop)`` of bosonic index and momentum range whose slices are solved,
+            or None for every slice.
+        :param out: The array ``[q, o1, o2, o3, o4, w, v]`` of this object's shape that the slices of ``runs`` are
+            solved into, or None.
         :return: The sum as a new one-fermion :class:`FourPoint` in the channel of ``kernel`` (half niw range,
             compressed momenta, stored in the memory layout of this object's array), with ``rhs`` the solutions as
             a list of such objects, one per member, or with ``slice_rhs`` the tuple ``(sum, solutions)``; ``self`` is
-            brought to the half niw range and compressed momenta in place.
+            brought to the half niw range and compressed momenta in place. With ``runs`` the sum's array is ``out``.
+        :raises ValueError: If ``runs`` and ``out`` do not come together, or ``runs`` comes with ``rhs`` or
+            ``slice_rhs``.
         """
+        if (runs is None) != (out is None) or (runs is not None and (rhs is not None or slice_rhs is not None)):
+            raise ValueError("runs and out come together, and only for the sum (without rhs or slice_rhs).")
         diagonal = self.to_half_niw_range().compress_q_dimension().mat  # [q, o1, o2, o3, o4, w, v]
         rhs_mats = [] if rhs is None else [b.to_half_niw_range().compress_q_dimension().mat for b in rhs]
         # this object's memory layout, which fixes the bits of later frequency sums
-        outs = [np.empty_like(diagonal) for _ in range(max(len(rhs_mats), 1))]
+        outs = [out] if runs is not None else [np.empty_like(diagonal) for _ in range(max(len(rhs_mats), 1))]
         summed = rhs is None and slice_rhs is None  # only the sum may take the elimination over pair groups
 
         def hook(i: int, w: int) -> list[np.ndarray]:
@@ -2020,7 +2049,16 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         with deferred_collection() if slice_rhs else contextlib.nullcontext():
             _summed_slice_solver(
                 lambda buf, pairs: _local_kernel_slices(
-                    diagonal, kernel, shift, scale, 0, buf, pairs, involution=orbital_involution, grouped=summed
+                    diagonal,
+                    kernel,
+                    shift,
+                    scale,
+                    0,
+                    buf,
+                    pairs,
+                    involution=orbital_involution,
+                    grouped=summed,
+                    runs=runs,
                 ),
                 diagonal,
                 outs,
@@ -2029,7 +2067,10 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
                 None if slice_rhs is None else hook,
             )
 
-        if rhs is None and slice_rhs is None:
+        if runs is not None:  # only the solved slices: the rest of out may hold the sums of other calls
+            for w, i_start, i_stop in runs:
+                out[i_start:i_stop, :, :, :, :, w] /= beta
+        elif rhs is None and slice_rhs is None:
             outs[0] /= beta
         results = [
             FourPoint(out, kernel.channel, self.nq, 1, 1, False, has_compressed_q_dimension=True) for out in outs

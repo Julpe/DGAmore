@@ -1307,6 +1307,35 @@ def test_scatter_to_full_bz_places_the_star_weighted_rows_at_their_representativ
         decompressed.scatter_to_full_bz(grid)
 
 
+def test_scatter_to_full_bz_on_given_rows_writes_those_rows_of_the_whole_scatter(c128_storage):
+    """With rows only those full-BZ rows are written, with the values of the whole scatter."""
+    grid = bz.KGrid(nk=(4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
+    payload = (np.arange(grid.nk_irr) + 1.0).astype(np.complex128).reshape(grid.nk_irr, 1, 1)
+    whole = IAmNonLocal(mat=payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True).scatter_to_full_bz(grid)
+    out = np.full((16, 1, 1), np.nan, dtype=np.complex128)
+    for rows in (slice(0, 5), slice(5, 11), slice(11, 16)):
+        IAmNonLocal(mat=payload.copy(), nq=(4, 4, 1), has_compressed_q_dimension=True).scatter_to_full_bz(
+            grid, out=out, rows=rows
+        )
+    assert np.array_equal(out, whole.mat)
+
+
+@pytest.mark.parametrize("nb", [1, 2])
+def test_map_to_full_bz_on_given_rows_writes_those_rows_with_the_bits_of_the_whole_unfold(nb):
+    """Unfolding row ranges, each into its rows of one buffer, gives the whole auto-grid unfold bit for bit."""
+    grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=nb)
+    rng = np.random.default_rng(nb)
+    shape = (grid.nk_irr, nb, nb, nb, nb, 3)
+    payload = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    whole = IAmNonLocal(mat=payload.copy(), nq=(4, 4, 4), has_compressed_q_dimension=True)
+    whole._map_to_full_bz(grid, num_orbital_dimensions=4)
+    out = np.full((64, *shape[1:]), np.nan, dtype=np.complex64)
+    for rows in (slice(0, 7), slice(7, 40), slice(40, 64)):
+        part = IAmNonLocal(mat=payload.copy(), nq=(4, 4, 4), has_compressed_q_dimension=True)
+        part._map_to_full_bz(grid, num_orbital_dimensions=4, out=out, rows=rows)
+    assert np.array_equal(out, whole.mat)
+
+
 def test_map_to_full_bz_auto_2idx_reconstructs_H_exactly(c128_storage):
     """End-to-end: pick auto IBZ slice of H, _map_to_full_bz should reproduce H."""
     grid, H = _build_auto_kgrid(nx=4, ny=4, nz=4, nb=1)
@@ -1539,6 +1568,32 @@ def test_map_to_full_bz_monomial_gather_holds_no_output_sized_temporary(c128_sto
         peaks.append(tracemalloc.get_traced_memory()[1])
         tracemalloc.stop()
     assert peaks[0] < 1.1 * full_bytes and peaks[1] < 0.1 * full_bytes
+
+
+@pytest.mark.parametrize(
+    "monomial, fortran, whole_copy",
+    [(True, False, False), (True, True, True), (False, False, False), (False, True, False)],
+)
+def test_map_to_full_bz_gather_reads_only_the_rows_it_needs_of_a_strided_source(
+    c128_storage, monomial, fortran, whole_copy
+):
+    """Unfolding a few rows of a strided source reads only those rows; the monomial gather copies Fortran order once."""
+    nk = (8, 8, 4)
+    grid = (
+        _random_auto_grid(2, nk=nk) if monomial else bz.KGrid(nk=nk, symmetries=bz.two_dimensional_square_symmetries())
+    )
+    if monomial:
+        grid.auto_monomial_map(np.complex128, 4)
+    source = _rng_payload((grid.nk_irr, 2, 2, 2, 2, 64))[..., 16:48]
+    source = np.asfortranarray(source) if fortran else source
+    expected = IAmNonLocal(np.ascontiguousarray(source), grid.nk, True)._map_to_full_bz(grid, 4).mat
+    out, rows = np.full(expected.shape, np.nan, dtype=expected.dtype), slice(0, grid.nk_tot // 16)
+    obj = IAmNonLocal(source, grid.nk, True)
+    tracemalloc.start()
+    obj._map_to_full_bz(grid, 4, out=out, rows=rows)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert np.array_equal(out[rows], expected[rows]) and peak < (1.5 if whole_copy else 0.5) * source.nbytes
 
 
 def test_map_to_full_bz_raises_for_invalid_num_orbital_dimensions(c128_storage):
