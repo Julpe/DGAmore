@@ -64,7 +64,8 @@ def main():
     reads the hr and umatrix files, first imports :mod:`dgamore.plotting` (with matplotlib) and pandas, and aborts the
     job when that fails. The imported libraries are then frozen out of the garbage collector's sweeps, so the
     ``gc.collect()`` of every n-point release (see :meth:`~dgamore.n_point_base.IHaveMat.free`) walks only the objects
-    the run creates.
+    the run creates. A normal end stops the rank-file watchdog rank 0 starts in :func:`run_dga_routine` (see
+    :func:`~dgamore.eliashberg_solver.start_rank_file_watchdog`), which otherwise deletes the per-rank intermediates.
 
     :return: None.
     """
@@ -91,6 +92,7 @@ def main():
         sys.stdout.flush()
         logging.shutdown()
         comm.Abort(1)
+    eliashberg_solver.stop_rank_file_watchdog()
     MPI.Finalize()
     sys.exit(status)
 
@@ -101,7 +103,9 @@ def run_dga_routine(comm: MPI.Comm) -> int:
     Schwinger-Dyson step (per inequivalent atom, assembled into full multi-band quantities), the non-local
     ladder-DGA self-energy and Green's function, optional analytic continuation, and the optional Eliashberg
     solution -- saving and plotting results throughout. With more processes than momenta in the irreducible BZ it
-    logs an error and returns right after the config reaches every rank.
+    logs an error and returns right after the config reaches every rank. With the Eliashberg step enabled, rank 0
+    starts the rank-file watchdog (see :func:`~dgamore.eliashberg_solver.start_rank_file_watchdog`) once the folders
+    exist.
 
     :param comm: The MPI communicator.
     :return: The exit status: 1 when there are more processes than momenta in the irreducible BZ, else 0.
@@ -115,6 +119,8 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         g_dmft_per_ineq, sigma_dmft_per_ineq, g2_dens_per_ineq, g2_magn_per_ineq = (
             dga_io.load_from_dmft_file_and_update_config()
         )
+        if config.eliashberg.perform_eliashberg:
+            eliashberg_solver.start_rank_file_watchdog()
         # rank 0 alone evaluates e(k) (cached in the Hamiltonian) and the auto symmetries; the broadcast below ships
         # them to every rank
         ek = config.lattice.hamiltonian.get_ek(config.lattice.k_grid)
@@ -974,6 +980,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
         ("energies", "occupation and energy step"),
         ("occupation", "occupation at the start of the non-local routine"),
         ("sigma_interp", "self-energy interpolation"),
+        ("chi0q_core", "Inverse core bubble of the Eliashberg step"),
         ("fq", "Pairing-vertex construction"),
         ("lanczos", "Eliashberg solver"),
     )

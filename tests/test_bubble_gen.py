@@ -11,7 +11,6 @@ which both validates correctness and locks the behavior of the memory-optimized 
 
 import threading
 import types
-from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -27,12 +26,6 @@ from dgamore.matsubara_frequencies import MFHelper
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import FrequencyNotation
 from tests.conftest import FAKE_MPI, create_comm_mock, run_parallel, traced_peak
-
-
-@pytest.fixture(autouse=True)
-def _mock_config_logger(monkeypatch):
-    """Gives every test a mock ``config.logger``, which the column pass tells where its exchanges run."""
-    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
 
 
 def _make_local_g(nb: int, niv: int, seed: int = 0) -> GreensFunction:
@@ -994,7 +987,7 @@ def _step_clock(waits_ms: list) -> types.SimpleNamespace:
     "waits_ms, behind", [([18.0, 6.0, 3.0, 2.5, 0.02, 0.02, 0.0], False), ([9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0], True)]
 )
 def test_column_ring_moves_behind_the_columns_only_when_most_steps_of_round_0_waited(waits_ms, behind, monkeypatch):
-    """Few long round-0 waits keep the exchanges in front, long waits throughout move them behind; the log names it."""
+    """Few long round-0 waits keep the exchanges in front, long waits throughout move them behind."""
     import threading
 
     import dgamore.bubble_gen as bubble_gen
@@ -1014,7 +1007,6 @@ def test_column_ring_moves_behind_the_columns_only_when_most_steps_of_round_0_wa
         return any(t is not caller for t in threads)
 
     assert run_parallel(ranks, fn)[1] == [behind] * ranks
-    assert any(("run behind" if behind else "run in front of") in c.args[0] for c in config.logger.info.call_args_list)
 
 
 def test_column_ring_raises_an_error_of_the_exchange_behind_the_columns(monkeypatch):

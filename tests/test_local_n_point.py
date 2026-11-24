@@ -463,6 +463,18 @@ def test_save_writes_the_file_then_syncs_it_and_drops_it_from_the_page_cache(mon
     assert advised == [(synced[0], 0, 0, 4)]
 
 
+@pytest.mark.parametrize("num_vn_dimensions, full_niv_range", [(1, True), (1, False), (2, True)])
+def test_save_with_a_fermionic_cutoff_writes_the_cut_object(monkeypatch, tmp_path, num_vn_dimensions, full_niv_range):
+    """save with niv_cut writes exactly the matrix of cut_niv and leaves the object itself uncut."""
+    monkeypatch.setattr(np, "save", _real_np_save)
+    shape = (2, 2, 3) + (8,) * num_vn_dimensions
+    mat = (np.arange(np.prod(shape)) + 1j).reshape(shape).astype(np.complex64)
+    obj = LocalNPoint(mat.copy(), 2, 1, num_vn_dimensions, full_niw_range=False, full_niv_range=full_niv_range)
+    obj.save(output_dir=str(tmp_path), name="dump", niv_cut=2)
+    assert np.array_equal(np.load(tmp_path / "dump.npy"), obj.cut_niv(2).mat)
+    assert np.array_equal(obj.mat, mat)
+
+
 def test_saves_matrix_calls_to_full_niw_range_when_full_range(monkeypatch):
     """save converts to full then half niw range before writing for a full-range object."""
     mat = np.zeros((4, 4, 10))

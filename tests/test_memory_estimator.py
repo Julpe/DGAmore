@@ -127,18 +127,27 @@ def test_keys_without_eliashberg():
 
 
 def test_keys_with_eliashberg():
-    """With Eliashberg the estimator adds the fq and lanczos branches."""
+    """With Eliashberg the estimator adds the rebuilt inverse core bubble, the fq and the lanczos branches."""
     branches = {
-        *("chi0q", "chiq_aux", "sde", "sigma_loop", "mu_update", "energies", "occupation", "fq", "lanczos", "local")
+        *("chi0q", "chiq_aux", "sde", "sigma_loop", "mu_update", "energies", "occupation", "local"),
+        *("chi0q_core", "fq", "lanczos"),
     }
     assert set(_peaks(with_eliashberg=True)) == branches
+
+
+@pytest.mark.parametrize("n_ranks", [1, 4])
+def test_rebuilt_inverse_core_bubble_never_needs_more_than_the_kernel_steps_bubble(n_ranks):
+    """The Eliashberg step's core-box bubble rebuild fits wherever the full-box bubble of the kernel step does."""
+    peaks = _peaks(with_eliashberg=True, n_ranks=n_ranks)
+    assert _off_node_total(peaks["chi0q_core"], n_ranks) < _off_node_total(peaks["chi0q"], n_ranks)
+    assert "chi0q_core" not in _peaks(with_eliashberg=True, n_ranks=n_ranks, bare_vertex=True)
 
 
 def test_every_branch_has_positive_baseline_and_off_transient():
     """The branches holding node-shared windows (SDE section, loop step, mu, energies, fq) carry a baseline beyond the
     rank footprint, the others none; all a transient."""
     peaks = _peaks(with_eliashberg=True)
-    shared = ("chi0q", "chiq_aux", "sde", "fq", "sigma_loop", "mu_update", "energies")
+    shared = ("chi0q", "chiq_aux", "sde", "chi0q_core", "fq", "sigma_loop", "mu_update", "energies")
     for key, bp in peaks.items():
         assert isinstance(bp, BranchPeak)
         base = _rank_base(BASE)  # every rank's footprint sits in every baseline, the interaction in rank 0's slots
@@ -294,7 +303,7 @@ def test_interpolation_reserves_the_mini_pole_modules_after_the_loop(spectrum):
     """MiniPole's modules join every rank's baseline from the interpolation on, the DMFT spectrum's reload included."""
     params = dict(with_eliashberg=True, do_spectrum_dmft=spectrum)
     plain, interpolating = _peaks(**params), _peaks(**params, niv_interp=40)
-    after_loop = {"fq", "lanczos"} | ({"occupation"} if spectrum else set())
+    after_loop = {"chi0q_core", "fq", "lanczos"} | ({"occupation"} if spectrum else set())
     assert after_loop <= plain.keys() and interpolating.keys() - plain.keys() == {"sigma_interp"}
     assert interpolating["sigma_interp"].baseline == _rank_base(BASE) + MINI_POLE_IMPORT_BYTES
     for key, bp in plain.items():
@@ -338,7 +347,8 @@ def _fq_branch(budget, streaming=False):
     window_slice = DTYPE_BYTES * nb**4 * nv * nv
     chunk = min(max(budget, window_slice), qi * nw * window_slice)
     group = max(1, chunk // (nw * window_slice))
-    residents = SCALE * (qi * nb**4 * vpp * vpp + 2 * (qi + group) * nb**4 * wp * vc)
+    # the inverse bubble on the core box, the three-leg vertex on the pp box unless the full vertex is streamed
+    residents = SCALE * (qi * nb**4 * vpp * vpp + (qi + group) * nb**4 * wp * (vc + (vc if streaming else vpp)))
     slices = (9 if streaming else 4) * DTYPE_BYTES * nb**4 * vc * vc
     return residents + OVERHEAD_FACTOR * (3 * chunk + 6 * (chunk * vc // nv**2) + slices), window_slice, qi * nw
 

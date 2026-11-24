@@ -1278,8 +1278,9 @@ def estimate_peaks(
     )
 
     if with_eliashberg:
-        # Slice-direct pairing-vertex build: pp accumulator, two loaded one-fermion inputs and their momentum-group
-        # copies, chunk transient at the driver-sized budget; the band's window is the pp box, a streamed one the core.
+        # Slice-direct pairing-vertex build: pp accumulator, two loaded one-fermion inputs (the three-leg vertex stored
+        # on the pp box for the band) and their momentum-group copies, chunk transient at the driver-sized budget; the
+        # band's window is the pp box, a streamed one the core.
         one_slice = DTYPE_BYTES * _two_fermion_block(1, nb, 1, vc)
         fq_nv, fq_nw = (vc, wp) if save_fq else (vpp, vpp)
         window_slice = DTYPE_BYTES * _two_fermion_block(1, nb, 1, fq_nv)
@@ -1297,7 +1298,9 @@ def estimate_peaks(
             local_vertex_fq = 0.0
         else:
             fq_distributed = scale * (
-                _two_fermion_block(qi, nb, 1, vpp) + 2 * _bubble_block(qi + q_group, nb, wp, vc)
+                _two_fermion_block(qi, nb, 1, vpp)
+                + _bubble_block(qi + q_group, nb, wp, vc)
+                + _bubble_block(qi + q_group, nb, wp, vc if save_fq else vpp)
             ) + overhead * _fq_transient(fq_chunk, fq_chunk * vc // fq_nv**2, one_slice, save_fq)
             # the local vertex the slices are built from, node-shared (counted once per node)
             local_vertex_fq = scale * _two_fermion_block(1, nb, wp, vc)
@@ -1310,6 +1313,35 @@ def estimate_peaks(
             on_single=giwk_dga_single,
             remote_single=0.0,
         )
+
+        if not bare_vertex:
+            # The inverse core bubble rebuilt at the start of the step (eliashberg_solver.inverse_core_bubble): the
+            # chi0q build on the core box, from the saved Green's function of the SDE box (node-shared like there)
+            core_window = 2 * (niv_core + niw_core)
+            rebuild_shared = giwk_sde
+            if n_ranks == 1:
+                rebuild_distributed = 0.0
+                rebuild_single = scale * (
+                    _bubble_block(nk_irr, nb, wp, vc)
+                    + (1 + CHI0Q_IFFTN_TRANSIENT_FACTOR) * _bubble_block(nk_tot, nb, 1, vc)
+                    + 2 * _giwk_rspace(nk_tot, nb, core_window)
+                    + _giwk_rspace(nk_tot, nb, vc)
+                )
+            else:
+                rebuild_shared += scale * _giwk_rspace(nk_tot, nb, core_window)
+                rebuild_distributed = scale * _bubble_block(qi, nb, wp, vc) + overhead * bubble_column_bytes(
+                    nk_tot, nk_irr, nb, _ceil_div(wp * vc, n_ranks), qi
+                )
+                rebuild_single = 0.0
+            peaks["chi0q_core"] = BranchPeak(
+                baseline=rank_base + rebuild_shared + mini_pole,
+                giwk_shareable=rebuild_shared,
+                off_distributed=rebuild_distributed,
+                off_single=giwk_dga_single + rebuild_single,
+                on_distributed=rebuild_distributed,
+                on_single=giwk_dga_single + rebuild_single,
+                remote_single=0.0,
+            )
 
         # The single-rank Lanczos solve in the off slots (from the one shared formula the solver dispatch reads as
         # well, see lanczos_solver_bytes), rank 0's share of a multi-rank solve in the on slots.

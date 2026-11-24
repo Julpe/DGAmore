@@ -414,13 +414,19 @@ Per-rank intermediates
 ----------------------
 
 When the Eliashberg step is enabled, the self-consistency loop additionally dumps the ingredients of the ladder
-vertex to ``eliashberg_path``, one file per MPI rank, so that the vertex can be assembled after the loop. They are
+vertex to ``eliashberg_path``, one file per MPI rank (the Green's function a single file from rank 0), so that the
+vertex can be assembled after the loop. They are
 written once: in the last scheduled iteration or, when the loop converges earlier, by one more kernel pass on the
 converged self-energy, whose Green's function the particle-particle bubble of the Eliashberg step uses as well. Their
 leading axis holds only the irreducible momenta of the writing rank, and they are deleted once the vertex has been
-built. A rank that fails deletes them before it aborts the job: it first renames the folder to
-``<eliashberg_path>_aborted``, so the writes the other ranks still attempt fail instead of adding files (their errors
-follow the first one in the log), and removes it once empty. Ladder runs write the first three files of the table;
+built. The Eliashberg step rebuilds the inverse bare bubble of its momenta on the core box from the saved Green's
+function, so the three-leg vertices and the bubble share the Green's function of the pass that wrote them. A rank that fails deletes them before it aborts the job: it first places an empty ``.aborting`` marker in
+``eliashberg_path``, after which the other ranks write no more rank files (a file whose save overlaps the marker's
+creation is deleted again by its own rank), and then deletes every rank file present. The folder keeps its name, its
+other files and the marker. For a job killed from outside (out of memory, time limit, SIGKILL), rank 0 starts a
+small shell watchdog in a session of its own when the folder is created: it deletes the rank files the same way once
+rank 0 ends without reporting a normal finish, and ignores the termination signal a scheduler sends before its final
+kill. Ladder runs write the first three files of the table;
 with ``misc.do_flex`` or ``misc.do_rpa`` only the physical susceptibilities are written.
 
 .. list-table::
@@ -430,13 +436,15 @@ with ``misc.do_flex`` or ``misc.do_rpa`` only the physical susceptibilities are 
    * - File
      - Quantity
      - Array layout
-   * - ``gchi0_q_inv_rank_<r>.npy``
-     - Inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` on the core box
-     - ``[nq_rank, no, no, no, no, niw_core + 1, 2 niv_core]``
+   * - ``giwk_core_rank_0.npy``
+     - Green's function :math:`G^{\mathrm{k}}_{12}` of the pass on the full grid, on the box
+       :math:`n_{\nu} + n_{\omega}` the core-box bubble reads
+     - ``[nkx, nky, nkz, no, no, 2 (niv_core + niw_core)]``
    * - ``vrg_q_<channel>_rank_<r>.npy``
      - Three-leg vertex :math:`\gamma^{\Gamma;\mathrm{q}\nu}_{\mathrm{r}}` of the ladder of :math:`\Gamma_{\mathrm{r}}`
-       alone
-     - ``[nq_rank, no, no, no, no, niw_core + 1, 2 niv_core]``
+       alone, on the pp box :math:`n_{\nu}^{\mathrm{pp}} = \min(n_{\omega}, n_{\nu}) / 2` of the core box (with
+       ``eliashberg.save_fq`` on the whole core box, which the streamed full vertex reads)
+     - ``[nq_rank, no, no, no, no, niw_core + 1, 2 niv_pp]`` (``2 niv_core`` with ``save_fq``)
    * - ``vrg_middle_q_<channel>_rank_<r>.npy``
      - Matrix :math:`Y^{\mathrm{q}}_{\mathrm{r}}` between the three-leg vertices of the ladder vertex (see
        :func:`dgamore.nonlocal_sde.create_ladder_vertex_middle`)

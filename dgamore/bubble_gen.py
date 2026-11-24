@@ -16,7 +16,6 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import scipy as sp
 
-import dgamore.config as config
 import dgamore.mpi_utils as mpi_utils
 from dgamore.brillouin_zone import KGrid
 from dgamore.four_point import FourPoint
@@ -849,11 +848,6 @@ class BubbleGenerator:
                 # a late or descheduled rank lengthens a few steps; a slow link three quarters of them on most ranks
                 wait = float(np.median(comm.allgather(float(np.percentile(waits, 25)) if waits else 0.0)))
                 behind = wait > BEHIND_STEP_SECONDS
-                config.logger.info(
-                    f"Bubble column exchange: the first round's ring steps waited {1e3 * wait:.2f} ms (lower quartile, "
-                    f"median over the ranks), so the later rounds run {'behind' if behind else 'in front of'} the "
-                    f"next round's columns."
-                )
 
     @staticmethod
     def create_generalized_chi0_q_loop(

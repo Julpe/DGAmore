@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 from mpi4py import MPI as RealMPI
 
-from dgamore import config, eliashberg_solver, dga_io
+from dgamore import config, eliashberg_solver, dga_io, nonlocal_sde
+from dgamore.bubble_gen import BubbleGenerator
 from dgamore.dga_logger import DgaLogger
 from dgamore.eliashberg_solver import gap_parity_diagnostics
 from dgamore.greens_function import GreensFunction
@@ -271,3 +272,33 @@ def test_eliashberg_distributed_solver_matches_reference(setup, monkeypatch):
     assert np.allclose(results[(SpinChannel.SING, "odd")][0], [1.82116, 1.82116, 1.82116, 1.82116], atol=1e-2)
     assert np.allclose(results[(SpinChannel.TRIP, "even")][0], [0.13606, 0.13606, 0.13606, 0.13606], atol=1e-2)
     assert np.allclose(results[(SpinChannel.TRIP, "odd")][0], [4.27357, 4.27355, 0.60454, 0.60454], atol=1e-2)
+
+
+def test_inverse_core_bubble_is_the_kernel_steps_core_cut_bit_for_bit(setup):
+    """The inverse bubble rebuilt from the saved Green's function equals the kernel step's cut of its full-box bubble."""
+    folder, comm_mock = setup
+    config.box.niw_core = 20
+    config.box.niv_core = 20
+    config.box.niv_shell = 10
+    _, s_dmft, _, _ = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
+    config.output.eliashberg_path = folder
+
+    ek, orbitals = config.lattice.hamiltonian.get_ek(), config.sys.correlated_orbitals
+    giwk = GreensFunction.get_g_full(s_dmft, config.sys.mu, ek, config.sys.beta, orbitals)
+    dist = nonlocal_sde.irreducible_momentum_distributor(comm_mock)
+    full_box = BubbleGenerator.create_generalized_chi0_q_fft(
+        dist,
+        giwk,
+        config.box.niw_core,
+        config.box.niv_full,
+        config.lattice.k_grid,
+        config.sys.beta,
+        involution=nonlocal_sde._orbital_involution(ek, orbitals),
+    )
+    assert config.box.niv_full > config.box.niv_core
+    expected = full_box.cut_niv(config.box.niv_core).invert()
+
+    rebuilt = eliashberg_solver.inverse_core_bubble(dist, None)
+
+    assert rebuilt.mat.shape == expected.mat.shape
+    assert np.array_equal(rebuilt.mat, expected.mat)

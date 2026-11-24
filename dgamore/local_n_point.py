@@ -249,9 +249,7 @@ class LocalNPoint(IHaveMat):
         :return: The cut object (a copy, ``self``, or ``self`` unchanged for the no-op case).
         :raises ValueError: If the object has no fermionic frequency dimension.
         """
-        if self.num_vn_dimensions == 0:
-            raise ValueError("Cannot cut fermionic frequencies if there are none.")
-
+        window = self._vn_window(niv_cut)
         if niv_cut > self.niv_first and niv_cut > self.niv_second:
             return self
 
@@ -261,15 +259,26 @@ class LocalNPoint(IHaveMat):
         else:
             obj = self
 
-        # both axes are sliced against their own width, so an asymmetric nu x nu' box is cut correctly
         # ``.copy()`` so the trimmed parent array is actually released; a bare slice would keep it alive via the view.
-        if obj.num_vn_dimensions == 2:
-            obj.mat = obj.mat[..., obj.vn_slice(obj.niv_first, niv_cut), obj.vn_slice(obj.niv_second, niv_cut)].copy()
-        elif obj.num_vn_dimensions == 1:
-            obj.mat = obj.mat[..., obj.vn_slice(obj.niv_second, niv_cut)].copy()
-
+        obj.mat = obj.mat[window].copy()
         obj.update_original_shape()
         return obj
+
+    def _vn_window(self, niv_cut: int) -> tuple:
+        """
+        Returns the index that keeps ``niv_cut`` fermionic frequencies on every fermionic axis of ``mat``, each axis
+        sliced against its own width (see :meth:`vn_slice`), so a box with two fermionic axes of different widths is
+        cut correctly.
+
+        :param niv_cut: Number of fermionic frequencies to keep (per sign).
+        :return: The index tuple to apply to ``mat``.
+        :raises ValueError: If the object has no fermionic frequency dimension.
+        """
+        if self.num_vn_dimensions == 0:
+            raise ValueError("Cannot cut fermionic frequencies if there are none.")
+        if self.num_vn_dimensions == 2:
+            return ..., self.vn_slice(self.niv_first, niv_cut), self.vn_slice(self.niv_second, niv_cut)
+        return ..., self.vn_slice(self.niv_second, niv_cut)
 
     def cut_niw_and_niv(self, niw_cut: int, niv_cut: int, copy: bool = True):
         """
@@ -591,19 +600,23 @@ class LocalNPoint(IHaveMat):
         self.mat = np.swapaxes(self.mat, -1, -2)
         return self
 
-    def save(self, output_dir: str = "./", name: str = "please_give_me_a_name") -> None:
+    def save(self, output_dir: str = "./", name: str = "please_give_me_a_name", niv_cut: int | None = None) -> None:
         """
         Saves the content of the matrix to a numpy file. Always saves it in half the niw range to save storage space.
-        The file is forced to disk and dropped from the page cache right away (see :func:`_flush_and_drop`), so the
-        dumps of a rank never accumulate as dirty page cache next to its arrays.
+        With ``niv_cut`` only that many fermionic frequencies per sign are written, the file then holding what
+        :meth:`cut_niv` would give; the window is written from a view, so no cut copy is made. The file is forced to
+        disk and dropped from the page cache right away (see :func:`_flush_and_drop`), so the dumps of a rank never
+        accumulate as dirty page cache next to its arrays.
 
         :param output_dir: Directory to write the ``.npy`` file to.
         :param name: File name (without extension).
+        :param niv_cut: Number of fermionic frequencies (per sign) to write, or ``None`` for all.
         :return: None.
         """
         is_self_full_niw_range = self.full_niw_range
         path = os.path.join(output_dir, f"{name}.npy")
-        np.save(path, self.to_half_niw_range().mat, allow_pickle=False)
+        mat = self.to_half_niw_range().mat
+        np.save(path, mat if niv_cut is None else mat[self._vn_window(niv_cut)], allow_pickle=False)
         _flush_and_drop(path)
         if is_self_full_niw_range:
             self.to_full_niw_range()

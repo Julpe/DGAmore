@@ -23,6 +23,7 @@ import re
 import zipfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 
 import mpi4py.MPI as MPI
@@ -64,6 +65,31 @@ _RESTRICTION_FALLBACK_FLOOR = 1e-2  # floor of the inverse static eigenvalues wh
 _SHELL_ROWS = 64  # momenta per chunk of a damped step's padded rows: 2.5 MB of complex64 at four bands, 300 frequencies
 _PROPOSAL_ROWS_TAG = 1500  # base MPI tag of the proposal's core rows sent to the other nodes
 NODE_SHARED_SLICE_GAIN = 0.03  # least cut of the busiest rank's Bethe-Salpeter slices for which a node shares them
+ABORT_MARKER = ".aborting"  # placed in the Eliashberg folder by a failed rank before it deletes the rank files
+GIWK_FILE_STEM = "giwk_core_rank_0"  # the kernel step's Green's function on the box of the core bubble, by rank 0
+
+
+def save_rank_file(obj: LocalNPoint, name: str, niv_cut: int | None = None) -> None:
+    """
+    Saves one per-rank intermediate of the Eliashberg step as ``<name>.npy`` in the run's Eliashberg folder. Once a
+    failed rank has placed :data:`ABORT_MARKER` there (see :func:`~dgamore.eliashberg_solver.delete_rank_files`),
+    nothing is written, and a file whose save straddles the marker's creation is deleted again, so no rank adds a rank
+    file after the cleanup began.
+
+    :param obj: The object to save.
+    :param name: File name (without extension).
+    :param niv_cut: Number of fermionic frequencies (per sign) to write, or ``None`` for all (see
+        :meth:`~dgamore.local_n_point.LocalNPoint.save`).
+    :return: None.
+    """
+    path = config.output.eliashberg_path
+    marker = os.path.join(path, ABORT_MARKER)
+    if os.path.exists(marker):
+        return
+    obj.save(name=name, output_dir=path, niv_cut=niv_cut)
+    if os.path.exists(marker):
+        with suppress(OSError):
+            os.remove(os.path.join(path, f"{name}.npy"))
 
 
 def real_space_interaction(u_loc: LocalInteraction, v_nonloc: Interaction) -> np.ndarray:
@@ -1383,10 +1409,7 @@ def _finish_physical_susceptibility(
     _monitor_chi_phys(chi_phys_q_r, mpi_dist_irrq)
 
     if save_eliashberg:
-        chi_phys_q_r.save(
-            name=f"chi_phys_q_{chi_phys_q_r.channel.value}_rank_{mpi_dist_irrq.comm.rank}",
-            output_dir=config.output.eliashberg_path,
-        )
+        save_rank_file(chi_phys_q_r, f"chi_phys_q_{chi_phys_q_r.channel.value}_rank_{mpi_dist_irrq.comm.rank}")
     return chi_phys_q_r
 
 
@@ -1417,8 +1440,9 @@ def calculate_sigma_kernel_r_q(
     eigenvalues the auxiliary Bethe-Salpeter matrix can have where the physical susceptibility is regular. Also performs
     a :math:`\lambda`-correction on the physical susceptibility if specified in the config (dispatched by the band
     count). Saves the physical susceptibility to file and, with ``save_eliashberg``, the per-rank Eliashberg
-    intermediates: the three-leg vertex as ``vrg_q_{channel}_rank_{rank}`` and the matrix between the three-leg
-    vertices of the ladder vertex (see :func:`create_ladder_vertex_middle`) as ``vrg_middle_q_{channel}_rank_{rank}``.
+    intermediates: the three-leg vertex as ``vrg_q_{channel}_rank_{rank}`` (on the pp box the Eliashberg step reads,
+    on the whole core box with ``eliashberg.save_fq``) and the matrix between the three-leg vertices of the ladder
+    vertex (see :func:`create_ladder_vertex_middle`) as ``vrg_middle_q_{channel}_rank_{rank}``.
 
     The three-leg vertex and the channel kernel are built in momentum groups of
     :func:`~dgamore.memory_estimator.kernel_momentum_group` on views of the rank's arrays: each group of the summed
@@ -1515,9 +1539,12 @@ def calculate_sigma_kernel_r_q(
                     copy=False,
                 )
     if save_eliashberg:
-        channel, rank, path = vrg_q_r.channel.value, mpi_dist_irrq.comm.rank, config.output.eliashberg_path
-        vrg_q_r.save(name=f"vrg_q_{channel}_rank_{rank}", output_dir=path)
-        create_ladder_vertex_middle(x_g, *parts).save(name=f"vrg_middle_q_{channel}_rank_{rank}", output_dir=path)
+        channel, rank = vrg_q_r.channel.value, mpi_dist_irrq.comm.rank
+        # the pp band reads the three-leg vertex on the pp box only (the box of eliashberg_solver.solve); the streamed
+        # full vertex reads the whole core box
+        niv_pp = None if config.eliashberg.save_fq else min(config.box.niw_core // 2, config.box.niv_core // 2)
+        save_rank_file(vrg_q_r, f"vrg_q_{channel}_rank_{rank}", niv_pp)
+        save_rank_file(create_ladder_vertex_middle(x_g, *parts), f"vrg_middle_q_{channel}_rank_{rank}")
         logger.info(f"Saved the Gamma-ladder three-leg vertex and vertex middle ({channel}) for the Eliashberg step.")
     return kernel
 
@@ -1900,7 +1927,6 @@ class _ColumnSdeStream:
         buffer, buffer_win = mpi_utils.allocate_node_shared_array(
             self._node, (max(batches.values()) * n_column,), self._dtype
         )
-        report_at = {-(-n_rounds // 2), n_rounds} if whole else set()
 
         def fold(r: int, t: int, partials: list[np.ndarray]) -> None:
             """Scales a finished task's partial sums (this rank's rows) and folds them into the running sums of its
@@ -1993,8 +2019,6 @@ class _ColumnSdeStream:
                 for win in windows:
                     if win is not None:
                         win.Free()
-                if k + 1 in report_at:
-                    config.logger.info(f"Self-energy contraction: {k + 1} of {n_rounds} column rounds done.")
         buffer = None
         if buffer_win is not None:
             buffer_win.Free()
@@ -3296,9 +3320,9 @@ def calculate_sigma_proposal(
         is off.
     :param chunk_budgets: Chunk byte budgets, of which the self-energy contraction reads its own (sized by the driver
         from the memory estimate); ``None`` gives it the job-wide fair-share budget of :func:`_sde_chunk_budget`.
-    :param save_eliashberg: Whether to write this rank's Eliashberg intermediates (inverse bubble, three-leg vertices
-        and vertex middles; in the bare-vertex modes the physical susceptibilities only); the loop asks for it in its
-        last scheduled iteration.
+    :param save_eliashberg: Whether to write this rank's Eliashberg intermediates (three-leg vertices and vertex
+        middles, and on rank 0 the Green's function the Eliashberg step rebuilds the inverse core bubble from; in the
+        bare-vertex modes the physical susceptibilities only); the loop asks for it in its last scheduled iteration.
     :param eliashberg_only: Whether to stop after the two channel kernels: the double-counting kernel and the SDE are
         skipped and ``None`` is returned on every rank (the pass after a loop that converged before its last
         iteration).
@@ -3422,8 +3446,10 @@ def calculate_sigma_proposal(
         if current_iter == 1:
             calculate_and_save_chi_q_r_rpa(gchi0_q_full_sum, u_loc, v_nonloc, mpi_dist_irrk)
 
-        if save_eliashberg:
-            gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
+        if save_eliashberg and comm.rank == 0:
+            # the Eliashberg step rebuilds the inverse core bubble from this Green's function (see
+            # eliashberg_solver.inverse_core_bubble): one file instead of every rank's inverse bubble
+            save_rank_file(giwk_full, GIWK_FILE_STEM)
 
         if involution is not None and current_iter == 1:
             logger.info(
