@@ -5,6 +5,7 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 
 import os
+import time
 import tracemalloc
 from contextlib import nullcontext
 from copy import deepcopy
@@ -636,7 +637,7 @@ def test_solve_eliashberg_lanczos_declares_the_dtype_and_logs_matvecs_thread_bud
         solve_eliashberg_lanczos(gamma, chi0, (0, 0))
     messages = [call.args[0] for call in config.logger.info.call_args_list]
     assert seen == [np.dtype(np.complex64)]
-    assert any("3 matvecs" in message and "ms each" in message for message in messages)
+    assert any("3 matvecs." in message for message in messages)
     assert any("thread budget" in message and ": 1 thread(s)" in message for message in messages)
     assert any("resident set" in message and "GB" in message for message in messages)
 
@@ -1476,7 +1477,7 @@ def _power_loop_team_arnoldi(apply_block, seed, n_eig, ncv, tol, max_matvec, com
         vec = apply_block(vec).reshape(-1)
         vec /= np.sqrt(comm.allreduce(float(np.vdot(vec, vec).real)))
     lam = comm.allreduce(float(np.vdot(vec, apply_block(vec).reshape(-1)).real))
-    return np.array([lam] * n_eig), np.ones((1, n_eig)), vec[None], 7, 0.0
+    return np.array([lam] * n_eig), np.ones((1, n_eig)), vec[None], 7
 
 
 def _sectors_match(res, expected, rank):
@@ -1513,7 +1514,7 @@ def test_team_arnoldi_finds_the_eigenpairs_of_largest_real_part_on_distributed_b
         bounds = np.linspace(0, n, comm.Get_size() + 1).astype(int)
         s0, s1 = int(bounds[rank]), int(bounds[rank + 1])
         apply_block = lambda block: (h @ np.concatenate(comm.allgather(block)))[s0:s1]
-        lambdas, ritz, basis, n_matvec, _ = es._team_arnoldi(apply_block, seed[s0:s1], n_eig, 12, 1e-10, 300, comm)
+        lambdas, ritz, basis, n_matvec = es._team_arnoldi(apply_block, seed[s0:s1], n_eig, 12, 1e-10, 300, comm)
         return lambdas, np.concatenate(comm.allgather(ritz.T @ basis), axis=1), n_matvec
 
     _, res = run_parallel(size, fn)
@@ -1540,7 +1541,7 @@ def test_team_arnoldi_follows_the_lead_where_the_ranks_small_eigensolves_differ(
         bounds = np.linspace(0, n, comm.Get_size() + 1).astype(int)
         s0, s1 = int(bounds[rank]), int(bounds[rank + 1])
         apply_block = lambda block: (h @ np.concatenate(comm.allgather(block)))[s0:s1]
-        lambdas, ritz, _, n_matvec, _ = es._team_arnoldi(apply_block, seed[s0:s1], n_eig, 12, 1e-10, 300, comm)
+        lambdas, ritz, _, n_matvec = es._team_arnoldi(apply_block, seed[s0:s1], n_eig, 12, 1e-10, 300, comm)
         return lambdas, ritz, n_matvec
 
     _, res = run_parallel(3, fn)
@@ -1562,7 +1563,7 @@ def test_team_arnoldi_finds_the_spectrum_of_a_sector_smaller_than_its_basis(size
         bounds = np.linspace(0, n, comm.Get_size() + 1).astype(int)
         s0, s1 = int(bounds[rank]), int(bounds[rank + 1])
         apply_block = lambda block: (h @ np.concatenate(comm.allgather(block)))[s0:s1]
-        lambdas, ritz, basis, _, _ = es._team_arnoldi(apply_block, seed[s0:s1], n_eig, 12, 1e-10, 300, comm)
+        lambdas, ritz, basis, _ = es._team_arnoldi(apply_block, seed[s0:s1], n_eig, 12, 1e-10, 300, comm)
         return lambdas, np.concatenate(comm.allgather(ritz.T @ basis), axis=1)
 
     _, res = run_parallel(size, fn)
@@ -1578,7 +1579,7 @@ def test_team_arnoldi_returns_the_converged_subset_at_the_restart_limit():
     h = _test_matrix(n, 4, False)
     seed = np.random.default_rng(5).standard_normal(n) + 0j
     comm = conftest.run_parallel(1, lambda comm, rank: comm)[1][0]
-    lambdas, ritz, basis, _, _ = es._team_arnoldi(lambda block: h @ block, seed, n_eig, 12, 1e-2, 0, comm)
+    lambdas, ritz, basis, _ = es._team_arnoldi(lambda block: h @ block, seed, n_eig, 12, 1e-2, 0, comm)
     blocks = ritz.T @ basis
     assert 0 < len(lambdas) < n_eig and blocks.shape == (len(lambdas), n)
     for lam, vec in zip(lambdas, blocks):
@@ -1613,7 +1614,7 @@ def test_team_arnoldi_block_finds_both_partners_of_every_doublet(size):
         s0, s1 = int(bounds[rank]), int(bounds[rank + 1])
         apply_block = lambda block: (h @ np.concatenate(comm.allgather(block)))[s0:s1]
         plain = es._team_arnoldi(apply_block, seeds[0, s0:s1], n_eig, 12, 1e-10, 300, comm)[0]
-        lambdas, ritz, basis, _, _ = es._team_arnoldi(apply_block, seeds[:, s0:s1], n_eig, 12, 1e-10, 300, comm, 2)
+        lambdas, ritz, basis, _ = es._team_arnoldi(apply_block, seeds[:, s0:s1], n_eig, 12, 1e-10, 300, comm, 2)
         return plain, lambdas, np.concatenate(comm.allgather(ritz.T @ basis), axis=1)
 
     _, res = run_parallel(size, fn)
@@ -1639,7 +1640,7 @@ def test_team_arnoldi_continues_from_a_fresh_direction_when_the_operator_annihil
         bounds = np.linspace(0, 2 * m, comm.Get_size() + 1).astype(int)
         s0, s1 = int(bounds[rank]), int(bounds[rank + 1])
         apply_block = lambda block: (h @ np.concatenate(comm.allgather(block)))[s0:s1]
-        lambdas, ritz, basis, _, _ = es._team_arnoldi(
+        lambdas, ritz, basis, _ = es._team_arnoldi(
             apply_block, seeds[:n_block, s0:s1], n_eig, 12, 1e-10, 300, comm, n_block
         )
         return lambdas, np.concatenate(comm.allgather(ritz.T @ basis), axis=1)
@@ -1662,7 +1663,7 @@ def test_team_arnoldi_restarts_from_a_fresh_direction_when_the_last_image_of_a_f
     h[:p, :p], h[p:, p:] = np.eye(p, k=-1), b + b.T + 10 * np.eye(m)
     seeds = np.zeros((2, p + m), dtype=complex)
     seeds[0, 0], seeds[1, p:] = 1.0, rng.standard_normal(m)
-    lambdas, ritz, basis, _, _ = es._team_arnoldi(lambda x: h @ x, seeds, 1, ncv, 1e-10, 300, None, 2)
+    lambdas, ritz, basis, _ = es._team_arnoldi(lambda x: h @ x, seeds, 1, ncv, 1e-10, 300, None, 2)
     vec = ritz[:, 0] @ basis
     assert np.allclose(lambdas, np.linalg.eigvalsh(b + b.T + 10 * np.eye(m))[-1:], atol=1e-7)
     assert np.linalg.norm(h @ vec - lambdas[0] * vec) <= 1e-6 * abs(lambdas[0])
@@ -2278,7 +2279,7 @@ def test_solve_loosening_retries_an_unconverged_sector_at_looser_tolerances_with
 
 
 def test_team_solve_logs_the_matvecs_of_every_attempt(monkeypatch):
-    """A team sector that converges only on its looser retry logs the matvecs and matvec time of both attempts."""
+    """A team sector that converges only on its looser retry logs the matvecs of both attempts."""
     nq, niv_pp = (4, 2, 1), 2
     _grid_test_config(nq, niv_pp)
     config.eliashberg.resolve_parity_sectors = False
@@ -2287,7 +2288,7 @@ def test_team_solve_logs_the_matvecs_of_every_attempt(monkeypatch):
 
     def fake_arnoldi(apply_block, seed, n_eig, ncv, tol, max_matvec, comm, n_block=1):
         k = n_eig if tol > config.eliashberg.epsilon else 0
-        return np.ones(k), np.ones((1, k)), vector, 7, 0.5
+        return np.ones(k), np.ones((1, k)), vector, 7
 
     def fn(comm, rank):
         team = es.LanczosTeam("h", 0, (0,), ((SpinChannel.SING, "none"),))
@@ -2297,7 +2298,7 @@ def test_team_solve_logs_the_matvecs_of_every_attempt(monkeypatch):
     monkeypatch.setattr(es, "_team_arnoldi", fake_arnoldi)
     run_parallel(1, fn)
 
-    assert any("14 matvecs, 1.0 s in the matvec" in c.args[0] for c in config.logger.info.call_args_list)
+    assert any("14 matvecs." in c.args[0] for c in config.logger.info.call_args_list)
 
 
 def test_team_seed_block_is_built_on_the_lead_alone(monkeypatch):
@@ -3696,8 +3697,12 @@ def _toy_arrays(no, rng, symmetric_bubble=True):
     return chi0_mat, gamma_mat, u_mat
 
 
-def _write_intermediates(chi0_mat, gamma_mat, u_mat, no):
-    """Regenerates the per-rank SDE intermediates the vertex constructors consume, and returns their inputs."""
+def _write_intermediates(chi0_mat, gamma_mat, u_mat, no, save_fq=True):
+    """
+    Regenerates the per-rank SDE intermediates the vertex constructors consume, and returns their inputs. With
+    ``save_fq`` the three-leg vertex is written on the whole core box, as the streamed full vertex reads it; without it
+    on the pp box only.
+    """
     gchi0_q = FourPoint(chi0_mat.copy(), SpinChannel.NONE, (N_Q, 1, 1), 1, 1, False, True, True)
     gchi0_q_inv = gchi0_q.invert()
     gchi0_q_inv.save(name="gchi0_q_inv_rank_0", output_dir=config.output.eliashberg_path)
@@ -3708,10 +3713,29 @@ def _write_intermediates(chi0_mat, gamma_mat, u_mat, no):
     zero_sum = FourPoint(np.zeros((N_Q, no, no, no, no, N_W)), SpinChannel.NONE, (N_Q, 1, 1), 1, 0, False, True, True)
 
     dist = _make_single_rank_distributor()
+    previous, config.eliashberg.save_fq = config.eliashberg.save_fq, save_fq
     nonlocal_sde.calculate_sigma_kernel_r_q(
         gamma_r, gchi0_q_inv, zero_sum, zero_sum, u_loc, v_nonloc, dist, save_eliashberg=True
     )
+    config.eliashberg.save_fq = previous
     return gamma_r, u_loc, v_nonloc, dist
+
+
+@pytest.mark.parametrize("no", [1, 2])
+def test_slice_constructor_reads_the_pp_box_three_leg_vertex_bit_for_bit(setup, no):
+    """The three-leg vertex stored on the pp box only gives the same pairing vertex bits as the core-box one."""
+    config.sys.n_bands = no
+    niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
+    chi0_mat, gamma_mat, u_mat = _toy_arrays(no, np.random.default_rng(3))
+
+    gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no, save_fq=True)
+    full_box = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+
+    gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no, save_fq=False)
+    assert np.load(os.path.join(config.output.eliashberg_path, "vrg_q_dens_rank_0.npy")).shape[-1] == 2 * niv_pp
+    pp_box = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+
+    assert np.array_equal(pp_box.mat, full_box.mat)
 
 
 @pytest.mark.parametrize("symmetric_bubble", [True, False])
@@ -3861,7 +3885,10 @@ def test_ladder_vertex_chunk_is_the_auxiliary_ladder_vertex_in_double_precision(
 
 
 def _write_random_intermediates(no: int, niv: int, niw: int, nq: int):
-    """Writes random rank-0 pairing-vertex intermediates of the given box and returns (gamma_r, u_loc, v_nonloc)."""
+    """
+    Writes random rank-0 pairing-vertex intermediates of the given box and returns (gamma_r, u_loc, v_nonloc). The
+    three-leg vertex is written on the pp box unless the full vertex is streamed, as the kernel step writes it.
+    """
     config.sys.n_bands, config.box.niv_core, config.box.niw_core = no, niv, niw
     config.lattice.k_grid = bz.KGrid((nq, 1, 1), symmetries=[])
     rng, vn, wp = np.random.default_rng(3), 2 * niv, niw + 1
@@ -3873,7 +3900,9 @@ def _write_random_intermediates(no: int, niv: int, niw: int, nq: int):
         chi0_inv[:, a, b, b, a] += 30.0
     path = config.output.eliashberg_path
     np.save(f"{path}/gchi0_q_inv_rank_0.npy", chi0_inv.astype(np.complex64))
-    np.save(f"{path}/vrg_q_dens_rank_0.npy", (0.01 * chi0_inv + 1.0).astype(np.complex64))
+    niv_vrg = niv if config.eliashberg.save_fq else min(niw // 2, niv // 2)
+    vrg = (0.01 * chi0_inv + 1.0)[..., niv - niv_vrg : niv + niv_vrg]
+    np.save(f"{path}/vrg_q_dens_rank_0.npy", vrg.astype(np.complex64))
     np.save(f"{path}/chi_phys_q_dens_rank_0.npy", (0.01 * chi0_inv[..., 0]).astype(np.complex64))
     np.save(f"{path}/vrg_middle_q_dens_rank_0.npy", (0.01 * chi0_inv[..., 0]).astype(np.complex64))
     u_loc = LocalInteraction(rng.standard_normal((no,) * 4))
@@ -4364,53 +4393,100 @@ def test_gap_orbital_mirrors_warn_when_the_correlated_probe_fails(monkeypatch):
     assert config.logger.warning.call_count == 1 and config.logger.debug.call_count == 0
 
 
-def test_delete_rank_files_removes_a_folder_of_rank_files_so_a_later_write_fails(monkeypatch, tmp_path):
-    """A folder holding only rank files is removed with them, so a rank still writing afterwards cannot add one."""
+def test_delete_rank_files_deletes_every_rank_file_and_keeps_the_folder_and_other_files(monkeypatch, tmp_path):
+    """Every rank file is deleted in place: the folder keeps its name, its other files and gains the abort marker."""
     monkeypatch.setattr(os, "remove", os.unlink)
     folder = tmp_path / "Eliashberg"
     folder.mkdir()
     config.output.eliashberg_path = str(folder)
-    for name in ["gchi0_q_inv_rank_0.npy", "vrg_q_dens_rank_3.npy", "vrg_middle_q_magn_rank_11.npy"]:
+    for name in ["gchi0_q_inv_rank_0.npy", "vrg_middle_q_magn_rank_11.npy", "chi_phys_q_dens_rank_2.npy"]:
         (folder / name).touch()
-    es.delete_rank_files()
-    with pytest.raises(FileNotFoundError):
-        (folder / "vrg_q_magn_rank_1.npy").touch()
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_delete_rank_files_keeps_the_other_files_in_the_folder_renamed_to_aborted(monkeypatch, tmp_path):
-    """Every rank file is removed and the other files stay, in the folder renamed to <folder>_aborted."""
-    monkeypatch.setattr(os, "remove", os.unlink)
-    folder = tmp_path / "Eliashberg"
-    folder.mkdir()
-    config.output.eliashberg_path = str(folder)
-    for name in ["gchi0_q_inv_rank_0.npy", "chi_phys_q_dens_rank_2.npy", "f_ud_loc_pp_w0.npy"]:
-        (folder / name).touch()
-    es.delete_rank_files()
-    assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")) == [
-        "Eliashberg_aborted",
-        "Eliashberg_aborted/f_ud_loc_pp_w0.npy",
-    ]
-
-
-def test_delete_rank_files_leaves_a_folder_without_rank_files_as_it_is(monkeypatch, tmp_path):
-    """A failure after the Eliashberg step, whose folder holds results but no rank files, changes nothing."""
-    monkeypatch.setattr(os, "remove", os.unlink)
-    folder = tmp_path / "Eliashberg"
-    folder.mkdir()
-    config.output.eliashberg_path = str(folder)
-    (folder / "eigenvalues.txt").touch()
+    (folder / "f_ud_loc_pp_w0.npy").touch()
     es.delete_rank_files()
     assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")) == [
         "Eliashberg",
-        "Eliashberg/eigenvalues.txt",
+        f"Eliashberg/{nonlocal_sde.ABORT_MARKER}",
+        "Eliashberg/f_ud_loc_pp_w0.npy",
     ]
 
 
+def test_save_rank_file_writes_into_the_eliashberg_folder(tmp_path):
+    """Without the abort marker a rank file is saved as <name>.npy in the Eliashberg folder."""
+    config.output.eliashberg_path = str(tmp_path)
+    obj = MagicMock()
+    nonlocal_sde.save_rank_file(obj, "vrg_q_dens_rank_3")
+    obj.save.assert_called_once_with(name="vrg_q_dens_rank_3", output_dir=str(tmp_path), niv_cut=None)
+
+
+def test_save_rank_file_writes_nothing_after_the_cleanup_began(monkeypatch, tmp_path):
+    """A rank still running after a failed rank's cleanup adds no rank file."""
+    monkeypatch.setattr(os, "remove", os.unlink)
+    config.output.eliashberg_path = str(tmp_path)
+    es.delete_rank_files()
+    obj = MagicMock()
+    nonlocal_sde.save_rank_file(obj, "vrg_q_dens_rank_3")
+    assert obj.save.call_count == 0
+
+
+def test_save_rank_file_deletes_a_file_whose_save_overlapped_the_cleanup(monkeypatch, tmp_path):
+    """A rank file whose save straddles the start of the cleanup is deleted again by its own rank."""
+    monkeypatch.setattr(os, "remove", os.unlink)
+    config.output.eliashberg_path = str(tmp_path)
+
+    def save_while_cleanup_starts(name, output_dir, niv_cut):
+        (tmp_path / f"{name}.npy").touch()
+        (tmp_path / nonlocal_sde.ABORT_MARKER).touch()
+
+    nonlocal_sde.save_rank_file(MagicMock(save=save_while_cleanup_starts), "gchi0_q_inv_rank_5")
+    assert [p.name for p in tmp_path.iterdir()] == [nonlocal_sde.ABORT_MARKER]
+
+
+def _watched_folder(monkeypatch, tmp_path):
+    """Returns an Eliashberg folder holding two rank files and one result, with the watchdog's second pass immediate."""
+    monkeypatch.setattr(es, "WATCHDOG_SECOND_PASS_SECONDS", 0)
+    monkeypatch.setattr(es, "_watchdog", None)
+    config.output.eliashberg_path = str(tmp_path)
+    for name in ["vrg_q_dens_rank_0.npy", "gchi0_q_inv_rank_7.npy", "f_ud_loc_pp_w0.npy"]:
+        (tmp_path / name).touch()
+    return tmp_path
+
+
+def test_rank_file_watchdog_deletes_the_rank_files_when_its_process_ends_unannounced(monkeypatch, tmp_path):
+    """A process killed without stopping its watchdog (closed pipe, as after SIGKILL) gets its rank files deleted."""
+    folder = _watched_folder(monkeypatch, tmp_path)
+    watchdog = es.start_rank_file_watchdog()
+    watchdog.stdin.close()
+    assert watchdog.wait(timeout=10) == 0
+    assert sorted(p.name for p in folder.iterdir()) == [nonlocal_sde.ABORT_MARKER, "f_ud_loc_pp_w0.npy"]
+
+
+def test_rank_file_watchdog_stopped_at_a_normal_end_deletes_nothing(monkeypatch, tmp_path):
+    """A watchdog stopped at the end of a normal run exits and leaves the folder as it is."""
+    folder = _watched_folder(monkeypatch, tmp_path)
+    es.start_rank_file_watchdog()
+    es.stop_rank_file_watchdog()
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "f_ud_loc_pp_w0.npy",
+        "gchi0_q_inv_rank_7.npy",
+        "vrg_q_dens_rank_0.npy",
+    ]
+
+
+def test_rank_file_watchdog_ignores_the_termination_signal_of_the_job(monkeypatch, tmp_path):
+    """The SIGTERM a scheduler sends to the whole job before killing it does not stop the watchdog's cleanup."""
+    folder = _watched_folder(monkeypatch, tmp_path)
+    watchdog = es.start_rank_file_watchdog()
+    time.sleep(0.2)
+    watchdog.terminate()
+    watchdog.stdin.close()
+    assert watchdog.wait(timeout=10) == 0
+    assert sorted(p.name for p in folder.iterdir()) == [nonlocal_sde.ABORT_MARKER, "f_ud_loc_pp_w0.npy"]
+
+
 def test_delete_rank_files_removes_nothing_without_an_eliashberg_folder(monkeypatch, tmp_path):
-    """A run that fails before its Eliashberg folder exists removes nothing."""
+    """A run that fails before its Eliashberg folder exists removes and creates nothing."""
     remove = MagicMock()
     monkeypatch.setattr(os, "remove", remove)
     config.output.eliashberg_path = str(tmp_path / "Eliashberg")
     es.delete_rank_files()
-    assert remove.call_count == 0
+    assert remove.call_count == 0 and list(tmp_path.iterdir()) == []

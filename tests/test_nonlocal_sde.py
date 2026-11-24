@@ -1564,13 +1564,17 @@ def test_kernel_step_writes_the_eliashberg_intermediates_only_when_asked(monkeyp
 def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_sde(
     monkeypatch, tmp_path, ek, involution
 ):
-    """The post-loop pass hands on the involution and the node communicator, skips dc kernel and SDE, returns None."""
+    """
+    The post-loop pass hands on the involution and the node communicator, skips dc kernel and SDE, returns None, and
+    saves its Green's function (rank 0) instead of the inverse bubble.
+    """
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
     config.output.output_path = str(tmp_path)
+    config.output.eliashberg_path = str(tmp_path)
     config.sys.beta = 10.0
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: ek)
-    core, bubble_kwargs, node = MagicMock(), [], MagicMock()
-    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, node))
+    core, bubble_kwargs, node, giwk = MagicMock(), [], MagicMock(), MagicMock()
+    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (giwk, None, node))
     monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
     monkeypatch.setattr(
         nonlocal_sde.BubbleGenerator,
@@ -1617,18 +1621,20 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
     for_bubble = bubble_kwargs[0]["involution"]
     assert (None if for_bubble is None else for_bubble.tolist()) == involution
     assert bubble_kwargs[0]["blocks"]
-    assert core.invert.return_value.save.call_args.kwargs["name"] == "gchi0_q_inv_rank_0"
+    assert giwk.save.call_args.kwargs["name"] == nonlocal_sde.GIWK_FILE_STEM
+    assert core.invert.return_value.save.call_count == 0
 
 
 @pytest.mark.parametrize("mode", ["do_flex", "do_rpa"])
 def test_bare_vertex_eliashberg_only_proposal_dumps_both_channels_without_a_local_vertex(monkeypatch, tmp_path, mode):
-    """The bare-vertex post-loop pass loads no local vertex, writes no inverse bubble, dumps both channels."""
+    """The bare-vertex post-loop pass loads no local vertex, writes no Green's function, dumps both channels."""
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
     setattr(config.misc, mode, True)
     config.output.output_path = str(tmp_path)
     config.sys.beta = 10.0
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
-    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, None))
+    giwk = MagicMock()
+    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (giwk, None, None))
     monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
     monkeypatch.setattr(
         nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: k["release"]() or []
@@ -1675,7 +1681,7 @@ def test_bare_vertex_eliashberg_only_proposal_dumps_both_channels_without_a_loca
 
     assert result is None
     assert steps == [(SpinChannel.DENS, True), (SpinChannel.MAGN, True)]
-    assert cores == [False]
+    assert cores == [False] and giwk.save.call_count == 0
 
 
 def _finished_proposal(sigma: SelfEnergy, donor: SelfEnergy, comm) -> nonlocal_sde._Proposal | None:
@@ -3407,9 +3413,12 @@ def test_kernel_step_with_a_boson_mass_adds_the_auxiliary_kernel_of_the_annealed
 
 
 def test_eliashberg_pass_saves_the_gamma_ladder_vertex_and_its_middle_and_keeps_the_kernel(monkeypatch, tmp_path):
-    """With save_eliashberg the step writes the Gamma-ladder three-leg vertex and its middle, the kernel unchanged."""
+    """
+    With save_eliashberg the step writes the Gamma-ladder three-leg vertex on the pp box and its middle, the kernel
+    unchanged.
+    """
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
-    config.sys.beta, config.box.niv_core = 9.0, 4
+    config.sys.beta, config.box.niv_core, config.box.niw_core = 9.0, 4, 2
     config.output.eliashberg_path = str(tmp_path)
     files = {}
     monkeypatch.setattr(np, "save", lambda path, arr, **k: files.__setitem__(os.path.basename(path), np.array(arr)))
@@ -3427,7 +3436,9 @@ def test_eliashberg_pass_saves_the_gamma_ladder_vertex_and_its_middle_and_keeps_
     chi = nonlocal_sde.create_shell_corrected_chi_from_gamma_ladder(x_g, *sums, u_loc, v_nonloc)
     middle = nonlocal_sde.create_ladder_vertex_middle(x_g, *sums, u_loc, v_nonloc, chi, chi)
     assert np.array_equal(saved.mat, plain.mat)
-    assert np.array_equal(files["vrg_q_dens_rank_0.npy"], nonlocal_sde.create_vrg_r_q(ladder, inv).mat)
+    niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
+    assert files["vrg_q_dens_rank_0.npy"].shape[-1] == 2 * niv_pp
+    assert np.array_equal(files["vrg_q_dens_rank_0.npy"], nonlocal_sde.create_vrg_r_q(ladder, inv).cut_niv(niv_pp).mat)
     assert np.array_equal(files["vrg_middle_q_dens_rank_0.npy"], middle.mat)
 
 
@@ -4466,16 +4477,6 @@ def test_build_rspace_giwk_window_is_the_frequency_first_transform_in_one_buffer
     _, res = run_parallel(2, fn, hostnames=["n0", "n0"])
     assert all(np.array_equal(r[0], expected) and r[2] for r in res)
     assert res[0][1] == res[1][1]
-
-
-@pytest.mark.parametrize("chunk_bytes, n_lines", [(1, 2), (2**40, 1)])
-def test_column_sde_logs_progress_at_the_halfway_and_the_last_round(chunk_bytes, n_lines, monkeypatch):
-    """Single-task rounds log the halfway and the last round, a single round logs once."""
-    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
-    kernel, giwk = _column_sde_setup(False)
-    _run_column_sde_parallel(1, kernel, giwk, chunk_bytes=chunk_bytes)
-    lines = [c.args[0] for c in config.logger.info.call_args_list if "column rounds" in c.args[0]]
-    assert len(lines) == n_lines and lines[-1].split(":")[1].split()[0] == lines[-1].split()[-4]
 
 
 def _stream_setup(auto, nk=(4, 4, 2), o=2, niw=6, niv=2, dtype=np.complex64, symmetric=True):

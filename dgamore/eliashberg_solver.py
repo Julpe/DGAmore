@@ -18,7 +18,7 @@ of all ranks whose vertex windows, vectors and bubble are split over the nodes o
 import glob
 import os
 import socket
-import time
+import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -67,6 +67,13 @@ SECTOR_RESIDUAL_WARNING = 1e-4  # residual (over max(|rho|, 1)) of a sector's le
 # above which (or above ten times a larger eigensolver tolerance) the parity sectors are reported as no symmetry of it
 LANCZOS_MATVECS = 3000  # matvec cap of one eigensolver attempt, after which _solve_loosening retries the sector
 TOLERANCE_LOOSENING = 1e2  # factor of each of the at most two looser retries of an unconverged sector
+WATCHDOG_SECOND_PASS_SECONDS = 5  # delay of the rank-file watchdog's second pass, for files of ranks killed mid-save
+# arguments: Eliashberg folder, abort marker, delay of the second pass; "done" on the pipe means a normal end
+_WATCHDOG_SCRIPT = (
+    'trap "" HUP INT TERM; read -r state; [ "$state" = done ] && exit 0; cd "$1" || exit 0; touch "$2"; '
+    "find . -maxdepth 1 -name '*_rank_*.npy' -delete; sleep \"$3\"; find . -maxdepth 1 -name '*_rank_*.npy' -delete"
+)
+_watchdog: subprocess.Popen | None = None  # the rank-file watchdog of this process, see start_rank_file_watchdog
 
 
 def delete_files(filepath: str, *args) -> None:
@@ -93,23 +100,60 @@ def delete_files(filepath: str, *args) -> None:
 def delete_rank_files() -> None:
     """
     Deletes the per-rank intermediates of every rank (the ``*_rank_<r>.npy`` files) from the run's Eliashberg folder.
-    A failed rank calls it before it aborts the job, while the other ranks may still be writing such files: the folder
-    is first renamed to ``<folder>_aborted``, so their later writes fail instead of adding files, and is removed once
-    empty (other files stay in it under that name). A missing folder, or one without rank files, is left as it is.
+    A failed rank calls it before it aborts the job, while the other ranks may still be writing such files: it first
+    places :data:`~dgamore.nonlocal_sde.ABORT_MARKER` in the folder, after which
+    :func:`~dgamore.nonlocal_sde.save_rank_file` adds no rank file, then deletes every rank file present. The folder
+    and its other files stay. A missing folder is left as it is. Every OS error is suppressed, so the abort is reached.
 
     :return: None.
     """
-    path = os.path.normpath(config.output.eliashberg_path)
-    if not glob.glob(os.path.join(path, "*_rank_*.npy")):
+    path = config.output.eliashberg_path
+    if not os.path.isdir(path):
         return
-    aborted = f"{path}_aborted"
     with suppress(OSError):
-        os.rename(path, aborted)
-    # both places: another failed rank may have moved the folder already, or the rename may have failed
-    for folder in (aborted, path):
-        delete_files(folder, *(os.path.basename(name) for name in glob.glob(os.path.join(folder, "*_rank_*.npy"))))
-    with suppress(OSError):
-        os.rmdir(aborted)
+        open(os.path.join(path, nonlocal_sde.ABORT_MARKER), "a").close()
+    for name in glob.glob(os.path.join(path, "*_rank_*.npy")):
+        with suppress(OSError):
+            os.remove(name)
+
+
+def start_rank_file_watchdog() -> subprocess.Popen:
+    """
+    Starts a shell, in a session of its own, that deletes the rank files of the run's Eliashberg folder as
+    :func:`delete_rank_files` does once the calling process ends without :func:`stop_rank_file_watchdog`, so a job
+    killed from outside (out of memory, time limit, SIGKILL) leaves none behind. The shell waits on a pipe from the
+    calling process, which closes however that process ends, and ignores the hang-up, interrupt and termination signals
+    a scheduler sends to the job before it kills it. A second pass after :data:`WATCHDOG_SECOND_PASS_SECONDS` deletes
+    the files of ranks killed during a save.
+
+    :return: The watchdog process.
+    """
+    global _watchdog
+    _watchdog = subprocess.Popen(
+        [
+            "sh",
+            "-c",
+            _WATCHDOG_SCRIPT,
+            "sh",
+            config.output.eliashberg_path,
+            nonlocal_sde.ABORT_MARKER,
+            str(WATCHDOG_SECOND_PASS_SECONDS),
+        ],
+        stdin=subprocess.PIPE,
+        start_new_session=True,
+    )
+    return _watchdog
+
+
+def stop_rank_file_watchdog() -> None:
+    """
+    Tells the watchdog of :func:`start_rank_file_watchdog` that the run ended normally, so it deletes nothing, and waits
+    for it to exit. Without a watchdog it does nothing.
+
+    :return: None.
+    """
+    if _watchdog is not None:
+        _watchdog.communicate(b"done\n")
 
 
 def _compute_once_per_node(node_comm: MPI.Comm | None, compute_fn):
@@ -339,13 +383,14 @@ def _build_pairing_vertex_pp(
     chunk_writer=None,
     chunk_bytes: int | None = None,
     channel: SpinChannel | None = None,
+    gchi0_q_inv: FourPoint | None = None,
 ) -> FourPoint:
     r"""
     Shared loop of the slice-direct pairing-vertex construction: walks the rank-local momenta and, per momentum, the
     bosonic axis in byte-bounded chunks, building each ladder-vertex chunk once and reading its :math:`\omega' = 0`
     pp band (see :func:`_pp_w0_band`). When ``chunk_writer`` is given, every ph-notation chunk is handed to it before
-    being released, so a caller can stream the full vertex to disk in the same pass. The ladder chunks read the saved
-    inverse bubble, three-leg vertex and vertex middle of the ladder of :math:`\Gamma_{r}` (see
+    being released, so a caller can stream the full vertex to disk in the same pass. The ladder chunks read the inverse
+    bubble, the saved three-leg vertex and vertex middle of the ladder of :math:`\Gamma_{r}` (see
     :func:`_build_ladder_vertex_chunk`). Without a local vertex the chunks are the RPA vertex of the saved physical
     susceptibility (see :func:`_build_rpa_vertex_chunk`), the only intermediate read then.
 
@@ -358,14 +403,18 @@ def _build_pairing_vertex_pp(
         momenta of the group as the leading axis).
     :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
     :param channel: Spin channel of the RPA vertex, i.e. density or magnetic; only read when ``gamma_r`` is ``None``.
+    :param gchi0_q_inv: The inverse bare bubble of this rank's momenta on the core box (see
+        :func:`inverse_core_bubble`), read and kept; ``None`` loads the saved ``gchi0_q_inv_rank_<r>.npy`` and frees it.
     :return: The pairing vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
     """
     logger = config.logger
     channel = channel if gamma_r is None else gamma_r.channel
     path, rank = config.output.eliashberg_path, mpi_dist_irrk.my_rank
 
-    if gamma_r is not None:
+    loaded_bubble = gamma_r is not None and gchi0_q_inv is None
+    if loaded_bubble:
         gchi0_q_inv = FourPoint.load(os.path.join(path, f"gchi0_q_inv_rank_{rank}.npy"), num_vn_dimensions=1)
+    if gamma_r is not None:
         vrg_q_r_left = FourPoint.load(
             os.path.join(path, f"vrg_q_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=1
         )
@@ -429,8 +478,9 @@ def _build_pairing_vertex_pp(
                 vrg_left_grp.free()
             bosonic_grp.free()
 
-    if gamma_r is not None:
+    if loaded_bubble:
         gchi0_q_inv.free()
+    if gamma_r is not None:
         vrg_q_r_left.free()
     bosonic_q_r.free()
 
@@ -452,6 +502,7 @@ def create_pairing_vertex_slice_q_r(
     mpi_dist_irrk: MpiDistributor,
     chunk_bytes: int | None = None,
     channel: SpinChannel | None = None,
+    gchi0_q_inv: FourPoint | None = None,
 ) -> FourPoint:
     r"""
     Builds the pp pairing vertex at :math:`\omega' = 0` directly, without ever materializing the full
@@ -466,10 +517,19 @@ def create_pairing_vertex_slice_q_r(
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
     :param channel: Spin channel of the RPA vertex, i.e. density or magnetic; only read when ``gamma_r`` is ``None``.
+    :param gchi0_q_inv: The inverse core bubble of this rank's momenta, or ``None`` to load the saved one (see
+        :func:`_build_pairing_vertex_pp`).
     :return: The pairing vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
     """
     return _build_pairing_vertex_pp(
-        u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk, chunk_bytes=chunk_bytes, channel=channel
+        u_loc,
+        v_nonloc,
+        gamma_r,
+        niv_pp,
+        mpi_dist_irrk,
+        chunk_bytes=chunk_bytes,
+        channel=channel,
+        gchi0_q_inv=gchi0_q_inv,
     )
 
 
@@ -481,6 +541,7 @@ def create_pairing_vertex_streaming_fq(
     mpi_dist_irrk: MpiDistributor,
     chunk_bytes: int | None = None,
     channel: SpinChannel | None = None,
+    gchi0_q_inv: FourPoint | None = None,
 ) -> FourPoint:
     r"""
     Builds the pp pairing vertex like :func:`create_pairing_vertex_slice_q_r` while streaming the full ladder vertex
@@ -495,6 +556,8 @@ def create_pairing_vertex_streaming_fq(
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
     :param channel: Spin channel of the RPA vertex, i.e. density or magnetic; only read when ``gamma_r`` is ``None``.
+    :param gchi0_q_inv: The inverse core bubble of this rank's momenta, or ``None`` to load the saved one (see
+        :func:`_build_pairing_vertex_pp`).
     :return: The pairing vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
     """
     channel = channel if gamma_r is None else gamma_r.channel
@@ -518,7 +581,7 @@ def create_pairing_vertex_streaming_fq(
         file_mat[q_offset + q_start : q_offset + q_start + chunk_mat.shape[0], ..., w_start:w_stop, :, :] = chunk_mat
 
     f_pp = _build_pairing_vertex_pp(
-        u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk, chunk_writer, chunk_bytes, channel=channel
+        u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk, chunk_writer, chunk_bytes, channel, gchi0_q_inv
     )
     file_mat.flush()
     del file_mat
@@ -1289,16 +1352,15 @@ def _team_arnoldi(
     :param max_matvec: Number of operator applications after which the next full basis ends the iteration.
     :param team_comm: The team communicator, or ``None`` for a single process holding the whole vectors.
     :param n_block: Number of starting vectors, the largest eigenvalue multiplicity resolved in exact arithmetic.
-    :return: ``(lambdas, ritz, basis, n_matvec, matvec_seconds)``: the converged eigenvalues in descending order,
-        their Ritz coefficients as columns (this rank's block of eigenvector ``i`` is ``ritz[:, i] @ basis``, of unit
-        norm up to rounding), this rank's blocks of the basis vectors as rows, the number of operator applications
-        and the time spent in them.
+    :return: ``(lambdas, ritz, basis, n_matvec)``: the converged eigenvalues in descending order, their Ritz
+        coefficients as columns (this rank's block of eigenvector ``i`` is ``ritz[:, i] @ basis``, of unit norm up to
+        rounding), this rank's blocks of the basis vectors as rows and the number of operator applications.
     """
     dtype = seed_block.dtype
     seeds = seed_block.reshape(n_block, -1)
     basis = np.empty((ncv + n_block - 1, seeds.shape[1]), dtype=dtype)
     rayleigh = np.zeros((ncv + n_block, ncv), dtype=np.complex128)
-    n_matvec, matvec_seconds = 0, 0.0
+    n_matvec = 0
 
     reduce = (lambda x: x) if team_comm is None else team_comm.allreduce
 
@@ -1330,9 +1392,7 @@ def _team_arnoldi(
     del seed_block, seeds
     j = 0
     while True:
-        start = time.perf_counter()
         w = apply_block(basis[j].copy()).reshape(-1).astype(dtype, copy=False)
-        matvec_seconds += time.perf_counter() - start
         n_matvec += 1
         w_norm = norm(w)
         top = j + n_block
@@ -1359,7 +1419,7 @@ def _team_arnoldi(
         converged = residual <= tol * np.abs(theta)
         if converged[:n_eig].all() or n_matvec >= max_matvec:
             chosen = [i for i in range(n_eig) if converged[i]]
-            return theta[chosen].real, ritz[:, chosen], basis[:ncv], n_matvec, matvec_seconds
+            return theta[chosen].real, ritz[:, chosen], basis[:ncv], n_matvec
         # Krylov-Schur restart: the wanted Ritz values and half of the rest lead the reordered Schur form
         threshold = theta.real[n_eig + (ncv - n_eig) // 2 - 1]
         schur, vectors, n_leading = on_lead(
@@ -3252,16 +3312,9 @@ def _solve_team_sectors(
             )
             return attempts[-1]
 
-        start = time.perf_counter()
-        lambdas, ritz, basis, _, _ = _solve_loosening(attempt, tol, n_eig, label, ranks)
+        lambdas, ritz, basis, _ = _solve_loosening(attempt, tol, n_eig, label, ranks)
         # the log counts every attempt, as the single-rank solve does
-        n_matvec, matvec_seconds = sum(a[3] for a in attempts), sum(a[4] for a in attempts)
-        logger.info(
-            f"Lanczos for {label}: {n_matvec} matvecs, {matvec_seconds:.1f} s in the matvec "
-            f"({1e3 * matvec_seconds / max(n_matvec, 1):.0f} ms each), {time.perf_counter() - start:.1f} s "
-            f"in the solve.",
-            allowed_ranks=ranks,
-        )
+        logger.info(f"Lanczos for {label}: {sum(a[3] for a in attempts)} matvecs.", allowed_ranks=ranks)
         if len(lambdas) < n_eig:
             logger.warning(
                 f"Lanczos for {label} did not converge within the matvec limit; keeping the {len(lambdas)} of "
@@ -3342,25 +3395,21 @@ def _solve_pairing_sectors(
             eps_p = None if eps_t is None else sign * eps_t
             label = _sector_log_label(channel, [parity])
             logger.info(f"Starting Lanczos method for {label}.", allowed_ranks=ranks)
-            n_matvec, matvec_seconds = 0, 0.0
+            n_matvec = 0
 
             def counted_matvec(gap: np.ndarray, eps_t=eps_t, eps_p=eps_p) -> np.ndarray:
-                nonlocal n_matvec, matvec_seconds
-                start = time.perf_counter()
-                result = mv(gap, eps_t, eps_p)
+                nonlocal n_matvec
                 n_matvec += 1
-                matvec_seconds += time.perf_counter() - start
-                return result
+                return mv(gap, eps_t, eps_p)
 
             mat = sp.sparse.linalg.LinearOperator(shape=(shape_flat, shape_flat), matvec=counted_matvec, dtype=dtype)
             n_block = block_size(config.lattice.k_grid, eps_p if gap_shape[3] == 1 else None)
-            eigsh_start = time.perf_counter()
             # BLAS is pinned to one thread for the solve (threadpool_limits resizes the live pool; an environment
             # change would be ignored) so the momentum-batch threads never nest BLAS threads underneath.
             with threadpool_limits(limits=1 if executor is not None else None):
                 if n_block > 1:
                     # forced multiplets need the block iteration, run on the full vectors of this rank
-                    lambdas, ritz, basis, _, _ = _solve_loosening(
+                    lambdas, ritz, basis, _ = _solve_loosening(
                         lambda t: _team_arnoldi(
                             counted_matvec,
                             _sector_seeds(base_seed, gap_shape, eps_t, eps_p, n_block, u),
@@ -3409,7 +3458,7 @@ def _solve_pairing_sectors(
                             logger.info(
                                 f"{label}: {exc}; continuing with the team Arnoldi iteration.", allowed_ranks=ranks
                             )
-                            lambdas, ritz, basis, _, _ = _team_arnoldi(
+                            lambdas, ritz, basis, _ = _team_arnoldi(
                                 counted_matvec, seed, n_eig, ncv, tol, LANCZOS_MATVECS, None
                             )
                             return lambdas, (ritz.T @ basis).T
@@ -3421,12 +3470,7 @@ def _solve_pairing_sectors(
                             f"{len(lambdas)} of {n_eig} converged eigenpair(s).",
                             allowed_ranks=ranks,
                         )
-            logger.info(
-                f"Lanczos for {label}: {n_matvec} matvecs, {matvec_seconds:.1f} s in the matvec "
-                f"({1e3 * matvec_seconds / max(n_matvec, 1):.0f} ms each), {time.perf_counter() - eigsh_start:.1f} s "
-                f"in eigsh.",
-                allowed_ranks=ranks,
-            )
+            logger.info(f"Lanczos for {label}: {n_matvec} matvecs.", allowed_ranks=ranks)
             if eps_t is not None and len(lambdas):
                 leading = gaps[:, int(np.argmax(lambdas))]
                 # the check's matvec runs on the momentum-batch threads as well, so BLAS stays pinned
@@ -3563,6 +3607,42 @@ def solve_eliashberg_lanczos(
 
 
 # --- Eliashberg eigensolver (Lanczos / ARPACK) ---
+def inverse_core_bubble(mpi_dist_irrk: MpiDistributor, node_comm: MPI.Comm | None) -> FourPoint:
+    r"""
+    Rebuilds the inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` of this rank's irreducible momenta on the
+    core box from the Green's function the kernel step saved with its Eliashberg intermediates
+    (:data:`~dgamore.nonlocal_sde.GIWK_FILE_STEM`), with the bubble generator and orbital involution of that step, so
+    the three-leg vertices and the inverse bubble share one Green's function. The Green's function is loaded once per
+    node into a shared window (straight from the file into the window) and released before the inversion.
+
+    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :param node_comm: The node-local communicator, or ``None`` on a single rank.
+    :return: The inverse bare bubble on the core box as a :class:`FourPoint`.
+    """
+    path = os.path.join(config.output.eliashberg_path, f"{nonlocal_sde.GIWK_FILE_STEM}.npy")
+    if node_comm is None:
+        giwk_mat, win = np.load(path), None
+    else:
+        giwk_mat, win = mpi_utils.build_node_shared_array(node_comm, lambda: np.load(path, mmap_mode="r"))
+    ek, orbitals = config.lattice.hamiltonian.get_ek(), config.sys.correlated_orbitals
+    giwk = GreensFunction(
+        giwk_mat, None, ek, True, False, nk=config.lattice.k_grid.nk, beta=config.sys.beta, orbitals=orbitals
+    )
+    chi0 = BubbleGenerator.create_generalized_chi0_q_fft(
+        mpi_dist_irrk,
+        giwk,
+        config.box.niw_core,
+        config.box.niv_core,
+        config.lattice.k_grid,
+        config.sys.beta,
+        node_comm=node_comm,
+        involution=nonlocal_sde._orbital_involution(ek, orbitals),
+    )
+    giwk.mat = None
+    nonlocal_sde._free_shared_window(win, node_comm)
+    return chi0.invert(copy=False)
+
+
 def dispatch_full_vertex_calculation(
     channel: SpinChannel,
     u_loc: LocalInteraction,
@@ -3571,6 +3651,7 @@ def dispatch_full_vertex_calculation(
     mpi_dist: MpiDistributor,
     chunk_bytes: int | None = None,
     node_comm: MPI.Comm | None = None,
+    gchi0_q_inv: FourPoint | None = None,
 ) -> FourPoint:
     r"""
     Loads the local irreducible vertex for ``channel`` and builds the full ladder pp vertex through the slice-direct
@@ -3607,6 +3688,8 @@ def dispatch_full_vertex_calculation(
     :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
     :param node_comm: Optional node-local communicator; when given, the multi-GB local vertex is loaded once per
         node into an MPI shared-memory window instead of once per rank (the build only reads it).
+    :param gchi0_q_inv: The inverse core bubble of this rank's momenta (see :func:`inverse_core_bubble`), or ``None``
+        to load the saved one; not read in the bare-vertex modes.
     :return: The full ladder pp vertex :math:`F^{\mathrm{q}}_{r}` as a :class:`FourPoint`.
     """
     if config.misc.bare_vertex:
@@ -3617,10 +3700,8 @@ def dispatch_full_vertex_calculation(
     gamma_r, gamma_win = nonlocal_sde._load_node_shared_local_vertex(
         node_comm, os.path.join(config.output.output_path, f"gamma_{channel.value}_loc.npy"), channel
     )
-    if config.eliashberg.save_fq:
-        f_q_r = create_pairing_vertex_streaming_fq(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist, chunk_bytes)
-    else:
-        f_q_r = create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist, chunk_bytes)
+    build = create_pairing_vertex_streaming_fq if config.eliashberg.save_fq else create_pairing_vertex_slice_q_r
+    f_q_r = build(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist, chunk_bytes, gchi0_q_inv=gchi0_q_inv)
     gamma_r.mat = None
     if gamma_win is None:
         gamma_r.free()
@@ -3758,18 +3839,23 @@ def solve(
         else chunk_budgets.fq
     )
 
-    build_start = time.perf_counter()
+    gchi0_q_inv = None
+    if not config.misc.bare_vertex:
+        gchi0_q_inv = inverse_core_bubble(mpi_dist_irrk, node_comm)
+        logger.info("Rebuilt the inverse core bubble.")
     f_dens_pp = dispatch_full_vertex_calculation(
-        SpinChannel.DENS, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes, node_comm
+        SpinChannel.DENS, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes, node_comm, gchi0_q_inv
     )
-    logger.info(f"Built the density full ladder vertex in pp notation in {time.perf_counter() - build_start:.1f} s.")
-    build_start = time.perf_counter()
+    logger.info("Built the density full ladder vertex in pp notation.")
     f_magn_pp = dispatch_full_vertex_calculation(
-        SpinChannel.MAGN, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes, node_comm
+        SpinChannel.MAGN, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes, node_comm, gchi0_q_inv
     )
-    logger.info(f"Built the magnetic full ladder vertex in pp notation in {time.perf_counter() - build_start:.1f} s.")
-
-    delete_files(config.output.eliashberg_path, f"gchi0_q_inv_rank_{comm.rank}.npy")
+    logger.info("Built the magnetic full ladder vertex in pp notation.")
+    if gchi0_q_inv is not None:
+        gchi0_q_inv.free()
+    mpi_dist_irrk.barrier()
+    if comm.rank == 0:
+        delete_files(config.output.eliashberg_path, f"{nonlocal_sde.GIWK_FILE_STEM}.npy")
 
     gamma_sing_pp = f_dens_pp.scale(0.5).sub(f_magn_pp.scale(1.5, copy=True), copy=False)
     del f_dens_pp
