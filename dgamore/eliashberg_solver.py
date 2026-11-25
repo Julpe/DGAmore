@@ -64,6 +64,7 @@ SECTOR_RESIDUAL_WARNING = 1e-4  # residual (over max(|rho|, 1)) of a sector's le
 LANCZOS_MATVECS = 3000  # matvec cap of one eigensolver attempt, after which _solve_loosening retries the sector
 TOLERANCE_LOOSENING = 1e2  # factor of each of the at most two looser retries of an unconverged sector
 WATCHDOG_SECOND_PASS_SECONDS = 5  # delay of the rank-file watchdog's second pass, for files of ranks killed mid-save
+STAR_BATCH_BYTES = 2**20  # right-hand sides of the stars of the real-space wedge one stacked matrix product takes
 # arguments: Eliashberg folder, abort marker, delay of the second pass; "done" on the pipe means a normal end
 _WATCHDOG_SCRIPT = (
     'trap "" HUP INT TERM; read -r state; [ "$state" = done ] && exit 0; cd "$1" || exit 0; touch "$2"; '
@@ -293,6 +294,9 @@ def _inversion_action(sigma_dmft: np.ndarray | None = None) -> tuple[np.ndarray 
     u = find_inversion_orbital_unitary(ek, 1e-4, orbitals=config.sys.correlated_orbitals)
     if u is None:
         return None, "inversion is no symmetry of H(k) to 1e-4 of its largest element"
+    if u.ndim == 2 and np.allclose(u, np.round(u), rtol=0.0, atol=1e-8):
+        # a permutation of the orbitals with phases 1, -1, i, -i is taken exact, without the rounding of its discovery
+        u = np.round(u)
     u_mat = hamiltonian.get_local_u().mat
     u0 = u if u.ndim == 2 else u[0, 0, 0]
     if u.ndim == 5:
@@ -431,17 +435,37 @@ def _at_minus_k(a: np.ndarray) -> np.ndarray:
     return np.roll(np.flip(a, axis=(0, 1, 2)), shift=1, axis=(0, 1, 2))
 
 
+def _permute_orbital_pair(g: np.ndarray, u: np.ndarray) -> np.ndarray | None:
+    r"""
+    Returns :math:`U g U^T` on the orbital pair of an array ``[..., o1, o2, v]`` for a constant action whose every
+    entry is exactly 0, 1, -1, i or -i with one entry per row, :math:`U_{ab} = s_a \delta_{b\,p(a)}`: the entries
+    :math:`s_a s_b\, g_{p(a) p(b)}`, gathered without a sum; ``None`` for any other action.
+
+    :param g: The array, its orbital pair on the two axes before the last.
+    :param u: The constant ``[o, o]`` action.
+    :return: The rotated array (a new one), or ``None``.
+    """
+    if not np.isin(u, (0, 1, -1, 1j, -1j)).all() or (np.count_nonzero(u, axis=1) != 1).any():
+        return None
+    perm = np.argmax(u != 0, axis=1)
+    phases = np.outer(u[np.arange(len(u)), perm], u[np.arange(len(u)), perm])
+    out = g[..., perm[:, None], perm, :]
+    return out if (phases == 1).all() else out * phases.astype(g.dtype)[..., None]
+
+
 def _rotate_orbital_pair(g: np.ndarray, u: np.ndarray | None) -> np.ndarray:
     r"""
     Applies the orbital action of the inversion to both orbitals of a gap ``[kx, ky, kz, o1, o2, v]``,
     :math:`U(\mathbf{k})\, g(\mathbf{k})\, U(-\mathbf{k})^T`, for a constant ``u`` (an involution, so
     :math:`U(-\mathbf{k}) = U`) or a momentum-dependent one of shape ``[kx, ky, kz, o, o]``; ``None`` is no action.
+    A constant orbital permutation with phases is gathered (see :func:`_permute_orbital_pair`).
     """
     if u is None:
         return g
     u = u.astype(g.dtype, copy=False)
     if u.ndim == 2:
-        return np.einsum("ac,xyzcdv,bd->xyzabv", u, g, u, optimize=True)
+        permuted = _permute_orbital_pair(g, u)
+        return np.einsum("ac,xyzcdv,bd->xyzabv", u, g, u, optimize=True) if permuted is None else permuted
     return np.einsum("xyzac,xyzcdv,xyzbd->xyzabv", u, g, _at_minus_k(u), optimize=True)
 
 
@@ -499,7 +523,8 @@ def _project_frequency_block(
     (see :func:`_project_gap_to_sector`), computed from that block and its frequency mirror alone: the :math:`T O_U`
     projector pairs :math:`\nu` with :math:`-\nu` and the :math:`P_U` projector acts within one frequency, so every
     element is formed by the same operations as in the projection of the whole gap: bit for bit without an orbital
-    action, and to rounding with one, whose einsum picks its contraction path by the operand shapes.
+    action and with an orbital permutation (see :func:`_permute_orbital_pair`), and to rounding with any other action,
+    whose einsum picks its contraction path by the operand shapes.
 
     :param gap: The gap in shape ``[kx, ky, kz, o1, o2, v]``.
     :param v0: First frequency index of the block.
@@ -1289,6 +1314,9 @@ def _wedge_orbits(k_grid: KGrid) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
     """
     if k_grid.is_auto:
         rep, us = point_group_orbits(k_grid._auto_group, tuple(k_grid.nk))
+        if np.allclose(us, np.round(us), rtol=0.0, atol=1e-8):
+            # orbital permutations with phases are taken exact, as in KGrid.auto_point_group
+            us = np.round(us)
         reps, inv = np.unique(rep, return_inverse=True)
     else:
         reps, inv, us = k_grid.irrk_ind, k_grid.irrk_inv.ravel(), None
@@ -1424,25 +1452,54 @@ def _member_rotations(orbits: tuple, r0: int, r1: int) -> np.ndarray | None:
     return np.einsum("kab,kcd->kacbd", members.conj(), members.conj()).reshape(len(members), oo, oo)
 
 
-def _contract_star(gamma_rep: np.ndarray, rhs: np.ndarray, w: np.ndarray | None, nv: int) -> np.ndarray:
+def _star_batches(offsets: np.ndarray, r0: int, r1: int, row_bytes: int) -> list[tuple[int, int]]:
     r"""
-    Contracts one star of the real-space wedge: the representative's matmul-layout vertex times its members'
-    right-hand sides as columns, rotated into the representative's orbital frame with :math:`W^\dagger` and out of it
-    with :math:`W` (see :func:`_member_rotations`).
+    Splits the stars ``r0..r1`` of :func:`_wedge_orbits` into runs of consecutive stars of one size whose right-hand
+    sides take at most :data:`STAR_BATCH_BYTES` (a star above the budget runs alone), the batches of
+    :func:`_contract_stars`.
 
-    :param gamma_rep: The representative's vertex, ``[(a, b, v), (c, d, p)]``.
-    :param rhs: The members' right-hand sides as columns, ``[(c, d, p), members]``.
+    :param offsets: The star boundaries of :func:`_wedge_orbits`.
+    :param r0: First star.
+    :param r1: One past the last star.
+    :param row_bytes: Bytes of one member's right-hand side.
+    :return: The batches as ``(first star, one past the last star)``.
+    """
+    sizes = np.diff(offsets[r0 : r1 + 1])
+    batches, a = [], r0
+    while a < r1:
+        size, b = sizes[a - r0], a + 1
+        cap = max(1, STAR_BATCH_BYTES // int(size * row_bytes))
+        while b < r1 and b - a < cap and sizes[b - r0] == size:
+            b += 1
+        batches.append((a, b))
+        a = b
+    return batches
+
+
+def _contract_stars(gamma: np.ndarray, rhs: np.ndarray, w: np.ndarray | None, nv: int) -> np.ndarray:
+    r"""
+    Contracts consecutive stars of one size of the real-space wedge in one stacked matrix product: every
+    representative's matmul-layout vertex times its members' right-hand sides as columns, rotated into the
+    representative's orbital frame with :math:`W^\dagger` and out of it with :math:`W` (see
+    :func:`_member_rotations`). Every star's product takes the operands a product of that star alone takes, so
+    without rotations the result does not depend on the batches.
+
+    :param gamma: The representatives' vertices, ``[stars, (a, b, v), (c, d, p)]``.
+    :param rhs: The members' right-hand sides in star order, ``[members, (c, d, p)]``.
     :param w: The members' rotations ``[members, o^2, o^2]``, or ``None`` for none.
     :param nv: Number of fermionic frequencies.
-    :return: The members' direct terms as columns, ``[(a, b, v), members]``.
+    :return: The members' direct terms, ``[members, (a, b, v)]``.
     """
-    rows = gamma_rep.shape[0]
+    n_stars, rows = gamma.shape[:2]
     oo = rows // nv
     if w is not None:
-        rhs = np.einsum("jab,apj->bpj", w.conj(), rhs.reshape(oo, nv, -1)).reshape(rows, -1)
-    out = gamma_rep @ rhs
+        rhs = np.matmul(w.conj().transpose(0, 2, 1), rhs.reshape(-1, oo, nv)).reshape(-1, rows)
+    cols = rhs.reshape(n_stars, -1, rows).transpose(0, 2, 1)
     if w is not None:
-        out = np.einsum("jab,bvj->avj", w, out.reshape(oo, nv, -1)).reshape(rows, -1)
+        cols = np.ascontiguousarray(cols)
+    out = np.matmul(gamma, cols).transpose(0, 2, 1).reshape(-1, rows)
+    if w is not None:
+        out = np.matmul(w, out.reshape(-1, oo, nv)).reshape(-1, rows)
     return out
 
 
@@ -1465,10 +1522,11 @@ def _team_matvec(
     of the frequency block (see :func:`_crossed_term`, which reads the mirror block of the direct term, so it is staged
     in its window before any block is overwritten), its addition and the inverse FFT, and for a projected sector the
     projection of the result on that block. Every element is computed by the same operations as in the single-rank
-    sector matvec, so the result is bit-identical to it without an orbital action, and agrees to rounding with one (the
-    orbital rotation's einsum picks its contraction path by the block's shape). With ``orbits`` the windows hold the
-    irreducible wedge of the real-space grid and each rank contracts the stars of its irreducible points instead, one
-    matrix product per star with the members' right-hand sides as columns (rotated into and out of the irreducible
+    sector matvec, so the result is bit-identical to it without an orbital action or with an orbital permutation, and
+    agrees to rounding with any other action (the orbital rotation's einsum picks its contraction path by the block's
+    shape). With ``orbits`` the windows hold the irreducible wedge of the real-space grid and each rank contracts the
+    stars of its irreducible points instead, the consecutive stars of one size in one stacked matrix product (see
+    :func:`_contract_stars`) with the members' right-hand sides as columns (rotated into and out of the irreducible
     point's orbital frame on an auto-symmetry grid: the layout's row and column pairs both carry the conjugate unitary,
     so :math:`W_{(12),(ab)} = U^*_{1a} U^*_{2b}` enters as :math:`W^\dagger` on the right-hand sides and as :math:`W` on
     the result); the result then equals the single-rank one to rounding.
@@ -1503,12 +1561,13 @@ def _team_matvec(
         bounds = np.searchsorted(offsets, np.linspace(0, nk, size + 1))
         r0, r1 = int(bounds[rank]), int(bounds[rank + 1])
         rotations = _member_rotations(orbits, r0, r1)
+        batches = _star_batches(offsets, r0, r1, rows * gg_w.itemsize)
 
     def contract_stars(gamma_irr: np.ndarray) -> None:
-        for r in range(r0, r1):
-            members = order[offsets[r] : offsets[r + 1]]
-            w = None if rotations is None else rotations[offsets[r] - offsets[r0] : offsets[r + 1] - offsets[r0]]
-            direct_flat[members, :, 0] = _contract_star(gamma_irr[r], gg_flat[members, :, 0].T, w, nv).T
+        for a, b in batches:
+            members = order[offsets[a] : offsets[b]]
+            w = None if rotations is None else rotations[offsets[a] - offsets[r0] : offsets[b] - offsets[r0]]
+            direct_flat[members, :, 0] = _contract_stars(gamma_irr[a:b], gg_flat[members, :, 0], w, nv)
 
     def run(channel: SpinChannel, eps_t: int | None, eps_p: int | None) -> None:
         gamma_flat = gamma_by_channel[channel].reshape(-1, rows, rows)
@@ -1871,7 +1930,8 @@ def _rotate_rows(g: np.ndarray, u_k: np.ndarray | None, u_m: np.ndarray | None) 
         return g
     u_k, u_m = u_k.astype(g.dtype, copy=False), u_m.astype(g.dtype, copy=False)
     if u_k.ndim == 2:
-        return np.einsum("ac,kcdv,bd->kabv", u_k, g, u_m, optimize=True)
+        permuted = _permute_orbital_pair(g, u_k)
+        return np.einsum("ac,kcdv,bd->kabv", u_k, g, u_m, optimize=True) if permuted is None else permuted
     return np.einsum("kac,kcdv,kbd->kabv", u_k, g, u_m, optimize=True)
 
 
@@ -1894,7 +1954,7 @@ def _node_team_matvec(
     (the :math:`T O_U` part, then the inversion reading the partner rows at :math:`-\mathbf{k}`), the bubble
     multiply on the same chunks, the momentum FFT on (orbital pair, frequency) columns, the first exchange (every
     node receives the transformed gap of its window's momenta at every frequency), the vertex contraction on the
-    node's stars (:func:`_contract_star`) or momentum range, the second exchange (every node receives the direct term
+    node's stars (:func:`_contract_stars`) or momentum range, the second exchange (every node receives the direct term
     at every momentum at its own frequencies), the crossed term on momentum chunks (:func:`_crossed_term`; the
     momentum and the frequency partners lie on the node), its addition, the inverse FFT on columns and the projection
     of the result. In each exchange the node at distance :math:`d` sends from its node rank :math:`(d - 1)` modulo
@@ -1950,6 +2010,7 @@ def _node_team_matvec(
         cuts = np.searchsorted(offsets[s0 : s1 + 1], np.linspace(offsets[s0], offsets[s1], size + 1))
         r0, r1 = s0 + int(cuts[local]), s0 + int(cuts[local + 1])
         rotations = _member_rotations(orbits, r0, r1)
+        batches = _star_batches(offsets, r0, r1, gin_flat.shape[1] * gin_flat.itemsize)
     n_nodes = len(layout.nodes)
     distances = [d for d in range(1, n_nodes) if (d - 1) % size == local]
 
@@ -1997,10 +2058,10 @@ def _node_team_matvec(
         if layout.stars is None:
             np.matmul(gamma_mm[o0:o1], gin_flat[o0:o1], out=dout_flat[o0:o1])
             return
-        for r in range(r0, r1):
-            a0, a1 = offsets[r] - offsets[s0], offsets[r + 1] - offsets[s0]
-            w = None if rotations is None else rotations[offsets[r] - offsets[r0] : offsets[r + 1] - offsets[r0]]
-            dout_flat[a0:a1, :, 0] = _contract_star(gamma_mm[r - s0], gin_flat[a0:a1, :, 0].T, w, nv).T
+        for a, b in batches:
+            a0, a1 = offsets[a] - offsets[s0], offsets[b] - offsets[s0]
+            w = None if rotations is None else rotations[offsets[a] - offsets[r0] : offsets[b] - offsets[r0]]
+            dout_flat[a0:a1, :, 0] = _contract_stars(gamma_mm[a - s0 : b - s0], gin_flat[a0:a1, :, 0], w, nv)
 
     def apply_block(channel: SpinChannel, eps_t: int | None, eps_p: int | None, block: np.ndarray) -> np.ndarray:
         x[k0:k1] = block.reshape(k1 - k0, n_bands, n_bands, f)
@@ -2185,10 +2246,10 @@ def _solve_sectors_in_teams(
     written into a node-shared matmul-layout window there (see :func:`_build_shared_vertex_window`), so a node holds
     one copy per hosted channel instead of one per sector; every team then runs the lockstep matvec of
     :func:`_team_matvec` over that window while its lead drives the eigensolver. On a symmetry-reduced grid with
-    unitary operations the windows hold the irreducible wedge of the real-space grid and the matvec contracts one
-    star at a time (see :func:`_wedge_orbits`). Both pairing vertices are **consumed**. The eigenvalues of
-    every sector reach every rank; the gap functions travel from the lead to rank 0 only (the rank that writes
-    them), one blocking transfer per gap, their number following the eigenvalues actually returned.
+    unitary operations the windows hold the irreducible wedge of the real-space grid and the matvec contracts its
+    stars (see :func:`_wedge_orbits`, :func:`_contract_stars`). Both pairing vertices are **consumed**. The
+    eigenvalues of every sector reach every rank; the gap functions travel from the lead to rank 0 only (the rank
+    that writes them), one blocking transfer per gap, their number following the eigenvalues actually returned.
 
     :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
     :param comm: The MPI communicator.

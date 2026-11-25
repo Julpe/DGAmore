@@ -108,6 +108,12 @@ def _loop_single(params):
     return 3 * _v_single(params)
 
 
+def _vertex_check(params):
+    """Rank 0's own copy of the double-counting vertex before the loop's first bubble; none without a shell."""
+    nb, wp, vc, vf = params["n_bands"], params["niw_core"] + 1, 2 * params["niv_core"], 2 * params["niv_full"]
+    return SCALE * nb**4 * wp * vf * vc if vf > vc else 0.0
+
+
 # the node total of r equal ranks on rank 0's node: each holds the baseline + the distributed transient, plus one single
 def _off_node_total(bp: BranchPeak, r):
     return r * (bp.baseline + bp.off_distributed) + bp.off_single
@@ -171,11 +177,11 @@ def test_uncorrelated_orbitals_add_only_the_dispersion_to_the_inputs_every_rank_
 
 def test_chi0q_fast_path_is_distributed_on_multi_rank_runs():
     """The chi0q fast path is column-distributed on multi-rank runs; only single-rank uses the rank-0 build."""
-    multi = _peaks()["chi0q"]
-    assert multi.off_distributed > 0.0 and multi.off_single == pytest.approx(_loop_single(BASE))
+    multi, rank_zero = _peaks()["chi0q"], _loop_single(BASE) + _vertex_check(BASE)
+    assert multi.off_distributed > 0.0 and multi.off_single == pytest.approx(rank_zero)
     single = _peaks(n_ranks=1)["chi0q"]
-    assert single.off_distributed == 0.0 and single.off_single > _loop_single(BASE)
-    assert multi.on_distributed > 0.0 and multi.on_single == pytest.approx(_loop_single(BASE))
+    assert single.off_distributed == 0.0 and single.off_single > rank_zero
+    assert multi.on_distributed > 0.0 and multi.on_single == pytest.approx(rank_zero)
 
 
 def test_chiq_aux_off_has_distributed_block_and_no_single_rank_gather():
@@ -357,20 +363,20 @@ def _fq_branch(budget, streaming=False):
 def test_chiq_aux_block_is_the_largest_kernel_section_stage(n_ranks):
     """The chiq_aux transient is the largest of the box parts, the attachment, the aux-sum solve and the groups."""
     params = {**TINY, "n_ranks": n_ranks, "niv_full": 40, "nk_irr": 2000, "nk_tot": 8000}
-    nb, wp, vc, vf = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"], 2 * params["niv_full"]
+    nb, wp, vc = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"]
     qi = -(-params["nk_irr"] // n_ranks)
     core, group = qi * nb**4 * wp * vc, -(-qi // KERNEL_MOMENTUM_GROUPS) * nb**4 * wp * vc
-    # several ranks consume the full-box bubble one bosonic frequency at a time, one rank holds it whole
+    # several ranks consume the bubble one bosonic frequency at a time, one rank holds it whole
     parts = 2 * core if n_ranks == 1 else 2 * qi * nb**4 * vc
-    expected = max(
-        SCALE * (qi * nb**4 * wp * vf + parts),
-        SCALE * 4 * core,
-        SCALE * 4 * core + OVERHEAD_FACTOR * _chiq_aux_transient(),
-        SCALE * (3 * core + KERNEL_GROUP_TRANSIENT * group),
-    )
-    bp = estimate_peaks(**params)["chiq_aux"]
-    assert bp.off_distributed == pytest.approx(expected) and expected == SCALE * (qi * nb**4 * wp * vf + parts)
-    assert bp.on_distributed == bp.off_distributed
+    for niv_full, held in ((40, vc + 1), (TINY["niv_core"], vc)):  # the core box with its outer sum, the full box
+        expected = max(
+            SCALE * (qi * nb**4 * wp * held + parts),
+            SCALE * 4 * core,
+            SCALE * 4 * core + OVERHEAD_FACTOR * _chiq_aux_transient(),
+            SCALE * (3 * core + KERNEL_GROUP_TRANSIENT * group),
+        )
+        bp = estimate_peaks(**{**params, "niv_full": niv_full})["chiq_aux"]
+        assert bp.off_distributed == pytest.approx(expected) and bp.on_distributed == bp.off_distributed
 
 
 def test_chiq_aux_transient_takes_no_chunk_budget():
@@ -415,21 +421,40 @@ def test_max_chunk_budget_bisects_to_the_largest_fitting_budget():
 
 def test_chi0q_fast_single_counts_buffer_ifftn_transient_and_g_copies():
     """The single-rank chi0q fast peak counts the multiply buffer, the ~2x ifftn transient and three G copies."""
-    nb, wp, vf = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_full"]
-    bubble_irr = TINY["nk_irr"] * nb**4 * wp * vf
-    fft_buffers = (1 + CHI0Q_IFFTN_TRANSIENT_FACTOR) * TINY["nk_tot"] * nb**4 * vf
-    gf_copies = 2 * TINY["nk_tot"] * nb**2 * (2 * (TINY["niv_full"] + TINY["niw_core"]))
-    g_center = TINY["nk_tot"] * nb**2 * vf
-    expected = SCALE * (bubble_irr + fft_buffers + gf_copies + g_center) + _loop_single(TINY)
-    assert estimate_peaks(**{**TINY, "n_ranks": 1})["chi0q"].off_single == pytest.approx(expected)
+    nb, wp, vc = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"]
+    for niv_full in (TINY["niv_full"], TINY["niv_core"]):  # a shell, whose columns are summed, and none
+        params, vf = {**TINY, "n_ranks": 1, "niv_full": niv_full}, 2 * niv_full
+        stored, buffered = (vc + 2, vc + 1) if niv_full > TINY["niv_core"] else (vf, vf)
+        bubble_irr = TINY["nk_irr"] * nb**4 * wp * stored
+        fft_buffers = (1 + CHI0Q_IFFTN_TRANSIENT_FACTOR) * TINY["nk_tot"] * nb**4 * buffered
+        gf_copies = 2 * TINY["nk_tot"] * nb**2 * (2 * (niv_full + TINY["niw_core"]))
+        g_center = TINY["nk_tot"] * nb**2 * vf
+        expected = SCALE * (bubble_irr + fft_buffers + gf_copies + g_center) + _loop_single(params)
+        assert estimate_peaks(**params)["chi0q"].off_single == pytest.approx(expected + _vertex_check(params))
 
 
 def test_chi0q_distributed_is_the_result_slice_and_the_column_work_of_the_rank():
     """The multi-rank chi0q peak is the rank's irr result slice plus its column work (see bubble_column_bytes)."""
-    nb, wp, vf = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_full"]
-    qi, n_cols = -(-TINY["nk_irr"] // TINY["n_ranks"]), -(-wp * vf // TINY["n_ranks"])
-    column = memory_estimator.bubble_column_bytes(TINY["nk_tot"], TINY["nk_irr"], nb, n_cols, qi)
-    assert estimate_peaks(**TINY)["chi0q"].off_distributed == pytest.approx(SCALE * qi * nb**4 * wp * vf + column)
+    nb, wp, vc = TINY["n_bands"], TINY["niw_core"] + 1, 2 * TINY["niv_core"]
+    qi = -(-TINY["nk_irr"] // TINY["n_ranks"])
+    for niv_full in (TINY["niv_full"], TINY["niv_core"]):  # a shell, whose columns are summed, and none
+        summed = niv_full > TINY["niv_core"]
+        stored = vc + 2 if summed else 2 * niv_full
+        n_cols = -(-wp * stored // TINY["n_ranks"])
+        column = memory_estimator.bubble_column_bytes(TINY["nk_tot"], TINY["nk_irr"], nb, n_cols, qi, summed)
+        peak = estimate_peaks(**{**TINY, "niv_full": niv_full})["chi0q"].off_distributed
+        assert peak == pytest.approx(SCALE * qi * nb**4 * wp * stored + column)
+
+
+def test_bubble_stored_columns_are_the_core_columns_with_the_pieces_and_the_sum_of_the_outer_ones():
+    """With a shell the bubble holds its core columns, one column per piece of outer columns and their sum."""
+    assert memory_estimator.BUBBLE_SUMMED_COLUMNS == bubble_gen.SUMMED_COLUMNS
+    assert memory_estimator.bubble_stored_columns(40, 40) == 80
+    for niv_core, niv_full in ((40, 140), (5, 6), (2, 18)):
+        pieces = len(bubble_gen.BubbleGenerator._summed_pieces(niv_full, niv_core))
+        assert memory_estimator.bubble_stored_columns(niv_core, niv_full) == 2 * niv_core + pieces + 1
+    work = [memory_estimator.bubble_column_bytes(1000, 100, 2, 3, 4, summed) for summed in (False, True)]
+    assert work[1] - work[0] == DTYPE_BYTES * 1000 * 2**4 + 3 * 2**20
 
 
 def test_bubble_column_bytes_hold_one_component_group_of_a_column_not_the_whole_column():
@@ -462,6 +487,34 @@ def test_bubble_column_bytes_bound_the_traced_peak_of_the_distributed_bubble_bes
     window = DTYPE_BYTES * q_grid.nk_tot * nb**2 * 2 * (niv + niw)
     work = memory_estimator.bubble_column_bytes(q_grid.nk_tot, q_grid.nk_irr, nb, (niw + 1) * 2 * niv, q_grid.nk_irr)
     assert result + window < peak <= result + window + work
+
+
+def test_bubble_with_summed_outer_columns_peaks_within_its_stored_columns_window_and_column_work():
+    """With the outer columns summed the bubble peaks within the modeled stored columns, window and column work."""
+    from dgamore import brillouin_zone as bz
+    from dgamore.bubble_gen import BubbleGenerator
+    from dgamore.greens_function import GreensFunction
+    from tests.conftest import create_comm_mock
+
+    nk, nb, niv, niv_core, niw = (32, 32, 1), 2, 40, 2, 2
+    config.lattice.nk = nk
+    rng = np.random.default_rng(4)
+    shape = (*nk, nb, nb, 2 * (niv + niw + 2))
+    g = GreensFunction(rng.standard_normal(shape) + 1j * rng.standard_normal(shape), nk=nk)
+    q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
+    dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock())
+    run = lambda: BubbleGenerator._create_generalized_chi0_q_fft_distributed(
+        dist, g, niw, niv, q_grid, 2.5, blocks=True, niv_core=niv_core
+    )
+    _, peak = traced_peak(run)
+    stored = memory_estimator.bubble_stored_columns(niv_core, niv)
+    result = DTYPE_BYTES * q_grid.nk_irr * nb**4 * (niw + 1) * stored
+    window = DTYPE_BYTES * q_grid.nk_tot * nb**2 * 2 * (niv + niw)
+    work = memory_estimator.bubble_column_bytes(
+        q_grid.nk_tot, q_grid.nk_irr, nb, (niw + 1) * stored, q_grid.nk_irr, summed=True
+    )
+    whole = DTYPE_BYTES * q_grid.nk_irr * nb**4 * (niw + 1) * 2 * niv
+    assert window < peak <= result + window + work and result < whole / 5
 
 
 def test_column_sde_schedule_splits_the_blocks_of_each_frequency_into_contiguous_rank_runs():

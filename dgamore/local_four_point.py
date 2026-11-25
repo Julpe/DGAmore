@@ -830,6 +830,26 @@ class LocalFourPoint(LocalNPoint, IHaveChannel):
         occupied = self.nonzero_orbital_components() | (u_r.mat != 0)
         return np.flatnonzero(~occupied.any(axis=(2, 3)) & ~occupied.any(axis=(0, 1)).T)
 
+    def first_frequency_is_constant_outside(self, niv: int) -> bool:
+        r"""
+        Returns whether this two-fermion vertex takes one value at all first fermionic frequencies outside the box
+        :math:`|\nu| < n_{\nu}`, bit for bit, at every orbital component, bosonic frequency and second fermionic
+        frequency: the case of a vertex whose shell is padded with a frequency-independent interaction (see
+        :func:`~dgamore.local_sde.create_full_vertex_from_gamma`). A sum over its first frequency then needs the
+        other factor's frequencies outside the box only as their sum. The vertex is compared one first orbital at a
+        time, so no temporary of its size is made.
+
+        :param niv: Number of positive fermionic frequencies of the box.
+        :return: Whether the rows outside the box all equal the first one (true without rows outside it).
+        """
+        n_first = self.mat.shape[-2] // 2
+        lower, upper = max(n_first - niv, 0), n_first + niv
+        for block in self.mat:
+            first = block[..., :1, :]
+            if not ((block[..., :lower, :] == first).all() and (block[..., upper:, :] == first).all()):
+                return False
+        return True
+
     def nonzero_orbital_components(self) -> np.ndarray:
         r"""
         Returns which orbital components :math:`(o_1, o_2, o_3, o_4)` hold a non-zero entry. Any non-zero entry

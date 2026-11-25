@@ -38,6 +38,10 @@ DELIVER_BATCH_BYTES = 2 * 1024**2
 # tests cost up to half a millisecond per step
 BEHIND_STEP_SECONDS = 2e-3
 
+# bubble columns whose real-space products are summed before one transform, where only the sum of the columns is asked
+# for: a piece then costs about as much as three transformed columns
+SUMMED_COLUMNS = 32
+
 
 class BubbleGenerator:
     """
@@ -80,7 +84,8 @@ class BubbleGenerator:
         involution: np.ndarray | None = None,
         blocks: bool = False,
         release: Callable[[], None] | None = None,
-    ) -> FourPoint | list[FourPoint]:
+        niv_core: int | None = None,
+    ) -> FourPoint | list[FourPoint] | tuple[list[FourPoint], list[FourPoint]]:
         r"""
         Returns the momentum-dependent generalized bare susceptibility :math:`\chi^{\mathrm{q}\nu}_{0;1234} = -\beta
         \sum_{\mathbf{k}} G^{\mathrm{k}}_{14}\, G^{\mathrm{k}-\mathrm{q}}_{32}`, evaluated via an FFT over the BZ with
@@ -102,6 +107,15 @@ class BubbleGenerator:
         at the same momentum and frequencies, so only one orbital component of each such pair is multiplied,
         transformed and exchanged and the other is its copy (see :meth:`_independent_components`).
 
+        With ``niv_core`` only the columns of the core box :math:`|\nu| < n_{\nu,\mathrm{core}}` are returned as
+        columns, and the columns outside it as their sum :math:`\sum_{\nu \notin \mathrm{core}}
+        \chi^{\mathrm{q}\nu}_{0;1234}`: their real-space products are summed in pieces of :data:`SUMMED_COLUMNS` columns
+        (see :meth:`_summed_pieces`, :meth:`_sum_column_products`) and every piece is transformed once, so the sum
+        costs a few transforms per bosonic frequency instead of one per column, and the outer columns are neither
+        stored nor exchanged. The pieces are added in their order, so the sum does not depend on the rank count; it
+        agrees with the sum of the transformed columns to rounding, and a core column whose crossing partner lies
+        outside the core box is transformed instead of derived.
+
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
         :param giwk: The momentum-dependent :class:`GreensFunction`.
         :param niw: Number of positive bosonic frequencies.
@@ -119,18 +133,42 @@ class BubbleGenerator:
             window by window; not with ``subtract_from``.
         :param release: Called once on every rank after the last read of ``giwk`` (its real-space transform and the
             symmetry checks are done) and before the first column, so the caller can free ``giwk``; or ``None``.
+        :param niv_core: Number of positive fermionic frequencies of the columns returned as columns, below ``niv``
+            and with ``blocks`` only; ``None`` returns every column.
         :return: The bubble as a :class:`FourPoint` over the irreducible BZ (compressed momentum, half niw range), or
-            ``subtract_from`` minus the bubble; with ``blocks`` the list of its bosonic windows.
+            ``subtract_from`` minus the bubble; with ``blocks`` the list of its bosonic windows; with ``niv_core`` the
+            tuple of that list on the core box and of the list of the sums of the outer columns over the same
+            bosonic windows (no fermionic axis).
+        :raises ValueError: If ``niv_core`` is given without ``blocks`` or is not a positive number below ``niv``.
         """
+        if niv_core is not None and not (blocks and subtract_from is None and 0 < niv_core < niv):
+            raise ValueError(
+                "The outer columns are summed for a bubble in bosonic blocks and a core box below its box."
+            )
         if mpi_dist_irrk.comm.size > 1:
             return BubbleGenerator._create_generalized_chi0_q_fft_distributed(
-                mpi_dist_irrk, giwk, niw, niv, k_grid, beta, node_comm, subtract_from, involution, blocks, release
+                mpi_dist_irrk,
+                giwk,
+                niw,
+                niv,
+                k_grid,
+                beta,
+                node_comm,
+                subtract_from,
+                involution,
+                blocks,
+                release,
+                niv_core,
             )
 
-        gchi0_q_mat = None
+        gchi0_q_mat = shell_mat = None
         if mpi_dist_irrk.my_rank == 0:
             nb = giwk.n_bands
             wn = MFHelper.wn(niw, return_only_positive=True)
+            # the columns kept as columns, and the pieces of the others (none without a core box)
+            n_keep = niv if niv_core is None else niv_core
+            first = niv - n_keep
+            pieces = BubbleGenerator._summed_pieces(niv, n_keep)
 
             g_k = giwk.cut_niv(niv + niw)
             g_r = g_k.fft().decompress_q_dimension()
@@ -139,31 +177,39 @@ class BubbleGenerator:
             pi = BubbleGenerator._orbital_transpose_permutation(giwk, niv + niw, involution)
             components = None if pi is None else BubbleGenerator._independent_components(nb, pi)
             comp_shape = (nb,) * 4 if components is None else (len(components[0]),)
-            gchi0_q_mat = np.zeros((len(k_grid.irrk_ind), nb, nb, nb, nb, len(wn), 2 * niv), dtype=g_r.mat.dtype)
-            gchi0_comps = gchi0_q_mat.reshape(len(k_grid.irrk_ind), nb**4, len(wn), 2 * niv)
-            chi_r_v_buffer = np.empty((*k_grid.nk, *comp_shape, 2 * niv), dtype=g_r.mat.dtype)
+            gchi0_q_mat = np.zeros((len(k_grid.irrk_ind), nb, nb, nb, nb, len(wn), 2 * n_keep), dtype=g_r.mat.dtype)
+            gchi0_comps = gchi0_q_mat.reshape(len(k_grid.irrk_ind), nb**4, len(wn), 2 * n_keep)
+            chi_r_v_buffer = np.empty((*k_grid.nk, *comp_shape, 2 * n_keep), dtype=g_r.mat.dtype)
 
             giwk_niv = g_r.current_shape[-1] // 2
             start = giwk_niv - niv
             end = giwk_niv + niv
+            if pieces:
+                # the sums read the whole window at R and at -R, as the distributed columns do
+                g_flat = np.reshape(g_r.mat, (k_grid.nk_tot, nb * nb, -1))
+                rev = BubbleGenerator._reversed_momenta(k_grid.nk)
+                pair_products = BubbleGenerator._pair_products(nb, None if components is None else components[0])
+                sums = np.zeros((len(k_grid.irrk_ind), nb**4, len(wn), len(pieces)), dtype=g_r.mat.dtype)
+                summed = np.empty((k_grid.nk_tot, len(pair_products)), dtype=g_r.mat.dtype)
             g_r = np.asarray(g_r.mat[..., start:end], order="C")
             g_r_rev = np.asarray(g_r_rev.mat, order="C")
-            columns, partners = np.arange(len(wn) * 2 * niv), np.full(len(wn) * 2 * niv, -1)
+            columns, partners = np.arange(len(wn) * 2 * n_keep), np.full(len(wn) * 2 * n_keep, -1)
             if BubbleGenerator._has_crossing_symmetries(giwk, niv + niw):
-                columns, partners = BubbleGenerator._crossing_columns(wn, niv)
+                columns, partners = BubbleGenerator._crossing_columns(wn, n_keep)
             if release is not None:
                 release()
 
             for iw, wn_i in enumerate(wn):
                 # the computed columns of a bosonic frequency are its first n_v fermionic ones
-                mine = columns // (2 * niv) == iw
+                mine = columns // (2 * n_keep) == iw
                 n_v = np.count_nonzero(mine)
                 buf = chi_r_v_buffer[..., :n_v]
-                g_vw = g_r_rev[..., start - wn_i : start - wn_i + n_v]
+                g_vw = g_r_rev[..., start + first - wn_i : start + first - wn_i + n_v]
+                g_v = g_r[..., first : first + n_v]
                 if components is None:
-                    np.multiply(g_r[:, :, :, :, None, None, :, :n_v], g_vw[:, :, :, None, :, :, None, :], out=buf)
+                    np.multiply(g_v[:, :, :, :, None, None, :, :], g_vw[:, :, :, None, :, :, None, :], out=buf)
                 else:
-                    BubbleGenerator._fill_components(buf, g_r[..., :n_v], g_vw, components[0], nb)
+                    BubbleGenerator._fill_components(buf, g_v, g_vw, components[0], nb)
                 # scipy.fft keeps complex64 in place; numpy.fft would upcast to complex128 (double work + 2x buffer)
                 chi_q_v = sp.fft.ifftn(buf, axes=(0, 1, 2), overwrite_x=True)
                 chi_q_v = chi_q_v.reshape((k_grid.nk_tot, *comp_shape, n_v))[k_grid.irrk_ind]
@@ -176,14 +222,30 @@ class BubbleGenerator:
                 found = partners[mine] >= 0
                 if found.any():
                     crossed = np.conj(gchi0_q_mat[..., iw, :n_v][..., found].transpose(0, 3, 4, 1, 2, 5))
-                    gchi0_q_mat[..., iw, partners[mine][found] % (2 * niv)] = crossed
+                    gchi0_q_mat[..., iw, partners[mine][found] % (2 * n_keep)] = crossed
+                for p, piece in enumerate(pieces):
+                    BubbleGenerator._sum_column_products(summed, g_flat, rev, start + piece, wn_i, pair_products)
+                    rows = sp.fft.ifftn(summed.reshape(*k_grid.nk, -1), axes=(0, 1, 2), overwrite_x=True)
+                    rows = rows.reshape(k_grid.nk_tot, -1)[k_grid.irrk_ind]
+                    if components is None:
+                        sums[:, :, iw, p] = rows
+                    else:
+                        sums[:, components[0], iw, p], sums[:, components[1], iw, p] = rows, rows[:, components[2]]
 
             gchi0_q_mat *= -beta / k_grid.nk_tot
+            if pieces:
+                shell_mat = BubbleGenerator._add_pieces(sums, beta, k_grid.nk_tot)
+                shell_mat = shell_mat.reshape(len(k_grid.irrk_ind), nb, nb, nb, nb, len(wn))
         gchi0_q_mat = mpi_dist_irrk.scatter(gchi0_q_mat)
 
         bubble = FourPoint(
             gchi0_q_mat, SpinChannel.NONE, k_grid.nk, 1, 1, full_niw_range=False, has_compressed_q_dimension=True
         ).filter_small_values()
+        if niv_core is not None:
+            shell = FourPoint(
+                mpi_dist_irrk.scatter(shell_mat), SpinChannel.NONE, k_grid.nk, 1, 0, False, True, True
+            ).filter_small_values()
+            return [bubble], [shell]
         if blocks:
             return [bubble]
         return bubble if subtract_from is None else subtract_from.sub(bubble, copy=False)
@@ -296,6 +358,82 @@ class BubbleGenerator:
         return bubbles
 
     @staticmethod
+    def _summed_pieces(niv: int, niv_kept: int) -> list[np.ndarray]:
+        r"""
+        Returns the columns of the box ``[-niv, niv)`` outside the kept box ``[-niv_kept, niv_kept)`` in pieces of at
+        most :data:`SUMMED_COLUMNS` columns, each summed in real space and transformed once.
+
+        :param niv: Number of positive fermionic frequencies of the box.
+        :param niv_kept: Number of positive fermionic frequencies of the columns kept as columns.
+        :return: The pieces as ascending index arrays into the box's ``2 niv`` columns; empty when every column is kept.
+        """
+        outer = np.concatenate((np.arange(niv - niv_kept), np.arange(niv + niv_kept, 2 * niv)))
+        return np.array_split(outer, -(-len(outer) // SUMMED_COLUMNS)) if len(outer) else []
+
+    @staticmethod
+    def _pair_products(nb: int, components: np.ndarray | None) -> np.ndarray:
+        r"""
+        Returns, per orbital component :math:`(1, 2, 3, 4)` of the bubble, the flat index of its two real-space factors
+        :math:`G_{14}(\mathbf{R})\, G_{32}(-\mathbf{R})` among all products of two orbital pairs (see
+        :meth:`_sum_column_products`).
+
+        :param nb: Number of orbitals.
+        :param components: The flat indices ``((o1 nb + o2) nb + o3) nb + o4`` of the components, or ``None`` for all.
+        :return: The flat indices ``(o1 nb + o4) nb^2 + (o3 nb + o2)``.
+        """
+        o1, o2, o3, o4 = np.unravel_index(np.arange(nb**4) if components is None else components, (nb,) * 4)
+        return (o1 * nb + o4) * nb * nb + o3 * nb + o2
+
+    @staticmethod
+    def _sum_column_products(
+        out: np.ndarray, g_r: np.ndarray, rev: np.ndarray, columns: np.ndarray, shift: int, pairs: np.ndarray
+    ) -> None:
+        r"""
+        Writes the real-space products of the bubble columns at the window frequencies ``columns``, summed over them,
+        :math:`\sum_{\nu} G_{14}(\mathbf{R}, \nu)\, G_{32}(-\mathbf{R}, \nu - \omega)`: per block of momenta and run of
+        consecutive frequencies one stacked matrix product of the two factors over the frequency, which gives the
+        products of all orbital pairs at once. The runs are added in their order, so the sum depends on nothing but
+        the columns.
+
+        :param out: The sums ``[n_R, n_c]`` of the components ``pairs``; written in place.
+        :param g_r: The real-space window of :math:`G`, ``[n_R, o^2, n_v]`` with the orbital pair flat.
+        :param rev: The flat index of :math:`-\mathbf{R}` for every flat :math:`\mathbf{R}`.
+        :param columns: The window indices of the summed frequencies :math:`\nu`, ascending.
+        :param shift: The bosonic index of :math:`\omega`: the partner factor is read at ``columns - shift``.
+        :param pairs: Per component the flat index of its two factors (see :meth:`_pair_products`).
+        :return: None.
+        """
+        n_r, n_pairs = g_r.shape[:2]
+        runs = np.split(columns, np.flatnonzero(np.diff(columns) != 1) + 1)
+        rows = min(n_r, max(1, 2**20 // (n_pairs * len(columns) * g_r.itemsize)))
+        product, term = (np.empty((rows, n_pairs, n_pairs), dtype=g_r.dtype) for _ in range(2))
+        for r0 in range(0, n_r, rows):
+            n = min(n_r, r0 + rows) - r0
+            for i, run in enumerate(runs):
+                v0, v1 = run[0], run[-1] + 1
+                partner = g_r[rev[r0 : r0 + n], :, v0 - shift : v1 - shift]
+                np.matmul(g_r[r0 : r0 + n, :, v0:v1], partner.transpose(0, 2, 1), out=(term if i else product)[:n])
+                if i:
+                    product[:n] += term[:n]
+            out[r0 : r0 + n] = product[:n].reshape(n, -1)[:, pairs]
+
+    @staticmethod
+    def _add_pieces(sums: np.ndarray, beta: float, nk_tot: int) -> np.ndarray:
+        r"""
+        Returns the sum of the transformed pieces of summed columns, added in their order and scaled as the bubble.
+
+        :param sums: The transformed pieces on the last axis, ``[..., n_pieces]``.
+        :param beta: Inverse temperature :math:`\beta`.
+        :param nk_tot: Number of momenta of the grid.
+        :return: The scaled sum ``[...]``.
+        """
+        total = sums[..., 0].copy()
+        for p in range(1, sums.shape[-1]):
+            total += sums[..., p]
+        total *= -beta / nk_tot
+        return total
+
+    @staticmethod
     def _add_product(out: np.ndarray, left: np.ndarray, right: np.ndarray, block: np.ndarray) -> None:
         """
         Adds the elementwise product of ``left`` and ``right`` to ``out`` in blocks of the leading momentum axes, each
@@ -379,7 +517,8 @@ class BubbleGenerator:
         involution: np.ndarray | None = None,
         blocks: bool = False,
         release: Callable[[], None] | None = None,
-    ) -> FourPoint | list[FourPoint]:
+        niv_core: int | None = None,
+    ) -> FourPoint | list[FourPoint] | tuple[list[FourPoint], list[FourPoint]]:
         r"""
         Distributed evaluation of :meth:`create_generalized_chi0_q_fft`: the flattened bosonic-fermionic
         frequency columns :math:`(\omega, \nu)` are split across the ranks, each rank runs the R-space multiply and
@@ -403,6 +542,13 @@ class BubbleGenerator:
         multiplied (in blocks of momenta), transformed and exchanged, and every rank copies the others from them as
         the blocks arrive.
 
+        With ``niv_core`` the columns outside the core box are computed as the sums of their pieces (see
+        :meth:`_summed_pieces`): a piece is one more column of its bosonic frequency, filled with the summed products
+        of all its components at once (see :meth:`_sum_column_products`; that buffer of one full-grid column of
+        every component is held from a rank's first piece to its first core column), and transformed and exchanged
+        as a column is. The pieces come first in the schedule, so the rounds that hold them hold little else, and each
+        is stored on its own until all have arrived and are added in their order.
+
         :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
         :param giwk: The momentum-dependent :class:`GreensFunction`.
         :param niw: Number of positive bosonic frequencies.
@@ -415,8 +561,11 @@ class BubbleGenerator:
         :param involution: An orbital permutation of order two that may transpose the Green's function, or ``None``.
         :param blocks: Whether to return one object per stored bosonic frequency; not with ``subtract_from``.
         :param release: Called once after the last read of ``giwk`` and before the first column, or ``None``.
+        :param niv_core: Number of positive fermionic frequencies of the columns returned as columns (with ``blocks``,
+            below ``niv``), or ``None`` for every column.
         :return: The bubble as a :class:`FourPoint` over the irreducible BZ (compressed momentum, half niw range), or
-            ``subtract_from`` minus the bubble; with ``blocks`` the list of its bosonic frequencies.
+            ``subtract_from`` minus the bubble; with ``blocks`` the list of its bosonic frequencies; with ``niv_core``
+            the tuple of that list on the core box and of the list of the sums of the outer columns.
         :raises ValueError: If both ``blocks`` and ``subtract_from`` are given.
         """
         if blocks and subtract_from is not None:
@@ -424,7 +573,12 @@ class BubbleGenerator:
         nb = giwk.n_bands
         nk_tot = k_grid.nk_tot
         wn = MFHelper.wn(niw, return_only_positive=True)
-        vpos = 2 * niv
+        # a bosonic frequency's columns: the sums of its pieces of outer columns (none without a core box), then the
+        # columns kept as columns
+        n_keep = niv if niv_core is None else niv_core
+        pieces = BubbleGenerator._summed_pieces(niv, n_keep)
+        n_sum = len(pieces)
+        vpos = n_sum + 2 * n_keep
         pi = BubbleGenerator._orbital_transpose_permutation(giwk, niv + niw, involution, mpi_dist_irrk.comm)
         components = None if pi is None else BubbleGenerator._independent_components(nb, pi)
 
@@ -443,12 +597,14 @@ class BubbleGenerator:
         if subtract_from is not None:
             mats = [subtract_from.mat]
         elif blocks:
-            mats = [np.empty((my_nq, nb, nb, nb, nb, 1, vpos), dtype=g_r_mat.dtype) for _ in wn]
+            mats = [np.empty((my_nq, nb, nb, nb, nb, 1, 2 * n_keep), dtype=g_r_mat.dtype) for _ in wn]
         else:
-            mats = [np.empty((my_nq, nb, nb, nb, nb, len(wn), vpos), dtype=g_r_mat.dtype)]
+            mats = [np.empty((my_nq, nb, nb, nb, nb, len(wn), 2 * n_keep), dtype=g_r_mat.dtype)]
         # contiguous, columns w-major; one stored bosonic frequency per array with blocks
-        width = vpos if blocks else len(wn) * vpos
+        width = 2 * n_keep if blocks else len(wn) * 2 * n_keep
         mat_cols = [np.reshape(mat, (my_nq, nb**4, width), copy=False) for mat in mats]
+        # the transformed pieces of every bosonic frequency, each on its own until they are added in their order
+        sums = [np.empty((my_nq, nb**4, n_sum), dtype=g_r_mat.dtype) for _ in wn] if n_sum else []
 
         # chi0_1234(R) = G_14(R) G_32(-R): the flat factor pairs of every transformed component, the orbital swap
         # of the partner, and the column's two factors, orbital-major, gathered once per column
@@ -458,10 +614,27 @@ class BubbleGenerator:
         rev = BubbleGenerator._reversed_momenta(k_grid.nk)
         factors = np.empty((2, nb * nb, nk_tot), dtype=g_r_mat.dtype)
         gathered = [None]
+        g_flat = np.reshape(g_r_mat, (nk_tot, nb * nb, -1), copy=False)
+        pair_products = BubbleGenerator._pair_products(nb, None if components is None else components[0])
+        summed = [None, None]
 
         def fill(out: np.ndarray, part: int, iw: int, iv: int, comps: slice) -> None:
             """Writes the R-space products of the components ``comps`` of the column ``(w, v)``, the bubble's only part;
-            the column's factors are gathered from the window when its first group is filled."""
+            the column's factors are gathered from the window when its first group is filled. A piece of summed
+            columns takes its components from the sums of all of them, computed at its first group."""
+            if iv < n_sum:
+                if summed[0] != (iw, iv):
+                    if summed[1] is None:
+                        summed[1] = np.empty((nk_tot, len(pair_products)), dtype=g_r_mat.dtype)
+                    BubbleGenerator._sum_column_products(
+                        summed[1], g_flat, rev, start + pieces[iv], wn[iw], pair_products
+                    )
+                    summed[0] = (iw, iv)
+                np.copyto(np.reshape(out, (nk_tot, -1), copy=False), summed[1][:, comps])
+                return
+            # the pieces come first, so the buffer of their sums is dropped with the first kept column
+            summed[1] = None
+            iv += niv - n_keep - n_sum
             if gathered[0] != (iw, iv):
                 np.copyto(factors[0], g_r_mat[..., start + iv].reshape(nk_tot, nb * nb).T)
                 right = g_r_mat[..., start + iv - wn[iw]].reshape(nk_tot, nb * nb)
@@ -473,10 +646,15 @@ class BubbleGenerator:
                 np.multiply(factors[0, left_pair[c]], factors[1, right_pair[c]], out=rows[:, i])
 
         def put(target: slice, values: np.ndarray) -> None:
-            """Writes ``values [q, nb**4, n]`` into the columns ``target`` of one bosonic frequency, or subtracts them
-            (``subtract_from``)."""
-            b = target.start // width
-            local = slice(target.start - b * width, target.stop - b * width)
+            """Writes ``values [q, nb**4, n]`` into the columns ``target`` of one bosonic frequency, its pieces or its
+            kept columns, or subtracts them (``subtract_from``)."""
+            iw, first = divmod(target.start, vpos)
+            if first < n_sum:
+                sums[iw][:, :, first : first + target.stop - target.start] = values
+                return
+            kept = iw * 2 * n_keep + first - n_sum
+            b = kept // width
+            local = slice(kept - b * width, kept - b * width + target.stop - target.start)
             if subtract_from is None:
                 mat_cols[b][:, :, local] = values
             else:
@@ -498,7 +676,8 @@ class BubbleGenerator:
                 block *= -beta / nk_tot
                 zero_small_values(block)
             flat = np.arange(where.start, where.stop) if isinstance(where, slice) else where
-            ends = np.flatnonzero((np.diff(flat) != 1) | (np.diff(flat // vpos) != 0)) + 1
+            piece = flat % vpos < n_sum
+            ends = np.flatnonzero((np.diff(flat) != 1) | (np.diff(flat // vpos) != 0) | (piece[1:] != piece[:-1])) + 1
             for o0, o1 in zip([0, *ends], [*ends, n]):
                 c0, c1 = flat[o0], flat[o0] + o1 - o0
                 put(slice(c0, c1), block[..., o0:o1])
@@ -510,11 +689,20 @@ class BubbleGenerator:
                     crossed = np.conjugate(crossed.transpose(0, 3, 4, 1, 2, 5)).reshape(my_nq, nb**4, -1)
                     put(slice(partner_of[c0 + found[-1]], partner_of[c0 + found[0]] + 1), crossed[..., ::-1])
 
+        def column(kept: np.ndarray) -> np.ndarray:
+            """The flat column ``iw * vpos + iv`` of the flat kept column ``iw * 2 n_keep + iv_kept``."""
+            return kept // (2 * n_keep) * vpos + n_sum + kept % (2 * n_keep)
+
         columns = partner_of = None
-        if BubbleGenerator._has_crossing_symmetries(giwk, niv + niw, mpi_dist_irrk.comm):
-            columns, partners = BubbleGenerator._crossing_columns(wn, niv)
-            partner_of = np.full(len(wn) * vpos, -1)
-            partner_of[columns] = partners
+        crossing = BubbleGenerator._has_crossing_symmetries(giwk, niv + niw, mpi_dist_irrk.comm)
+        if crossing or n_sum:
+            kept, partners = np.arange(len(wn) * 2 * n_keep), None
+            if crossing:
+                kept, partners = BubbleGenerator._crossing_columns(wn, n_keep)
+                partner_of = np.full(len(wn) * vpos, -1)
+                partner_of[column(kept)] = np.where(partners >= 0, column(partners), -1)
+            # every piece before the first kept column
+            columns = np.concatenate(((np.arange(len(wn))[:, None] * vpos + np.arange(n_sum)).ravel(), column(kept)))
         if release is not None:
             release()
         comp_shape = (nb,) * 4 if components is None else (len(components[0]),)
@@ -536,7 +724,13 @@ class BubbleGenerator:
                 FourPoint(mat, SpinChannel.NONE, k_grid.nk, 1, 1, full_niw_range=False, has_compressed_q_dimension=True)
             )
             bubbles[-1].filter_small_values()
-        return bubbles if blocks else bubbles[0]
+        if niv_core is None:
+            return bubbles if blocks else bubbles[0]
+        shells = []
+        while sums:
+            total = BubbleGenerator._add_pieces(sums.pop(0), beta, nk_tot).reshape(my_nq, nb, nb, nb, nb, 1)
+            shells.append(FourPoint(total, SpinChannel.NONE, k_grid.nk, 1, 0, False, True, True).filter_small_values())
+        return bubbles, shells
 
     @staticmethod
     def _independent_components(nb: int, pi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
@@ -711,7 +905,7 @@ class BubbleGenerator:
         ``scipy.fft.ifftn`` transforms them and their irreducible-BZ rows are kept, so a rank holds one group of one
         column at a time. The rows of all parts are ring-exchanged onto the irr-BZ q-distribution, one rank distance in
         flight per rank, and handed to ``deliver(where, block)``, ``block = [q, *comp_shape, n_parts, n]`` holding
-        this rank's momenta of the ``n`` flat columns ``where`` (a slice, or an ascending index array with
+        this rank's momenta of the ``n`` flat columns ``where`` (a slice, or an index array with
         ``columns``). With one column per round the ring's consecutive sources hold consecutive columns, so their
         blocks are staged and handed over together, up to ``DELIVER_BATCH_BYTES`` per call. A round holds at most
         ``ROUND_BUFFER_BYTES`` of whole columns (a column above the budget runs alone). When MPI lets a helper thread
@@ -733,7 +927,7 @@ class BubbleGenerator:
         :param fill: Writes the R-space product ``part`` of the flat components ``comps`` of the column ``(iw, iv)``
             into ``out`` ``[x, y, z, comps.stop - comps.start]``.
         :param deliver: Receives every column block of this rank's momenta.
-        :param columns: The flat columns to compute, ascending, or ``None`` for all of them.
+        :param columns: The flat columns to compute in their order, or ``None`` for all of them, ascending.
         :param group: Number of flat components transformed at once, or ``None`` for whole columns.
         :return: None.
         """
