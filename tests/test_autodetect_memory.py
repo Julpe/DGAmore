@@ -140,7 +140,7 @@ def test_chunk_budgets_take_the_minimum_over_the_nodes(fake_system, monkeypatch)
     fake_system(1)
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", _linear_chunk_branches)
     big, small = 8 * 1024**3, 2 * 1024**3
-    two_nodes = lambda obj: [("node0", big), ("node1", small)]
+    two_nodes = lambda obj: [(0, "node0", big), (1, "node1", small)]
     budgets = dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=two_nodes))
     tight = small * dgamore_main.NODE_MEMORY_FRACTION / 3
     assert tight - 2**20 <= budgets.sde <= tight
@@ -451,7 +451,7 @@ def test_lanczos_multi_rank_gate_uses_the_team_formula_per_node(fake_system, mon
     monkeypatch.setattr(dgamore_main.memory_estimator, "lanczos_distributed_bytes", lambda *args: 0.1 * single)
     dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=lambda obj: [obj, obj]))
 
-    two_nodes = lambda obj: [("node0", obj[1]), ("node1", obj[1])]
+    two_nodes = lambda obj: [(0, "node0", obj[2]), (1, "node1", obj[2])]
     monkeypatch.setattr(dgamore_main.memory_estimator, "lanczos_distributed_bytes", lambda *args: 2 * single)
     dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=two_nodes))
 
@@ -485,12 +485,12 @@ def test_a_node_without_rank_0_holds_only_the_remote_share_of_a_single_rank_peak
     """Rank 0's single-rank peak counts on its own node only; a branch without a remote share counts it everywhere."""
     fake_system(1)
     small, big = 1024.0**2, 100 * 1024.0**2
-    two_nodes = lambda obj: [("node0", int(10 * big)), ("node1", int(10 * small))]
+    two_nodes = lambda obj: [(0, "node0", int(10 * big)), (1, "node1", int(10 * small))]
     branch = dict(baseline=small, off_single=big, on_single=big)
     rank_zero_only = {"chiq_aux": _mock_branch(**branch, remote_single=0.0)}
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: rank_zero_only)
     dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=two_nodes))
-    rank_zero_tight = lambda obj: [("node0", int(10 * small)), ("node1", int(10 * big))]
+    rank_zero_tight = lambda obj: [(0, "node0", int(10 * small)), (1, "node1", int(10 * big))]
     with pytest.raises(MemoryError, match="Auxiliary susceptibility"):
         dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=rank_zero_tight))
     anywhere = {"chiq_aux": _mock_branch(**branch)}
@@ -514,7 +514,7 @@ def test_each_node_sums_its_own_ranks_momentum_counts_and_every_rank_gets_the_sa
     avail0, avail1 = int(line / dgamore_main.NODE_MEMORY_FRACTION), int(
         (line + 2 * unit) / dgamore_main.NODE_MEMORY_FRACTION
     )
-    cyclic = lambda obj: [("node0", avail0), ("node1", avail1), ("node0", avail0), ("node1", avail1)]
+    cyclic = lambda obj: [(0, "node0", avail0), (1, "node1", avail1), (0, "node0", avail0), (1, "node1", avail1)]
     budgets = []
     for rank in range(4):
         comm = _mock_comm(size=4, allgather=cyclic)
@@ -537,8 +537,22 @@ def test_ranks_of_equal_momentum_counts_without_column_tasks_get_an_estimate_of_
         return {"sde": _mock_branch(remote_single=0.0)}
 
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", estimate)
-    dgamore_main.autodetect_memory_settings(_mock_comm(size=4, allgather=lambda obj: [("node0", 2**34)] * 4))
+    dgamore_main.autodetect_memory_settings(_mock_comm(size=4, allgather=lambda obj: [(0, "node0", 2**34)] * 4))
     assert set(ranks) == {0, 3}
+
+
+def test_nodes_are_the_shared_memory_groups_not_the_hostnames(fake_system, monkeypatch):
+    """Two shared-memory groups reporting one hostname stay two nodes; one group of both ranks is one node."""
+    fake_system(1)
+    unit = 1024.0**3
+    bubble = {"chi0q": _mock_branch(off_distributed=unit, remote_single=0.0)}
+    monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: bubble)
+    avail = int(1.5 * unit / dgamore_main.NODE_MEMORY_FRACTION)  # one rank's bubble fits a node, two do not
+    two_groups = lambda obj: [(0, "node0", avail), (1, "node0", avail)]
+    dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=two_groups))
+    assert "2 node(s): node0 with 1 rank(s)" in config.logger.info.call_args_list[0].args[0]
+    with pytest.raises(MemoryError, match="Bare bubble needs 2.000 GB"):
+        dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=lambda obj: [(0, "node0", avail)] * 2))
 
 
 def test_an_exact_jacobian_that_fits_no_node_is_disabled_and_the_rest_checked_without_it(fake_system, monkeypatch):
@@ -557,7 +571,7 @@ def test_an_exact_jacobian_that_fits_no_node_is_disabled_and_the_rest_checked_wi
         return peaks
 
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", estimate)
-    two_nodes = lambda obj: [("node0", int(10 * small)), ("node1", int(10 * small))]
+    two_nodes = lambda obj: [(0, "node0", int(10 * small)), (1, "node1", int(10 * small))]
     dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=two_nodes))
     assert config.stabilization.use_exact_jacobian is False and calls[-1] is False
     assert any("exact Jacobian" in str(call) for call in config.logger.warning.call_args_list)
@@ -575,8 +589,8 @@ def test_lanczos_team_gate_counts_rank_0s_interaction_on_its_node_only(fake_syst
     monkeypatch.setattr(dgamore_main.memory_estimator, "estimate_peaks", lambda **kw: peaks)
     monkeypatch.setattr(dgamore_main.memory_estimator, "lanczos_distributed_bytes", lambda *args: 10 * single)
     lines = lambda a, b: lambda obj: [
-        ("node0", int(a / dgamore_main.NODE_MEMORY_FRACTION)),
-        ("node1", int(b / dgamore_main.NODE_MEMORY_FRACTION)),
+        (0, "node0", int(a / dgamore_main.NODE_MEMORY_FRACTION)),
+        (1, "node1", int(b / dgamore_main.NODE_MEMORY_FRACTION)),
     ]
     dgamore_main.autodetect_memory_settings(_mock_comm(size=2, allgather=lines(1.5 * single, 1.05 * single)))
     with pytest.raises(MemoryError, match="Eliashberg solver needs 0.102 GB"):
