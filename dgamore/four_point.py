@@ -1804,7 +1804,11 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         return np.array(nonzero).reshape(o, o, o, o)
 
     def contract_first_pair_with_local_vertex(
-        self, f_loc: LocalFourPoint, niv_out: int, components: np.ndarray | None = None
+        self,
+        f_loc: LocalFourPoint,
+        niv_out: int,
+        components: np.ndarray | None = None,
+        outer_sum: "FourPoint | None" = None,
     ) -> "FourPoint":
         r"""
         Contracts the first orbital pair and the fermionic frequency of this one-fermion bubble with the first
@@ -1823,33 +1827,56 @@ class FourPoint(IAmNonLocal, LocalFourPoint):
         bosonic window of the bubble contracted with the same window of the vertex and the whole vertex's
         ``components`` holds the bits of that window of the whole contraction (one product per bosonic frequency).
 
+        With ``outer_sum`` this bubble holds only the frequencies of a core box inside the vertex's first-frequency
+        box, and the sum over the frequencies outside it is taken with the bubble's sum over them: the vertex must
+        take one value at all of them (see :meth:`LocalFourPoint.first_frequency_is_constant_outside`), which is read
+        at its first stored frequency, so the contraction is the one of the whole bubble to rounding.
+
         :param f_loc: The local two-fermion vertex ``[o1, o2, o3, o4, w, nu, nu']`` (half niw range) whose stored
             first frequency is summed.
         :param niv_out: Number of positive fermionic frequencies kept of the vertex's second frequency.
         :param components: The vertex's non-zero orbital components (see
             :meth:`LocalFourPoint.nonzero_orbital_components`), or ``None`` to find them in ``f_loc``.
+        :param outer_sum: The bubble summed over the fermionic frequencies outside this object's box,
+            :math:`\sum_{\nu} \chi^{\mathrm{q}\nu}_{0}` without a prefactor (no fermionic axis, the momenta and
+            bosonic frequencies of this object), or ``None`` for a bubble on the vertex's whole first-frequency box.
         :return: The contraction as a new one-fermion :class:`FourPoint` (half niw range, compressed momentum axis,
             channel ``NONE``).
         """
         nq, nb, n_w = self.current_shape[0], self.n_bands, self.mat.shape[-2]
         window = f_loc.vn_slice(f_loc.niv_second, niv_out)
         shape = (nq, nb, nb, nb, nb, n_w, 2 * niv_out)
+        # the vertex rows this bubble's frequencies meet: all of them without the sum of the outer ones
+        core = f_loc.vn_slice(f_loc.mat.shape[-2] // 2, self.mat.shape[-1] // 2)
         if components is None:
             components = f_loc.nonzero_orbital_components() if nq else np.ones((nb,) * 4, dtype=bool)
         if components.all():
-            f_pair = f_loc.mat.transpose(4, 0, 1, 5, 2, 3, 6).reshape(n_w, nb * nb * f_loc.mat.shape[-2], -1)
+            f_rows = f_loc.mat.transpose(4, 0, 1, 5, 2, 3, 6)  # [w, a, b, nu, 2, 1, nu']
+            f_pair = f_rows[:, :, :, core].reshape(n_w, nb * nb * (core.stop - core.start), -1)
+            if outer_sum is not None:
+                f_outer = f_rows[:, :, :, 0].reshape(n_w, nb * nb, -1)
             out = np.empty(shape, dtype=self.mat.dtype)
             for q in range(nq):
                 bubble = self.mat[q].transpose(4, 2, 3, 0, 1, 5).reshape(n_w, nb * nb, -1)
-                out[q] = (bubble @ f_pair).reshape(n_w, nb, nb, nb, nb, -1).transpose(4, 3, 1, 2, 0, 5)[..., window]
+                product = bubble @ f_pair
+                if outer_sum is not None:
+                    product += outer_sum.mat[q].transpose(4, 2, 3, 0, 1).reshape(n_w, nb * nb, -1) @ f_outer
+                out[q] = product.reshape(n_w, nb, nb, nb, nb, -1).transpose(4, 3, 1, 2, 0, 5)[..., window]
         else:
             # component (a, b, 2, 1) of the vertex takes the bubble's first pair (a, b) to the output pair (1, 2)
-            terms = [(a, b, c, d, f_loc.mat[a, b, c, d][..., window]) for a, b, c, d in np.argwhere(components)]
+            terms = [
+                (a, b, c, d, f_loc.mat[a, b, c, d][:, core, window], f_loc.mat[a, b, c, d][:, 0, window])
+                for a, b, c, d in np.argwhere(components)
+            ]
             out = np.zeros(shape, dtype=self.mat.dtype)
             for q in range(nq):
                 pairs = self.mat[q].reshape(nb, nb, nb * nb, n_w, -1)  # [a, b, (34), w, nu]
-                for a, b, c, d, f_block in terms:
+                if outer_sum is not None:
+                    outer = outer_sum.mat[q].reshape(nb, nb, nb * nb, n_w)  # [a, b, (34), w]
+                for a, b, c, d, f_block, f_row in terms:
                     product = pairs[a, b].transpose(1, 0, 2) @ f_block  # [w, (34), nu']
+                    if outer_sum is not None:
+                        product += outer[a, b].T[:, :, None] * f_row[:, None, :]
                     out[q, d, c] += product.transpose(1, 0, 2).reshape(nb, nb, n_w, -1)
         return FourPoint(
             out, SpinChannel.NONE, self.nq, 1, 1, self.full_niw_range, True, has_compressed_q_dimension=True

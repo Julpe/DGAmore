@@ -590,7 +590,12 @@ def calculate_sigma_dc_kernel(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, u_lo
     return attach_dc_interaction(contract_dc_vertex(f_dc_loc, gchi0_q), u_loc)
 
 
-def contract_dc_vertex(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, components: np.ndarray | None = None) -> FourPoint:
+def contract_dc_vertex(
+    f_dc_loc: LocalFourPoint,
+    gchi0_q: FourPoint,
+    components: np.ndarray | None = None,
+    outer_sum: FourPoint | None = None,
+) -> FourPoint:
     r"""
     Returns the vertex contraction of the double-counting kernel (see :func:`calculate_sigma_dc_kernel`): the bubble
     summed with the local vertex over its stored full-box first frequency (see
@@ -599,18 +604,24 @@ def contract_dc_vertex(f_dc_loc: LocalFourPoint, gchi0_q: FourPoint, components:
 
     :param f_dc_loc: The local double-counting vertex :math:`F_{\mathrm{dc}}` (see
         :func:`~dgamore.local_sde.double_counting_vertex`), or its window of the bubble's bosonic frequencies.
-    :param gchi0_q: The momentum-dependent bare bubble :math:`\chi^{\mathrm{q}\nu}_{0}` (full fermionic box).
+    :param gchi0_q: The momentum-dependent bare bubble :math:`\chi^{\mathrm{q}\nu}_{0}`: on the full fermionic box, or
+        on the core box with ``outer_sum``.
     :param components: The non-zero orbital components of the whole vertex, or ``None`` to find them in ``f_dc_loc``.
+    :param outer_sum: The bubble summed over the fermionic frequencies outside the core box (no prefactor), for a
+        vertex constant in its first frequency there, or ``None``.
     :return: The contraction as a :class:`FourPoint` on the core fermionic box.
     """
     # the stored full-box first index supplies the summed v' via F_{1dfe}(v,v') = F_{efd1}(v',v): the stored slots
     # (e,f,d,1) then pair directly with chi0's row pair (e,f) - the standard-product reversal F_{..fe} chi0_{ef..}
     niv_out = min(f_dc_loc.niv_second, config.box.niv_core)
-    return gchi0_q.contract_first_pair_with_local_vertex(f_dc_loc, niv_out, components)
+    return gchi0_q.contract_first_pair_with_local_vertex(f_dc_loc, niv_out, components, outer_sum)
 
 
 def bubble_box_parts(
-    blocks: list[FourPoint], f_dc_loc: LocalFourPoint | None, with_core: bool
+    blocks: list[FourPoint],
+    f_dc_loc: LocalFourPoint | None,
+    with_core: bool,
+    outer_sums: list[FourPoint] | None = None,
 ) -> tuple[FourPoint, FourPoint | None, FourPoint | None]:
     r"""
     Returns what the kernel section reads of the full-box bubble, from the bubble given as consecutive bosonic
@@ -619,10 +630,17 @@ def bubble_box_parts(
     windows are consumed in turn: each is freed once its parts are taken, so the whole full-box bubble never sits
     beside the whole core box; every part is the window of the whole bubble's result, bit for bit.
 
+    With ``outer_sums`` the windows hold the core box alone and come with the bubble's sum over the fermionic
+    frequencies outside it: all three parts read those frequencies only through that sum (the double-counting vertex
+    is constant in its summed frequency there, see :meth:`LocalFourPoint.first_frequency_is_constant_outside`), so
+    the parts equal those of the full-box bubble to rounding and the core windows are handed on as they are.
+
     :param blocks: The bubble's bosonic windows in order (see
         :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_q_fft`); emptied.
     :param f_dc_loc: The local double-counting vertex, or ``None`` for no contraction.
     :param with_core: Whether to cut the core box.
+    :param outer_sums: Per window of ``blocks`` on the core box, the bubble's sum over the frequencies outside it
+        (no prefactor); emptied. ``None`` for windows on the full box.
     :return: The tuple ``(full_sum, dc_contraction, core)``; ``None`` for the parts not asked for.
     """
     beta = config.sys.beta
@@ -632,14 +650,20 @@ def bubble_box_parts(
     with deferred_collection():
         while blocks:
             block = blocks.pop(0)
+            outer = outer_sums.pop(0) if outer_sums else None
             w1 = w0 + block.current_shape[-2]
             sums.append(block.sum_over_all_vn(beta).scale(1.0 / beta))
+            if outer is not None:
+                sums[-1].add(outer.scale(1.0 / beta**2, copy=True), copy=False)
             if f_dc_loc is not None:
                 window = f_dc_loc.take_wn_slice(w0, w1, copy=False)
-                contractions.append(contract_dc_vertex(window, block, components))
+                contractions.append(contract_dc_vertex(window, block, components, outer))
             if with_core:
-                cores.append(block.cut_niv(config.box.niv_core))
-            block.free()
+                cores.append(block if outer is not None else block.cut_niv(config.box.niv_core))
+            if outer is None or not with_core:
+                block.free()
+            if outer is not None:
+                outer.free()
             w0 = w1
         parts = [LocalNPoint.join_wn(part) if part else None for part in (sums, contractions, cores)]
     return tuple(parts)

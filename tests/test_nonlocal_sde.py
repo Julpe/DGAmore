@@ -1555,6 +1555,48 @@ def test_kernel_step_writes_the_eliashberg_intermediates_only_when_asked(monkeyp
     assert names == ["chi_phys_q_dens"]
 
 
+@pytest.mark.parametrize("constant", [True, False])
+def test_proposal_sums_the_outer_bubble_columns_only_for_a_vertex_constant_outside_the_core_box(
+    monkeypatch, tmp_path, constant
+):
+    """With a shell the first proposal asks the double-counting vertex once; every proposal builds its bubble by it."""
+    monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
+    config.output.output_path = config.output.eliashberg_path = str(tmp_path)
+    config.sys.beta, config.box.niv_core, config.box.niv_full = 10.0, 2, 5
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
+    cores, handed, asked, holder = [], [], [], []
+
+    def bubble(*args, niv_core=None, release=None, **kwargs):
+        cores.append(niv_core)
+        release()
+        return [] if niv_core is None else ([], ["outer sum"])
+
+    def parts(blocks, f_dc, with_core, outer):
+        handed.append(outer)
+        return MagicMock(), None, MagicMock()
+
+    vertex = MagicMock(first_frequency_is_constant_outside=lambda niv: asked.append(niv) or constant)
+    monkeypatch.setattr(sde_kernels, "build_giwk_full", lambda *a, **k: (MagicMock(), None, MagicMock()))
+    monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
+    monkeypatch.setattr(nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", bubble)
+    monkeypatch.setattr(sde_kernels, "bubble_box_parts", parts)
+    monkeypatch.setattr(sde_kernels, "cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
+    monkeypatch.setattr(sde_kernels, "load_node_shared_local_vertex", lambda *a, **k: (vertex, None))
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_kernel_r_q", lambda *a, **k: MagicMock())
+    for _ in range(2):
+        nonlocal_sde.calculate_sigma_proposal(
+            MagicMock(),
+            *[MagicMock() for _ in range(8)],
+            create_comm_mock(),
+            2,
+            chunk_budgets=memory_estimator.ChunkBudgets(1, 1),
+            eliashberg_only=True,
+            outer_sum=holder,
+        )
+    assert asked == [2] and holder == [constant]
+    assert cores == [2 if constant else None] * 2 and handed == [["outer sum"] if constant else None] * 2
+
+
 @pytest.mark.parametrize("ek, involution", [(np.zeros((1, 1, 1, 1, 1)), None), (np.ones((1, 1, 1, 2, 2)), [1, 0])])
 def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_sde(
     monkeypatch, tmp_path, ek, involution
@@ -1576,7 +1618,9 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
         "create_generalized_chi0_q_fft",
         lambda *a, **k: bubble_kwargs.append(k) or k["release"]() or [],
     )
-    monkeypatch.setattr(sde_kernels, "bubble_box_parts", lambda blocks, f_dc, with_core: (MagicMock(), None, core))
+    monkeypatch.setattr(
+        sde_kernels, "bubble_box_parts", lambda blocks, f_dc, with_core, outer: (MagicMock(), None, core)
+    )
     monkeypatch.setattr(sde_kernels, "cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
     loaded, saves, involutions, nodes = [], [], [], []
 
@@ -1638,7 +1682,7 @@ def test_bare_vertex_eliashberg_only_proposal_dumps_both_channels_without_a_loca
     monkeypatch.setattr(
         sde_kernels,
         "bubble_box_parts",
-        lambda blocks, f_dc, with_core: cores.append(with_core) or (MagicMock(), None, None),
+        lambda blocks, f_dc, with_core, outer: cores.append(with_core) or (MagicMock(), None, None),
     )
     monkeypatch.setattr(sde_kernels, "cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
     steps = []
@@ -1727,7 +1771,10 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
     monkeypatch.setattr(
         nonlocal_sde,
         "GreensFunction",
-        SimpleNamespace(get_g_full=lambda *a, **k: gf_stub, get_occupation=lambda *a, **k: gf_stub.get_fill_nonlocal()),
+        SimpleNamespace(
+            get_g_full=lambda *a, **k: gf_stub,
+            get_occupation=lambda siw, mu, ek, *a, **k: (1.0, None, np.zeros((len(ek), 1, 1, nb, nb))),
+        ),
     )
     monkeypatch.setattr(sde_kernels, "GreensFunction", nonlocal_sde.GreensFunction)
     monkeypatch.setattr(nonlocal_sde, "update_mu", lambda *a, **k: 0.5)
@@ -2129,9 +2176,9 @@ def test_warm_start_holds_the_dmft_filling_and_resolves_mu(monkeypatch, tmp_path
 
     built = []
 
-    def g_full(siw, mu, ek, beta, orbitals=None):
+    def g_full(siw, mu, ek, beta, real_dispersion=None, orbitals=None):
         n = 0.85 if np.isclose(siw.mat.reshape(-1)[0], 1.0 + 0.1j) and mu == 0.5 else 0.8621
-        fill = (n, np.eye(1, dtype=np.complex128), np.zeros((1, 1, 1, 1, 1)))
+        fill = (n, np.eye(1, dtype=np.complex128), np.full((1, 1, 1, 1, 1), n / 2))
         return SimpleNamespace(get_fill_nonlocal=lambda: fill, save=lambda *a, **k: None, free=lambda: None)
 
     monkeypatch.setattr(
@@ -2182,7 +2229,7 @@ def test_dmft_spectrum_builds_and_saves_the_lattice_green_function_once_next_to_
         built.append(mu)
         return SimpleNamespace(save=lambda **k: saved.append(k["name"]), free=lambda: None)
 
-    def occupation(siw, mu, ek, beta, orbitals=None):
+    def occupation(siw, mu, ek, beta, real_dispersion=None, orbitals=None):
         occupations.append(mu)
         return fill
 
@@ -2251,6 +2298,84 @@ def test_warm_start_and_loop_solve_mu_on_every_rank_with_its_momenta(monkeypatch
     assert calls[0][1].my_slice.stop == calls[2][1].my_slice.start > 0
     assert all(np.array_equal(c[2], (start.mat, mixed[0])[i % 2][c[1].my_slice]) for i, c in enumerate(calls))
     assert all(np.array_equal(c[3], calls[i % 2][3]) and c[4] is None for i, c in enumerate(calls))
+
+
+def _momentum_dependent_sigma(rng, nk_tot, o, niv):
+    """A complex64 self-energy array ``[k, o, o, 2 niv]``: a real symmetric part per momentum and a causal diagonal."""
+    static = rng.standard_normal((nk_tot, o, o)) * 0.1
+    sign = np.sign(np.arange(-niv, niv) + 0.5)
+    mat = (static + static.swapaxes(1, 2))[..., None] - 0.3j * sign * np.eye(o)[None, :, :, None]
+    return mat.astype(np.complex64)
+
+
+def test_occupation_on_slices_equals_the_occupation_of_every_momentum_at_once(monkeypatch):
+    """Every rank occupying its own momenta assembles the filling and occupations of the whole grid bit for bit."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, o, rng = (4, 3, 1), 2, np.random.default_rng(3)
+    config.lattice.k_grid, config.sys.beta = bz.KGrid(nk, symmetries=[]), 10.0
+    ek = rng.standard_normal(nk + (o, o))
+    ek = ek + ek.swapaxes(-1, -2)
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: ek)
+    mat = _momentum_dependent_sigma(rng, 12, o, 8)
+    whole = SelfEnergy(mat.copy(), nk, has_compressed_q_dimension=True, beta=10.0)
+    moments, ref = whole.smom, GreensFunction.get_occupation(whole, 0.4, ek, 10.0)
+
+    def fn(comm, rank):
+        dist = mpi_utils.MpiDistributor(ntasks=12, comm=comm)
+        rows = mat[dist.my_slice].copy()
+        sigma = SelfEnergy(rows, (len(rows), 1, 1), has_compressed_q_dimension=True, calc_smom=False, beta=10.0)
+        sigma._smom0, sigma._smom1 = moments
+        return nonlocal_sde._occupation_on_slices(sigma, 0.4, dist)
+
+    _, res = run_parallel(5, fn)
+    assert all(n == ref[0] and np.array_equal(occ, ref[1]) and np.array_equal(occ_k, ref[2]) for n, occ, occ_k in res)
+
+
+@pytest.mark.parametrize("niv_start", [6, 24])  # a start inside the loop's box of 13, and one on the DMFT box
+def test_warm_start_sums_both_fillings_on_every_rank_as_rank_0_would_on_the_whole_grid(
+    monkeypatch, tmp_path, niv_start
+):
+    """A warm start's DMFT filling and its start's occupation, summed rank by rank, equal the whole-grid sums."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mixing, "MPI", FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", FAKE_MPI)
+    _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0)
+    nk, o, rng = (5, 1, 1), 2, np.random.default_rng(11)
+    config.sys.n_bands, config.sys.mu_dmft, config.box.niv_dmft = o, 0.3, 24
+    config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
+    ek = rng.standard_normal(nk + (o, o))
+    ek = ek + ek.swapaxes(-1, -2)
+    config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: ek)
+    dmft_mat, start_mat = _momentum_dependent_sigma(rng, 1, o, 24), _momentum_dependent_sigma(rng, 5, o, niv_start)
+
+    def sigma(mat, grid):
+        return SelfEnergy(mat.copy(), grid, has_compressed_q_dimension=True, beta=10.0)
+
+    whole = sigma(start_mat, nk).concatenate_self_energies(sigma(dmft_mat, (1, 1, 1)))
+    n_ref = GreensFunction.get_occupation(sigma(dmft_mat, (1, 1, 1)), 0.3, ek, 10.0)[0]
+    _, occ_ref, occ_k_ref = GreensFunction.get_occupation(whole, 0.5, ek, 10.0)
+    monkeypatch.setattr(nonlocal_sde.GreensFunction, "get_occupation", GreensFunction.get_occupation)
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (sigma(start_mat, nk), 3, True))
+    monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda warm_start: [0.7])
+    fake, seen = nonlocal_sde.calculate_sigma_proposal, []
+
+    def spy(*args, **kwargs):
+        seen.append((config.sys.n, config.sys.occ.copy(), config.sys.occ_k.copy()))
+        return fake(*args, **kwargs)
+
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", spy)
+
+    def fn(comm, rank):
+        v_nonloc = Interaction(np.zeros(nk + (o,) * 4), SpinChannel.NONE, nk) if rank == 0 else None
+        dmft = sigma(dmft_mat, (1, 1, 1))
+        nonlocal_sde.calculate_self_energy_q(comm, None, v_nonloc, dmft, dmft.copy())
+
+    run_parallel(3, fn, hostnames=["n0"] * 3)
+    assert len(seen) == 3 and np.abs(occ_k_ref - occ_ref).max() > 1e-3
+    assert all(
+        n == n_ref and np.array_equal(occ, occ_ref) and np.array_equal(occ_k, occ_k_ref) for n, occ, occ_k in seen
+    )
 
 
 def test_loop_sums_mu_and_the_occupation_over_the_momenta_picked_for_its_mixed_iterate(monkeypatch, tmp_path):
@@ -3500,7 +3625,8 @@ def test_proposal_attaches_the_double_counting_interaction_once_the_full_box_bub
     monkeypatch.setattr(
         sde_kernels,
         "bubble_box_parts",
-        lambda blocks, f_dc, with_core: events.append("bubble consumed") or (MagicMock(), MagicMock(), MagicMock()),
+        lambda blocks, f_dc, with_core, outer: events.append("bubble consumed")
+        or (MagicMock(), MagicMock(), MagicMock()),
     )
     monkeypatch.setattr(sde_kernels, "attach_dc_interaction", lambda t, u: events.append("attached") or MagicMock())
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_kernel_r_q", lambda *a, kernel=None, **k: kernel)
@@ -3573,6 +3699,81 @@ def test_bubble_box_parts_from_bosonic_blocks_hold_the_bits_of_the_whole_bubble(
     assert dc is None or np.array_equal(dc.mat, sde_kernels.contract_dc_vertex(f_dc, whole).mat)
     assert core is None or np.array_equal(core.mat, whole.cut_niv(2).mat)
     assert blocks == [] and all(block.mat is None for block in kept)
+
+
+def _constant_outside(rng, o, nw, niv_full, niv_core):
+    """A complex64 two-fermion vertex array ``[o, o, o, o, w, 2 niv_full, 2 niv_core]`` that takes one value at all
+    first frequencies outside the core box, with one zero orbital component."""
+    shape = (o, o, o, o, nw, 2 * niv_full, 2 * niv_core)
+    mat = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+    mat[..., : niv_full - niv_core, :] = mat[..., niv_full + niv_core :, :] = mat[..., :1, :]
+    mat[1, 0, 0, 0] = 0.0
+    return mat
+
+
+@pytest.mark.parametrize("dense", [True, False])  # every orbital component or a zero one (stored: the loader's order)
+@pytest.mark.parametrize("stored", [False, True])
+def test_dc_contraction_of_the_core_bubble_and_its_outer_sum_equals_the_full_box_contraction(dense, stored):
+    """A vertex constant outside the core box contracts the core columns plus the outer sum to the full contraction."""
+    config.sys.beta, config.box.niv_core = 2.5, 2
+    rng, nq, o, nw, niv_full = np.random.default_rng(21), 3, 2, 3, 5
+    b_shape = (nq, o, o, o, o, nw, 2 * niv_full)
+    b_mat = (rng.standard_normal(b_shape) + 1j * rng.standard_normal(b_shape)).astype(np.complex64)
+    f_mat = _constant_outside(rng, o, nw, niv_full, 2)
+    if dense:
+        f_mat[1, 0, 0, 0] = f_mat[0, 1, 0, 0]
+    if stored:
+        axes = (4, 0, 1, 5, 2, 3, 6)
+        f_mat = np.ascontiguousarray(f_mat.transpose(axes)).transpose(np.argsort(axes))
+    f_dc = LocalFourPoint(f_mat, SpinChannel.MAGN, 1, 2, False, True)
+    whole = FourPoint(b_mat, SpinChannel.NONE, (nq, 1, 1), 1, 1, False, True, has_compressed_q_dimension=True)
+    core = whole.cut_niv(2)
+    outer_mat = b_mat[..., : niv_full - 2].sum(axis=-1) + b_mat[..., niv_full + 2 :].sum(axis=-1)
+    outer = FourPoint(outer_mat, SpinChannel.NONE, (nq, 1, 1), 1, 0, False, True, has_compressed_q_dimension=True)
+    expected = sde_kernels.contract_dc_vertex(f_dc, whole).mat
+    summed = sde_kernels.contract_dc_vertex(f_dc, core, outer_sum=outer).mat
+    assert f_dc.first_frequency_is_constant_outside(2) and f_dc.nonzero_orbital_components().all() == dense
+    assert np.allclose(summed, expected, atol=1e-5 * np.abs(expected).max())
+    assert not np.allclose(sde_kernels.contract_dc_vertex(f_dc, core).mat, expected, atol=1e-2 * np.abs(expected).max())
+
+
+def test_first_frequency_is_constant_outside_holds_for_equal_rows_only():
+    """The vertex is constant outside a box when all its rows there carry the first row's bits, on either side."""
+    rng = np.random.default_rng(22)
+    f_dc = LocalFourPoint(_constant_outside(rng, 2, 2, 5, 2), SpinChannel.MAGN, 1, 2, False, True)
+    assert f_dc.first_frequency_is_constant_outside(2) and f_dc.first_frequency_is_constant_outside(5)
+    assert f_dc.first_frequency_is_constant_outside(7) and not f_dc.first_frequency_is_constant_outside(1)
+    for row in (1, 8):
+        changed = f_dc.copy()
+        changed.mat[1, 1, 0, 1, 1, row, 3] += 1e-6
+        assert not changed.first_frequency_is_constant_outside(2)
+
+
+@pytest.mark.parametrize("with_dc, with_core", [(True, True), (False, True), (False, False)])
+def test_bubble_box_parts_of_core_blocks_and_outer_sums_equal_those_of_the_full_box_bubble(with_dc, with_core):
+    """Box sum, dc contraction and core box from core windows with their outer sums equal the full-box bubble's."""
+    config.sys.beta, config.box.niv_core = 2.5, 2
+    rng, nq, o, nw, niv_full = np.random.default_rng(23), 3, 2, 3, 4
+    b_shape = (nq, o, o, o, o, nw, 2 * niv_full)
+    b_mat = (rng.standard_normal(b_shape) + 1j * rng.standard_normal(b_shape)).astype(np.complex64)
+    whole = FourPoint(b_mat, SpinChannel.NONE, (nq, 1, 1), 1, 1, False, True, has_compressed_q_dimension=True)
+    f_dc = LocalFourPoint(_constant_outside(rng, o, nw, niv_full, 2), SpinChannel.MAGN, 1, 2, False, True)
+    f_dc = f_dc if with_dc else None
+    full_sum, dc, core = sde_kernels.bubble_box_parts([whole.take_wn_slice(w, w + 1) for w in range(nw)], f_dc, True)
+    cut = whole.cut_niv(2)
+    blocks = [cut.take_wn_slice(w, w + 1) for w in range(nw)]
+    outer_mat = b_mat[..., : niv_full - 2].sum(axis=-1) + b_mat[..., niv_full + 2 :].sum(axis=-1)
+    outer = FourPoint(outer_mat, SpinChannel.NONE, (nq, 1, 1), 1, 0, False, True, has_compressed_q_dimension=True)
+    outers = [outer.take_wn_slice(w, w + 1) for w in range(nw)]
+    kept = blocks + outers
+
+    summed, dc_summed, core_summed = sde_kernels.bubble_box_parts(blocks, f_dc, with_core, outers)
+
+    assert np.allclose(summed.mat, full_sum.mat, atol=1e-5 * np.abs(full_sum.mat).max())
+    assert (dc_summed is None) != with_dc and (core_summed is None) != with_core
+    assert dc is None or np.allclose(dc_summed.mat, dc.mat, atol=1e-5 * np.abs(dc.mat).max())
+    assert core_summed is None or np.array_equal(core_summed.mat, core.mat)
+    assert blocks == [] and outers == [] and all(block.mat is None for block in kept)
 
 
 def test_bubble_box_parts_never_hold_the_whole_core_box_beside_the_whole_full_box_bubble():

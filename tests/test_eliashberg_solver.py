@@ -993,9 +993,33 @@ def test_shared_vertex_window_matches_the_single_rank_layout_on_every_node_rank(
     assert res[0][1]
 
 
+@pytest.mark.parametrize("phases", [(1, 1, 1), (1, -1, 1j)])
+def test_orbital_permutation_is_gathered_to_the_values_its_einsum_sums(phases):
+    """A constant orbital permutation with phases 1, -1, i, -i is gathered to the einsum's values, no other action."""
+    rng = np.random.default_rng(2)
+    g = (rng.standard_normal((3, 2, 1, 3, 3, 4)) + 1j * rng.standard_normal((3, 2, 1, 3, 3, 4))).astype(np.complex64)
+    u = (np.eye(3)[[2, 0, 1]] * np.array(phases)[:, None]).astype(np.complex64)
+    expected = np.einsum("ac,xyzcdv,bd->xyzabv", u, g, u)
+    assert np.array_equal(es._permute_orbital_pair(g, u), expected)
+    assert np.array_equal(es._rotate_orbital_pair(g, u), expected)
+    assert np.array_equal(es._rotate_rows(g.reshape(6, 3, 3, 4), u, u), expected.reshape(6, 3, 3, 4))
+    assert es._permute_orbital_pair(g, u + 1e-6) is None and es._permute_orbital_pair(g, np.ones_like(u)) is None
+
+
+def test_inversion_action_takes_an_orbital_permutation_exact_and_keeps_any_other_action(monkeypatch):
+    """A discovered action within 1e-8 of an orbital permutation with phases comes back exact, another one as found."""
+    swap, rotation = np.array([[0, 1], [1, 0]], dtype=complex), np.array([[0.6, 0.8], [0.8, -0.6]], dtype=complex)
+    config.lattice.k_grid = bz.KGrid((2, 1, 1), symmetries=[])
+    config.lattice.hamiltonian = MagicMock(get_local_u=MagicMock(return_value=LocalInteraction(np.zeros((2,) * 4))))
+    monkeypatch.setattr(es, "find_inversion_orbital_unitary", lambda *args, **kwargs: swap + 1e-12)
+    assert np.array_equal(es._inversion_action()[0], swap)
+    monkeypatch.setattr(es, "find_inversion_orbital_unitary", lambda *args, **kwargs: rotation)
+    assert es._inversion_action()[0] is rotation
+
+
 @pytest.mark.parametrize("action", ["none", "swap", "momentum-dependent"])
 def test_project_frequency_block_matches_the_block_of_the_full_projection(action):
-    """Each frequency block of the sector projector equals the full one, bit for bit or, with an action, to rounding."""
+    """A frequency block of the sector projector equals the full one, to rounding with a momentum-dependent action."""
     gap_shape = (4, 2, 1, 2, 2, 6)
     u = _orbital_actions(gap_shape[:3])[action]
     rng = np.random.default_rng(5)
@@ -1005,7 +1029,8 @@ def test_project_frequency_block_matches_the_block_of_the_full_projection(action
             full = es._project_gap_to_sector(gap.reshape(-1), gap_shape, eps_t, eps_p, u).reshape(gap_shape)
             for v0, v1 in ((0, 6), (0, 2), (2, 5), (5, 6)):
                 block, expected = es._project_frequency_block(gap, v0, v1, eps_t, eps_p, u), full[..., v0:v1]
-                assert np.array_equal(block, expected) if u is None else np.allclose(block, expected, atol=1e-6)
+                exact = action != "momentum-dependent"
+                assert np.array_equal(block, expected) if exact else np.allclose(block, expected, atol=1e-6)
 
 
 def _matvec_references(monkeypatch, gamma, chi0, gap_shape, eps_list, u=None):
@@ -1191,6 +1216,56 @@ def test_wedge_orbits_partition_the_grid_by_star():
     points, offsets, order, us = es._wedge_orbits(auto)
     assert auto.nk_irr == len(points) < auto.nk_tot and us.shape == (auto.nk_tot, 2, 2)
     assert all(np.allclose(us[point], np.eye(2)) for point in points)
+
+
+def test_wedge_orbits_take_orbital_permutations_exact_and_keep_any_other_rotation(monkeypatch):
+    """Star rotations within 1e-8 of orbital permutations with phases come back exact, any others as discovered."""
+    grid = _rotating_auto_grid((4, 4, 1))
+    rep, us = es.point_group_orbits(grid._auto_group, (4, 4, 1))
+    exact = np.round(us)
+    assert np.allclose(us, exact, atol=1e-8) and not np.allclose(exact, np.eye(2))
+    for found, expected in ((exact + 1e-12, exact), (exact * np.exp(0.3j), None)):
+        monkeypatch.setattr(es, "point_group_orbits", lambda *args: (rep, found))
+        es._wedge_orbits.cache_clear()
+        rotations = es._wedge_orbits(grid)[3]
+        assert rotations is found if expected is None else np.array_equal(rotations, expected)
+    es._wedge_orbits.cache_clear()
+
+
+@pytest.mark.parametrize("rotation", ["none", "permutation", "unitary"])
+def test_contract_stars_gives_every_star_the_product_it_takes_alone(rotation):
+    """A batch of stars equals the stars contracted one by one: bit for bit without rotations or with permutations."""
+    rng, n_stars, m, o, nv = np.random.default_rng(7), 5, 4, 2, 3
+    oo, rows = o * o, o * o * nv
+
+    def draw(*shape):
+        return (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex64)
+
+    gamma, rhs, w = draw(n_stars, rows, rows), draw(n_stars * m, rows), None
+    if rotation != "none":
+        quarter_turn = np.where(rng.integers(0, 2, (n_stars * m, 1, 1)) == 1, np.array([[0, 1], [-1, 0]]), np.eye(2))
+        u = np.linalg.qr(draw(n_stars * m, o, o))[0] if rotation == "unitary" else quarter_turn.astype(np.complex64)
+        w = np.einsum("kab,kcd->kacbd", u.conj(), u.conj()).reshape(n_stars * m, oo, oo)
+
+    def alone(star):
+        cols, w_star = rhs[star * m : (star + 1) * m].T, None if w is None else w[star * m : (star + 1) * m]
+        if w_star is not None:
+            cols = np.einsum("jab,apj->bpj", w_star.conj(), cols.reshape(oo, nv, -1)).reshape(rows, -1)
+        out = gamma[star] @ cols
+        if w_star is not None:
+            out = np.einsum("jab,bvj->avj", w_star, out.reshape(oo, nv, -1)).reshape(rows, -1)
+        return out.T
+
+    got, expected = es._contract_stars(gamma, rhs, w, nv), np.concatenate([alone(star) for star in range(n_stars)])
+    assert np.allclose(got, expected, atol=1e-4) if rotation == "unitary" else np.array_equal(got, expected)
+
+
+def test_star_batches_run_over_consecutive_stars_of_one_size_within_the_budget(monkeypatch):
+    """A batch holds consecutive stars of one size up to the byte budget; a star above the budget runs alone."""
+    monkeypatch.setattr(es, "STAR_BATCH_BYTES", 64)
+    offsets = np.array([0, 1, 3, 5, 7, 9, 17, 25])  # star sizes 1, 2, 2, 2, 2, 8, 8 at 16 bytes per member
+    assert es._star_batches(offsets, 0, 7, 16) == [(0, 1), (1, 3), (3, 5), (5, 6), (6, 7)]
+    assert es._star_batches(offsets, 2, 4, 16) == [(2, 4)] and es._star_batches(offsets, 3, 3, 16) == []
 
 
 @pytest.mark.parametrize("size", [1, 3])

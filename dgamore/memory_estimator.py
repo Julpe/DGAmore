@@ -107,6 +107,9 @@ EXACT_VRG_RECOMPUTE_COST: float = 0.02
 BUBBLE_ROUND_BYTES: int = 4 * 1024**2
 # Bytes of received one-column blocks the distributed bubble hands to one deliver call (bubble_gen.DELIVER_BATCH_BYTES)
 BUBBLE_DELIVER_BYTES: int = 2 * 1024**2
+# Columns outside the core box whose real-space products the bubble sums before one transform
+# (bubble_gen.SUMMED_COLUMNS)
+BUBBLE_SUMMED_COLUMNS: int = 32
 
 # Momentum groups of a channel's three-leg vertex and kernel (bits do not depend on it) and one group's blocks alive
 # beside the stage's residents: the in-place vertex's copies (measured 2.0 to 3.6), the kernel's products (3.2 to 3.6).
@@ -460,7 +463,22 @@ def column_sde_stream_bytes(
     return carried * slab, per_round * column * (n_kernels + q_rank / nk_irr) + columns + work * slab
 
 
-def bubble_column_bytes(nk_tot: int, nk_irr: int, n_bands: int, n_cols: int, n_q: int) -> int:
+def bubble_stored_columns(niv_core: int, niv_full: int) -> int:
+    r"""
+    Returns the fermionic columns per bosonic frequency the loop's bubble holds while it is built: every column of
+    the full box without a shell; with one the core columns, the transformed pieces of the outer ones (see
+    :meth:`~dgamore.bubble_gen.BubbleGenerator._summed_pieces`) and their sum.
+
+    :param niv_core: Number of positive fermionic core frequencies.
+    :param niv_full: Number of positive fermionic full-region frequencies.
+    :return: The number of columns.
+    """
+    if niv_full <= niv_core:
+        return 2 * niv_full
+    return 2 * niv_core + _ceil_div(2 * (niv_full - niv_core), BUBBLE_SUMMED_COLUMNS) + 1
+
+
+def bubble_column_bytes(nk_tot: int, nk_irr: int, n_bands: int, n_cols: int, n_q: int, summed: bool = False) -> int:
     r"""
     Returns the per-rank bytes of the column work of the column-distributed bubble
     (:meth:`~dgamore.bubble_gen.BubbleGenerator._create_generalized_chi0_q_fft_distributed`) beside its result: the
@@ -468,8 +486,9 @@ def bubble_column_bytes(nk_tot: int, nk_irr: int, n_bands: int, n_cols: int, n_q
     of orbital components of at most :data:`BUBBLE_ROUND_BYTES` (one component when a component is larger), the
     irreducible rows of two rounds of columns held for the ring (a round's exchange may run behind the next round's
     columns), the rank's own rows of a round received from it and completed to every orbital component, and the
-    staged blocks of one deliver call with their two expanded copies (three :data:`BUBBLE_DELIVER_BYTES`). The node
-    root's private copy
+    staged blocks of one deliver call with their two expanded copies (three :data:`BUBBLE_DELIVER_BYTES`). With the
+    outer columns summed a rank also holds the sums of one piece for every orbital component (one full-grid column)
+    with the stacked products of a block of momenta (three blocks of about 1 MiB). The node root's private copy
     of the real-space window while it builds the window precedes all of this and is not counted.
 
     :param nk_tot: Total number of momentum points (full BZ).
@@ -477,6 +496,7 @@ def bubble_column_bytes(nk_tot: int, nk_irr: int, n_bands: int, n_cols: int, n_q
     :param n_bands: Number of bands :math:`B`.
     :param n_cols: Number of columns of the rank (bounds the columns of a round).
     :param n_q: Number of the rank's irreducible momenta.
+    :param summed: Whether the columns outside the core box are summed in real space.
     :return: The bytes.
     """
     full = DTYPE_BYTES * nk_tot
@@ -484,7 +504,8 @@ def bubble_column_bytes(nk_tot: int, nk_irr: int, n_bands: int, n_cols: int, n_q
     group = min(n_comp, max(1, BUBBLE_ROUND_BYTES // full))
     round_cols = max(1, min(n_cols, BUBBLE_ROUND_BYTES // (n_comp * full)))
     rows = (2 * nk_irr + 2 * n_q) * n_comp * round_cols
-    return 2 * n_bands**2 * full + 8 * nk_tot + group * full + DTYPE_BYTES * rows + 3 * BUBBLE_DELIVER_BYTES
+    pieces = n_comp * full + 3 * 2**20 if summed else 0
+    return 2 * n_bands**2 * full + 8 * nk_tot + group * full + DTYPE_BYTES * rows + 3 * BUBBLE_DELIVER_BYTES + pieces
 
 
 def team_build_columns(nk_tot: int, n_bands: int, npp: int) -> int:
@@ -1174,14 +1195,22 @@ def estimate_peaks(
 
     # Single-path FFT bubble (verify-only): multi-rank splits (w, v) columns across ranks (R-space G node-shared);
     # single-rank builds the whole irr-BZ bubble plus the full-grid multiply buffer per iw (in-place scipy ifftn).
+    # With a shell the columns outside the core box are summed in real space: the bubble holds the core columns with
+    # the pieces and the sum of the outer ones, and the kernel section the core columns with that sum.
     gf_window_bubble = 2 * (niv_full + niw_core)
+    summed = niv_full > niv_core
+    v_bubble = bubble_stored_columns(niv_core, niv_full)
+    v_held = vc + 1 if summed else vf
+    # rank 0 loads the double-counting vertex for itself once, before the first bubble, to see that it is constant
+    # outside the core box
+    vertex_check = scale * _two_fermion_block(1, nb, wp, vf, vc) if summed else 0.0
     if n_ranks == 1:
         chi0q_baseline = baseline_bubble
         chi0q_shareable = giwk_bubble + sigma_shared
         chi0q_off_distributed = 0.0
-        chi0q_off_single = scale * (
-            _bubble_block(nk_irr, nb, wp, vf)
-            + (1 + CHI0Q_IFFTN_TRANSIENT_FACTOR) * _bubble_block(nk_tot, nb, 1, vf)
+        chi0q_off_single = vertex_check + scale * (
+            _bubble_block(nk_irr, nb, wp, v_bubble)
+            + (1 + CHI0Q_IFFTN_TRANSIENT_FACTOR) * _bubble_block(nk_tot, nb, 1, vc + 1 if summed else vf)
             + 2 * _giwk_rspace(nk_tot, nb, gf_window_bubble)
             + _giwk_rspace(nk_tot, nb, vf)
         )
@@ -1190,11 +1219,11 @@ def estimate_peaks(
         # the columns read only the real-space window, giwk is cut to the SDE box before them
         chi0q_baseline = giwk_sde + sigma_shared + g_r_windows
         chi0q_shareable = chi0q_baseline
-        n_cols = _ceil_div(wp * vf, n_ranks)
-        chi0q_off_distributed = scale * _bubble_block(qi, nb, wp, vf) + overhead * bubble_column_bytes(
-            nk_tot, nk_irr, nb, n_cols, qi
+        n_cols = _ceil_div(wp * v_bubble, n_ranks)
+        chi0q_off_distributed = scale * _bubble_block(qi, nb, wp, v_bubble) + overhead * bubble_column_bytes(
+            nk_tot, nk_irr, nb, n_cols, qi, summed
         )
-        chi0q_off_single = 0.0
+        chi0q_off_single = vertex_check
     peaks["chi0q"] = BranchPeak(
         baseline=chi0q_baseline + rank_base,
         giwk_shareable=chi0q_shareable,
@@ -1213,7 +1242,7 @@ def estimate_peaks(
     # time and free it (see sde_kernels.bubble_box_parts), one rank holds the bubble whole
     box_parts = 2 * (core_block if n_ranks == 1 else _bubble_block(qi, nb, 1, vc))
     chiq_aux_distributed = max(
-        scale * (_bubble_block(qi, nb, wp, vf) + box_parts),
+        scale * (_bubble_block(qi, nb, wp, v_held) + box_parts),
         scale * 4 * core_block,
         # the aux sum's solve: the node windows of shared Bethe-Salpeter slices hold one more block per rank
         scale * 4 * core_block + overhead * _chiq_aux_transient(nb * nb * vc, nb),

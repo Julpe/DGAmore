@@ -36,7 +36,7 @@ import dgamore.mpi_utils as mpi_utils
 from dgamore.brillouin_zone import KGrid
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.four_point import FourPoint
-from dgamore.greens_function import GreensFunction, non_interacting_mu, orbital_block, update_mu
+from dgamore.greens_function import GreensFunction, non_interacting_mu, update_mu
 from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.jacobian_stabilization import (
     JACOBIAN_FILE,
@@ -998,6 +998,51 @@ def get_starting_sigma(default_sigma: SelfEnergy) -> tuple[SelfEnergy, int, bool
     return sigma, max_iter, True
 
 
+def _dc_vertex_is_constant_outside_core(comm: MPI.Comm) -> bool:
+    r"""
+    Returns whether the stored local double-counting vertex takes one value at all summed frequencies outside the
+    core box (see :meth:`~dgamore.local_four_point.LocalFourPoint.first_frequency_is_constant_outside`): rank 0 loads
+    the vertex for itself, frees it and broadcasts the answer. Collective.
+
+    :param comm: The MPI communicator.
+    :return: Whether a sum over the vertex's first frequency needs its partner outside the core box only as a sum.
+    """
+    constant = None
+    if comm.rank == 0:
+        path = output_files.npy_path(config.output.output_path, output_files.F_DC_LOC)
+        f_dc_loc, _ = sde_kernels.load_node_shared_local_vertex(None, path, SpinChannel.MAGN)
+        constant = f_dc_loc.first_frequency_is_constant_outside(config.box.niv_core)
+        f_dc_loc.free()
+    return comm.bcast(constant, root=0)
+
+
+def _occupation_on_slices(
+    sigma: SelfEnergy, mu: float, mpi_dist_fullbz: MpiDistributor
+) -> tuple[float, np.ndarray, np.ndarray]:
+    r"""
+    Returns the filling and the occupations of a self-energy on its whole frequency box, every rank evaluating its own
+    momenta (collective): ``sigma`` is momentum-local or holds this rank's momenta. The real-or-complex arithmetic is
+    decided on the whole dispersion and the slices are assembled exactly (see
+    :func:`~dgamore.sde_kernels.assemble_occupation`), so the result is that of
+    :meth:`GreensFunction.get_occupation` on every momentum at once, bit for bit.
+
+    :param sigma: The :class:`SelfEnergy`, momentum-local or on this rank's momenta of ``mpi_dist_fullbz``; not read
+        on a rank without momenta.
+    :param mu: Chemical potential :math:`\mu`.
+    :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
+    :return: A tuple of the total filling :math:`n` over every orbital, and the k-averaged ``[o1, o2]`` and the
+        k-resolved ``[kx, ky, kz, o1, o2]`` occupation of the correlated orbitals on the full grid.
+    """
+    ek, orbitals = config.lattice.hamiltonian.get_ek(), config.sys.correlated_orbitals
+    n_my, nb = mpi_dist_fullbz.my_size, ek.shape[-1]
+    occ_k_my = np.zeros((0, 1, 1, nb, nb))
+    if n_my:
+        ek_my = ek.reshape(-1, nb, nb)[mpi_dist_fullbz.my_slice].reshape(n_my, 1, 1, nb, nb)
+        real_ek = np.isrealobj(np.real_if_close(ek))
+        occ_k_my = GreensFunction.get_occupation(sigma, mu, ek_my, config.sys.beta, real_ek, orbitals=orbitals)[2]
+    return sde_kernels.assemble_occupation(occ_k_my, mpi_dist_fullbz, orbitals)
+
+
 def _init_mu_history(warm_start: bool) -> list[float]:
     r"""
     Seeds the chemical-potential history for the self-consistency loop. For a fresh run (no warm start) the history
@@ -1397,6 +1442,7 @@ def calculate_sigma_proposal(
     static_magn: list | None = None,
     last_chi: dict | None = None,
     w_r_full: list | None = None,
+    outer_sum: list | None = None,
 ) -> _Proposal | None:
     r"""
     Returns the raw (un-mixed) DGA self-energy proposal :math:`S(\Sigma_{\mathrm{in}})` at chemical potential
@@ -1460,6 +1506,11 @@ def calculate_sigma_proposal(
     :param w_r_full: Holder of the real-space interactions of the two Hartree-Fock terms, :math:`U + V^{\mathbf{q}}` and
         :math:`V^{\mathbf{q}}` alone (see :func:`~dgamore.sde_kernels.real_space_interaction`), which rank 0 transforms
         into an empty holder and reads from a filled one, or ``None`` to transform them every time; only read on rank 0.
+    :param outer_sum: Holder of whether the bubble is built on the core box with the sum of its columns outside it (see
+        :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_q_fft`), which the kernels read only as that
+        sum when the double-counting vertex is constant in its summed frequency there (see
+        :func:`_dc_vertex_is_constant_outside_core`): decided into an empty holder and read from a filled one, or
+        ``None`` to build every column of the full box.
     :return: The proposal (see :class:`_Proposal`): its core on every rank of rank 0's node, with the donor and the
         offset of its tail on rank 0; ``None`` on the other nodes, and on every rank with ``eliashberg_only``.
     """
@@ -1485,6 +1536,20 @@ def calculate_sigma_proposal(
             giwk_full.mat = None
         mpi_utils.free_shared_window(giwk_win, shared_node_comm)
 
+    # with a shell the kernels read the bubble's columns outside the core box only as their sum, when the
+    # double-counting vertex is constant in its summed frequency there (the bare-vertex modes read no such vertex)
+    bare_vertex = config.misc.bare_vertex
+    summed = False
+    if outer_sum is not None and config.box.niv_full > config.box.niv_core:
+        if not outer_sum:
+            outer_sum.append(bare_vertex or _dc_vertex_is_constant_outside_core(comm))
+            if not outer_sum[0]:
+                logger.warning(
+                    "The double-counting vertex is not constant outside the core box: the bubble is built on the full "
+                    "box, which needs more memory than was estimated."
+                )
+        summed = outer_sum[0]
+
     blocks = BubbleGenerator.create_generalized_chi0_q_fft(
         mpi_dist_irrk,
         giwk_full,
@@ -1496,15 +1561,20 @@ def calculate_sigma_proposal(
         involution=involution,
         blocks=True,
         release=release,
+        niv_core=config.box.niv_core if summed else None,
     )
     # the cut giwk stays one copy per node through the SDE
     giwk_full, giwk_win = cut
 
-    logger.log_memory_usage("Gchi0_q_full", blocks, comm.size)
+    outer_sums = None
+    if summed:
+        blocks, outer_sums = blocks
+        logger.log_memory_usage("Gchi0_q_core with its outer sums", blocks + outer_sums, comm.size)
+    else:
+        logger.log_memory_usage("Gchi0_q_full", blocks, comm.size)
 
     # the local vertices are identical on every rank, so they are loaded once per node into shared windows; the
     # double-counting kernel only enters the SDE, which the Eliashberg-only pass skips
-    bare_vertex = config.misc.bare_vertex
     tail_moment = f_dc_loc = None
     if not eliashberg_only and not bare_vertex:
         f_dc_loc, f_dc_win = sde_kernels.load_node_shared_local_vertex(
@@ -1514,7 +1584,9 @@ def calculate_sigma_proposal(
             axes=(4, 0, 1, 5, 2, 3, 6),  # the order contract_first_pair_with_local_vertex reads as a view
         )
     # the full-box bubble is consumed bosonic window by bosonic window, so it never sits beside the whole core box
-    gchi0_q_full_sum, dc_contraction, gchi0_q_core = sde_kernels.bubble_box_parts(blocks, f_dc_loc, not bare_vertex)
+    gchi0_q_full_sum, dc_contraction, gchi0_q_core = sde_kernels.bubble_box_parts(
+        blocks, f_dc_loc, not bare_vertex, outer_sums
+    )
     if f_dc_loc is not None:
         f_dc_loc.mat = None
         if f_dc_win is None:
@@ -2179,10 +2251,11 @@ def calculate_self_energy_q(
         giwk_full_dmft.save(output_dir=config.output.output_path, name=output_files.G_LATT_DMFT)
         giwk_full_dmft.free()
         logger.info("Lattice Green's function calculated.")
-    if comm.rank == 0 and warm_start:
-        n_dmft = GreensFunction.get_occupation(
-            sigma_dmft_full, config.sys.mu_dmft, ek, config.sys.beta, orbitals=orbitals
-        )[0]
+    if warm_start:
+        # the DMFT lattice filling a warm start holds: every rank sums its momenta of the momentum-local DMFT sigma
+        n_dmft = _occupation_on_slices(sigma_dmft_full, config.sys.mu_dmft, mpi_dist_fullbz)[0]
+        # beyond its own box the start holds the momentum-local DMFT tail
+        niv_start = sigma_old.niv if comm.rank == 0 else None
 
     if comm.rank == 0 or not warm_start:
         sigma_old = sigma_old.concatenate_self_energies(sigma_dmft_full)
@@ -2190,18 +2263,8 @@ def calculate_self_energy_q(
     if not warm_start:
         # a fresh start holds the momentum-local DMFT sigma on every rank, so each rank evaluates the filling of the
         # full DMFT box on its own momentum slice (arithmetic decided on all momenta) and assembles it exactly
-        n_my, nb = mpi_dist_fullbz.my_size, ek.shape[-1]
-        ek_my = ek.reshape(-1, nb, nb)[mpi_dist_fullbz.my_slice].reshape(n_my, 1, 1, nb, nb)
-        real_ek = np.isrealobj(np.real_if_close(ek))
-        occ_k_my = (
-            GreensFunction.get_occupation(
-                sigma_old, mu_history[-1], ek_my, config.sys.beta, real_ek, orbitals=orbitals
-            )[2]
-            if n_my
-            else np.zeros((0, 1, 1, nb, nb))
-        )
-        config.sys.n, config.sys.occ, config.sys.occ_k = sde_kernels.assemble_occupation(
-            occ_k_my, mpi_dist_fullbz, orbitals
+        config.sys.n, config.sys.occ, config.sys.occ_k = _occupation_on_slices(
+            sigma_old, mu_history[-1], mpi_dist_fullbz
         )
         if config.misc.do_rpa:
             # RPA mode evaluates its one proposal on the non-interacting lattice: a zero self-energy (new, so its
@@ -2215,16 +2278,7 @@ def calculate_self_energy_q(
             )
             mu_history[-1] = comm.bcast(non_interacting_mu(ek, config.sys.n, config.sys.beta), root=0)
             config.sys.mu = config.sys.mu_non_interacting = mu_history[-1]
-            occ_k_my = (
-                GreensFunction.get_occupation(
-                    sigma_old, mu_history[-1], ek_my, config.sys.beta, real_ek, orbitals=orbitals
-                )[2]
-                if n_my
-                else np.zeros((0, 1, 1, nb, nb))
-            )
-            n_bare, config.sys.occ, config.sys.occ_k = sde_kernels.assemble_occupation(
-                occ_k_my, mpi_dist_fullbz, orbitals
-            )
+            n_bare, config.sys.occ, config.sys.occ_k = _occupation_on_slices(sigma_old, mu_history[-1], mpi_dist_fullbz)
             logger.info(
                 f"RPA mode starts from the non-interacting lattice: mu = {config.sys.mu} gives the filling "
                 f"{n_bare:.6f} (target {config.sys.n:.6f})."
@@ -2233,7 +2287,9 @@ def calculate_self_energy_q(
         # a warm start's own filling drifts along a chain of rungs, so mu is re-solved for the DMFT lattice filling on
         # the loop's frequency box, every rank on its momenta of rank 0's starting iterate
         sigma_cut = sigma_old.cut_niv(niv_cut).compress_q_dimension() if comm.rank == 0 else None
-        n_dmft, smom0 = comm.bcast((n_dmft, sigma_cut.fit_smom()[0]) if comm.rank == 0 else None, root=0)
+        smom0, moments, niv_start = comm.bcast(
+            (sigma_cut.fit_smom()[0], sigma_old.smom, niv_start) if comm.rank == 0 else None, root=0
+        )
         sigma_my = mpi_dist_fullbz.scatter(sigma_cut.mat if comm.rank == 0 else None)
         del sigma_cut
         mu_previous = mu_history[-1]
@@ -2248,22 +2304,27 @@ def calculate_self_energy_q(
             mpi_dist=mpi_dist_fullbz,
             orbitals=orbitals,
         )
-        del sigma_my
         if comm.rank == 0:
             logger.info(
                 f"Warm start holds the DMFT lattice filling {n_dmft:.6f}: mu re-solved from {mu_previous} to "
                 f"{mu_history[-1]}."
             )
-            # only the occupations are needed here: sum the Dyson chunks directly instead of holding a second full-k
-            # Green's function on the full DMFT frequency box (tens of GB at production scale)
-            _, occ, occ_k = GreensFunction.get_occupation(
-                sigma_old, mu_history[-1], ek, config.sys.beta, orbitals=orbitals
-            )
-            config.sys.occ, config.sys.occ_k = orbital_block(occ, orbitals), orbital_block(occ_k, orbitals)
-            config.sys.n = n_dmft
-        config.sys.n, config.sys.occ, config.sys.occ_k = comm.bcast(
-            (config.sys.n, config.sys.occ, config.sys.occ_k), root=0
-        )
+        # only the occupations are needed: every rank sums the Dyson chunks of its momenta of the start on the DMFT
+        # box, its rows of the start's own box with the momentum-local DMFT tail and rank 0's moments of the whole
+        if niv_start > niv_cut:
+            wide = sigma_old.cut_niv(niv_start).compress_q_dimension().mat if comm.rank == 0 else None
+            sigma_my = mpi_dist_fullbz.scatter(wide)
+            del wide
+        sigma_occ = None
+        if len(sigma_my):
+            sigma_occ = SelfEnergy(
+                sigma_my, (len(sigma_my), 1, 1), has_compressed_q_dimension=True, calc_smom=False, beta=config.sys.beta
+            ).concatenate_self_energies(sigma_dmft_full)
+            sigma_occ._smom0, sigma_occ._smom1 = moments
+        del sigma_my
+        _, config.sys.occ, config.sys.occ_k = _occupation_on_slices(sigma_occ, mu_history[-1], mpi_dist_fullbz)
+        config.sys.n = n_dmft
+        del sigma_occ
         config.sys.mu = mu_history[-1]
 
     sigma_old = sigma_old.cut_niv(niv_cut)
@@ -2285,7 +2346,7 @@ def calculate_self_energy_q(
     # only rank 0 finishes the proposal with the Hartree-Fock term, which reads the full q-grid interaction; the first
     # proposal transforms the interactions of both terms for the whole loop
     v_nonloc_full = v_nonloc if comm.rank == 0 else None
-    w_r_full = []
+    w_r_full, outer_sum = [], []
     if config.stabilization.use_jacobian_stabilization and comm.rank == 0 and np.any(v_nonloc.mat):
         held = " and the exact Jacobian holds the offset fixed" if config.stabilization.use_exact_jacobian else ""
         logger.warning(
@@ -2354,6 +2415,7 @@ def calculate_self_energy_q(
             static_magn=static_magn,
             last_chi=last_chi,
             w_r_full=w_r_full,
+            outer_sum=outer_sum,
         )
         mpi_utils.idle_barrier(comm)  # the other nodes sleep while rank 0's node finishes the proposal
 
@@ -2643,6 +2705,7 @@ def calculate_self_energy_q(
             lambda_previous=lambda_previous,
             static_magn=static_magn,
             last_chi=last_chi,
+            outer_sum=outer_sum,
         )
 
     # without a lambda correction the proposals keep their susceptibilities on the ranks, so only the last is written

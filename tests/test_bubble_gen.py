@@ -19,7 +19,7 @@ import dgamore.config as config
 import dgamore.mpi_utils as mpi_utils
 import dgamore.n_point_base as n_point_base
 from dgamore import brillouin_zone as bz
-from dgamore import sde_kernels
+from dgamore import bubble_gen, sde_kernels
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.greens_function import GreensFunction
 from dgamore.matsubara_frequencies import MFHelper
@@ -375,6 +375,110 @@ def test_fft_bubble_in_bosonic_blocks_holds_the_bits_of_the_whole_bubble(ranks, 
     assert all(len(rank_blocks) == (1 if ranks == 1 else niw + 1) for rank_blocks in blocks)
     joined = [np.concatenate([block.mat for block in rank_blocks], axis=-2) for rank_blocks in blocks]
     assert all(np.array_equal(a, b) for a, b in zip(joined, whole))
+
+
+def _core_and_outer_sum(ranks, g, niw, niv, niv_core, q_grid, beta, involution=None):
+    """The core columns ``[q, o1, o2, o3, o4, w, v]`` and the sum of the outer ones ``[q, o1, o2, o3, o4, w]`` of the
+    bubble built with ``niv_core`` on ``ranks`` ranks, the ranks' momenta joined in order."""
+    g_ranks = [g.copy() for _ in range(ranks)]
+
+    def fn(comm, rank):
+        dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
+        cores, sums = BubbleGenerator.create_generalized_chi0_q_fft(
+            dist, g_ranks[rank], niw, niv, q_grid, beta, involution=involution, blocks=True, niv_core=niv_core
+        )
+        assert all(block.num_vn_dimensions == 0 and not block.full_niw_range for block in sums)
+        return np.concatenate([b.mat for b in cores], axis=-2), np.concatenate([b.mat for b in sums], axis=-1)
+
+    parts = _on_ranks(ranks, fn)
+    return np.concatenate([core for core, _ in parts]), np.concatenate([outer for _, outer in parts])
+
+
+@pytest.mark.parametrize("summed_columns", [2, 6])  # three pieces, the middle one on both sides of the core; one piece
+@pytest.mark.parametrize(
+    "ranks, kind", [(1, "plain"), (3, "plain"), (1, "crossing"), (2, "crossing"), (2, "transposed")]
+)
+def test_bubble_with_a_core_box_keeps_its_core_columns_and_sums_the_outer_ones(
+    ranks, kind, summed_columns, monkeypatch
+):
+    """With niv_core the bubble holds the core columns, bit for bit where none is derived, and the outer ones' sum."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(bubble_gen, "SUMMED_COLUMNS", summed_columns)
+    nk, nb, niv, niv_core, niw, beta = (4, 2, 1), 2, 5, 2, 2, 2.5
+    make = {"plain": _make_momentum_g, "crossing": _make_crossing_g}.get(kind)
+    g = make(nk, nb, niv + niw + 2, seed=41) if make else _make_transposed_g(nk, niv + niw + 2, [1, 0], seed=41)
+    q_grid, involution = bz.KGrid(nk, symmetries=[]), np.array([1, 0])
+    dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock())
+    whole = BubbleGenerator.create_generalized_chi0_q_fft(dist, g.copy(), niw, niv, q_grid, beta, involution=involution)
+    core, outer = _core_and_outer_sum(ranks, g, niw, niv, niv_core, q_grid, beta, involution)
+    kept = slice(niv - niv_core, niv + niv_core)
+    expected = whole.mat[..., : kept.start].sum(axis=-1) + whole.mat[..., kept.stop :].sum(axis=-1)
+    bound = 1e-5 * np.abs(whole.mat).max()
+    assert (
+        np.array_equal(core, whole.mat[..., kept])
+        if kind == "plain"
+        else np.allclose(core, whole.mat[..., kept], atol=bound)
+    )
+    assert np.allclose(outer, expected, atol=bound) and np.abs(expected).max() > 1e3 * bound
+
+
+@pytest.mark.parametrize("kind", ["plain", "crossing", "transposed"])
+def test_bubble_with_a_core_box_has_the_same_bits_on_one_rank_and_on_several(kind, monkeypatch):
+    """The core columns and the sum of the outer ones do not depend on the rank count or on the column schedule."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(bubble_gen, "SUMMED_COLUMNS", 2)
+    nk, nb, niv, niv_core, niw, beta = (4, 2, 1), 2, 5, 2, 2, 2.5
+    make = {"plain": _make_momentum_g, "crossing": _make_crossing_g}.get(kind)
+    g = make(nk, nb, niv + niw + 2, seed=43) if make else _make_transposed_g(nk, niv + niw + 2, [1, 0], seed=43)
+    q_grid, involution = bz.KGrid(nk, symmetries=[]), np.array([1, 0])
+    one = _core_and_outer_sum(1, g, niw, niv, niv_core, q_grid, beta, involution)
+    for ranks, budget in ((2, bubble_gen.ROUND_BUFFER_BYTES), (3, 1), (5, 1)):
+        with monkeypatch.context() as mp:
+            mp.setattr(bubble_gen, "ROUND_BUFFER_BYTES", budget)  # a budget of one byte: one component, one column
+            several = _core_and_outer_sum(ranks, g, niw, niv, niv_core, q_grid, beta, involution)
+        assert np.array_equal(several[0], one[0]) and np.array_equal(several[1], one[1])
+
+
+@pytest.mark.parametrize("ranks", [1, 3])
+def test_bubble_with_a_core_box_transforms_one_column_per_piece_and_no_outer_column(ranks, monkeypatch):
+    """The outer columns are transformed as their pieces: per bosonic frequency the core columns and one per piece."""
+    import scipy as sp
+
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    monkeypatch.setattr(bubble_gen, "SUMMED_COLUMNS", 4)
+    nk, nb, niv, niv_core, niw, beta = (4, 2, 1), 2, 6, 2, 2, 2.5
+    g, q_grid = _make_momentum_g(nk, nb, niv + niw + 2, seed=44), bz.KGrid(nk, symmetries=[])
+    shapes, ifftn = [], sp.fft.ifftn
+    monkeypatch.setattr(sp.fft, "ifftn", lambda x, **kwargs: shapes.append(x.shape) or ifftn(x, **kwargs))
+    _core_and_outer_sum(ranks, g, niw, niv, niv_core, q_grid, beta)
+    pieces = BubbleGenerator._summed_pieces(niv, niv_core)
+    assert [piece.tolist() for piece in pieces] == [[0, 1, 2, 3], [8, 9, 10, 11]]
+    assert sum(int(np.prod(shape[3:])) for shape in shapes) == (niw + 1) * (2 * niv_core + len(pieces)) * nb**4
+
+
+def test_sum_column_products_adds_the_products_of_the_columns_over_both_runs_of_frequencies():
+    """The stacked product of a block of momenta gives the columns' elementwise products summed over the columns."""
+    rng, nk, nb, n_v = np.random.default_rng(45), (3, 2, 2), 2, 9
+    window = rng.standard_normal((12, nb * nb, n_v)) + 1j * rng.standard_normal((12, nb * nb, n_v))
+    rev, columns, shift = BubbleGenerator._reversed_momenta(nk), np.array([3, 4, 7, 8]), 2
+    components = np.array([0, 5, 6, 11, 15])
+    out = np.empty((12, len(components)), dtype=window.dtype)
+    BubbleGenerator._sum_column_products(
+        out, window, rev, columns, shift, BubbleGenerator._pair_products(nb, components)
+    )
+    o1, o2, o3, o4 = np.unravel_index(components, (nb,) * 4)
+    left, partner = window[:, o1 * nb + o4][..., columns], window[rev][:, o3 * nb + o2][..., columns - shift]
+    assert np.allclose(out, (left * partner).sum(axis=-1), atol=1e-12)
+
+
+@pytest.mark.parametrize("blocks, niv_core", [(False, 2), (True, 0), (True, 3), (True, 4)])
+def test_bubble_refuses_a_core_box_without_blocks_or_not_inside_its_box(blocks, niv_core):
+    """The outer columns are summed only for a bubble in bosonic blocks and a core box of 1 to niv - 1 frequencies."""
+    nk, niv, niw = (2, 1, 1), 3, 1
+    g, q_grid = _make_momentum_g(nk, 1, niv + niw + 1, seed=46), bz.KGrid(nk, symmetries=[])
+    dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock())
+    with pytest.raises(ValueError, match="outer columns"):
+        BubbleGenerator.create_generalized_chi0_q_fft(dist, g, niw, niv, q_grid, 2.0, blocks=blocks, niv_core=niv_core)
 
 
 @pytest.mark.parametrize("ranks", [1, 2])
@@ -809,6 +913,9 @@ def test_column_pass_peak_does_not_grow_with_the_number_of_rounds():
 
         return traced_peak(run)[1]
 
+    # under coverage's sysmon core the first call reads low: traced_peak subtracts the tables coverage allocates after
+    # the peak for code it sees first
+    peak(1)
     one_round = peak(1)
     assert peak(4) <= 1.05 * one_round
 
