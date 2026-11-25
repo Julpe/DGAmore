@@ -38,7 +38,7 @@ import dgamore.local_sde as local_sde
 import dgamore.memory_estimator as memory_estimator
 import dgamore.mpi_utils as mpi_utils
 import dgamore.nonlocal_sde as nonlocal_sde
-from dgamore import max_ent
+from dgamore import gap_classification, max_ent, output_files
 from dgamore.brillouin_zone import is_auto_symmetries
 from dgamore.config_parser import ConfigParser
 from dgamore.greens_function import GreensFunction, non_interacting_mu
@@ -271,7 +271,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         for g2_per_ineq, channel in [(g2_dens_per_ineq, "dens"), (g2_magn_per_ineq, "magn")]:
             for g2 in g2_per_ineq:
                 g2.to_half_niw_range()
-            g2_full = save_full_4pt_quantity(g2_per_ineq, f"g2_{channel}_loc")
+            g2_full = save_full_4pt_quantity(g2_per_ineq, output_files.local_name("g2", SpinChannel(channel)))
             if config.output.do_plotting:
                 from dgamore import plotting
 
@@ -378,16 +378,16 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         # one quantity at a time is assembled, saved (and plotted) and dropped with its per-atom objects: the later
         # steps read the files, so no local vertex stays on rank 0. chi_*_loc.npy is read by both lambda corrections.
         for obj_per_ineq, name in [
-            (chi_d_per_ineq, "chi_dens_loc"),
-            (chi_m_per_ineq, "chi_magn_loc"),
-            (vrg_d_per_ineq, "vrg_dens_loc"),
-            (vrg_m_per_ineq, "vrg_magn_loc"),
+            (chi_d_per_ineq, output_files.local_name("chi", SpinChannel.DENS)),
+            (chi_m_per_ineq, output_files.local_name("chi", SpinChannel.MAGN)),
+            (vrg_d_per_ineq, output_files.local_name("vrg", SpinChannel.DENS)),
+            (vrg_m_per_ineq, output_files.local_name("vrg", SpinChannel.MAGN)),
         ]:
             save_full_4pt_quantity(obj_per_ineq, name)
             obj_per_ineq.clear()
 
         for gchi_per_ineq, channel in [(gchi_d_per_ineq, "dens"), (gchi_m_per_ineq, "magn")]:
-            gchi_full = save_full_4pt_quantity(gchi_per_ineq, f"gchi_{channel}_loc")
+            gchi_full = save_full_4pt_quantity(gchi_per_ineq, output_files.local_name("gchi", SpinChannel(channel)))
             gchi_per_ineq.clear()
             if config.output.do_plotting:
                 from dgamore import plotting
@@ -398,7 +398,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
             logger.info(f"Local generalized susceptibilities dens & magn plotted.")
 
         for gamma_per_ineq, channel in [(gamma_d_per_ineq, "dens"), (gamma_m_per_ineq, "magn")]:
-            gamma_full = save_full_4pt_quantity(gamma_per_ineq, f"gamma_{channel}_loc")
+            gamma_full = save_full_4pt_quantity(gamma_per_ineq, output_files.local_name("gamma", SpinChannel(channel)))
             gamma_per_ineq.clear()
             if config.output.do_plotting:
                 from dgamore import plotting
@@ -422,9 +422,9 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         del f_d, f_m
         f_d_per_ineq.clear()
         for obj_per_ineq, name in [
-            (f_m_per_ineq, "f_dc_loc"),
-            (f_d_core_per_ineq, "f_dens_loc"),
-            (f_m_core_per_ineq, "f_magn_loc"),
+            (f_m_per_ineq, output_files.F_DC_LOC),
+            (f_d_core_per_ineq, output_files.local_name("f", SpinChannel.DENS)),
+            (f_m_core_per_ineq, output_files.local_name("f", SpinChannel.MAGN)),
         ]:
             save_full_4pt_quantity(obj_per_ineq, name)
             obj_per_ineq.clear()
@@ -461,7 +461,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
 
     if comm.rank == 0:
         sigma_dmft_full.save(name="sigma_dmft", output_dir=config.output.output_path)
-        g_dmft_full.save(name="g_dmft", output_dir=config.output.output_path)
+        g_dmft_full.save(name=output_files.G_DMFT, output_dir=config.output.output_path)
         sigma_loc_full.save(name="siw_dga_local", output_dir=config.output.output_path)
 
     if comm.rank != 0:
@@ -511,7 +511,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         g_latt = None
         if comm.rank == 0:
             g_latt = GreensFunction(
-                np.load(os.path.join(config.output.output_path, "g_latt_dmft.npy")),
+                np.load(output_files.npy_path(config.output.output_path, output_files.G_LATT_DMFT)),
                 nk=config.lattice.nk,
                 beta=config.sys.beta,
             ).cut_niv(config.box.niv_core)
@@ -536,7 +536,7 @@ def run_dga_routine(comm: MPI.Comm) -> int:
         del spectrum
 
     if comm.rank == 0:
-        sigma_dga.save(name=f"sigma_dga", output_dir=config.output.output_path)
+        sigma_dga.save(name=output_files.SIGMA_DGA, output_dir=config.output.output_path)
         logger.info("Saved non-local self-energy as numpy file.")
 
         giwk_dga.save(name=f"giwk_dga", output_dir=config.output.output_path)
@@ -676,7 +676,7 @@ def _readable_label(channel: SpinChannel, parity: str) -> str:
 def _write_gap_parity(results: dict, ek: np.ndarray, inversion: np.ndarray | None) -> None:
     r"""
     Writes ``gap_parity.txt``, one line per gap: its label (see
-    :func:`~dgamore.eliashberg_solver.classify_gap_symmetry`, whose s+- test reads the bare bands at the run's
+    :func:`~dgamore.gap_classification.classify_gap_symmetry`, whose s+- test reads the bare bands at the run's
     filling), the parity Rayleigh quotients of T, P, O and PO (see
     :func:`~dgamore.eliashberg_solver.gap_parity_diagnostics`), led by those of the sector operators TOU and PU where
     the sectors were solved, and its even-frequency weight.
@@ -689,12 +689,12 @@ def _write_gap_parity(results: dict, ek: np.ndarray, inversion: np.ndarray | Non
     mu_bare = (
         config.sys.mu_non_interacting if config.misc.do_rpa else non_interacting_mu(ek, config.sys.n, config.sys.beta)
     )
-    bands = eliashberg_solver.fermi_surface_bands(ek, mu_bare, config.sys.correlated_orbitals)
+    bands = gap_classification.fermi_surface_bands(ek, mu_bare, config.sys.correlated_orbitals)
     keys = ("TOU", "PU", "T", "P", "O", "PO") if config.eliashberg.resolve_parity_sectors else ("T", "P", "O", "PO")
     with open(os.path.join(config.output.eliashberg_path, "gap_parity.txt"), "w") as parity_file:
         for (channel, parity), (_lambdas, gaps) in results.items():
             for i, gap in enumerate(gaps):
-                label = eliashberg_solver.classify_gap_symmetry(gap.mat, bands=bands)
+                label = gap_classification.classify_gap_symmetry(gap.mat, bands=bands)
                 diagnostics = eliashberg_solver.gap_parity_diagnostics(gap.mat.flatten(), gap.mat.shape, inversion)
                 parity_file.write(
                     f"{label} {_readable_label(channel, parity)} {i+1}: "
@@ -725,7 +725,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     memory limit when the scheduler sets one (see :func:`dgamore.mpi_utils.cgroup_memory_limit`). A node is the group
     of ranks that share memory (``comm.Split_type(MPI.COMM_TYPE_SHARED)``, the groups the node-shared windows are
     built on), not a hostname, and its available memory is the minimum over its ranks (see
-    :func:`dgamore.eliashberg_solver._node_groups`); a branch's path is judged to "fit" only if it fits on **every**
+    :func:`~dgamore.mpi_utils.node_groups`); a branch's path is judged to "fit" only if it fits on **every**
     node (the flags are process-wide, so the tightest node governs). On a multi-rank job the in-memory Eliashberg
     solve is judged by the team solve's node formula, with rank 0's full-grid interaction on rank 0's node. A
     :class:`MemoryError` is raised only if the path that would actually run does not fit.
@@ -752,7 +752,7 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     if cgroup_limit is not None:
         node_available = min(node_available, cgroup_limit)
     node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
-    node_ranks, node_host, node_free = eliashberg_solver._node_groups(comm, node_comm, node_available)
+    node_ranks, node_host, node_free = mpi_utils.node_groups(comm, node_comm, node_available)
     node_comm.Free()
     nodes = {root: [ranks, node_free[root]] for root, ranks in node_ranks.items()}
     nk_irr, nk_tot = config.lattice.k_grid.nk_irr, config.lattice.k_grid.nk_tot

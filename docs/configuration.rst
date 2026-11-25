@@ -423,7 +423,7 @@ the RPA susceptibility of the bubble,
 
 The bubble is summed over all fermionic frequencies: over the box of :math:`n` = ``niv_core + niv_shell`` positive
 and as many negative frequencies, plus the analytic sum beyond it to the leading order :math:`G \simeq 1/\imath\nu` of
-the Green's function (:func:`~dgamore.nonlocal_sde.create_bubble_tail`). Without that tail the bubble falls short by
+the Green's function (:func:`~dgamore.sde_kernels.create_bubble_tail`). Without that tail the bubble falls short by
 about :math:`\beta / (2\pi^2 n)` on the diagonal of its compound-index matrix, which keeps every susceptibility away
 from its Stoner pole, most at low temperature. The tail is of second order for bosonic frequencies well inside the
 box; towards its edge the left-out frequencies reach :math:`\nu \approx \omega`, where :math:`G(\nu - \omega)` is far

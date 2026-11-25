@@ -19,7 +19,7 @@ import dgamore.config as config
 import dgamore.mpi_utils as mpi_utils
 import dgamore.n_point_base as n_point_base
 from dgamore import brillouin_zone as bz
-from dgamore import nonlocal_sde
+from dgamore import sde_kernels
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.greens_function import GreensFunction
 from dgamore.matsubara_frequencies import MFHelper
@@ -557,10 +557,10 @@ def test_crossing_bubble_exchanges_only_the_computed_columns(monkeypatch):
     g = _make_crossing_g(nk, nb, niv + niw + 2, seed=81)
     q_grid = bz.KGrid(nk, symmetries=[])
     n_computed = len(BubbleGenerator._crossing_columns(MFHelper.wn(niw, return_only_positive=True), niv)[0])
-    sent, isend = [], mpi_utils._isend_rows
+    sent, isend = [], mpi_utils.isend_rows
     monkeypatch.setattr(
         mpi_utils,
-        "_isend_rows",
+        "isend_rows",
         lambda comm, arr, *args, **kwargs: sent.append(arr.shape[-1]) or isend(comm, arr, *args, **kwargs),
     )
     g_ranks = [g.copy() for _ in range(ranks)]
@@ -1043,7 +1043,7 @@ def _window_bubbles(comm, greens, niv, niw, q_grid, beta, bounds) -> list:
     """Builds the windows of G and the changes, runs the window bubble per bosonic window and frees the windows."""
     node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
     dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
-    built = [nonlocal_sde._build_rspace_giwk_window(g, node_comm, niv_window=niv + niw) for g in greens]
+    built = [sde_kernels.build_rspace_giwk_window(g, node_comm, niv_window=niv + niw) for g in greens]
     groups = [
         BubbleGenerator.create_generalized_chi0_q_fft_window(
             dist, built[0][0], niv, q_grid, beta, (w0, w1), [g_r for g_r, _ in built[1:]]
@@ -1053,7 +1053,7 @@ def _window_bubbles(comm, greens, niv, niw, q_grid, beta, bounds) -> list:
     wins = [win for _, win in built]
     built = None
     for win in wins:
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
     return [np.concatenate([group[i].mat for group in groups], axis=-2) for i in range(len(greens))]
 
 
@@ -1157,7 +1157,7 @@ def test_window_bubble_refuses_an_empty_window_or_one_beyond_the_rspace_frequenc
     g = _make_momentum_g(nk, nb, niv + niw + 1, seed=45)
     q_grid = bz.KGrid(nk, symmetries=[])
     dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock())
-    g_r, _ = nonlocal_sde._build_rspace_giwk_window(g, create_comm_mock(), niv_window=niv + niw)
+    g_r, _ = sde_kernels.build_rspace_giwk_window(g, create_comm_mock(), niv_window=niv + niw)
     with pytest.raises(ValueError):
         BubbleGenerator.create_generalized_chi0_q_fft_window(dist, g_r, niv, q_grid, beta, w_window)
 
@@ -1168,7 +1168,7 @@ def test_window_bubble_peaks_at_its_bubbles_and_one_column_round_without_copying
     g, dg = (_make_momentum_g(nk, nb, 402, seed=seed) for seed in (46, 47))
     q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
     dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock())
-    g_r, dg_r = (nonlocal_sde._build_rspace_giwk_window(x, create_comm_mock(), niv_window=400)[0] for x in (g, dg))
+    g_r, dg_r = (sde_kernels.build_rspace_giwk_window(x, create_comm_mock(), niv_window=400)[0] for x in (g, dg))
 
     def run():
         return BubbleGenerator.create_generalized_chi0_q_fft_window(dist, g_r, niv, q_grid, beta, (0, niw + 1), [dg_r])
@@ -1191,7 +1191,7 @@ def test_window_bubble_without_the_bubble_of_g_returns_the_bits_of_its_responses
     def fn(comm, rank):
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
         dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=comm)
-        built = [nonlocal_sde._build_rspace_giwk_window(g, node_comm, niv_window=niv + niw) for g in greens]
+        built = [sde_kernels.build_rspace_giwk_window(g, node_comm, niv_window=niv + niw) for g in greens]
         g_r, dg_rs = built[0][0], [g for g, _ in built[1:]]
         window = BubbleGenerator.create_generalized_chi0_q_fft_window
         both = [b.mat.copy() for b in window(dist, g_r, niv, q_grid, beta, (1, 4), dg_rs)[1:]]
@@ -1199,7 +1199,7 @@ def test_window_bubble_without_the_bubble_of_g_returns_the_bits_of_its_responses
         wins = [win for _, win in built]
         built = g_r = dg_rs = None
         for win in wins:
-            nonlocal_sde._free_shared_window(win, node_comm)
+            mpi_utils.free_shared_window(win, node_comm)
         return both, alone
 
     results = _on_ranks(ranks, fn, hostnames)
@@ -1232,9 +1232,7 @@ def test_window_bubble_on_one_rank_transforms_all_fermionic_columns_of_a_frequen
     g, dg = (_make_momentum_g(nk, nb, niv + niw + 2, seed=seed) for seed in (65, 66))
     q_grid = bz.KGrid(nk, bz.two_dimensional_square_symmetries())
     dist = MpiDistributor.create_distributor(ntasks=q_grid.nk_irr, comm=create_comm_mock())
-    g_r, dg_r = (
-        nonlocal_sde._build_rspace_giwk_window(x, create_comm_mock(), niv_window=niv + niw)[0] for x in (g, dg)
-    )
+    g_r, dg_r = (sde_kernels.build_rspace_giwk_window(x, create_comm_mock(), niv_window=niv + niw)[0] for x in (g, dg))
     shapes, real = [], sp.fft.ifftn
 
     def column_pass(*args):

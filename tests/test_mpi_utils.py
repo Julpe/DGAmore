@@ -833,15 +833,15 @@ def test_send_recv_bytes_roundtrip_multichunk():
 
 
 def test_isend_irecv_rows_roundtrip_multichunk():
-    """_isend_rows / _irecv_rows_into round-trip an array across multiple chunks via non-blocking requests."""
+    """isend_rows / irecv_rows_into round-trip an array across multiple chunks via non-blocking requests."""
     arr = (np.arange(6 * 2).reshape(6, 2) + 1j).astype(np.complex128)
 
     def fn(comm, rank):
         if rank == 0:
-            MPI.Request.Waitall(mu._isend_rows(comm, arr, dest=1, limit=16))
+            MPI.Request.Waitall(mu.isend_rows(comm, arr, dest=1, limit=16))
             return None
         buf = np.empty_like(arr)
-        MPI.Request.Waitall(mu._irecv_rows_into(comm, buf, source=0, limit=16))
+        MPI.Request.Waitall(mu.irecv_rows_into(comm, buf, source=0, limit=16))
         return buf
 
     _, res = run_parallel(2, fn)
@@ -849,10 +849,19 @@ def test_isend_irecv_rows_roundtrip_multichunk():
 
 
 def test_isend_rows_rejects_non_contiguous():
-    """_isend_rows refuses a non-C-contiguous array (it must not silently stage a throwaway copy)."""
+    """isend_rows refuses a non-C-contiguous array (it must not silently stage a throwaway copy)."""
     arr = (np.arange(6 * 2).reshape(6, 2) + 1j).astype(np.complex128).T  # F-contiguous view
     with pytest.raises(ValueError):
-        mu._isend_rows(comm1(), arr, dest=0)
+        mu.isend_rows(comm1(), arr, dest=0)
+
+
+def test_free_shared_window_frees_window_but_keeps_communicator():
+    """free_shared_window barriers and frees the window but leaves the node communicator alive (reused for the cut)."""
+    win, node_comm = MagicMock(), MagicMock()
+    mu.free_shared_window(win, node_comm)
+    node_comm.Barrier.assert_called_once()
+    win.Free.assert_called_once()
+    node_comm.Free.assert_not_called()
 
 
 def test_allocate_node_shared_array_single_rank_returns_private_array():

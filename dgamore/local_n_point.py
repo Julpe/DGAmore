@@ -18,7 +18,7 @@ import numpy as np
 from dgamore.n_point_base import IHaveMat
 
 
-def _flush_and_drop(path: str) -> None:
+def flush_and_drop(path: str) -> None:
     """
     Forces a freshly written file to disk and drops its pages from the page cache. Without this a large dump lingers
     as dirty, not yet evictable memory until the kernel's writeback catches up (Linux keeps dirty pages up to
@@ -605,7 +605,7 @@ class LocalNPoint(IHaveMat):
         Saves the content of the matrix to a numpy file. Always saves it in half the niw range to save storage space.
         With ``niv_cut`` only that many fermionic frequencies per sign are written, the file then holding what
         :meth:`cut_niv` would give; the window is written from a view, so no cut copy is made. The file is forced to
-        disk and dropped from the page cache right away (see :func:`_flush_and_drop`), so the dumps of a rank never
+        disk and dropped from the page cache right away (see :func:`flush_and_drop`), so the dumps of a rank never
         accumulate as dirty page cache next to its arrays.
 
         :param output_dir: Directory to write the ``.npy`` file to.
@@ -617,7 +617,7 @@ class LocalNPoint(IHaveMat):
         path = os.path.join(output_dir, f"{name}.npy")
         mat = self.to_half_niw_range().mat
         np.save(path, mat if niv_cut is None else mat[self._vn_window(niv_cut)], allow_pickle=False)
-        _flush_and_drop(path)
+        flush_and_drop(path)
         if is_self_full_niw_range:
             self.to_full_niw_range()
 

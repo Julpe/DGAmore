@@ -20,13 +20,13 @@ import pytest
 from scipy.linalg import block_diag
 
 import dgamore.jacobian_stabilization as jacobian_stabilization
-from dgamore.jacobian_stabilization import _CHECK_BAND, _CHECK_START, _FLIP_OVERLAP, _FLIP_PERSIST, _MAP_NORM_CAP
+from dgamore.jacobian_stabilization import _CHECK_BAND, CHECK_START, _FLIP_OVERLAP, _FLIP_PERSIST, _MAP_NORM_CAP
 from dgamore.jacobian_stabilization import _MARGIN, _MAX_BETA_STEP_RATIO, _MAX_EXACT_CHECKS, _MIN_ITERATION_CAP
-from dgamore.jacobian_stabilization import _MIXING_FLOOR, _NOISE_FACTOR, _PERSIST, _RITZ_GATE, _SCHUR_TOL
+from dgamore.jacobian_stabilization import _MIXING_FLOOR, _NOISE_FACTOR, _PERSIST, RITZ_GATE, _SCHUR_TOL
 from dgamore.jacobian_stabilization import _SIGNS_UNBOUNDED, _STORE_BAND, _SUBSPACE_ANGLE, JACOBIAN_FILE
 from dgamore.jacobian_stabilization import JacobianTracker, SchurForm, TRACKER_PAIRS, _carried_nonuniform_map
 from dgamore.jacobian_stabilization import _conjugate_partners, _diagonal_positions, _direction_damping, _match_modes
-from dgamore.jacobian_stabilization import _nonuniform_map, _ritz_from_increments, _schur_ritz, classify
+from dgamore.jacobian_stabilization import _nonuniform_map, _ritz_from_increments, schur_ritz, classify
 from dgamore.jacobian_stabilization import detect_pole_jump, load_spectrum, predict_crossing, predict_rung_crossing
 from dgamore.jacobian_stabilization import secant_ritz, to_mat, to_vec
 from tests.conftest import linear_pairs
@@ -210,11 +210,11 @@ def test_secant_ritz_recovers_the_dominant_planted_mode(n, real_eigs, pair_eigs)
     mat = planted_jacobian(n, real_eigs, pair_eigs, rng)
     xs, fs = damped_history(mat, rng.standard_normal(n), 0.5, 14, np.random.default_rng(90))
     theta, _, res = secant_ritz(xs[:, -7:], fs[:, -7:])
-    gated = res <= _RITZ_GATE * np.maximum(1.0, np.abs(theta))
+    gated = res <= RITZ_GATE * np.maximum(1.0, np.abs(theta))
     for target in real_eigs + pair_eigs + [lam.conjugate() for lam in pair_eigs]:
         assert np.min(np.abs(theta[gated] - target)) < 1e-3
     if real_eigs:
-        assert np.min(res[np.abs(theta - 1.3) < 1e-3]) < _RITZ_GATE
+        assert np.min(res[np.abs(theta - 1.3) < 1e-3]) < RITZ_GATE
 
 
 def test_secant_ritz_matches_dense_eig_on_tiny_map():
@@ -245,9 +245,9 @@ def test_secant_ritz_drops_noise_columns_at_single_precision():
     fs = np.column_stack([to_vec(mat) for mat in proposals[-7:]])
     floor = _NOISE_FACTOR * np.finfo(np.float32).eps * float(np.linalg.norm(xs[:, -1]))
     theta, _, res = _ritz_from_increments(np.diff(xs, axis=1), np.diff(fs, axis=1), 0.0)[:3]
-    lam_pi = 1.0 - theta[res <= _RITZ_GATE * np.maximum(1.0, np.abs(theta))]
+    lam_pi = 1.0 - theta[res <= RITZ_GATE * np.maximum(1.0, np.abs(theta))]
     theta_kept, _, res_kept = _ritz_from_increments(np.diff(xs, axis=1), np.diff(fs, axis=1), floor)[:3]
-    gated_kept = res_kept <= _RITZ_GATE * np.maximum(1.0, np.abs(theta_kept))
+    gated_kept = res_kept <= RITZ_GATE * np.maximum(1.0, np.abs(theta_kept))
     assert np.max(np.abs(lam_pi)) > 3.0
     assert theta_kept.size == 2
     assert np.max(np.min(np.abs(theta_kept[gated_kept, None] - np.array([1.3, 0.5])), axis=1)) < 1e-2
@@ -343,7 +343,7 @@ def _map_gain(tracker: JacobianTracker, residual: np.ndarray) -> float:
 
 def _schur_map(b_proj: np.ndarray, q_kept: np.ndarray, gated: list[bool], log: MagicMock | None = None) -> tuple:
     """Builds the per-direction map of b_proj on q_kept with the flip below -_MARGIN; returns lambda_Pi, flip, map."""
-    theta, _, form = _schur_ritz(b_proj)
+    theta, _, form = schur_ritz(b_proj)
     lam_pi = 1.0 - theta
     flip = lam_pi.real < -_MARGIN
     return lam_pi, flip, _nonuniform_map(q_kept, form, theta, lam_pi, flip, np.array(gated), log)
@@ -454,7 +454,7 @@ def test_a_growing_residual_releases_the_map_and_holds_it_off_for_persist_update
 def test_nonuniform_map_damps_each_certified_direction_of_a_non_normal_map():
     """Every certified Ritz direction is an eigendirection of the map at its own signed damping, which is reported."""
     q_kept, b_proj = _projected_map(7, [4.0, -3.6, 0.7, 0.4], 0.5)
-    theta, y, form = _schur_ritz(b_proj)
+    theta, y, form = schur_ritz(b_proj)
     lam_pi, gated = 1.0 - theta, np.array([True, True, True, False])
     (span, dual, damping), applied = _nonuniform_map(q_kept, form, theta, lam_pi, lam_pi.real < -_MARGIN, gated)
     expected = np.where(lam_pi.real < -_MARGIN, -1.0, 1.0) * np.minimum(1.0, np.abs(lam_pi.real) / np.abs(lam_pi) ** 2)
@@ -469,7 +469,7 @@ def test_nonuniform_map_damps_each_certified_direction_of_a_non_normal_map():
 def test_the_oblique_projector_leaves_an_uncertified_direction_of_a_non_normal_map_at_the_mixings_step():
     """An uncertified Ritz direction of a non-normal map keeps exactly the step the mixing gave it."""
     q_kept, b_proj = _projected_map(7, [4.0, -3.6, 0.7, 0.4], 0.5)
-    theta, y, form = _schur_ritz(b_proj)
+    theta, y, form = schur_ritz(b_proj)
     lam_pi, gated, p_step = 1.0 - theta, np.array([True, True, True, False]), 0.2
     tracker = JacobianTracker(0.4)
     tracker._nonuniform = _nonuniform_map(q_kept, form, theta, lam_pi, lam_pi.real < -_MARGIN, gated)[0]
@@ -490,7 +490,7 @@ def test_the_certified_projector_falls_back_to_the_orthogonal_one_on_a_nearly_pa
 def test_nonuniform_map_leaves_an_uncertified_direction_outside_the_certified_span():
     """An uncertified Ritz direction of a normal map is orthogonal to the span the damping is built on."""
     q_kept, b_proj = _projected_map(7, [4.0, -3.6, 0.7, 0.4], 0.0)
-    theta, y, form = _schur_ritz(b_proj)
+    theta, y, form = schur_ritz(b_proj)
     lam_pi, gated = 1.0 - theta, np.array([True, True, True, False])
     span = _nonuniform_map(q_kept, form, theta, lam_pi, lam_pi.real < -_MARGIN, gated)[0][0]
     assert np.allclose(span.T @ (q_kept @ y[:, 3]), 0.0, atol=1e-10)
@@ -504,7 +504,7 @@ _COUPLED_FORM = np.array(  # a flip at -0.5 beside a near-neutral pair 0.002 -+ 
 
 def _coupled_fallback() -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple, np.ndarray]:
     """Builds the map of _COUPLED_FORM; returns lambda_Pi, the flip mask, the Ritz vectors, the map and its damping."""
-    theta, y, form = _schur_ritz(_COUPLED_FORM)
+    theta, y, form = schur_ritz(_COUPLED_FORM)
     lam_pi, q_kept = 1.0 - theta, np.eye(8, 4)
     flip = lam_pi.real < -_MARGIN
     built, applied = _nonuniform_map(q_kept, form, theta, lam_pi, flip, np.ones(4, dtype=bool))
@@ -523,7 +523,7 @@ def test_the_fallback_damps_only_the_coupled_blocks_uniformly_and_signs_every_ei
 
 def test_two_coincident_certified_blocks_share_one_damping_and_the_flipped_block_keeps_its_own():
     """Two stable blocks of one eigenvalue build without a uniform fallback, the flipped eigenvector at its own -p."""
-    theta, y, form = _schur_ritz(_FALLBACK_FORM)
+    theta, y, form = schur_ritz(_FALLBACK_FORM)
     lam_pi, flip, q_kept = 1.0 - theta, (1.0 - theta).real < -_MARGIN, np.eye(8, 3)
     built, applied = _nonuniform_map(q_kept, form, theta, lam_pi, flip, np.ones(3, dtype=bool))
     expected = _direction_damping(lam_pi, flip)
@@ -669,7 +669,7 @@ def test_reflector_and_map_survive_a_nearly_defective_flipped_pair():
     upper = np.diag([4.0, 4.0 - 1e-2, 0.7, 0.4])
     upper[0, 1] = 1e3
     q_kept = np.linalg.qr(rng.standard_normal((10, 4)))[0]
-    theta, y, form = _schur_ritz(orth @ upper @ orth.T)
+    theta, y, form = schur_ritz(orth @ upper @ orth.T)
     flip, u = theta.real > 2.0, q_kept @ y
     q, w = JacobianTracker(0.2)._flipped_reflector(flip, q_kept, form)
     reflect = lambda v: v - 2.0 * (q @ (w @ v))
@@ -685,7 +685,7 @@ def test_a_conjugate_pair_is_located_on_its_schur_block_and_flipped_as_one():
     q_kept = np.linalg.qr(rng.standard_normal((10, 4)))[0]
     orth = np.linalg.qr(rng.standard_normal((4, 4)))[0]
     block = np.array([[0.9, -1.2, 0.3, 0.1], [1.2, 0.9, 0.0, 0.2], [0.0, 0.0, 0.3, 0.05], [0.0, 0.0, 0.0, 0.5]])
-    theta, y, form = _schur_ritz(orth @ block @ orth.T)
+    theta, y, form = schur_ritz(orth @ block @ orth.T)
     pair = np.abs(theta.imag) > 1.0
     low = int(form.positions[pair].min())
     assert sorted(form.positions[pair]) == [low, low + 1] and form.t[low + 1, low] != 0.0
@@ -948,7 +948,7 @@ def _planted_stiff_updates(monkeypatch, tracker: JacobianTracker, values: list[f
     planted = iter(values)
 
     def ritz(dx, df, floor, norm):
-        theta, y, form = _schur_ritz(np.array([[1.0 - next(planted)]]))
+        theta, y, form = schur_ritz(np.array([[1.0 - next(planted)]]))
         return theta, np.eye(4, 1) @ y, res * np.abs(theta), np.eye(4, 1), form, np.ones(1)
 
     monkeypatch.setattr(jacobian_stabilization, "_ritz_from_increments", ritz)
@@ -1099,7 +1099,7 @@ def test_a_nearly_collinear_increment_of_a_large_step_certifies_no_spurious_ritz
     certified = []
     for norm in (np.inf, np.sqrt(6.0)):
         theta, _, res, _, _, _ = _ritz_from_increments(dx, df, 0.0, norm)
-        certified.append(1.0 - theta[res <= _RITZ_GATE * np.maximum(1.0, np.abs(theta))])
+        certified.append(1.0 - theta[res <= RITZ_GATE * np.maximum(1.0, np.abs(theta))])
     assert np.min(certified[0].real) < -90.0 and certified[0].size == 4
     assert certified[1].size == 3 and np.allclose(np.sort(certified[1].real), [0.3, 0.4, 0.5], atol=1e-10)
 
@@ -1223,7 +1223,7 @@ def _projected_map(seed: int, diagonal: list[float], coupling: float) -> tuple[n
 def test_reflector_of_a_normal_map_is_the_orthogonal_reflection():
     """On a symmetric projected map the Schur reflector is the orthogonal reflection of the flipped eigendirections."""
     q_kept, b_proj = _projected_map(5, [4.0, -3.6, 0.7, 0.4], 0.0)
-    theta, y, form = _schur_ritz(b_proj)
+    theta, y, form = schur_ritz(b_proj)
     flip = theta.real > 2.0
     u = q_kept @ y
     q, w = JacobianTracker(0.2)._flipped_reflector(flip, q_kept, form)
@@ -1236,7 +1236,7 @@ def test_reflector_of_a_normal_map_is_the_orthogonal_reflection():
 def test_reflector_projector_commutes_with_the_projected_jacobian():
     """The projector the reflector carries is idempotent and commutes with the projected Jacobian it was built from."""
     q_kept, b_proj = _projected_map(11, [4.0, -3.6, 0.7, 0.4], 0.5)
-    theta, _, form = _schur_ritz(b_proj)
+    theta, _, form = schur_ritz(b_proj)
     q, w = JacobianTracker(0.2)._flipped_reflector(theta.real > 2.0, q_kept, form)
     projector = q_kept.T @ q @ w @ q_kept
     assert np.allclose(projector @ projector, projector, atol=1e-10)
@@ -1249,7 +1249,7 @@ def test_reflector_flips_a_conjugate_pair_as_one_real_block():
     q_kept = np.linalg.qr(rng.standard_normal((10, 4)))[0]
     orth = np.linalg.qr(rng.standard_normal((4, 4)))[0]
     block = np.array([[0.9, -1.2, 0.3, 0.1], [1.2, 0.9, 0.0, 0.2], [0.0, 0.0, 0.3, 0.05], [0.0, 0.0, 0.0, 0.5]])
-    theta, y, form = _schur_ritz(orth @ block @ orth.T)
+    theta, y, form = schur_ritz(orth @ block @ orth.T)
     flip = np.abs(theta) > 1.0
     q, w = JacobianTracker(0.2)._flipped_reflector(flip, q_kept, form)
     u = q_kept @ y
@@ -1261,7 +1261,7 @@ def test_reflector_flips_a_conjugate_pair_as_one_real_block():
 def test_reflector_falls_back_to_the_orthogonal_reflection_on_a_nearly_parallel_complement():
     """A flipped subspace closer to its complement than the obliquity cap is reflected orthogonally."""
     logger = MagicMock()
-    theta, _, form = _schur_ritz(np.array([[4.0, 100.0], [0.0, 0.7]]))
+    theta, _, form = schur_ritz(np.array([[4.0, 100.0], [0.0, 0.7]]))
     q, w = JacobianTracker(0.2, logger=logger)._flipped_reflector(theta.real > 2.0, np.eye(8, 2), form)
     assert np.allclose(w, q.T, atol=1e-12)
     assert any("orthogonal reflection" in call[0][0] for call in logger.info.call_args_list)
@@ -1270,7 +1270,7 @@ def test_reflector_falls_back_to_the_orthogonal_reflection_on_a_nearly_parallel_
 def test_reflector_refuses_a_flipped_subspace_it_cannot_separate():
     """Two eigenvalues 1e-9 apart with one of them flipped blow up the Sylvester solution, so no reflector is built."""
     tracker, logger = _logged_tracker(0.2)
-    theta, _, form = _schur_ritz(np.array([[4.0, 0.5], [0.0, 4.0 + 1e-9]]))
+    theta, _, form = schur_ritz(np.array([[4.0, 0.5], [0.0, 4.0 + 1e-9]]))
     assert tracker._flipped_reflector(np.array([False, True]), np.eye(6, 2), form) is None
     assert "Sylvester solution norm" in logger.info.call_args_list[-2][0][0]
     assert "not separable from its complement" in logger.info.call_args[0][0]
@@ -1280,7 +1280,7 @@ def test_reflector_refuses_a_schur_form_lapack_cannot_reorder(monkeypatch):
     """A reordering LAPACK itself refuses (two blocks too close to swap) leaves the flipped subspace inseparable."""
     tracker, logger = _logged_tracker(0.2)
     q_kept, b_proj = _projected_map(29, [4.0, -3.6, 0.7, 0.4], 0.3)
-    theta, _, form = _schur_ritz(b_proj)
+    theta, _, form = schur_ritz(b_proj)
     refused = (form.t, form.z, np.diag(form.t), np.zeros(4), 2, 0.0, 0.0, 1)
     monkeypatch.setattr("dgamore.jacobian_stabilization.dtrsen", MagicMock(return_value=refused))
     assert tracker._flipped_reflector(theta.real > 2.0, q_kept, form) is None
@@ -1294,7 +1294,7 @@ def test_reflector_refuses_a_conjugate_pair_flipped_on_one_side_only():
     rng = np.random.default_rng(17)
     orth = np.linalg.qr(rng.standard_normal((4, 4)))[0]
     block = np.array([[0.9, -1.2, 0.3, 0.1], [1.2, 0.9, 0.0, 0.2], [0.0, 0.0, 0.3, 0.05], [0.0, 0.0, 0.0, 0.5]])
-    theta, _, form = _schur_ritz(orth @ block @ orth.T)
+    theta, _, form = schur_ritz(orth @ block @ orth.T)
     flip = theta.imag > 1.0
     assert JacobianTracker(0.2, logger=logger)._flipped_reflector(flip, np.eye(8, 4), form) is None
     assert "conjugate pair" in logger.info.call_args_list[-2][0][0]
@@ -1304,7 +1304,7 @@ def test_reflector_builds_nothing_without_a_resolved_flipped_eigenvalue():
     """Neither an empty flip set nor a Ritz value the Schur form does not locate produces a reflector."""
     logger = MagicMock()
     q_kept, b_proj = _projected_map(23, [4.0, -3.6, 0.7, 0.4], 0.3)
-    theta, _, form = _schur_ritz(b_proj)
+    theta, _, form = schur_ritz(b_proj)
     tracker = JacobianTracker(0.2, logger=logger)
     assert tracker._flipped_reflector(np.zeros(4, dtype=bool), q_kept, form) is None
     unlocated = SchurForm(form.t, form.z, None)
@@ -2569,7 +2569,7 @@ def test_the_flip_band_widens_with_the_condition_number_of_the_ritz_value(monkey
     """A Ritz value at -0.05 with residual 0.02 is flipped when well conditioned and not at condition number five."""
     flips = []
     for kappa in (1.0, 5.0):
-        theta, y, form = _schur_ritz(np.array([[1.05]]))
+        theta, y, form = schur_ritz(np.array([[1.05]]))
         planted = (theta, np.eye(4, 1) @ y, np.array([0.02]), np.eye(4, 1), form, np.array([kappa]))
         monkeypatch.setattr(jacobian_stabilization, "_ritz_from_increments", lambda dx, df, floor, norm: planted)
         tracker = JacobianTracker(0.4)
@@ -2649,7 +2649,7 @@ def test_the_rung_start_check_never_splits_a_conjugate_pair_and_holds_its_own_co
     tracker = JacobianTracker(0.4)
     tracker.carry_in(_exact_file_with_three_pairs(), _expand_identity())
     columns = tracker._start_check
-    assert columns.shape == (14, _CHECK_START - 1) and columns.flags.owndata and columns.flags.c_contiguous
+    assert columns.shape == (14, CHECK_START - 1) and columns.flags.owndata and columns.flags.c_contiguous
 
 
 def test_a_tracker_without_exact_checks_keeps_no_start_columns_and_requests_nothing():
@@ -2707,7 +2707,7 @@ def test_schur_helpers_refuse_what_they_cannot_place_or_solve(monkeypatch):
     log = MagicMock()
     assert _diagonal_positions(np.array([5.0 + 0.0j]), np.array([[1.0]])) is None
     assert _conjugate_partners(np.array([1.0 + 1.0j, 2.0 - 1.0j])).tolist() == [-1, -1]
-    theta, _, form = _schur_ritz(np.array([[4.0, 0.5], [0.0, 0.7]]))
+    theta, _, form = schur_ritz(np.array([[4.0, 0.5], [0.0, 0.7]]))
     lam_pi = 1.0 - theta
     raising = MagicMock(side_effect=np.linalg.LinAlgError("singular"))
     monkeypatch.setattr(jacobian_stabilization, "solve_triangular", raising)
@@ -2770,7 +2770,7 @@ def test_a_tracker_frozen_on_persist_updates_requests_an_exact_check_from_its_re
 @pytest.mark.parametrize("value, waiting, held", [(40.0, True, True), (40.0, False, False), (-6.0, True, False)])
 def test_the_map_holds_a_waiting_stiff_mode_the_next_estimate_does_not_certify(monkeypatch, value, waiting, held):
     """An uncertified mode matching the waiting lambda_Pi = 40 stays mapped with c 2 / 40; an unstable one does not."""
-    theta, y, form = _schur_ritz(np.diag([1.0 - value, 1.0 - 0.5]))
+    theta, y, form = schur_ritz(np.diag([1.0 - value, 1.0 - 0.5]))
     stiff = int(np.argmax(np.abs(1.0 - theta)))
     relative = iter([np.where(np.arange(2) == stiff, 1e-3, 1e-6), np.where(np.arange(2) == stiff, 0.1, 1e-6)])
 

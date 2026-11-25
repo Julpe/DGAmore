@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from dgamore.brillouin_zone import KGrid, two_dimensional_square_symmetries
-from dgamore.greens_function import GreensFunction, _fermi_dirac_density
+from dgamore.greens_function import GreensFunction, fermi_dirac_density
 from dgamore.gap_function import GapFunction
 from dgamore.local_n_point import LocalNPoint
 from dgamore.local_two_point import LocalTwoPoint
@@ -176,35 +176,35 @@ def test_invert_last_orbital_block_matches_manual_inverse(shape):
 
 
 def test_fermi_dirac_density_diagonal():
-    """_fermi_dirac_density returns the Fermi function on the diagonal of a diagonal Hamiltonian."""
+    """fermi_dirac_density returns the Fermi function on the diagonal of a diagonal Hamiltonian."""
     beta = 2.0
     h = np.diag([0.5, -0.7]).astype(complex)
-    rho = _fermi_dirac_density(h, beta)
+    rho = fermi_dirac_density(h, beta)
     expected = np.diag(1.0 / (1.0 + np.exp(beta * np.array([0.5, -0.7]))))
     assert np.allclose(rho, expected)
 
 
 def test_fermi_dirac_density_numerically_stable():
-    """_fermi_dirac_density stays finite and saturates to 0/1 for large eigenvalues."""
+    """fermi_dirac_density stays finite and saturates to 0/1 for large eigenvalues."""
     beta = 1.0
     h = np.diag([1e3, -1e3]).astype(complex)
-    rho = _fermi_dirac_density(h, beta)
+    rho = fermi_dirac_density(h, beta)
     assert np.all(np.isfinite(rho))
     assert np.isclose(rho[0, 0], 0.0, atol=1e-12)
     assert np.isclose(rho[1, 1], 1.0, atol=1e-12)
 
 
 def test_fermi_dirac_density_batched_matches_per_element():
-    """_fermi_dirac_density on a k-batch equals applying it to each k-block independently."""
+    """fermi_dirac_density on a k-batch equals applying it to each k-block independently."""
     beta = 1.5
     rng = np.random.default_rng(3)
     h = rng.standard_normal((4, 2, 2))
     h = h + np.swapaxes(h, -1, -2)  # Hermitian (real symmetric) per k
     h = h.astype(complex)
 
-    rho_batched = _fermi_dirac_density(h, beta)
+    rho_batched = fermi_dirac_density(h, beta)
     for k in range(h.shape[0]):
-        assert np.allclose(rho_batched[k], _fermi_dirac_density(h[k], beta))
+        assert np.allclose(rho_batched[k], fermi_dirac_density(h[k], beta))
 
 
 @pytest.mark.parametrize("full_niv_range", [True, False])

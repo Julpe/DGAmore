@@ -29,11 +29,11 @@ def test_enumerate_integer_matrices_returns_only_gl3z_matrices():
 
 def test_m_preserves_grid_accepts_compatible_matrix_and_rejects_incompatible_one():
     """m_preserves_grid accepts a grid-compatible matrix and rejects an incompatible one."""
-    assert sr._M_preserves_grid(np.eye(3, dtype=np.int64), (4, 4, 4)) is True
-    assert sr._M_preserves_grid(np.eye(3, dtype=np.int64), (4, 2, 4)) is True
+    assert sr.M_preserves_grid(np.eye(3, dtype=np.int64), (4, 4, 4)) is True
+    assert sr.M_preserves_grid(np.eye(3, dtype=np.int64), (4, 2, 4)) is True
 
     incompatible = np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=np.int64)
-    assert sr._M_preserves_grid(incompatible, (4, 2, 4)) is False
+    assert sr.M_preserves_grid(incompatible, (4, 2, 4)) is False
 
 
 def test_apply_m_to_kgrid_indices_maps_identity_and_negative_axis_correctly():
@@ -147,7 +147,7 @@ def test_compose_and_inverse_round_trip():
 
 
 def test_close_group_adds_identity_and_raw_operations():
-    """_close_group includes the identity and the raw operations."""
+    """close_group includes the identity and the raw operations."""
     nk = (2, 2, 1)
     ops_raw = [
         {
@@ -159,7 +159,7 @@ def test_close_group_adds_identity_and_raw_operations():
         }
     ]
 
-    group = sr._close_group(ops_raw, norb=2, nk=nk, max_size=10)
+    group = sr.close_group(ops_raw, norb=2, nk=nk, max_size=10)
     assert any(np.array_equal(g.q, np.zeros(3, dtype=np.int64)) for g in group)
     assert any(np.array_equal(g.q, np.array([1, 0, 0], dtype=np.int64)) for g in group)
 
@@ -220,7 +220,7 @@ def test_get_symmetry_reduction_public_api_with_monkeypatched_discovery(monkeypa
                 )
             ),
         )
-        mp.setattr(sr, "_close_group", MagicMock(return_value=fake_group))
+        mp.setattr(sr, "close_group", MagicMock(return_value=fake_group))
         result = sr.get_symmetry_reduction(H, atol=1e-12, verbose=False)
 
     assert result["n_fbz"] == 2
@@ -260,7 +260,7 @@ def test_expand_reconstructs_full_hamiltonian_from_ibz_values(monkeypatch):
                 )
             ),
         )
-        mp.setattr(sr, "_close_group", MagicMock(return_value=fake_group))
+        mp.setattr(sr, "close_group", MagicMock(return_value=fake_group))
         result = sr.get_symmetry_reduction(H, atol=1e-12, verbose=False)
 
     # the orbit collapse picks index 0 as the IBZ representative, so both FBZ points reconstruct from it
@@ -300,7 +300,7 @@ def test_expand_tensor_validates_kind_and_tensor_shape(monkeypatch):
                 )
             ),
         )
-        mp.setattr(sr, "_close_group", MagicMock(return_value=fake_group))
+        mp.setattr(sr, "close_group", MagicMock(return_value=fake_group))
         result = sr.get_symmetry_reduction(H, atol=1e-12, verbose=False)
 
     tensor_ibz = np.ones((1, 1, 1), dtype=complex)
@@ -344,7 +344,7 @@ def test_expand_tensor_supports_shortcuts_and_sigma_power_zero(monkeypatch):
                 )
             ),
         )
-        mp.setattr(sr, "_close_group", MagicMock(return_value=fake_group))
+        mp.setattr(sr, "close_group", MagicMock(return_value=fake_group))
         result = sr.get_symmetry_reduction(H, atol=1e-12, verbose=False)
 
     tensor_ibz = np.ones((1, 1, 1, 1, 1), dtype=complex)
@@ -377,7 +377,7 @@ def test_discover_symmetries_branching_with_monkeypatched_helpers(monkeypatch):
 
     with monkeypatch.context() as mp:
         mp.setattr(sr, "_enumerate_integer_matrices", MagicMock(return_value=[np.eye(3, dtype=np.int64)]))
-        mp.setattr(sr, "_M_preserves_grid", MagicMock(return_value=True))
+        mp.setattr(sr, "M_preserves_grid", MagicMock(return_value=True))
         mp.setattr(sr, "_apply_M_to_kgrid_indices", MagicMock(return_value=np.array([0, 1], dtype=np.int64)))
         mp.setattr(sr, "_solve_U_for_op", MagicMock(return_value=np.eye(1)))
         ops, n_found = sr._discover_symmetries(H, atol=1e-12, verbose=False)
@@ -467,7 +467,7 @@ def test_fix_gauge_degenerate_can_return_unitary_for_trivial_cluster():
 
 
 def test_close_group_uses_all_raw_ops_and_identity():
-    """_close_group uses every raw operation plus the identity."""
+    """close_group uses every raw operation plus the identity."""
     nk = (1, 1, 1)
     ops_raw = [
         {
@@ -485,7 +485,7 @@ def test_close_group_uses_all_raw_ops_and_identity():
             "conj": True,
         },
     ]
-    group = sr._close_group(ops_raw, norb=1, nk=nk, max_size=20)
+    group = sr.close_group(ops_raw, norb=1, nk=nk, max_size=20)
     assert len(group) >= 2
     assert any(g.sigma == -1 and g.conj for g in group)
 
@@ -513,7 +513,7 @@ def test_get_symmetry_reduction_honors_verbose_branch_and_cache_reset(monkeypatc
     mock_close = MagicMock(return_value=fake_group)
     with monkeypatch.context() as mp:
         mp.setattr(sr, "_discover_symmetries", mock_disc)
-        mp.setattr(sr, "_close_group", mock_close)
+        mp.setattr(sr, "close_group", mock_close)
         result = sr.get_symmetry_reduction(H, atol=1e-12, verbose=True)
 
     assert mock_disc.call_count == 1
@@ -529,7 +529,7 @@ def test_expand_tensor_rejects_unknown_shortcut_kind(monkeypatch):
     fake_group = {sr._GroupElement.identity(1, (1, 1, 1))}
     with monkeypatch.context() as mp:
         mp.setattr(sr, "_discover_symmetries", MagicMock(return_value=([], 0)))
-        mp.setattr(sr, "_close_group", MagicMock(return_value=fake_group))
+        mp.setattr(sr, "close_group", MagicMock(return_value=fake_group))
         result = sr.get_symmetry_reduction(H, atol=1e-12, verbose=False)
 
     with pytest.raises(ValueError):
@@ -545,7 +545,7 @@ def test_expand_tensor_applies_sigma_factor_when_requested(monkeypatch):
     }
     with monkeypatch.context() as mp:
         mp.setattr(sr, "_discover_symmetries", MagicMock(return_value=([{}], 0)))
-        mp.setattr(sr, "_close_group", MagicMock(return_value=fake_group))
+        mp.setattr(sr, "close_group", MagicMock(return_value=fake_group))
         result = sr.get_symmetry_reduction(H, atol=1e-12, verbose=False)
 
     tensor_ibz = np.ones((1, 1, 1), dtype=complex)
@@ -576,7 +576,7 @@ def test_discover_symmetries_dedups_identical_M_grid_actions(monkeypatch):
             "_enumerate_integer_matrices",
             MagicMock(return_value=[np.eye(3, dtype=np.int64), np.eye(3, dtype=np.int64)]),
         )
-        mp.setattr(sr, "_M_preserves_grid", MagicMock(return_value=True))
+        mp.setattr(sr, "M_preserves_grid", MagicMock(return_value=True))
         mp.setattr(sr, "_apply_M_to_kgrid_indices", MagicMock(return_value=np.array([0], dtype=np.int64)))
         mp.setattr(sr, "_solve_U_for_op", MagicMock(return_value=np.eye(1)))
         ops, n_found = sr._discover_symmetries(H, atol=1e-12, verbose=False)
@@ -1263,7 +1263,7 @@ def test_discover_symmetries_handles_zero_pivot_in_U_canonicalization(monkeypatc
     H = np.zeros((1, 1, 1, 1, 1), dtype=complex)
     with monkeypatch.context() as mp:
         mp.setattr(sr, "_enumerate_integer_matrices", MagicMock(return_value=[np.eye(3, dtype=np.int64)]))
-        mp.setattr(sr, "_M_preserves_grid", MagicMock(return_value=True))
+        mp.setattr(sr, "M_preserves_grid", MagicMock(return_value=True))
         mp.setattr(sr, "_apply_M_to_kgrid_indices", MagicMock(return_value=np.array([0], dtype=np.int64)))
         mp.setattr(sr, "_solve_U_for_op", MagicMock(return_value=np.zeros((1, 1), dtype=complex)))
         ops, n = sr._discover_symmetries(H, atol=1e-12, verbose=False)
@@ -1279,7 +1279,7 @@ def test_discover_symmetries_skips_duplicate_action_key(monkeypatch):
             "_enumerate_integer_matrices",
             MagicMock(return_value=[np.eye(3, dtype=np.int64), np.diag([-1, 1, 1]).astype(np.int64)]),
         )
-        mp.setattr(sr, "_M_preserves_grid", MagicMock(return_value=True))
+        mp.setattr(sr, "M_preserves_grid", MagicMock(return_value=True))
         mp.setattr(
             sr,
             "_apply_M_to_kgrid_indices",
@@ -1316,7 +1316,7 @@ def test_close_group_returns_early_when_max_size_reached_during_composition():
             "conj": False,
         }
     ]
-    group = sr._close_group(ops_raw, norb=1, nk=nk, max_size=4)
+    group = sr.close_group(ops_raw, norb=1, nk=nk, max_size=4)
     assert len(group) >= 4
 
 
@@ -1903,7 +1903,7 @@ def test_close_group_warns_when_the_size_cap_stops_the_closure():
     ]
 
     with pytest.warns(RuntimeWarning):
-        sr._close_group(ops, norb=1, nk=(4, 1, 1), max_size=2)
+        sr.close_group(ops, norb=1, nk=(4, 1, 1), max_size=2)
 
 
 @pytest.mark.parametrize(
@@ -1918,7 +1918,7 @@ def test_close_group_warns_when_the_size_cap_stops_the_closure():
 def test_forced_multiplicity_reads_the_irreducible_dimensions_of_the_group(matrices, nk, expected):
     """D4, D2h and Oh force multiplets of 2, 1 and 3, the square lattice's doublets living in the odd parity only."""
     ops = [{"M": m, "q": np.zeros(3, dtype=int), "U": np.eye(1), "sigma": 1, "conj": False} for m in matrices]
-    group = sr._close_group(ops, 1, nk)
+    group = sr.close_group(ops, 1, nk)
     assert tuple(sr.forced_multiplicity(group, nk, parity) for parity in (None, 1, -1)) == expected
 
 

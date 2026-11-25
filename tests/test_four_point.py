@@ -21,7 +21,7 @@ import dgamore.four_point as four_point
 import dgamore.memory_estimator as memory_estimator
 import dgamore.n_point_base as npb
 from dgamore import brillouin_zone as bz
-from dgamore import nonlocal_sde
+from dgamore import sde_kernels
 from dgamore.four_point import FourPoint, _is_complex_symmetric
 from dgamore.interaction import LocalInteraction, Interaction
 from dgamore.local_four_point import LocalFourPoint
@@ -1323,7 +1323,7 @@ def test_invert_with_local_kernel_and_sum_is_the_assembled_v2_solve_bit_for_bit(
     monkeypatch.setattr(npb, "DTYPE", dtype)
     beta = config.sys.beta = np.float64(8.0)  # a NumPy float, as the DMFT file gives it: no operand may be promoted
     gamma, chi0, u_r, inactive = _kernel_inputs(rng, o, full=full, two_atoms=two_atoms)
-    ref = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r).invert_and_sum_over_last_vn_v2(beta, inactive)
+    ref = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r).invert_and_sum_over_last_vn_v2(beta, inactive)
     flags = _spy_factorizations(monkeypatch)
     out = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / beta**2, beta, inactive)
     assert set(flags) == {True, False} and (inactive.size > 0) == two_atoms
@@ -1358,7 +1358,7 @@ def test_invert_with_local_kernel_and_sum_decides_symmetry_like_the_whole_slice_
                 gamma.mat[0, 0, 0, 0, 0, 1, 0] = value
             if where == "diag":
                 chi0.mat[1, 0, o - 1, 0, 0, 1, 0] += value
-            assembled = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r)
+            assembled = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r)
             slices = assembled.mat.transpose(0, 5, 1, 2, 6, 4, 3, 7).reshape(2, 2, n, n)
             expected = [_is_complex_symmetric(np.asfortranarray(slices[q, w])) for w in range(2) for q in range(2)]
             ref = assembled.invert_and_sum_over_last_vn_v2(8.0)
@@ -1411,7 +1411,7 @@ def test_invert_with_local_kernel_and_rhs_gives_the_assembled_v2_solutions_bit_f
         )
         for _ in range(2)
     ]
-    assembled = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r)
+    assembled = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r)
     ref = assembled.invert_and_sum_over_last_vn_v2(beta, inactive, rhs=[b.copy() for b in rhs])
     flags = _spy_factorizations(monkeypatch)
     out = chi0.invert_with_local_kernel_and_sum_over_last_vn(gamma, u_r, 1.0 / beta**2, beta, inactive, rhs=rhs)
@@ -1506,7 +1506,7 @@ def test_invert_with_local_kernel_and_sum_solves_layer_swapped_slices_with_the_p
         gamma, u_r, 1.0 / beta**2, beta, inactive, orbital_involution=_LAYER_SWAP
     )
     taken = (len(permuted), len(flags))
-    assembled = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r)
+    assembled = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r)
     monkeypatch.setattr(npb, "DTYPE", np.complex128)
     assembled.mat = assembled.mat  # the same complex64 slices, solved in complex128
     ref = assembled.invert_and_sum_over_last_vn_v2(beta, inactive).mat
@@ -1695,7 +1695,7 @@ def _spy_grouped_solves(monkeypatch) -> list[int]:
 
 def _complex128_sum_reference(gamma, chi0, u_r, inactive, beta, monkeypatch) -> np.ndarray:
     """The summed solve of the same complex64 slices in complex128."""
-    assembled = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r)
+    assembled = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r)
     monkeypatch.setattr(npb, "DTYPE", np.complex128)
     assembled.mat = assembled.mat
     return assembled.invert_and_sum_over_last_vn_v2(beta, inactive).mat
@@ -1761,7 +1761,7 @@ def test_invert_with_local_kernel_and_sum_keeps_the_bits_below_the_group_gate_in
     gamma, chi0, u_r, inactive = _kernel_inputs(rng, 2, niv=4)
     if case != "one group":
         _split_pair_groups(gamma, u_r)
-    ref = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r).invert_and_sum_over_last_vn_v2(beta, inactive)
+    ref = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, chi0, u_r).invert_and_sum_over_last_vn_v2(beta, inactive)
     if case != "small":
         monkeypatch.setattr(four_point, "_GROUPED_ROWS_PER_PAIR", 0)
     grouped = _spy_grouped_solves(monkeypatch)
@@ -2017,7 +2017,7 @@ def test_invert_and_sum_v2_keeps_the_bits_of_symmetric_slices_whose_products_und
 def _assembled_window(gamma: LocalFourPoint, chi0: FourPoint, u_r: LocalInteraction, w_start: int) -> FourPoint:
     """The matrix of chi0's bosonic window [w_start, ...) assembled by the kernel step's builder."""
     half = gamma.copy().to_half_niw_range() if gamma.full_niw_range else gamma
-    return nonlocal_sde.create_inverse_auxiliary_chi_r_q(half.take_wn_slice(w_start, half.current_shape[-3]), chi0, u_r)
+    return sde_kernels.create_inverse_auxiliary_chi_r_q(half.take_wn_slice(w_start, half.current_shape[-3]), chi0, u_r)
 
 
 @pytest.mark.parametrize("dtype", [np.complex64, np.complex128])

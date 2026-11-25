@@ -31,7 +31,7 @@ from mpi4py import MPI
 from scipy import optimize as opt
 from scipy.linalg import block_diag
 
-from dgamore import config
+from dgamore import config, output_files
 from dgamore.four_point import FourPoint
 from dgamore.local_four_point import LocalFourPoint
 from dgamore.mpi_utils import MpiDistributor
@@ -296,7 +296,7 @@ class LambdaCorrection:
         if config.lambda_correction.type.lower() == "spch":
             logger.info(f"Performing lambda correction for {chi_phys_q_r.channel.value} channel.")
             chi_r_loc = LocalFourPoint.load(
-                os.path.join(config.output.output_path, f"chi_{chi_phys_q_r.channel.value}_loc.npy"),
+                output_files.npy_path(config.output.output_path, output_files.local_name("chi", chi_phys_q_r.channel)),
                 chi_phys_q_r.channel,
                 num_vn_dimensions=0,
             ).to_full_niw_range()
@@ -324,14 +324,16 @@ class LambdaCorrection:
 
         logger.info(f"Performing lambda correction for magn channel.")
         chi_phys_q_dens = FourPoint.load(
-            os.path.join(config.output.output_path, f"chi_phys_q_dens.npy"),
+            output_files.npy_path(
+                config.output.output_path, output_files.channel_name(output_files.CHI_PHYS_Q, SpinChannel.DENS)
+            ),
             SpinChannel.DENS,
             num_vn_dimensions=0,
         ).to_full_niw_range()
 
         chi_dens_loc, chi_magn_loc = [
             LocalFourPoint.load(
-                os.path.join(config.output.output_path, f"chi_{channel.value}_loc.npy"),
+                output_files.npy_path(config.output.output_path, output_files.local_name("chi", channel)),
                 channel,
                 num_vn_dimensions=0,
             ).to_full_niw_range()
@@ -936,7 +938,7 @@ class MultiOrbitalLambdaCorrection:
         :return: The target as a compound matrix, shape ``[no^2, no^2]``, complex128.
         """
         chi_r_loc = LocalFourPoint.load(
-            os.path.join(config.output.output_path, f"chi_{channel.value}_loc.npy"),
+            output_files.npy_path(config.output.output_path, output_files.local_name("chi", channel)),
             channel,
             num_vn_dimensions=0,
         ).to_full_niw_range()
@@ -976,7 +978,9 @@ class MultiOrbitalLambdaCorrection:
         s_r = MultiOrbitalLambdaCorrection._local_sum_rule(channel)
         if lambda_type == "sp":
             chi_dens = FourPoint.load(
-                os.path.join(config.output.output_path, "chi_phys_q_dens.npy"),
+                output_files.npy_path(
+                    config.output.output_path, output_files.channel_name(output_files.CHI_PHYS_Q, SpinChannel.DENS)
+                ),
                 SpinChannel.DENS,
                 num_vn_dimensions=0,
                 has_compressed_q_dimension=True,
@@ -1045,7 +1049,9 @@ class MultiOrbitalLambdaCorrection:
         :param chi_magn: The freshly corrected magnetic susceptibility :math:`\chi^{\mathrm{q}}_{m}` (irreducible BZ).
         :return: None.
         """
-        dens_path = os.path.join(config.output.output_path, "chi_phys_q_dens.npy")
+        dens_path = output_files.npy_path(
+            config.output.output_path, output_files.channel_name(output_files.CHI_PHYS_Q, SpinChannel.DENS)
+        )
         if not (config.sys.occ_dmft_per_ineq and config.dmft.ineq_ordering and os.path.exists(dens_path)):
             return
 

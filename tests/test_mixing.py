@@ -15,10 +15,11 @@ import pytest
 
 import dgamore.brillouin_zone as bz
 import dgamore.n_point_base as n_point_base
+import dgamore.mixing as mixing
 import dgamore.nonlocal_sde as nonlocal_sde
 from dgamore.jacobian_stabilization import JacobianTracker, to_mat, to_vec
 from dgamore.self_energy import SelfEnergy
-from dgamore.nonlocal_sde import _core_pair, apply_mixing_strategy
+from dgamore.mixing import core_pair, apply_mixing_strategy
 from dgamore.sigma_jacobian import tracker_sector_maps
 from tests.conftest import run_parallel, traced_peak
 
@@ -90,7 +91,7 @@ def sigma_of(window: np.ndarray) -> SelfEnergy:
 
 
 def make_config_mock(strategy: str = "linear", mixing: float = 0.5, n_hist: int = 3, niv_core: int = NIV_CORE):
-    """Builds a mock config object for patching dgamore.nonlocal_sde.config."""
+    """Builds a mock config object for patching the config of dgamore.nonlocal_sde and dgamore.mixing."""
     cfg = MagicMock()
     cfg.self_consistency.mixing_strategy = strategy
     cfg.self_consistency.mixing = mixing
@@ -102,9 +103,11 @@ def make_config_mock(strategy: str = "linear", mixing: float = 0.5, n_hist: int 
 
 @contextlib.contextmanager
 def patch_config(**kwargs):
-    """Installs a mock config in dgamore.nonlocal_sde for the duration of the block."""
+    """Installs one mock config in dgamore.nonlocal_sde and dgamore.mixing for the duration of the block."""
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("dgamore.nonlocal_sde.config", make_config_mock(**kwargs))
+        cfg = make_config_mock(**kwargs)
+        mp.setattr("dgamore.nonlocal_sde.config", cfg)
+        mp.setattr("dgamore.mixing.config", cfg)
         yield
 
 
@@ -672,9 +675,9 @@ def test_the_gram_solve_gives_the_svd_step_to_the_rounding_of_the_storage(monkey
 def test_the_gram_matrix_reads_each_chunk_through_one_double_precision_block(dtype):
     """The augmented Gram matrix of a chunk of rows is accumulated from one float64 copy of its columns and its
     right-hand side, whatever the precision of the columns."""
-    m, n = 3, nonlocal_sde.GRAM_ROWS
+    m, n = 3, mixing.GRAM_ROWS
     columns, rhs = np.ones((n, m), dtype=dtype), np.ones(n, dtype=dtype)
-    _, peak = traced_peak(lambda: nonlocal_sde._least_squares_coefficients(columns, rhs, False, None))
+    _, peak = traced_peak(lambda: mixing._least_squares_coefficients(columns, rhs, False, None))
     assert peak <= 1.25 * np.dtype(np.float64).itemsize * (m + 1) * n
 
 
@@ -690,9 +693,7 @@ def test_every_owner_takes_the_coefficients_of_the_first_owner(monkeypatch):
         return (lam if threading.current_thread().name == "rank0" else 0.0 * lam), v
 
     monkeypatch.setattr(np.linalg, "eigh", disagreeing)
-    solve = lambda comm, rank: nonlocal_sde._least_squares_coefficients(
-        columns[blocks[rank]], rhs[blocks[rank]], True, comm
-    )
+    solve = lambda comm, rank: mixing._least_squares_coefficients(columns[blocks[rank]], rhs[blocks[rank]], True, comm)
     results = run_parallel(3, solve)[1]
     assert results[0][0] is not None
     assert all(np.array_equal(coeffs, results[0][0]) and norm == results[0][1] for coeffs, norm in results)
@@ -700,8 +701,8 @@ def test_every_owner_takes_the_coefficients_of_the_first_owner(monkeypatch):
 
 def test_the_squared_norm_of_real_rows_copies_each_chunk_in_double_precision_only():
     """Real rows are summed from a float64 copy of each chunk, half the bytes of a complex128 one."""
-    values = np.full(nonlocal_sde.GRAM_ROWS, 2.0, dtype=np.float32)
-    total, peak = traced_peak(lambda: nonlocal_sde._squared_norm(values, None))
+    values = np.full(mixing.GRAM_ROWS, 2.0, dtype=np.float32)
+    total, peak = traced_peak(lambda: mixing._squared_norm(values, None))
     assert total == 4.0 * values.size
     assert peak <= 1.25 * np.dtype(np.float64).itemsize * values.size
 
@@ -768,11 +769,11 @@ def test_an_active_tracker_mixes_the_reflected_proposal_and_records_it_as_the_us
 
 
 def test_core_pair_is_the_pair_the_mixing_records_and_keeps_both_layouts():
-    """_core_pair gives bit for bit the pair the mixing records, and each self-energy keeps its momentum layout."""
+    """core_pair gives bit for bit the pair the mixing records, and each self-energy keeps its momentum layout."""
     sigma_new, sigma_old = make_sigma(2.0 + 1.0j), make_sigma(1.0).compress_q_dimension()
     history = []
     with patch_config(strategy="linear", mixing=0.5):
-        iterate, proposal = _core_pair(sigma_new, sigma_old)
+        iterate, proposal = core_pair(sigma_new, sigma_old)
         assert not sigma_new.has_compressed_q_dimension and sigma_old.has_compressed_q_dimension
         apply_mixing_strategy(sigma_new, sigma_old, mixing_history=history)
     assert np.array_equal(history[-1][0], iterate) and np.array_equal(history[-1][1], proposal)
@@ -789,10 +790,8 @@ def test_the_mixing_copies_the_pair_only_for_a_window_history_and_keeps_the_damp
     sigma_new, sigma_old = SelfEnergy(new, NK, beta=BETA), SelfEnergy(old, NK, beta=BETA)
     raw, iterate = sigma_new.mat.copy(), sigma_old.mat.copy()
     copies = []
-    core_pair = nonlocal_sde._core_pair
-    monkeypatch.setattr(
-        nonlocal_sde, "_core_pair", lambda *a, copy=True: copies.append(copy) or core_pair(*a, copy=copy)
-    )
+    core_pair = mixing.core_pair
+    monkeypatch.setattr(mixing, "core_pair", lambda *a, copy=True: copies.append(copy) or core_pair(*a, copy=copy))
     with patch_config(strategy="linear", mixing=0.5):
         result = apply_mixing_strategy(sigma_new, sigma_old, tracker=tracker)
         apply_mixing_strategy(make_sigma(2.0), make_sigma(1.0), mixing_history=[], tracker=tracker)

@@ -25,7 +25,7 @@ from dgamore.two_point import TwoPoint
 # Element budget for one [k, band, v-chunk] temporary of the analytic potential-energy tail (16 MiB complex128; the
 # tail holds three) and for one frequency chunk of the Dyson build; the default niv_asympt = 50000 would otherwise
 # materialize [nk_tot, n_bands, 2*niv_asympt] - several GB - per plain sum.
-_MODEL_EPOT_CHUNK_ELEMENTS: int = 2**20
+MODEL_EPOT_CHUNK_ELEMENTS: int = 2**20
 
 # Element budget of one momentum chunk of the frequency arrays in the occupation and potential-energy sums (64 MiB
 # in complex128); each sum holds a few such arrays at once, which for many momenta on a wide frequency box would otherwise
@@ -33,7 +33,7 @@ _MODEL_EPOT_CHUNK_ELEMENTS: int = 2**20
 _MOMENTUM_CHUNK_ELEMENTS: int = 2**22
 
 
-def _fermi_dirac_density(h: np.ndarray, beta: float) -> np.ndarray:
+def fermi_dirac_density(h: np.ndarray, beta: float) -> np.ndarray:
     r"""
     Returns the (possibly k-resolved) single-particle density matrix :math:`\rho = f(\beta h)` of a static
     effective Hamiltonian :math:`h = \varepsilon + \Sigma_\infty - \mu` (shape ``[..., o, o]``), evaluated in the
@@ -130,7 +130,7 @@ def get_total_fill(
     function built from the self-energy moment is subtracted to accelerate the Matsubara sum convergence. This is
     the cheap, purely local (k-summed) scalar variant used inside the :math:`\mu` root search (a Newton method);
     :meth:`GreensFunction.get_fill_nonlocal` is the k-resolved counterpart that additionally returns the
-    occupation matrices. Both share the Fermi-Dirac density matrix via :func:`_fermi_dirac_density`.
+    occupation matrices. Both share the Fermi-Dirac density matrix via :func:`fermi_dirac_density`.
 
     With ``mpi_dist`` every rank builds and inverts the Dyson matrix of its own momenta only, and the momentum sum
     continues from rank to rank in momentum order (:meth:`MpiDistributor.ordered_sum`); rank 0's filling is broadcast,
@@ -183,7 +183,7 @@ def get_total_fill(
             np.mean(g_full_mat, axis=0) if mpi_dist is None else mpi_dist.ordered_sum(g_full_mat) / mpi_dist.ntasks
         )
 
-    rho_loc = _fermi_dirac_density(hloc.real + smom0 - mu_bands, beta)
+    rho_loc = fermi_dirac_density(hloc.real + smom0 - mu_bands, beta)
     occ = rho_loc + np.sum(g_loc_mat.real - g_model_mat.real, axis=-1) / beta
     fill = 2.0 * np.trace(occ).real
     return fill if mpi_dist is None else mpi_dist.bcast(fill, root=0)
@@ -507,7 +507,7 @@ class GreensFunction(TwoPoint):
         r"""
         Yields the inverse Dyson matrix :math:`[(\imath\nu + \mu) - \varepsilon(\mathbf{k}) -
         \Sigma^{\mathrm{k}}]^{-1}` on every orbital of ``ek``, one fermionic-frequency chunk of
-        :data:`_MODEL_EPOT_CHUNK_ELEMENTS` entries per momentum and orbital pair at a time, from the frequency index
+        :data:`MODEL_EPOT_CHUNK_ELEMENTS` entries per momentum and orbital pair at a time, from the frequency index
         ``first`` to the end of the axis.
 
         :param sigma_mat: The uncompressed self-energy array ``[kx, ky, kz, o1, o2, 2 niv]`` (or momentum-local).
@@ -526,7 +526,7 @@ class GreensFunction(TwoPoint):
         eye_bands = np.eye(n_orbitals, n_orbitals)
         iv = 1j * MFHelper.vn(niv, beta)
         static_bands = (mu * eye_bands)[None, None, None, :, :, None] - ek[..., None]
-        step = max(1, _MODEL_EPOT_CHUNK_ELEMENTS // (int(np.prod(ek.shape[:3])) * n_orbitals**2))
+        step = max(1, MODEL_EPOT_CHUNK_ELEMENTS // (int(np.prod(ek.shape[:3])) * n_orbitals**2))
         for start in range(first, 2 * niv, step):
             stop = min(2 * niv, start + step)
             dyson = (iv[start:stop][None, None, :] * eye_bands[..., None])[None, None, None, ...] + static_bands
@@ -647,7 +647,7 @@ class GreensFunction(TwoPoint):
         r"""
         Returns the k-resolved occupation :math:`n_{12}(\mathbf{k}) = \rho_{12}(\mathbf{k}) + \frac{1}{\beta}
         \sum_{\nu} [G - G_{\mathrm{mod}}]_{12}^{\mathbf{k}\nu}` with the moment model :math:`G_{\mathrm{mod}}` and its
-        analytic density matrix :math:`\rho` (see :func:`_fermi_dirac_density`). A real dispersion takes the real
+        analytic density matrix :math:`\rho` (see :func:`fermi_dirac_density`). A real dispersion takes the real
         part of the dispersion and of the frequency sums, a complex (Hermitian) one keeps their imaginary parts. The
         decision is taken once for all momenta: from ``real_dispersion`` when given, which lets a caller holding only
         some momenta of a complex dispersion keep its complex arithmetic, otherwise from ``ek`` (real when its
@@ -677,7 +677,7 @@ class GreensFunction(TwoPoint):
         if real_dispersion is None:
             real_dispersion = np.isrealobj(np.real_if_close(ek))
         ek_density = ek.real if real_dispersion else ek
-        rho_k = _fermi_dirac_density(ek_density + smom0[None, None, None] - mu * eye_bands[None, None, None], beta)
+        rho_k = fermi_dirac_density(ek_density + smom0[None, None, None] - mu * eye_bands[None, None, None], beta)
         complex_box = not real_dispersion
 
         nk = int(np.prod(ek.shape[:3]))
@@ -817,7 +817,7 @@ class GreensFunction(TwoPoint):
         # the frequency sum is evaluated in bounded v-chunks: the single-pass form materialized several
         # [k, band, 2*niv] complex temporaries, which for the default niv_asympt = 50000 spikes to many GB
         iv_full = 1j * MFHelper.vn(niv, beta)
-        step = max(1, _MODEL_EPOT_CHUNK_ELEMENTS // (self.nq_tot * n))
+        step = max(1, MODEL_EPOT_CHUNK_ELEMENTS // (self.nq_tot * n))
         total = 0.0
         for i in range(0, len(iv_full), step):
             iv = iv_full[i : i + step]

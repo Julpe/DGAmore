@@ -13,7 +13,7 @@ import pytest
 
 import dgamore.brillouin_zone as bz
 from dgamore import config, dga_io, local_sde
-from dgamore import nonlocal_sde
+from dgamore import nonlocal_sde, sde_kernels
 from dgamore.brillouin_zone import KnownSymmetries
 from dgamore.dga_logger import DgaLogger
 from dgamore.dmft_interface import W2dynInterface
@@ -197,14 +197,14 @@ def _flex_and_bare_vertex_ladder(comm_mock, monkeypatch, s_dmft) -> tuple[np.nda
         return LocalFourPoint(np.broadcast_to(mat[..., None, None, None], box).copy(), channel, 1, 2, False), None
 
     sys_state = deepcopy(config.sys)
-    monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", bare_vertex)
+    monkeypatch.setattr(sde_kernels, "load_node_shared_local_vertex", bare_vertex)
     ladder = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), s_dmft.copy())
 
     config.sys = sys_state
     config.misc.do_flex = True
-    monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", MagicMock(side_effect=AssertionError))
-    tails, tail = [], nonlocal_sde.create_bubble_tail
-    monkeypatch.setattr(nonlocal_sde, "create_bubble_tail", lambda *a: tails.append(a) or tail(*a).scale(0.0))
+    monkeypatch.setattr(sde_kernels, "load_node_shared_local_vertex", MagicMock(side_effect=AssertionError))
+    tails, tail = [], sde_kernels.create_bubble_tail
+    monkeypatch.setattr(sde_kernels, "create_bubble_tail", lambda *a: tails.append(a) or tail(*a).scale(0.0))
     flex = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), s_dmft.copy())
     assert tails and set(tails) == {(config.sys.n_bands, niw, niv_full, config.sys.beta)}
     return flex.mat, ladder.mat
@@ -317,7 +317,7 @@ def test_rpa_mode_pads_its_proposal_with_the_hartree_fock_term_and_its_own_tail(
     folder, comm_mock = setup
     ((_, occ, occ_k),), sigma = _rpa_run(folder, comm_mock, monkeypatch, 1, 1.0)
 
-    hartree, fock = nonlocal_sde.get_hartree_fock(
+    hartree, fock = sde_kernels.get_hartree_fock(
         config.lattice.hamiltonian.get_local_u(), config.lattice.hamiltonian.get_vq(config.lattice.k_grid), occ, occ_k
     )
     mat, niv, niv_core = sigma.compress_q_dimension().mat, sigma.niv, config.box.niv_core
@@ -341,14 +341,14 @@ def test_self_consistent_rpa_mode_keeps_its_own_tail_through_the_mixing(setup, m
 def test_rpa_mode_takes_its_shell_moment_from_the_kernel_the_sde_contracts(setup, monkeypatch):
     """RPA mode's shell Sigma_1 is the tail moment of the very kernel the column SDE contracts, before its v axis."""
     folder, comm_mock = setup
-    tail, run, seen = nonlocal_sde._sde_tail_moment, nonlocal_sde._run_column_sde, {}
+    tail, run, seen = nonlocal_sde._sde_tail_moment, sde_kernels.run_column_sde, {}
     monkeypatch.setattr(
         nonlocal_sde,
         "_sde_tail_moment",
         lambda kernel, dist: seen.update(tail_kernel=kernel.mat.copy(), moment=tail(kernel, dist)) or seen["moment"],
     )
     monkeypatch.setattr(
-        nonlocal_sde, "_run_column_sde", lambda kernel, *a: seen.update(sde_kernel=kernel.mat.copy()) or run(kernel, *a)
+        sde_kernels, "run_column_sde", lambda kernel, *a: seen.update(sde_kernel=kernel.mat.copy()) or run(kernel, *a)
     )
     _, sigma = _rpa_run(folder, comm_mock, monkeypatch, 1, 1.0)
 
