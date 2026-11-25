@@ -20,7 +20,6 @@ import itertools as it
 import logging
 import os
 import pickle
-import socket
 import sys
 import traceback
 
@@ -723,12 +722,13 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     rank 0 builds while the others idle, every other node the branch's ``remote_single`` (all of the single-rank
     transient when the branch sets none), and the node-shared windows count once; this must not exceed
     ``NODE_MEMORY_FRACTION`` times the node budget - ``psutil.virtual_memory().available``, capped by the cgroup
-    memory limit when the scheduler sets one (see :func:`dgamore.mpi_utils.cgroup_memory_limit`). Each node's ranks
-    and available memory are collected with a single ``allgather`` of ``(hostname, available_bytes)`` in rank
-    order; a branch's path is judged to "fit" only if it fits on **every** node (the flags are process-wide, so the
-    tightest node governs). On a multi-rank job the in-memory Eliashberg solve is judged by the team solve's node
-    formula, with rank 0's full-grid interaction on rank 0's node. A :class:`MemoryError` is raised only if the path
-    that would actually run does not fit.
+    memory limit when the scheduler sets one (see :func:`dgamore.mpi_utils.cgroup_memory_limit`). A node is the group
+    of ranks that share memory (``comm.Split_type(MPI.COMM_TYPE_SHARED)``, the groups the node-shared windows are
+    built on), not a hostname, and its available memory is the minimum over its ranks (see
+    :func:`dgamore.eliashberg_solver._node_groups`); a branch's path is judged to "fit" only if it fits on **every**
+    node (the flags are process-wide, so the tightest node governs). On a multi-rank job the in-memory Eliashberg
+    solve is judged by the team solve's node formula, with rank 0's full-grid interaction on rank 0's node. A
+    :class:`MemoryError` is raised only if the path that would actually run does not fit.
 
     The two chunked builds get the memory their residents leave below the node budget: for every chunked branch
     :func:`dgamore.memory_estimator.max_chunk_budget` searches the largest per-rank chunk budget whose modeled node
@@ -746,19 +746,15 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
     """
     logger = config.logger
 
-    # Gather (hostname, available bytes) from every rank in a single collective and reduce to one entry per node:
-    # the node's ranks (in rank order) and the (minimum, conservative) available memory on that node.
+    # one entry per node of ranks sharing memory: its ranks (in rank order), hostname and (minimum) available memory
     node_available = psutil.virtual_memory().available
     cgroup_limit = mpi_utils.cgroup_memory_limit()
     if cgroup_limit is not None:
         node_available = min(node_available, cgroup_limit)
-    hostname = socket.gethostname()
-    nodes: dict[str, list] = {}
-    for rank, (host, avail) in enumerate(comm.allgather((hostname, node_available))):
-        if host not in nodes:
-            nodes[host] = [[], avail]
-        nodes[host][0].append(rank)
-        nodes[host][1] = min(nodes[host][1], avail)
+    node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+    node_ranks, node_host, node_free = eliashberg_solver._node_groups(comm, node_comm, node_available)
+    node_comm.Free()
+    nodes = {root: [ranks, node_free[root]] for root, ranks in node_ranks.items()}
     nk_irr, nk_tot = config.lattice.k_grid.nk_irr, config.lattice.k_grid.nk_tot
     niw, niv = config.box.niw_core, config.box.niv_core
     sde_tasks = np.diff(memory_estimator.column_sde_schedule(niw, niv, comm.size)[1])
@@ -918,7 +914,14 @@ def autodetect_memory_settings(comm: MPI.Comm) -> memory_estimator.ChunkBudgets:
             )
         )
 
-    logger.info(f"Auto memory detection (node-total budget): {len(nodes)} node(s).")
+    logger.info(
+        f"Auto memory detection (node-total budget): {len(nodes)} node(s): "
+        + ", ".join(
+            f"{node_host[root]} with {len(ranks)} rank(s) and {avail / 1024**3:.1f} GB available"
+            for root, (ranks, avail) in nodes.items()
+        )
+        + "."
+    )
 
     def budget_label(budget: int) -> str:
         """Human-readable chunk budget: gigabytes, or the whole rank block when the search hit its upper bound."""
