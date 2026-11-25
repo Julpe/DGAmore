@@ -11,7 +11,7 @@ import pytest
 import dgamore.bubble_gen as bubble_gen
 import dgamore.config as config
 import dgamore.memory_estimator as memory_estimator
-import dgamore.nonlocal_sde as nonlocal_sde
+import dgamore.sde_kernels as sde_kernels
 from dgamore.four_point import FourPoint
 from dgamore.interaction import LocalInteraction
 from dgamore.jacobian_stabilization import TRACKER_PAIRS
@@ -1081,8 +1081,8 @@ def test_exact_solve_transient_bounds_the_traced_peak_of_the_right_hand_side_sol
     gchi0_q_inv = FourPoint(rng.standard_normal(shape) + 30.0, *meta)
     u_loc = LocalInteraction(np.ones((o,) * 4), SpinChannel.NONE)
     rhs = [FourPoint(rng.standard_normal(shape) + 0j, *meta) for _ in range(n_rhs)]
-    nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=rhs)
-    solved, peak = traced_peak(lambda: nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=rhs))
+    sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=rhs)
+    solved, peak = traced_peak(lambda: sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=rhs))
     above = peak - sum(x.mat.nbytes for x in solved)
     assert 2 * n**2 * DTYPE_BYTES < above <= memory_estimator._exact_solve_transient(n, o, n_rhs)
 

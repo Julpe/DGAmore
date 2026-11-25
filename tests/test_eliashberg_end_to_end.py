@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from mpi4py import MPI as RealMPI
 
-from dgamore import config, eliashberg_solver, dga_io, nonlocal_sde
+from dgamore import config, eliashberg_solver, dga_io, sde_kernels
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.dga_logger import DgaLogger
 from dgamore.eliashberg_solver import gap_parity_diagnostics
@@ -285,7 +285,7 @@ def test_inverse_core_bubble_is_the_kernel_steps_core_cut_bit_for_bit(setup):
 
     ek, orbitals = config.lattice.hamiltonian.get_ek(), config.sys.correlated_orbitals
     giwk = GreensFunction.get_g_full(s_dmft, config.sys.mu, ek, config.sys.beta, orbitals)
-    dist = nonlocal_sde.irreducible_momentum_distributor(comm_mock)
+    dist = sde_kernels.irreducible_momentum_distributor(comm_mock)
     full_box = BubbleGenerator.create_generalized_chi0_q_fft(
         dist,
         giwk,
@@ -293,7 +293,7 @@ def test_inverse_core_bubble_is_the_kernel_steps_core_cut_bit_for_bit(setup):
         config.box.niv_full,
         config.lattice.k_grid,
         config.sys.beta,
-        involution=nonlocal_sde._orbital_involution(ek, orbitals),
+        involution=sde_kernels.orbital_involution(ek, orbitals),
     )
     assert config.box.niv_full > config.box.niv_core
     expected = full_box.cut_niv(config.box.niv_core).invert()

@@ -15,6 +15,7 @@ API Reference
    dgamore.dmft_interface
    dgamore.eliashberg_solver
    dgamore.four_point
+   dgamore.gap_classification
    dgamore.gap_function
    dgamore.greens_function
    dgamore.hamiltonian
@@ -28,10 +29,14 @@ API Reference
    dgamore.matsubara_frequencies
    dgamore.max_ent
    dgamore.memory_estimator
+   dgamore.mixing
    dgamore.mpi_utils
    dgamore.n_point_base
    dgamore.nonlocal_sde
+   dgamore.output_files
+   dgamore.pairing_vertex
    dgamore.plotting
+   dgamore.sde_kernels
    dgamore.self_energy
    dgamore.sigma_jacobian
    dgamore.symmetrize

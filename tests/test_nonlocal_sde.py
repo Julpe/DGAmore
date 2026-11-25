@@ -24,7 +24,10 @@ import dgamore.config as config
 import dgamore.four_point as four_point
 import dgamore.memory_estimator as memory_estimator
 import dgamore.mpi_utils as mpi_utils
+import dgamore.mixing as mixing
 import dgamore.nonlocal_sde as nonlocal_sde
+import dgamore.sde_kernels as sde_kernels
+import dgamore.output_files as output_files
 import dgamore.sigma_jacobian as sigma_jacobian
 from dgamore.four_point import FourPoint
 from dgamore.greens_function import GreensFunction
@@ -37,13 +40,14 @@ from dgamore.n_point_base import DTYPE, SpinChannel
 from tests import conftest
 from tests.conftest import FAKE_MPI, emery_hk, run_parallel
 from dgamore.nonlocal_sde import (
-    _build_giwk_full,
-    _cut_and_reshare_giwk,
-    _free_shared_window,
     _init_mu_history,
-    _release_shared_giwk,
-    get_hartree_fock,
     perform_ornstein_zernike_fit,
+)
+from dgamore.sde_kernels import (
+    build_giwk_full,
+    cut_and_reshare_giwk,
+    release_shared_giwk,
+    get_hartree_fock,
 )
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore.self_energy import SelfEnergy
@@ -309,7 +313,7 @@ def test_hartree_fock_with_the_held_real_space_interaction_keeps_the_bits_of_tra
     config.sys.occ = config.sys.occ_k.mean(axis=(0, 1, 2))
     v_before = v_nonloc.mat.copy()
     for u in (u_loc, LocalInteraction(np.zeros_like(u_loc.mat))):
-        held = nonlocal_sde.real_space_interaction(u, v_nonloc)
+        held = sde_kernels.real_space_interaction(u, v_nonloc)
         for _ in range(2):
             assert all(
                 np.array_equal(a, b)
@@ -459,7 +463,7 @@ def test_bubble_tail_completes_the_box_sum_of_a_band_at_the_chemical_potential(m
     )
     summed = bubble.sum_over_all_vn(beta).scale(1.0 / beta)
 
-    summed.add(nonlocal_sde.create_bubble_tail(no, niw, niv, beta), copy=False)
+    summed.add(sde_kernels.create_bubble_tail(no, niw, niv, beta), copy=False)
 
     whole = np.einsum("ad,bc,w->abcdw", np.eye(no), np.eye(no), np.where(np.arange(niw + 1) == 0, beta / 4, 0.0))
     assert np.allclose(summed.mat, whole[None], atol=1e-12)
@@ -480,7 +484,7 @@ def test_rpa_susceptibilities_are_graser_spin_and_charge_rpa_without_inversion(m
     v_nonloc = Interaction(np.zeros((nk,) + (2,) * 4), SpinChannel.NONE, (nk, 1, 1), True)
 
     chi_d, chi_m = (
-        nonlocal_sde.create_rpa_susceptibility(summed, u_loc, v_nonloc, channel).mat
+        sde_kernels.create_rpa_susceptibility(summed, u_loc, v_nonloc, channel).mat
         for channel in (SpinChannel.DENS, SpinChannel.MAGN)
     )
 
@@ -552,20 +556,20 @@ def test_build_giwk_full_shared_single_rank_matches_direct_dyson():
     sigma, ek = _tiny_sigma_and_ek()
     comm = create_comm_mock()
 
-    giwk, win, node_comm = _build_giwk_full(comm, sigma, 0.3, ek, 10.0)
+    giwk, win, node_comm = build_giwk_full(comm, sigma, 0.3, ek, 10.0)
 
     assert win is None
     assert np.array_equal(giwk.mat, GreensFunction.get_g_full(sigma, 0.3, ek, 10.0).mat)
-    _release_shared_giwk(win, node_comm)  # must not raise on the single-rank / mock path
+    release_shared_giwk(win, node_comm)  # must not raise on the single-rank / mock path
 
 
 def test_build_giwk_full_keeps_no_self_energy_so_its_copies_never_duplicate_sigma():
     """The proposal's Green's function holds the dispersion but no self-energy, so a frequency cut copies no Sigma."""
     sigma, ek = _tiny_sigma_and_ek(niv=8)
-    giwk, win, node_comm = _build_giwk_full(create_comm_mock(), sigma, 0.3, ek, 10.0)
+    giwk, win, node_comm = build_giwk_full(create_comm_mock(), sigma, 0.3, ek, 10.0)
     cut = giwk.cut_niv(4)
     assert giwk._sigma is None and cut._sigma is None and np.array_equal(cut._ek, ek)
-    _release_shared_giwk(win, node_comm)
+    release_shared_giwk(win, node_comm)
 
 
 @pytest.mark.parametrize(
@@ -603,10 +607,10 @@ def test_build_giwk_full_node_ranks_fill_the_window_with_the_bits_of_the_single_
     )
 
     def fn(comm, rank):
-        giwk, win, node_comm = _build_giwk_full(comm, make_sigma(), 0.3, ek, beta)
+        giwk, win, node_comm = build_giwk_full(comm, make_sigma(), 0.3, ek, beta)
         result = giwk.mat.copy()
         giwk.mat = None
-        _release_shared_giwk(win, node_comm)
+        release_shared_giwk(win, node_comm)
         return result
 
     _, results = run_parallel(len(hostnames), fn, hostnames=hostnames)
@@ -618,32 +622,23 @@ def test_build_giwk_full_node_ranks_fill_the_window_with_the_bits_of_the_single_
 
 def test_release_shared_giwk_without_sharing_is_noop():
     """Releasing a non-shared giwk (both handles None) is a safe no-op."""
-    _release_shared_giwk(None, None)
+    release_shared_giwk(None, None)
 
 
 def test_release_shared_giwk_frees_window_and_communicator():
     """With a window allocated, _release barriers (so no rank still reads), frees the window, then the node comm."""
     win, node_comm = MagicMock(), MagicMock()
-    _release_shared_giwk(win, node_comm)
+    release_shared_giwk(win, node_comm)
     node_comm.Barrier.assert_called_once()
     win.Free.assert_called_once()
     node_comm.Free.assert_called_once()
 
 
-def test_free_shared_window_frees_window_but_keeps_communicator():
-    """_free_shared_window barriers and frees the window but leaves the node communicator alive (reused for the cut)."""
-    win, node_comm = MagicMock(), MagicMock()
-    _free_shared_window(win, node_comm)
-    node_comm.Barrier.assert_called_once()
-    win.Free.assert_called_once()
-    node_comm.Free.assert_not_called()
-
-
 def test_cut_and_reshare_giwk_without_sharing_is_a_plain_cut():
-    """Without a node communicator, _cut_and_reshare_giwk is a plain per-rank cut and allocates no window."""
+    """Without a node communicator, cut_and_reshare_giwk is a plain per-rank cut and allocates no window."""
     sigma, ek = _tiny_sigma_and_ek(niv=8)
     giwk = GreensFunction.get_g_full(sigma, 0.3, ek, 10.0)
-    cut, win = _cut_and_reshare_giwk(giwk, None, None, 4)
+    cut, win = cut_and_reshare_giwk(giwk, None, None, 4)
     assert win is None
     assert cut.niv == 4
     assert np.array_equal(cut.mat, GreensFunction.get_g_full(sigma, 0.3, ek, 10.0).cut_niv(4).mat)
@@ -653,7 +648,7 @@ def test_cut_and_reshare_giwk_shared_single_rank_matches_plain_cut():
     """With a single-rank node communicator the cut giwk matches the plain cut and needs no window."""
     sigma, ek = _tiny_sigma_and_ek(niv=8)
     giwk = GreensFunction.get_g_full(sigma, 0.3, ek, 10.0)
-    cut, win = _cut_and_reshare_giwk(giwk, None, create_comm_mock(), 4)
+    cut, win = cut_and_reshare_giwk(giwk, None, create_comm_mock(), 4)
     assert win is None
     assert cut.niv == 4
     assert np.array_equal(cut.mat, GreensFunction.get_g_full(sigma, 0.3, ek, 10.0).cut_niv(4).mat)
@@ -686,7 +681,7 @@ def test_create_inverse_auxiliary_chi_r_q_matches_two_block_expression():
     gamma_before, chi0_before = gamma.mat.copy(), gchi0_q_inv.mat.copy()
     ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc)
     u_r = u_loc.as_channel(gamma.channel)
-    fused = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
+    fused = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
     assert np.array_equal(fused.mat, ref.mat)
     assert fused.channel == SpinChannel.DENS
     assert not fused.full_niw_range and fused.num_vn_dimensions == 2
@@ -699,8 +694,8 @@ def test_create_inverse_auxiliary_chi_r_q_accepts_half_niw_gamma():
     rng = np.random.default_rng(22)
     gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(rng)
     u_r = u_loc.as_channel(gamma.channel)
-    full = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
-    half = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma.copy().to_half_niw_range(), gchi0_q_inv, u_r)
+    full = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
+    half = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma.copy().to_half_niw_range(), gchi0_q_inv, u_r)
     assert np.array_equal(full.mat, half.mat)
 
 
@@ -709,7 +704,7 @@ def test_create_auxiliary_chi_r_q_matches_explicit_reference():
     rng = np.random.default_rng(24)
     gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(rng)
     ref = _bse_assembly_reference(gamma, gchi0_q_inv, u_loc).invert(False)
-    out = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc)
+    out = sde_kernels.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc)
     assert np.allclose(out.mat, ref.mat, atol=1e-10)
 
 
@@ -718,13 +713,13 @@ def test_auxiliary_chi_r_q_chain_resums_to_the_ladder_with_the_nonlocal_rung():
     rng = np.random.default_rng(25)
     gamma, gchi0_q_inv, u_loc, v_nonloc = _bse_assembly_inputs(rng)
     beta, channel = config.sys.beta, gamma.channel
-    chi_star_sum = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc).sum_over_all_vn(beta)
+    chi_star_sum = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc).sum_over_all_vn(beta)
     # zero shell correction (same sum added and subtracted); direct = chi0^-1 + (Gamma^w + V_r)/beta^2 via -V_r
-    chain = nonlocal_sde.create_generalized_chi_q_with_shell_correction(
+    chain = sde_kernels.create_generalized_chi_q_with_shell_correction(
         chi_star_sum, chi_star_sum, chi_star_sum, u_loc, v_nonloc
     )
     direct = (
-        nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, -v_nonloc.as_channel(channel))
+        sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, -v_nonloc.as_channel(channel))
         .invert(False)
         .sum_over_all_vn(beta)
     )
@@ -760,11 +755,11 @@ def test_ladder_vertex_middle_is_the_auxiliary_separable_part_of_the_vertex(monk
     monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
     x_g, (full, core), u_loc, v_nonloc = _middle_inputs(o, 3, 4, 41)
     x_star = (x_g.invert() - u_loc.as_channel(SpinChannel.DENS)).invert()
-    chi = nonlocal_sde.create_generalized_chi_q_with_shell_correction(x_star, full, core, u_loc, v_nonloc)
+    chi = sde_kernels.create_generalized_chi_q_with_shell_correction(x_star, full, core, u_loc, v_nonloc)
     one = LocalInteraction(np.einsum("ad,bc->abcd", np.eye(o), np.eye(o)))
     chi_hat = (chi.invert() + one.scale(lam, copy=True)).invert()
 
-    middle = nonlocal_sde.create_ladder_vertex_middle(x_g, full, core, u_loc, v_nonloc, chi, chi_hat)
+    middle = sde_kernels.create_ladder_vertex_middle(x_g, full, core, u_loc, v_nonloc, chi, chi_hat)
 
     ref = _auxiliary_middle(x_g, u_loc, v_nonloc, chi_hat)
     assert middle.channel == SpinChannel.DENS and middle.num_vn_dimensions == 0
@@ -782,8 +777,8 @@ def test_ladder_vertex_middle_stays_well_conditioned_at_a_zero_of_the_auxiliary_
         x_g.mat, full.mat, core.mat = np.full((1,) * 6, x), np.full((1,) * 6, 0.05), np.zeros((1,) * 6)
         v_nonloc = Interaction(np.zeros((1,) * 5), SpinChannel.NONE, (1, 1, 1), True)
         u_loc = LocalInteraction(np.full((1,) * 4, u))
-        chi = nonlocal_sde.create_generalized_chi_q_with_shell_correction(x_g, full, core, u_loc, v_nonloc)
-        out[dtype] = nonlocal_sde.create_ladder_vertex_middle(x_g, full, core, u_loc, v_nonloc, chi, chi).mat
+        chi = sde_kernels.create_generalized_chi_q_with_shell_correction(x_g, full, core, u_loc, v_nonloc)
+        out[dtype] = sde_kernels.create_ladder_vertex_middle(x_g, full, core, u_loc, v_nonloc, chi, chi).mat
         if dtype is np.complex64:
             with pytest.raises(np.linalg.LinAlgError):
                 _auxiliary_middle(x_g, u_loc, v_nonloc, chi)
@@ -796,9 +791,9 @@ def test_gamma_ladder_chi_is_the_shell_corrected_auxiliary_chi(monkeypatch, o):
     monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
     x_g, (full, core), u_loc, v_nonloc = _middle_inputs(o, 3, 4, 43)
     x_star = (x_g.invert() - u_loc.as_channel(SpinChannel.DENS)).invert()
-    ref = nonlocal_sde.create_generalized_chi_q_with_shell_correction(x_star, full, core, u_loc, v_nonloc)
+    ref = sde_kernels.create_generalized_chi_q_with_shell_correction(x_star, full, core, u_loc, v_nonloc)
 
-    chi = nonlocal_sde.create_shell_corrected_chi_from_gamma_ladder(x_g, full, core, u_loc, v_nonloc)
+    chi = sde_kernels.create_shell_corrected_chi_from_gamma_ladder(x_g, full, core, u_loc, v_nonloc)
 
     assert chi.channel == SpinChannel.DENS and chi.num_vn_dimensions == 0
     assert np.allclose(chi.mat, ref.mat, rtol=0.0, atol=1e-12 * np.abs(ref.mat).max())
@@ -814,12 +809,12 @@ def test_gamma_ladder_chi_stays_well_conditioned_at_a_zero_of_the_auxiliary_ladd
         x_g.mat, full.mat, core.mat = np.full((1,) * 6, 0.4), np.full((1,) * 6, 0.05), np.zeros((1,) * 6)
         v_nonloc = Interaction(np.zeros((1,) * 5), SpinChannel.NONE, (1, 1, 1), True)
         u_loc = LocalInteraction(np.full((1,) * 4, (1.0 - 1e-9) / 0.4))
-        out[dtype] = nonlocal_sde.create_shell_corrected_chi_from_gamma_ladder(x_g, full, core, u_loc, v_nonloc).mat
+        out[dtype] = sde_kernels.create_shell_corrected_chi_from_gamma_ladder(x_g, full, core, u_loc, v_nonloc).mat
         if dtype is np.complex64:
             one = LocalInteraction(np.ones((1,) * 4))
             with pytest.raises(np.linalg.LinAlgError):
                 x_star = x_g @ ((u_loc.as_channel(SpinChannel.DENS) @ x_g).scale(-1.0) + one).invert()
-                nonlocal_sde.create_generalized_chi_q_with_shell_correction(x_star, full, core, u_loc, v_nonloc)
+                sde_kernels.create_generalized_chi_q_with_shell_correction(x_star, full, core, u_loc, v_nonloc)
     assert np.allclose(out[np.complex64], out[np.complex128], rtol=1e-6, atol=0.0)
 
 
@@ -833,16 +828,16 @@ def test_pole_free_kernel_is_the_auxiliary_kernel(monkeypatch, o, lam):
     u_r = u_loc.as_channel(SpinChannel.DENS)
     one = LocalInteraction(np.einsum("ad,bc->abcd", np.eye(o), np.eye(o)))
     x_star = (x_g.invert() - u_r).invert()
-    chi = nonlocal_sde.create_generalized_chi_q_with_shell_correction(x_star, full, core, u_loc, v_nonloc)
+    chi = sde_kernels.create_generalized_chi_q_with_shell_correction(x_star, full, core, u_loc, v_nonloc)
     chi_hat = (chi.invert() + one.scale(lam, copy=True)).invert()
     rng = np.random.default_rng(45)
     vrg_mat = rng.standard_normal((3,) + (o,) * 4 + (4, 6)) + 0j
     vrg_g = FourPoint(vrg_mat, SpinChannel.DENS, (3, 1, 1), 1, 1, False, True, True)
     vrg_star = vrg_g @ ((u_r @ x_g).scale(-1.0) + one).invert()
-    ref = nonlocal_sde.calculate_kernel_r_q(vrg_star, chi_hat, v_nonloc, u_loc)
+    ref = sde_kernels.calculate_kernel_r_q(vrg_star, chi_hat, v_nonloc, u_loc)
 
-    middle = nonlocal_sde.create_kernel_middle(x_g, full, core, u_loc, v_nonloc, chi, chi_hat)
-    out = nonlocal_sde.calculate_pole_free_kernel_r_q(vrg_g, middle, v_nonloc, u_loc)
+    middle = sde_kernels.create_kernel_middle(x_g, full, core, u_loc, v_nonloc, chi, chi_hat)
+    out = sde_kernels.calculate_pole_free_kernel_r_q(vrg_g, middle, v_nonloc, u_loc)
 
     assert np.allclose(out.mat, ref.mat, rtol=0.0, atol=1e-12 * np.abs(ref.mat).max())
 
@@ -856,17 +851,17 @@ def test_middles_form_the_auxiliary_pole_term_only_at_momenta_whose_chi_changed(
     u_loc = LocalInteraction(np.full((1,) * 4, 2.0))
     v_nonloc.mat[...] = 0.0
     x_g.mat[1] = 0.5  # 1 - U_r X_G = 0 exactly at the middle momentum
-    chi = nonlocal_sde.create_shell_corrected_chi_from_gamma_ladder(x_g, full, core, u_loc, v_nonloc)
+    chi = sde_kernels.create_shell_corrected_chi_from_gamma_ladder(x_g, full, core, u_loc, v_nonloc)
     chi_hat = chi.copy()
     chi_hat.mat[[0, 2]] *= 1.1
     parts = (x_g, full, core, u_loc, v_nonloc, chi, chi_hat)
 
-    middle = getattr(nonlocal_sde, build)(*parts)
+    middle = getattr(sde_kernels, build)(*parts)
 
     assert np.isfinite(middle.mat).all()
     for q in range(3):
         alone = [p if p is u_loc else p.take_q_index_slice(q, q + 1) for p in parts]
-        ref = getattr(nonlocal_sde, build)(*alone)
+        ref = getattr(sde_kernels, build)(*alone)
         assert np.allclose(middle.mat[q], ref.mat[0], rtol=1e-14, atol=0.0)
 
 
@@ -911,7 +906,7 @@ def test_calculate_kernel_r_q_matches_rewired_reference():
         ref = inner @ u_r
         # "abcd->badc" on the orbital axes of [q, o1, o2, o3, o4, w, v]
         ref_mat = ref.mat.transpose(0, 2, 1, 4, 3, 5, 6)
-        out = nonlocal_sde.calculate_kernel_r_q(vrg, chi, v_nonloc, u_loc)
+        out = sde_kernels.calculate_kernel_r_q(vrg, chi, v_nonloc, u_loc)
         assert np.allclose(out.mat, ref_mat, atol=1e-10)
 
 
@@ -927,9 +922,9 @@ def test_rpa_kernel_is_the_ladder_kernel_at_unit_three_leg_vertex(channel):
     u_loc = LocalInteraction(rng.standard_normal((o,) * 4), SpinChannel.NONE)
     v_nonloc = Interaction(rng.standard_normal((nqi,) + (o,) * 4), SpinChannel.NONE, (nqi, 1, 1), True)
     unit = FourPoint.identity(o, niw, niv, nqi, (nqi, 1, 1), num_vn_dimensions=1).set_channel(channel)
-    ladder = nonlocal_sde.calculate_kernel_r_q(unit, chi.copy(), v_nonloc, u_loc)
+    ladder = sde_kernels.calculate_kernel_r_q(unit, chi.copy(), v_nonloc, u_loc)
 
-    out = nonlocal_sde.calculate_rpa_kernel_r_q(chi, v_nonloc, u_loc)
+    out = sde_kernels.calculate_rpa_kernel_r_q(chi, v_nonloc, u_loc)
 
     assert out.num_vn_dimensions == 0
     assert np.allclose(ladder.mat, out.mat[..., None], atol=1e-5 * np.abs(ladder.mat).max())
@@ -947,7 +942,7 @@ def test_vrg_is_the_inverse_bubble_applied_to_the_last_frequency_sum_of_chi_aux(
     sum_last = FourPoint(chi_star.sum(axis=-1) / beta, SpinChannel.DENS, (nqi, 1, 1), 1, 1, False, True, True)
     chi0_inv_fp = FourPoint(chi0_inv.copy(), SpinChannel.NONE, (nqi, 1, 1), 1, 1, False, True, True)
 
-    vrg_left = nonlocal_sde.create_vrg_r_q(sum_last.copy(), chi0_inv_fp)
+    vrg_left = sde_kernels.create_vrg_r_q(sum_last.copy(), chi0_inv_fp)
     ref_left = np.einsum("qabefwv,qfecdwv->qabcdwv", chi0_inv, chi_star.sum(axis=-1), optimize=True)
     assert np.allclose(vrg_left.mat, ref_left, atol=1e-10)
 
@@ -977,8 +972,8 @@ def test_unused_qloop_sigma_variants_agree():
             kernel_mat.copy(), SpinChannel.NONE, nk, 1, 1, full_niw_range=False, has_compressed_q_dimension=True
         )
 
-    sigma_ref = nonlocal_sde.calculate_sigma_from_kernel(make_kernel(), giwk, q_list)
-    sigma_loop = nonlocal_sde.calculate_sigma_from_kernel_loop(make_kernel(), giwk, q_list)
+    sigma_ref = sde_kernels.calculate_sigma_from_kernel(make_kernel(), giwk, q_list)
+    sigma_loop = sde_kernels.calculate_sigma_from_kernel_loop(make_kernel(), giwk, q_list)
 
     assert np.allclose(sigma_loop.mat, sigma_ref.mat, atol=1e-6)
 
@@ -1141,7 +1136,7 @@ def test_load_node_shared_local_vertex_private_path_applies_transform(monkeypatc
     )
     monkeypatch.setattr(np, "load", lambda *a, **k: mat.copy())
     ref = LocalFourPoint(mat.copy(), SpinChannel.NONE, 1, 2, False, True).permute_orbitals("abcd->cbad").scale(2.0)
-    out, win = nonlocal_sde._load_node_shared_local_vertex(
+    out, win = sde_kernels.load_node_shared_local_vertex(
         None,
         "unused.npy",
         SpinChannel.NONE,
@@ -1169,10 +1164,10 @@ def test_load_node_shared_local_vertex_loads_once_per_node(monkeypatch):
 
     def fn(comm, rank):
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
-        out, win = nonlocal_sde._load_node_shared_local_vertex(node_comm, "unused.npy", SpinChannel.DENS)
+        out, win = sde_kernels.load_node_shared_local_vertex(node_comm, "unused.npy", SpinChannel.DENS)
         res = out.mat.copy()
         out.mat = None
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
         return res
 
     _, res = run_parallel(2, fn, hostnames=["n0", "n0"])
@@ -1192,13 +1187,13 @@ def test_load_node_shared_local_vertex_exposes_the_requested_storage_order_as_a_
 
     def fn(comm, rank):
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
-        out, win = nonlocal_sde._load_node_shared_local_vertex(node_comm, "unused.npy", SpinChannel.DENS, axes=axes)
+        out, win = sde_kernels.load_node_shared_local_vertex(node_comm, "unused.npy", SpinChannel.DENS, axes=axes)
         res = (out.mat.copy(), out.mat.transpose(axes).flags["C_CONTIGUOUS"])
         out.mat = None
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
         return res
 
-    private, _ = nonlocal_sde._load_node_shared_local_vertex(None, "unused.npy", SpinChannel.DENS, axes=axes)
+    private, _ = sde_kernels.load_node_shared_local_vertex(None, "unused.npy", SpinChannel.DENS, axes=axes)
     assert np.array_equal(private.mat, mat) and private.mat.transpose(axes).flags["C_CONTIGUOUS"]
     _, res = run_parallel(2, fn, hostnames=["n0", "n0"])
     assert all(np.array_equal(r[0], mat) and r[1] for r in res)
@@ -1214,14 +1209,14 @@ def stab_logger(monkeypatch):
 
 def test_mixing_history_cap_uses_most_recent_reset_event():
     """The history cap counts iterations since the latest of the release, the mass change and the tracker event."""
-    assert nonlocal_sde._mixing_history_cap(10, None, None) is None
-    assert nonlocal_sde._mixing_history_cap(10, 7, None) == 2
-    assert nonlocal_sde._mixing_history_cap(10, None, 8) == 1
-    assert nonlocal_sde._mixing_history_cap(10, 7, 9) == 0
-    assert nonlocal_sde._mixing_history_cap(9, 4, 9) == 0
-    assert nonlocal_sde._mixing_history_cap(10, None, None, 8) == 1
-    assert nonlocal_sde._mixing_history_cap(10, 7, None, 9) == 0
-    assert nonlocal_sde._mixing_history_cap(10, 9, 5, 6) == 0
+    assert mixing.mixing_history_cap(10, None, None) is None
+    assert mixing.mixing_history_cap(10, 7, None) == 2
+    assert mixing.mixing_history_cap(10, None, 8) == 1
+    assert mixing.mixing_history_cap(10, 7, 9) == 0
+    assert mixing.mixing_history_cap(9, 4, 9) == 0
+    assert mixing.mixing_history_cap(10, None, None, 8) == 1
+    assert mixing.mixing_history_cap(10, 7, None, 9) == 0
+    assert mixing.mixing_history_cap(10, 9, 5, 6) == 0
 
 
 def test_update_jacobian_tracker_windows_and_allow_flip():
@@ -1264,7 +1259,7 @@ def test_relative_sigma_residual_zero_for_identical_input():
     config.box.niv_core = 3
     rng = np.random.default_rng(0)
     mat = (rng.standard_normal((4, 1, 1, 10)) + 1j * rng.standard_normal((4, 1, 1, 10))).astype(np.complex64)
-    assert nonlocal_sde._relative_sigma_residual(_make_resid_sigma(mat), _make_resid_sigma(mat.copy())) == 0.0
+    assert mixing.relative_sigma_residual(_make_resid_sigma(mat), _make_resid_sigma(mat.copy())) == 0.0
 
 
 def test_relative_sigma_residual_matches_explicit_core_window_formula():
@@ -1278,7 +1273,7 @@ def test_relative_sigma_residual_matches_explicit_core_window_formula():
     ref = max(
         np.linalg.norm(diff.real) / np.linalg.norm(old_c.real), np.linalg.norm(diff.imag) / np.linalg.norm(old_c.imag)
     )
-    out = nonlocal_sde._relative_sigma_residual(_make_resid_sigma(a), _make_resid_sigma(b))
+    out = mixing.relative_sigma_residual(_make_resid_sigma(a), _make_resid_sigma(b))
     assert np.allclose(out, ref, atol=1e-12)
 
 
@@ -1287,7 +1282,7 @@ def test_relative_sigma_residual_measures_each_part_against_its_own_norm():
     config.box.niv_core = 3
     old = np.full((4, 1, 1, 10), 1e-2 + 1.0j, dtype=np.complex128)
     new = old + 1e-4
-    out = nonlocal_sde._relative_sigma_residual(_make_resid_sigma(new), _make_resid_sigma(old))
+    out = mixing.relative_sigma_residual(_make_resid_sigma(new), _make_resid_sigma(old))
     assert np.allclose(out, 1e-2, atol=1e-12)
     assert np.linalg.norm(new - old) / np.linalg.norm(old) < 0.02 * out
 
@@ -1298,7 +1293,7 @@ def test_relative_sigma_residual_against_a_zero_iterate_is_infinite_without_a_wa
     new = np.full((4, 1, 1, 10), 0.3 - 0.2j, dtype=np.complex128)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        out = nonlocal_sde._relative_sigma_residual(_make_resid_sigma(new), _make_resid_sigma(np.zeros_like(new)))
+        out = mixing.relative_sigma_residual(_make_resid_sigma(new), _make_resid_sigma(np.zeros_like(new)))
     assert out == np.inf
 
 
@@ -1308,9 +1303,9 @@ def test_relative_sigma_residual_broadcasts_local_old_against_full_bz():
     rng = np.random.default_rng(2)
     new = (rng.standard_normal((6, 1, 1, 10)) + 1j * rng.standard_normal((6, 1, 1, 10))).astype(np.complex64)
     old_local = new[:1].copy()
-    out = nonlocal_sde._relative_sigma_residual(_make_resid_sigma(new), _make_resid_sigma(old_local))
+    out = mixing.relative_sigma_residual(_make_resid_sigma(new), _make_resid_sigma(old_local))
     assert np.isfinite(out) and out > 0.0
-    assert nonlocal_sde._relative_sigma_residual(_make_resid_sigma(new[:1].copy()), _make_resid_sigma(old_local)) == 0.0
+    assert mixing.relative_sigma_residual(_make_resid_sigma(new[:1].copy()), _make_resid_sigma(old_local)) == 0.0
 
 
 def test_relative_sigma_residual_scales_with_mixing_step():
@@ -1321,8 +1316,8 @@ def test_relative_sigma_residual_scales_with_mixing_step():
     prop = (rng.standard_normal((4, 1, 1, 10)) + 1j * rng.standard_normal((4, 1, 1, 10))).astype(np.complex128)
     alpha = 0.2
     mixed = alpha * prop + (1 - alpha) * old
-    raw = nonlocal_sde._relative_sigma_residual(_make_resid_sigma(prop), _make_resid_sigma(old))
-    step = nonlocal_sde._relative_sigma_residual(_make_resid_sigma(mixed), _make_resid_sigma(old))
+    raw = mixing.relative_sigma_residual(_make_resid_sigma(prop), _make_resid_sigma(old))
+    step = mixing.relative_sigma_residual(_make_resid_sigma(mixed), _make_resid_sigma(old))
     assert np.allclose(step, alpha * raw, atol=1e-12)
 
 
@@ -1468,8 +1463,8 @@ def test_relative_sigma_residual_layout_mismatch_is_normalized():
     sig_comp = SelfEnergy(
         mat_dec.reshape(6, 1, 1, 10).copy(), nk, has_compressed_q_dimension=True, calc_smom=False, beta=10.0
     )
-    assert nonlocal_sde._relative_sigma_residual(sig_comp, sig_dec) == 0.0
-    assert nonlocal_sde._relative_sigma_residual(sig_dec, sig_comp) == 0.0
+    assert mixing.relative_sigma_residual(sig_comp, sig_dec) == 0.0
+    assert mixing.relative_sigma_residual(sig_dec, sig_comp) == 0.0
 
 
 def test_relative_sigma_residual_local_old_normalization_is_k_count_independent():
@@ -1478,7 +1473,7 @@ def test_relative_sigma_residual_local_old_normalization_is_k_count_independent(
     old_local = np.ones((1, 1, 1, 10), dtype=np.complex64)
     for nk_tot in (4, 16):
         new_full = 2.0 * np.ones((nk_tot, 1, 1, 10), dtype=np.complex64)
-        out = nonlocal_sde._relative_sigma_residual(_make_resid_sigma(new_full), _make_resid_sigma(old_local))
+        out = mixing.relative_sigma_residual(_make_resid_sigma(new_full), _make_resid_sigma(old_local))
         assert np.allclose(out, 1.0, atol=1e-12)
 
 
@@ -1531,10 +1526,10 @@ def test_kernel_step_writes_the_eliashberg_intermediates_only_when_asked(monkeyp
     vrg.channel.value = "dens"
     chi.channel = SpinChannel.DENS
     aux_kwargs = []
-    monkeypatch.setattr(nonlocal_sde, "create_auxiliary_chi_r_q_sum", lambda *a, **k: aux_kwargs.append(k) or vrg)
-    monkeypatch.setattr(nonlocal_sde, "create_vrg_r_q", lambda *a, **k: vrg)
-    monkeypatch.setattr(nonlocal_sde, "create_shell_corrected_chi_from_gamma_ladder", lambda *a: chi)
-    monkeypatch.setattr(nonlocal_sde, "create_ladder_vertex_middle", lambda *a: middle)
+    monkeypatch.setattr(sde_kernels, "create_auxiliary_chi_r_q_sum", lambda *a, **k: aux_kwargs.append(k) or vrg)
+    monkeypatch.setattr(sde_kernels, "create_vrg_r_q", lambda *a, **k: vrg)
+    monkeypatch.setattr(sde_kernels, "create_shell_corrected_chi_from_gamma_ladder", lambda *a: chi)
+    monkeypatch.setattr(sde_kernels, "create_ladder_vertex_middle", lambda *a: middle)
     monkeypatch.setattr(nonlocal_sde, "_select_and_apply_lambda_correction", lambda c, lambda_previous=None: c)
     monkeypatch.setattr(nonlocal_sde, "min_static_compound_eigenvalue", lambda c: 1.0)
     monkeypatch.setattr(nonlocal_sde.LambdaAnnealer, "_static_gap", staticmethod(lambda c, dist: 1.0))
@@ -1574,15 +1569,15 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
     config.sys.beta = 10.0
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: ek)
     core, bubble_kwargs, node, giwk = MagicMock(), [], MagicMock(), MagicMock()
-    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (giwk, None, node))
+    monkeypatch.setattr(sde_kernels, "build_giwk_full", lambda *a, **k: (giwk, None, node))
     monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
     monkeypatch.setattr(
         nonlocal_sde.BubbleGenerator,
         "create_generalized_chi0_q_fft",
         lambda *a, **k: bubble_kwargs.append(k) or k["release"]() or [],
     )
-    monkeypatch.setattr(nonlocal_sde, "_bubble_box_parts", lambda blocks, f_dc, with_core: (MagicMock(), None, core))
-    monkeypatch.setattr(nonlocal_sde, "_cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
+    monkeypatch.setattr(sde_kernels, "bubble_box_parts", lambda blocks, f_dc, with_core: (MagicMock(), None, core))
+    monkeypatch.setattr(sde_kernels, "cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
     loaded, saves, involutions, nodes = [], [], [], []
 
     def load_vertex(node_comm, path, *a, **k):
@@ -1598,10 +1593,10 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
         nodes.append(node_comm)
         return MagicMock()
 
-    monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", load_vertex)
-    monkeypatch.setattr(nonlocal_sde, "_contract_dc_vertex", forbidden)
-    monkeypatch.setattr(nonlocal_sde, "_attach_dc_interaction", forbidden)
-    monkeypatch.setattr(nonlocal_sde, "_run_column_sde", forbidden)
+    monkeypatch.setattr(sde_kernels, "load_node_shared_local_vertex", load_vertex)
+    monkeypatch.setattr(sde_kernels, "contract_dc_vertex", forbidden)
+    monkeypatch.setattr(sde_kernels, "attach_dc_interaction", forbidden)
+    monkeypatch.setattr(sde_kernels, "run_column_sde", forbidden)
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_kernel_r_q", kernel_step)
     args = [MagicMock() for _ in range(8)]  # mu, u_loc, v_nonloc, v_nonloc_full, sigma_dmft, delta_sigma, q list, dist
 
@@ -1621,7 +1616,7 @@ def test_eliashberg_only_proposal_writes_the_intermediates_and_stops_before_the_
     for_bubble = bubble_kwargs[0]["involution"]
     assert (None if for_bubble is None else for_bubble.tolist()) == involution
     assert bubble_kwargs[0]["blocks"]
-    assert giwk.save.call_args.kwargs["name"] == nonlocal_sde.GIWK_FILE_STEM
+    assert giwk.save.call_args.kwargs["name"] == output_files.GIWK_FILE_STEM
     assert core.invert.return_value.save.call_count == 0
 
 
@@ -1634,33 +1629,33 @@ def test_bare_vertex_eliashberg_only_proposal_dumps_both_channels_without_a_loca
     config.sys.beta = 10.0
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
     giwk = MagicMock()
-    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (giwk, None, None))
+    monkeypatch.setattr(sde_kernels, "build_giwk_full", lambda *a, **k: (giwk, None, None))
     monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
     monkeypatch.setattr(
         nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: k["release"]() or []
     )
     cores = []
     monkeypatch.setattr(
-        nonlocal_sde,
-        "_bubble_box_parts",
+        sde_kernels,
+        "bubble_box_parts",
         lambda blocks, f_dc, with_core: cores.append(with_core) or (MagicMock(), None, None),
     )
-    monkeypatch.setattr(nonlocal_sde, "_cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
+    monkeypatch.setattr(sde_kernels, "cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
     steps = []
 
     def forbidden(*a, **k):
         raise AssertionError("the Eliashberg-only pass must not load a local vertex or reach a kernel or the SDE")
 
     for name in (
-        "_load_node_shared_local_vertex",
+        "load_node_shared_local_vertex",
         "calculate_bare_dc_kernel",
         "calculate_rpa_kernel_r_q",
-        "_run_column_sde",
+        "run_column_sde",
     ):
-        monkeypatch.setattr(nonlocal_sde, name, forbidden)
-    monkeypatch.setattr(nonlocal_sde, "create_bubble_tail", lambda *a: MagicMock())
+        monkeypatch.setattr(sde_kernels, name, forbidden)
+    monkeypatch.setattr(sde_kernels, "create_bubble_tail", lambda *a: MagicMock())
     monkeypatch.setattr(nonlocal_sde, "_monitor_stoner_factor", lambda *a: None)
-    monkeypatch.setattr(nonlocal_sde, "create_rpa_susceptibility", lambda *a: SimpleNamespace(channel=a[-1]))
+    monkeypatch.setattr(sde_kernels, "create_rpa_susceptibility", lambda *a: SimpleNamespace(channel=a[-1]))
     monkeypatch.setattr(
         nonlocal_sde,
         "_finish_physical_susceptibility",
@@ -1734,10 +1729,11 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
         "GreensFunction",
         SimpleNamespace(get_g_full=lambda *a, **k: gf_stub, get_occupation=lambda *a, **k: gf_stub.get_fill_nonlocal()),
     )
+    monkeypatch.setattr(sde_kernels, "GreensFunction", nonlocal_sde.GreensFunction)
     monkeypatch.setattr(nonlocal_sde, "update_mu", lambda *a, **k: 0.5)
     monkeypatch.setattr(
-        nonlocal_sde,
-        "_update_occ_and_energies_distributed",
+        sde_kernels,
+        "update_occ_and_energies_distributed",
         lambda *a: (1.0, np.zeros((nb, nb)), np.zeros((1, 1, 1, nb, nb)), 0.0, 0.0),
     )
 
@@ -1786,6 +1782,8 @@ def test_loop_rewrites_the_mu_history_on_rank0_every_iteration(monkeypatch, tmp_
     """Rank 0 alone writes the whole mu history after every iteration and once more after the loop."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mixing, "MPI", FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", FAKE_MPI)
     run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0)
     monkeypatch.setattr(nonlocal_sde, "update_mu", lambda mu0, *a, **k: mu0 + 0.1)
     writes = []
@@ -1807,6 +1805,8 @@ def _run_loop_on_two_node_ranks(monkeypatch, tmp_path, spied_name, spied_owner):
     """Runs the loop on two fake ranks of one node, returning the thread names of the in-loop calls of the spy."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mixing, "MPI", FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", FAKE_MPI)
     run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0)
     original = getattr(spied_owner, spied_name)
     seen = []
@@ -1825,6 +1825,8 @@ def test_loop_returns_sigma_on_rank0_only_after_interpolating_the_final_sigma_on
     """Only rank 0 gets the loop's result back and writes mu_history.npy; every rank interpolates the final sigma."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mixing, "MPI", FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", FAKE_MPI)
     run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
     config.self_energy_interpolation.do_interpolation = True
     seen, writers = [], []
@@ -1899,7 +1901,7 @@ def test_loop_writes_the_eliashberg_intermediates_once(
 def test_loop_writes_each_iterate_in_the_background_before_its_window_is_freed(monkeypatch, tmp_path):
     """Rank 0 writes every iterate off the main thread and awaits the write before the next mixing frees its window."""
     run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0)
-    events, free = [], nonlocal_sde._free_shared_window
+    events, free = [], mpi_utils.free_shared_window
 
     def slow_save(sigma, name, current_iter):
         threading.Event().wait(0.05)  # a write that outlasts the rest of the iteration unless it is awaited
@@ -1921,7 +1923,7 @@ def test_loop_writes_each_iterate_in_the_background_before_its_window_is_freed(m
         free(win, comm)
 
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", proposing)
-    monkeypatch.setattr(nonlocal_sde, "_free_shared_window", freeing)
+    monkeypatch.setattr(mpi_utils, "free_shared_window", freeing)
     result = run()
 
     saves = [event for event in events if event != "free"]
@@ -1939,10 +1941,10 @@ def test_loop_lets_the_other_ranks_sleep_through_the_serial_steps_of_rank_0(monk
     step = _affine_core_step(_STABLE_GAINS)
     run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, step, max_iter=2, epsilon=0.0)
     config.stabilization.use_jacobian_stabilization = tracker
-    events, free, mixing = [], nonlocal_sde._free_shared_window, nonlocal_sde.apply_mixing_strategy
+    events, free, mix = [], mpi_utils.free_shared_window, mixing.apply_mixing_strategy
     monkeypatch.setattr(mpi_utils, "idle_barrier", lambda comm, *a, **k: events.append("idle"))
-    monkeypatch.setattr(nonlocal_sde, "_free_shared_window", lambda win, comm: events.append("free") or free(win, comm))
-    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", lambda *a, **k: events.append("mix") or mixing(*a, **k))
+    monkeypatch.setattr(mpi_utils, "free_shared_window", lambda win, comm: events.append("free") or free(win, comm))
+    monkeypatch.setattr(mixing, "apply_mixing_strategy", lambda *a, **k: events.append("mix") or mix(*a, **k))
     monkeypatch.setattr(nonlocal_sde, "update_mu", lambda *a, **k: events.append("mu") or 0.5)
     run()
     # the finish idles first (no terms to free here); the loop then idles, mixes, idles and frees three windows
@@ -2075,6 +2077,8 @@ def test_resumed_run_shares_the_starting_iterate_per_node_before_the_first_propo
     """A resumed run reads its iterate on rank 0 only and hands it to the node-shared window before iteration one."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mixing, "MPI", FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", FAKE_MPI)
     run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=2, epsilon=0.0)
     monkeypatch.setattr(nonlocal_sde, "_init_mu_history", lambda warm_start: [config.sys.mu])
     original, before, loads, broadcasts = nonlocal_sde._share_sigma_per_node, [], [], []
@@ -2138,6 +2142,7 @@ def test_warm_start_holds_the_dmft_filling_and_resolves_mu(monkeypatch, tmp_path
             get_occupation=lambda *a, **k: g_full(*a, **k).get_fill_nonlocal(),
         ),
     )
+    monkeypatch.setattr(sde_kernels, "GreensFunction", nonlocal_sde.GreensFunction)
     solves = []
     monkeypatch.setattr(nonlocal_sde, "update_mu", lambda mu0, n, *a, **k: solves.append((mu0, n)) or 0.42)
     fake, proposal_mus, iterations = nonlocal_sde.calculate_sigma_proposal, [], []
@@ -2182,6 +2187,8 @@ def test_dmft_spectrum_builds_and_saves_the_lattice_green_function_once_next_to_
         return fill
 
     monkeypatch.setattr(nonlocal_sde, "GreensFunction", SimpleNamespace(get_g_full=g_full, get_occupation=occupation))
+
+    monkeypatch.setattr(sde_kernels, "GreensFunction", SimpleNamespace(get_g_full=g_full, get_occupation=occupation))
     run()
     assert built == [0.5] and saved == ["g_latt_dmft"]
     assert occupations == [0.5, 0.42]  # the DMFT filling, then the start's occupation at the re-solved mu
@@ -2192,6 +2199,8 @@ def test_fresh_start_occupies_a_real_reading_slice_of_a_complex_dispersion_as_co
     slice alone reads as real."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mixing, "MPI", FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", FAKE_MPI)
     run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0)
     config.lattice.k_grid = bz.KGrid((2, 1, 1), symmetries=[])
     ek = np.array([0.0, 0.3j]).reshape(2, 1, 1, 1, 1)  # the first momentum real alone, the whole dispersion complex
@@ -2201,6 +2210,7 @@ def test_fresh_start_occupies_a_real_reading_slice_of_a_complex_dispersion_as_co
         "get_occupation": lambda *a, **k: occupied.append((threading.current_thread().name, *a[2:])) or fill
     }
     monkeypatch.setattr(nonlocal_sde, "GreensFunction", SimpleNamespace(**greens))
+    monkeypatch.setattr(sde_kernels, "GreensFunction", SimpleNamespace(**greens))
     run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
     assert sorted((name, ek_my.ravel().tolist(), real) for name, ek_my, _, real in occupied) == [
         ("rank0", [0.0], False),
@@ -2212,6 +2222,8 @@ def test_warm_start_and_loop_solve_mu_on_every_rank_with_its_momenta(monkeypatch
     """Both mu searches run on every rank on its own rows of the start and of the mixed iterate with one moment."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mixing, "MPI", FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", FAKE_MPI)
     run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0)
     config.lattice.k_grid = bz.KGrid((3, 1, 1), symmetries=[])
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((3, 1, 1, 1, 1)))
@@ -2245,6 +2257,8 @@ def test_loop_sums_mu_and_the_occupation_over_the_momenta_picked_for_its_mixed_i
     """The loop's mu search and occupation take the rows, distributor and star weights picked for the mixed iterate."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mixing, "MPI", FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", FAKE_MPI)
     run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0)
     config.lattice.k_grid = bz.KGrid((4, 4, 1), symmetries=bz.two_dimensional_square_symmetries())
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((4, 4, 1, 1, 1)))
@@ -2268,7 +2282,7 @@ def test_loop_sums_mu_and_the_occupation_over_the_momenta_picked_for_its_mixed_i
 
     monkeypatch.setattr(nonlocal_sde, "_lattice_sum_momenta", pick)
     monkeypatch.setattr(nonlocal_sde, "update_mu", solve)
-    monkeypatch.setattr(nonlocal_sde, "_update_occ_and_energies_distributed", occupy)
+    monkeypatch.setattr(sde_kernels, "update_occ_and_energies_distributed", occupy)
     run()
     assert picked == [(SelfEnergy, (1, 1, 1), 6, 16)] and occupied == [(0.42, 16, 6)]
     assert solved[1:] == [("rows", 6, "wedge")]  # after the warm start's search
@@ -2290,7 +2304,7 @@ def test_loop_pads_only_the_rows_of_each_ranks_share_of_its_node(monkeypatch, tm
 def test_loop_measures_the_step_proposal_and_map_residuals_on_the_owners_of_rows(monkeypatch, tmp_path):
     """The owners of momentum rows, here rank 0 with the one momentum, measure the step and map residuals every
     iteration and the proposal's from the second on."""
-    seen = _run_loop_on_two_node_ranks(monkeypatch, tmp_path, "_relative_core_residual", nonlocal_sde)
+    seen = _run_loop_on_two_node_ranks(monkeypatch, tmp_path, "relative_core_residual", mixing)
     assert seen == ["rank0"] * 8
 
 
@@ -2403,8 +2417,8 @@ def test_loop_one_shot_lambda_correction_never_fires_release(monkeypatch, tmp_pa
 def test_loop_flag_off_never_builds_tracker_or_history(monkeypatch, tmp_path):
     """With the Jacobian flag off the loop mixes without a tracker and allocates no pair history for linear mixing."""
     run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy())
-    spy = create_autospec(nonlocal_sde.apply_mixing_strategy, wraps=nonlocal_sde.apply_mixing_strategy)
-    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", spy)
+    spy = create_autospec(mixing.apply_mixing_strategy, wraps=mixing.apply_mixing_strategy)
+    monkeypatch.setattr(mixing, "apply_mixing_strategy", spy)
     run()
     assert len(calls) == 2 and len(spy.call_args_list) == 2
     assert all(call.args[3] is None and call.args[4] is None for call in spy.call_args_list)
@@ -2413,7 +2427,7 @@ def test_loop_flag_off_never_builds_tracker_or_history(monkeypatch, tmp_path):
 def test_loop_does_not_converge_while_the_map_residual_stays_above_epsilon(monkeypatch, tmp_path):
     """Steps that stop while the map residual stays put above epsilon never reach the verdict."""
     run, calls, logger = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=10, epsilon=1e-3, tracked=False)
-    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", lambda new, old, *a, **k: old.copy())
+    monkeypatch.setattr(mixing, "apply_mixing_strategy", lambda new, old, *a, **k: old.copy())
     run()
     assert len(calls) == 10
     assert not any("Self-consistency of sigma and mu reached" in str(c.args[0]) for c in logger.info.call_args_list)
@@ -2429,7 +2443,7 @@ def test_loop_waits_for_the_proposal_to_settle(monkeypatch, tmp_path, alternatin
         return proposal
 
     run, calls, _ = _setup_self_energy_loop(monkeypatch, tmp_path, step, max_iter=10, epsilon=1e-3)
-    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", lambda new, old, *a, **k: old.copy())
+    monkeypatch.setattr(mixing, "apply_mixing_strategy", lambda new, old, *a, **k: old.copy())
     run()
     assert len(calls) == iterations
 
@@ -2579,9 +2593,9 @@ def test_loop_tracker_keeps_its_vectors_on_the_weighted_sector_of_the_window(mon
 def test_loop_tracker_event_feeds_history_cap(monkeypatch, tmp_path):
     """A tracker event reaches the accelerated-mixing cap while the tracker's own raw window is never shortened."""
     run, _, _ = _affine_loop(monkeypatch, tmp_path, _UNSTABLE_GAINS, max_iter=15, epsilon=1e-3)
-    cap_spy = create_autospec(nonlocal_sde._mixing_history_cap, wraps=nonlocal_sde._mixing_history_cap)
+    cap_spy = create_autospec(mixing.mixing_history_cap, wraps=mixing.mixing_history_cap)
     update_spy = create_autospec(JacobianTracker.update_recorded, wraps=JacobianTracker.update_recorded)
-    monkeypatch.setattr(nonlocal_sde, "_mixing_history_cap", cap_spy)
+    monkeypatch.setattr(mixing, "mixing_history_cap", cap_spy)
     monkeypatch.setattr(nonlocal_sde.JacobianTracker, "update_recorded", update_spy)
     run()
     events = [call.args[3] for call in cap_spy.call_args_list if len(call.args) == 4 and call.args[3] is not None]
@@ -2631,8 +2645,8 @@ def test_loop_tracker_switch_caps_the_history_of_the_same_iteration(monkeypatch,
         monkeypatch.setattr(nonlocal_sde, "_run_exact_check", lambda *a: True)
     else:
         monkeypatch.setattr(nonlocal_sde, "_update_jacobian_tracker", lambda *a: updates.append(1) or len(updates) == 4)
-    mix = nonlocal_sde.apply_mixing_strategy
-    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", lambda *a, **k: caps.append(a[2]) or mix(*a, **k))
+    mix = mixing.apply_mixing_strategy
+    monkeypatch.setattr(mixing, "apply_mixing_strategy", lambda *a, **k: caps.append(a[2]) or mix(*a, **k))
     run()
     assert caps[:3] == [None] * 3 and caps[3] == 0 and caps[4] == 1
 
@@ -2641,18 +2655,20 @@ def test_loop_runs_a_requested_exact_check_on_every_rank_before_the_step(monkeyp
     """A request of the tracker brings both ranks into one exact check, after the proposal and before rank 0 mixes."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mixing, "MPI", FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", FAKE_MPI)
     run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0)
     config.stabilization.use_jacobian_stabilization = True
     config.stabilization.use_exact_jacobian = True
     requests = iter([None, np.ones((8, 1)), None])
     monkeypatch.setattr(JacobianTracker, "exact_check_request", lambda self: next(requests))
-    events, mix = [], nonlocal_sde.apply_mixing_strategy
+    events, mix = [], mixing.apply_mixing_strategy
 
     def record(what):
         events.append((threading.current_thread().name, what))
 
     monkeypatch.setattr(nonlocal_sde, "_run_exact_check", lambda *a: record("check") or False)
-    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", lambda *a, **k: record("mix") or mix(*a, **k))
+    monkeypatch.setattr(mixing, "apply_mixing_strategy", lambda *a, **k: record("mix") or mix(*a, **k))
     run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
     names = sorted({name for name, _ in events})
     by_rank = [[what for name, what in events if name == thread] for thread in names]
@@ -2694,6 +2710,8 @@ def test_loop_tracker_runs_on_rank0_only_on_two_node_ranks(monkeypatch, tmp_path
     """On one node only rank 0 tracks, saves and returns sigma; rank 1 reads rank 0's mixed iterate from one buffer."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mixing, "MPI", FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", FAKE_MPI)
     step, inputs, buffers = _affine_core_step(_STABLE_GAINS), {"rank0": [], "rank1": []}, {"rank0": [], "rank1": []}
 
     def recording_step(sigma_in, n, annealer):
@@ -2720,14 +2738,14 @@ def test_loop_tracker_runs_on_rank0_only_on_two_node_ranks(monkeypatch, tmp_path
     monkeypatch.setattr(nonlocal_sde.JacobianTracker, "update_recorded", update_spy)
     monkeypatch.setattr(nonlocal_sde, "_save_sigma_iteration", save_spy)
     monkeypatch.setattr(nonlocal_sde, "_save_jacobian_spectrum", lambda tracker, converged, *rows: None)
-    mix, mixed = nonlocal_sde.apply_mixing_strategy, []
+    mix, mixed = mixing.apply_mixing_strategy, []
 
     def mix_spy(*args, **kwargs):
         out = mix(*args, **kwargs)
         mixed.append(out.mat.reshape(-1).copy())  # copied here: sharing the window drops rank 0's own array
         return out
 
-    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", mix_spy)
+    monkeypatch.setattr(mixing, "apply_mixing_strategy", mix_spy)
     _, results = run_parallel(2, lambda comm, rank: run(comm), hostnames=["n0", "n0"])
     assert len(calls) == 8 and updates == ["rank0"] * 4 and saves == ["rank0"] * 4
     assert any(estimates)
@@ -2817,7 +2835,7 @@ def test_loop_stabilizes_the_mixed_step_of_an_ill_conditioned_accelerated_fallba
     config.self_consistency.mixing_history_length = 2
     monkeypatch.setattr(nonlocal_sde.JacobianTracker, "active", property(lambda self: True))
     # no direction of the secant columns survives the cutoff
-    monkeypatch.setattr(nonlocal_sde, "_least_squares_coefficients", lambda columns, rhs, *a: (None, 1.0))
+    monkeypatch.setattr(mixing, "_least_squares_coefficients", lambda columns, rhs, *a: (None, 1.0))
     spy = create_autospec(JacobianTracker.stabilize_step, wraps=JacobianTracker.stabilize_step)
     monkeypatch.setattr(nonlocal_sde.JacobianTracker, "stabilize_step", spy)
     run()
@@ -2913,7 +2931,7 @@ def test_sigma_dc_kernel_matches_explicit_reference(o):
     f_dc_loc, gchi0_q, u_loc = _dc_kernel_inputs(o, nq, niw, niv_core, niv_full)
     beta = config.sys.beta
 
-    out = nonlocal_sde.calculate_sigma_dc_kernel(f_dc_loc, gchi0_q.copy(), u_loc)
+    out = sde_kernels.calculate_sigma_dc_kernel(f_dc_loc, gchi0_q.copy(), u_loc)
 
     window = slice(niv_full - niv_core, niv_full + niv_core)
     t = np.einsum("efgiwvp,qefdcwv->qigdcwp", f_dc_loc.mat, gchi0_q.mat, optimize=True)[..., window]
@@ -2931,8 +2949,8 @@ def test_sigma_dc_kernel_sums_the_stored_first_fermionic_index_over_the_full_box
     f_shell_zeroed = f_dc_loc.copy()
     f_shell_zeroed.mat[..., : niv_full - niv_core, :] = 0.0
 
-    full = nonlocal_sde.calculate_sigma_dc_kernel(f_dc_loc, gchi0_q.copy(), u_loc)
-    zeroed = nonlocal_sde.calculate_sigma_dc_kernel(f_shell_zeroed, gchi0_q.copy(), u_loc)
+    full = sde_kernels.calculate_sigma_dc_kernel(f_dc_loc, gchi0_q.copy(), u_loc)
+    zeroed = sde_kernels.calculate_sigma_dc_kernel(f_shell_zeroed, gchi0_q.copy(), u_loc)
 
     assert not np.allclose(zeroed.mat, full.mat, atol=1e-6)
 
@@ -2950,9 +2968,9 @@ def test_bare_dc_kernel_is_the_dc_kernel_of_the_constant_transversal_vertex(o):
     f_dc = u_mat - 2.0 * u_mat.transpose(0, 3, 2, 1)
     box = (o,) * 4 + (niw + 1, 2 * niv_full, 2 * niv_core)
     f_dc_loc = LocalFourPoint(np.broadcast_to(f_dc[..., None, None, None], box).copy(), SpinChannel.MAGN, 1, 2, False)
-    reference = nonlocal_sde.calculate_sigma_dc_kernel(f_dc_loc, gchi0_q.copy(), u_loc)
+    reference = sde_kernels.calculate_sigma_dc_kernel(f_dc_loc, gchi0_q.copy(), u_loc)
 
-    out = nonlocal_sde.calculate_bare_dc_kernel(gchi0_q.sum_over_all_vn(beta).scale(1.0 / beta), u_loc)
+    out = sde_kernels.calculate_bare_dc_kernel(gchi0_q.sum_over_all_vn(beta).scale(1.0 / beta), u_loc)
 
     assert out.num_vn_dimensions == 0
     assert np.allclose(reference.mat, out.mat[..., None], atol=1e-5 * np.abs(reference.mat).max())
@@ -2968,10 +2986,10 @@ def _rpa_sde_kernel(chi0_sum: np.ndarray, u_loc: LocalInteraction, chi_r: dict) 
     bubble plus 1x the density and 3x the magnetic RPA kernel of the susceptibilities chi_r."""
     nq = chi0_sum.shape[0]
     v_nonloc = Interaction(np.zeros((nq,) + u_loc.mat.shape), SpinChannel.NONE, (nq, 1, 1), True)
-    kernel = nonlocal_sde.calculate_bare_dc_kernel(_summed_bubble(chi0_sum), u_loc)
+    kernel = sde_kernels.calculate_bare_dc_kernel(_summed_bubble(chi0_sum), u_loc)
     for channel, weight in ((SpinChannel.DENS, 1.0), (SpinChannel.MAGN, 3.0)):
         chi = _summed_bubble(chi_r[channel], channel)
-        kernel.add(nonlocal_sde.calculate_rpa_kernel_r_q(chi, v_nonloc, u_loc).scale(weight), copy=False)
+        kernel.add(sde_kernels.calculate_rpa_kernel_r_q(chi, v_nonloc, u_loc).scale(weight), copy=False)
     return kernel.mat
 
 
@@ -2985,7 +3003,7 @@ def test_rpa_kernels_of_one_band_sum_to_the_flex_interaction():
     u_loc = LocalInteraction(np.full((1, 1, 1, 1), u), SpinChannel.NONE)
     v_nonloc = Interaction(np.zeros((6, 1, 1, 1, 1)), SpinChannel.NONE, (6, 1, 1), True)
     chi_r = {
-        channel: nonlocal_sde.create_rpa_susceptibility(_summed_bubble(chi0), u_loc, v_nonloc, channel).mat
+        channel: sde_kernels.create_rpa_susceptibility(_summed_bubble(chi0), u_loc, v_nonloc, channel).mat
         for channel in (SpinChannel.DENS, SpinChannel.MAGN)
     }
 
@@ -3107,8 +3125,8 @@ def test_create_auxiliary_chi_r_q_sum_matches_full_inversion_reference():
     """The chunked auxiliary-susceptibility sum equals the full compound inversion summed over the last frequency."""
     rng = np.random.default_rng(31)
     gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(rng)
-    ref = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc).sum_over_vn(config.sys.beta)
-    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    ref = sde_kernels.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc).sum_over_vn(config.sys.beta)
+    out = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
     assert np.allclose(out.mat, ref.mat, atol=1e-5)
     assert out.channel == gamma.channel and not out.full_niw_range and out.num_vn_dimensions == 1
 
@@ -3119,11 +3137,11 @@ def test_create_auxiliary_chi_r_q_sum_is_the_assembled_per_slice_solve_bit_for_b
     """The sum equals the assembled BSE matrix summed slice by slice with v2, bit for bit, for full and half gamma."""
     gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(np.random.default_rng(32), o=o, channel=channel)
     u_r = u_loc.as_channel(channel)
-    ref = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r).invert_and_sum_over_last_vn_v2(
+    ref = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r).invert_and_sum_over_last_vn_v2(
         config.sys.beta
     )
-    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
-    half = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma.copy().to_half_niw_range(), gchi0_q_inv, u_loc, 1)
+    out = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    half = sde_kernels.create_auxiliary_chi_r_q_sum(gamma.copy().to_half_niw_range(), gchi0_q_inv, u_loc, 1)
     assert out.channel == channel and not out.full_niw_range and out.num_vn_dimensions == 1
     assert np.array_equal(out.mat, ref.mat) and np.array_equal(half.mat, ref.mat)
 
@@ -3133,11 +3151,11 @@ def test_create_auxiliary_chi_r_q_sum_without_the_u_shift_sums_the_gamma_ladder(
     """With subtract_u=False the sum is that of the assembled chi0^-1 + Gamma/beta^2, the ladder of Gamma alone."""
     gamma, gchi0_q_inv, u_loc, _ = _bse_assembly_inputs(np.random.default_rng(32), o=o)
     zero = u_loc.as_channel(gamma.channel).scale(0.0)
-    ref = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, zero).invert_and_sum_over_last_vn_v2(
+    ref = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, zero).invert_and_sum_over_last_vn_v2(
         config.sys.beta
     )
-    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, subtract_u=False)
-    shifted = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    out = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, subtract_u=False)
+    shifted = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
     assert np.array_equal(out.mat, ref.mat) and not np.allclose(out.mat, shifted.mat)
 
 
@@ -3150,10 +3168,10 @@ def test_create_auxiliary_chi_r_q_sum_eliminates_the_pairs_without_vertex_of_a_t
     per_atom = same & (same.transpose(0, 2, 1, 3)) & (same.transpose(0, 2, 3, 1))
     gamma.mat[~per_atom] = 0.0
     u_loc.mat[~per_atom] = 0.0
-    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
-    ref = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc).sum_over_vn(config.sys.beta)
+    out = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    ref = sde_kernels.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc).sum_over_vn(config.sys.beta)
     u_r = u_loc.as_channel(gamma.channel)
-    assembled = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
+    assembled = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_r)
     inactive = gamma.orbital_pairs_without_vertex(u_r)
     assert "8 of 16 orbital pairs" in config.logger.info.call_args.args[0]
     assert np.allclose(out.mat, ref.mat, atol=1e-5)
@@ -3168,8 +3186,8 @@ def test_create_auxiliary_chi_r_q_sum_with_rhs_solves_the_bethe_salpeter_system(
     shape = gchi0_q_inv.current_shape
     mats = [rng.standard_normal(shape) + 1j * rng.standard_normal(shape) for _ in range(2)]
     rhs = [FourPoint(mat, SpinChannel.NONE, gchi0_q_inv.nq, 1, 1, False, True, True) for mat in mats]
-    chi_star = nonlocal_sde.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc).to_half_niw_range().mat
-    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=rhs)
+    chi_star = sde_kernels.create_auxiliary_chi_r_q(gamma, gchi0_q_inv, u_loc).to_half_niw_range().mat
+    out = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=rhs)
     assert len(out) == 2
     for solved, b in zip(out, rhs):
         assert np.allclose(solved.mat, np.einsum("qijabwvp,qbaklwp->qijklwv", chi_star, b.mat), atol=1e-10)
@@ -3184,21 +3202,21 @@ def test_create_auxiliary_chi_r_q_sum_takes_the_given_pairs_without_vertex_inste
     per_atom = same & (same.transpose(0, 2, 1, 3)) & (same.transpose(0, 2, 3, 1))
     gamma.mat[~per_atom] = 0.0
     u_loc.mat[~per_atom] = 0.0
-    scanned = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    scanned = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
     inactive = gamma.copy().to_half_niw_range().orbital_pairs_without_vertex(u_loc.as_channel(gamma.channel))
     config.logger.reset_mock()
     scan = create_autospec(
         LocalFourPoint.orbital_pairs_without_vertex, wraps=LocalFourPoint.orbital_pairs_without_vertex
     )
     monkeypatch.setattr(LocalFourPoint, "orbital_pairs_without_vertex", scan)
-    given = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, inactive=inactive)
+    given = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, inactive=inactive)
     assert inactive.size == 8 and scan.call_count == 0 and not config.logger.info.called
     assert np.array_equal(given.mat, scanned.mat)
 
 
 def test_share_slices_on_node_gate():
     """A node shares from a 3 % cut of its busiest rank's slices on; even counts, one rank or no momenta never share."""
-    share = nonlocal_sde._share_slices_on_node
+    share = sde_kernels._share_slices_on_node
     assert share(np.array([2, 1, 2, 1]), 41) and share(np.array([52, 48]), 1) and not share(np.array([51, 49]), 1)
     assert not share(np.array([25] * 112), 41) and not share(np.array([3]), 41) and not share(np.array([0, 0]), 41)
 
@@ -3250,7 +3268,7 @@ def _node_and_rank_sums(counts: list[int], hostnames: list[str], extra=lambda in
             inv = FourPoint(rows, SpinChannel.NONE, (int(bounds[-1]), 1, 1), 1, 1, False, True, True)
             gamma_r = LocalFourPoint(gamma.copy(), SpinChannel.DENS, 1, 2, False, True)
             u_loc = LocalInteraction(u.copy(), SpinChannel.NONE)
-            return nonlocal_sde.create_auxiliary_chi_r_q_sum(
+            return sde_kernels.create_auxiliary_chi_r_q_sum(
                 gamma_r, inv, u_loc, involution=_LAYER_SWAP, node_comm=node, **extra(inv)
             )
 
@@ -3282,7 +3300,7 @@ def _slices_per_rank(monkeypatch) -> dict[str, list[int]]:
 def test_node_shared_sum_matches_per_rank_sum(monkeypatch, dtype):
     """Four ranks of a node solve 4, 5, 4, 5 of its 18 slices and get the bits and layout of their per-rank sums."""
     monkeypatch.setattr("dgamore.n_point_base.DTYPE", dtype)
-    monkeypatch.setattr(nonlocal_sde, "NODE_SHARED_SLICE_GAIN", -1.0)
+    monkeypatch.setattr(sde_kernels, "NODE_SHARED_SLICE_GAIN", -1.0)
     hosts, permuted, refined = _node_test_setup(monkeypatch), [], four_point._refined_solve
     monkeypatch.setattr(four_point, "_refined_solve", lambda *a: permuted.append(1) or refined(*a))
     parts = _slices_per_rank(monkeypatch)
@@ -3319,7 +3337,7 @@ def test_node_shared_sum_decides_per_node(monkeypatch):
 @pytest.mark.parametrize("given", ["rhs", "slice_rhs"])
 def test_node_shared_sum_ignores_right_hand_sides(monkeypatch, given):
     """With right-hand sides, as the exact Jacobian passes them, every rank solves its own slices without a window."""
-    monkeypatch.setattr(nonlocal_sde, "NODE_SHARED_SLICE_GAIN", -1.0)
+    monkeypatch.setattr(sde_kernels, "NODE_SHARED_SLICE_GAIN", -1.0)
     hosts = _node_test_setup(monkeypatch)
     extra = {"rhs": lambda inv: {"rhs": [inv.copy()]}, "slice_rhs": lambda inv: {"slice_rhs": lambda i, w, t: []}}
     results = _node_and_rank_sums([2, 1, 2, 1], ["n0"] * 4, extra[given])
@@ -3336,9 +3354,9 @@ def test_chiq_aux_transient_bounds_the_traced_peak_of_the_build(o, niv, nw):
     chi0_inv = rng.standard_normal((1,) + (o,) * 4 + (nw, vn)) + 30.0
     gchi0_q_inv = FourPoint(chi0_inv, SpinChannel.NONE, (1, 1, 1), 1, 1, False, True, True)
     u_loc = LocalInteraction(np.ones((o,) * 4), SpinChannel.NONE)
-    nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
     tracemalloc.start()
-    out = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    out = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
     peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
     modeled = memory_estimator._chiq_aux_transient(n, o)
@@ -3366,11 +3384,11 @@ def test_kernel_step_in_momentum_groups_adds_the_bits_of_the_whole_rank_chain(mo
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
     config.sys.beta, config.box.niv_core = 9.0, 4
     gamma, inv, sums, u_loc, v_nonloc, kernel = _kernel_step_inputs(2, 7, 3, 8)
-    ladder = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, inv, u_loc, subtract_u=False)
+    ladder = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, inv, u_loc, subtract_u=False)
     vrg, x_g = (inv @ ladder).scale(9.0), ladder.sum_over_all_vn(9.0)
-    chi = nonlocal_sde.create_shell_corrected_chi_from_gamma_ladder(x_g, *sums, u_loc, v_nonloc)
-    middle = nonlocal_sde.create_kernel_middle(x_g, *sums, u_loc, v_nonloc, chi, chi)
-    expected = kernel.mat + nonlocal_sde.calculate_pole_free_kernel_r_q(vrg, middle, v_nonloc, u_loc).scale(3.0).mat
+    chi = sde_kernels.create_shell_corrected_chi_from_gamma_ladder(x_g, *sums, u_loc, v_nonloc)
+    middle = sde_kernels.create_kernel_middle(x_g, *sums, u_loc, v_nonloc, chi, chi)
+    expected = kernel.mat + sde_kernels.calculate_pole_free_kernel_r_q(vrg, middle, v_nonloc, u_loc).scale(3.0).mat
     dist = mpi_utils.MpiDistributor(ntasks=7, comm=create_comm_mock())
 
     out = nonlocal_sde.calculate_sigma_kernel_r_q(gamma, inv, *sums, u_loc, v_nonloc, dist, kernel=kernel, weight=3.0)
@@ -3401,9 +3419,9 @@ def test_kernel_step_with_a_boson_mass_adds_the_auxiliary_kernel_of_the_annealed
     one = LocalInteraction(np.einsum("ad,bc->abcd", np.eye(2), np.eye(2)))
     shift = lambda chi: (chi.invert() + one.scale(0.3, copy=True)).invert()
     annealer = SimpleNamespace(apply=lambda chi, dist: setattr(chi, "mat", shift(chi).mat) or chi)
-    aux = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, inv, u_loc)
-    chi = nonlocal_sde.create_generalized_chi_q_with_shell_correction(aux.sum_over_all_vn(9.0), *sums, u_loc, v_nonloc)
-    ref = nonlocal_sde.calculate_kernel_r_q((inv @ aux).scale(9.0), shift(chi), v_nonloc, u_loc).mat
+    aux = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, inv, u_loc)
+    chi = sde_kernels.create_generalized_chi_q_with_shell_correction(aux.sum_over_all_vn(9.0), *sums, u_loc, v_nonloc)
+    ref = sde_kernels.calculate_kernel_r_q((inv @ aux).scale(9.0), shift(chi), v_nonloc, u_loc).mat
     expected = kernel.mat + ref
     dist = mpi_utils.MpiDistributor(ntasks=7, comm=create_comm_mock())
 
@@ -3431,14 +3449,14 @@ def test_eliashberg_pass_saves_the_gamma_ladder_vertex_and_its_middle_and_keeps_
         gamma, inv, *sums, u_loc, v_nonloc, dist, save_eliashberg=True, kernel=saved
     )
 
-    ladder = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, inv, u_loc, subtract_u=False)
+    ladder = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, inv, u_loc, subtract_u=False)
     x_g = ladder.sum_over_all_vn(9.0)
-    chi = nonlocal_sde.create_shell_corrected_chi_from_gamma_ladder(x_g, *sums, u_loc, v_nonloc)
-    middle = nonlocal_sde.create_ladder_vertex_middle(x_g, *sums, u_loc, v_nonloc, chi, chi)
+    chi = sde_kernels.create_shell_corrected_chi_from_gamma_ladder(x_g, *sums, u_loc, v_nonloc)
+    middle = sde_kernels.create_ladder_vertex_middle(x_g, *sums, u_loc, v_nonloc, chi, chi)
     assert np.array_equal(saved.mat, plain.mat)
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
     assert files["vrg_q_dens_rank_0.npy"].shape[-1] == 2 * niv_pp
-    assert np.array_equal(files["vrg_q_dens_rank_0.npy"], nonlocal_sde.create_vrg_r_q(ladder, inv).cut_niv(niv_pp).mat)
+    assert np.array_equal(files["vrg_q_dens_rank_0.npy"], sde_kernels.create_vrg_r_q(ladder, inv).cut_niv(niv_pp).mat)
     assert np.array_equal(files["vrg_middle_q_dens_rank_0.npy"], middle.mat)
 
 
@@ -3470,23 +3488,23 @@ def test_proposal_attaches_the_double_counting_interaction_once_the_full_box_bub
     config.sys.beta = 10.0
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
     events = []
-    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, None))
+    monkeypatch.setattr(sde_kernels, "build_giwk_full", lambda *a, **k: (MagicMock(), None, None))
     monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
     monkeypatch.setattr(
         nonlocal_sde.BubbleGenerator,
         "create_generalized_chi0_q_fft",
         lambda *a, **k: k["release"]() or events.append("giwk cut") or ["blocks"],
     )
-    monkeypatch.setattr(nonlocal_sde, "_cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
-    monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", lambda *a, **k: (MagicMock(), None))
+    monkeypatch.setattr(sde_kernels, "cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
+    monkeypatch.setattr(sde_kernels, "load_node_shared_local_vertex", lambda *a, **k: (MagicMock(), None))
     monkeypatch.setattr(
-        nonlocal_sde,
-        "_bubble_box_parts",
+        sde_kernels,
+        "bubble_box_parts",
         lambda blocks, f_dc, with_core: events.append("bubble consumed") or (MagicMock(), MagicMock(), MagicMock()),
     )
-    monkeypatch.setattr(nonlocal_sde, "_attach_dc_interaction", lambda t, u: events.append("attached") or MagicMock())
+    monkeypatch.setattr(sde_kernels, "attach_dc_interaction", lambda t, u: events.append("attached") or MagicMock())
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_kernel_r_q", lambda *a, kernel=None, **k: kernel)
-    monkeypatch.setattr(nonlocal_sde, "_build_rspace_giwk_window", MagicMock(side_effect=RuntimeError("the SDE")))
+    monkeypatch.setattr(sde_kernels, "build_rspace_giwk_window", MagicMock(side_effect=RuntimeError("the SDE")))
 
     with pytest.raises(RuntimeError, match="the SDE"):
         nonlocal_sde.calculate_sigma_proposal(
@@ -3506,24 +3524,24 @@ def test_proposal_hands_the_node_to_the_contraction_only_where_its_ranks_share_t
     config.sys.beta = 10.0
     config.lattice.hamiltonian = SimpleNamespace(get_ek=lambda: np.zeros((1, 1, 1, 1, 1)))
     node, handed = MagicMock(), []
-    monkeypatch.setattr(nonlocal_sde, "_build_giwk_full", lambda *a, **k: (MagicMock(), None, node))
+    monkeypatch.setattr(sde_kernels, "build_giwk_full", lambda *a, **k: (MagicMock(), None, node))
     monkeypatch.setattr(nonlocal_sde.mpi_utils, "count_nodes", lambda *a: 1)
     monkeypatch.setattr(
         nonlocal_sde.BubbleGenerator, "create_generalized_chi0_q_fft", lambda *a, **k: k["release"]() or ["blocks"]
     )
-    monkeypatch.setattr(nonlocal_sde, "_cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
-    monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", lambda *a, **k: (MagicMock(), None))
-    monkeypatch.setattr(nonlocal_sde, "_bubble_box_parts", lambda *a: (MagicMock(), MagicMock(), MagicMock()))
-    monkeypatch.setattr(nonlocal_sde, "_attach_dc_interaction", lambda t, u: MagicMock())
+    monkeypatch.setattr(sde_kernels, "cut_and_reshare_giwk", lambda giwk, win, node_comm, niv: (giwk, None))
+    monkeypatch.setattr(sde_kernels, "load_node_shared_local_vertex", lambda *a, **k: (MagicMock(), None))
+    monkeypatch.setattr(sde_kernels, "bubble_box_parts", lambda *a: (MagicMock(), MagicMock(), MagicMock()))
+    monkeypatch.setattr(sde_kernels, "attach_dc_interaction", lambda t, u: MagicMock())
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_kernel_r_q", lambda *a, kernel=None, **k: kernel)
     monkeypatch.setattr(nonlocal_sde, "_has_point_group_covariance", lambda *a: True)
-    monkeypatch.setattr(nonlocal_sde, "_build_rspace_giwk_window", lambda *a: (MagicMock(), None))
+    monkeypatch.setattr(sde_kernels, "build_rspace_giwk_window", lambda *a: (MagicMock(), None))
 
     def contraction(*a):
         handed.append(a[-1])
         raise RuntimeError("the SDE")
 
-    monkeypatch.setattr(nonlocal_sde, "_run_column_sde", contraction)
+    monkeypatch.setattr(sde_kernels, "run_column_sde", contraction)
     budgets = memory_estimator.ChunkBudgets(1, 1, sde_node=sde_node)
     with pytest.raises(RuntimeError, match="the SDE"):
         nonlocal_sde.calculate_sigma_proposal(
@@ -3548,11 +3566,11 @@ def test_bubble_box_parts_from_bosonic_blocks_hold_the_bits_of_the_whole_bubble(
     blocks = [whole.take_wn_slice(w, w + 1) for w in range(nw)]
     kept = list(blocks)
 
-    full_sum, dc, core = nonlocal_sde._bubble_box_parts(blocks, f_dc, with_core)
+    full_sum, dc, core = sde_kernels.bubble_box_parts(blocks, f_dc, with_core)
 
     assert np.array_equal(full_sum.mat, whole.sum_over_all_vn(2.5).scale(1 / 2.5).mat)
     assert (dc is None) != with_dc and (core is None) != with_core
-    assert dc is None or np.array_equal(dc.mat, nonlocal_sde._contract_dc_vertex(f_dc, whole).mat)
+    assert dc is None or np.array_equal(dc.mat, sde_kernels.contract_dc_vertex(f_dc, whole).mat)
     assert core is None or np.array_equal(core.mat, whole.cut_niv(2).mat)
     assert blocks == [] and all(block.mat is None for block in kept)
 
@@ -3573,7 +3591,7 @@ def test_bubble_box_parts_never_hold_the_whole_core_box_beside_the_whole_full_bo
 
     def run():
         blocks = [whole.take_wn_slice(w, w + 1) for w in range(nw)]
-        return nonlocal_sde._bubble_box_parts(blocks, f_dc, True)
+        return sde_kernels.bubble_box_parts(blocks, f_dc, True)
 
     _, peak = traced_peak(run)
 
@@ -3610,7 +3628,7 @@ def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(mon
 
     def fn(comm, rank):
         d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
-        return nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
+        return sde_kernels.update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
 
     _, res = run_parallel(2, fn)
     # occupations reproduce the full-box reference bit-for-bit; only the energy scalars regroup their k-sums
@@ -3634,9 +3652,9 @@ def test_update_occ_and_energies_on_the_irreducible_momenta_match_those_of_the_w
     dmft_mat = np.eye(2)[..., None] * (0.3 + 0.2 / iv_dmft)
     sigma_new = SelfEnergy(sig_mat, grid.nk, has_compressed_q_dimension=True, beta=beta)
     sigma_dmft_full = SelfEnergy(dmft_mat[None, None, None], (1, 1, 1), beta=beta)
-    evaluate, rows = nonlocal_sde._slice_occupation_and_energies, []
+    evaluate, rows = sde_kernels._slice_occupation_and_energies, []
     monkeypatch.setattr(
-        nonlocal_sde, "_slice_occupation_and_energies", lambda s, *a: rows.append(s.mat.shape[0]) or evaluate(s, *a)
+        sde_kernels, "_slice_occupation_and_energies", lambda s, *a: rows.append(s.mat.shape[0]) or evaluate(s, *a)
     )
 
     def run(on_wedge):
@@ -3645,7 +3663,7 @@ def test_update_occ_and_energies_on_the_irreducible_momenta_match_those_of_the_w
         def fn(comm, rank):
             d_full = mpi_utils.MpiDistributor(ntasks=grid.nk_tot, comm=comm)
             d_irr = mpi_utils.MpiDistributor(ntasks=grid.nk_irr, comm=comm) if on_wedge else None
-            return nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu, d_irr)
+            return sde_kernels.update_occ_and_energies_distributed(*sigmas[rank], d_full, mu, d_irr)
 
         return run_parallel(size, fn)[1]
 
@@ -3689,7 +3707,7 @@ def test_update_occ_and_energies_distributed_carries_the_shell_offset_of_the_mix
 
     def fn(comm, rank):
         d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
-        return nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
+        return sde_kernels.update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
 
     _, res = run_parallel(2, fn)
     for _, occ, occ_k, ekin, epot in res:
@@ -3706,7 +3724,7 @@ def test_energies_estimate_bounds_the_traced_peak_of_the_occupation_and_energy_s
     for module, name, value in (
         (gf_module, "_MOMENTUM_CHUNK_ELEMENTS", 2**12),
         (memory_estimator, "GF_MOMENTUM_CHUNK_ELEMENTS", 2**12),
-        (gf_module, "_MODEL_EPOT_CHUNK_ELEMENTS", 2**17),
+        (gf_module, "MODEL_EPOT_CHUNK_ELEMENTS", 2**17),
         (memory_estimator, "GF_FREQUENCY_CHUNK_ELEMENTS", 2**17),
     ):
         monkeypatch.setattr(module, name, value)
@@ -3725,7 +3743,7 @@ def test_energies_estimate_bounds_the_traced_peak_of_the_occupation_and_energy_s
     dist = mpi_utils.MpiDistributor(ntasks=n_k, comm=create_comm_mock())
     tracemalloc.start()
     base = tracemalloc.get_traced_memory()[0]
-    nonlocal_sde._update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, dist, mu)
+    sde_kernels.update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, dist, mu)
     peak = tracemalloc.get_traced_memory()[1] - base
     tracemalloc.stop()
     modeled = memory_estimator.estimate_peaks(
@@ -3767,7 +3785,7 @@ def test_update_occ_and_energies_distributed_serves_a_rank_without_momenta(monke
 
     def fn(comm, rank):
         d_full = mpi_utils.MpiDistributor(ntasks=2, comm=comm)
-        return nonlocal_sde._update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, d_full, mu)
+        return sde_kernels.update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, d_full, mu)
 
     (_, one), (_, three) = run_parallel(1, fn), run_parallel(3, fn)
     for result in three:
@@ -3812,7 +3830,7 @@ def test_update_occ_and_energies_distributed_pins_the_occupation_dtype_across_ra
 
     def fn(comm, rank):
         d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
-        return nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
+        return sde_kernels.update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
 
     with monkeypatch.context() as mp:
         mp.setattr(nonlocal_sde.GreensFunction, "get_g_full", fake_get_g_full)
@@ -3854,7 +3872,7 @@ def test_update_occ_and_energies_distributed_decides_the_arithmetic_on_the_whole
 
     def fn(comm, rank):
         d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
-        return nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
+        return sde_kernels.update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
 
     _, res = run_parallel(2, fn)
     assert np.abs(occ_k_ref.reshape(nk_tot, o, o)[: nk_tot // 2].imag).max() > 1e-3
@@ -3917,7 +3935,7 @@ def test_assemble_occupation_from_momentum_slices_matches_the_full_grid_filling(
         n_my = d_full.my_size
         ek_my = ek.reshape(-1, o, o)[d_full.my_slice].reshape(n_my, 1, 1, o, o)
         occ_k_my = GreensFunction.get_g_full(sigma, mu, ek_my, beta).get_fill_nonlocal()[2]
-        return nonlocal_sde._assemble_occupation(occ_k_my, d_full)
+        return sde_kernels.assemble_occupation(occ_k_my, d_full)
 
     _, res = run_parallel(3, fn)
     for n_el, occ, occ_k in res:
@@ -3928,6 +3946,8 @@ def test_fresh_start_occupation_decides_the_arithmetic_on_the_whole_dispersion(m
     """A fresh start whose rank holds only real-H(k) momenta assembles the whole-grid occupation of a complex H(k)."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mixing, "MPI", FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", FAKE_MPI)
     _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=1, epsilon=0.0)
     nk, o, rng = (4, 1, 1), 2, np.random.default_rng(29)
     config.sys.n_bands = o
@@ -3939,10 +3959,8 @@ def test_fresh_start_occupation_decides_the_arithmetic_on_the_whole_dispersion(m
         SelfEnergy(mat.copy(), has_compressed_q_dimension=True, beta=10.0), 0.5, ek, 10.0
     )
     monkeypatch.setattr(nonlocal_sde.GreensFunction, "get_occupation", GreensFunction.get_occupation)
-    assembled, assemble = [], nonlocal_sde._assemble_occupation
-    monkeypatch.setattr(
-        nonlocal_sde, "_assemble_occupation", lambda *a: assembled.append(assemble(*a)) or assembled[-1]
-    )
+    assembled, assemble = [], sde_kernels.assemble_occupation
+    monkeypatch.setattr(sde_kernels, "assemble_occupation", lambda *a: assembled.append(assemble(*a)) or assembled[-1])
 
     def fn(comm, rank):
         sigma_dmft = SelfEnergy(mat.copy(), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0)
@@ -3979,7 +3997,7 @@ def test_scattered_interaction_is_each_ranks_reduction_of_the_full_grid_bit_for_
     def fn(comm, rank):
         dist = mpi_utils.MpiDistributor.create_distributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
         v_full = Interaction(mat.copy(), SpinChannel.NONE, nk)
-        scattered = nonlocal_sde.scatter_irreducible_interaction(v_full if rank == 0 else None, dist)
+        scattered = sde_kernels.scatter_irreducible_interaction(v_full if rank == 0 else None, dist)
         return scattered, v_full.reduce_q(irrq[dist.my_slice])
 
     _, results = run_parallel(n_ranks, fn)
@@ -4023,13 +4041,13 @@ def _run_column_sde_parallel(size, kernel, giwk, chunk_bytes=None, hostnames=Non
     def fn(comm, rank):
         d_irr = mpi_utils.MpiDistributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
-        g_r, win = nonlocal_sde._build_rspace_giwk_window(giwk, node_comm)
+        g_r, win = sde_kernels.build_rspace_giwk_window(giwk, node_comm)
         kern = FourPoint(kernel[d_irr.my_slice].copy(), SpinChannel.NONE, config.lattice.nk, 1, 1, False, True, True)
-        sigma = nonlocal_sde._run_column_sde(
+        sigma = sde_kernels.run_column_sde(
             kern, d_irr, g_r, giwk.niv, chunk_bytes, node_comm=node_comm if node else None, **flags
         )
         g_r = None
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
         return None if sigma is None else sigma.mat.copy()
 
     _, res = run_parallel(size, fn, hostnames=hostnames)
@@ -4062,13 +4080,13 @@ def test_has_time_reversal_accepts_real_hoppings_and_rejects_a_complex_one():
     ek[..., 0, 0] = -2 * np.cos(kx)[:, None, None]
     ek[..., 0, 1] = (0.3 + 0.7 * np.exp(1j * kx))[:, None, None]
     ek[..., 1, 0] = np.conj(ek[..., 0, 1])
-    assert nonlocal_sde._has_time_reversal(ek)
+    assert sde_kernels.has_time_reversal(ek)
     ek[..., 0, 1] += 1e-6j
     ek[..., 1, 0] -= 1e-6j
-    assert nonlocal_sde._has_time_reversal(ek)
+    assert sde_kernels.has_time_reversal(ek)
     ek[..., 0, 1] += 0.2j
     ek[..., 1, 0] -= 0.2j
-    assert not nonlocal_sde._has_time_reversal(ek)
+    assert not sde_kernels.has_time_reversal(ek)
 
 
 def test_orbital_involution_finds_the_layer_swap_that_transposes_a_bilayer_dispersion():
@@ -4076,14 +4094,14 @@ def test_orbital_involution_finds_the_layer_swap_that_transposes_a_bilayer_dispe
     rng, pi = np.random.default_rng(3), np.array([2, 3, 0, 1])
     ek = rng.standard_normal((4, 2, 1, 4, 4)) + 1j * rng.standard_normal((4, 2, 1, 4, 4))
     ek = 0.5 * (ek + np.swapaxes(ek, -1, -2)[..., pi, :][..., pi])
-    assert np.array_equal(nonlocal_sde._orbital_involution(ek), pi)
-    assert np.array_equal(nonlocal_sde._orbital_involution(ek + 1e-6 * rng.standard_normal(ek.shape)), pi)
+    assert np.array_equal(sde_kernels.orbital_involution(ek), pi)
+    assert np.array_equal(sde_kernels.orbital_involution(ek + 1e-6 * rng.standard_normal(ek.shape)), pi)
     broken = ek.copy()
     broken[..., 0, 1] += 0.1
     tied = ek.copy()
     tied[..., [0, 1, 2, 3], [0, 1, 2, 3]] = ek[..., :1, 0]
     for ek_none in (ek[..., :1, :1], np.real(ek[..., :2, :2]), broken, tied):
-        assert nonlocal_sde._orbital_involution(ek_none) is None
+        assert sde_kernels.orbital_involution(ek_none) is None
 
 
 @pytest.mark.parametrize("auto", [False, True])
@@ -4374,9 +4392,9 @@ def test_column_sde_single_rank_mock_path_equals_the_fake_mpi_run(monkeypatch):
     kernel, giwk = _column_sde_setup(True)
     comm = create_comm_mock()
     d_irr = mpi_utils.MpiDistributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
-    g_r, win = nonlocal_sde._build_rspace_giwk_window(giwk, comm)
+    g_r, win = sde_kernels.build_rspace_giwk_window(giwk, comm)
     kern = FourPoint(kernel.copy(), SpinChannel.NONE, config.lattice.nk, 1, 1, False, True, True)
-    sigma = nonlocal_sde._run_column_sde(kern, d_irr, g_r, giwk.niv)
+    sigma = sde_kernels.run_column_sde(kern, d_irr, g_r, giwk.niv)
     assert win is None
     assert np.array_equal(sigma.mat, _run_column_sde_parallel(1, kernel, giwk))
 
@@ -4468,10 +4486,10 @@ def test_build_rspace_giwk_window_is_the_frequency_first_transform_in_one_buffer
 
     def fn(comm, rank):
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
-        g_r, win = nonlocal_sde._build_rspace_giwk_window(giwk, node_comm)
+        g_r, win = sde_kernels.build_rspace_giwk_window(giwk, node_comm)
         res = (g_r.copy(), g_r.__array_interface__["data"][0], g_r.flags["C_CONTIGUOUS"])
         g_r = None
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
         return res
 
     _, res = run_parallel(2, fn, hostnames=["n0", "n0"])
@@ -4508,8 +4526,8 @@ def _stream_parallel(size, kernels, g_mats, windows, terms=_STREAM_TERMS, chunk_
         d_irr = mpi_utils.MpiDistributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
         giwks = [GreensFunction(g.copy(), calc_filling=False, nk=nk, beta=config.sys.beta) for g in g_mats]
-        g_rs = [nonlocal_sde._build_rspace_giwk_window(g, node_comm) for g in giwks]
-        stream = nonlocal_sde._ColumnSdeStream(d_irr, n_out, kernels[0].dtype, chunk_bytes, by_frequency=True)
+        g_rs = [sde_kernels.build_rspace_giwk_window(g, node_comm) for g in giwks]
+        stream = sde_kernels.ColumnSdeStream(d_irr, n_out, kernels[0].dtype, chunk_bytes, by_frequency=True)
         for w0, w1 in windows:
             group = [
                 FourPoint(k[d_irr.my_slice][..., w0:w1, :].copy(), SpinChannel.NONE, nk, 1, 1, False, True, True)
@@ -4519,7 +4537,7 @@ def _stream_parallel(size, kernels, g_mats, windows, terms=_STREAM_TERMS, chunk_
         outs = [stream.finish(j) for j in range(n_out)]
         wins, g_rs = [win for _, win in g_rs], None
         for win in wins:
-            nonlocal_sde._free_shared_window(win, node_comm)
+            mpi_utils.free_shared_window(win, node_comm)
         return None if rank else [out.mat.copy() for out in outs]
 
     _, res = run_parallel(size, fn, hostnames=["n0"] * size)
@@ -4528,7 +4546,7 @@ def _stream_parallel(size, kernels, g_mats, windows, terms=_STREAM_TERMS, chunk_
 
 
 def _two_column_sde_sums(size, kernels, g_mats):
-    """Two _run_column_sde calls per output: the contraction of K with dG_j plus that of dK_j with G."""
+    """Two run_column_sde calls per output: the contraction of K with dG_j plus that of dK_j with G."""
     nk = config.lattice.nk
     giwks = [GreensFunction(g.copy(), calc_filling=False, nk=nk, beta=config.sys.beta) for g in g_mats]
     return [
@@ -4611,7 +4629,7 @@ def test_column_sde_stream_batches_agree_with_one_column_unfold_batches_within_t
 
 @pytest.mark.parametrize("size", [1, 3])
 def test_column_sde_stream_matches_two_column_sde_calls_within_ten_times_the_single_precision_error(size, monkeypatch):
-    """The c64 stream differs from two _run_column_sde contractions by at most 10x their own distance to c128."""
+    """The c64 stream differs from two run_column_sde contractions by at most 10x their own distance to c128."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     kernels, g_mats = _stream_setup(True)
     got = _stream_parallel(size, kernels, g_mats, _windows(2))
@@ -4626,7 +4644,7 @@ def test_column_sde_stream_matches_two_column_sde_calls_within_ten_times_the_sin
 
 @pytest.mark.parametrize("size", [1, 3])
 def test_column_sde_stream_in_double_precision_matches_two_column_sde_calls_to_rounding(size, monkeypatch):
-    """In c128 the stream agrees with two _run_column_sde contractions to 1e-13 of the largest entry."""
+    """In c128 the stream agrees with two run_column_sde contractions to 1e-13 of the largest entry."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr("dgamore.n_point_base.DTYPE", np.complex128)
     kernels, g_mats = _stream_setup(True, dtype=np.complex128)
@@ -4652,8 +4670,8 @@ def test_column_sde_stream_single_rank_mock_path_equals_the_fake_mpi_run(monkeyp
     nk, comm = config.lattice.nk, create_comm_mock()
     d_irr = mpi_utils.MpiDistributor(ntasks=config.lattice.k_grid.nk_irr, comm=comm)
     giwks = [GreensFunction(g.copy(), calc_filling=False, nk=nk, beta=config.sys.beta) for g in g_mats]
-    g_rs = [nonlocal_sde._build_rspace_giwk_window(g, comm)[0] for g in giwks]
-    stream = nonlocal_sde._ColumnSdeStream(d_irr, 2, kernels[0].dtype, by_frequency=True)
+    g_rs = [sde_kernels.build_rspace_giwk_window(g, comm)[0] for g in giwks]
+    stream = sde_kernels.ColumnSdeStream(d_irr, 2, kernels[0].dtype, by_frequency=True)
     for w0, w1 in _windows(2):
         group = [FourPoint(k[..., w0:w1, :].copy(), SpinChannel.NONE, nk, 1, 1, False, True, True) for k in kernels]
         stream.add_group((w0, w1), group, [(i, j, g_rs[g], giwks[g].niv) for i, j, g in _STREAM_TERMS])
@@ -4672,14 +4690,14 @@ def test_column_sde_stream_rejects_windows_out_of_order_past_the_range_or_unfini
         """The kernel K of the window as a FourPoint."""
         return [FourPoint(kernels[0][..., w0:w1, :].copy(), SpinChannel.NONE, nk, 1, 1, False, True, True)]
 
-    stream = nonlocal_sde._ColumnSdeStream(d_irr, 1, kernels[0].dtype, by_frequency=True)
+    stream = sde_kernels.ColumnSdeStream(d_irr, 1, kernels[0].dtype, by_frequency=True)
     for window, kernel in (((1, 2), group(1, 2)), ((0, 0), group(0, 0)), ((0, 5), group(0, 4)), ((0, 2), group(0, 3))):
         with pytest.raises(ValueError):
             stream.add_group(window, kernel, [])
     with pytest.raises(ValueError):
         stream.finish(0)
     with pytest.raises(ValueError):
-        nonlocal_sde._ColumnSdeStream(d_irr, 1, kernels[0].dtype).add_group((0, 2), group(0, 2), [])
+        sde_kernels.ColumnSdeStream(d_irr, 1, kernels[0].dtype).add_group((0, 2), group(0, 2), [])
 
 
 def test_column_sde_stream_bytes_bound_the_traced_peak_of_a_one_rank_stream(monkeypatch):
@@ -4695,11 +4713,11 @@ def test_column_sde_stream_bytes_bound_the_traced_peak_of_a_one_rank_stream(monk
     def fn(comm, rank):
         d_irr = mpi_utils.MpiDistributor(ntasks=grid.nk_irr, comm=comm)
         giwks = [GreensFunction(g.copy(), calc_filling=False, nk=nk, beta=config.sys.beta) for g in g_mats]
-        g_rs = [nonlocal_sde._build_rspace_giwk_window(g, comm)[0] for g in giwks]
+        g_rs = [sde_kernels.build_rspace_giwk_window(g, comm)[0] for g in giwks]
         terms = [(i, j, g_rs[g], giwks[g].niv) for i, j, g in _STREAM_TERMS]
 
         def stream():
-            s = nonlocal_sde._ColumnSdeStream(d_irr, 2, kernels[0].dtype, chunk_bytes=1, by_frequency=True)
+            s = sde_kernels.ColumnSdeStream(d_irr, 2, kernels[0].dtype, chunk_bytes=1, by_frequency=True)
             for window, group in groups.items():
                 s.add_group(window, group, terms)
             return s
@@ -4720,7 +4738,7 @@ def test_sde_chunk_budget_is_the_job_wide_minimum(monkeypatch):
     node_sizes = (8, 64, 512)  # per-node budgets: capped at 4 GiB, 2 GiB, floored at 256 MiB
 
     def fn(comm, rank):
-        return nonlocal_sde._sde_chunk_budget(comm, SimpleNamespace(size=node_sizes[rank]))
+        return sde_kernels.sde_chunk_budget(comm, SimpleNamespace(size=node_sizes[rank]))
 
     _, budgets = run_parallel(3, fn)
     assert budgets == [memory_estimator.SLICE_CHUNK_BYTES] * 3
@@ -5068,7 +5086,7 @@ def test_prune_sigma_iterates_deletes_the_iterates_and_proposals_before_the_kept
 def test_loop_saves_the_core_window_of_the_proposal_as_the_map_returned_it(monkeypatch, tmp_path):
     """The saved proposal is the raw map output's core window, neither reflected nor mixed, unlike the next iterate."""
     run, _, _ = _affine_loop(monkeypatch, tmp_path, _STABLE_GAINS, max_iter=3, epsilon=0.0)
-    proposal_map, mixing = nonlocal_sde.calculate_sigma_proposal, nonlocal_sde.apply_mixing_strategy
+    proposal_map, mix = nonlocal_sde.calculate_sigma_proposal, mixing.apply_mixing_strategy
     save_iteration = nonlocal_sde._save_sigma_iteration
     produced, saved, mixed_in, mixed_out = [], [], [], []
 
@@ -5084,13 +5102,13 @@ def test_loop_saves_the_core_window_of_the_proposal_as_the_map_returned_it(monke
 
     def mixing_spy(sigma_new, *args, **kwargs):
         mixed_in.append(sigma_new.mat.reshape(-1).copy())
-        mixed = mixing(sigma_new, *args, **kwargs)
+        mixed = mix(sigma_new, *args, **kwargs)
         mixed_out.append(mixed.mat.reshape(-1).copy())
         return mixed
 
     monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", proposal_spy)
     monkeypatch.setattr(nonlocal_sde, "_save_sigma_iteration", save_spy)
-    monkeypatch.setattr(nonlocal_sde, "apply_mixing_strategy", mixing_spy)
+    monkeypatch.setattr(mixing, "apply_mixing_strategy", mixing_spy)
     reflect = MagicMock(side_effect=lambda proposal, iterate: np.zeros_like(proposal))
     monkeypatch.setattr(nonlocal_sde.JacobianTracker, "active", property(lambda self: True))
     monkeypatch.setattr(nonlocal_sde.JacobianTracker, "reflect", reflect)
@@ -5395,7 +5413,7 @@ def test_update_occ_and_energies_distributed_decides_the_complex_occupation_on_t
 
     def fn(comm, rank):
         d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
-        return nonlocal_sde._update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, d_full, mu)
+        return sde_kernels.update_occ_and_energies_distributed(sigma_new, sigma_dmft_full, d_full, mu)
 
     (_, one), (_, four) = run_parallel(1, fn), run_parallel(4, fn)
     assert np.abs(one[0][2].reshape(nk_tot, o, o)[:4].imag).max() > 1e-6
@@ -5419,6 +5437,7 @@ def test_warm_start_reads_the_dmft_filling_without_building_the_dmft_box_greens_
         get_occupation=lambda *a, **k: fillings.append(a) or fill,
     )
     monkeypatch.setattr(nonlocal_sde, "GreensFunction", greens)
+    monkeypatch.setattr(sde_kernels, "GreensFunction", greens)
     run()
     assert built == [] and fillings[0][1] == 0.5 and np.allclose(fillings[0][0].mat, 1.0 + 0.1j)
     config.ana_cont.do_spectrum_dmft = True
@@ -5459,10 +5478,8 @@ def test_loop_builds_the_tracker_with_exact_checks_only_with_the_exact_jacobian(
 def test_loop_records_the_tracker_pairs_and_mixes_linearly_without_copying_the_core_windows(monkeypatch, tmp_path):
     """With linear mixing the tracker's record and the mixing read the core windows in place; no pair is copied."""
     run, calls, _ = _affine_loop(monkeypatch, tmp_path, _UNSTABLE_GAINS, max_iter=8, epsilon=1e-3)
-    core_pair, copies = nonlocal_sde._core_pair, []
-    monkeypatch.setattr(
-        nonlocal_sde, "_core_pair", lambda *a, copy=True: copies.append(copy) or core_pair(*a, copy=copy)
-    )
+    core_pair, copies = mixing.core_pair, []
+    monkeypatch.setattr(mixing, "core_pair", lambda *a, copy=True: copies.append(copy) or core_pair(*a, copy=copy))
     run()
     assert len(copies) == 2 * len(calls) and not any(copies)
 
@@ -5512,22 +5529,22 @@ def test_sigma_kernel_pipeline_restricts_chi_phys_and_reports_the_count_of_every
     config.stabilization.use_chi_phys_restriction = True
     config.sys.beta, config.sys.n_bands = 10.0, 1
     logger, kernels, shells, aux = stab_logger, {}, {}, MagicMock(channel=SpinChannel.DENS)
-    monkeypatch.setattr(nonlocal_sde, "create_auxiliary_chi_r_q_sum", lambda *a, **k: aux)
-    monkeypatch.setattr(nonlocal_sde, "create_vrg_r_q", lambda *a, **k: aux)
+    monkeypatch.setattr(sde_kernels, "create_auxiliary_chi_r_q_sum", lambda *a, **k: aux)
+    monkeypatch.setattr(sde_kernels, "create_vrg_r_q", lambda *a, **k: aux)
     monkeypatch.setattr(
-        nonlocal_sde,
+        sde_kernels,
         "create_shell_corrected_chi_from_gamma_ladder",
         lambda *a: _chi_from_compound(
             np.array([[[[0.1]], [[0.05]]], [[[-0.2]], [[0.05]]]], dtype=complex), 1
         ).take_q_index_slice(*((0, 1) if threading.current_thread().name == "rank0" else (1, 2))),
     )
     monkeypatch.setattr(
-        nonlocal_sde,
+        sde_kernels,
         "create_kernel_middle",
         lambda *a: kernels.setdefault(threading.current_thread().name, a[-1])
         and shells.setdefault(threading.current_thread().name, a[-2]),
     )
-    monkeypatch.setattr(nonlocal_sde, "calculate_pole_free_kernel_r_q", lambda *a: MagicMock())
+    monkeypatch.setattr(sde_kernels, "calculate_pole_free_kernel_r_q", lambda *a: MagicMock())
 
     def fn(comm, rank):
         dist = mpi_utils.MpiDistributor(ntasks=2, comm=comm)
@@ -5557,7 +5574,7 @@ def test_in_place_rspace_window_holds_the_bits_of_the_window_of_the_cut_green_fu
     g = _random_momentum_g((4, 4, 2), nb, niv_window + 2, seed=48)
     ref = np.moveaxis(g.cut_niv(niv_window).fft().mat.reshape(32, nb, nb, -1), -1, 0)
     g = g.compress_q_dimension() if compressed else g
-    g_r, win = nonlocal_sde._build_rspace_giwk_window(g, create_comm_mock(), niv_window=niv_window)
+    g_r, win = sde_kernels.build_rspace_giwk_window(g, create_comm_mock(), niv_window=niv_window)
     assert win is None and np.array_equal(g_r, ref)
 
 
@@ -5595,7 +5612,7 @@ def _finish_on_node(hostnames, core_mat, terms, nk, average, unfold=False) -> li
         sigma, win, removed = nonlocal_sde._finish_proposal_on_node(core, *args, node_comm, unfold=unfold and rank == 0)
         mat = sigma.mat.copy()
         node_comm.Barrier()
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
         return mat, sigma.nq, sigma.has_compressed_q_dimension, removed
 
     return run_parallel(len(hostnames), fn, hostnames=hostnames)[1]
@@ -5684,7 +5701,7 @@ def test_scatter_and_gather_of_the_core_rows_hand_every_node_every_mixed_row(mon
         core[layout.rows] *= 2.0  # the owner's mixed rows
         nonlocal_sde._gather_mixed_rows(core, layout)
         gathered = core.copy()
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
         return layout.rows, received, gathered
 
     for rows, received, gathered in run_parallel(len(hostnames), fn, hostnames=hostnames)[1]:
@@ -5739,7 +5756,7 @@ def test_build_iterate_window_pads_every_row_as_the_mixing_of_the_whole_self_ene
         shell = (donor, offset, average, donor_old, damped, 0.3)
         sigma, win, removed = nonlocal_sde._build_iterate_window(core, old(), shell, node_comm, 10.0)
         mat = sigma.mat.copy()
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
         return mat, sigma.nq, sigma.has_compressed_q_dimension, removed
 
     for mat, nq, compressed, removed in run_parallel(len(hostnames), fn, hostnames=hostnames)[1]:
@@ -5751,6 +5768,8 @@ def _loop_on_grid(monkeypatch, tmp_path, strategy: str, hostnames: list, n_bands
     result."""
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", FAKE_MPI)
+    monkeypatch.setattr(mixing, "MPI", FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", FAKE_MPI)
     nb = n_bands
     run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, _distinct_rows_step, 4, 0.0, n_bands=nb)
     config.lattice.k_grid = bz.KGrid((4, 1, 1), symmetries=[])
@@ -5759,6 +5778,7 @@ def _loop_on_grid(monkeypatch, tmp_path, strategy: str, hostnames: list, n_bands
     occupy = lambda sigma, mu, ek, *a, **k: (1.0, np.eye(nb, dtype=np.complex128), np.zeros((*ek.shape[:3], nb, nb)))
     greens = SimpleNamespace(get_g_full=nonlocal_sde.GreensFunction.get_g_full, get_occupation=occupy)
     monkeypatch.setattr(nonlocal_sde, "GreensFunction", greens)
+    monkeypatch.setattr(sde_kernels, "GreensFunction", greens)
     return run_parallel(len(hostnames), lambda comm, rank: run(comm), hostnames=hostnames)[1][0].mat.copy()
 
 
@@ -5815,7 +5835,7 @@ def _holds_view(value, window: np.ndarray) -> bool:
 def test_loop_drops_every_view_into_a_window_before_freeing_it(monkeypatch, tmp_path):
     """No local of the function that frees a shared window of the loop still views the window's memory."""
     allocate, build = mpi_utils.allocate_node_shared_array, mpi_utils.build_node_shared_array
-    free, windows, held = nonlocal_sde._free_shared_window, {}, []
+    free, windows, held = mpi_utils.free_shared_window, {}, []
 
     def remembered(result):
         if result[1] is not None:
@@ -5831,7 +5851,7 @@ def test_loop_drops_every_view_into_a_window_before_freeing_it(monkeypatch, tmp_
 
     monkeypatch.setattr(mpi_utils, "allocate_node_shared_array", lambda *a, **k: remembered(allocate(*a, **k)))
     monkeypatch.setattr(mpi_utils, "build_node_shared_array", lambda *a, **k: remembered(build(*a, **k)))
-    monkeypatch.setattr(nonlocal_sde, "_free_shared_window", checked_free)
+    monkeypatch.setattr(mpi_utils, "free_shared_window", checked_free)
     _loop_on_grid(monkeypatch, tmp_path, "linear", ["n0", "n0", "n1", "n1"])
     assert sorted(set(held)) == []
 
@@ -6021,10 +6041,10 @@ def test_rspace_window_ranks_transform_their_own_frequencies_with_the_bits_of_th
 
     def fn(comm, rank):
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
-        g_r, win = nonlocal_sde._build_rspace_giwk_window(g, node_comm, niv_window=niv_window)
+        g_r, win = sde_kernels.build_rspace_giwk_window(g, node_comm, niv_window=niv_window)
         result = g_r.copy()
         g_r = None
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
         return result
 
     _, results = run_parallel(len(hostnames), fn, hostnames=hostnames)
@@ -6038,7 +6058,7 @@ def test_in_place_rspace_window_refuses_more_frequencies_than_the_green_function
     """A window wider than the Green's function's frequency box raises instead of reading outside it."""
     g = _random_momentum_g((2, 2, 1), 1, 3, seed=49)
     with pytest.raises(ValueError):
-        nonlocal_sde._build_rspace_giwk_window(g, create_comm_mock(), niv_window=4)
+        sde_kernels.build_rspace_giwk_window(g, create_comm_mock(), niv_window=4)
 
 
 def test_in_place_rspace_window_is_shared_per_node_and_built_without_a_private_copy(monkeypatch):
@@ -6046,15 +6066,15 @@ def test_in_place_rspace_window_is_shared_per_node_and_built_without_a_private_c
     monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
     niv_window = 20
     g = _random_momentum_g((8, 8, 1), 2, niv_window + 2, seed=50)
-    ref, _ = nonlocal_sde._build_rspace_giwk_window(g.cut_niv(niv_window), create_comm_mock())
+    ref, _ = sde_kernels.build_rspace_giwk_window(g.cut_niv(niv_window), create_comm_mock())
 
     def fn(comm, rank):
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
-        build = lambda: nonlocal_sde._build_rspace_giwk_window(g, node_comm, niv_window=niv_window)
+        build = lambda: sde_kernels.build_rspace_giwk_window(g, node_comm, niv_window=niv_window)
         (g_r, win), peak = traced_peak(build) if rank == 0 else (build(), 0)
         result = (g_r.__array_interface__["data"][0], np.array_equal(g_r, ref), peak)
         g_r = None
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
         return result
 
     results = run_parallel(2, fn, hostnames=["n0", "n0"])[1]
@@ -6077,11 +6097,11 @@ def test_column_sde_on_a_wider_in_place_window_keeps_the_bits_of_the_cut_window(
         kern = FourPoint(kernel[d_irr.my_slice].copy(), SpinChannel.NONE, config.lattice.nk, 1, 1, False, True, True)
         sigmas = []
         for g, niv_window in ((giwk, None), (wide, wide.niv)):
-            g_r, win = nonlocal_sde._build_rspace_giwk_window(g, node_comm, niv_window=niv_window)
-            sigma = nonlocal_sde._run_column_sde(kern, d_irr, g_r, g.niv)
+            g_r, win = sde_kernels.build_rspace_giwk_window(g, node_comm, niv_window=niv_window)
+            sigma = sde_kernels.run_column_sde(kern, d_irr, g_r, g.niv)
             sigmas.append(None if sigma is None else sigma.mat.copy())
             g_r = None
-            nonlocal_sde._free_shared_window(win, node_comm)
+            mpi_utils.free_shared_window(win, node_comm)
         return sigmas
 
     cut, wide_sigma = run_parallel(2, fn, hostnames=["n0", "n0"])[1][0]
@@ -6103,7 +6123,7 @@ def test_kernel_with_per_wn_products_gives_every_bosonic_window_its_window_of_th
     def kernel(w0: int, w1: int, per_wn: bool) -> np.ndarray:
         """The kernel of the bosonic window [w0, w1)."""
         window = (vrg.take_wn_slice(w0, w1), chi.take_wn_slice(w0, w1), v_nonloc, u_loc, per_wn)
-        return nonlocal_sde.calculate_kernel_r_q(*window).mat
+        return sde_kernels.calculate_kernel_r_q(*window).mat
 
     whole, batched = kernel(0, nw, True), kernel(0, nw, False)
     windows = [(kernel(w0, min(nw, w0 + 2), True), whole[..., w0 : w0 + 2, :]) for w0 in (0, 2, 4)]
@@ -6113,7 +6133,7 @@ def test_kernel_with_per_wn_products_gives_every_bosonic_window_its_window_of_th
 
 @pytest.mark.parametrize("o", [1, 2])
 def test_dc_attachment_per_wn_gives_every_bosonic_window_its_window_of_the_whole_attachment(o):
-    """_attach_dc_interaction with per_wn gives a window that window of its whole kernel and matches the batched one."""
+    """attach_dc_interaction with per_wn gives a window that window of its whole kernel and matches the batched one."""
     rng = np.random.default_rng(7)
     config.sys.beta = 9.0
     shape = (3, o, o, o, o, 5, 8)
@@ -6121,13 +6141,13 @@ def test_dc_attachment_per_wn_gives_every_bosonic_window_its_window_of_the_whole
     contraction = FourPoint(mat, SpinChannel.NONE, (3, 1, 1), 1, 1, False, True, True)
     u_loc = LocalInteraction(rng.standard_normal((o,) * 4))
 
-    whole = nonlocal_sde._attach_dc_interaction(contraction, u_loc, per_wn=True).mat
+    whole = sde_kernels.attach_dc_interaction(contraction, u_loc, per_wn=True).mat
     windows = [
-        nonlocal_sde._attach_dc_interaction(contraction.take_wn_slice(w0, w0 + 2), u_loc, per_wn=True).mat
+        sde_kernels.attach_dc_interaction(contraction.take_wn_slice(w0, w0 + 2), u_loc, per_wn=True).mat
         for w0 in (0, 2, 4)
     ]
 
-    batched = nonlocal_sde._attach_dc_interaction(contraction, u_loc).mat
+    batched = sde_kernels.attach_dc_interaction(contraction, u_loc).mat
     atol = ten_times_the_floor(whole)
     assert all(np.allclose(p, whole[..., w0 : w0 + 2, :], rtol=0, atol=atol) for p, w0 in zip(windows, (0, 2, 4)))
     assert np.allclose(whole, batched, atol=1e-5 * np.abs(batched).max())
@@ -6150,15 +6170,15 @@ def test_load_node_shared_local_vertex_streams_only_its_bosonic_window_on_any_no
 
     def fn(comm, rank):
         node_comm = comm.Split_type(FAKE_MPI.COMM_TYPE_SHARED)
-        out, win = nonlocal_sde._load_node_shared_local_vertex(
+        out, win = sde_kernels.load_node_shared_local_vertex(
             node_comm, "unused.npy", SpinChannel.MAGN, axes=axes, w_window=(1, 3)
         )
         res = (out.mat.copy(), out.mat.transpose(axes).flags["C_CONTIGUOUS"])
         out.mat = None
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
         return res
 
-    single, win = nonlocal_sde._load_node_shared_local_vertex(
+    single, win = sde_kernels.load_node_shared_local_vertex(
         create_comm_mock(), "unused.npy", SpinChannel.MAGN, axes=axes, w_window=(1, 3)
     )
     _, res = run_parallel(2, fn, hostnames=["n0", "n0"])
@@ -6177,9 +6197,9 @@ def test_auxiliary_sum_with_slice_rhs_returns_the_sum_and_the_solutions_of_its_r
     gchi0_q_inv = FourPoint(chi0_inv, SpinChannel.NONE, (q, 1, 1), 1, 1, False, True, True)
     u_loc = LocalInteraction(rng.standard_normal((o,) * 4), SpinChannel.NONE)
 
-    total = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
-    (solved,) = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=[total.scale(3.0, copy=True)])
-    fused, fused_solved = nonlocal_sde.create_auxiliary_chi_r_q_sum(
+    total = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc)
+    (solved,) = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_q_inv, u_loc, rhs=[total.scale(3.0, copy=True)])
+    fused, fused_solved = sde_kernels.create_auxiliary_chi_r_q_sum(
         gamma, gchi0_q_inv, u_loc, slice_rhs=lambda i, w, b: [b.scale(3.0, copy=True)]
     )
 
@@ -6202,7 +6222,7 @@ def test_assemble_occupation_traces_every_orbital_and_hands_on_the_correlated_bl
         d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
         ek_my = ek.reshape(-1, 3, 3)[d_full.my_slice].reshape(d_full.my_size, 1, 1, 3, 3)
         occ_k_my = GreensFunction.get_occupation(sigma, mu, ek_my, beta, real_dispersion=False, orbitals=o)[2]
-        return nonlocal_sde._assemble_occupation(occ_k_my, d_full, orbitals=o)
+        return sde_kernels.assemble_occupation(occ_k_my, d_full, orbitals=o)
 
     _, res = run_parallel(3, fn)
     for n_el, occ, occ_k in res:
@@ -6234,5 +6254,5 @@ def test_orbital_involution_is_restricted_to_the_correlated_orbitals():
     rng, pi = np.random.default_rng(3), np.array([2, 3, 0, 1])
     ek = rng.standard_normal((4, 2, 1, 4, 4)) + 1j * rng.standard_normal((4, 2, 1, 4, 4))
     ek = 0.5 * (ek + np.swapaxes(ek, -1, -2)[..., pi, :][..., pi])
-    assert np.array_equal(nonlocal_sde._orbital_involution(ek, orbitals=np.array([0, 2])), [1, 0])
-    assert nonlocal_sde._orbital_involution(ek, orbitals=np.array([0, 1])) is None
+    assert np.array_equal(sde_kernels.orbital_involution(ek, orbitals=np.array([0, 2])), [1, 0])
+    assert sde_kernels.orbital_involution(ek, orbitals=np.array([0, 1])) is None

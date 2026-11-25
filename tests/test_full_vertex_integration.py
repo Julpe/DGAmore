@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from dgamore import brillouin_zone as bz
-from dgamore import config, eliashberg_solver, nonlocal_sde
+from dgamore import config, nonlocal_sde, pairing_vertex
 from dgamore.dga_logger import DgaLogger
 from dgamore.four_point import FourPoint
 from dgamore.interaction import Interaction, LocalInteraction
@@ -110,7 +110,7 @@ def test_streamed_full_vertex_matches_exact_bse_inversion(setup, no):
     config.sys.n_bands = no
     config.lattice.k_grid = bz.KGrid((n_q, 1, 1), symmetries=[])
     config.box.niv_core = niv
-    eliashberg_solver.create_pairing_vertex_streaming_fq(u_loc, v_nonloc, gamma_r, niv // 2, dist)
+    pairing_vertex.create_pairing_vertex_streaming_fq(u_loc, v_nonloc, gamma_r, niv // 2, dist)
     f_q_mat = np.load(os.path.join(config.output.output_path, "f_irrq_dens.npy"))
 
     # exact reference per (q, omega) slice from the raw toy tensors: F depends only on chi0, Gamma and beta

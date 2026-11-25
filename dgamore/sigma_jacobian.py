@@ -25,7 +25,6 @@ on the self-energies the loop can reach (:func:`sector_projector`).
 
 import contextlib
 import hashlib
-import os
 from collections.abc import Callable
 
 import mpi4py.MPI as MPI
@@ -36,19 +35,23 @@ from scipy.linalg import schur
 import dgamore.brillouin_zone as bz
 import dgamore.config as config
 import dgamore.mpi_utils as mpi_utils
-from dgamore import memory_estimator, n_point_base, nonlocal_sde, symmetry_reduction
+from dgamore import memory_estimator, n_point_base, output_files, sde_kernels, symmetry_reduction
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.four_point import FourPoint
-from dgamore.greens_function import _MODEL_EPOT_CHUNK_ELEMENTS, GreensFunction, _fermi_dirac_density, embed_orbitals
+from dgamore.greens_function import MODEL_EPOT_CHUNK_ELEMENTS, GreensFunction, fermi_dirac_density, embed_orbitals
 from dgamore.interaction import Interaction, LocalInteraction
-from dgamore.jacobian_stabilization import _RITZ_GATE, _condition_numbers, _schur_ritz, to_mat, to_vec
+from dgamore.jacobian_stabilization import RITZ_GATE, condition_numbers, schur_ritz, to_mat, to_vec
 from dgamore.matsubara_frequencies import MFHelper
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.n_point_base import SpinChannel, deferred_collection
 from dgamore.self_energy import SelfEnergy
 
 _CHANNELS = ((SpinChannel.DENS, 1.0), (SpinChannel.MAGN, 3.0))  # ladder channels and their weights in the kernel
-_F_DC = ("f_dc_loc.npy", SpinChannel.MAGN, (4, 0, 1, 5, 2, 3, 6))  # the dc vertex, stored in its contraction order
+_F_DC = (
+    output_files.F_DC_LOC,
+    SpinChannel.MAGN,
+    (4, 0, 1, 5, 2, 3, 6),
+)  # the dc vertex, stored in its contraction order
 _INVERSE_ORDER = (0, 5, 6, 1, 2, 4, 3)  # storage order of a one-fermion object after FourPoint.invert
 _MAX_MATVECS = 150  # rough bound on the products of one ARPACK target and on the block search's passes
 _SWEEP_ROWS = 1 << 15  # rows of the block eigen-solve's basis and images read per chunk of a sweep
@@ -83,7 +86,7 @@ def _squared_box_sum(
     iv = 1j * MFHelper.vn(sigma_mat.shape[-1] // 2, beta)
     static = (iv[:, None, None] + mu) * np.eye(nb)
     out = np.empty((nk, nb, nb), dtype=np.complex128 if complex_ek else np.float64)
-    for start, stop in mpi_utils.row_chunks(nk, 1, nb * nb * iv.size, _MODEL_EPOT_CHUNK_ELEMENTS):
+    for start, stop in mpi_utils.row_chunks(nk, 1, nb * nb * iv.size, MODEL_EPOT_CHUNK_ELEMENTS):
         rows = sigma_mat if sigma_mat.shape[0] == 1 else sigma_mat[start:stop]
         dyson = static[None] - ek[start:stop, None]
         if orbitals is None:
@@ -204,7 +207,7 @@ class ExactJacobian:
     3. per window of stored bosonic frequencies: :math:`\delta\chi^{\mathrm{q}\nu}_{0} = \chi_{0}[G, \delta G] +
        \chi_{0}[\delta G, G]`, the derivative of the bubble, which is quadratic in :math:`G` (see
        :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_q_fft_window`);
-    4. per window and channel the Bethe-Salpeter system of :func:`~dgamore.nonlocal_sde.create_auxiliary_chi_r_q_sum`
+    4. per window and channel the Bethe-Salpeter system of :func:`~dgamore.sde_kernels.create_auxiliary_chi_r_q_sum`
        solved for :math:`t^{\mathrm{q}\nu}_{r} = (\chi^{\mathrm{q}\nu}_{0})^{-1}\,\delta\chi^{\mathrm{q}\nu}_{0}\,
        \gamma^{\mathrm{q}\nu}_{r}`, giving :math:`s^{\mathrm{q}\nu}_{r}`,
        :math:`\delta\gamma^{\mathrm{q}\nu}_{r} = (\chi^{\mathrm{q}\nu}_{0})^{-1}s^{\mathrm{q}\nu}_{r} -
@@ -215,7 +218,7 @@ class ExactJacobian:
        \mathcal{U}^{\mathbf{q}}_{r}\chi^{\mathrm{q}}_{r} - \gamma^{\mathrm{q}\nu}_{r}\mathcal{U}^{\mathbf{q}}_{r}
        \delta\chi^{\mathrm{q}}_{r})\,\mathcal{U}^{\mathbf{q}}_{r}`, beside the double-counting kernel of
        :math:`\delta\chi^{\mathrm{q}\nu}_{0}`;
-    5. per window, the column contraction of :class:`~dgamore.nonlocal_sde._ColumnSdeStream` of :math:`(K, \delta G)`
+    5. per window, the column contraction of :class:`~dgamore.sde_kernels.ColumnSdeStream` of :math:`(K, \delta G)`
        and :math:`(\delta K, G)` into one output per column, and on rank 0 the Hartree-Fock term of
        :math:`\delta n^{\mathbf{k}}`;
     6. rank 0, for several orbitals on a lattice with real hoppings: the time-reversal average of the proposal
@@ -263,7 +266,7 @@ class ExactJacobian:
         :param comm: The MPI communicator.
         :param chunk_budgets: Chunk byte budget, block width, window width and residency of the products (see
             :class:`~dgamore.memory_estimator.ChunkBudgets`); ``None`` gives the job-wide fair-share budget of
-            :func:`~dgamore.nonlocal_sde._sde_chunk_budget`, one-column products, one window and held vertices.
+            :func:`~dgamore.sde_kernels.sde_chunk_budget`, one-column products, one window and held vertices.
         """
         box, k_grid, nb = config.box, config.lattice.k_grid, config.sys.n_bands
         beta = float(config.sys.beta)
@@ -274,7 +277,7 @@ class ExactJacobian:
         # the occupation of a complex dispersion (decided on the whole dispersion, the same on every momentum slice)
         # and the proposal's time-reversal average, as the forward map has them
         self._complex_ek = np.iscomplexobj(np.real_if_close(self._ek))
-        self._tr_average = nb > 1 and nonlocal_sde._has_time_reversal(self._ek)
+        self._tr_average = nb > 1 and sde_kernels.has_time_reversal(self._ek)
         if any(niv - SelfEnergy._n_freq_fit(niv) < box.niv_core for niv in (sigma.niv, sigma_dmft_full.niv)):
             config.logger.warning(
                 f"Exact Jacobian: the moment-fit window of the loop box (niv {sigma.niv}) or of the DMFT box (niv "
@@ -293,7 +296,7 @@ class ExactJacobian:
             self._project = sector_projector(k_grid, keep)
 
         with deferred_collection():
-            self._giwk, self._giwk_win, self._node_comm = nonlocal_sde._build_giwk_full(comm, sigma, mu, self._ek, beta)
+            self._giwk, self._giwk_win, self._node_comm = sde_kernels.build_giwk_full(comm, sigma, mu, self._ek, beta)
             # with uncorrelated orbitals the mu response needs (G G)_dd, which is not G_dd G_dd
             self._g2, self._g2_win = None, None
             if config.sys.correlated_orbitals is not None:
@@ -312,7 +315,7 @@ class ExactJacobian:
 
             budgets = memory_estimator.ChunkBudgets() if chunk_budgets is None else chunk_budgets
             self._sde_chunk = (
-                nonlocal_sde._sde_chunk_budget(comm, self._node_comm) if chunk_budgets is None else budgets.exact
+                sde_kernels.sde_chunk_budget(comm, self._node_comm) if chunk_budgets is None else budgets.exact
             )
             self.block = max(1, budgets.exact_block)
             self._vertices_per_window = budgets.exact_vertices_per_window
@@ -322,7 +325,7 @@ class ExactJacobian:
             self._vertices = {}
             # one real-space window per Green's function serves the bubbles and the contraction
             self._niv_r = box.niv_full + box.niw_core
-            self._g_r, self._g_r_win = nonlocal_sde._build_rspace_giwk_window(
+            self._g_r, self._g_r_win = sde_kernels.build_rspace_giwk_window(
                 self._giwk, self._node_comm, niv_window=self._niv_r
             )
 
@@ -355,28 +358,28 @@ class ExactJacobian:
         """
         Yields a local vertex of the output folder, held once per node (collective), or the window ``w_window`` of its
         stored bosonic indices: a view of the held vertex, or a fresh load of that window of the file (see
-        :func:`~dgamore.nonlocal_sde._load_node_shared_local_vertex`). A fresh load is kept when the vertices stay
+        :func:`~dgamore.sde_kernels.load_node_shared_local_vertex`). A fresh load is kept when the vertices stay
         resident and freed at the end of the phase when they are loaded per window. The load is freed on the normal
         path only: an exception aborts the job instead of meeting another collective.
 
-        :param name: File name of the vertex in the output folder.
+        :param name: Bare file name of the vertex in the output folder (see :mod:`~dgamore.output_files`).
         :param channel: Spin channel of the vertex (see :class:`SpinChannel`).
         :param axes: The axis order its window stores (see
-            :func:`~dgamore.nonlocal_sde._load_node_shared_local_vertex`).
+            :func:`~dgamore.sde_kernels.load_node_shared_local_vertex`).
         :param w_window: The window ``(start, stop)`` of stored bosonic indices (half niw range), or ``None`` for the
             whole vertex.
         :return: A context yielding the :class:`LocalFourPoint`.
         """
         if name not in self._vertices:
-            path = os.path.join(config.output.output_path, name)
+            path = output_files.npy_path(config.output.output_path, name)
             window = w_window if self._vertices_per_window else None
-            vertex, win = nonlocal_sde._load_node_shared_local_vertex(
+            vertex, win = sde_kernels.load_node_shared_local_vertex(
                 self._node_comm, path, channel, axes=axes, w_window=window
             )
             if self._vertices_per_window:
                 yield vertex
                 vertex.mat = None
-                nonlocal_sde._free_shared_window(win, self._node_comm)
+                mpi_utils.free_shared_window(win, self._node_comm)
                 return
             self._vertices[name] = (vertex, win)
         vertex = self._vertices[name][0]
@@ -396,7 +399,7 @@ class ExactJacobian:
         """
         inactive = None
         for window in self._w_windows if self._vertices_per_window else [None]:
-            with self._local_vertex(f"gamma_{channel.value}_loc.npy", channel, w_window=window) as gamma:
+            with self._local_vertex(output_files.local_name("gamma", channel), channel, w_window=window) as gamma:
                 pairs = gamma.orbital_pairs_without_vertex(u_r)
             inactive = pairs if inactive is None else np.intersect1d(inactive, pairs)
         return inactive
@@ -438,7 +441,7 @@ class ExactJacobian:
         .. math:: \partial_\mu N = 2\,\mathrm{tr}\Big[\beta\bar\rho(1 - \bar\rho) + \frac{1}{\beta}\sum_{\nu}
             \mathrm{Re}\big((\bar G^{\nu}_{\mathrm{mod}})^2 - \langle (G^{\mathrm{k}})^2\rangle_{\mathbf{k}}\big)\Big],
 
-        and the k-resolved occupation of :func:`~dgamore.nonlocal_sde._update_occ_and_energies_distributed` on the
+        and the k-resolved occupation of :func:`~dgamore.sde_kernels.update_occ_and_energies_distributed` on the
         DMFT box, :math:`\kappa^{\mathbf{k}} = \beta\rho^{\mathbf{k}}(1 - \rho^{\mathbf{k}}) + \frac{1}{\beta}
         \sum_{\nu}\big((G^{\mathrm{k}}_{\mathrm{mod}})^2 - (G^{\mathrm{k}})^2\big)` (complex Hermitian for a complex
         dispersion, its real part for a real one, as the occupation), both summed over the momentum slices of the
@@ -457,16 +460,16 @@ class ExactJacobian:
         ek = self._ek.reshape(-1, nb, nb)
         ek_my = ek[mpi_dist_fullbz.my_slice]
 
-        sigma_occ = nonlocal_sde._occupation_self_energy(sigma, sigma_dmft_full, mpi_dist_fullbz)
+        sigma_occ = sde_kernels.occupation_self_energy(sigma, sigma_dmft_full, mpi_dist_fullbz)
         smom0 = embed_orbitals(sigma_occ.smom[0], orbitals, nb)
-        rho = _fermi_dirac_density((ek_my if complex_ek else ek_my.real) + smom0 - mu * eye, beta)
+        rho = fermi_dirac_density((ek_my if complex_ek else ek_my.real) + smom0 - mu * eye, beta)
         model = np.broadcast_to(smom0[None, :, :, None], (1, nb, nb, sigma_occ.mat.shape[-1]))
         box_sum = _squared_box_sum(model, mu, ek_my, beta, complex_ek) - _squared_box_sum(
             sigma_occ.mat, mu, ek_my, beta, complex_ek, orbitals
         )
         kappa_my = beta * rho @ (eye - rho) + box_sum / beta
         sigma_occ.free()
-        kappa = nonlocal_sde._assemble_occupation(kappa_my.reshape(-1, 1, 1, nb, nb), mpi_dist_fullbz, orbitals)[2]
+        kappa = sde_kernels.assemble_occupation(kappa_my.reshape(-1, 1, 1, nb, nb), mpi_dist_fullbz, orbitals)[2]
 
         # only the real part of the trace enters the filling, so these sums stay real on every slice
         g2_sum = _squared_box_sum(sigma.mat[mpi_dist_fullbz.my_slice], mu, ek_my, beta, False, orbitals).sum(axis=0)
@@ -476,7 +479,7 @@ class ExactJacobian:
             return None, None
         smom0 = embed_orbitals(sigma.fit_smom()[0], orbitals, nb)
         hloc = np.mean(self._ek, axis=(0, 1, 2))
-        rho = _fermi_dirac_density(hloc.real + smom0 - mu * eye, beta)
+        rho = fermi_dirac_density(hloc.real + smom0 - mu * eye, beta)
         model = np.broadcast_to(smom0[None, :, :, None], (1, nb, nb, sigma.mat.shape[-1]))
         model_sum = _squared_box_sum(model, mu, hloc[None], beta, False)[0]
         inner = beta * rho @ (eye - rho) + (model_sum - g2_sum / ek.shape[0]) / beta
@@ -519,7 +522,7 @@ class ExactJacobian:
         core = gchi0_q.cut_niv(config.box.niv_core)
         gchi0_q.free()
         core_sum = core.sum_over_all_vn(beta).scale(1.0 / beta)
-        return nonlocal_sde._attach_dc_interaction(contraction, self._u_loc, per_wn=True), full_sum, core_sum, core
+        return sde_kernels.attach_dc_interaction(contraction, self._u_loc, per_wn=True), full_sum, core_sum, core
 
     def _build_window(self, bubble: FourPoint, w_window: tuple[int, int]) -> None:
         r"""
@@ -535,7 +538,7 @@ class ExactJacobian:
         """
         beta, u_loc, (w0, w1) = self._beta, self._u_loc, w_window
         with self._local_vertex(*_F_DC, w_window=w_window) as f_dc:
-            contraction = nonlocal_sde._contract_dc_vertex(f_dc, bubble)
+            contraction = sde_kernels.contract_dc_vertex(f_dc, bubble)
         dc_kernel, full_sum, core_sum, core = self._split_bubble(bubble, contraction)
         contraction = None
         kernel = self._kernel.take_wn_slice(w0, w1, copy=False).add(dc_kernel, copy=False)
@@ -543,14 +546,14 @@ class ExactJacobian:
         gchi0_inv = self._gchi0_inv.take_wn_slice(w0, w1, copy=False).add(core.invert(copy=False), copy=False)
         core.free()
         for weight, channel, u_r, inactive in self._channels:
-            with self._local_vertex(f"gamma_{channel.value}_loc.npy", channel, w_window=w_window) as gamma:
-                aux = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma, gchi0_inv, u_loc, inactive=inactive)
-            chi = nonlocal_sde.create_generalized_chi_q_with_shell_correction(
+            with self._local_vertex(output_files.local_name("gamma", channel), channel, w_window=w_window) as gamma:
+                aux = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_inv, u_loc, inactive=inactive)
+            chi = sde_kernels.create_generalized_chi_q_with_shell_correction(
                 aux.sum_over_all_vn(beta), full_sum, core_sum, u_loc, self._v_nonloc
             )
             chi = self._chi[channel].take_wn_slice(w0, w1, copy=False).add(chi, copy=False)
-            vrg = nonlocal_sde.create_vrg_r_q(aux, gchi0_inv, copy=False)
-            term = nonlocal_sde.calculate_kernel_r_q(vrg, chi, self._v_nonloc, u_loc, per_wn=True).scale(weight)
+            vrg = sde_kernels.create_vrg_r_q(aux, gchi0_inv, copy=False)
+            term = sde_kernels.calculate_kernel_r_q(vrg, chi, self._v_nonloc, u_loc, per_wn=True).scale(weight)
             kernel.add(term, copy=False)
             term.free()
             if channel in self._vrg:
@@ -642,9 +645,9 @@ class ExactJacobian:
     ) -> Callable[[int, int, FourPoint], list[FourPoint]]:
         r"""
         Returns the per-slice right-hand sides of the columns' Bethe-Salpeter systems for
-        :func:`~dgamore.nonlocal_sde.create_auxiliary_chi_r_q_sum`: from the summed auxiliary susceptibility of the
+        :func:`~dgamore.sde_kernels.create_auxiliary_chi_r_q_sum`: from the summed auxiliary susceptibility of the
         slice ``(i, w)``, that slice's three-leg vertex :math:`\gamma^{\mathrm{q}\nu}_{r}` (see
-        :func:`~dgamore.nonlocal_sde.create_vrg_r_q`) and every column's :math:`t^{\mathrm{q}\nu}_{r} =
+        :func:`~dgamore.sde_kernels.create_vrg_r_q`) and every column's :math:`t^{\mathrm{q}\nu}_{r} =
         (\chi^{\mathrm{q}\nu}_{0})^{-1}\,\delta\chi^{\mathrm{q}\nu}_{0}\,\gamma^{\mathrm{q}\nu}_{r}`. Momentum and
         bosonic frequency are batch indices of these products, so a slice's right-hand sides have the bits of its
         slice of the products on the whole window.
@@ -663,7 +666,7 @@ class ExactJacobian:
                 return obj.take_q_index_slice(i, i + 1, copy=False).take_wn_slice(w, w + 1, copy=False)
 
             g_inv = take(gchi0_inv)
-            vrg = nonlocal_sde.create_vrg_r_q(total, g_inv)
+            vrg = sde_kernels.create_vrg_r_q(total, g_inv)
             return [g_inv @ (take(dcore) @ vrg) for dcore in dcores]
 
         return slice_rhs
@@ -695,25 +698,23 @@ class ExactJacobian:
         fused = config.sys.n_bands**2 * 2 * config.box.niv_core >= _FUSED_SOLVE_MIN_COMPOUND
         for weight, channel, u_r, inactive in self._channels:
             chi = self._chi[channel].take_wn_slice(w0, w1, copy=False)
-            with self._local_vertex(f"gamma_{channel.value}_loc.npy", channel, w_window=w_window) as gamma:
+            with self._local_vertex(output_files.local_name("gamma", channel), channel, w_window=w_window) as gamma:
                 if channel in self._vrg or not fused:
                     if channel in self._vrg:
                         vrg = self._vrg[channel].take_wn_slice(w0, w1, copy=False)
                     else:
-                        aux = nonlocal_sde.create_auxiliary_chi_r_q_sum(
-                            gamma, gchi0_inv, self._u_loc, inactive=inactive
-                        )
-                        vrg = nonlocal_sde.create_vrg_r_q(aux, gchi0_inv, copy=False)
+                        aux = sde_kernels.create_auxiliary_chi_r_q_sum(gamma, gchi0_inv, self._u_loc, inactive=inactive)
+                        vrg = sde_kernels.create_vrg_r_q(aux, gchi0_inv, copy=False)
                     rhs = [gchi0_inv @ (dcore @ vrg) for dcore in dcores]
-                    solved = nonlocal_sde.create_auxiliary_chi_r_q_sum(
+                    solved = sde_kernels.create_auxiliary_chi_r_q_sum(
                         gamma, gchi0_inv, self._u_loc, rhs=rhs, inactive=inactive
                     )
                 else:
                     hook = self._response_rhs(gchi0_inv, dcores)
-                    aux, solved = nonlocal_sde.create_auxiliary_chi_r_q_sum(
+                    aux, solved = sde_kernels.create_auxiliary_chi_r_q_sum(
                         gamma, gchi0_inv, self._u_loc, inactive=inactive, slice_rhs=hook
                     )
-                    vrg = nonlocal_sde.create_vrg_r_q(aux, gchi0_inv, copy=False)
+                    vrg = sde_kernels.create_vrg_r_q(aux, gchi0_inv, copy=False)
                     # the right-hand sides the slices built, bit for bit
                     rhs = [gchi0_inv @ (dcore @ vrg) for dcore in dcores]
             for dkernel, (_, dfull_sum, dcore_sum, _), t, s in zip(dkernels, parts, rhs, solved):
@@ -767,7 +768,7 @@ class ExactJacobian:
         Hartree-Fock term of the occupation changes and the reduction to the sector, in place.
 
         :param dsigma: The column's contraction of :math:`(K, \delta G)` and :math:`(\delta K, G)` in real space (see
-            :meth:`~dgamore.nonlocal_sde._ColumnSdeStream.finish`; rank 0).
+            :meth:`~dgamore.sde_kernels.ColumnSdeStream.finish`; rank 0).
         :param docc: The local occupation change (rank 0).
         :param docc_k: The momentum-resolved occupation change (rank 0).
         :return: The product as a real sector vector on rank 0; ``None`` elsewhere.
@@ -775,7 +776,7 @@ class ExactJacobian:
         if self._comm.rank != 0:
             return None
         dsigma.ifft(copy=False).to_full_niv_range()
-        hartree, fock = nonlocal_sde.get_hartree_fock(self._u_loc, self._v_nonloc_full, docc, docc_k, self._w_r)
+        hartree, fock = sde_kernels.get_hartree_fock(self._u_loc, self._v_nonloc_full, docc, docc_k, self._w_r)
         dsigma.add(hartree, copy=False).add(fock, copy=False)
         if self._tr_average:
             dsigma.compress_q_dimension().symmetrize_time_reversal()
@@ -829,13 +830,13 @@ class ExactJacobian:
         changes, dg_rs, wins = [], [], []
         for y in columns:
             changes.append(self._apply_change(y))
-            dg_r, win = nonlocal_sde._build_rspace_giwk_window(
+            dg_r, win = sde_kernels.build_rspace_giwk_window(
                 self._greens_function(self._dg), self._node_comm, niv_window=self._niv_r
             )
             dg_rs.append(dg_r)
             wins.append(win)
         dg_r = win = None
-        stream = nonlocal_sde._ColumnSdeStream(
+        stream = sde_kernels.ColumnSdeStream(
             self._dist, len(columns), self._g_r.dtype, self._sde_chunk, by_frequency=True
         )
         terms = [(0, j, dg_r, self._niv_r) for j, dg_r in enumerate(dg_rs)]
@@ -843,9 +844,7 @@ class ExactJacobian:
         for w0, w1 in self._w_windows:
             responses = self._bubbles((w0, w1), dg_rs)
             with self._local_vertex(*_F_DC, w_window=(w0, w1)) as f_dc:
-                parts = [
-                    self._split_bubble(dchi0, nonlocal_sde._contract_dc_vertex(f_dc, dchi0)) for dchi0 in responses
-                ]
+                parts = [self._split_bubble(dchi0, sde_kernels.contract_dc_vertex(f_dc, dchi0)) for dchi0 in responses]
             responses = None
             dkernels = self._kernel_responses(parts, (w0, w1))
             parts = None
@@ -855,7 +854,7 @@ class ExactJacobian:
         products = [self._finalize(stream.finish(j), *change[1:]) for j, change in enumerate(changes)]
         dg_rs = terms = None
         for win in wins:
-            nonlocal_sde._free_shared_window(win, self._node_comm)
+            mpi_utils.free_shared_window(win, self._node_comm)
         return products
 
     def free(self) -> None:
@@ -871,17 +870,17 @@ class ExactJacobian:
         self._w_r = None
         for vertex, win in self._vertices.values():
             vertex.mat = None
-            nonlocal_sde._free_shared_window(win, node_comm)
+            mpi_utils.free_shared_window(win, node_comm)
         self._vertices = {}
         self._g_r = self._dg = None
         for win in (self._g_r_win, self._dg_win):
-            nonlocal_sde._free_shared_window(win, node_comm)
+            mpi_utils.free_shared_window(win, node_comm)
         if self._roots_comm != MPI.COMM_NULL:
             self._roots_comm.Free()
         self._g2 = None
-        nonlocal_sde._free_shared_window(self._g2_win, node_comm)
+        mpi_utils.free_shared_window(self._g2_win, node_comm)
         self._giwk.mat = None
-        nonlocal_sde._release_shared_giwk(self._giwk_win, node_comm)
+        sde_kernels.release_shared_giwk(self._giwk_win, node_comm)
 
 
 def _merge_modes(theta: np.ndarray, vectors: np.ndarray, tol: float) -> tuple[np.ndarray, np.ndarray]:
@@ -1164,7 +1163,7 @@ def _block_eigenpairs(
             h[:size, done:size] = basis[:, :size].T @ images[:, done:size]
             h[done:size, :done] = basis[:, done:size].T @ images[:, :done]
             count, done = count + size - done, size
-        theta, y, _ = _schur_ritz(h[:done, :done])
+        theta, y, _ = schur_ritz(h[:done, :done])
         wanted = _wanted_pairs(theta, k)
         res, _ = _ritz_sweep(basis, images, done, y[:, wanted], theta[wanted])
         converged = res <= tol * np.maximum(1.0, np.abs(theta[wanted]))
@@ -1334,7 +1333,7 @@ def certify_subspace(
     .. math:: \mathrm{res} = \frac{\lVert W y - \theta\, Q y \rVert}{\lVert Q y \rVert}.
 
     The search stops once the pair with the largest real part of :math:`\theta` passes the tracker's Ritz gate,
-    :math:`\mathrm{res} \leq g \max(1, |\theta|)` with :math:`g` its ``_RITZ_GATE``, or once the basis holds
+    :math:`\mathrm{res} \leq g \max(1, |\theta|)` with :math:`g` its ``RITZ_GATE``, or once the basis holds
     ``_CHECK_BASIS`` vectors; until then the real and the imaginary part of that pair's residual extend the basis.
 
     :param jac: The operator (``n_real``, ``matvec_block``, ``project``).
@@ -1363,13 +1362,13 @@ def certify_subspace(
         images[:, done:size] = jac.matvec_block(basis[:, done:size])
         done = size
         q, w = basis[:, :done], images[:, :done]
-        theta, y, _ = _schur_ritz(q.T @ w)
+        theta, y, _ = schur_ritz(q.T @ w)
         res = np.empty(done)
         for j in range(done):
             r_re, r_im, ritz_norm = _ritz_residual(q, w, y[:, j], theta[j])
             res[j] = np.hypot(np.linalg.norm(r_re), np.linalg.norm(r_im)) / ritz_norm
         lead = int(np.argmax(theta.real))
-        if res[lead] <= _RITZ_GATE * max(1.0, abs(theta[lead])):
+        if res[lead] <= RITZ_GATE * max(1.0, abs(theta[lead])):
             break
         size = _orthonormal_extension(basis, done, np.column_stack(_ritz_residual(q, w, y[:, lead], theta[lead])[:2]))
     # released on the normal path only: an exception aborts the job instead of meeting another collective
@@ -1377,7 +1376,7 @@ def certify_subspace(
 
     lam_pi = 1.0 - theta
     order = np.argsort(lam_pi.real)
-    lam_pi, res, kappa = lam_pi[order], res[order], _condition_numbers(y)[order]
+    lam_pi, res, kappa = lam_pi[order], res[order], condition_numbers(y)[order]
     u = np.empty((n, order.size), dtype=np.complex128, order="F")
     for column, j in zip(u.T, order):
         column.real = basis[:, :done] @ y[:, j].real

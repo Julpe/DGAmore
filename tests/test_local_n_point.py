@@ -15,7 +15,7 @@ import dgamore.local_n_point as local_n_point
 from dgamore.local_n_point import LocalNPoint
 
 # captured at import time, before the autouse fixtures replace them with no-ops
-_real_np_save, _real_flush_and_drop = np.save, local_n_point._flush_and_drop
+_real_np_save, _real_flush_and_drop = np.save, local_n_point.flush_and_drop
 
 
 def test_initializes_with_valid_parameters():
@@ -444,7 +444,7 @@ def test_raises_error_when_swapping_with_less_than_two_fermionic_dimensions(num_
 def test_save_writes_the_file_then_syncs_it_and_drops_it_from_the_page_cache(monkeypatch, tmp_path):
     """save writes the half-range matrix, fsyncs the written file and advises the kernel to drop its pages."""
     monkeypatch.setattr(np, "save", _real_np_save)
-    monkeypatch.setattr(local_n_point, "_flush_and_drop", _real_flush_and_drop)
+    monkeypatch.setattr(local_n_point, "flush_and_drop", _real_flush_and_drop)
     synced, advised, real_fsync = [], [], os.fsync
     monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd)))
     monkeypatch.setattr(

@@ -447,7 +447,7 @@ with ``misc.do_flex`` or ``misc.do_rpa`` only the physical susceptibilities are 
      - ``[nq_rank, no, no, no, no, niw_core + 1, 2 niv_pp]`` (``2 niv_core`` with ``save_fq``)
    * - ``vrg_middle_q_<channel>_rank_<r>.npy``
      - Matrix :math:`Y^{\mathrm{q}}_{\mathrm{r}}` between the three-leg vertices of the ladder vertex (see
-       :func:`dgamore.nonlocal_sde.create_ladder_vertex_middle`)
+       :func:`dgamore.sde_kernels.create_ladder_vertex_middle`)
      - ``[nq_rank, no, no, no, no, niw_core + 1]``
    * - ``chi_phys_q_<channel>_rank_<r>.npy``
      - Physical susceptibility of that rank's momenta

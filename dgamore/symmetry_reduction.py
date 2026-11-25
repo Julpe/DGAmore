@@ -87,7 +87,7 @@ def _enumerate_integer_matrices():
     return mats
 
 
-def _M_preserves_grid(M, nk):
+def M_preserves_grid(M, nk):
     """
     Checks whether the integer matrix ``M`` is compatible with the (possibly non-cubic) grid: ``M[i,j] != 0`` is
     allowed only if ``N_j`` divides ``N_i``, so the k-index action ``k_i -> sum_j M[i,j] k_j`` is well-defined modulo
@@ -486,7 +486,7 @@ def _discover_symmetries(H, atol, verbose=False):
     """
     nx, ny, nz, norb, _ = H.shape
     nk = (nx, ny, nz)
-    M_candidates = [M for M in _enumerate_integer_matrices() if _M_preserves_grid(M, nk)]
+    M_candidates = [M for M in _enumerate_integer_matrices() if M_preserves_grid(M, nk)]
 
     ev = np.linalg.eigvalsh(H)
     ev_flat = ev.reshape(-1, norb)
@@ -657,7 +657,7 @@ def _inverse(g, nk):
     return _GroupElement(M_inv, q_inv, U_inv, g.sigma, g.conj, nk)
 
 
-def _close_group(ops_raw, norb, nk, max_size=10000):
+def close_group(ops_raw, norb, nk, max_size=10000):
     """
     Closes the discovered raw operations under composition (including the identity) to form the full symmetry group,
     up to a maximum size safeguard.
@@ -963,7 +963,7 @@ def get_symmetry_reduction(H, atol=1e-8, verbose=False, include_antiunitary=Fals
         if verbose:
             print(f"  Anti-unitary ops dropped: {n_pre - len(ops_raw)}; kept {len(ops_raw)}")
 
-    group = _close_group(ops_raw, norb, nk)
+    group = close_group(ops_raw, norb, nk)
     if verbose:
         print(f"  Closed group size: {len(group)}")
 

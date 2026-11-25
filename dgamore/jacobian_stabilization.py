@@ -34,12 +34,12 @@ import numpy as np
 from scipy.linalg import orth, qr, schur, solve_sylvester, solve_triangular
 from scipy.linalg.lapack import dtrsen
 
-from dgamore.local_n_point import _flush_and_drop
+from dgamore.local_n_point import flush_and_drop
 
 _MARGIN = 1e-2  # |Re lambda_Pi| below this is undecidable: not flipped, binds the damping with the margin
 _DAMPING_C = 0.5  # safety factor c in (0, 1) of the damping bound, at the vertex of the stability parabola
 _MIXING_FLOOR = 0.01  # the effective damping is never lowered below this
-_RITZ_GATE = 3e-2  # Ritz residual gate, relative to max(1, |theta|)
+RITZ_GATE = 3e-2  # Ritz residual gate, relative to max(1, |theta|)
 _FLIP_PERSIST = 1  # updates carrying a certified unstable mode before the flip is acted on
 _PERSIST = 3  # updates of the calm and (at least) the growth release, and of the hold a growth release leaves behind
 _MAX_GROWTH_PATIENCE = 64  # most consecutive residual growths a held flipped pair defers the growth release to
@@ -68,7 +68,7 @@ _STORE_BAND = 0.1  # Re lambda_Pi below which a certified mode's Ritz vector is 
 _CHECK_BAND = 1.0  # Re lambda_Pi below which an exact snapshot stores a mode's vector for the successor's exact check
 _MAX_EXACT_CHECKS = 5  # mid-rung exact checks one run may request, plus up to as many that certified their lead and
 # found every certified pair above its undecidable band (the rung-start check does not count)
-_CHECK_START = 6  # real start columns of the rung-start exact check, least stable modes first
+CHECK_START = 6  # real start columns of the rung-start exact check, least stable modes first
 _CHAIN_LENGTH = 3  # informative updates the values of a mode are chained over for the extrapolation
 _POLE_MODULUS = 5.0  # |lambda_Pi| beyond which a mode counts as approaching or crossing a pole; without exact checks
 # a secant estimate past it flips only on a pole jump, a prediction or once reproduced (see JacobianTracker._reproduced)
@@ -216,7 +216,7 @@ def _ritz_from_increments(
     ``_COLLINEAR_CAP``) of :func:`_independent_columns`: the second-order inconsistency of a secant pair grows with its
     step, and :math:`R_2^{-1}` would amplify it along a nearly collinear direction into a certified but meaningless
     Ritz value. The tall factor :math:`Q` is released once the kept basis :math:`Q_K = Q Q_2` exists, :math:`R_2^{-1}`
-    is applied as a solve, the eigenpairs are read from the real Schur form of :math:`B` (:func:`_schur_ritz`), and
+    is applied as a solve, the eigenpairs are read from the real Schur form of :math:`B` (:func:`schur_ritz`), and
     :math:`u` and the residual are assembled from the real and imaginary part of :math:`y` without a complex copy of a
     tall factor. Each Ritz value
     also gets its eigenvalue condition number :math:`\kappa_\alpha = \lVert x_\alpha \rVert \lVert y_\alpha \rVert /
@@ -242,8 +242,8 @@ def _ritz_from_increments(
     q_kept = q @ q2
     del q
     jq = np.linalg.solve(r2.T, df[:, keep].T).T
-    theta, y, form = _schur_ritz(q_kept.T @ jq)
-    kappa = _condition_numbers(y)
+    theta, y, form = schur_ritz(q_kept.T @ jq)
+    kappa = condition_numbers(y)
     u = np.empty((q_kept.shape[0], theta.size), dtype=np.complex128)
     u.real = q_kept @ y.real
     u.imag = q_kept @ y.imag
@@ -256,7 +256,7 @@ def _ritz_from_increments(
     return theta, u, res, q_kept, form, kappa
 
 
-def _condition_numbers(y: np.ndarray) -> np.ndarray:
+def condition_numbers(y: np.ndarray) -> np.ndarray:
     r"""
     Returns the eigenvalue condition numbers :math:`\kappa_\alpha = \lVert x_\alpha \rVert \lVert y_\alpha \rVert /
     |x_\alpha^{H} y_\alpha|` of a projected map from its eigenvectors :math:`y` (columns), :math:`x_\alpha` the rows of
@@ -436,7 +436,7 @@ def _diagonal_positions(theta: np.ndarray, t_mat: np.ndarray) -> np.ndarray | No
     return positions
 
 
-def _schur_ritz(b_proj: np.ndarray) -> tuple[np.ndarray, np.ndarray, SchurForm]:
+def schur_ritz(b_proj: np.ndarray) -> tuple[np.ndarray, np.ndarray, SchurForm]:
     r"""
     Decomposes a projected map once, :math:`B = Z T Z^{T}`, and reads its eigenpairs off the quasi-triangular
     factor, :math:`T y = \theta y`, so that the Ritz values, the Schur blocks and the positions locating each
@@ -1200,7 +1200,7 @@ class JacobianTracker:
         partial = f"{path}.tmp"
         with open(partial, "wb") as handle:
             np.savez(handle, **state, **(traces or {}))
-        _flush_and_drop(partial)
+        flush_and_drop(partial)
         os.replace(partial, path)
         self._log_info(
             f"Jacobian tracker: saved {state['lam_pi'].size} certified modes ({int(state['stored'].sum())} with "
@@ -1267,7 +1267,7 @@ class JacobianTracker:
         :return: Whether the reflected map switched, i.e. whether the reflected subspace changed.
         """
         lam_pi, res = np.asarray(lam_pi, dtype=np.complex128), np.asarray(res, dtype=np.float64)
-        gated = res <= _RITZ_GATE * np.maximum(1.0, np.abs(1.0 - lam_pi))
+        gated = res <= RITZ_GATE * np.maximum(1.0, np.abs(1.0 - lam_pi))
         if kappa is not None:
             res = res * np.asarray(kappa, dtype=np.float64)
         counted, self._counted_check = self._counted_check, False
@@ -1407,7 +1407,7 @@ class JacobianTracker:
         for a scaffold's release, and the damping the predecessor ended with is not read back; a carried spectrum
         without a certified mode leaves the damping where it is. A converged predecessor's columns are kept for
         :meth:`spectrum_state` to match against. The real columns of an exact file's least stable modes, at most
-        ``_CHECK_START`` and never half a conjugate pair, wait for the first update that allows flips as an exact
+        ``CHECK_START`` and never half a conjugate pair, wait for the first update that allows flips as an exact
         check request (see :meth:`exact_check_request`), unless the tracker runs without exact checks.
 
         :param state: The dictionary :func:`load_spectrum` returns.
@@ -1481,7 +1481,7 @@ class JacobianTracker:
             self._predecessor = (lam_c, res_c, beta_last, u)
         if exact and self._exact_checks:
             columns, owners = _real_columns(1.0 - lam_c, u, np.ones(lam_c.size, dtype=bool))
-            cut = min(_CHECK_START, owners.size)
+            cut = min(CHECK_START, owners.size)
             # a conjugate pair is checked from both of its columns or not at all
             cut -= int(0 < cut < owners.size and owners[cut] == owners[cut - 1])
             self._start_check = np.ascontiguousarray(columns[:, :cut]) if cut else None
@@ -1732,7 +1732,7 @@ class JacobianTracker:
         self._frozen_run = 0
 
         self.last_lam_pi, self._last_u = 1.0 - theta, u
-        gated = self.last_gated = res <= _RITZ_GATE * np.maximum(1.0, np.abs(theta))
+        gated = self.last_gated = res <= RITZ_GATE * np.maximum(1.0, np.abs(theta))
         # past the gate a Ritz value is read with its error bound, the backward error times its condition number
         res = self.last_res = res * kappa
 

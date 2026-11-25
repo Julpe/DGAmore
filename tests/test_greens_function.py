@@ -255,7 +255,7 @@ def test_get_fill_nonlocal_is_the_fermi_dirac_density_of_a_complex_hopping_dispe
 
 def test_get_fill_nonlocal_keeps_the_real_arithmetic_for_a_real_dispersion():
     """A real dispersion is occupied with the real-part arithmetic f(Re h) + Re(G - G_model), bit for bit."""
-    from dgamore.greens_function import _fermi_dirac_density
+    from dgamore.greens_function import fermi_dirac_density
 
     nk, nb, niv, beta, mu = (2, 2, 1), 2, 6, 5.0, 0.3
     rng = np.random.default_rng(3)
@@ -270,14 +270,14 @@ def test_get_fill_nonlocal_keeps_the_real_arithmetic_for_a_real_dispersion():
     model = iv_bands[None, None, None] + mu_bands[None, None, None] - ek[..., None] - sig.smom[0][..., None]
     g_model = GreensFunction._invert_last_orbital_block(model)
     box = np.sum(g._get_gfull_mat().real - g_model.real, axis=-1) / beta
-    ref = _fermi_dirac_density(ek.real + sig.smom[0][None, None, None] - mu * np.eye(nb), beta) + box
+    ref = fermi_dirac_density(ek.real + sig.smom[0][None, None, None] - mu * np.eye(nb), beta) + box
     ref.real[np.abs(ref) < 1e-12] = 0.0
     assert np.array_equal(occ_k, ref)
 
 
 def test_fermi_dirac_density_matches_diagonal_matmul_reference():
-    """_fermi_dirac_density (column-scaling) equals the explicit V diag(f) V^-1 construction, bit-for-bit."""
-    from dgamore.greens_function import _fermi_dirac_density
+    """fermi_dirac_density (column-scaling) equals the explicit V diag(f) V^-1 construction, bit-for-bit."""
+    from dgamore.greens_function import fermi_dirac_density
 
     rng = np.random.default_rng(0)
     a = rng.standard_normal((5, 3, 3))
@@ -289,7 +289,7 @@ def test_fermi_dirac_density_matches_diagonal_matmul_reference():
     d[m] = np.exp(-eigvals[m]) / (1 + np.exp(-eigvals[m]))
     d[~m] = 1 / (1 + np.exp(eigvals[~m]))
     ref = eigvecs @ np.einsum("...i,ij->...ij", d, np.eye(3, dtype=d.dtype)) @ np.linalg.inv(eigvecs)
-    assert np.array_equal(_fermi_dirac_density(h, beta), ref)
+    assert np.array_equal(fermi_dirac_density(h, beta), ref)
 
 
 def test_get_epot_e_corr_einsum_matches_transposed_product_reference():
@@ -537,7 +537,7 @@ def test_model_epot_chunked_matches_unchunked_reference(monkeypatch):
     g_diag = 1.0 / (iv[None, :] + mu - lam[:, :, None])
     ref = (-np.einsum("kii,kiv->kv", smom1_rot, g_diag) / iv[None, :]).sum().real / beta
 
-    monkeypatch.setattr(gf_module, "_MODEL_EPOT_CHUNK_ELEMENTS", 50)
+    monkeypatch.setattr(gf_module, "MODEL_EPOT_CHUNK_ELEMENTS", 50)
     assert np.allclose(g._model_epot(smom0, smom1, 37, beta), ref, atol=1e-10)
 
 
@@ -677,7 +677,7 @@ def test_chunk_constants_are_mirrored_by_the_memory_estimator():
     from dgamore import memory_estimator
 
     assert memory_estimator.GF_MOMENTUM_CHUNK_ELEMENTS == gf_module._MOMENTUM_CHUNK_ELEMENTS
-    assert memory_estimator.GF_FREQUENCY_CHUNK_ELEMENTS == gf_module._MODEL_EPOT_CHUNK_ELEMENTS
+    assert memory_estimator.GF_FREQUENCY_CHUNK_ELEMENTS == gf_module.MODEL_EPOT_CHUNK_ELEMENTS
     niv_asympt = inspect.signature(GreensFunction.get_epot).parameters["niv_asympt"].default
     assert memory_estimator.EPOT_NIV_ASYMPT == niv_asympt
 
@@ -697,7 +697,7 @@ def _dense_inputs(nk=(4, 4, 1), nbands=2, niv=256, beta=10.0, mu=0.3, seed=0):
 
 def _reference_fill_nonlocal(sig, mu, ek, beta):
     """Brute-force k-resolved occupation: full [k, o, o, v] G and model G, summed over the whole frequency box."""
-    from dgamore.greens_function import _fermi_dirac_density
+    from dgamore.greens_function import fermi_dirac_density
 
     nb, niv = sig.n_bands, sig.niv
     iv = 1j * MFHelper.vn(niv, beta)
@@ -711,7 +711,7 @@ def _reference_fill_nonlocal(sig, mu, ek, beta):
         np.moveaxis(iv_bands + mu_bands - ek[..., None] - smom0[None, None, None, :, :, None], -1, -3)
     )
     g, g_model = np.moveaxis(g, -3, -1), np.moveaxis(g_model, -3, -1)
-    rho_k = _fermi_dirac_density(ek.real + smom0[None, None, None] - mu * eye[None, None, None], beta)
+    rho_k = fermi_dirac_density(ek.real + smom0[None, None, None] - mu * eye[None, None, None], beta)
     occ_k = rho_k + np.sum(g.real - g_model.real, axis=-1) / beta
     occ = np.mean(occ_k, axis=(0, 1, 2))
     return 2.0 * np.trace(occ).real, occ, occ_k

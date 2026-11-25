@@ -202,7 +202,7 @@ class BubbleGenerator:
         r"""
         Returns the momentum-dependent bubbles of the stored bosonic frequencies :math:`\omega = w_0, \ldots, w_1 - 1`
         of the half niw range, ``w_window = (w0, w1)``, from frequency-first real-space windows built beforehand (see
-        :func:`~dgamore.nonlocal_sde._build_rspace_giwk_window`), on any rank count (collective; every rank passes the
+        :func:`~dgamore.sde_kernels.build_rspace_giwk_window`), on any rank count (collective; every rank passes the
         same window and as many changes). With :math:`\chi_{0}[A, B]^{\mathrm{q}\nu}_{1234} =
         -\frac{\beta}{n_{\mathbf{k}}} \sum_{\mathbf{k}} A^{\mathrm{k}}_{14}\, B^{\mathrm{k}-\mathrm{q}}_{32}`, the
         first bubble is :math:`\chi_{0}[G, G]`, scaled and filtered as :meth:`create_generalized_chi0_q_fft` builds
@@ -785,7 +785,7 @@ class BubbleGenerator:
                 dst_slice = mpi_dist_irrk.slices[dst]
                 n_dst = (dst_slice.stop - dst_slice.start) if dst_slice is not None else 0
                 if n_mine and n_dst:
-                    reqs += mpi_utils._isend_rows(comm, chunk_irr[dst_slice], dst, base_tag=500 + step)
+                    reqs += mpi_utils.isend_rows(comm, chunk_irr[dst_slice], dst, base_tag=500 + step)
 
                 s0, s1 = round_cols(src, rnd)
                 if my_nq and s1 > s0:
@@ -793,7 +793,7 @@ class BubbleGenerator:
                         block = np.empty((my_nq, *comp_shape, n_parts * (s1 - s0)), dtype=dtype)
                     else:
                         block = staging[len(staged)]
-                    reqs += mpi_utils._irecv_rows_into(comm, block, src, base_tag=500 + step)
+                    reqs += mpi_utils.irecv_rows_into(comm, block, src, base_tag=500 + step)
 
                 if reqs:
                     t0 = time.perf_counter()

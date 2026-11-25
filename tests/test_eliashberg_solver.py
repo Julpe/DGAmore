@@ -19,7 +19,16 @@ import dgamore.config as config
 import dgamore.mpi_utils as mu
 import dgamore.n_point_base as n_point_base
 from dgamore import eliashberg_solver as es
-from dgamore import memory_estimator, nonlocal_sde, symmetry_reduction
+from dgamore import (
+    gap_classification,
+    memory_estimator,
+    nonlocal_sde,
+    output_files,
+    pairing_vertex,
+    symmetry_reduction,
+    sde_kernels,
+)
+from dgamore.gap_classification import classify_gap_symmetry
 from dgamore.dga_logger import DgaLogger
 from dgamore.interaction import Interaction, LocalInteraction
 from dgamore import brillouin_zone as bz
@@ -38,14 +47,15 @@ from dgamore.eliashberg_solver import (
     _validated_orbital_mirrors,
     gap_parity_diagnostics,
     _project_gap_to_sector,
-    classify_gap_symmetry,
     get_initial_gap_function,
-    create_local_f_ud_transformed_w0,
-    create_local_gamma_ud_pp_w0,
-    create_local_gamma_ud_pp_w0_per_ineq,
     _gamma_to_matmul_layout,
     solve_eliashberg_lanczos,
     symmetrize_degenerate_gaps,
+)
+from dgamore.pairing_vertex import (
+    create_local_f_ud_transformed_w0,
+    create_local_gamma_ud_pp_w0,
+    create_local_gamma_ud_pp_w0_per_ineq,
     transform_vertex_loc_frequencies_w0,
 )
 from dgamore.four_point import FourPoint
@@ -1229,7 +1239,7 @@ def test_distributed_window_holds_the_rows_of_the_single_rank_layout(monkeypatch
     """Every node's window holds its rows of the single-rank scaled matmul layout bit for bit; the vertex is used up."""
     monkeypatch.setattr("dgamore.mpi_utils.MPI", FAKE_MPI)
     monkeypatch.setattr(es, "MPI", FAKE_MPI)
-    monkeypatch.setattr(es, "socket", conftest.FAKE_SOCKET)
+    monkeypatch.setattr(mu, "socket", conftest.FAKE_SOCKET)
     monkeypatch.setattr("dgamore.memory_estimator.TEAM_BUILD_CHUNK_BYTES", 2048)
     nq, o, niv_pp = ((4, 2, 1) if kind in ("full", "auto") else (4, 4, 1)), 2, 2
     _grid_test_config(nq, niv_pp)
@@ -1298,10 +1308,10 @@ def _node_matvec_outputs(hostnames, gamma, chi0, gap_shape, o, references, probe
                 blocks = [x.reshape(nk, o, o, nv)[k0:k1][..., freqs].reshape(-1) for x in probes]
                 outputs[key] = [apply_block(channel, eps_t, eps_p, block) for block in blocks]
             del apply_block, window
-            nonlocal_sde._free_shared_window(win, node_comm)
+            mu.free_shared_window(win, node_comm)
         del arrays, chi0_share
         for win in wins + [chi0_win]:
-            nonlocal_sde._free_shared_window(win, node_comm)
+            mu.free_shared_window(win, node_comm)
         return outputs, (k0, k1), freqs
 
     return run_parallel(len(hostnames), fn, hostnames=hostnames)[1]
@@ -1320,7 +1330,7 @@ def _node_matvec_setup(monkeypatch, nq, o, niv_pp, projected):
     """Patches the fake MPI into the solver and installs the test config of the node-distributed matvec tests."""
     monkeypatch.setattr("dgamore.mpi_utils.MPI", FAKE_MPI)
     monkeypatch.setattr(es, "MPI", FAKE_MPI)
-    monkeypatch.setattr(es, "socket", conftest.FAKE_SOCKET)
+    monkeypatch.setattr(mu, "socket", conftest.FAKE_SOCKET)
     _grid_test_config(nq, niv_pp)
     config.eliashberg.resolve_parity_sectors = projected
 
@@ -1418,7 +1428,7 @@ def test_node_seed_blocks_are_the_single_rank_seeds(monkeypatch, hostnames, symm
         blocks = [seed_block(ch, et, ep, n_block) for ch, et, ep in sectors]
         del arrays
         for win in wins:
-            nonlocal_sde._free_shared_window(win, node_comm)
+            mu.free_shared_window(win, node_comm)
         return blocks, (k0, k1), freqs
 
     _, res = run_parallel(len(hostnames), fn, hostnames=hostnames)
@@ -1453,7 +1463,7 @@ def test_node_collect_assembles_every_vector_on_rank_0_alone(monkeypatch, hostna
         collect(vector.reshape(nk, o, o, nv)[k0:k1][..., freqs].reshape(-1), out)
         del arrays
         for win in wins:
-            nonlocal_sde._free_shared_window(win, node_comm)
+            mu.free_shared_window(win, node_comm)
         return out
 
     _, res = run_parallel(len(hostnames), fn, hostnames=hostnames)
@@ -1717,7 +1727,7 @@ def test_solve_sectors_in_teams_reproduces_the_single_rank_sectors_and_delivers_
     monkeypatch.setattr(es, "threadpool_limits", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr("dgamore.mpi_utils.MPI", FAKE_MPI)
     monkeypatch.setattr(es, "MPI", FAKE_MPI)
-    monkeypatch.setattr(es, "socket", conftest.FAKE_SOCKET)
+    monkeypatch.setattr(mu, "socket", conftest.FAKE_SOCKET)
     monkeypatch.setattr("dgamore.eliashberg_solver.sp.sparse.linalg.eigsh", _power_loop_eigsh)
     monkeypatch.setattr(es, "_team_arnoldi", _power_loop_team_arnoldi)
     if budget < 10**15:
@@ -2407,9 +2417,11 @@ def _rpa_kernel_of_site_lattice(monkeypatch, hk: np.ndarray, u_site: float, chan
     v_q = Interaction(np.zeros((int(np.prod(nq)),) + (o,) * 4), SpinChannel.NONE, nq, True)
     f_pp = {}
     for ph in (SpinChannel.DENS, SpinChannel.MAGN):
-        chi = nonlocal_sde.create_rpa_susceptibility(summed, u_loc, v_q, ph)
+        chi = sde_kernels.create_rpa_susceptibility(summed, u_loc, v_q, ph)
         chi.save(name=f"chi_phys_q_{ph.value}_rank_0", output_dir=config.output.eliashberg_path)
-        f_pp[ph] = es._build_pairing_vertex_pp(u_loc, v_q, None, niv_pp, _make_single_rank_distributor(), channel=ph)
+        f_pp[ph] = pairing_vertex._build_pairing_vertex_pp(
+            u_loc, v_q, None, niv_pp, _make_single_rank_distributor(), channel=ph
+        )
     gamma = 0.5 * f_pp[SpinChannel.DENS].mat - 1.5 * f_pp[SpinChannel.MAGN].mat
     gamma += u_loc.permute_orbitals("abcd->adcb").mat[None, ..., None, None]
     if channel == SpinChannel.TRIP:
@@ -2554,10 +2566,10 @@ def test_inversion_check_finds_no_inversion_in_a_d_p_chain_without_it_in_any_ene
 def test_irreducible_distributors_share_the_spread_split(monkeypatch):
     """The loop writing the per-rank files and the Eliashberg step reading them build one spread irreducible split."""
     config.lattice.k_grid = SimpleNamespace(nk_irr=6)
-    assert list(nonlocal_sde.irreducible_momentum_distributor(FAKE_MPI.Comm(4)).sizes) == [1, 2, 1, 2]
+    assert list(sde_kernels.irreducible_momentum_distributor(FAKE_MPI.Comm(4)).sizes) == [1, 2, 1, 2]
     monkeypatch.setattr(config, "logger", MagicMock(), raising=False)
     built = MagicMock(side_effect=RuntimeError("irreducible distributor built"))
-    monkeypatch.setattr(nonlocal_sde, "irreducible_momentum_distributor", built)
+    monkeypatch.setattr(sde_kernels, "irreducible_momentum_distributor", built)
     comm = conftest.create_comm_mock()
     # the stub stops each site where it builds its distributor
     with pytest.raises(RuntimeError, match="irreducible distributor built"):
@@ -2684,7 +2696,7 @@ def test_classify_gap_symmetry_tells_s_pm_from_s_with_the_fermi_surface(pairing,
     if pairing.endswith("weak interlayer s"):
         gap = gap + 0.3 * np.array([[0.0, 1.0], [1.0, 0.0]])[None, None, None, :, :, None]
 
-    assert classify_gap_symmetry(gap, bands=es.fermi_surface_bands(hk, 0.0)) == expected
+    assert classify_gap_symmetry(gap, bands=gap_classification.fermi_surface_bands(hk, 0.0)) == expected
 
 
 def test_classify_gap_symmetry_reads_the_band_gap_of_the_transposed_gap():
@@ -2699,7 +2711,7 @@ def test_classify_gap_symmetry_reads_the_band_gap_of_the_transposed_gap():
     gap[..., 0, 1, :] += 1j * np.sin(k)[:, None, None, None]
     gap[..., 1, 0, :] -= 1j * np.sin(k)[:, None, None, None]
 
-    assert classify_gap_symmetry(gap, bands=es.fermi_surface_bands(hk, 0.3)) == "x+[01,10]|s±+[00,11]"
+    assert classify_gap_symmetry(gap, bands=gap_classification.fermi_surface_bands(hk, 0.3)) == "x+[01,10]|s±+[00,11]"
 
 
 def test_classify_gap_symmetry_sees_no_s_pm_between_degenerate_bands():
@@ -2709,7 +2721,7 @@ def test_classify_gap_symmetry_sees_no_s_pm_between_degenerate_bands():
     hk[..., 0, 0] = hk[..., 1, 1] = eps[..., None]
     gap = np.broadcast_to(np.diag([1.0, -1.0])[None, None, None, :, :, None], (8, 8, 1, 2, 2, 4)).astype(complex)
 
-    assert classify_gap_symmetry(gap, bands=es.fermi_surface_bands(hk, 0.0)) == "s+"
+    assert classify_gap_symmetry(gap, bands=gap_classification.fermi_surface_bands(hk, 0.0)) == "s+"
 
 
 @pytest.mark.parametrize(
@@ -2727,7 +2739,7 @@ def test_classify_gap_symmetry_merges_degenerate_bands_into_one_fermi_surface(sp
         hk[..., 2, 2] = third[0] * eps[..., None] + third[1]
     gap = np.broadcast_to(np.diag([1.0, -1.0, 1.0][:n])[None, None, None, :, :, None], (8, 8, 1, n, n, 4))
 
-    assert classify_gap_symmetry(gap.astype(complex), bands=es.fermi_surface_bands(hk, 0.0)) == "s+"
+    assert classify_gap_symmetry(gap.astype(complex), bands=gap_classification.fermi_surface_bands(hk, 0.0)) == "s+"
 
 
 def test_classify_gap_symmetry_returns_unknown_for_zero_gap():
@@ -3729,11 +3741,11 @@ def test_slice_constructor_reads_the_pp_box_three_leg_vertex_bit_for_bit(setup, 
     chi0_mat, gamma_mat, u_mat = _toy_arrays(no, np.random.default_rng(3))
 
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no, save_fq=True)
-    full_box = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+    full_box = pairing_vertex.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
 
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no, save_fq=False)
     assert np.load(os.path.join(config.output.eliashberg_path, "vrg_q_dens_rank_0.npy")).shape[-1] == 2 * niv_pp
-    pp_box = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+    pp_box = pairing_vertex.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
 
     assert np.array_equal(pp_box.mat, full_box.mat)
 
@@ -3748,10 +3760,10 @@ def test_slice_constructor_matches_streaming_route_in_double_precision(setup, mo
     chi0_mat, gamma_mat, u_mat = _toy_arrays(no, np.random.default_rng(0), symmetric_bubble)
 
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    reference = es.create_pairing_vertex_streaming_fq(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+    reference = pairing_vertex.create_pairing_vertex_streaming_fq(u_loc, v_nonloc, gamma_r, niv_pp, dist)
 
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    result = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+    result = pairing_vertex.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
 
     assert result.mat.dtype == np.complex128
     assert np.allclose(result.mat, reference.mat, atol=1e-11 * np.max(np.abs(reference.mat)))
@@ -3765,10 +3777,10 @@ def test_slice_constructor_matches_streaming_route(setup, no):
     chi0_mat, gamma_mat, u_mat = _toy_arrays(no, np.random.default_rng(0))
 
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    reference = es.create_pairing_vertex_streaming_fq(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+    reference = pairing_vertex.create_pairing_vertex_streaming_fq(u_loc, v_nonloc, gamma_r, niv_pp, dist)
 
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    result = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+    result = pairing_vertex.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
 
     assert result.mat.shape == reference.mat.shape
     assert np.allclose(result.mat, reference.mat, atol=1e-4 * np.max(np.abs(reference.mat)))
@@ -3782,17 +3794,19 @@ def test_slice_constructor_is_bit_invariant_under_the_chunk_budget(setup, monkey
     chi0_mat, gamma_mat, u_mat = _toy_arrays(no, np.random.default_rng(1))
 
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    one_chunk = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+    one_chunk = pairing_vertex.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
 
     one_wn = no**4 * (2 * niv_pp) ** 2 * np.dtype(es.DTYPE).itemsize
     for budget in (1, 2 * one_wn, N_W * one_wn, 2 * N_W * one_wn):
         gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-        chunked = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist, chunk_bytes=budget)
+        chunked = pairing_vertex.create_pairing_vertex_slice_q_r(
+            u_loc, v_nonloc, gamma_r, niv_pp, dist, chunk_bytes=budget
+        )
         assert np.array_equal(one_chunk.mat, chunked.mat)
 
-    monkeypatch.setattr(es, "SLICE_CHUNK_BYTES", 1)
+    monkeypatch.setattr(pairing_vertex, "SLICE_CHUNK_BYTES", 1)
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    per_w = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+    per_w = pairing_vertex.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, gamma_r, niv_pp, dist)
     assert np.array_equal(one_chunk.mat, per_w.mat)
 
 
@@ -3800,7 +3814,7 @@ def _assembled_band(chi0, gamma_r, u_r, scale, beta, niv_band, w_start, inactive
     """The band solve of the Bethe-Salpeter window the kernel step's builder assembles (stands in for
     invert_with_local_kernel_on_anti_diagonal)."""
     gamma_w = gamma_r.take_wn_slice(w_start, w_start + chi0.current_shape[-2])
-    matrix = nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma_w, chi0, u_r)
+    matrix = sde_kernels.create_inverse_auxiliary_chi_r_q(gamma_w, chi0, u_r)
     return matrix.invert_on_anti_diagonal(niv_band, w_start, beta, inactive_pairs)
 
 
@@ -3808,7 +3822,7 @@ def _assembled_inverse(chi0, gamma_r, u_r, scale, w_start=0):
     """FourPoint.invert of the Bethe-Salpeter window the kernel step's builder assembles (stands in for
     invert_with_local_kernel)."""
     gamma_w = gamma_r.take_wn_slice(w_start, w_start + chi0.current_shape[-2])
-    return nonlocal_sde.create_inverse_auxiliary_chi_r_q(gamma_w, chi0, u_r).invert(False)
+    return sde_kernels.create_inverse_auxiliary_chi_r_q(gamma_w, chi0, u_r).invert(False)
 
 
 @pytest.mark.parametrize("save_fq", [False, True])
@@ -3822,7 +3836,9 @@ def test_pairing_vertex_build_gives_the_bits_of_the_assembled_bethe_salpeter_win
     config.eliashberg.save_fq = save_fq
     niv_pp = min(config.box.niw_core // 2, config.box.niv_core // 2)
     chi0_mat, gamma_mat, u_mat = _toy_arrays(no, np.random.default_rng(4), symmetric_bubble)
-    build = es.create_pairing_vertex_streaming_fq if save_fq else es.create_pairing_vertex_slice_q_r
+    build = (
+        pairing_vertex.create_pairing_vertex_streaming_fq if save_fq else pairing_vertex.create_pairing_vertex_slice_q_r
+    )
     file_path = f"{config.output.output_path}/f_irrq_dens.npy"
 
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
@@ -3862,24 +3878,22 @@ def test_ladder_vertex_chunk_is_the_auxiliary_ladder_vertex_in_double_precision(
     gchi0_q_inv = FourPoint(chi0_mat, SpinChannel.NONE, (N_Q, 1, 1), 1, 1, False, True, True).invert()
     u_r_loc = u_loc.as_channel(SpinChannel.DENS)
     u_r = u_r_loc + v_nonloc.as_channel(SpinChannel.DENS)
-    aux = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc)
-    chi = nonlocal_sde.create_generalized_chi_q_with_shell_correction(aux.sum_over_all_vn(beta), *sums, u_loc, v_nonloc)
+    aux = sde_kernels.create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc)
+    chi = sde_kernels.create_generalized_chi_q_with_shell_correction(aux.sum_over_all_vn(beta), *sums, u_loc, v_nonloc)
     one = LocalInteraction(np.einsum("ad,bc->abcd", np.eye(no), np.eye(no)))
     chi_hat = (chi.invert() + one.scale(lam, copy=True)).invert()
-    ladder = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc, subtract_u=False)
-    middle = nonlocal_sde.create_ladder_vertex_middle(
-        ladder.sum_over_all_vn(beta), *sums, u_loc, v_nonloc, chi, chi_hat
-    )
-    vrg_g = nonlocal_sde.create_vrg_r_q(ladder, gchi0_q_inv)
+    ladder = sde_kernels.create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc, subtract_u=False)
+    middle = sde_kernels.create_ladder_vertex_middle(ladder.sum_over_all_vn(beta), *sums, u_loc, v_nonloc, chi, chi_hat)
+    vrg_g = sde_kernels.create_vrg_r_q(ladder, gchi0_q_inv)
     inactive = gamma_r.orbital_pairs_without_vertex(u_r_loc)
     assert inactive.tolist() == ([1, 2] if blocks else [])
 
-    out = es._build_ladder_vertex_chunk(gamma_r, gchi0_q_inv, vrg_g, middle, 0, N_W, None, inactive)
+    out = pairing_vertex._build_ladder_vertex_chunk(gamma_r, gchi0_q_inv, vrg_g, middle, 0, N_W, None, inactive)
 
     chi_aux = gchi0_q_inv.invert_with_local_kernel(gamma_r, u_r_loc, 1.0 / beta**2, 0)
     vrg_right = (chi_aux.sum_over_vn(beta, axis=(-2,)) @ gchi0_q_inv).scale(beta)
     ref = (gchi0_q_inv @ chi_aux @ gchi0_q_inv).scale(-(beta**2)).add_on_vn_diagonal(gchi0_q_inv, factor=beta**2)
-    vrg = nonlocal_sde.create_vrg_r_q(aux, gchi0_q_inv)
+    vrg = sde_kernels.create_vrg_r_q(aux, gchi0_q_inv)
     ref = ref.add((vrg @ u_r - vrg @ (u_r @ chi_hat @ u_r)) * vrg_right)
     assert np.allclose(out.mat, ref.mat, rtol=0.0, atol=1e-10 * np.abs(ref.mat).max())
 
@@ -3929,7 +3943,9 @@ def test_fq_estimate_bounds_the_traced_peak_of_the_pairing_vertex_build(
     gamma_r, u_loc, v_nonloc = _write_random_intermediates(no, niv, niw, nq=2)
     gamma_r = None if bare_vertex else gamma_r
     niv_pp = min(niw // 2, niv // 2)
-    build = es.create_pairing_vertex_streaming_fq if save_fq else es.create_pairing_vertex_slice_q_r
+    build = (
+        pairing_vertex.create_pairing_vertex_streaming_fq if save_fq else pairing_vertex.create_pairing_vertex_slice_q_r
+    )
     dist = _make_single_rank_distributor()
     tracemalloc.start()
     try:
@@ -3963,9 +3979,11 @@ def test_pp_band_reads_the_negative_bosonic_half_by_hermiticity():
     shape = (nq,) + (no,) * 4 + (n2, n2, n2)
     rng = np.random.default_rng(8)
     f = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
-    _, omega = es._pp_w0_band(niv_pp, n2 - 1)
+    _, omega = pairing_vertex._pp_w0_band(niv_pp, n2 - 1)
     out = np.zeros((nq,) + (no,) * 4 + (n2, n2), dtype=np.complex128)
-    es._write_pp_band(out, FourPoint(f.copy(), SpinChannel.DENS, (nq, 1, 1), 1, 2, False, True, True), niv_pp, omega, 0)
+    pairing_vertex._write_pp_band(
+        out, FourPoint(f.copy(), SpinChannel.DENS, (nq, 1, 1), 1, 2, False, True, True), niv_pp, omega, 0
+    )
     f_1432, f_2341 = np.einsum("qadcbwxy->qabcdwxy", f), np.einsum("qbcdawxy->qabcdwxy", f)
     ref = np.empty_like(out)
     for i, j in np.ndindex(n2, n2):
@@ -3983,7 +4001,7 @@ def test_streaming_fq_file_has_gather_layout_and_matches_pp_band(setup):
     chi0_mat, gamma_mat, u_mat = _toy_arrays(no, np.random.default_rng(2))
 
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    result_pp = es.create_pairing_vertex_streaming_fq(u_loc, v_nonloc, gamma_r, niv_pp, dist)
+    result_pp = pairing_vertex.create_pairing_vertex_streaming_fq(u_loc, v_nonloc, gamma_r, niv_pp, dist)
     streamed = np.load(f"{config.output.output_path}/f_irrq_dens.npy")
 
     assert streamed.shape == (N_Q,) + (no,) * 4 + (config.box.niw_core + 1, 2 * NIV, 2 * NIV)
@@ -3998,13 +4016,13 @@ def test_dispatch_selects_slice_or_streaming_construction_by_save_fq(setup, monk
     """dispatch_full_vertex_calculation routes to the slice constructor, or to the streaming one under save_fq."""
     config.eliashberg.save_fq = save_fq
     loader = MagicMock(return_value=(MagicMock(spec=LocalFourPoint), None))
-    monkeypatch.setattr(es.nonlocal_sde, "_load_node_shared_local_vertex", loader)
+    monkeypatch.setattr(sde_kernels, "load_node_shared_local_vertex", loader)
     slice_mock = MagicMock(return_value="slice")
     streaming_mock = MagicMock(return_value="streamed")
-    monkeypatch.setattr(es, "create_pairing_vertex_slice_q_r", slice_mock)
-    monkeypatch.setattr(es, "create_pairing_vertex_streaming_fq", streaming_mock)
+    monkeypatch.setattr(pairing_vertex, "create_pairing_vertex_slice_q_r", slice_mock)
+    monkeypatch.setattr(pairing_vertex, "create_pairing_vertex_streaming_fq", streaming_mock)
 
-    result = es.dispatch_full_vertex_calculation(
+    result = pairing_vertex.dispatch_full_vertex_calculation(
         SpinChannel.DENS, MagicMock(), MagicMock(), 2, _make_single_rank_distributor()
     )
 
@@ -4019,12 +4037,12 @@ def test_dispatch_loads_the_vertex_node_shared_and_frees_its_window(setup, monke
     win = MagicMock()
     loader = MagicMock(return_value=(MagicMock(spec=LocalFourPoint), win))
     free_mock = MagicMock()
-    monkeypatch.setattr(es.nonlocal_sde, "_load_node_shared_local_vertex", loader)
-    monkeypatch.setattr(es.nonlocal_sde, "_free_shared_window", free_mock)
-    monkeypatch.setattr(es, "create_pairing_vertex_slice_q_r", MagicMock(return_value="slice"))
+    monkeypatch.setattr(sde_kernels, "load_node_shared_local_vertex", loader)
+    monkeypatch.setattr(mu, "free_shared_window", free_mock)
+    monkeypatch.setattr(pairing_vertex, "create_pairing_vertex_slice_q_r", MagicMock(return_value="slice"))
     node_comm = MagicMock()
 
-    result = es.dispatch_full_vertex_calculation(
+    result = pairing_vertex.dispatch_full_vertex_calculation(
         SpinChannel.DENS, MagicMock(), MagicMock(), 2, _make_single_rank_distributor(), node_comm=node_comm
     )
 
@@ -4053,15 +4071,15 @@ def test_rpa_vertex_chunk_is_the_ladder_vertex_chunk_at_the_bare_local_vertex(mo
     chi = FourPoint(chi_mat, channel, (N_Q, 1, 1), 1, 0, False, True, True)
     # the ladder of Gamma_r alone and its middle for the shell-free susceptibility of the auxiliary ladder and chi
     zero_sum = FourPoint(np.zeros_like(chi_mat), SpinChannel.NONE, (N_Q, 1, 1), 1, 0, False, True, True)
-    aux = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc).sum_over_all_vn(config.sys.beta)
-    chi_shell = nonlocal_sde.create_generalized_chi_q_with_shell_correction(aux, zero_sum, zero_sum, u_loc, v_nonloc)
-    ladder_sum = nonlocal_sde.create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc, subtract_u=False)
+    aux = sde_kernels.create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc).sum_over_all_vn(config.sys.beta)
+    chi_shell = sde_kernels.create_generalized_chi_q_with_shell_correction(aux, zero_sum, zero_sum, u_loc, v_nonloc)
+    ladder_sum = sde_kernels.create_auxiliary_chi_r_q_sum(gamma_r, gchi0_q_inv, u_loc, subtract_u=False)
     x_g = ladder_sum.sum_over_all_vn(config.sys.beta)
-    middle = nonlocal_sde.create_ladder_vertex_middle(x_g, zero_sum, zero_sum, u_loc, v_nonloc, chi_shell, chi)
-    vrg = nonlocal_sde.create_vrg_r_q(ladder_sum, gchi0_q_inv)
-    ladder = es._build_ladder_vertex_chunk(gamma_r, gchi0_q_inv, vrg, middle, 0, N_W, None)
+    middle = sde_kernels.create_ladder_vertex_middle(x_g, zero_sum, zero_sum, u_loc, v_nonloc, chi_shell, chi)
+    vrg = sde_kernels.create_vrg_r_q(ladder_sum, gchi0_q_inv)
+    ladder = pairing_vertex._build_ladder_vertex_chunk(gamma_r, gchi0_q_inv, vrg, middle, 0, N_W, None)
 
-    out = es._build_rpa_vertex_chunk(chi, u_r, 0, N_W, NIV)
+    out = pairing_vertex._build_rpa_vertex_chunk(chi, u_r, 0, N_W, NIV)
 
     assert np.allclose(out.mat, ladder.mat, atol=1e-9 * np.abs(ladder.mat).max())
 
@@ -4096,7 +4114,7 @@ def test_rpa_pairing_vertices_of_one_band_are_the_spin_fluctuation_vertices(setu
     v_q = Interaction(np.zeros((N_Q, 1, 1, 1, 1)), SpinChannel.NONE, (N_Q, 1, 1), True)
     chi = {}
     for channel in (SpinChannel.DENS, SpinChannel.MAGN):
-        chi_q_r = nonlocal_sde.create_rpa_susceptibility(summed, u_loc, v_q, channel)
+        chi_q_r = sde_kernels.create_rpa_susceptibility(summed, u_loc, v_q, channel)
         nonlocal_sde._finish_physical_susceptibility(chi_q_r, _make_single_rank_distributor(), save_eliashberg=True)
         chi[channel] = np.load(os.path.join(rank_path, f"chi_phys_q_{channel.value}_rank_0.npy")).reshape(N_Q, N_W)
 
@@ -4198,7 +4216,7 @@ def test_rpa_pairing_vertices_of_kanamori_orbitals_give_the_graser_gap_equation(
     u_loc = LocalInteraction(general_su2_u(no, 2.0, 1.3, 0.35, 0.25))
     v_q = Interaction(np.zeros((nk,) + (no,) * 4), SpinChannel.NONE, (nk, 1, 1), True)
     for r in (SpinChannel.DENS, SpinChannel.MAGN):
-        chi = nonlocal_sde.create_rpa_susceptibility(summed, u_loc, v_q, r)
+        chi = sde_kernels.create_rpa_susceptibility(summed, u_loc, v_q, r)
         nonlocal_sde._finish_physical_susceptibility(chi, _make_single_rank_distributor(), save_eliashberg=True)
     sing, trip = _rpa_solve_capturing_vertices(monkeypatch, u_loc, no, "do_rpa", nk=(nk, 1, 1))
     niv_pp = min(niw // 2, config.box.niv_core // 2)
@@ -4248,6 +4266,8 @@ def test_streaming_fq_multi_rank_writes_disjoint_slabs_matching_single_rank(setu
     from dgamore.mpi_utils import MpiDistributor
 
     monkeypatch.setattr(es, "MPI", conftest.FAKE_MPI)
+
+    monkeypatch.setattr(pairing_vertex, "MPI", conftest.FAKE_MPI)
     no = 2
     config.sys.n_bands = no
     config.eliashberg.save_fq = True
@@ -4255,7 +4275,7 @@ def test_streaming_fq_multi_rank_writes_disjoint_slabs_matching_single_rank(setu
     chi0_mat, gamma_mat, u_mat = _toy_arrays(no, np.random.default_rng(7))
 
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    reference_pp = es.create_pairing_vertex_streaming_fq(u_loc, v_nonloc, deepcopy(gamma_r), niv_pp, dist)
+    reference_pp = pairing_vertex.create_pairing_vertex_streaming_fq(u_loc, v_nonloc, deepcopy(gamma_r), niv_pp, dist)
     reference_file = np.load(f"{config.output.output_path}/f_irrq_dens.npy").copy()
 
     # split the regenerated single-rank intermediates into per-rank q-shares (the q axis leads in every file)
@@ -4270,7 +4290,9 @@ def test_streaming_fq_multi_rank_writes_disjoint_slabs_matching_single_rank(setu
     def worker(comm, rank):
         mpi_dist = MpiDistributor.create_distributor(ntasks=N_Q, comm=comm)
         local_v = Interaction(v_nonloc.mat[rank : rank + 1].copy(), SpinChannel.NONE, (1, 1, 1), True)
-        results[rank] = es.create_pairing_vertex_streaming_fq(u_loc, local_v, deepcopy(gamma_r), niv_pp, mpi_dist)
+        results[rank] = pairing_vertex.create_pairing_vertex_streaming_fq(
+            u_loc, local_v, deepcopy(gamma_r), niv_pp, mpi_dist
+        )
 
     conftest.run_parallel(2, worker)
     streamed_file = np.load(f"{config.output.output_path}/f_irrq_dens.npy")
@@ -4287,6 +4309,8 @@ def test_pairing_vertex_gather_scatter_round_trip_preserves_rank_shares(setup, m
     from dgamore.mpi_utils import MpiDistributor
 
     monkeypatch.setattr(es, "MPI", conftest.FAKE_MPI)
+
+    monkeypatch.setattr(pairing_vertex, "MPI", conftest.FAKE_MPI)
     monkeypatch.setattr(mu, "MPI", conftest.FAKE_MPI)
     no = 2
     config.sys.n_bands = no
@@ -4294,7 +4318,7 @@ def test_pairing_vertex_gather_scatter_round_trip_preserves_rank_shares(setup, m
     chi0_mat, gamma_mat, u_mat = _toy_arrays(no, np.random.default_rng(11))
 
     gamma_r, u_loc, v_nonloc, dist = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
-    reference = es.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, deepcopy(gamma_r), niv_pp, dist)
+    reference = pairing_vertex.create_pairing_vertex_slice_q_r(u_loc, v_nonloc, deepcopy(gamma_r), niv_pp, dist)
 
     gamma_r, u_loc, v_nonloc, _ = _write_intermediates(chi0_mat, gamma_mat, u_mat, no)
     for name in ("gchi0_q_inv", "vrg_q_dens", "vrg_middle_q_dens"):
@@ -4305,7 +4329,7 @@ def test_pairing_vertex_gather_scatter_round_trip_preserves_rank_shares(setup, m
     def worker(comm, rank):
         mpi_dist = MpiDistributor.create_distributor(ntasks=N_Q, comm=comm)
         local_v = Interaction(v_nonloc.mat[rank : rank + 1].copy(), SpinChannel.NONE, (1, 1, 1), True)
-        vertex = es.create_pairing_vertex_slice_q_r(u_loc, local_v, deepcopy(gamma_r), niv_pp, mpi_dist)
+        vertex = pairing_vertex.create_pairing_vertex_slice_q_r(u_loc, local_v, deepcopy(gamma_r), niv_pp, mpi_dist)
         own = vertex.mat.copy()
         gathered = mpi_dist.gather(vertex.mat)
         if comm.rank == 0:
@@ -4405,7 +4429,7 @@ def test_delete_rank_files_deletes_every_rank_file_and_keeps_the_folder_and_othe
     es.delete_rank_files()
     assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")) == [
         "Eliashberg",
-        f"Eliashberg/{nonlocal_sde.ABORT_MARKER}",
+        f"Eliashberg/{output_files.ABORT_MARKER}",
         "Eliashberg/f_ud_loc_pp_w0.npy",
     ]
 
@@ -4435,10 +4459,10 @@ def test_save_rank_file_deletes_a_file_whose_save_overlapped_the_cleanup(monkeyp
 
     def save_while_cleanup_starts(name, output_dir, niv_cut):
         (tmp_path / f"{name}.npy").touch()
-        (tmp_path / nonlocal_sde.ABORT_MARKER).touch()
+        (tmp_path / output_files.ABORT_MARKER).touch()
 
     nonlocal_sde.save_rank_file(MagicMock(save=save_while_cleanup_starts), "gchi0_q_inv_rank_5")
-    assert [p.name for p in tmp_path.iterdir()] == [nonlocal_sde.ABORT_MARKER]
+    assert [p.name for p in tmp_path.iterdir()] == [output_files.ABORT_MARKER]
 
 
 def _watched_folder(monkeypatch, tmp_path):
@@ -4457,7 +4481,7 @@ def test_rank_file_watchdog_deletes_the_rank_files_when_its_process_ends_unannou
     watchdog = es.start_rank_file_watchdog()
     watchdog.stdin.close()
     assert watchdog.wait(timeout=10) == 0
-    assert sorted(p.name for p in folder.iterdir()) == [nonlocal_sde.ABORT_MARKER, "f_ud_loc_pp_w0.npy"]
+    assert sorted(p.name for p in folder.iterdir()) == [output_files.ABORT_MARKER, "f_ud_loc_pp_w0.npy"]
 
 
 def test_rank_file_watchdog_stopped_at_a_normal_end_deletes_nothing(monkeypatch, tmp_path):
@@ -4480,7 +4504,7 @@ def test_rank_file_watchdog_ignores_the_termination_signal_of_the_job(monkeypatc
     watchdog.terminate()
     watchdog.stdin.close()
     assert watchdog.wait(timeout=10) == 0
-    assert sorted(p.name for p in folder.iterdir()) == [nonlocal_sde.ABORT_MARKER, "f_ud_loc_pp_w0.npy"]
+    assert sorted(p.name for p in folder.iterdir()) == [output_files.ABORT_MARKER, "f_ud_loc_pp_w0.npy"]
 
 
 def test_delete_rank_files_removes_nothing_without_an_eliashberg_folder(monkeypatch, tmp_path):

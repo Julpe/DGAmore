@@ -37,7 +37,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from dgamore.jacobian_stabilization import _CHECK_START, TRACKER_PAIRS
+from dgamore.jacobian_stabilization import CHECK_START, TRACKER_PAIRS
 
 from dgamore.n_point_base import DTYPE
 
@@ -70,7 +70,7 @@ SDE_CONTRACTION_CHUNK_BYTES: int = 32 * 1024**2
 SDE_UNFOLD_BATCH_BYTES: int = 4 * 1024**2
 
 # The chunk element budgets of dgamore.greens_function (_MOMENTUM_CHUNK_ELEMENTS of the occupation and in-box
-# potential-energy sums, _MODEL_EPOT_CHUNK_ELEMENTS of the Dyson build and the analytic potential-energy tail) and the
+# potential-energy sums, MODEL_EPOT_CHUNK_ELEMENTS of the Dyson build and the analytic potential-energy tail) and the
 # tail's default frequency count (GreensFunction.get_epot's niv_asympt); test-locked to those values.
 GF_MOMENTUM_CHUNK_ELEMENTS: int = 2**22
 GF_FREQUENCY_CHUNK_ELEMENTS: int = 2**20
@@ -149,8 +149,8 @@ class ChunkBudgets:
     The exact Jacobian's fields are sized the same way. Byte budgets default to the :data:`SLICE_CHUNK_BYTES` floor.
 
     :ivar sde: Budget of one round of transposed irreducible kernel columns of the self-energy contraction
-        (:func:`dgamore.nonlocal_sde._run_column_sde`).
-    :ivar fq: Budget of the pairing-vertex build (:func:`dgamore.eliashberg_solver._build_pairing_vertex_pp`).
+        (:func:`~dgamore.sde_kernels.run_column_sde`).
+    :ivar fq: Budget of the pairing-vertex build (:func:`dgamore.pairing_vertex._build_pairing_vertex_pp`).
     :ivar exact: Budget of the exact Jacobian's products (:class:`dgamore.sigma_jacobian.ExactJacobian`): one round of
         transposed kernel columns of its self-energy contraction.
     :ivar exact_block: Columns one block product of the exact Jacobian takes at once
@@ -163,7 +163,7 @@ class ChunkBudgets:
         of its Bethe-Salpeter pass, against the factorization that solves the window's responses, instead of holding
         them between products.
     :ivar sde_node: Whether the ranks of a node share the column work of the self-energy contraction
-        (:class:`dgamore.nonlocal_sde._ColumnSdeStream`) instead of each rank contracting its own column tasks alone.
+        (:class:`~dgamore.sde_kernels.ColumnSdeStream`) instead of each rank contracting its own column tasks alone.
     """
 
     sde: int = SLICE_CHUNK_BYTES
@@ -313,7 +313,7 @@ def column_sde_schedule(
 ) -> tuple[list, np.ndarray, np.ndarray]:
     r"""
     Returns the task layout of the column-distributed self-energy contraction
-    (:class:`dgamore.nonlocal_sde._ColumnSdeStream`). Task ``t = v * n_blocks + b`` sums the bosonic block ``b`` of the
+    (:class:`~dgamore.sde_kernels.ColumnSdeStream`). Task ``t = v * n_blocks + b`` sums the bosonic block ``b`` of the
     fermionic frequency index ``v``; the blocks are the runs of :data:`SDE_W_BLOCK` consecutive frequencies
     :math:`\omega = 0, \ldots, n_\omega` followed by the runs of the negative frequencies :math:`\omega = -1, \ldots,
     -n_\omega`, in the order the bosonic sum is associated. With ``by_frequency`` every block holds one frequency
@@ -346,7 +346,7 @@ def column_sde_schedule(
 def sde_unfold_batch(column_bytes: int, partial_bytes: int, n_columns: int) -> int:
     r"""
     Returns the number of full-BZ kernel columns the column-distributed self-energy contraction
-    (:class:`dgamore.nonlocal_sde._ColumnSdeStream`) unfolds and transforms in one call: as many as fit
+    (:class:`~dgamore.sde_kernels.ColumnSdeStream`) unfolds and transforms in one call: as many as fit
     :data:`SDE_UNFOLD_BATCH_BYTES` with the partial sums of their tasks, at least one and at most ``n_columns``.
 
     :param column_bytes: Bytes of one full-BZ kernel column.
@@ -430,7 +430,7 @@ def column_sde_stream_bytes(
 ) -> tuple[float, float]:
     r"""
     Returns the per-rank bytes of the self-energy contraction fed in bosonic groups
-    (:class:`dgamore.nonlocal_sde._ColumnSdeStream` with ``by_frequency``) beside the kernels of a group: the slabs
+    (:class:`~dgamore.sde_kernels.ColumnSdeStream` with ``by_frequency``) beside the kernels of a group: the slabs
     held from its first group to its end (see :func:`column_sde_slabs`), and the transient of a group or of the
     reduction beside them: one round of one-column tasks of every kernel with one kernel's ring send copy, the full-BZ
     column work of one batch (see :func:`sde_unfold_batch`) with the contraction's operand chunk, every output's
@@ -678,7 +678,7 @@ def rank_tasks(n_tasks: int, n_ranks: int, rank: int, spread: bool = False) -> i
 def rank_counts(nk_irr: int, nk_tot: int, n_ranks: int, rank: int) -> tuple[int, int]:
     """
     Returns a rank's task counts as the distributors of the non-local step give them: its irreducible momenta of the
-    spread split (see :func:`~dgamore.nonlocal_sde.irreducible_momentum_distributor`) and its share of the full BZ of
+    spread split (see :func:`~dgamore.sde_kernels.irreducible_momentum_distributor`) and its share of the full BZ of
     the default split (see :func:`rank_tasks`).
 
     :param nk_irr: Number of momentum points in the irreducible BZ.
@@ -960,7 +960,7 @@ def jacobian_tracker_bytes(
     # the estimate's basis, span and their dual rows, or an orthogonal set's basis and span with views as dual rows
     tall = 2 * real_column * max(2 * k, carried, check_set)
     # the rung-start check's real start columns and the complex columns of a later check's candidate mode
-    checks = _CHECK_START * real_column + 2 * complex_column if with_exact_jacobian else 0
+    checks = CHECK_START * real_column + 2 * complex_column if with_exact_jacobian else 0
     transient = 7 * real_column * k
     return window + ritz_vectors + predecessor + tall + checks, transient
 
@@ -1210,7 +1210,7 @@ def estimate_peaks(
     core_block = _bubble_block(qi, nb, wp, vc)
     group_block = _bubble_block(kernel_momentum_group(qi), nb, wp, vc)
     # the cut and the dc contraction beside the full-box bubble: several ranks take them one bosonic frequency at a
-    # time and free it (see nonlocal_sde._bubble_box_parts), one rank holds the bubble whole
+    # time and free it (see sde_kernels.bubble_box_parts), one rank holds the bubble whole
     box_parts = 2 * (core_block if n_ranks == 1 else _bubble_block(qi, nb, 1, vc))
     chiq_aux_distributed = max(
         scale * (_bubble_block(qi, nb, wp, vf) + box_parts),

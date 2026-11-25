@@ -165,6 +165,22 @@ def allocate_node_shared_array(node_comm, shape: tuple, dtype=DTYPE):
     return np.ndarray(buffer=buf, dtype=dtype, shape=shape), win
 
 
+def free_shared_window(win, node_comm) -> None:
+    r"""
+    Frees a shared-memory window while keeping its node communicator alive - the communicator is reused for the cut
+    ``giwk_full`` window and released later by :func:`~dgamore.sde_kernels.release_shared_giwk`. A barrier
+    guarantees no rank is still reading the window's buffer. A no-op when there is no window.
+
+    :param win: The MPI shared-memory window (or ``None``).
+    :param node_comm: The node-local communicator (or ``None``).
+    :return: None.
+    """
+    if node_comm is None or win is None:
+        return
+    node_comm.Barrier()
+    win.Free()
+
+
 def cgroup_memory_limit(proc_file: str = "/proc/self/cgroup", cgroup_root: str = "/sys/fs/cgroup") -> int | None:
     """
     Returns this process's effective cgroup memory limit in bytes, or ``None`` when no limit is set (or none is
@@ -233,6 +249,30 @@ def count_nodes(comm, node_comm) -> int:
     if node_comm is None or node_comm.size >= comm.size:
         return 1
     return comm.allreduce(1 if node_comm.rank == 0 else 0)
+
+
+def node_groups(
+    comm: MPI.Comm, node_comm: MPI.Comm, available_bytes: int
+) -> tuple[dict[int, list[int]], dict[int, str], dict[int, int]]:
+    r"""
+    Groups the ranks by node: the groups of ``node_comm``, keyed by the lowest rank of each (ascending), with the
+    node's hostname and its free memory, the minimum over its ranks. Collective over ``comm``; identical on every rank.
+
+    :param comm: The MPI communicator.
+    :param node_comm: The node-local communicator.
+    :param available_bytes: This rank's free host memory.
+    :return: ``(node_ranks, node_host, node_available)``: every node's ranks in ascending order, its hostname and its
+        free memory, each keyed by the node's lowest rank.
+    """
+    info = comm.allgather((node_comm.bcast(comm.rank, root=0), socket.gethostname(), available_bytes))
+    node_ranks: dict[int, list[int]] = {}
+    node_host: dict[int, str] = {}
+    node_available: dict[int, int] = {}
+    for rank, (node_root, host, avail) in enumerate(info):
+        node_ranks.setdefault(node_root, []).append(rank)
+        node_host[node_root] = host
+        node_available[node_root] = min(node_available.get(node_root, avail), avail)
+    return node_ranks, node_host, node_available
 
 
 # ====================================================================================================================
@@ -325,7 +365,7 @@ def recv_rows_alloc(
     return recv_rows_into(comm, np.empty(shape, dtype=dtype), source, base_tag=base_tag, limit=limit)
 
 
-def _isend_rows(comm, arr: np.ndarray, dest: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> list:
+def isend_rows(comm, arr: np.ndarray, dest: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> list:
     """
     Non-blocking counterpart of :func:`send_rows`: posts one ``Isend`` per sub-``limit``-byte axis-0 chunk
     (``tag = base_tag + chunk_index``) and returns the request list for a later ``Waitall``, so transfers to
@@ -343,14 +383,14 @@ def _isend_rows(comm, arr: np.ndarray, dest: int, base_tag: int = 0, limit: int 
     :raises ValueError: If ``arr`` is not C-contiguous.
     """
     if not arr.flags["C_CONTIGUOUS"]:
-        raise ValueError("_isend_rows requires a C-contiguous array (the caller must keep it alive until Waitall)")
+        raise ValueError("isend_rows requires a C-contiguous array (the caller must keep it alive until Waitall)")
     reqs = []
     for idx, (i, j) in enumerate(row_chunks(arr.shape[0], arr.dtype.itemsize, _items_per_row(arr.shape), limit)):
         reqs.append(comm.Isend(arr[i:j], dest=dest, tag=base_tag + idx))
     return reqs
 
 
-def _irecv_rows_into(comm, buf: np.ndarray, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> list:
+def irecv_rows_into(comm, buf: np.ndarray, source: int, base_tag: int = 0, limit: int = MAX_MPI_BYTES) -> list:
     """
     Non-blocking counterpart of :func:`recv_rows_into`: posts one ``Irecv`` per sub-``limit``-byte axis-0 chunk
     **directly into** the contiguous buffer ``buf`` (no per-chunk staging) and returns the request list for a later
@@ -674,11 +714,11 @@ class MpiDistributor:
             for r in range(self.mpi_size):
                 if r == root or self._sizes[r] == 0:
                     continue
-                reqs += _irecv_rows_into(self.comm, tot_result[self._slices[r]], source=r, limit=MAX_MPI_BYTES)
+                reqs += irecv_rows_into(self.comm, tot_result[self._slices[r]], source=r, limit=MAX_MPI_BYTES)
             MPI.Request.Waitall(reqs)
         else:
             if rank_result.shape[0] > 0:
-                MPI.Request.Waitall(_isend_rows(self.comm, rank_result, dest=root, limit=MAX_MPI_BYTES))
+                MPI.Request.Waitall(isend_rows(self.comm, rank_result, dest=root, limit=MAX_MPI_BYTES))
 
         return tot_result
 
@@ -732,7 +772,7 @@ class MpiDistributor:
                     if r == root:
                         rank_data[...] = full_data[sl]
                     else:
-                        reqs += _isend_rows(self.comm, full_data[sl], dest=r, limit=MAX_MPI_BYTES)
+                        reqs += isend_rows(self.comm, full_data[sl], dest=r, limit=MAX_MPI_BYTES)
                 MPI.Request.Waitall(reqs)
             elif data_len == self._my_size and self.mpi_size == 1:
                 rank_data[...] = full_data
@@ -740,7 +780,7 @@ class MpiDistributor:
                 raise ValueError(f"Mismatch in scatter!")
         else:
             if self._my_size > 0:
-                MPI.Request.Waitall(_irecv_rows_into(self.comm, rank_data, source=root, limit=MAX_MPI_BYTES))
+                MPI.Request.Waitall(irecv_rows_into(self.comm, rank_data, source=root, limit=MAX_MPI_BYTES))
 
         return rank_data
 
@@ -976,9 +1016,9 @@ def transpose_columns(
         reqs, send = [], None
         if local.shape[0] and len(cols_of[dst][0]):
             send = np.ascontiguousarray(columns(cols_of[dst]))
-            reqs += _isend_rows(comm, send, dst, base_tag=base_tag, limit=MAX_MPI_BYTES)
+            reqs += isend_rows(comm, send, dst, base_tag=base_tag, limit=MAX_MPI_BYTES)
         if slices[src].stop > slices[src].start and len(mine[0]):
-            reqs += _irecv_rows_into(comm, out[slices[src]], src, base_tag=base_tag, limit=MAX_MPI_BYTES)
+            reqs += irecv_rows_into(comm, out[slices[src]], src, base_tag=base_tag, limit=MAX_MPI_BYTES)
         MPI.Request.Waitall(reqs)
         del send
     return out
@@ -1007,9 +1047,9 @@ def exchange_blocks(
     received = [np.empty(shape, dtype=dtype) for _ in sources]
     reqs = []
     for dst, block in sends:
-        reqs += _isend_rows(comm, block, dst, base_tag=base_tag, limit=MAX_MPI_BYTES)
+        reqs += isend_rows(comm, block, dst, base_tag=base_tag, limit=MAX_MPI_BYTES)
     for src, buf in zip(sources, received):
-        reqs += _irecv_rows_into(comm, buf, src, base_tag=base_tag, limit=MAX_MPI_BYTES)
+        reqs += irecv_rows_into(comm, buf, src, base_tag=base_tag, limit=MAX_MPI_BYTES)
     MPI.Request.Waitall(reqs)
     return received
 

@@ -5,19 +5,18 @@
 #           Eliashberg Equation Solver for Strongly Correlated Electron Systems
 r"""
 Linearized Eliashberg equation solver. Starting from the ladder-DGA full vertex (saved per channel by the non-local SDE
-step), this module assembles the particle-particle pairing vertex in the singlet/triplet channels at :math:`\omega = 0`,
-optionally adds the local reducible diagrams, and solves the linearized gap equation :math:`\lambda \Delta =
-\pm\frac{1}{2\beta n_{\mathbf{k}}}\, \Gamma^{\mathrm{pp}}\, \chi_0^{\mathrm{pp}}\, \Delta` with a matrix-free
-ARPACK/Lanczos eigensolver: in memory when a node holds one channel's pairing vertex (as a team solve over one
-node-shared vertex window per channel on a multi-rank job, sector after sector on a single rank) and with one team
-of all ranks whose vertex windows, vectors and bubble are split over the nodes otherwise. The leading eigenvalue
-:math:`\lambda` signals the pairing instability and the eigenvector is the gap function
+step), this module assembles (through :mod:`~dgamore.pairing_vertex`) the particle-particle pairing vertex in the
+singlet/triplet channels at :math:`\omega = 0`, optionally adds the local reducible diagrams, and solves the linearized
+gap equation :math:`\lambda \Delta = \pm\frac{1}{2\beta n_{\mathbf{k}}}\, \Gamma^{\mathrm{pp}}\, \chi_0^{\mathrm{pp}}\,
+\Delta` with a matrix-free ARPACK/Lanczos eigensolver: in memory when a node holds one channel's pairing vertex (as a
+team solve over one node-shared vertex window per channel on a multi-rank job, sector after sector on a single rank) and
+with one team of all ranks whose vertex windows, vectors and bubble are split over the nodes otherwise. The leading
+eigenvalue :math:`\lambda` signals the pairing instability and the eigenvector is the gap function
 :math:`\Delta^{\mathrm{k}}_{12}`. Equation numbers refer to the author's master's thesis (Chapter 4).
 """
 
 import glob
 import os
-import socket
 import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -31,18 +30,15 @@ import scipy as sp
 from threadpoolctl import ThreadpoolController, threadpool_limits
 
 import dgamore.config as config
-from dgamore import nonlocal_sde, mpi_utils
+from dgamore import mpi_utils, output_files, pairing_vertex, sde_kernels
 from dgamore.brillouin_zone import KGrid, KnownSymmetries
 from dgamore.bubble_gen import BubbleGenerator
 from dgamore.four_point import FourPoint
 from dgamore.gap_function import GapFunction
 from dgamore.greens_function import GreensFunction
 from dgamore.interaction import LocalInteraction, Interaction
-from dgamore.local_four_point import LocalFourPoint
-from dgamore.matsubara_frequencies import MFHelper
 from dgamore import memory_estimator
 from dgamore.memory_estimator import (
-    SLICE_CHUNK_BYTES,
     lanczos_distributed_bytes,
     lanczos_ncv,
     lanczos_solver_bytes,
@@ -50,11 +46,11 @@ from dgamore.memory_estimator import (
     team_build_columns,
 )
 from dgamore.mpi_utils import MpiDistributor
-from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE, deferred_collection
+from dgamore.n_point_base import SpinChannel, FrequencyNotation, DTYPE
 from dgamore.self_energy import SelfEnergy
 from dgamore.symmetry_reduction import (
-    _M_preserves_grid,
-    _close_group,
+    M_preserves_grid,
+    close_group,
     find_coordinate_mirror_orbital_unitaries,
     find_inversion_orbital_unitary,
     forced_multiplicity,
@@ -76,32 +72,11 @@ _WATCHDOG_SCRIPT = (
 _watchdog: subprocess.Popen | None = None  # the rank-file watchdog of this process, see start_rank_file_watchdog
 
 
-def delete_files(filepath: str, *args) -> None:
-    """
-    Deletes files in the given directory. If a file is not found, it is ignored. The deleted files are usually
-    temporary files that are no longer needed after the calculation is done.
-
-    :param filepath: Directory containing the files.
-    :param args: One or more file names (relative to ``filepath``) to delete.
-    :return: None.
-    :raises TypeError: If any of the given names is not a string.
-    """
-    for name in args:
-        if not isinstance(name, str):
-            raise TypeError(f"Expected string, got {type(name)}.")
-        full_path = os.path.join(filepath, name)
-        if os.path.isfile(full_path):
-            try:
-                os.remove(full_path)
-            except OSError:
-                config.logger.info(f"Error deleting file: {name}.")
-
-
 def delete_rank_files() -> None:
     """
     Deletes the per-rank intermediates of every rank (the ``*_rank_<r>.npy`` files) from the run's Eliashberg folder.
     A failed rank calls it before it aborts the job, while the other ranks may still be writing such files: it first
-    places :data:`~dgamore.nonlocal_sde.ABORT_MARKER` in the folder, after which
+    places :data:`~dgamore.output_files.ABORT_MARKER` in the folder, after which
     :func:`~dgamore.nonlocal_sde.save_rank_file` adds no rank file, then deletes every rank file present. The folder
     and its other files stay. A missing folder is left as it is. Every OS error is suppressed, so the abort is reached.
 
@@ -111,7 +86,7 @@ def delete_rank_files() -> None:
     if not os.path.isdir(path):
         return
     with suppress(OSError):
-        open(os.path.join(path, nonlocal_sde.ABORT_MARKER), "a").close()
+        open(os.path.join(path, output_files.ABORT_MARKER), "a").close()
     for name in glob.glob(os.path.join(path, "*_rank_*.npy")):
         with suppress(OSError):
             os.remove(name)
@@ -136,7 +111,7 @@ def start_rank_file_watchdog() -> subprocess.Popen:
             _WATCHDOG_SCRIPT,
             "sh",
             config.output.eliashberg_path,
-            nonlocal_sde.ABORT_MARKER,
+            output_files.ABORT_MARKER,
             str(WATCHDOG_SECOND_PASS_SECONDS),
         ],
         stdin=subprocess.PIPE,
@@ -170,643 +145,6 @@ def _compute_once_per_node(node_comm: MPI.Comm | None, compute_fn):
         return compute_fn()
     result = compute_fn() if node_comm.Get_rank() == 0 else None
     return node_comm.bcast(result, root=0)
-
-
-# --- Frequency transform helpers (PH -> PP w0) ---
-def _pp_w0_band(niv_pp: int, niw_stored: int) -> tuple[np.ndarray, np.ndarray]:
-    r"""
-    Index map of the :math:`\omega' = 0` particle-particle band, shared by every consumer of the ph-to-pp map so that
-    the map exists in exactly one place. For a pp entry :math:`(\nu, \nu')` the ph object is read at the bosonic
-    frequency :math:`\omega = \nu - \nu'`, so each :math:`\omega` contributes one anti-diagonal of the
-    :math:`(\nu, \nu')` plane and only :math:`|\omega| \leq 2 n_{\nu}^{\mathrm{pp}} - 1` is ever read.
-
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :param niw_stored: Number of positive bosonic frequencies available in the ph object.
-    :return: ``(wn, omega)``: the bosonic indices of the readable window, and the matrix
-        :math:`\omega = \nu - \nu'` whose entries select one anti-diagonal per bosonic frequency.
-    """
-    vn = MFHelper.vn(niv_pp)
-    return MFHelper.wn(min(niw_stored, 2 * niv_pp - 1)), vn[:, None] - vn[None, :]
-
-
-def _transform_vertex_frequencies_w0(vertex: LocalFourPoint | FourPoint, niv_pp: int) -> np.ndarray:
-    r"""
-    Transforms a vertex from particle-hole to particle-particle notation at :math:`\omega' = 0`, following Motoharu
-    Kitatani's frequency convention: the fermionic frequency is flipped, the bosonic index is remapped via
-    :math:`\omega = \nu - \nu'` and the orbitals are permuted to :math:`1432`. In full index notation the output is
-
-    .. math:: \bar{F}^{\mathrm{pp};\nu\nu'}_{1234} = -F^{\mathrm{ph};\,\omega=\nu-\nu';\ \nu_1=\nu,\ \nu_2=-\nu'}_{1432}
-        = -F^{\mathrm{ph};(\nu-\nu')\nu(-\nu')}_{1432},
-
-    i.e. (minus) the crossed-slot form of the pairing vertex of Eq. (4.49) in my thesis: with the ph frequency
-    convention of Eq. (3.28a) the four legs of :math:`\bar{F}^{\mathrm{pp};\nu\nu'}_{1234}` carry the frequencies
-    :math:`(\nu, \nu', -\nu, -\nu')` on the orbitals :math:`(1, 4, 3, 2)`. The overall minus is the sign of the
-    power-iteration matrix :math:`M = -\Gamma\chi` of Eq. (4.42). Used by :func:`transform_vertex_loc_frequencies_w0`; the direct-slot counterpart (:math:`\omega_{\mathrm{ph}} = \nu +
-    \nu'`, no flip, orbitals :math:`1234`) is
-    :meth:`~dgamore.local_four_point.LocalFourPoint.change_frequency_notation_ph_to_pp_w0`.
-
-    :param vertex: The vertex to transform (:class:`LocalFourPoint` or :class:`FourPoint`) in ph notation.
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :return: The transformed vertex as a raw numpy array with two fermionic axes ``[..., 2*niv_pp, 2*niv_pp]``.
-    """
-    vertex = vertex.cut_niv(niv_pp)
-    # only the |w| <= 2*niv_pp - 1 anti-diagonals (omega = v - v') are read below, so the bosonic axis is trimmed to
-    # that window before to_full_niw_range doubles it (cut_niw's no-op guard misjudges half-range objects here)
-    w_axis = -3
-    niw_stored = vertex.current_shape[w_axis] // 2 if vertex.full_niw_range else vertex.current_shape[w_axis] - 1
-    wn, omega = _pp_w0_band(niv_pp, niw_stored)
-    niw_window = (len(wn) - 1) // 2
-    if niw_window < niw_stored:
-        slicer = [slice(None)] * vertex.mat.ndim
-        slicer[w_axis] = (
-            slice(niw_stored - niw_window, niw_stored + niw_window + 1)
-            if vertex.full_niw_range
-            else slice(0, niw_window + 1)
-        )
-        vertex.mat = vertex.mat[tuple(slicer)].copy()
-        vertex.update_original_shape()
-
-    vertex = vertex.to_full_niw_range().permute_orbitals("abcd->adcb", copy=False).flip_frequency_axis(-1, False)
-    f_q_r_pp_mat = np.zeros((*vertex.current_shape[:-3], 2 * niv_pp, 2 * niv_pp), dtype=vertex.mat.dtype)
-
-    for idx, w in enumerate(wn):
-        f_q_r_pp_mat[..., omega == w] = -vertex[..., idx, omega == w]
-    return f_q_r_pp_mat
-
-
-def transform_vertex_loc_frequencies_w0(f_r_loc: LocalFourPoint, niv_pp: int) -> LocalFourPoint:
-    r"""
-    Transforms a local vertex from particle-hole to the modified particle-particle notation at :math:`\omega' = 0`
-    (see :func:`_transform_vertex_frequencies_w0`).
-
-    :param f_r_loc: The local vertex :math:`F` in ph notation.
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :return: The transformed vertex as a :class:`LocalFourPoint` (channel UD, pp notation, no bosonic axis).
-    """
-    mat = _transform_vertex_frequencies_w0(f_r_loc, niv_pp)
-    return LocalFourPoint(mat, SpinChannel.UD, 0, 2, True, True, FrequencyNotation.PP)
-
-
-def _wn_chunk_size(one_wn_bytes: int, chunk_bytes: int) -> int:
-    """Number of bosonic frequencies assembled at once, bounded by the chunk byte budget (never below one)."""
-    return max(1, int(chunk_bytes // max(one_wn_bytes, 1)))
-
-
-def _build_ladder_vertex_chunk(
-    gamma_r: LocalFourPoint,
-    gchi0_q_inv: FourPoint,
-    vrg_q_r_left: FourPoint,
-    middle_q_r: FourPoint,
-    w_start: int,
-    w_stop: int,
-    niv_pp: int | None,
-    inactive_pairs: np.ndarray | None = None,
-) -> FourPoint:
-    r"""
-    Builds the full ladder vertex :math:`F^{\mathrm{q}}_{r}` for the momenta of the inputs and the bosonic window
-    ``[w_start, w_stop)`` from the ladder of :math:`\Gamma_{r}` alone: its amputated susceptibility plus the separable
-    part :math:`(\gamma^{\Gamma}_{r} Y_{r}) \tilde\gamma^{\Gamma}_{r}` with the matrix :math:`Y_{r}` between the
-    three-leg vertices (see :func:`~dgamore.nonlocal_sde.create_ladder_vertex_middle`). This is the vertex of the
-    auxiliary ladder (shift :math:`U_{r}`), written so that no inversion meets the zero eigenvalues the auxiliary
-    Bethe-Salpeter matrix can have where the physical susceptibility is regular. The right-sided three-leg vertex
-    :math:`\tilde\gamma^{\Gamma;\mathrm{q}\nu'}_{r;1234} = \beta \sum_{ab}\sum_{\nu}
-    \chi^{\Gamma;\mathrm{q}\nu\nu'}_{r;12ab} (\chi^{\mathrm{q}\nu'}_{0;ba34})^{-1}` sums the ladder susceptibility
-    over its first frequency, which the build takes from the same inversion (exact also where the Bethe-Salpeter matrix
-    is not complex-symmetric). The Bethe-Salpeter matrix is built one compound slice at a time from the local vertex
-    and the inverse bubble, never as a whole window.
-
-    With ``niv_pp`` given, only what the :math:`\omega' = 0` pp band reads is built: the ladder susceptibility on the
-    anti-diagonal :math:`\nu + \nu' = \omega` of the pp box (see
-    :meth:`FourPoint.invert_with_local_kernel_on_anti_diagonal`, with the inverse bubble as the frequency-diagonal
-    part, the kernel :math:`\Gamma_{r}`, a zero shift and the scale :math:`1/\beta^2`), and the whole chain on the pp
-    box, so the result is exact on that anti-diagonal only. With ``niv_pp`` None the whole core box is inverted (see
-    :meth:`FourPoint.invert_with_local_kernel`) and every entry is exact (the streamed full vertex).
-
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel, from :math:`\omega = 0` on
-        (half bosonic range) or on the full range.
-    :param gchi0_q_inv: The inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` of the momenta.
-    :param vrg_q_r_left: The three-leg vertex :math:`\gamma^{\Gamma;\mathrm{q}\nu}_{r}` of the ladder of
-        :math:`\Gamma_{r}` of the momenta.
-    :param middle_q_r: The matrix :math:`Y^{\mathrm{q}}_{r}` between the three-leg vertices of the momenta.
-    :param w_start: First bosonic index of the window.
-    :param w_stop: One past the last bosonic index of the window.
-    :param niv_pp: Number of positive fermionic frequencies of the pp box, or None for the whole core box.
-    :param inactive_pairs: Orbital pairs without vertex (see :meth:`LocalFourPoint.orbital_pairs_without_vertex`).
-    :return: The ladder vertex over that window as a :class:`FourPoint` (half niw range, two fermionic dimensions).
-    """
-    beta = config.sys.beta
-    zero = LocalInteraction(np.zeros((gamma_r.n_bands,) * 4), gamma_r.channel)
-    gchi0_w = gchi0_q_inv.take_wn_slice(w_start, w_stop)
-    vrg_left_w = vrg_q_r_left.take_wn_slice(w_start, w_stop)
-    if niv_pp is None:
-        chi_ladder = gchi0_w.invert_with_local_kernel(gamma_r, zero, 1.0 / beta**2, w_start)
-        chi_ladder_first_sum = chi_ladder.sum_over_vn(beta, axis=(-2,))
-    else:
-        chi_ladder, chi_ladder_first_sum = gchi0_w.invert_with_local_kernel_on_anti_diagonal(
-            gamma_r, zero, 1.0 / beta**2, beta, niv_pp, w_start, inactive_pairs
-        )
-        gchi0_w = gchi0_w.cut_niv(niv_pp)
-        vrg_left_w = vrg_left_w.cut_niv(niv_pp)
-
-    # chi is released right after the first matmul and its product by rebinding; the bubble term enters in place
-    f_chunk = gchi0_w @ chi_ladder
-    del chi_ladder
-    f_chunk = f_chunk @ gchi0_w
-    f_chunk = f_chunk.scale(-(beta**2)).add_on_vn_diagonal(gchi0_w, factor=beta**2)
-
-    vrg_right_w = (chi_ladder_first_sum @ gchi0_w).scale(beta)
-    return f_chunk.add((vrg_left_w @ middle_q_r.take_wn_slice(w_start, w_stop)) * vrg_right_w, copy=False)
-
-
-def _build_rpa_vertex_chunk(chi_q_r: FourPoint, u_r: Interaction, w_start: int, w_stop: int, niv: int) -> FourPoint:
-    r"""
-    Builds the full vertex of the RPA ladder, :math:`F^{\mathrm{q}}_{r;1234} = \mathcal{U}^{\mathbf{q}}_{r;1234} -
-    \sum_{abcd} \mathcal{U}^{\mathbf{q}}_{r;12ab}\,\chi^{\mathrm{q}}_{r;bacd}\,\mathcal{U}^{\mathbf{q}}_{r;dc34}`, for
-    the momenta of the inputs and the bosonic window ``[w_start, w_stop)``: the vertex of
-    :func:`_build_ladder_vertex_chunk` for :math:`\Gamma_{r} = U_{r}`, where the auxiliary susceptibility is the
-    bubble, the bubble term vanishes and both three-leg vertices are one. It does not depend on the fermionic
-    frequencies and is held constant on the box of ``niv`` positive frequencies.
-
-    :param chi_q_r: The physical susceptibility :math:`\chi^{\mathrm{q}}_{r}` of the momenta.
-    :param u_r: The channel-projected total interaction :math:`\mathcal{U}^{\mathbf{q}}_{r}`.
-    :param w_start: First bosonic index of the window.
-    :param w_stop: One past the last bosonic index of the window.
-    :param niv: Number of positive fermionic frequencies of the box.
-    :return: The vertex over that window as a :class:`FourPoint` (half niw range, two fermionic dimensions).
-    """
-    chi_w = chi_q_r.take_wn_slice(w_start, w_stop)
-    return (u_r @ chi_w @ u_r).scale(-1.0).add(u_r, copy=False).repeat_over_vn(niv, 2)
-
-
-def _write_pp_band(out: np.ndarray, f_chunk: FourPoint, niv_pp: int, omega: np.ndarray, w_start: int) -> None:
-    r"""
-    Writes the :math:`\omega' = 0` pp band of one ladder-vertex window into the pp accumulator of its momenta.
-
-    Each bosonic frequency contributes the anti-diagonal :math:`\omega = \nu - \nu'` (see :func:`_pp_w0_band`), and
-    the negative bosonic half is obtained from the positive one at the same momentum through the Hermiticity of the
-    vertex, :math:`F^{(\mathbf{q},-\omega)\nu\nu'}_{1234} = (F^{(\mathbf{q},\omega)(-\nu')(-\nu)}_{4321})^*` (a plain
-    conjugation would need :math:`-\mathbf{q}`). The orbital permutation, the fermionic flip and the overall minus
-    are the ones of :func:`_transform_vertex_frequencies_w0`.
-
-    :param out: The pp accumulator of this momentum group, shape ``[nq_group, no, no, no, no, 2 niv_pp, 2 niv_pp]``.
-    :param f_chunk: The ladder vertex over a bosonic window, in ph notation and half niw range.
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :param omega: The :math:`\nu - \nu'` matrix returned by :func:`_pp_w0_band`.
-    :param w_start: Bosonic index the window starts at.
-    :return: None.
-    """
-    # cut to the pp box first so the negative-half copy is pp-sized, not core-sized (the cut is centered, so the
-    # fermionic flips inside to_negative_niw_range commute with it); positive then mutates the cut copy in place
-    cut = f_chunk.cut_niv(niv_pp)
-    # Hermitian partner F^{-w}_{1234}(v, v') = conj(F^{w}_{4321}(-v', -v)), then the 1432 slot map: orbitals 2341
-    negative = (
-        cut.to_negative_niw_range()
-        .swap_fermionic_frequency_axes(copy=False)
-        .permute_orbitals("bcda->abcd", copy=False)
-        .flip_frequency_axis(-1, False)
-    )
-    positive = cut.permute_orbitals("abcd->adcb", copy=False).flip_frequency_axis(-1, False)
-
-    for index in range(positive.current_shape[-3]):
-        w = w_start + index
-        out[..., omega == w] = -positive.mat[..., index, omega == w]
-        if w > 0:  # w = 0 is shared by both halves and belongs to the positive one
-            out[..., omega == -w] = -negative.mat[..., index, omega == -w]
-
-
-def _build_pairing_vertex_pp(
-    u_loc: LocalInteraction,
-    v_nonloc: Interaction,
-    gamma_r: LocalFourPoint | None,
-    niv_pp: int,
-    mpi_dist_irrk: MpiDistributor,
-    chunk_writer=None,
-    chunk_bytes: int | None = None,
-    channel: SpinChannel | None = None,
-    gchi0_q_inv: FourPoint | None = None,
-) -> FourPoint:
-    r"""
-    Shared loop of the slice-direct pairing-vertex construction: walks the rank-local momenta and, per momentum, the
-    bosonic axis in byte-bounded chunks, building each ladder-vertex chunk once and reading its :math:`\omega' = 0`
-    pp band (see :func:`_pp_w0_band`). When ``chunk_writer`` is given, every ph-notation chunk is handed to it before
-    being released, so a caller can stream the full vertex to disk in the same pass. The ladder chunks read the inverse
-    bubble, the saved three-leg vertex and vertex middle of the ladder of :math:`\Gamma_{r}` (see
-    :func:`_build_ladder_vertex_chunk`). Without a local vertex the chunks are the RPA vertex of the saved physical
-    susceptibility (see :func:`_build_rpa_vertex_chunk`), the only intermediate read then.
-
-    :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel, or ``None`` for the RPA vertex.
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :param chunk_writer: Optional callable ``(q_start, w_start, chunk_mat)`` receiving each ph-notation chunk (the
-        momenta of the group as the leading axis).
-    :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
-    :param channel: Spin channel of the RPA vertex, i.e. density or magnetic; only read when ``gamma_r`` is ``None``.
-    :param gchi0_q_inv: The inverse bare bubble of this rank's momenta on the core box (see
-        :func:`inverse_core_bubble`), read and kept; ``None`` loads the saved ``gchi0_q_inv_rank_<r>.npy`` and frees it.
-    :return: The pairing vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
-    """
-    logger = config.logger
-    channel = channel if gamma_r is None else gamma_r.channel
-    path, rank = config.output.eliashberg_path, mpi_dist_irrk.my_rank
-
-    loaded_bubble = gamma_r is not None and gchi0_q_inv is None
-    if loaded_bubble:
-        gchi0_q_inv = FourPoint.load(os.path.join(path, f"gchi0_q_inv_rank_{rank}.npy"), num_vn_dimensions=1)
-    if gamma_r is not None:
-        vrg_q_r_left = FourPoint.load(
-            os.path.join(path, f"vrg_q_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=1
-        )
-    bosonic_name = "vrg_middle_q" if gamma_r is not None else "chi_phys_q"
-    bosonic_q_r = FourPoint.load(
-        os.path.join(path, f"{bosonic_name}_{channel.value}_rank_{rank}.npy"), channel=channel, num_vn_dimensions=0
-    )
-    logger.info(f"Loaded the intermediates for the {channel.value} pairing vertex.")
-
-    my_irr_q_list = config.lattice.k_grid.get_irrq_list()[mpi_dist_irrk.my_slice]
-    niw_stored = bosonic_q_r.current_shape[-1] - 1
-    _, omega = _pp_w0_band(niv_pp, niw_stored)
-    # the pp band only reads |w| <= 2 niv_pp - 1, but a streamed full vertex must cover the whole stored box
-    niw_build = niw_stored if chunk_writer is not None else int(np.max(omega))
-
-    n_bands = config.sys.n_bands
-    # orbital pairs without vertex are eliminated from every slice, as in the kernel step's auxiliary susceptibility
-    inactive = None if gamma_r is None else gamma_r.orbital_pairs_without_vertex(u_loc.as_channel(channel))
-    f_pp_mat = np.zeros((len(my_irr_q_list),) + (n_bands,) * 4 + (2 * niv_pp,) * 2, dtype=bosonic_q_r.mat.dtype)
-
-    # the budget bounds a chunk's two-fermion window on the box its chain runs on (pp box for the band, core box for a
-    # streamed full vertex): as many whole momenta as fit, else one momentum's bosonic axis is chunked
-    budget = SLICE_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
-    niv_window = config.box.niv_core if chunk_writer is not None else niv_pp
-    one_wn_bytes = n_bands**4 * (2 * niv_window) ** 2 * np.dtype(DTYPE).itemsize
-    w_chunk = _wn_chunk_size(one_wn_bytes, budget)
-    q_group = max(1, int(budget // max(one_wn_bytes * (niw_build + 1), 1)))
-
-    with deferred_collection():
-        for q_start in range(0, len(my_irr_q_list), q_group):
-            q_stop = min(q_start + q_group, len(my_irr_q_list))
-            if gamma_r is not None:
-                gchi0_grp = gchi0_q_inv.take_q_index_slice(q_start, q_stop)
-                vrg_left_grp = vrg_q_r_left.take_q_index_slice(q_start, q_stop)
-            else:
-                u_r = u_loc.as_channel(channel) + v_nonloc.take_q_index_slice(q_start, q_stop).as_channel(channel)
-            bosonic_grp = bosonic_q_r.take_q_index_slice(q_start, q_stop)
-
-            for w_start in range(0, niw_build + 1, w_chunk):
-                w_stop = min(w_start + w_chunk, niw_build + 1)
-                if gamma_r is None:
-                    f_chunk = _build_rpa_vertex_chunk(bosonic_grp, u_r, w_start, w_stop, niv_window)
-                else:
-                    f_chunk = _build_ladder_vertex_chunk(
-                        gamma_r,
-                        gchi0_grp,
-                        vrg_left_grp,
-                        bosonic_grp,
-                        w_start,
-                        w_stop,
-                        None if chunk_writer is not None else niv_pp,
-                        inactive,
-                    )
-                if chunk_writer is not None:
-                    chunk_writer(q_start, w_start, f_chunk.mat)
-                _write_pp_band(f_pp_mat[q_start:q_stop], f_chunk, niv_pp, omega, w_start)
-                f_chunk.free()
-
-            if gamma_r is not None:
-                gchi0_grp.free()
-                vrg_left_grp.free()
-            bosonic_grp.free()
-
-    if loaded_bubble:
-        gchi0_q_inv.free()
-    if gamma_r is not None:
-        vrg_q_r_left.free()
-    bosonic_q_r.free()
-
-    delete_files(
-        path,
-        f"vrg_q_{channel.value}_rank_{rank}.npy",
-        f"vrg_middle_q_{channel.value}_rank_{rank}.npy",
-        f"chi_phys_q_{channel.value}_rank_{rank}.npy",
-    )
-
-    return FourPoint(f_pp_mat, channel, config.lattice.k_grid.nk, 0, 2, False, True, True, FrequencyNotation.PP)
-
-
-def create_pairing_vertex_slice_q_r(
-    u_loc: LocalInteraction,
-    v_nonloc: Interaction,
-    gamma_r: LocalFourPoint | None,
-    niv_pp: int,
-    mpi_dist_irrk: MpiDistributor,
-    chunk_bytes: int | None = None,
-    channel: SpinChannel | None = None,
-    gchi0_q_inv: FourPoint | None = None,
-) -> FourPoint:
-    r"""
-    Builds the pp pairing vertex at :math:`\omega' = 0` directly, without ever materializing the full
-    three-frequency ladder vertex :math:`F^{\mathrm{q}\nu\nu'}_{r}` (see :func:`_build_pairing_vertex_pp`). The
-    result is identical to the full-inversion construction up to floating-point accuracy, at a transient of one
-    byte-bounded bosonic chunk instead of the whole rank-local box.
-
-    :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel, or ``None`` for the RPA vertex.
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
-    :param channel: Spin channel of the RPA vertex, i.e. density or magnetic; only read when ``gamma_r`` is ``None``.
-    :param gchi0_q_inv: The inverse core bubble of this rank's momenta, or ``None`` to load the saved one (see
-        :func:`_build_pairing_vertex_pp`).
-    :return: The pairing vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
-    """
-    return _build_pairing_vertex_pp(
-        u_loc,
-        v_nonloc,
-        gamma_r,
-        niv_pp,
-        mpi_dist_irrk,
-        chunk_bytes=chunk_bytes,
-        channel=channel,
-        gchi0_q_inv=gchi0_q_inv,
-    )
-
-
-def create_pairing_vertex_streaming_fq(
-    u_loc: LocalInteraction,
-    v_nonloc: Interaction,
-    gamma_r: LocalFourPoint | None,
-    niv_pp: int,
-    mpi_dist_irrk: MpiDistributor,
-    chunk_bytes: int | None = None,
-    channel: SpinChannel | None = None,
-    gchi0_q_inv: FourPoint | None = None,
-) -> FourPoint:
-    r"""
-    Builds the pp pairing vertex like :func:`create_pairing_vertex_slice_q_r` while streaming the full ladder vertex
-    in ph notation to ``f_irrq_<channel>.npy`` chunk by chunk, replacing the rank-0 gather of the whole
-    irreducible-BZ vertex. Rank 0 creates the memory-mapped file with the layout of the gathered save (half bosonic
-    range, global irreducible q-ordering); every rank then writes only its own disjoint ``(q, omega)`` slabs.
-
-    :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :param gamma_r: The local irreducible vertex :math:`\Gamma_{r}` for this channel, or ``None`` for the RPA vertex.
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :param mpi_dist_irrk: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
-    :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
-    :param channel: Spin channel of the RPA vertex, i.e. density or magnetic; only read when ``gamma_r`` is ``None``.
-    :param gchi0_q_inv: The inverse core bubble of this rank's momenta, or ``None`` to load the saved one (see
-        :func:`_build_pairing_vertex_pp`).
-    :return: The pairing vertex :math:`F^{\mathrm{q}}_{r}` in pp notation as a :class:`FourPoint`.
-    """
-    channel = channel if gamma_r is None else gamma_r.channel
-    n_bands = config.sys.n_bands
-    nk_irr = config.lattice.k_grid.nk_irr
-    file_path = os.path.join(config.output.output_path, f"f_irrq_{channel.value}.npy")
-    # plain ints: numpy scalars in the shape end up as np.int64(...) in the npy header, which cannot be re-read
-    shape = tuple(
-        int(n) for n in (nk_irr,) + (n_bands,) * 4 + (config.box.niw_core + 1,) + (2 * config.box.niv_core,) * 2
-    )
-
-    if mpi_dist_irrk.comm.rank == 0:
-        np.lib.format.open_memmap(file_path, mode="w+", dtype=DTYPE, shape=shape)
-    mpi_dist_irrk.barrier()
-    file_mat = np.lib.format.open_memmap(file_path, mode="r+")
-
-    q_offset = mpi_dist_irrk.my_slice.indices(nk_irr)[0]
-
-    def chunk_writer(q_start: int, w_start: int, chunk_mat: np.ndarray) -> None:
-        w_stop = w_start + chunk_mat.shape[-3]
-        file_mat[q_offset + q_start : q_offset + q_start + chunk_mat.shape[0], ..., w_start:w_stop, :, :] = chunk_mat
-
-    f_pp = _build_pairing_vertex_pp(
-        u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist_irrk, chunk_writer, chunk_bytes, channel, gchi0_q_inv
-    )
-    file_mat.flush()
-    del file_mat
-    mpi_dist_irrk.barrier()
-    config.logger.info(f"Streamed full ladder-vertex ({channel.value}) in the irreducible BZ to file.")
-    return f_pp
-
-
-# --- Local particle-particle reducible diagrams (w=0) ---
-def create_local_gamma_ud_pp_w0(
-    gchi_ud_pp_w0: LocalFourPoint, gchi0_pp_w0: LocalFourPoint, beta: float
-) -> LocalFourPoint:
-    r"""
-    Returns the local pp-irreducible up-down vertex at :math:`\omega = 0` from the crossing-decoupled pp
-    Bethe-Salpeter equation,
-
-    .. math:: \Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234} = \beta^2 \left[\chi^{\mathrm{pp}}_0 J - \chi^{\mathrm{pp}}_0\,
-        (\chi^{\mathrm{pp}}_{\uparrow\downarrow})^{-1}\, \chi^{\mathrm{pp}}_0\right]^{-1;\,\nu\nu'}_{1234}.
-
-    All products and inverses live in compound pp index space, i.e. as matrices :math:`M_{(13\nu),(42\nu')} =
-    X^{\mathrm{pp};\nu\nu'}_{1234}` with the product and unit element
-
-    .. math:: (X Y)^{\mathrm{pp};\nu\nu'}_{1234} = \sum_{ab\nu_1} X^{\mathrm{pp};\nu\nu_1}_{1a3b}\, Y^{\mathrm{pp};\nu_1\nu'}_{b2a4}, \qquad
-        \mathbb{1}^{\mathrm{pp};\nu\nu'}_{1234} = \delta_{14}\,\delta_{23}\,\delta_{\nu\nu'}.
-
-    The ingredients in full index notation are the diagonal bare pp bubble, built from the local DMFT Green's function
-    :math:`G^{\mathrm{DMFT}}_{12}(\nu)`, and its image under the crossing operator :math:`J` (:math:`\nu' \to -\nu'`
-    combined with the orbital permutation :math:`1234 \to 1432`, i.e. :math:`(XJ)^{\mathrm{pp};\nu\nu'}_{1234} =
-    X^{\mathrm{pp};\nu(-\nu')}_{1432}`),
-
-    .. math:: \chi^{\mathrm{pp};\nu\nu'}_{0;1234} = -\beta\, G^{\mathrm{DMFT}}_{14}(\nu)\, G^{\mathrm{DMFT}}_{32}(-\nu)\,
-        \delta_{\nu\nu'}, \qquad (\chi^{\mathrm{pp}}_0 J)^{\nu\nu'}_{1234} = -\beta\, G^{\mathrm{DMFT}}_{12}(\nu)\,
-        G^{\mathrm{DMFT}}_{34}(-\nu)\, \delta_{\nu,-\nu'}.
-
-    The returned :math:`\Gamma^{\mathrm{pp}}_{\uparrow\downarrow}` is equivalent to solving the crossing-decoupled pp
-    BSE
-
-    .. math:: F^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234} = \Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}
-        - \frac{1}{\beta} \sum_{\nu_1} \sum_{abcd} \Gamma^{\mathrm{pp};\nu\nu_1}_{\uparrow\downarrow;1a3b}\,
-        G^{\mathrm{DMFT}}_{bc}(\nu_1)\, G^{\mathrm{DMFT}}_{ad}(-\nu_1)\,
-        F^{\mathrm{pp};(-\nu_1)\nu'}_{\uparrow\downarrow;d2c4}
-
-    for the full vertex :math:`F^{\mathrm{pp}}_{\uparrow\downarrow}` defined by amputating the DMFT legs of the
-    susceptibility,
-
-    .. math:: \chi^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234} = -\sum_{abcd} F^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;abcd}\,
-        G^{\mathrm{DMFT}}_{1a}(\nu)\, G^{\mathrm{DMFT}}_{b2}(-\nu')\, G^{\mathrm{DMFT}}_{3c}(-\nu)\,
-        G^{\mathrm{DMFT}}_{d4}(\nu').
-
-    Note that :math:`\chi^{\mathrm{pp}}_{\uparrow\downarrow}` must be the CONNECTED susceptibility: the disconnected
-    straight term :math:`\delta_{\omega_{\mathrm{ph}} 0}\, \beta\, G^{\mathrm{DMFT}}_{12}(\nu)\,
-    G^{\mathrm{DMFT}}_{34}(\nu')` would land exactly on the pp anti-diagonal :math:`\nu' = -\nu` and corrupt the
-    :math:`\chi^{\mathrm{pp}}_0 J` rung. The loader guarantees this: :func:`~dgamore.local_sde.create_generalized_chi`
-    subtracts that term in the density channel, and the :math:`\frac{1}{2}(\chi^{\mathrm{ph}}_{d} -
-    \chi^{\mathrm{ph}}_{m})` combination cancels both it and the vertical bubble exactly.
-
-    In the pair basis that keeps the up and down lines apart, i.e. for the matrices
-    :math:`S[X]_{(13\nu),(24\nu')} = X^{\mathrm{pp};\nu(-\nu')}_{1234}` with the ordinary matrix product and inverse,
-    the expression is the up-down pp Bethe-Salpeter equation in the form of the ph one,
-
-    .. math:: S[\Gamma^{\mathrm{pp}}_{\uparrow\downarrow}] = \beta^2 \left( S[\chi^{\mathrm{pp}}_{\uparrow\downarrow}
-        - \chi^{\mathrm{pp}}_0 J]^{-1} - S[-\chi^{\mathrm{pp}}_0 J]^{-1} \right),
-
-    where :math:`-\chi^{\mathrm{pp}}_0 J` is the disconnected straight term of the up-down susceptibility in pp
-    notation. Only :math:`J \chi^{\mathrm{pp}}_0 J = \chi^{\mathrm{pp}}_0` enters, which holds for any Green's
-    function: neither :math:`G^{\mathrm{DMFT}}_{12}(\nu) = G^{\mathrm{DMFT}}_{21}(\nu)` nor crossing symmetry of
-    :math:`\chi^{\mathrm{pp}}_{\uparrow\downarrow}` is assumed. For a crossing-symmetric susceptibility :math:`J`
-    commutes with every pp object, so this is also the full-space form of inverting the decoupled singlet/triplet BSEs
-    (thesis Eqs. 3.51/3.52) on their :math:`J`-even/odd blocks. For a single band :math:`J` reduces to the plain
-    frequency flip and the expression is equivalent to Eq. (B.26) of Rohringer's thesis.
-
-    :param gchi_ud_pp_w0: The local connected up-down susceptibility
-        :math:`\chi^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}` in pp notation at :math:`\omega = 0`, see
-        :meth:`~dgamore.local_four_point.LocalFourPoint.change_frequency_notation_ph_to_pp_w0`.
-    :param gchi0_pp_w0: The local bare pp bubble :math:`\chi^{\mathrm{pp};\nu\nu'}_{0;1234}` (diagonal in
-        :math:`\nu\nu'`), built from the DMFT Green's function via
-        :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_pp_w0`.
-    :param beta: Inverse temperature :math:`\beta`.
-    :return: The vertex :math:`\Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}` as a :class:`LocalFourPoint` in
-        pp notation.
-    """
-    # chi0 * J in tensor form: the bubble with the second fermionic frequency flipped and the orbitals permuted
-    gchi0_j = gchi0_pp_w0.flip_frequency_axis(-1).permute_orbitals("abcd->adcb", copy=False).to_half_niw_range()
-    return (
-        (gchi0_j - gchi0_pp_w0 @ gchi_ud_pp_w0.invert() @ gchi0_pp_w0)
-        .invert()
-        .scale(beta**2)
-        .set_channel(SpinChannel.UD)
-    )
-
-
-def create_local_gamma_ud_pp_w0_per_ineq(
-    gchi_ud_pp_w0: LocalFourPoint, g_dmft: GreensFunction, beta: float
-) -> LocalFourPoint:
-    r"""
-    Builds the local pp-irreducible up-down vertex :math:`\Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}` per
-    inequivalent atom and assembles the per-atom blocks into the full multi-band object (mirroring the local
-    Schwinger-Dyson assembly). Local correlations do not connect orbitals of different atoms, so the assembled
-    multi-band susceptibility is nonzero only when all four orbital indices belong to the same atom; the compound pp
-    matrix of the FULL object is therefore singular for more than one atom and must never be inverted directly. Instead,
-    :func:`create_local_gamma_ud_pp_w0` is evaluated on each atom's orbital block (with the bare pp bubble built from
-    that atom's block of :math:`G^{\mathrm{DMFT}}_{12}(\nu)`), computing every inequivalent atom only once and writing
-    the result into all of its positions in the compound band layout.
-
-    :param gchi_ud_pp_w0: The full multi-band connected up-down susceptibility
-        :math:`\chi^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}` in pp notation at :math:`\omega = 0`
-        (block-structured per inequivalent atom).
-    :param g_dmft: The full multi-band local DMFT :class:`GreensFunction` :math:`G^{\mathrm{DMFT}}_{12}(\nu)`.
-    :param beta: Inverse temperature :math:`\beta`.
-    :return: The assembled vertex :math:`\Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}` as a
-        :class:`LocalFourPoint` in pp notation (nonzero only on the same-atom orbital blocks).
-    """
-    n_bands = gchi_ud_pp_w0.n_bands
-    if config.dmft.n_bands_per_ineq and config.dmft.ineq_ordering:
-        layout = []
-        n_start = 0
-        for ineq in config.dmft.ineq_ordering:
-            n_end = n_start + config.dmft.n_bands_per_ineq[ineq - 1]
-            layout.append((ineq, slice(n_start, n_end)))
-            n_start = n_end
-    else:
-        layout = [(1, slice(0, n_bands))]
-
-    gamma_full = gchi_ud_pp_w0._clone_without_mat()
-    gamma_full.mat = np.zeros(gchi_ud_pp_w0.current_shape, dtype=gchi_ud_pp_w0.mat.dtype)
-    gamma_full.update_original_shape()
-
-    gamma_per_ineq: dict[int, LocalFourPoint] = {}
-    for ineq, sl in layout:
-        if ineq not in gamma_per_ineq:
-            gchi_block = LocalFourPoint(
-                gchi_ud_pp_w0.mat[sl, sl, sl, sl].copy(),
-                SpinChannel.UD,
-                1,
-                2,
-                gchi_ud_pp_w0.full_niw_range,
-                gchi_ud_pp_w0.full_niv_range,
-                FrequencyNotation.PP,
-            )
-            g_mat_block = g_dmft.mat[..., sl, sl, :]
-            g_block = GreensFunction(g_mat_block.reshape((1, 1, 1) + g_mat_block.shape[-3:]).copy())
-            gchi0_block = BubbleGenerator.create_generalized_chi0_pp_w0(
-                g_block, gchi_block.niv, beta
-            ).extend_vn_to_diagonal()
-            gamma_per_ineq[ineq] = create_local_gamma_ud_pp_w0(gchi_block, gchi0_block, beta)
-        gamma_full.mat[sl, sl, sl, sl] = gamma_per_ineq[ineq].mat
-
-    return gamma_full.set_channel(SpinChannel.UD)
-
-
-def create_local_ud_diagrams_pp_w0(
-    g_dmft: GreensFunction, niv_pp: int
-) -> tuple[LocalFourPoint, LocalFourPoint, LocalFourPoint]:
-    r"""
-    Builds the local particle-particle reducible diagrams at :math:`\omega = 0` in the up-down channel: the full vertex
-    :math:`F^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}`, the pp-irreducible vertex
-    :math:`\Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}` (built per inequivalent atom and assembled into the
-    full multi-band object, see :func:`create_local_gamma_ud_pp_w0_per_ineq`), and the reducible part
-
-    .. math:: \Phi^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234} = F^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234}
-        - \Gamma^{\mathrm{pp};\nu\nu'}_{\uparrow\downarrow;1234},
-
-    with :math:`\chi^{\mathrm{pp}}_{\uparrow\downarrow} = \frac{1}{2}(\chi^{\mathrm{ph}}_{d} - \chi^{\mathrm{ph}}_{m})`
-    mapped to pp notation at :math:`\omega_{\mathrm{pp}} = 0` via
-    :meth:`~dgamore.local_four_point.LocalFourPoint.change_frequency_notation_ph_to_pp_w0` (ph legs evaluated at
-    :math:`\omega_{\mathrm{ph}} = \nu + \nu'`) and the bare pp bubble built from the local DMFT Green's function
-    :math:`G^{\mathrm{DMFT}}_{12}(\nu)` via :meth:`~dgamore.bubble_gen.BubbleGenerator.create_generalized_chi0_pp_w0`.
-    The pairing vertex subtracts :math:`\Phi` from its ladder part, which makes it pp-irreducible, together with the
-    local full vertex of :func:`create_local_f_ud_transformed_w0`, which both ladders contain (thesis Eqs. 4.49-4.52).
-
-    :param g_dmft: The local DMFT :class:`GreensFunction` :math:`G^{\mathrm{DMFT}}_{12}(\nu)`.
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex; the local diagrams are cut to this
-        box so they always match the ladder pairing vertex, also when ``niw_core > niv_core``.
-    :return: The tuple ``(f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0)`` of local pp diagrams at
-        :math:`\omega = 0`.
-    """
-    gchi_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"gchi_dens_loc.npy"), SpinChannel.DENS)
-    gchi_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"gchi_magn_loc.npy"), SpinChannel.MAGN)
-    gchi_ud_loc = (gchi_dens_loc - gchi_magn_loc).set_channel(SpinChannel.UD).scale(0.5)
-    # the fermionic cut commutes with the w0 pp map (it samples only the retained window), so cutting first shrinks
-    # the transform transient from the full box to the pp box
-    gchi_ud_loc_pp_w0 = gchi_ud_loc.cut_niv(niv_pp).change_frequency_notation_ph_to_pp_w0()
-    del gchi_dens_loc, gchi_magn_loc, gchi_ud_loc
-
-    gamma_ud_loc_pp_w0 = create_local_gamma_ud_pp_w0_per_ineq(gchi_ud_loc_pp_w0, g_dmft, config.sys.beta)
-    del gchi_ud_loc_pp_w0
-
-    gamma_ud_loc_pp_w0.save(output_dir=config.output.eliashberg_path, name="gamma_ud_loc_pp_w0")
-
-    f_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_dens_loc.npy"), SpinChannel.DENS)
-    f_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_magn_loc.npy"), SpinChannel.MAGN)
-    f_ud_loc = (f_dens_loc - f_magn_loc).set_channel(SpinChannel.UD).scale(0.5)
-    f_ud_loc_pp_w0 = f_ud_loc.cut_niv(niv_pp).change_frequency_notation_ph_to_pp_w0()
-
-    del f_dens_loc, f_magn_loc, f_ud_loc
-
-    phi_ud_loc_pp_w0 = f_ud_loc_pp_w0 - gamma_ud_loc_pp_w0
-    phi_ud_loc_pp_w0 = phi_ud_loc_pp_w0.take_first_wn()
-    f_ud_loc_pp_w0 = f_ud_loc_pp_w0.take_first_wn()
-
-    return f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0
-
-
-def create_local_f_ud_transformed_w0(niv_pp: int) -> LocalFourPoint:
-    r"""
-    Loads the local full vertex of both particle-hole channels from file and returns the up-down combination
-
-    .. math:: F^{\omega\nu\nu'}_{\uparrow\downarrow;1234} = \frac{1}{2}\left(F^{\omega\nu\nu'}_{d;1234}
-        - F^{\omega\nu\nu'}_{m;1234}\right)
-
-    in the modified particle-particle notation at :math:`\omega' = 0` (see
-    :func:`transform_vertex_loc_frequencies_w0`). This is the local full vertex subtracted from each ladder slot of
-    the pairing vertex (thesis Eqs. 4.49-4.52); it carries a different frequency notation than the other local pp
-    diagrams of :func:`create_local_ud_diagrams_pp_w0`. The loaded vertices carry both fermionic indices on the core
-    box (only the double-counting kernel needs the summed index on the full asymptotic box, and it reads its own
-    file for that), yet they remain among the largest objects of this step, so the caller reduces them once per node.
-
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :return: The transformed vertex as a :class:`LocalFourPoint` (channel UD, pp notation, no bosonic axis).
-    """
-    f_dens_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_dens_loc.npy"), SpinChannel.DENS)
-    f_magn_loc = LocalFourPoint.load(os.path.join(config.output.output_path, f"f_magn_loc.npy"), SpinChannel.MAGN)
-    f_ud_loc = (f_dens_loc - f_magn_loc).set_channel(SpinChannel.UD).scale(0.5)
-    del f_dens_loc, f_magn_loc
-    return transform_vertex_loc_frequencies_w0(f_ud_loc, niv_pp)
 
 
 # --- Gap initialization ---
@@ -1492,196 +830,6 @@ def gap_parity_diagnostics(gap: np.ndarray, gap_shape: tuple, u: np.ndarray | No
     return {name: complex(np.vdot(g, op) / denom) for name, op in ops.items()}
 
 
-def _classify_momentum_block(block: np.ndarray, purity: float) -> str:
-    r"""
-    Classifies the wave symmetry of one orbital block's momentum profile, returning ``s``, ``d``, ``dxy`` (``dxz``,
-    ``dyz``), ``g``, ``p`` or ``x``.
-
-    The block is decomposed into symmetry sectors rather than compared element-wise: for an involution :math:`X`,
-    the fraction of the block's weight that is even under it is
-    :math:`\lVert \tfrac{1}{2}(b + Xb)\rVert^{2}/\lVert b\rVert^{2}`, and the odd fraction is its complement. A
-    sector counts as realized when its fraction reaches ``purity``. This tolerates the few percent of admixture
-    that a converged gap generally carries, where an element-wise ``allclose`` would reject it outright.
-
-    The involutions are the three coordinate inversions :math:`k_i \to -k_i` (in the ``np.roll(np.flip(...), 1)``
-    convention of the Gamma-at-index-0 grid) and the axis exchanges :math:`k_i \leftrightarrow k_j`, the latter only
-    for pairs of axes of equal length. All three exchanges are tested, not just :math:`k_x \leftrightarrow k_y`: on
-    a cubic lattice a :math:`d`-wave living in the :math:`xz` plane is antisymmetric under
-    :math:`k_x \leftrightarrow k_z` and carries no definite symmetry under :math:`k_x \leftrightarrow k_y` at all.
-
-    Only the momentum profile enters here; the orbital indices are fixed by the caller. This is a diagnostic label,
-    so unlike the mirrors of :func:`_mirror_operator` no orbital transformation accompanies the reflections.
-
-    :param block: The momentum profile ``[kx, ky, kz]`` of one orbital block.
-    :param purity: Minimum weight fraction for a symmetry sector to count as realized.
-    :return: ``s`` (even under every inversion, symmetric under every applicable exchange), ``d`` (even under every
-        inversion, antisymmetric under some exchange: the :math:`d_{x^2-y^2}` type), ``dxy`` (odd under
-        :math:`k_x \to -k_x` and :math:`k_y \to -k_y`, even under the third, symmetric under their exchange; ``dxz``,
-        ``dyz`` in the other planes), ``g`` (odd under two inversions, antisymmetric under their exchange), ``p`` (odd
-        under the full inversion) or ``x``.
-    """
-
-    def even_fraction(arr: np.ndarray, mirrored: np.ndarray) -> float:
-        norm = float(np.vdot(arr, arr).real)
-        return float(np.vdot(arr + mirrored, arr + mirrored).real) / (4.0 * norm) if norm > 0 else 0.0
-
-    def invert(arr: np.ndarray, axes: tuple) -> np.ndarray:
-        return np.roll(np.flip(arr, axis=axes), shift=(1,) * len(axes), axis=axes)
-
-    if float(np.vdot(block, block).real) <= 0:
-        return "x"
-
-    even_axis = [even_fraction(block, invert(block, (axis,))) for axis in range(3)]
-    if all(frac >= purity for frac in even_axis):
-        exchanges = [
-            (i, j) for i, j in ((0, 1), (0, 2), (1, 2)) if block.shape[i] == block.shape[j] and block.shape[i] > 1
-        ]
-        swapped = [np.swapaxes(block, i, j) for i, j in exchanges]
-        if any(even_fraction(block, -swap) >= purity for swap in swapped):  # antisymmetric under some exchange
-            return "d"
-        if all(even_fraction(block, swap) >= purity for swap in swapped):
-            return "s"
-        return "x"
-    odd_axes = [axis for axis in range(3) if 1.0 - even_axis[axis] >= purity]
-    if len(odd_axes) == 2 and even_axis[3 - sum(odd_axes)] >= purity:
-        i, j = odd_axes
-        if block.shape[i] == block.shape[j]:
-            swapped = np.swapaxes(block, i, j)
-            if even_fraction(block, swapped) >= purity:
-                return f"d{'xyz'[i]}{'xyz'[j]}"
-            if even_fraction(block, -swapped) >= purity:
-                return "g"
-        return "x"
-    if even_fraction(block, -invert(block, (0, 1, 2))) >= purity:  # odd under the full inversion
-        return "p"
-    return "x"
-
-
-def fermi_surface_bands(ek: np.ndarray, mu: float, orbitals: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-    r"""
-    Returns the band energies relative to the chemical potential and the band eigenvectors on the gap's orbitals,
-    :math:`\varepsilon_n(\mathbf{k}) - \mu` and :math:`\psi_{an}(\mathbf{k})`, the input of the Fermi-surface sign test
-    of :func:`classify_gap_symmetry`.
-
-    :param ek: Band dispersion :math:`\varepsilon(\mathbf{k})` on the whole grid, shape ``[kx, ky, kz, o1, o2]``.
-    :param mu: Chemical potential :math:`\mu`.
-    :param orbitals: Indices of the orbitals the gap lives on (the correlated ones); ``None`` for every orbital.
-    :return: ``(energies, vectors)`` of shapes ``[kx, ky, kz, n]`` and ``[kx, ky, kz, o, n]``.
-    """
-    energies, vectors = np.linalg.eigh(ek)
-    return energies - mu, (vectors if orbitals is None else vectors[..., orbitals, :])
-
-
-def _changes_sign_between_fermi_sheets(
-    gap_slice: np.ndarray, bands: tuple[np.ndarray, np.ndarray], consistency: float = 0.5, floor: float = 0.05
-) -> bool:
-    r"""
-    Whether a gap at one frequency has opposite signs on the Fermi sheets of two bands. The intraband gap
-    :math:`\Delta_n(\mathbf{k}) = \psi_n(\mathbf{k})^\dagger \Delta(\mathbf{k})^{T} \psi_n(\mathbf{k})` (the band gap of
-    the time-reversal gauge :math:`\psi(-\mathbf{k}) = \psi(\mathbf{k})^*` for the gap's first orbital at
-    :math:`-\mathbf{k}`, independent of the eigenvector phases) is read on the momenta next to a sign change of
-    :math:`\varepsilon_n - \mu` towards a grid neighbor, after the global phase that makes it most nearly real. A band
-    counts when its sheet carries at least ``floor`` of the largest sheet's weight and keeps at least ``consistency`` of
-    it in the signed sum (one sign on most of the sheet). Bands degenerate at a momentum to 1e-4 of the largest band
-    energy all carry the trace over them there as their band gap, independent of the basis the eigensolver picked
-    among them, so degenerate partners count with one sign, also where another band crosses them.
-
-    :param gap_slice: The gap at one frequency, shape ``[kx, ky, kz, o1, o2]``.
-    :param bands: The ``(energies, vectors)`` of :func:`fermi_surface_bands`.
-    :param consistency: Minimum ratio of the signed to the absolute sum on a sheet.
-    :param floor: Minimum weight of a sheet relative to the largest one.
-    :return: True when two counted Fermi surfaces carry opposite signs.
-    """
-    energies, vectors = bands
-    intra = np.einsum("xyzan,xyzba,xyzbn->xyzn", vectors.conj(), gap_slice, vectors)
-    sheet = np.zeros(energies.shape, dtype=bool)
-    for axis in range(3):
-        if energies.shape[axis] > 1:
-            crossing = energies * np.roll(energies, -1, axis=axis) < 0
-            sheet |= crossing | np.roll(crossing, 1, axis=axis)
-    if not sheet.any():
-        return False
-    # bands degenerate at a momentum all carry the trace over them there as their band gap
-    degenerate = np.abs(energies[..., :, None] - energies[..., None, :]) <= 1e-4 * np.abs(energies).max()
-    intra = np.einsum("xyznm,xyzm->xyzn", degenerate, intra)
-    signed = (intra * np.exp(-0.5j * np.angle(np.sum(intra[sheet] ** 2)))).real
-    sums = [
-        (signed[..., n][sheet[..., n]].sum(), np.abs(intra[..., n][sheet[..., n]]).sum())
-        for n in range(intra.shape[-1])
-    ]
-    largest = max(weight for _, weight in sums)
-    signs = [
-        np.sign(total) for total, weight in sums if weight > floor * largest and abs(total) >= consistency * weight
-    ]
-    return min(signs, default=0) < 0 < max(signs, default=0)
-
-
-def classify_gap_symmetry(
-    gap: np.ndarray,
-    purity: float = 0.9,
-    weight_floor: float = 0.01,
-    bands: tuple[np.ndarray, np.ndarray] | None = None,
-) -> str:
-    r"""
-    Classifies the momentum wave symmetry and Matsubara-frequency parity of a gap and returns a compact label of the
-    form ``<wave><parity>``. The wave is ``s``, ``s±``, ``d`` (:math:`d_{x^2-y^2}` type), ``dxy`` (``dxz``, ``dyz``),
-    ``g`` or ``p`` (``x`` if none of these match), and the parity sign is ``+`` (even in :math:`\nu`), ``-`` (odd) or
-    empty (neither). The momentum tests are reflections of the grid axes, so the names presume the axes of a square or
-    cubic lattice. With ``bands`` an ``s`` wave whose band gap has opposite signs on the Fermi sheets of two bands
-    becomes ``s±`` (see :func:`_changes_sign_between_fermi_sheets`). The frequency parity is the sign of the
-    global T Rayleigh quotient :math:`\langle \Delta, T\Delta \rangle / \langle \Delta, \Delta \rangle` (with
-    :math:`T` the fermionic-frequency flip), so it is consistent with the parity diagnostics.
-
-    Every orbital block :math:`(o_1, o_2)` carrying at least ``weight_floor`` of the heaviest block's weight is
-    classified separately from its momentum profile at the first positive Matsubara frequency (see
-    :func:`_classify_momentum_block`), because a multi-orbital gap need not carry the same wave in every block: the
-    :math:`E_g` singlet of a cubic :math:`t_{2g}` system, for instance, is a :math:`d`-wave in each block but a
-    *different* one each time, :math:`\cos k_x - \cos k_y` on :math:`d_{xy}` and its cyclic images on the other two.
-    Blocks below the floor are skipped - the wave symmetry of a numerically negligible block is noise.
-
-    Blocks that agree collapse to a single label, so the common case stays one token wide. When they disagree the
-    label lists each distinct wave with the blocks realizing it, e.g. ``d+[00,11]|s+[22]``, ordered by weight; the
-    number of entries is bounded by the number of distinct waves, never by the number of orbital blocks.
-
-    :param gap: The gap array in the ``[kx, ky, kz, o1, o2, v]`` layout.
-    :param purity: Minimum weight fraction for a symmetry sector to count as realized within a block.
-    :param weight_floor: Minimum weight of a block relative to the heaviest one for it to be classified at all.
-    :param bands: The band energies and eigenvectors of :func:`fermi_surface_bands`, for the ``s±`` test; ``None``
-        skips it.
-    :return: The ``<wave><parity>`` label, or ``"unknown"`` for an all-zero gap.
-    """
-    denom = np.vdot(gap, gap)
-    if denom == 0:
-        return "unknown"
-    t = (np.vdot(gap, np.flip(gap, axis=-1)) / denom).real
-    freq_label = "+" if t > 0.5 else ("-" if t < -0.5 else "")
-
-    n_o1, n_o2 = gap.shape[3], gap.shape[4]
-    weights = np.linalg.norm(gap.reshape(-1, n_o1, n_o2, gap.shape[-1]), axis=(0, -1))
-    if weights.max() <= 0:
-        return f"x{freq_label}"
-
-    labeled: dict[str, list[tuple[float, str]]] = {}
-    for o1 in range(n_o1):
-        for o2 in range(n_o2):
-            if weights[o1, o2] < weight_floor * weights.max():
-                continue
-            wave = _classify_momentum_block(gap[:, :, :, o1, o2, gap.shape[-1] // 2], purity)
-            labeled.setdefault(wave, []).append((float(weights[o1, o2]), f"{o1}{o2}"))
-
-    if not labeled:
-        return f"x{freq_label}"
-    if "s" in labeled and bands is not None and _changes_sign_between_fermi_sheets(gap[..., gap.shape[-1] // 2], bands):
-        labeled["s±"] = labeled.pop("s")
-    if len(labeled) == 1:
-        return f"{next(iter(labeled))}{freq_label}"
-    order = sorted(labeled.items(), key=lambda kv: -sum(w for w, _ in kv[1]))
-    return "|".join(
-        f"{wave}{freq_label}[{','.join(block for _, block in sorted(blocks, key=lambda wb: -wb[0]))}]"
-        for wave, blocks in order
-    )
-
-
 # Testing/benchmark override: forces the node-distributed team solve even where a node holds the vertex windows.
 FORCE_DISTRIBUTED_SOLVER: bool = False
 
@@ -2181,9 +1329,9 @@ def block_size(k_grid: KGrid, parity: int | None = None) -> int:
     ops = [
         {"M": m, "q": np.zeros(3, dtype=np.int64), "U": np.eye(1), "sigma": 1, "conj": False}
         for m in matrices
-        if m is not None and _M_preserves_grid(m, nk)
+        if m is not None and M_preserves_grid(m, nk)
     ]
-    return forced_multiplicity(_close_group(ops, 1, nk), nk, parity)
+    return forced_multiplicity(close_group(ops, 1, nk), nk, parity)
 
 
 def wedge_window_points(k_grid: KGrid) -> int:
@@ -2251,7 +1399,7 @@ def _build_shared_vertex_window(
         np.multiply(np.transpose(block, (0, 1, 3, 2, 4, 5)), norm, out=target[:, :, :, v, :, :, p0:p1])
     del irr, target
     node_comm.Barrier()
-    nonlocal_sde._free_shared_window(irr_win, node_comm)
+    mpi_utils.free_shared_window(irr_win, node_comm)
     if size == 1:
         gamma_r_pp.free()
     return gamma_mm, win
@@ -2416,30 +1564,6 @@ class LanczosTeam:
     sectors: tuple[tuple[SpinChannel, str], ...]
 
 
-def _node_groups(
-    comm: MPI.Comm, node_comm: MPI.Comm, available_bytes: int
-) -> tuple[dict[int, list[int]], dict[int, str], dict[int, int]]:
-    r"""
-    Groups the ranks by node: the groups of ``node_comm``, keyed by the lowest rank of each (ascending), with the
-    node's hostname and its free memory, the minimum over its ranks. Collective over ``comm``; identical on every rank.
-
-    :param comm: The MPI communicator.
-    :param node_comm: The node-local communicator.
-    :param available_bytes: This rank's free host memory.
-    :return: ``(node_ranks, node_host, node_available)``: every node's ranks in ascending order, its hostname and its
-        free memory, each keyed by the node's lowest rank.
-    """
-    info = comm.allgather((node_comm.bcast(comm.rank, root=0), socket.gethostname(), available_bytes))
-    node_ranks: dict[int, list[int]] = {}
-    node_host: dict[int, str] = {}
-    node_available: dict[int, int] = {}
-    for rank, (node_root, host, avail) in enumerate(info):
-        node_ranks.setdefault(node_root, []).append(rank)
-        node_host[node_root] = host
-        node_available[node_root] = min(node_available.get(node_root, avail), avail)
-    return node_ranks, node_host, node_available
-
-
 def plan_lanczos_teams(
     comm: MPI.Comm, node_comm: MPI.Comm, available_bytes: int, niv_pp: int
 ) -> tuple[tuple[LanczosTeam, ...], ...] | None:
@@ -2461,7 +1585,7 @@ def plan_lanczos_teams(
     :param niv_pp: Number of positive fermionic frequencies of the pp box.
     :return: The rounds of the solve, each a tuple of teams that run concurrently, or ``None`` when no round fits.
     """
-    node_ranks, node_host, node_available = _node_groups(comm, node_comm, available_bytes)
+    node_ranks, node_host, node_available = mpi_utils.node_groups(comm, node_comm, available_bytes)
     nodes = list(node_ranks)
     parities = [label for label, _ in _parity_sectors(config.eliashberg.resolve_parity_sectors)]
     sectors = [(channel, parity) for channel in (SpinChannel.SING, SpinChannel.TRIP) for parity in parities]
@@ -2548,7 +1672,7 @@ def plan_distributed_solve(comm: MPI.Comm, node_comm: MPI.Comm, available_bytes:
     :return: The layout of the solve.
     :raises MemoryError: If one builder per node does not fit every node.
     """
-    node_ranks, _, node_available = _node_groups(comm, node_comm, available_bytes)
+    node_ranks, _, node_available = mpi_utils.node_groups(comm, node_comm, available_bytes)
     nodes = tuple(tuple(ranks) for ranks in node_ranks.values())
     n_nodes, k_grid = len(nodes), config.lattice.k_grid
     nk = k_grid.nk_tot
@@ -2686,7 +1810,7 @@ def _build_distributed_window(
                     incoming.append((mine[step], piece))
                 elif piece.size:
                     sends.append(piece)
-                    reqs += mpi_utils._isend_rows(comm, piece, dest, base_tag=WINDOW_TAG)
+                    reqs += mpi_utils.isend_rows(comm, piece, dest, base_tag=WINDOW_TAG)
             del block
         for builder, chunk_ids in owned.items():
             if (
@@ -2697,7 +1821,7 @@ def _build_distributed_window(
                 v, p0, p1 = chunks[chunk_ids[step]]
                 piece = np.empty((len(rows), nb, nb, nb, nb, p1 - p0), dtype=dtype)
                 if piece.size:
-                    reqs += mpi_utils._irecv_rows_into(comm, piece, builder, base_tag=WINDOW_TAG)
+                    reqs += mpi_utils.irecv_rows_into(comm, piece, builder, base_tag=WINDOW_TAG)
                 incoming.append((chunk_ids[step], piece))
         MPI.Request.Waitall(reqs)
         del sends
@@ -2836,11 +1960,11 @@ def _node_team_matvec(
             block = pack(dest)
             if block.size:
                 sends.append(block)
-                reqs += mpi_utils._isend_rows(comm, block, layout.nodes[dest][(d - 1) % len(layout.nodes[dest])], tag)
+                reqs += mpi_utils.isend_rows(comm, block, layout.nodes[dest][(d - 1) % len(layout.nodes[dest])], tag)
             buf = np.empty(shape_from(src), dtype=y_share.dtype)
             if buf.size:
                 received.append((src, buf))
-                reqs += mpi_utils._irecv_rows_into(comm, buf, layout.nodes[src][(d - 1) % len(layout.nodes[src])], tag)
+                reqs += mpi_utils.irecv_rows_into(comm, buf, layout.nodes[src][(d - 1) % len(layout.nodes[src])], tag)
         MPI.Request.Waitall(reqs)
         for src, buf in received:
             unpack(src, buf)
@@ -3033,13 +2157,13 @@ def _solve_sectors_distributed(
             local = _solve_team_sectors(comm, team, apply_block, seed_block, collect, gap_shape)
         # every view into a window dies before the window is freed
         del apply_block, seed_block, collect, gamma_mm
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
         for sector in team.sectors:
             mine = local.get(sector)
             results[sector] = (comm.bcast(mine[0] if mine is not None else None, root=0), mine[1] if mine else [])
     del arrays, chi0_share
     for win in scratch_wins + [chi0_win]:
-        nonlocal_sde._free_shared_window(win, node_comm)
+        mpi_utils.free_shared_window(win, node_comm)
     return results
 
 
@@ -3170,7 +2294,7 @@ def _solve_sectors_in_teams(
             scratch_wins = [win for _, win in scratch]
             del apply_block, scratch
             for win in scratch_wins:
-                nonlocal_sde._free_shared_window(win, team_comm)
+                mpi_utils.free_shared_window(win, team_comm)
         team_comm.Free()
 
         for team in teams:
@@ -3187,9 +2311,9 @@ def _solve_sectors_in_teams(
                 results[sector] = (lambdas, gaps)
         gamma_by_channel.clear()
         for win in vertex_wins:
-            nonlocal_sde._free_shared_window(win, node_comm)
+            mpi_utils.free_shared_window(win, node_comm)
     del chi0_mm
-    nonlocal_sde._free_shared_window(chi0_win, node_comm)
+    mpi_utils.free_shared_window(chi0_win, node_comm)
     return results
 
 
@@ -3227,7 +2351,7 @@ def _team_seed_block(
     )
     seed = np.ascontiguousarray(seeds.reshape((n_block,) + tuple(gap_shape))[..., v0:v1])
     del seeds
-    nonlocal_sde._free_shared_window(win, team_comm)
+    mpi_utils.free_shared_window(win, team_comm)
     return seed
 
 
@@ -3611,7 +2735,7 @@ def inverse_core_bubble(mpi_dist_irrk: MpiDistributor, node_comm: MPI.Comm | Non
     r"""
     Rebuilds the inverse bare bubble :math:`(\chi^{\mathrm{q}\nu}_{0})^{-1}` of this rank's irreducible momenta on the
     core box from the Green's function the kernel step saved with its Eliashberg intermediates
-    (:data:`~dgamore.nonlocal_sde.GIWK_FILE_STEM`), with the bubble generator and orbital involution of that step, so
+    (:data:`~dgamore.output_files.GIWK_FILE_STEM`), with the bubble generator and orbital involution of that step, so
     the three-leg vertices and the inverse bubble share one Green's function. The Green's function is loaded once per
     node into a shared window (straight from the file into the window) and released before the inversion.
 
@@ -3619,7 +2743,7 @@ def inverse_core_bubble(mpi_dist_irrk: MpiDistributor, node_comm: MPI.Comm | Non
     :param node_comm: The node-local communicator, or ``None`` on a single rank.
     :return: The inverse bare bubble on the core box as a :class:`FourPoint`.
     """
-    path = os.path.join(config.output.eliashberg_path, f"{nonlocal_sde.GIWK_FILE_STEM}.npy")
+    path = output_files.npy_path(config.output.eliashberg_path, output_files.GIWK_FILE_STEM)
     if node_comm is None:
         giwk_mat, win = np.load(path), None
     else:
@@ -3636,78 +2760,11 @@ def inverse_core_bubble(mpi_dist_irrk: MpiDistributor, node_comm: MPI.Comm | Non
         config.lattice.k_grid,
         config.sys.beta,
         node_comm=node_comm,
-        involution=nonlocal_sde._orbital_involution(ek, orbitals),
+        involution=sde_kernels.orbital_involution(ek, orbitals),
     )
     giwk.mat = None
-    nonlocal_sde._free_shared_window(win, node_comm)
+    mpi_utils.free_shared_window(win, node_comm)
     return chi0.invert(copy=False)
-
-
-def dispatch_full_vertex_calculation(
-    channel: SpinChannel,
-    u_loc: LocalInteraction,
-    v_nonloc: Interaction,
-    niv_pp: int,
-    mpi_dist: MpiDistributor,
-    chunk_bytes: int | None = None,
-    node_comm: MPI.Comm | None = None,
-    gchi0_q_inv: FourPoint | None = None,
-) -> FourPoint:
-    r"""
-    Loads the local irreducible vertex for ``channel`` and builds the full ladder pp vertex through the slice-direct
-    construction, streaming the ph-notation vertex to disk when ``save_fq`` is set. Please note that Eq. (4.43) in
-    my master's thesis is wrong. The correct formula is
-    :math:`F^{\mathrm{q}\nu\nu'}_{r;1234}=F^{(1);\mathrm{q}\nu\nu'}_{r;1234}+F^{(2);\mathrm{q}\nu\nu'}_{r;1234}`, with
-    :math:`F^{(1);\mathrm{q}\nu\nu'}_{r;1234} = \beta^2\Big[(\chi^{\mathrm{q}\nu\nu'}_{0;1234})^{-1}-
-    \sum_{\nu_1\nu_2}\sum_{abcd}(\chi^{\mathrm{q}\nu\nu_1}_{0;12ab})^{-1}\chi^{*;\mathrm{q}\nu_1\nu_2}_{r;bacd}(\chi^{\mathrm{q}\nu_2\nu'}_{0;dc34})^{-1}\Big]`
-    and :math:`F^{(2);\mathrm{q}\nu\nu'}_{r;1234} = \sum_{abcdgh}\gamma^{\mathrm{q}\nu}_{r;12ab}\Big(\mathbb{1}_{bacd} -
-    \sum_{ef}\mathcal{U}^{\mathbf{q}}_{r;baef}\chi^{\mathrm{q}}_{r;fecd}\Big)\mathcal{U}^{\mathbf{q}}_{r;dcgh}\tilde\gamma^{\mathrm{q}\nu'}_{r;hg34}`,
-    where :math:`\tilde\gamma^{\mathrm{q}\nu}_{r;1234}=\beta \sum_{ab}\sum_{\nu'} \chi^{*;\mathrm{q}\nu'\nu}_{r;12ab}
-    (\chi^{\mathrm{q}\nu}_{0;ba34})^{-1}` sums over the FIRST frequency argument. It equals the orbital-reversed sum
-    over the last one, :math:`\beta \sum_{ab}\sum_{\nu'} \chi^{*;\mathrm{q}\nu\nu'}_{r;ab21}
-    (\chi^{\mathrm{q}\nu}_{0;ab34})^{-1}`, only where the Bethe-Salpeter matrix is complex-symmetric, i.e. where
-    :math:`G^{\mathrm{k}} = (G^{\mathrm{k}})^{T}`; complex hoppings or a lattice without inversion break that symmetry
-    of the lattice bubble, so the build takes the first-frequency sum from its own inversion (see
-    :func:`_build_ladder_vertex_chunk`). No explicit factors of :math:`\beta`
-    appear in :math:`F^{(2)}` because they are absorbed into the stored objects: :math:`\chi^{\mathrm{q}}_{r}` is the
-    (:math:`U`-dressed, shell- (and sometimes :math:`\lambda`-corrected)) physical susceptibility normalized as
-    :math:`\frac{1}{\beta^2}\sum_{\nu\nu'}\chi^{\mathrm{q}\nu\nu'}_{r}`, and the three-leg vertices carry the net
-    normalization :math:`\gamma^{\mathrm{q}\nu}_{r} = (\chi^{\mathrm{q}\nu}_{0})^{-1}\sum_{\nu'}
-    \chi^{*;\mathrm{q}\nu\nu'}_{r}` (the explicit :math:`\beta` in their construction cancels the :math:`1/\beta` of the
-    fused frequency sum), such that :math:`\gamma^{\mathrm{q}\nu}_{r} \to \mathbb{1}` for :math:`\nu \to \infty`. In the
-    bare-vertex modes (``config.misc.do_flex``, ``config.misc.do_rpa``) no local vertex is loaded and the vertex is the
-    RPA one, :math:`F^{\mathrm{q}}_{r} = \mathcal{U}^{\mathbf{q}}_{r} -
-    \mathcal{U}^{\mathbf{q}}_{r}\chi^{\mathrm{q}}_{r}\mathcal{U}^{\mathbf{q}}_{r}` (see
-    :func:`_build_rpa_vertex_chunk`).
-
-    :param channel: The spin channel (density or magnetic).
-    :param u_loc: The bare local interaction :math:`U`.
-    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}`.
-    :param niv_pp: Number of positive fermionic frequencies of the pp vertex.
-    :param mpi_dist: MPI distributor over the irreducible BZ q-points.
-    :param chunk_bytes: Chunk byte budget of the build (``None`` uses the floor).
-    :param node_comm: Optional node-local communicator; when given, the multi-GB local vertex is loaded once per
-        node into an MPI shared-memory window instead of once per rank (the build only reads it).
-    :param gchi0_q_inv: The inverse core bubble of this rank's momenta (see :func:`inverse_core_bubble`), or ``None``
-        to load the saved one; not read in the bare-vertex modes.
-    :return: The full ladder pp vertex :math:`F^{\mathrm{q}}_{r}` as a :class:`FourPoint`.
-    """
-    if config.misc.bare_vertex:
-        build = create_pairing_vertex_streaming_fq if config.eliashberg.save_fq else create_pairing_vertex_slice_q_r
-        f_q_r = build(u_loc, v_nonloc, None, niv_pp, mpi_dist, chunk_bytes, channel=channel)
-        mpi_dist.barrier()
-        return f_q_r
-    gamma_r, gamma_win = nonlocal_sde._load_node_shared_local_vertex(
-        node_comm, os.path.join(config.output.output_path, f"gamma_{channel.value}_loc.npy"), channel
-    )
-    build = create_pairing_vertex_streaming_fq if config.eliashberg.save_fq else create_pairing_vertex_slice_q_r
-    f_q_r = build(u_loc, v_nonloc, gamma_r, niv_pp, mpi_dist, chunk_bytes, gchi0_q_inv=gchi0_q_inv)
-    gamma_r.mat = None
-    if gamma_win is None:
-        gamma_r.free()
-    nonlocal_sde._free_shared_window(gamma_win, node_comm)
-    mpi_dist.barrier()
-    return f_q_r
 
 
 def _solve_sectors_in_memory(
@@ -3780,8 +2837,8 @@ def solve(
     logger = config.logger
     import psutil
 
-    mpi_dist_irrk = nonlocal_sde.irreducible_momentum_distributor(comm)
-    v_nonloc = nonlocal_sde.scatter_irreducible_interaction(v_nonloc, mpi_dist_irrk)
+    mpi_dist_irrk = sde_kernels.irreducible_momentum_distributor(comm)
+    v_nonloc = sde_kernels.scatter_irreducible_interaction(v_nonloc, mpi_dist_irrk)
 
     # the check may switch the sectors off, so it runs before they are fixed
     inversion = check_parity_sectors(comm)
@@ -3843,11 +2900,11 @@ def solve(
     if not config.misc.bare_vertex:
         gchi0_q_inv = inverse_core_bubble(mpi_dist_irrk, node_comm)
         logger.info("Rebuilt the inverse core bubble.")
-    f_dens_pp = dispatch_full_vertex_calculation(
+    f_dens_pp = pairing_vertex.dispatch_full_vertex_calculation(
         SpinChannel.DENS, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes, node_comm, gchi0_q_inv
     )
     logger.info("Built the density full ladder vertex in pp notation.")
-    f_magn_pp = dispatch_full_vertex_calculation(
+    f_magn_pp = pairing_vertex.dispatch_full_vertex_calculation(
         SpinChannel.MAGN, u_loc, v_nonloc, niv_pp, mpi_dist_irrk, chunk_bytes, node_comm, gchi0_q_inv
     )
     logger.info("Built the magnetic full ladder vertex in pp notation.")
@@ -3855,7 +2912,7 @@ def solve(
         gchi0_q_inv.free()
     mpi_dist_irrk.barrier()
     if comm.rank == 0:
-        delete_files(config.output.eliashberg_path, f"{nonlocal_sde.GIWK_FILE_STEM}.npy")
+        output_files.delete_files(config.output.eliashberg_path, f"{output_files.GIWK_FILE_STEM}.npy")
 
     gamma_sing_pp = f_dens_pp.scale(0.5).sub(f_magn_pp.scale(1.5, copy=True), copy=False)
     del f_dens_pp
@@ -3877,7 +2934,7 @@ def solve(
         # the local diagrams are reduced from local vertices on the full asymptotic fermionic box; one rank per node
         # reads and reduces them and broadcasts the pp-box-sized results, so that transient exists once per node
         f_ud_loc_pp_w0, gamma_ud_loc_pp_w0, phi_ud_loc_pp_w0 = _compute_once_per_node(
-            node_comm, lambda: create_local_ud_diagrams_pp_w0(g_dmft, niv_pp)
+            node_comm, lambda: pairing_vertex.create_local_ud_diagrams_pp_w0(g_dmft, niv_pp)
         )
 
         if mpi_dist_irrk.my_rank == 0:
@@ -3890,7 +2947,9 @@ def solve(
 
         # special treatment of local full vertex that is subtracted with a different frequency notation and is
         # different from the regular pp
-        f_ud_loc_transf_w0 = _compute_once_per_node(node_comm, lambda: create_local_f_ud_transformed_w0(niv_pp))
+        f_ud_loc_transf_w0 = _compute_once_per_node(
+            node_comm, lambda: pairing_vertex.create_local_f_ud_transformed_w0(niv_pp)
+        )
 
         # Eqs. (4.49)-(4.52): the assembled vertex holds the negative crossed slot, so the local full vertex enters
         # with a relative minus, the pp-reducible diagrams phi with a plus, both in crossed-slot form ((v, -v'), 1432).

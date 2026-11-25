@@ -17,7 +17,7 @@ import scipy.sparse.linalg as spla
 
 import dgamore.brillouin_zone as bz
 import dgamore.n_point_base as npb
-from dgamore import config, dga_io, four_point, memory_estimator, mpi_utils, nonlocal_sde
+from dgamore import config, dga_io, four_point, memory_estimator, mpi_utils, nonlocal_sde, sde_kernels
 from dgamore.dga_logger import DgaLogger
 from dgamore.four_point import FourPoint
 from dgamore.local_four_point import LocalFourPoint
@@ -25,7 +25,7 @@ from dgamore.matsubara_frequencies import MFHelper
 from dgamore.n_point_base import SpinChannel, deferred_collection
 from dgamore.greens_function import GreensFunction, update_mu
 from dgamore.interaction import Interaction, LocalInteraction
-from dgamore.jacobian_stabilization import _RITZ_GATE, JacobianTracker, _schur_ritz
+from dgamore.jacobian_stabilization import RITZ_GATE, JacobianTracker, schur_ritz
 from dgamore.mpi_utils import MpiDistributor
 from dgamore.self_energy import SelfEnergy
 from dgamore.sigma_jacobian import (
@@ -87,9 +87,9 @@ def _first_orbital(s_dmft: SelfEnergy, u_loc: LocalInteraction, folder) -> tuple
     are written to ``folder`` and read from there, so held and per-window (streamed) loads both get one band.
     """
     assert not os.path.samefile(folder, config.output.output_path)  # never overwrite the fixture's own vertices
-    for name in ("gamma_dens_loc.npy", "gamma_magn_loc.npy", _F_DC[0]):
-        first = np.load(os.path.join(config.output.output_path, name))[:1, :1, :1, :1]
-        with open(os.path.join(folder, name), "wb") as file:
+    for name in ("gamma_dens_loc", "gamma_magn_loc", _F_DC[0]):
+        first = np.load(os.path.join(config.output.output_path, f"{name}.npy"))[:1, :1, :1, :1]
+        with open(os.path.join(folder, f"{name}.npy"), "wb") as file:
             np.lib.format.write_array(file, np.ascontiguousarray(first))
     config.output.output_path = str(folder)
     config.sys.n_bands = 1
@@ -141,7 +141,7 @@ def _loop_state(monkeypatch, lattice: str = "fixture", tmp_path=None) -> types.S
     start = s_dmft.concatenate_self_energies(s_dmft)
     nb, o = ek.shape[-1], config.sys.correlated_orbitals
     occ_k = GreensFunction.get_g_full(start, config.sys.mu, ek.reshape(-1, 1, 1, nb, nb), config.sys.beta, o)
-    config.sys.n, config.sys.occ, config.sys.occ_k = nonlocal_sde._assemble_occupation(
+    config.sys.n, config.sys.occ, config.sys.occ_k = sde_kernels.assemble_occupation(
         occ_k.get_fill_nonlocal()[2], dist_fullbz, o
     )
     sigma_dmft = s_dmft.cut_niv(niv_cut)
@@ -194,7 +194,7 @@ def _mu_and_occupations(state, sigma, mu_start: float, fixed: bool = False) -> f
     if not fixed:
         smom0, orbitals = s.fit_smom()[0], config.sys.correlated_orbitals
         mu = update_mu(mu_start, config.sys.n, state.ek, s.mat, config.sys.beta, smom0, tol=1e-14, orbitals=orbitals)
-    _, config.sys.occ, config.sys.occ_k, _, _ = nonlocal_sde._update_occ_and_energies_distributed(
+    _, config.sys.occ, config.sys.occ_k, _, _ = sde_kernels.update_occ_and_energies_distributed(
         s, state.sigma_dmft_full, state.dist_fullbz, mu
     )
     return mu
@@ -316,8 +316,8 @@ def test_exact_jacobian_block_products_share_one_bethe_salpeter_pass_per_channel
     rng = np.random.default_rng(11)
     ys = np.column_stack([jac.project(rng.standard_normal(jac.n_real)) for _ in range(3)])
     singles = np.column_stack([jac.matvec(y) for y in ys.T])
-    solve = MagicMock(side_effect=nonlocal_sde.create_auxiliary_chi_r_q_sum)
-    monkeypatch.setattr(nonlocal_sde, "create_auxiliary_chi_r_q_sum", solve)
+    solve = MagicMock(side_effect=sde_kernels.create_auxiliary_chi_r_q_sum)
+    monkeypatch.setattr(sde_kernels, "create_auxiliary_chi_r_q_sum", solve)
     block = jac.matvec_block(ys)
     jac.free()
     assert [len(call.kwargs["rhs"]) for call in solve.call_args_list] == [2, 2, 1, 1]
@@ -336,8 +336,8 @@ def test_exact_jacobian_solves_each_channel_once_per_window_and_piece_with_the_w
     whole = jac.matvec_block(ys)
     jac.free()
     jac = _jacobian(loop_state, base.copy(), mu0, memory_estimator.ChunkBudgets(exact_block=2, exact_window=width))
-    solve = MagicMock(side_effect=nonlocal_sde.create_auxiliary_chi_r_q_sum)
-    monkeypatch.setattr(nonlocal_sde, "create_auxiliary_chi_r_q_sum", solve)
+    solve = MagicMock(side_effect=sde_kernels.create_auxiliary_chi_r_q_sum)
+    monkeypatch.setattr(sde_kernels, "create_auxiliary_chi_r_q_sum", solve)
     products, windows = jac.matvec_block(ys), jac._w_windows
     jac.free()
     n_w = config.box.niw_core + 1
@@ -348,13 +348,13 @@ def test_exact_jacobian_solves_each_channel_once_per_window_and_piece_with_the_w
 def test_exact_jacobian_loads_its_local_vertices_per_window_with_the_same_products(loop_state, monkeypatch):
     """Vertices loaded per window give the held vertices' products to 10x the floor, one load per vertex and piece."""
     base, mu0 = _start(loop_state)
-    real_load, loads, products, held = nonlocal_sde._load_node_shared_local_vertex, [], {}, {}
+    real_load, loads, products, held = sde_kernels.load_node_shared_local_vertex, [], {}, {}
 
     def load(node_comm, path, channel, **kwargs):
         loads.append(os.path.basename(path))
         return real_load(node_comm, path, channel, **kwargs)
 
-    monkeypatch.setattr(nonlocal_sde, "_load_node_shared_local_vertex", load)
+    monkeypatch.setattr(sde_kernels, "load_node_shared_local_vertex", load)
     for per_window in (False, True):
         budgets = memory_estimator.ChunkBudgets(exact_block=2, exact_vertices_per_window=per_window)
         jac = _jacobian(loop_state, base.copy(), mu0, budgets)
@@ -362,10 +362,14 @@ def test_exact_jacobian_loads_its_local_vertices_per_window_with_the_same_produc
         loads.clear()
         products[per_window], held[per_window] = (jac.matvec_block(ys), sorted(loads)), sorted(jac._vertices)
         jac.free()
-    names = ["f_dc_loc.npy", "gamma_dens_loc.npy", "gamma_magn_loc.npy"]
+    names = ["f_dc_loc", "gamma_dens_loc", "gamma_magn_loc"]
     held_products = products[False][0]
     assert np.allclose(products[True][0], held_products, rtol=0, atol=conftest.ten_times_the_floor(held_products))
-    assert products[False][1] == [] and products[True][1] == sorted(names * 2) and held == {False: names, True: []}
+    assert (
+        products[False][1] == []
+        and products[True][1] == sorted(f"{n}.npy" for n in names * 2)
+        and held == {False: names, True: []}
+    )
 
 
 @pytest.mark.parametrize("hostnames", [["n0", "n0"], ["n0", "n1"]])
@@ -382,6 +386,7 @@ def test_exact_jacobian_products_agree_across_rank_layouts(hostnames, loop_state
     single.free()
     monkeypatch.setattr(mpi_utils, "MPI", conftest.FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", conftest.FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", conftest.FAKE_MPI)
 
     k_grid = config.lattice.k_grid
 
@@ -622,7 +627,7 @@ def test_certify_subspace_certifies_the_leading_pair_from_a_nearby_start(quiet_l
         _make_matrix_operator(a, comm), _start_near(_leading_vector(a), 0.9, seed=4), comm
     )
     j = int(np.argmin(lam_pi.real))
-    assert np.isclose(lam_pi[j], -1.0, atol=1e-2) and res[j] <= _RITZ_GATE * 2.0 and 0 < n_products <= _CHECK_BASIS
+    assert np.isclose(lam_pi[j], -1.0, atol=1e-2) and res[j] <= RITZ_GATE * 2.0 and 0 < n_products <= _CHECK_BASIS
     assert np.isclose(res[j], np.linalg.norm(a @ u[:, j] - (1.0 - lam_pi[j]) * u[:, j]), atol=1e-12)
 
 
@@ -645,7 +650,7 @@ def test_certify_subspace_returns_an_uncertified_pair_when_the_budget_runs_out(q
     operator = _make_matrix_operator(_normal_matrix(40, seed=1), comm)
     lam_pi, res, _, n_products, _ = certify_subspace(operator, np.random.default_rng(7).standard_normal((40, 1)), comm)
     assert n_products == operator.matvec_block.call_count == 1 and lam_pi.size == 1
-    assert res[0] > _RITZ_GATE * max(1.0, abs(1.0 - lam_pi[0]))
+    assert res[0] > RITZ_GATE * max(1.0, abs(1.0 - lam_pi[0]))
 
 
 def test_certify_subspace_applies_its_start_columns_and_each_extension_as_one_block(quiet_logger):
@@ -964,8 +969,8 @@ def test_exact_jacobian_scans_each_channel_once_and_reuses_the_real_space_intera
         LocalFourPoint.orbital_pairs_without_vertex, wraps=LocalFourPoint.orbital_pairs_without_vertex
     )
     monkeypatch.setattr(LocalFourPoint, "orbital_pairs_without_vertex", scan)
-    hartree_fock = MagicMock(side_effect=nonlocal_sde.get_hartree_fock)
-    monkeypatch.setattr(nonlocal_sde, "get_hartree_fock", hartree_fock)
+    hartree_fock = MagicMock(side_effect=sde_kernels.get_hartree_fock)
+    monkeypatch.setattr(sde_kernels, "get_hartree_fock", hartree_fock)
     jac = _jacobian(loop_state, base, mu0)
     y = jac.project(np.random.default_rng(2).standard_normal(jac.n_real))
     first, second, w_r = jac.matvec(y), jac.matvec(y), jac._w_r
@@ -978,7 +983,7 @@ def test_exact_jacobian_frees_every_full_box_bubble_before_attaching_the_dc_inte
     """The build and a product split and free every window's full-box bubble before attaching the dc interaction."""
     base, mu0 = _start(loop_state)
     bubbles, freed = [], []
-    contract, attach = nonlocal_sde._contract_dc_vertex, nonlocal_sde._attach_dc_interaction
+    contract, attach = sde_kernels.contract_dc_vertex, sde_kernels.attach_dc_interaction
 
     def contract_dc_vertex(f_dc_loc, gchi0_q):
         bubbles.append(gchi0_q)
@@ -988,8 +993,8 @@ def test_exact_jacobian_frees_every_full_box_bubble_before_attaching_the_dc_inte
         freed.append(bubbles[-1].mat is None and per_wn)
         return attach(contraction, u_loc, per_wn)
 
-    monkeypatch.setattr(nonlocal_sde, "_contract_dc_vertex", contract_dc_vertex)
-    monkeypatch.setattr(nonlocal_sde, "_attach_dc_interaction", attach_dc_interaction)
+    monkeypatch.setattr(sde_kernels, "contract_dc_vertex", contract_dc_vertex)
+    monkeypatch.setattr(sde_kernels, "attach_dc_interaction", attach_dc_interaction)
     jac = _jacobian(loop_state, base, mu0, memory_estimator.ChunkBudgets(exact_window=4))
     jac.matvec(jac.project(np.random.default_rng(3).standard_normal(jac.n_real)))
     jac.free()
@@ -1003,7 +1008,7 @@ def test_exact_product_finalized_in_place_has_the_bits_of_the_out_of_place_sums(
     monkeypatch.setattr(npb, "DTYPE", dtype)
     jac = _jacobian(loop_state, base, mu0)
     contractions, terms = [], []
-    real_finish, real_hartree_fock = nonlocal_sde._ColumnSdeStream.finish, nonlocal_sde.get_hartree_fock
+    real_finish, real_hartree_fock = sde_kernels.ColumnSdeStream.finish, sde_kernels.get_hartree_fock
 
     def finish(stream, out):
         contractions.append(real_finish(stream, out))
@@ -1013,8 +1018,8 @@ def test_exact_product_finalized_in_place_has_the_bits_of_the_out_of_place_sums(
         terms.append(real_hartree_fock(*args))
         return terms[-1]
 
-    monkeypatch.setattr(nonlocal_sde._ColumnSdeStream, "finish", finish)
-    monkeypatch.setattr(nonlocal_sde, "get_hartree_fock", hartree_fock)
+    monkeypatch.setattr(sde_kernels.ColumnSdeStream, "finish", finish)
+    monkeypatch.setattr(sde_kernels, "get_hartree_fock", hartree_fock)
     product = jac.matvec(jac.project(np.random.default_rng(3).standard_normal(jac.n_real)))
     reference = contractions[0].ifft().to_full_niv_range() + terms[0][0] + terms[0][1]
     reference.compress_q_dimension().symmetrize_time_reversal()
@@ -1090,12 +1095,12 @@ def _certify_reference(a: np.ndarray, start: np.ndarray) -> tuple[np.ndarray, np
     basis, images = extend(np.zeros((a.shape[0], 0)), start), np.zeros((a.shape[0], 0))
     while basis.shape[1] > images.shape[1]:
         images = np.column_stack([images, a @ basis[:, images.shape[1] :]])
-        theta, y, _ = _schur_ritz(basis.T @ images)
+        theta, y, _ = schur_ritz(basis.T @ images)
         ritz = basis @ y
         residuals = images @ y - ritz * theta
         res = np.linalg.norm(residuals, axis=0) / np.linalg.norm(ritz, axis=0)
         lead = int(np.argmax(theta.real))
-        if res[lead] <= _RITZ_GATE * max(1.0, abs(theta[lead])):
+        if res[lead] <= RITZ_GATE * max(1.0, abs(theta[lead])):
             break
         basis = extend(basis, np.column_stack([residuals[:, lead].real, residuals[:, lead].imag]))
     order = np.argsort((1.0 - theta).real)
@@ -1130,6 +1135,7 @@ def test_exact_jacobian_recomputing_three_leg_vertices_per_window_gives_the_held
     ys = np.random.default_rng(13).standard_normal((2 * k_grid.nk_irr * config.sys.n_bands**2 * config.box.niv_core, 2))
     monkeypatch.setattr(mpi_utils, "MPI", conftest.FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", conftest.FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", conftest.FAKE_MPI)
     real_scan, scans = LocalFourPoint.orbital_pairs_without_vertex, []
 
     def scan(gamma, u_r):
@@ -1168,6 +1174,7 @@ def test_exact_jacobian_solves_recomputed_three_leg_vertices_fused_or_in_two_pas
     ys = np.random.default_rng(15).standard_normal((2 * k_grid.nk_irr * config.sys.n_bands**2 * config.box.niv_core, 2))
     monkeypatch.setattr(mpi_utils, "MPI", conftest.FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", conftest.FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", conftest.FAKE_MPI)
     hooks = MagicMock(side_effect=ExactJacobian._response_rhs)
     monkeypatch.setattr(ExactJacobian, "_response_rhs", hooks)
 
@@ -1285,6 +1292,7 @@ def test_exact_jacobian_products_on_any_rank_layout_do_not_depend_on_the_window_
     ys = np.random.default_rng(14).standard_normal((2 * k_grid.nk_irr * config.sys.n_bands**2 * config.box.niv_core, 3))
     monkeypatch.setattr(mpi_utils, "MPI", conftest.FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", conftest.FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", conftest.FAKE_MPI)
     specs = [{}, {"exact_block": 2, "exact_window": 4, "exact_vrg_per_window": True}]
     specs.append({"exact_block": 3, "exact_window": 1, "exact_vertices_per_window": True})
 
@@ -1314,6 +1322,7 @@ def test_rank_jacobians_clone_no_interaction_the_fake_ranks_share(loop_state, mo
     ys = np.random.default_rng(16).standard_normal(2 * k_grid.nk_irr * config.sys.n_bands**2 * config.box.niv_core)
     monkeypatch.setattr(mpi_utils, "MPI", conftest.FAKE_MPI)
     monkeypatch.setattr(nonlocal_sde, "MPI", conftest.FAKE_MPI)
+    monkeypatch.setattr(sde_kernels, "MPI", conftest.FAKE_MPI)
     shared, real_clone, cloned_by = loop_state.v_full, npb.IHaveMat._clone_without_mat, []
 
     def clone(self):
@@ -1365,7 +1374,7 @@ def _window_operator(case, width: int, per_window: bool = False) -> ExactJacobia
     f_dc = LocalFourPoint(stored.transpose(np.argsort(_F_DC[2])), SpinChannel.MAGN, 1, 2, False, True)
     jac._vertices[_F_DC[0]] = (f_dc, None)
     for (channel, _), gamma in zip(_CHANNELS, case.gammas):
-        jac._vertices[f"gamma_{channel.value}_loc.npy"] = (LocalFourPoint(gamma, channel, 1, 2, False, True), None)
+        jac._vertices[f"gamma_{channel.value}_loc"] = (LocalFourPoint(gamma, channel, 1, 2, False, True), None)
     jac._w_windows = [(w0, min(case.wp, w0 + width)) for w0 in range(0, case.wp, width)]
     jac._channels = []
     for channel, weight in _CHANNELS:
@@ -1392,7 +1401,7 @@ def _window_parts(jac: ExactJacobian, case, w_window: tuple[int, int]) -> list[t
     w0, w1 = w_window
     responses = [FourPoint(r[..., w0:w1, :].copy(), *_window_meta(case)) for r in case.bubbles[1:]]
     with jac._local_vertex(*_F_DC, w_window=w_window) as f_dc:
-        return [jac._split_bubble(r, nonlocal_sde._contract_dc_vertex(f_dc, r)) for r in responses]
+        return [jac._split_bubble(r, sde_kernels.contract_dc_vertex(f_dc, r)) for r in responses]
 
 
 @pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
